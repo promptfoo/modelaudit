@@ -60,6 +60,7 @@ _ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_TOTAL = 64 * 1024 * 1024
 _ZIP_MAX_LOCAL_DESCRIPTOR_SEARCH_WORK = 1_000_000
 _ZIP_MAX_LOCAL_ENTRY_PADDING = 64 * 1024
 _ZIP_MAX_LOCAL_HEADER_CANDIDATES = 10000
+_ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH = 160
 _ZIP64_EOCD_LOCATOR_SIGNATURE = b"PK\x06\x07"
 _ZIP64_EOCD_LOCATOR_SIZE = 20
 _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
@@ -269,6 +270,28 @@ class ZipScanner(BaseScanner):
 
     def _is_content_only_member_entry(self, name: str) -> bool:
         return self._normalize_skip_entry_name(name) in self.content_only_member_entries
+
+    @staticmethod
+    def _archive_entry_basename(name: str) -> str:
+        return name.replace("\\", "/").rsplit("/", 1)[-1]
+
+    @staticmethod
+    def _safe_preserved_temp_basename(name: str) -> str:
+        if len(name) <= _ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH:
+            return name
+
+        stem, ext = os.path.splitext(name)
+        max_stem_length = max(1, _ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH - len(ext))
+        return f"{stem[:max_stem_length]}{ext}"
+
+    @classmethod
+    def _preserve_nested_routing_basename(cls, name: str) -> bool:
+        """Return True when nested scanner routing depends on the exact basename."""
+        basename = cls._archive_entry_basename(name).lower()
+        ext = os.path.splitext(basename)[1]
+        if ext in {".zip", ".npz", ".mar"}:
+            return True
+        return basename == ".env" or is_declared_text_content_filename(basename)
 
     def _is_known_unreadable_archive_entry(self, info: zipfile.ZipInfo) -> bool:
         return info.header_offset in self.known_unreadable_archive_entry_offsets
@@ -1556,6 +1579,30 @@ class ZipScanner(BaseScanner):
             raise zipfile.BadZipFile("ZIP archive is already closed")
         yield cast(BinaryIO, archive_fp)
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _open_member_temp_file(
+        suffix: str,
+        safe_name: str | None,
+        preserve_nested_routing_basename: bool,
+    ) -> Iterator[tuple[str, BinaryIO, str | None]]:
+        """Yield a writable temporary member path plus its optional parent directory."""
+        if preserve_nested_routing_basename:
+            tmp_dir = tempfile.mkdtemp()
+            try:
+                tmp_name = ZipScanner._safe_preserved_temp_basename(safe_name or "archive-member")
+                tmp_path = os.path.join(tmp_dir, tmp_name)
+                with open(tmp_path, "wb") as tmp:
+                    yield tmp_path, tmp, tmp_dir
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.rmdir(tmp_dir)
+                raise
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as named_tmp:
+            yield named_tmp.name, cast(BinaryIO, named_tmp), None
+
     def _scan_nested_archive_entry(self, path: str, nested_config: dict[str, Any]) -> ScanResult:
         """Dispatch a nested archive member through an injected callback or registry fallback."""
         nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
@@ -1946,8 +1993,8 @@ class ZipScanner(BaseScanner):
                     continue
 
                 # Extract and scan the file
-                tmp_path: str | None = None
                 tmp_dir: str | None = None
+                tmp_path: str | None = None
                 try:
                     max_entry_size = self._get_max_entry_size()
                     is_security_only_member = self._is_security_only_member_entry(name)
@@ -1955,6 +2002,24 @@ class ZipScanner(BaseScanner):
                     is_mar_python_fallback = (
                         archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member
                     )
+                    preserve_nested_routing_basename = self._preserve_nested_routing_basename(name)
+                    safe_name: str | None = None
+
+                    if is_content_only_member:
+                        suffix = ""
+                    else:
+                        raw_safe_name = re.sub(
+                            r"[^a-zA-Z0-9_.-]",
+                            "_",
+                            self._archive_entry_basename(name),
+                        )
+                        safe_name = raw_safe_name if preserve_nested_routing_basename else raw_safe_name.strip("._")
+                        if not safe_name:
+                            safe_name = "archive-member"
+                        if is_mar_python_fallback:
+                            safe_name = f"member_{safe_name}"
+                            preserve_nested_routing_basename = False
+                        suffix = f"_{safe_name}"
 
                     def copy_entry_to(
                         tmp_file: BinaryIO,
@@ -1986,27 +2051,12 @@ class ZipScanner(BaseScanner):
                         return copied_size
 
                     try:
-                        total_size = 0
-                        if is_content_only_member:
-                            with tempfile.NamedTemporaryFile(suffix="", delete=False) as named_tmp:
-                                tmp_path = named_tmp.name
-                                total_size = copy_entry_to(cast(BinaryIO, named_tmp))
-                        else:
-                            member_basename = os.path.basename(name.replace("\\", "/"))
-                            safe_name = (
-                                re.sub(
-                                    r"[^a-zA-Z0-9_.-]",
-                                    "_",
-                                    member_basename,
-                                )
-                                or "member"
-                            )
-                            if not is_declared_text_content_filename(member_basename) or is_mar_python_fallback:
-                                safe_name = f"member_{safe_name}"
-                            tmp_dir = tempfile.mkdtemp(prefix="modelaudit_zip_")
-                            tmp_path = os.path.join(tmp_dir, safe_name)
-                            with open(tmp_path, "wb") as tmp_file:
-                                total_size = copy_entry_to(tmp_file)
+                        with self._open_member_temp_file(
+                            suffix,
+                            safe_name,
+                            preserve_nested_routing_basename and not is_content_only_member,
+                        ) as (tmp_path, tmp, tmp_dir):
+                            total_size = copy_entry_to(tmp)
 
                         extracted_uncompressed_size += total_size
 

@@ -211,6 +211,10 @@ _PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
 _PYTORCH_STORAGE_GLOBALS = frozenset(
     (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
 )
+_PYTORCH_STORAGE_REDACTED_BINPERSID_PREVIEW = re.compile(
+    r"^tuple\(str_span\(len=7\), global:(?P<module>[A-Za-z_][A-Za-z0-9_.]*)\.(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r", str_span\(len=(?P<key_len>[0-9]+)\), str_span\(len=(?P<device_len>[0-9]+)\), int:(?P<size>[0-9]+)\)$"
+)
 _ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 CRITICAL_SYSTEM_PATHS: tuple[str, ...] = (
     "/etc",
@@ -2668,6 +2672,32 @@ class PyTorchZipScanner(BaseScanner):
         return value if isinstance(value, str) else None
 
     @classmethod
+    def _storage_key_from_redacted_binary_persid_preview(
+        cls,
+        preview: Any,
+        trusted_storage_keys: set[str],
+    ) -> str | None:
+        if not isinstance(preview, str) or len(preview) > 4096:
+            return None
+        match = _PYTORCH_STORAGE_REDACTED_BINPERSID_PREVIEW.fullmatch(preview)
+        if match is None:
+            return None
+        if (match.group("module"), match.group("name")) not in _PYTORCH_STORAGE_GLOBALS:
+            return None
+        key_len = int(match.group("key_len"))
+        device_len = int(match.group("device_len"))
+        if key_len <= 0 or device_len <= 0:
+            return None
+        matching_keys = [
+            key
+            for key in trusted_storage_keys
+            if cls._is_ascii_decimal_digits(key) and len(key.encode("utf-8")) == key_len
+        ]
+        if len(matching_keys) != 1:
+            return None
+        return matching_keys[0]
+
+    @classmethod
     def _is_pytorch_storage_persistent_id_record(cls, details: dict[str, Any], trusted_storage_keys: set[str]) -> bool:
         if details.get("pickle_rule_code") != "PERSISTENT_ID":
             return False
@@ -2678,6 +2708,17 @@ class PyTorchZipScanner(BaseScanner):
             and isinstance(storage_key, str)
         ):
             return storage_key in trusted_storage_keys
+
+        if details.get("opcode") == "BINPERSID":
+            storage_key = cls._storage_key_from_redacted_binary_persid_preview(
+                details.get("persistent_id_preview"),
+                trusted_storage_keys,
+            )
+            if storage_key is None:
+                return False
+            details["pytorch_storage_persistent_id"] = True
+            details["pytorch_storage_key"] = storage_key
+            return True
 
         if details.get("opcode") != "PERSID":
             return False
