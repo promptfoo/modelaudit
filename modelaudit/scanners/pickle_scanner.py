@@ -8,6 +8,7 @@ import hashlib
 import io
 import pickletools
 import re
+from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -454,6 +455,8 @@ class _LegacyPyTorchStorageRecord:
     key: str
     element_count: int
     element_size: int
+    storage_type_module: str
+    storage_type_name: str
 
 
 @dataclass(frozen=True)
@@ -826,6 +829,8 @@ def _legacy_pytorch_storage_record_from_pid(
             key=key,
             element_count=element_count,
             element_size=_PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES[storage_type.name],
+            storage_type_module=storage_type.module,
+            storage_type_name=storage_type.name,
         ),
     )
 
@@ -2603,6 +2608,58 @@ class PickleScanner(BaseScanner):
         )
 
     @staticmethod
+    def _legacy_pytorch_storage_import_reference(record: _LegacyPyTorchStorageRecord) -> str:
+        return f"{record.storage_type_module}.{record.storage_type_name}"
+
+    @classmethod
+    def _trusted_legacy_pytorch_storage_import_references(
+        cls,
+        result: ScanResult,
+        layout: _LegacyPyTorchStreamLayout,
+    ) -> set[str]:
+        if result.metadata.get("import_references_truncated") is True:
+            return set()
+        storage_records = layout.storage_records or ()
+        trusted_import_counts = Counter(
+            cls._legacy_pytorch_storage_import_reference(record) for record in storage_records
+        )
+        if not trusted_import_counts:
+            return set()
+
+        import_references = result.metadata.get("import_references")
+        if not isinstance(import_references, list):
+            return set()
+
+        observed_import_counts: Counter[str] = Counter()
+        for raw_reference in import_references:
+            if not isinstance(raw_reference, dict):
+                continue
+            import_reference = raw_reference.get("import_reference")
+            if isinstance(import_reference, str) and import_reference in trusted_import_counts:
+                observed_import_counts[import_reference] += 1
+
+        return {
+            import_reference
+            for import_reference, expected_count in trusted_import_counts.items()
+            if observed_import_counts.get(import_reference) == expected_count
+        }
+
+    @staticmethod
+    def _is_legacy_pytorch_storage_import_call_graph_finding(
+        details: dict[str, Any],
+        trusted_import_references: set[str],
+    ) -> bool:
+        import_reference = details.get("import_reference")
+        return (
+            details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
+            and details.get("analysis") == "python_call_graph"
+            and "opcode" not in details
+            and "invocation_import_reference" not in details
+            and isinstance(import_reference, str)
+            and import_reference in trusted_import_references
+        )
+
+    @staticmethod
     def _annotate_legacy_pytorch_storage_persistent_id_record(
         details: dict[str, Any],
         record: _LegacyPyTorchStorageRecord,
@@ -2723,6 +2780,34 @@ class PickleScanner(BaseScanner):
             for issue in result.issues
             if not cls._is_legacy_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
         ]
+        trusted_storage_import_references = cls._trusted_legacy_pytorch_storage_import_references(result, layout)
+        downgraded_import_count = 0
+        for check in result.checks:
+            if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
+                check.details,
+                trusted_storage_import_references,
+            ):
+                continue
+            if check.rule_code is not None:
+                downgraded_private_entries.append({"name": check.name, "rule_code": check.rule_code})
+            check.status = CheckStatus.PASSED
+            check.severity = IssueSeverity.INFO
+            check.message = "PyTorch storage global import found in validated legacy PyTorch stream"
+            check.details["trusted_legacy_pytorch_context"] = True
+            check.details["pytorch_storage_import_reference"] = True
+            downgraded_import_count += 1
+
+        if downgraded_import_count:
+            result.metadata["legacy_pytorch_trusted_storage_import_count"] = downgraded_import_count
+            result.issues = [
+                issue
+                for issue in result.issues
+                if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
+                    issue.details,
+                    trusted_storage_import_references,
+                )
+            ]
+
         if downgraded_count:
             result.metadata["legacy_pytorch_trusted_storage_persistent_id_count"] = downgraded_count
             clean_trusted_storage_downgrade = (
