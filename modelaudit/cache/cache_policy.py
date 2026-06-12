@@ -50,7 +50,7 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
     if scan_result.get("success") is False:
         return False
 
-    if _metadata_disqualifies_cache(scan_result.get("metadata")):
+    if _metadata_disqualifies_cache(scan_result.get("metadata"), allow_bare_analysis_incomplete=True):
         return False
 
     private_metadata = scan_result.get("_private_metadata")
@@ -104,12 +104,11 @@ def _record_status_is_skipped(record: dict[str, Any]) -> bool:
     return False
 
 
-def _metadata_disqualifies_cache(metadata: Any, *, allow_bare_analysis_incomplete: bool = True) -> bool:
+def _metadata_disqualifies_cache(metadata: Any, *, allow_bare_analysis_incomplete: bool) -> bool:
     if not isinstance(metadata, dict):
         return False
     if (
         bool(metadata.get("operational_error"))
-        or (allow_bare_analysis_incomplete and bool(metadata.get("analysis_incomplete")))
         or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         or _has_incomplete_coverage_reasons(
             metadata,
@@ -146,7 +145,7 @@ def _metadata_disqualifies_cache(metadata: Any, *, allow_bare_analysis_incomplet
 def _has_incomplete_coverage_reasons(
     metadata: dict[str, Any],
     *,
-    allow_bare_analysis_incomplete: bool = True,
+    allow_bare_analysis_incomplete: bool,
 ) -> bool:
     reason = metadata.get("scan_outcome_reason")
     if isinstance(reason, str) and reason:

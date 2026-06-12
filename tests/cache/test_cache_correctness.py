@@ -2526,12 +2526,17 @@ def test_cached_scan_skips_persisting_incomplete_metadata(
     "details",
     [
         {"scan_outcome": INCONCLUSIVE_SCAN_OUTCOME},
-        {"analysis_incomplete": True},
         {"scan_outcome_reason": "bounded_probe_exhausted"},
         {"scan_outcome_reasons": ["bounded_probe_exhausted"]},
         {"operational_error": True},
-        {"component_count": 2, "findings": [{"analysis_incomplete": True}]},
-        {"component_count": 2, "findings": [{"details": {"analysis_incomplete": True}}]},
+        {
+            "component_count": 2,
+            "findings": [{"analysis_incomplete": True, "scan_outcome_reason": "bounded_probe_exhausted"}],
+        },
+        {
+            "component_count": 2,
+            "findings": [{"details": {"analysis_incomplete": True, "scan_outcome_reason": "bounded_probe_exhausted"}}],
+        },
     ],
 )
 def test_cached_scan_skips_persisting_incomplete_record_details(
@@ -2584,9 +2589,14 @@ def test_cached_scan_persists_skipped_bare_analysis_incomplete_check(tmp_path: P
         return {
             "checks": [
                 {
-                    "message": "PyTorch runtime version is unknown",
+                    "message": "PyTorch runtime version not available; CVE applicability unknown",
                     "status": "skipped",
-                    "details": {"analysis_incomplete": True, "runtime_cve_applicability": "unknown"},
+                    "details": {
+                        "analysis_incomplete": True,
+                        "runtime_version_known": False,
+                        "runtime_cve_applicability": "unknown",
+                        "runtime_cve_version_gate": "local_environment_only",
+                    },
                 }
             ],
             "issues": [],
@@ -2599,7 +2609,7 @@ def test_cached_scan_persists_skipped_bare_analysis_incomplete_check(tmp_path: P
     second = scan(str(file_path), config)
 
     assert first["scan_count"] == 1
-    assert second == first
+    assert second["scan_count"] == 1
     assert calls["count"] == 1
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
 

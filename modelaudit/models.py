@@ -88,6 +88,23 @@ def _metadata_has_incomplete_coverage(metadata: Any, *, allow_bare_analysis_inco
     return False
 
 
+def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
+    """Return True when record details explicitly identify incomplete coverage."""
+    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
+        return True
+    reason = _metadata_value(metadata, "scan_outcome_reason")
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = _metadata_value(metadata, "scan_outcome_reasons")
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(reason) for reason in reasons)
+
+    return False
+
+
 def _details_have_incomplete_coverage(
     details: Any,
     *,
@@ -95,7 +112,10 @@ def _details_have_incomplete_coverage(
     _depth: int = 0,
 ) -> bool:
     """Return True when details or consolidated detail findings identify incomplete coverage."""
-    if _metadata_has_incomplete_coverage(details, allow_bare_analysis_incomplete=allow_bare_analysis_incomplete):
+    if allow_bare_analysis_incomplete:
+        if _metadata_has_incomplete_coverage(details, allow_bare_analysis_incomplete=True):
+            return True
+    elif _metadata_has_explicit_incomplete_coverage_marker(details):
         return True
     if _depth >= 4:
         return False
@@ -414,11 +434,16 @@ class FileHashesModel(BaseModel):
     md5: str | None = Field(None, description="MD5 hash", pattern=r"^[a-fA-F0-9]{32}$")
     sha1: str | None = Field(None, description="SHA1 hash", pattern=r"^[a-fA-F0-9]{40}$")
     sha256: str | None = Field(None, description="SHA256 hash", pattern=r"^[a-fA-F0-9]{64}$")
+    sha256_prefix: str | None = Field(
+        None,
+        description="SHA256 hash for a bounded prefix only; not a complete file hash",
+        pattern=r"^[a-fA-F0-9]{64}$",
+    )
     sha512: str | None = Field(None, description="SHA512 hash", pattern=r"^[a-fA-F0-9]{128}$")
 
     def has_any_hash(self) -> bool:
         """Check if any hash is present"""
-        return any([self.md5, self.sha1, self.sha256, self.sha512])
+        return any([self.md5, self.sha1, self.sha256, self.sha256_prefix, self.sha512])
 
     def get_strongest_hash(self) -> tuple[str, str] | None:
         """Get the strongest available hash as (algorithm, hash) tuple"""

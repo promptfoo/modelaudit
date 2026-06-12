@@ -138,7 +138,7 @@ from modelaudit.utils.file.large_file_handler import (
     should_use_large_file_handler,
 )
 from modelaudit.utils.file.streaming import stream_analyze_file, stream_source_path
-from modelaudit.utils.helpers.cache_decorator import cached_scan
+from modelaudit.utils.helpers.cache_decorator import cached_scan, should_defer_hash_for_pytorch_read_limit
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
     FilePath,
@@ -1472,7 +1472,7 @@ def _resolve_discovered_shard_path(shard_path: str, results: ModelAuditResultMod
     """Resolve a detected shard without aborting if it changes during discovery."""
     try:
         return str(Path(shard_path).resolve(strict=True))
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         _add_issue_to_model(
             results,
             "Shard path changed during directory discovery",
@@ -2162,7 +2162,14 @@ def _should_defer_hash_for_max_total_size(
 
 
 def _is_incomplete_aggregate_hash_placeholder(content_hash: str) -> bool:
-    return content_hash.startswith(("unhashable_max_file_size_", "unhashable_max_total_size_"))
+    return content_hash.startswith(
+        (
+            "unhashable_max_file_size_",
+            "unhashable_max_total_size_",
+            "unhashable_legacy_pytorch_read_limit_",
+            "unhashable_pytorch_zip_read_limit_",
+        )
+    )
 
 
 def _hash_files_by_path(
@@ -2192,6 +2199,9 @@ def _hash_files_by_path(
         routing_path = routing_paths.get(file_path, file_path) if routing_paths is not None else file_path
         if _should_defer_hash_for_safetensors_header_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_bounded_safetensors_{id(file_path)}"
+            continue
+        if should_defer_hash_for_pytorch_read_limit(routing_path, hash_config):
+            content_hashes[file_path] = f"unhashable_pytorch_zip_read_limit_{id(file_path)}"
             continue
         if _should_defer_hash_for_max_file_size(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_max_file_size_{id(file_path)}"
@@ -3703,12 +3713,20 @@ def scan_model_directory_or_file(
                     hashed_bytes=top_level_hashed_bytes,
                 )
                 defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(target, config)
-                if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
+                defer_hash_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(
+                    target,
+                    config,
+                )
+                if defer_hash_for_max_total_size or defer_hash_for_max_file_size or defer_hash_for_pytorch_read_limit:
                     aggregate_hash_complete = False
+                if defer_hash_for_pytorch_read_limit:
+                    target_config = dict(target_config)
+                    target_config["cache_enabled"] = False
                 if (
                     not _should_defer_hash_for_safetensors_header_limit(target, config)
                     and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
+                    and not defer_hash_for_pytorch_read_limit
                 ):
                     try:
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
@@ -3752,9 +3770,11 @@ def scan_model_directory_or_file(
                         if check.name == "Sharded Model Detection" and isinstance(shard_paths, list):
                             sharded_detection_families.append(
                                 {
-                                    str(Path(shard_path).resolve())
+                                    resolved_shard_path
                                     for shard_path in shard_paths
                                     if isinstance(shard_path, str)
+                                    and (resolved_shard_path := _resolve_discovered_shard_path(shard_path, results))
+                                    is not None
                                 }
                             )
                     only_detected_shard_family = len(sharded_detection_families) <= 1
@@ -4427,6 +4447,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
+    bypass_cache_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(path, config, file_size)
+
     # Check if we should use extreme handler BEFORE applying size limits
     # Extreme handler bypasses size limits for large models
     use_extreme_handler = should_use_advanced_handler(
@@ -4843,7 +4865,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             elif use_large_handler:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                 result = scan_large_file(path, scanner, progress_callback, timeout)
-            elif is_xgboost_pickle_spoof or (scanner_id == "nemo" and gzip_tar_trailing_status is not None):
+            elif (
+                is_xgboost_pickle_spoof
+                or bypass_cache_for_pytorch_read_limit
+                or (scanner_id == "nemo" and gzip_tar_trailing_status is not None)
+            ):
                 result = scanner.scan(path)
             else:
                 result = scanner.scan_with_cache(path)
@@ -4914,6 +4940,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 elif (
                     unavailable_preferred_scanner_id is not None
                     or is_xgboost_pickle_spoof
+                    or bypass_cache_for_pytorch_read_limit
                     or (scanner_class.name == "nemo" and gzip_tar_trailing_status is not None)
                 ):
                     result = scanner.scan(path)
@@ -5414,7 +5441,8 @@ def scan_model_streaming(
             hashed_bytes=top_level_hashed_bytes,
         )
         defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
-        if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
+        defer_hash_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(str(scan_path), scan_config)
+        if defer_hash_for_max_total_size or defer_hash_for_max_file_size or defer_hash_for_pytorch_read_limit:
             aggregate_hash_complete = False
             return None
         if _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config):
@@ -5706,6 +5734,14 @@ def scan_model_streaming(
                             aggregate_hash_complete = False
                             files_processed += 1
                             continue
+
+                defer_hash_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(
+                    str(scan_path),
+                    scan_config,
+                )
+                if defer_hash_for_pytorch_read_limit:
+                    scan_config = dict(scan_config)
+                    scan_config["cache_enabled"] = False
 
                 file_hash = append_streamed_file_hash(
                     scan_path,

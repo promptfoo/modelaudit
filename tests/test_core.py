@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import builtins
 import errno
 import gzip
 import importlib
@@ -260,6 +261,60 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
     return pickle.dumps(DangerousPayload(), protocol=protocol)
 
 
+def _core_binunicode(data: bytes) -> bytes:
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def _core_legacy_pytorch_object_stream(
+    storage_keys: tuple[str, ...],
+    storage_size: int,
+    *,
+    malicious_object: bool = False,
+) -> bytes:
+    object_stream = bytearray(b"\x80\x02]")
+    for key in storage_keys:
+        encoded_key = key.encode("ascii")
+        object_stream += b"(" + _core_binunicode(b"storage")
+        object_stream += b"ctorch\nByteStorage\n"
+        object_stream += _core_binunicode(encoded_key) + _core_binunicode(b"cpu")
+        object_stream += pickle.dumps(storage_size, protocol=2)[2:-1]
+        object_stream += b"NtQa"
+    if malicious_object:
+        malicious_pickle = _build_malicious_pickle(protocol=2)
+        object_stream += malicious_pickle[2:-1] + b"a"
+    object_stream += b"."
+    return bytes(object_stream)
+
+
+def _make_core_legacy_pytorch_container(
+    storage_payload: bytes,
+    *,
+    malicious_object: bool = False,
+    storage_keys: tuple[str, ...] = ("0",),
+) -> bytes:
+    storage_size = len(storage_payload)
+    control_streams = (
+        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
+        pickle.dumps(1001, protocol=2),
+        pickle.dumps(
+            {
+                "protocol_version": 1001,
+                "little_endian": True,
+                "type_sizes": {"short": 2, "int": 4, "long": 8},
+            },
+            protocol=2,
+        ),
+        _core_legacy_pytorch_object_stream(
+            storage_keys,
+            storage_size,
+            malicious_object=malicious_object,
+        ),
+        pickle.dumps(list(storage_keys), protocol=2),
+    )
+    storage_record = b"".join(storage_size.to_bytes(8, "little") + storage_payload for _key in storage_keys)
+    return b"".join(control_streams) + storage_record
+
+
 def test_scan_file_padded_media_pickle_polyglot_fails_closed(tmp_path: Path) -> None:
     media_path = tmp_path / "padded-polyglot.png"
     media_path.write_bytes(
@@ -287,6 +342,34 @@ def _build_protocolless_binary_malicious_pickle() -> bytes:
 def _build_protocolless_binary_benign_scalar_pickle() -> bytes:
     """Build a harmless binary pickle scalar without the optional PROTO opcode."""
     return b"\x8c\x02os\x94."
+
+
+def _build_printable_utf8_ambiguous_binary_route() -> bytes:
+    """Build printable UTF-8 bytes that still require binary fail-closed routing."""
+    return (b'""' + ("é" * 17).encode("utf-8")) * 4097
+
+
+def _build_line_broken_printable_utf8_ambiguous_binary_route() -> bytes:
+    """Build line-broken printable UTF-8 bytes requiring binary fail-closed routing."""
+    return (b'""' + ("é" * 17).encode("utf-8") + b"\n") * 4097
+
+
+def _build_printable_utf8_protobuf_candidate_route() -> bytes:
+    """Build printable UTF-8 protobuf fields that exhaust bounded model routing."""
+    field_payload = ("é" * 60).encode("utf-8") + b" x:12"
+    return (b"B" + bytes([len(field_payload)]) + field_payload) * 4097
+
+
+def _build_printable_ascii_protobuf_candidate_route() -> bytes:
+    """Build printable ASCII protobuf fields that exhaust bounded model routing."""
+    field_payload = b"x" * 58
+    return (b"B" + bytes([len(field_payload)]) + field_payload) * 4097
+
+
+def _build_large_text_owner_text(line: str = "Ġtoken token\n") -> str:
+    """Build deterministic text above the binary-routing fast path."""
+    repeat_count = (3 * 1024 * 1024) // len(line.encode("utf-8")) + 1
+    return "#version: 0.2\n" + line * repeat_count
 
 
 def _write_pickle_safetensors_polyglot(path: Path, header_length: int) -> None:
@@ -649,6 +732,18 @@ def _write_sparse_oversized_safetensors_candidate(
         handle.truncate(8 + header_len + 1)
 
 
+def _write_sparse_safetensors_delayed_flax_overlap(path: Path) -> None:
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+    root_offset = (8 * 1024) + 817
+    flax_root = b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.write(b"\x00" * (root_offset - 9))
+        handle.write(flax_root)
+        handle.truncate(8 + header_len)
+
+
 def _write_tensorflow_overlap_safetensors_candidate(path: Path, header_prefix: bytes) -> None:
     header_len = 0x212
     header = header_prefix + (b" " * (header_len - len(header_prefix)))
@@ -704,6 +799,18 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         for name, data in entries.items():
             archive.writestr(name, data)
+
+
+def _pack_flax_ndarray_ext_checkpoint(tensor_bytes: bytes, *, dtype: str = "float32") -> bytes:
+    shape = (len(tensor_bytes) // 4,)
+    ndarray_body = flax_msgpack_scanner.msgpack.packb((shape, dtype, tensor_bytes), use_bin_type=True)
+    return cast(
+        bytes,
+        flax_msgpack_scanner.msgpack.packb(
+            {"params": {"embedding": flax_msgpack_scanner.msgpack.ExtType(1, ndarray_body)}},
+            use_bin_type=True,
+        ),
+    )
 
 
 def _promote_small_zip_to_zip64(path: Path) -> None:
@@ -3440,6 +3547,23 @@ def test_scan_file_merges_safetensors_findings_for_pickle_overlap(tmp_path: Path
     assert safetensors_only_result.success is False
 
 
+def test_scan_file_flax_selection_preserves_text_suffix_safetensors_delayed_flax_overlap(tmp_path: Path) -> None:
+    overlap = tmp_path / "weights.conf"
+    _write_sparse_safetensors_delayed_flax_overlap(overlap)
+
+    assert file_detection.has_safetensors_routing_candidate(str(overlap))
+    assert file_detection.detect_file_format(str(overlap)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(overlap)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(overlap)) == "flax_msgpack"
+
+    direct = scan_file(str(overlap), config={"scanners": ["flax_msgpack"], "cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(overlap), scanners=["flax_msgpack"], cache_scan_results=False)
+
+    assert direct.scanner_name == "flax_msgpack"
+    assert aggregate["files_scanned"] == 1
+    assert "flax_msgpack" in aggregate.scanner_names
+
+
 @pytest.mark.parametrize("opcode", [b"B", b"X"], ids=["binbytes", "binunicode"])
 def test_scan_file_routes_oversized_pickle_safetensors_polyglot_to_pickle(
     tmp_path: Path,
@@ -4165,6 +4289,105 @@ def test_scan_file_does_not_route_native_flax_suffix_lightgbm_near_match(tmp_pat
 
     assert result.scanner_name == "flax_msgpack"
     assert not any(check.name == "Command/Network Correlation Check" for check in result.checks)
+
+
+def test_scan_file_treats_valid_flax_ndarray_tensor_bytes_as_data(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "flax_model.msgpack"
+    checkpoint.write_bytes(_pack_flax_ndarray_ext_checkpoint(b"eval('x')" + (b"\0" * 27)))
+
+    result = scan_file(
+        str(checkpoint),
+        config={"cache_scan_results": False, "max_msgpack_decode_bytes": 16},
+    )
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is True
+    assert not any(issue.message == r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+
+
+def test_scan_file_treats_small_valid_flax_ndarray_tensor_bytes_as_data_by_default(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "small_flax_model.msgpack"
+    checkpoint.write_bytes(_pack_flax_ndarray_ext_checkpoint(b"eval('x')" + (b"\0" * 27)))
+
+    result = scan_file(
+        str(checkpoint),
+        config={"cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is True
+    assert not any(issue.message == r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+
+
+def test_scan_file_treats_nested_flax_ndarray_tensor_bytes_as_data(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = _pack_flax_ndarray_ext_checkpoint(b"eval('x')" + (b"\0" * 27))
+    archive = tmp_path / "flax-bundle.zip"
+    _create_misnamed_zip(archive, {"flax_model.msgpack": checkpoint})
+
+    result = scan_file(
+        str(archive),
+        config={"cache_scan_results": False, "max_msgpack_decode_bytes": 16},
+    )
+
+    assert result.scanner_name == "zip"
+    assert result.success is True
+    assert not any(issue.message == r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+
+
+def test_scan_file_flax_ndarray_timeout_fails_closed_and_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "timeout_flax_model.msgpack"
+    checkpoint.write_bytes(_pack_flax_ndarray_ext_checkpoint(b"\0" * 32))
+    cache_dir = tmp_path / "cache"
+    skipped_tensor_payload = False
+    original_skip = flax_msgpack_scanner._MsgpackStreamCursor.skip
+
+    def skip_and_timeout_afterwards(cursor: Any, size: int) -> None:
+        nonlocal skipped_tensor_payload
+        original_skip(cursor, size)
+        skipped_tensor_payload = True
+
+    def forced_timeout_after_tensor_skip(scanner: Any, allow_partial: bool = False) -> bool:
+        if skipped_tensor_payload:
+            raise TimeoutError("forced Flax MessagePack timeout after tensor skip")
+        return False
+
+    monkeypatch.setattr(flax_msgpack_scanner._MsgpackStreamCursor, "skip", skip_and_timeout_afterwards)
+    monkeypatch.setattr(flax_msgpack_scanner.FlaxMsgpackScanner, "_check_timeout", forced_timeout_after_tensor_skip)
+    reset_cache_manager()
+    try:
+        result = scan_file(
+            str(checkpoint),
+            config={
+                "cache_enabled": True,
+                "cache_dir": str(cache_dir),
+                "min_cache_file_size": 0,
+                "max_msgpack_decode_bytes": 16,
+            },
+        )
+
+        assert skipped_tensor_payload is True
+        assert result.scanner_name == "flax_msgpack"
+        assert result.success is False
+        assert result.metadata["operational_error_reason"] == "scan_timeout"
+        assert any(check.name == "Scan Timeout Check" for check in result.checks)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 @pytest.mark.parametrize("foreign_format", ["rknn", "torch7", "cntk", "lightgbm"])
@@ -5111,6 +5334,439 @@ def test_scan_file_routes_malicious_flax_checkpoint_under_skipped_suffix(tmp_pat
     assert result.scanner_name == "flax_msgpack"
     assert result.success is False
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "expected_scanner"),
+    [
+        ("merges.txt", "#version: 0.2\nĠ t\n", "unknown"),
+        (
+            "tokenizer.json",
+            json.dumps({"version": "1.0", "model": {"type": "BPE", "vocab": {"Ġthe": 0}}}),
+            "unknown",
+        ),
+        ("vocab.json", json.dumps({"Ġthe": 0, "áudio": 1}), "unknown"),
+        ("README.md", "# Higgs áudio\n\nModel card.\n", "text"),
+    ],
+    ids=["bpe-merges", "tokenizer-json", "vocab-json", "markdown-readme"],
+)
+def test_scan_file_keeps_bounded_utf8_tokenizer_text_out_of_flax_scanner(
+    tmp_path: Path,
+    filename: str,
+    payload: str,
+    expected_scanner: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(payload, encoding="utf-8")
+
+    assert file_detection.detect_file_format(str(text_path)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(text_path)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(text_path)) == "unknown"
+
+    result = scan_file(str(text_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == expected_scanner
+    assert result.scanner_name != "flax_msgpack"
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    ("filename", "line"),
+    [("merges.txt", "Ġtoken token\n"), ("settings.conf", "token=olá\n")],
+    ids=["bpe-merges", "conf"],
+)
+def test_scan_file_keeps_large_text_owner_text_out_of_flax_scanner(
+    tmp_path: Path,
+    filename: str,
+    line: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(_build_large_text_owner_text(line), encoding="utf-8")
+
+    assert 2 * 1024 * 1024 < text_path.stat().st_size < 10 * 1024 * 1024
+    assert file_detection.detect_file_format(str(text_path)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(text_path)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(text_path)) == "unknown"
+
+    result = scan_file(str(text_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+
+
+def test_scan_file_keeps_nested_utf8_tokenizer_text_member_out_of_flax_scanner(tmp_path: Path) -> None:
+    archive = tmp_path / "tokenizer-bundle.zip"
+    _create_misnamed_zip(archive, {"tokenizer/merges.txt": "#version: 0.2\nĠ t\n".encode()})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert result.success is True
+    assert not result.issues
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert result.metadata["contents"] == [{"path": f"{archive}:tokenizer/merges.txt", "type": "unknown", "size": 19}]
+
+
+def test_scan_file_keeps_large_nested_tokenizer_text_member_out_of_flax_scanner(tmp_path: Path) -> None:
+    archive = tmp_path / "large-tokenizer-bundle.zip"
+    payload = _build_large_text_owner_text().encode("utf-8")
+    _create_misnamed_zip(archive, {"tokenizer/merges.txt": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert result.success is True
+    assert not result.issues
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert result.metadata["contents"] == [
+        {"path": f"{archive}:tokenizer/merges.txt", "type": "unknown", "size": len(payload)}
+    ]
+
+
+def test_scan_file_fails_closed_for_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:
+    payload = _build_printable_utf8_ambiguous_binary_route()
+    candidate = tmp_path / "ambiguous.jpg"
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "flax_msgpack"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_printable_utf8_invalid_json_protobuf_candidate(tmp_path: Path) -> None:
+    payload = _build_printable_utf8_protobuf_candidate_route()
+    candidate = tmp_path / "ambiguous.json"
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert any(
+        reason
+        in {
+            "onnx_tentative_candidate_analysis_unavailable",
+            "onnx_tentative_candidate_parse_incomplete",
+            "coreml_analysis_incomplete",
+        }
+        for reason in result.metadata["scan_outcome_reasons"]
+    )
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_printable_utf8_text_suffix_binary_candidate(tmp_path: Path) -> None:
+    payload = _build_printable_utf8_ambiguous_binary_route()
+    candidate = tmp_path / "ambiguous.txt"
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "flax_msgpack"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("filename", ["ambiguous.txt", "settings.conf"])
+@pytest.mark.parametrize(
+    "prefix",
+    [b" ", b":", b":\n", b": a\n", b"a:\n"],
+    ids=["space", "colon-inline", "colon-newline", "colon-space-value", "key-colon"],
+)
+def test_scan_file_fails_closed_for_prefixed_text_suffix_messagepack_candidate(
+    tmp_path: Path,
+    filename: str,
+    prefix: bytes,
+) -> None:
+    payload = prefix + _build_printable_utf8_ambiguous_binary_route()
+    candidate = tmp_path / filename
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "flax_msgpack"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_key_prefixed_line_broken_text_suffix_messagepack_candidate(
+    tmp_path: Path,
+) -> None:
+    payload = b"key:\n" + _build_line_broken_printable_utf8_ambiguous_binary_route()
+    candidate = tmp_path / "ambiguous.conf"
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "flax_msgpack"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload_factory"),
+    [
+        ("ambiguous.txt", _build_printable_utf8_protobuf_candidate_route),
+        ("settings.conf", _build_printable_utf8_protobuf_candidate_route),
+    ],
+    ids=["utf8-txt", "utf8-conf"],
+)
+def test_scan_file_fails_closed_for_printable_text_suffix_protobuf_candidate(
+    tmp_path: Path,
+    filename: str,
+    payload_factory: Callable[[], bytes],
+) -> None:
+    payload = payload_factory()
+    candidate = tmp_path / filename
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert any(
+        reason
+        in {
+            "onnx_tentative_candidate_analysis_unavailable",
+            "onnx_tentative_candidate_parse_incomplete",
+            "coreml_analysis_incomplete",
+        }
+        for reason in result.metadata["scan_outcome_reasons"]
+    )
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("filename", ["ascii.txt", "ascii.conf"])
+def test_scan_file_keeps_printable_ascii_text_suffix_protobuf_tag_near_match_out_of_protobuf_candidate(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    payload = _build_printable_ascii_protobuf_candidate_route()
+    candidate = tmp_path / filename
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "unknown"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") is None
+    assert core_module.determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize("filename", ["ascii-varint.txt", "ascii-varint.conf"])
+def test_scan_file_keeps_printable_ascii_text_suffix_protobuf_varint_near_match_out_of_protobuf_candidate(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    payload = (b"(h benign ascii text\n") * 4097
+    candidate = tmp_path / filename
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "unknown"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") is None
+    assert core_module.determine_exit_code(aggregate) == 0
+
+
+def test_scan_file_fails_closed_for_large_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:
+    unit = _build_printable_utf8_ambiguous_binary_route()
+    payload = unit * ((2 * 1024 * 1024) // len(unit) + 1)
+    candidate = tmp_path / "ambiguous.jpg"
+    candidate.write_bytes(payload)
+
+    assert candidate.stat().st_size > 2 * 1024 * 1024
+    assert file_detection.detect_file_format(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "flax_msgpack"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_nested_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:
+    payload = _build_printable_utf8_ambiguous_binary_route()
+    archive = tmp_path / "ambiguous-bundle.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.message == "Flax MessagePack analysis incomplete because bounded routing inspection could not complete"
+        for issue in result.issues
+    )
+    assert result.metadata["contents"] == [
+        {"path": f"{archive}:payload.jpg", "type": "flax_msgpack", "size": len(payload)}
+    ]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [b": a\n", b"a:\n"],
+    ids=["colon-space-value", "key-colon"],
+)
+def test_scan_file_fails_closed_for_nested_structure_prefixed_text_suffix_messagepack_candidate(
+    tmp_path: Path,
+    prefix: bytes,
+) -> None:
+    payload = prefix + _build_printable_utf8_ambiguous_binary_route()
+    archive = tmp_path / "ambiguous-text-bundle.zip"
+    _create_misnamed_zip(archive, {"models/ambiguous.conf": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["contents"] == [
+        {"path": f"{archive}:models/ambiguous.conf", "type": "flax_msgpack", "size": len(payload)}
+    ]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_nested_key_prefixed_line_broken_text_suffix_messagepack_candidate(
+    tmp_path: Path,
+) -> None:
+    payload = b"key:\n" + _build_line_broken_printable_utf8_ambiguous_binary_route()
+    archive = tmp_path / "ambiguous-line-bundle.zip"
+    _create_misnamed_zip(archive, {"models/ambiguous.conf": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["contents"] == [
+        {"path": f"{archive}:models/ambiguous.conf", "type": "flax_msgpack", "size": len(payload)}
+    ]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_nested_printable_utf8_text_suffix_protobuf_candidate(tmp_path: Path) -> None:
+    payload = _build_printable_utf8_protobuf_candidate_route()
+    archive = tmp_path / "protobuf-text-bundle.zip"
+    _create_misnamed_zip(archive, {"models/ambiguous.txt": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        reason
+        in {
+            "onnx_tentative_candidate_analysis_unavailable",
+            "onnx_tentative_candidate_parse_incomplete",
+            "coreml_analysis_incomplete",
+        }
+        for reason in result.metadata["scan_outcome_reasons"]
+    )
+    assert result.metadata["contents"] == [
+        {"path": f"{archive}:models/ambiguous.txt", "type": "unknown", "size": len(payload)}
+    ]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_keeps_real_msgpack_fixture_owned_by_flax_scanner(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "checkpoint.jpg"
+    checkpoint.write_bytes(flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+
+    assert file_detection.detect_file_format(str(checkpoint)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(checkpoint)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is True
+
+
+def test_scan_file_keeps_malformed_binary_control_owned_by_pytorch_binary_scanner(tmp_path: Path) -> None:
+    binary_path = tmp_path / "malformed.bin"
+    binary_path.write_bytes(b"\xff\x00\x01\x02broken binary")
+
+    assert file_detection.detect_file_format(str(binary_path)) == "pytorch_binary"
+
+    result = scan_file(str(binary_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pytorch_binary"
 
 
 def test_scan_file_routes_large_malicious_renamed_flax_msgpack_with_later_root_to_flax_scanner(tmp_path: Path) -> None:
@@ -13375,6 +14031,149 @@ def test_scan_file_inconclusive_safetensors_header_limit_result_is_not_cached(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_scan_file_bypasses_cache_hash_for_bounded_pytorch_zip_read_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "large.pt")
+    with model_path.open("ab") as handle:
+        handle.write(b"A" * 2048)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_cache_file_size": 10_000,
+        "max_file_read_size": 128,
+    }
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file",
+        lambda _self, _path: pytest.fail("bounded PyTorch scans must bypass cache-key hashing"),
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file_with_stat",
+        lambda _self, _path, _stat: pytest.fail("bounded PyTorch scans must bypass cache validation hashing"),
+    )
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(model_path), config=config)
+
+        assert result.success is True
+        assert result.metadata["file_hashes"]["sha256_prefix"]
+        assert "sha256" not in result.metadata["file_hashes"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_bypasses_cache_hash_for_bounded_legacy_pytorch_read_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "legacy-large.pt"
+    model_path.write_bytes(
+        _make_core_legacy_pytorch_container(
+            b"A" * 2048,
+            malicious_object=True,
+        )
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_cache_file_size": 10_000,
+        "max_file_read_size": 512,
+    }
+    assert cache_decorator.should_defer_hash_for_pytorch_read_limit(
+        str(model_path),
+        config,
+        model_path.stat().st_size,
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file",
+        lambda _self, _path: pytest.fail("bounded legacy PyTorch scans must bypass cache-key hashing"),
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file_with_stat",
+        lambda _self, _path, _stat: pytest.fail("bounded legacy PyTorch scans must bypass cache validation hashing"),
+    )
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(model_path), config=config)
+
+        assert result.success is False
+        assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+        assert result.metadata["legacy_pytorch_storage_payload_skipped"] is True
+        assert result.metadata["file_hashes"]["sha256_prefix"]
+        assert "sha256" not in result.metadata["file_hashes"]
+        assert any(issue.details.get("associated_global") in _SYSTEM_GLOBAL_NAMES for issue in result.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize("suffix", [".pt", ".bin"])
+def test_pytorch_legacy_cache_probe_respects_max_file_read_size_for_near_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    max_file_read_size = 64
+    near_match = tmp_path / f"not-legacy{suffix}"
+    legacy_preamble = pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2) + pickle.dumps(1001, protocol=2)
+    near_match.write_bytes(legacy_preamble + b"\x80\x02X" + (4096).to_bytes(4, "little") + (b"A" * 4096))
+    real_open = builtins.open
+    read_sizes: list[int] = []
+
+    class ReadSizeGuard:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> ReadSizeGuard:
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self._handle.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._handle, name)
+
+        def read(self, size: int = -1) -> bytes:
+            if size < 0 or size > max_file_read_size:
+                pytest.fail(f"legacy cache probe read {size} bytes before proving layout")
+            read_sizes.append(size)
+            return cast(bytes, self._handle.read(size))
+
+    def guarded_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(file, mode, *args, **kwargs)
+        try:
+            candidate = Path(file)
+        except TypeError:
+            return handle
+        if candidate == near_match and "r" in mode and "b" in mode:
+            return ReadSizeGuard(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+
+    should_defer = cache_decorator.should_defer_hash_for_pytorch_read_limit(
+        str(near_match),
+        {"max_file_read_size": max_file_read_size},
+        near_match.stat().st_size,
+    )
+
+    assert should_defer is False
+    assert read_sizes == [4, max_file_read_size]
 
 
 def test_scan_file_ignores_benign_onnx_token_near_match(tmp_path: Path) -> None:
