@@ -353,12 +353,15 @@ def _huggingface_stream_preview_openvino_companion_names(
     runtime: "_ScanRuntimeConfig",
 ) -> set[str]:
     """Return exact OpenVINO BIN companions intentionally suppressed from no-max previews."""
-    if runtime.scannable_scanner_ids is None or "openvino" not in {
-        str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids
-    }:
-        return set()
-
     from .utils.sources import huggingface as huggingface_source
+
+    if runtime.scannable_scanner_ids is None:
+        return set()
+    selected_route_scanner_ids = {str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids}.intersection(
+        huggingface_source._get_hf_content_route_scanner_ids()
+    )
+    if selected_route_scanner_ids != {"openvino"}:
+        return set()
 
     file_names = _huggingface_preview_file_names(files)
     repo_file_set = set(file_names)

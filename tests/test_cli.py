@@ -4960,6 +4960,95 @@ def test_scan_huggingface_streaming_dry_run_openvino_companion_no_max_is_not_sel
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_dry_run_mixed_openvino_coreml_rejects_unbudgeted_companion(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_read_prefix: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Mixed content-routed dry-run must not suppress exact OpenVINO BIN companions."""
+    mock_is_hf_url.return_value = True
+    mock_get_model_info.return_value = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": _HF_TEST_REVISION,
+        "total_size": 1100,
+        "file_count": 2,
+        "files": [
+            {"name": "openvino/model.xml", "size": 100},
+            {"name": "openvino/model.bin", "size": 1000},
+        ],
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--stream", "--scanners", "openvino,coreml", "--format", "text", "hf://test/model"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 2, output
+    assert "Hugging Face stream dry-run cannot account for content-routed files without --max-size" in output
+    mock_read_prefix.assert_not_called()
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_dry_run_mixed_openvino_coreml_counts_companions_for_probe_limit(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_read_prefix: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Mixed OpenVINO/CoreML dry-run should mirror live content-probe candidate limits."""
+    mock_is_hf_url.return_value = True
+    files = [{"name": f"openvino/model-{index}.xml", "size": 10} for index in range(257)] + [
+        {"name": f"openvino/model-{index}.bin", "size": 1} for index in range(257)
+    ]
+    mock_get_model_info.return_value = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": _HF_TEST_REVISION,
+        "total_size": 257 * 11,
+        "file_count": len(files),
+        "files": files,
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--dry-run",
+            "--stream",
+            "--scanners",
+            "openvino,coreml",
+            "--max-size",
+            "10MB",
+            "--format",
+            "text",
+            "hf://test/model",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 2, output
+    assert "skipped file inspection limit exceeded for test/model (256 files)" in output
+    mock_read_prefix.assert_not_called()
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_dry_run_openvino_companion_counts_against_max_size(
