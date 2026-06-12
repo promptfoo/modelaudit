@@ -725,11 +725,11 @@ class SafeTensorsScanner(BaseScanner):
             return []
         before = stripped[: match.start()]
         after = stripped[match.end() :]
-        if not before.strip() or not after.strip():
+        annotations = [annotation for annotation in (before, after) if annotation.strip()]
+        if not annotations:
             return []
         if not all(
-            SafeTensorsScanner._license_document_annotation_looks_documentary(annotation)
-            for annotation in (before, after)
+            SafeTensorsScanner._license_document_annotation_looks_documentary(annotation) for annotation in annotations
         ):
             return []
         return [token]
