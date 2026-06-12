@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import struct
+from collections.abc import Iterable
 from typing import Any, BinaryIO, ClassVar, NamedTuple
+from urllib.parse import unquote, urlparse
+
+from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -44,6 +49,166 @@ GGUF_STRUCTURE_INCONCLUSIVE_REASON = "gguf_structure_validation_failed"
 GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
 GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
 GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
+_GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS = 64
+_GGUF_NETWORK_REFERENCE_LIMIT = 64
+_GGUF_INERT_TOKENIZER_ARRAY_KEYS = frozenset({"tokenizer.ggml.merges", "tokenizer.ggml.tokens"})
+_GGUF_REPORT_BOUNDED_TOKENIZER_ARRAY_KEYS = frozenset(
+    {
+        "tokenizer.ggml.merges",
+        "tokenizer.ggml.scores",
+        "tokenizer.ggml.token_type",
+        "tokenizer.ggml.tokens",
+    }
+)
+_GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "python_command_api",
+        re.compile(
+            r"(?i)(?:\b(?:os\.system|os\.popen|subprocess\."
+            r"(?:popen|call|run|check_call|check_output|getoutput|getstatusoutput)))\s*\(",
+        ),
+    ),
+    (
+        "shell_command",
+        re.compile(
+            r"(?i)(?:^|[;&|`$()]\s*)"
+            r"(?:(?:(?:[a-z]:)?[\\/](?:[^\\/\s]+[\\/])*)?"
+            r"(?:sudo|doas|command|env|nohup|nice|setsid)\s+"
+            r"(?:(?:[a-z_][a-z0-9_]*=\S+|-\S+)\s+)*)*"
+            r"(?:(?:[a-z]:)?[\\/](?:[^\\/\s]+[\\/])*)?"
+            r"(?:bash|sh|zsh|fish|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?|perl|ruby|node)\s+(?:-[ce]|/c)\b",
+        ),
+    ),
+    ("backtick_command", re.compile(r"(?i)`\s*(?:rm|curl|wget|bash|sh|python(?:3)?|powershell|pwsh|cmd(?:\.exe)?)\b")),
+)
+_GGUF_DESTRUCTIVE_COMMAND_PREFIXES = ("sudo", "doas", "command", "env", "nohup", "nice", "setsid", "timeout")
+_GGUF_PREFIX_OPTIONS_WITH_VALUE = frozenset(
+    {"-c", "--close-from", "-g", "--group", "-h", "--host", "-p", "--prompt", "-t", "--command-timeout", "-u", "--user"}
+)
+_GGUF_METADATA_SHELL_FETCH_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("shell_download", ("curl", "fetch", "wget")),
+    ("powershell_download", ("invoke-restmethod", "invoke-webrequest", "irm", "iwr")),
+)
+_GGUF_POWERSHELL_FETCH_COMMANDS = frozenset({"invoke-restmethod", "invoke-webrequest", "irm", "iwr"})
+_GGUF_SHELL_FETCH_COMMAND_PATTERN = re.compile(
+    r"(?i)(?:^|[\s;&|`()/'\"\\])"
+    r"(?:curl|fetch|wget|invoke-restmethod|invoke-webrequest|irm|iwr)"
+    r"(?=$|\s|\$\{ifs(?:[^}]*)?\}|\$ifs\b)"
+)
+_GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-a",
+        "--append-output",
+        "-d",
+        "--data",
+        "--data-ascii",
+        "--data-binary",
+        "--data-raw",
+        "--data-urlencode",
+        "-F",
+        "--form",
+        "--form-string",
+        "-A",
+        "--user-agent",
+        "-h",
+        "--header",
+        "-e",
+        "--referer",
+        "-m",
+        "--connect-timeout",
+        "--limit-rate",
+        "--max-time",
+        "-o",
+        "--output",
+        "--output-document",
+        "--post-data",
+        "--post-file",
+        "--proto",
+        "--proto-default",
+        "--proto-redir",
+        "--proxy",
+        "--retry",
+        "--retry-delay",
+        "--retry-max-time",
+        "--speed-limit",
+        "--speed-time",
+        "-u",
+        "--user",
+        "-x",
+        "--request",
+        "--url",
+        "-K",
+        "--config",
+        "-headers",
+        "-method",
+        "-uri",
+        "-outfile",
+    }
+)
+_GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE = frozenset({"--url", "-uri"})
+_GGUF_CURL_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"A", "a", "d", "e", "F", "H", "K", "m", "o", "u", "x", "X"})
+_GGUF_WGET_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"O", "U", "a", "d", "h", "m", "o", "u", "x"})
+_GGUF_POWERSHELL_FETCH_SHORT_OPTIONS_WITH_VALUE: frozenset[str] = frozenset()
+_GGUF_PYTHON_EXEC_CALLS = ("eval", "exec", "__import__")
+_GGUF_METADATA_NETWORK_APIS = (
+    "httpx.get",
+    "httpx.post",
+    "httpx.put",
+    "httpx.patch",
+    "httpx.delete",
+    "httpx.head",
+    "httpx.options",
+    "httpx.request",
+    "httpx.stream",
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.patch",
+    "requests.delete",
+    "requests.head",
+    "requests.options",
+    "requests.request",
+    "urllib.request.urlopen",
+    "urllib.request.urlretrieve",
+    "urlopen",
+    "urlretrieve",
+    "fetch",
+)
+_GGUF_NETWORK_CLIENT_ALIAS_METHODS = {
+    "httpx": ("get", "post", "put", "patch", "delete", "head", "options", "request", "stream"),
+    "requests": ("get", "post", "put", "patch", "delete", "head", "options", "request"),
+    "urllib.request": ("urlopen", "urlretrieve"),
+}
+_GGUF_NETWORK_CLIENT_ALIAS_PATTERN = re.compile(
+    r"(?is)\bimport\s+(?P<module>requests|httpx|urllib\.request)\s+as\s+(?P<alias>[a-z_][a-z0-9_]*)",
+)
+_GGUF_URLLIB_REQUEST_ALIAS_PATTERN = re.compile(
+    r"(?is)\bfrom\s+urllib\s+import\s+request\s+as\s+(?P<alias>[a-z_][a-z0-9_]*)",
+)
+_GGUF_NETWORK_FUNCTION_IMPORT_PATTERN = re.compile(
+    r"(?is)\bfrom\s+(?P<module>requests|httpx|urllib\.request)\s+import\s+(?P<imports>[^;\n]+)",
+)
+_GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
+    r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
+)
+_GGUF_REMOTE_URL_PATTERN = re.compile(r"(?i)\b(?:https?|ftp)://[^\s'\"<>)\]}]+")
+_GGUF_EXECUTION_SINK_COMMANDS = frozenset(
+    {"bash", "sh", "zsh", "fish", "cmd", "powershell", "pwsh", "python", "python3", "perl", "ruby", "node"}
+)
+_GGUF_DOCUMENTATION_URL_HOSTS = frozenset({"hf.co", "huggingface.co", "www.huggingface.co"})
+_GGUF_SHELL_IFS_PATTERN = re.compile(r"(?i)\$\{ifs(?:[^}]*)?\}|\$ifs\b")
+_GGUF_SHELL_VARIABLE_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
+_GGUF_DEFAULT_MAX_TEMPLATE_SIZE = 50000
+_GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES = tuple(JINJA2_SSTI_PATTERNS)
+_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (pattern_type, re.compile(pattern, re.IGNORECASE | re.MULTILINE))
+    for pattern_type in _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES
+    for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
+)
+_GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
+_GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+_GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
+_GGUF_SHELL_SEGMENT_SEPARATORS = ";&|`()"
 
 
 class _GgufMetadataLimitExceeded(ValueError):
@@ -76,6 +241,17 @@ class _GgufTensorInfo(NamedTuple):
     offset: int
 
 
+class _GgufRemoteUrlAssignments(NamedTuple):
+    items: tuple[tuple[int, str], ...]
+    truncated_after_position: int | None
+
+
+class _GgufNetworkApiAliases(NamedTuple):
+    tokens: tuple[str, ...]
+    truncated_after_position: int | None
+    truncated_tokens: tuple[str, ...]
+
+
 class GgufScanner(BaseScanner):
     """Scanner for GGUF/GGML model files with comprehensive parsing and security checks."""
 
@@ -90,6 +266,7 @@ class GgufScanner(BaseScanner):
     DEFAULT_MAX_TENSORS: ClassVar[int] = 50_000
     DEFAULT_MAX_TENSOR_INFO_BYTES: ClassVar[int] = 16 * 1024 * 1024
     DEFAULT_MAX_REPORTED_TENSORS: ClassVar[int] = 1024
+    DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS: ClassVar[int] = 1024
     # Include common GGML variant extensions as well
     supported_extensions: ClassVar[list[str]] = [
         ".gguf",
@@ -137,6 +314,10 @@ class GgufScanner(BaseScanner):
         self.max_reported_tensors = self._normalize_positive_int_config(
             self.config.get("gguf_max_reported_tensors"),
             self.DEFAULT_MAX_REPORTED_TENSORS,
+        )
+        self.max_reported_tokenizer_metadata_array_items = self._normalize_positive_int_config(
+            self.config.get("gguf_max_reported_tokenizer_metadata_array_items"),
+            self.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS,
         )
 
     @staticmethod
@@ -265,7 +446,7 @@ class GgufScanner(BaseScanner):
         data = self._read_bytes(f, length, budget)
         if len(data) != length:
             raise ValueError("Unexpected end of file while reading string")
-        return data.decode("utf-8", "ignore")
+        return data.decode("utf-8")
 
     def _scan_gguf(self, f: BinaryIO, file_size: int, result: ScanResult) -> None:
         """Comprehensive GGUF file scanning with security checks."""
@@ -321,7 +502,7 @@ class GgufScanner(BaseScanner):
                 metadata_key_occurrences[key] = occurrence
 
                 # Security check for suspicious keys
-                if any(x in key for x in ("../", "..\\", "/", "\\")):
+                if self._contains_path_traversal(key):
                     result.add_check(
                         name="Metadata Key Security Check",
                         passed=False,
@@ -343,19 +524,9 @@ class GgufScanner(BaseScanner):
                     self._record_chat_template_occurrence(chat_templates, key, value, occurrence)
                 metadata[key] = value
 
-                # Security check for suspicious values
-                if isinstance(value, str) and any(p in value for p in ("/", "\\", ";", "&&", "|", "`")):
-                    result.add_check(
-                        name="Metadata Value Security Check",
-                        passed=False,
-                        message=f"Suspicious metadata value for key '{key}': {value}",
-                        severity=IssueSeverity.INFO,
-                        location=self.current_file_path,
-                        details={"key": key, "value": str(value)[:200]},
-                        rule_code="S902",
-                    )
+                self._report_metadata_value_security_checks(key, value, result)
 
-            result.metadata["metadata"] = metadata
+            result.metadata["metadata"] = self._metadata_for_reporting(metadata, result)
             self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
             self._scan_embedded_chat_templates(chat_templates, result)
             if metadata_key_limit_exceeded:
@@ -862,6 +1033,1059 @@ class GgufScanner(BaseScanner):
         return key == "tokenizer.chat_template" or key.startswith("tokenizer.chat_template.")
 
     @staticmethod
+    def _is_inert_tokenizer_array_key(key: str, value: Any) -> bool:
+        return key in _GGUF_INERT_TOKENIZER_ARRAY_KEYS and isinstance(value, list)
+
+    def _metadata_report_view(self, metadata: dict[str, Any]) -> tuple[dict[str, Any], dict[str, dict[str, int]]]:
+        reported: dict[str, Any] = {}
+        truncation: dict[str, dict[str, int]] = {}
+        limit = self.max_reported_tokenizer_metadata_array_items
+
+        for key, value in metadata.items():
+            if key in _GGUF_REPORT_BOUNDED_TOKENIZER_ARRAY_KEYS and isinstance(value, list) and len(value) > limit:
+                reported[key] = value[:limit]
+                truncation[key] = {
+                    "original_count": len(value),
+                    "reported_count": limit,
+                    "truncated_count": len(value) - limit,
+                    "max_reported_items": limit,
+                }
+                continue
+            reported[key] = value
+
+        return reported, truncation
+
+    def _metadata_for_reporting(self, metadata: dict[str, Any], result: ScanResult) -> dict[str, Any]:
+        reported, truncation = self._metadata_report_view(metadata)
+        if truncation:
+            result.metadata["metadata_arrays_truncated"] = True
+            result.metadata["metadata_array_truncation"] = truncation
+            result.metadata["max_reported_tokenizer_metadata_array_items"] = (
+                self.max_reported_tokenizer_metadata_array_items
+            )
+
+        return reported
+
+    @staticmethod
+    def _metadata_decode_variants(value: str) -> tuple[str, ...]:
+        variants: list[str] = []
+        current = value
+        for _ in range(3):
+            if current not in variants:
+                variants.append(current)
+            decoded = unquote(current)
+            if decoded == current:
+                break
+            current = decoded
+        if current not in variants:
+            variants.append(current)
+        return tuple(variants)
+
+    @classmethod
+    def _contains_path_traversal(cls, value: str) -> bool:
+        for candidate in cls._metadata_decode_variants(value):
+            if ".." not in candidate:
+                continue
+            normalized = candidate.replace("\\", "/")
+            if normalized == ".." or normalized.startswith("../") or normalized.endswith("/..") or "/../" in normalized:
+                return True
+        return False
+
+    @staticmethod
+    def _shell_command_segments(value: str) -> list[list[str]]:
+        value = _GGUF_SHELL_IFS_PATTERN.sub(" ", value)
+        segments: list[list[str]] = []
+        current_segment: list[str] = []
+        current_word: list[str] = []
+        quote: str | None = None
+
+        for character in value:
+            if quote is not None:
+                if character == quote:
+                    quote = None
+                    continue
+                current_word.append(character)
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                continue
+            if character in "\r\n":
+                if current_word:
+                    current_segment.append("".join(current_word))
+                    current_word = []
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+                continue
+            if character.isspace():
+                if current_word:
+                    current_segment.append("".join(current_word))
+                    current_word = []
+                continue
+            if character in _GGUF_SHELL_SEGMENT_SEPARATORS:
+                if current_word:
+                    current_segment.append("".join(current_word))
+                    current_word = []
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+                continue
+            current_word.append(character)
+
+        if current_word:
+            current_segment.append("".join(current_word))
+        if current_segment:
+            segments.append(current_segment)
+        return segments
+
+    @staticmethod
+    def _is_documentation_metadata_key(key: str) -> bool:
+        lowered = key.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "description",
+                "documentation",
+                "instructions",
+                "readme",
+                "model_card",
+                "license",
+                "author",
+            )
+        )
+
+    @classmethod
+    def _metadata_value_looks_like_documentation(cls, key: str, value: str) -> bool:
+        if not cls._is_documentation_metadata_key(key):
+            return False
+
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        if not lines:
+            return False
+
+        doc_lines = 0
+        in_fence = False
+        fenced_lines: list[str] = []
+        possible_evidence_lines: list[str] = []
+        for line in lines:
+            lowered = line.lower()
+            if lowered.startswith(("```", "~~~")):
+                if in_fence:
+                    fenced_text = "\n".join(fenced_lines)
+                    if cls._text_contains_actionable_fenced_evidence(fenced_text):
+                        return False
+                    doc_lines += len(fenced_lines)
+                    fenced_lines = []
+                in_fence = not in_fence
+                doc_lines += 1
+                continue
+            if in_fence:
+                fenced_lines.append(line)
+                continue
+            if lowered.startswith(("#", "//", "*", "-", ">")) or cls._line_looks_like_documentation(lowered):
+                if cls._line_contains_security_evidence(line):
+                    if cls._text_contains_only_benign_documentation_fetch(line):
+                        doc_lines += 1
+                    else:
+                        possible_evidence_lines.append(line)
+                    continue
+                doc_lines += 1
+                continue
+            if cls._line_may_contain_security_evidence(lowered):
+                possible_evidence_lines.append(line)
+
+        if in_fence:
+            fenced_text = "\n".join(fenced_lines)
+            if cls._text_contains_actionable_fenced_evidence(fenced_text):
+                return False
+            doc_lines += len(fenced_lines)
+
+        if doc_lines <= len(lines) / 2:
+            return False
+
+        if not possible_evidence_lines:
+            return True
+
+        possible_evidence_text = "\n".join(possible_evidence_lines)
+        if not cls._line_contains_security_evidence(possible_evidence_text):
+            return True
+        return cls._text_contains_only_benign_documentation_fetch(possible_evidence_text)
+
+    @classmethod
+    def _line_may_contain_security_evidence(cls, lowered_line: str) -> bool:
+        if any(
+            marker in lowered_line
+            for marker in (
+                "..",
+                "curl",
+                "invoke-restmethod",
+                "irm",
+                "wget",
+                "invoke-webrequest",
+                "iwr",
+                "http://",
+                "https://",
+                "ftp://",
+                "requests.",
+                "httpx.",
+                "urllib",
+                "urlopen",
+                "urlretrieve",
+                "fetch",
+                "subprocess",
+                "os.system",
+                "os.popen",
+                "eval(",
+                "exec(",
+                "__import__(",
+                "bash",
+                "powershell",
+                "pwsh",
+                "cmd",
+            )
+        ):
+            return True
+
+        return any(
+            cls._has_token_boundary(lowered_line, position, "rm")
+            for position in cls._iter_substring_positions(lowered_line, "rm")
+        )
+
+    @classmethod
+    def _text_contains_actionable_fenced_evidence(cls, text: str) -> bool:
+        if not cls._line_contains_security_evidence(text):
+            return False
+        return not cls._text_contains_only_benign_documentation_fetch(text)
+
+    @classmethod
+    def _line_contains_security_evidence(cls, line: str) -> bool:
+        return (
+            cls._contains_path_traversal(line)
+            or cls._destructive_rm_pattern(line)
+            or cls._shell_remote_fetch_pattern(line) is not None
+            or cls._network_api_remote_fetch_pattern(line) is not None
+            or cls._metadata_command_pattern(line) is not None
+        )
+
+    @classmethod
+    def _text_contains_only_benign_documentation_fetch(cls, text: str) -> bool:
+        if (
+            cls._contains_path_traversal(text)
+            or cls._destructive_rm_pattern(text)
+            or cls._metadata_command_pattern(text) is not None
+            or cls._text_pipes_to_execution_sink(text)
+        ):
+            return False
+        if cls._shell_remote_fetch_pattern(text) is None and cls._network_api_remote_fetch_pattern(text) is None:
+            return False
+        urls = cls._remote_urls_in_text(text)
+        return bool(urls) and all(cls._is_documentation_reference_url(url) for url in urls)
+
+    @staticmethod
+    def _remote_urls_in_text(text: str) -> tuple[str, ...]:
+        urls: list[str] = []
+        for match in _GGUF_REMOTE_URL_PATTERN.finditer(text):
+            urls.append(match.group(0).rstrip(".,;:"))
+            if len(urls) >= 64:
+                break
+        return tuple(urls)
+
+    @staticmethod
+    def _is_documentation_reference_url(url: str) -> bool:
+        hostname = urlparse(url).hostname
+        return hostname in _GGUF_DOCUMENTATION_URL_HOSTS
+
+    @staticmethod
+    def _line_looks_like_documentation(lowered_line: str) -> bool:
+        return lowered_line.startswith(
+            (
+                "example:",
+                "examples:",
+                "documentation:",
+                "instructions:",
+                "model card",
+                "repository instructions:",
+                "usage:",
+            )
+        ) or any(
+            marker in lowered_line
+            for marker in (
+                " example is documentation",
+                " examples are documented",
+                " examples are listed",
+                " model card ",
+            )
+        )
+
+    @classmethod
+    def _text_pipes_to_execution_sink(cls, text: str) -> bool:
+        for piped_part in text.split("|")[1:]:
+            segments = cls._shell_command_segments(piped_part)
+            if segments and cls._segment_starts_with_execution_sink(segments[0]):
+                return True
+        return False
+
+    @classmethod
+    def _segment_starts_with_execution_sink(cls, words: list[str]) -> bool:
+        index = 0
+        while index < len(words):
+            word = words[index]
+            command_name = cls._shell_command_name(word)
+            if command_name in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
+                index += 1
+                if command_name == "timeout":
+                    index = cls._skip_timeout_prefix_arguments(words, index)
+                    continue
+                index = cls._skip_command_prefix_arguments(command_name, words, index)
+                continue
+            if "=" in word and not word.startswith("-"):
+                index += 1
+                continue
+            break
+
+        return index < len(words) and cls._shell_command_name(words[index]) in _GGUF_EXECUTION_SINK_COMMANDS
+
+    @staticmethod
+    def _shell_command_name(word: str) -> str:
+        command = word.strip("\"'").replace("\\", "/").rsplit("/", 1)[-1]
+        if command.endswith(".exe"):
+            return command[:-4]
+        return command.lower()
+
+    @staticmethod
+    def _is_destructive_rm_target(word: str) -> bool:
+        target = word.strip("\"'").replace("\\", "/")
+        return bool(target)
+
+    @staticmethod
+    def _rm_option_flags(word: str) -> tuple[bool, bool]:
+        option = word.lower().split("=", 1)[0]
+        if option in {"--recursive", "--force"}:
+            return option == "--recursive", option == "--force"
+        if option.startswith("--"):
+            return False, False
+        short_options = option.lstrip("-")
+        return "r" in short_options, "f" in short_options
+
+    @staticmethod
+    def _is_timeout_duration(word: str) -> bool:
+        return bool(_GGUF_TIMEOUT_DURATION_PATTERN.fullmatch(word.strip("\"'")))
+
+    @classmethod
+    def _skip_timeout_prefix_arguments(cls, words: list[str], index: int) -> int:
+        while index < len(words):
+            word = words[index]
+            option = word.split("=", 1)[0]
+            if option in _GGUF_TIMEOUT_OPTIONS_WITH_VALUE:
+                index += 1 if "=" in word else 2
+                continue
+            if word.startswith("-"):
+                index += 1
+                continue
+            if cls._is_timeout_duration(word):
+                return index + 1
+            return index
+        return index
+
+    @staticmethod
+    def _skip_command_prefix_arguments(command_name: str, words: list[str], index: int) -> int:
+        while index < len(words):
+            word = words[index]
+            option = word.split("=", 1)[0]
+            if word.startswith("-"):
+                if command_name in {"sudo", "doas"} and option in _GGUF_PREFIX_OPTIONS_WITH_VALUE:
+                    index += 1 if "=" in word else 2
+                    continue
+                index += 1
+                continue
+            if "=" in word:
+                index += 1
+                continue
+            break
+        return index
+
+    @classmethod
+    def _destructive_rm_segment(cls, words: list[str]) -> bool:
+        index = 0
+        while index < len(words):
+            word = words[index]
+            command_name = cls._shell_command_name(word)
+            if command_name in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
+                index += 1
+                if command_name == "timeout":
+                    index = cls._skip_timeout_prefix_arguments(words, index)
+                    continue
+                index = cls._skip_command_prefix_arguments(command_name, words, index)
+                continue
+            if "=" in word and not word.startswith("-"):
+                index += 1
+                continue
+            break
+
+        if index >= len(words) or cls._shell_command_name(words[index]) != "rm":
+            return False
+
+        has_recursive = False
+        has_force = False
+        has_target = False
+        index += 1
+        while index < len(words):
+            word = words[index]
+            if word.startswith("-"):
+                option_recursive, option_force = cls._rm_option_flags(word)
+                has_recursive = has_recursive or option_recursive
+                has_force = has_force or option_force
+            else:
+                has_target = has_target or cls._is_destructive_rm_target(word)
+            index += 1
+
+        return has_recursive and has_force and has_target
+
+    @classmethod
+    def _destructive_rm_pattern(cls, value: str) -> bool:
+        value_lower = value.lower()
+        if "rm" not in value_lower:
+            return False
+        return any(cls._destructive_rm_segment(segment) for segment in cls._shell_command_segments(value_lower))
+
+    @staticmethod
+    def _iter_substring_positions(value: str, needle: str) -> Iterable[int]:
+        start = 0
+        while True:
+            position = value.find(needle, start)
+            if position == -1:
+                return
+            yield position
+            start = position + 1
+
+    @staticmethod
+    def _previous_nonspace_character(value: str, position: int) -> str:
+        index = position - 1
+        while index >= 0 and value[index].isspace():
+            index -= 1
+        return value[index] if index >= 0 else ""
+
+    @staticmethod
+    def _next_nonspace_position(value: str, position: int) -> int:
+        index = position
+        while index < len(value) and value[index].isspace():
+            index += 1
+        return index
+
+    @staticmethod
+    def _has_python_identifier_boundary(value: str, position: int, token: str) -> bool:
+        before = value[position - 1] if position else ""
+        after_position = position + len(token)
+        after = value[after_position] if after_position < len(value) else ""
+        if before and (before.isalnum() or before == "_"):
+            return False
+        return not (after and (after.isalnum() or after == "_"))
+
+    @classmethod
+    def _standalone_python_exec_call_pattern(cls, value: str) -> str | None:
+        value_lower = value.lower()
+        for call_name in _GGUF_PYTHON_EXEC_CALLS:
+            for position in cls._iter_substring_positions(value_lower, call_name):
+                if not cls._has_python_identifier_boundary(value_lower, position, call_name):
+                    continue
+                if cls._previous_nonspace_character(value_lower, position) == ".":
+                    continue
+                open_position = cls._next_nonspace_position(value_lower, position + len(call_name))
+                if open_position < len(value_lower) and value_lower[open_position] == "(":
+                    return "python_command_api"
+        return None
+
+    @classmethod
+    def _metadata_command_pattern(cls, value: str) -> str | None:
+        for pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS:
+            if pattern.search(value):
+                return pattern_name
+        if cls._shell_execution_command_pattern(value):
+            return "shell_command"
+        return cls._standalone_python_exec_call_pattern(value)
+
+    @staticmethod
+    def _shell_execution_payload_option(command: str, word: str) -> bool:
+        option = word.strip("\"'").lower().split("=", 1)[0]
+        if command in {"cmd", "powershell", "pwsh"}:
+            return option in {"/c", "-c", "-command", "-encodedcommand"}
+        return option in {"-c", "-e"}
+
+    @classmethod
+    def _shell_execution_command_pattern(cls, value: str) -> bool:
+        value_lower = value.lower()
+        if not any(command in value_lower for command in _GGUF_EXECUTION_SINK_COMMANDS):
+            return False
+
+        for segment in cls._shell_command_segments(value_lower):
+            index = 0
+            while index < len(segment):
+                command_name = cls._shell_command_name(segment[index])
+                if command_name in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
+                    index += 1
+                    if command_name == "timeout":
+                        index = cls._skip_timeout_prefix_arguments(segment, index)
+                        continue
+                    index = cls._skip_command_prefix_arguments(command_name, segment, index)
+                    continue
+                if "=" in segment[index] and not segment[index].startswith("-"):
+                    index += 1
+                    continue
+                break
+
+            if index + 1 < len(segment):
+                command_name = cls._shell_command_name(segment[index])
+                if command_name in _GGUF_EXECUTION_SINK_COMMANDS and cls._shell_execution_payload_option(
+                    command_name,
+                    segment[index + 1],
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _is_remote_url_token(word: str) -> bool:
+        token = word.strip("\"'<>[]{}(),")
+        return any(token.lower().startswith(scheme) for scheme in _GGUF_REMOTE_URL_SCHEMES)
+
+    @classmethod
+    def _shell_url_variable_name(cls, word: str) -> str | None:
+        if "=" not in word or word.startswith("-"):
+            return None
+        name, value = word.split("=", 1)
+        name = name.strip("\"'")
+        if _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(name) and cls._is_remote_url_token(value):
+            return name
+        return None
+
+    @classmethod
+    def _shell_url_variable_names(cls, words: list[str]) -> set[str]:
+        names: set[str] = set()
+        for word in words:
+            name = cls._shell_url_variable_name(word)
+            if name is not None:
+                names.add(name)
+        return names
+
+    @staticmethod
+    def _shell_word_references_variable(word: str, names: set[str]) -> bool:
+        if not names:
+            return False
+
+        token = word.strip("\"'<>[](),")
+        if token.startswith("${"):
+            close_position = token.find("}", 2)
+            if close_position == -1:
+                return False
+            name = token[2:close_position]
+            return name in names
+
+        if not token.startswith("$"):
+            return False
+
+        name_chars: list[str] = []
+        for character in token[1:]:
+            if character.isalnum() or character == "_":
+                name_chars.append(character)
+                continue
+            break
+        return "".join(name_chars) in names
+
+    @staticmethod
+    def _fetch_short_options_with_value(command: str) -> frozenset[str]:
+        if command == "curl":
+            return _GGUF_CURL_FETCH_SHORT_OPTIONS_WITH_VALUE
+        if command == "wget":
+            return _GGUF_WGET_FETCH_SHORT_OPTIONS_WITH_VALUE
+        return _GGUF_POWERSHELL_FETCH_SHORT_OPTIONS_WITH_VALUE
+
+    @classmethod
+    def _fetch_option_value_mode(cls, word: str, command: str) -> str:
+        if not word.startswith("-"):
+            return "none"
+        if word in {"-", "--"}:
+            return "none"
+
+        normalized_word = word.lower() if command in _GGUF_POWERSHELL_FETCH_COMMANDS else word
+        if normalized_word.startswith("--"):
+            option_name, separator, _option_value = normalized_word.partition("=")
+            if option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE:
+                return "attached" if separator else "separate"
+            return "none"
+
+        option_name, separator, _option_value = normalized_word.partition("=")
+        if option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE:
+            return "attached" if separator else "separate"
+
+        short_options = normalized_word[1:]
+        value_options = cls._fetch_short_options_with_value(command)
+        for index, option in enumerate(short_options):
+            if option not in value_options:
+                continue
+            return "separate" if index == len(short_options) - 1 else "attached"
+        return "none"
+
+    @staticmethod
+    def _is_fetch_destination_option_with_value(word: str, command: str) -> bool:
+        option_name = word.split("=", 1)[0]
+        if command in _GGUF_POWERSHELL_FETCH_COMMANDS:
+            option_name = option_name.lower()
+        return option_name in _GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE
+
+    @staticmethod
+    def _is_powershell_hashtable_option(word: str, command: str) -> bool:
+        return command in _GGUF_POWERSHELL_FETCH_COMMANDS and word.lower().split("=", 1)[0] == "-headers"
+
+    @staticmethod
+    def _skip_powershell_hashtable_value(words: list[str], index: int) -> int:
+        if index >= len(words) or not words[index].lstrip().startswith("@{"):
+            return index + 1
+
+        depth = 0
+        while index < len(words):
+            word = words[index]
+            depth += word.count("@{")
+            depth -= word.count("}")
+            index += 1
+            if depth <= 0:
+                return index
+        return index
+
+    @classmethod
+    def _fetch_segment_has_remote_url(cls, words: list[str], command: str, shell_url_variables: set[str]) -> bool:
+        same_segment_url_variables: set[str] = set()
+        for command_index, word in enumerate(words):
+            if cls._shell_command_name(word) != command:
+                name = cls._shell_url_variable_name(word)
+                if name is not None:
+                    same_segment_url_variables.add(name)
+                continue
+            available_url_variables = shell_url_variables | same_segment_url_variables
+            index = command_index + 1
+            while index < len(words):
+                candidate = words[index]
+                if cls._is_remote_url_token(candidate) or cls._shell_word_references_variable(
+                    candidate,
+                    available_url_variables,
+                ):
+                    return True
+                if candidate.startswith("-"):
+                    value_mode = cls._fetch_option_value_mode(candidate, command)
+                    if value_mode == "none" and any(scheme in candidate.lower() for scheme in _GGUF_REMOTE_URL_SCHEMES):
+                        return True
+                    if value_mode != "none":
+                        if "=" in candidate:
+                            _option_name, option_value = candidate.split("=", 1)
+                            if cls._is_fetch_destination_option_with_value(candidate, command) and (
+                                cls._is_remote_url_token(option_value)
+                                or cls._shell_word_references_variable(option_value, available_url_variables)
+                            ):
+                                return True
+                            index += 1
+                            continue
+                        if value_mode == "separate":
+                            index += 1
+                        if (
+                            value_mode == "separate"
+                            and cls._is_fetch_destination_option_with_value(candidate, command)
+                            and index < len(words)
+                            and (
+                                cls._is_remote_url_token(words[index])
+                                or cls._shell_word_references_variable(words[index], available_url_variables)
+                            )
+                        ):
+                            return True
+                        if value_mode == "separate" and cls._is_powershell_hashtable_option(candidate, command):
+                            index = cls._skip_powershell_hashtable_value(words, index)
+                            continue
+                        if value_mode == "attached":
+                            index += 1
+                            continue
+                    index += 1
+                    continue
+                break
+        return False
+
+    @classmethod
+    def _has_fetch_command_with_url(cls, value: str, commands: tuple[str, ...]) -> bool:
+        shell_url_variables: set[str] = set()
+        for segment in cls._shell_command_segments(value):
+            for command in commands:
+                if cls._fetch_segment_has_remote_url(segment, command, shell_url_variables):
+                    return True
+            shell_url_variables.update(cls._shell_url_variable_names(segment))
+        return False
+
+    @staticmethod
+    def _has_remote_url(value: str) -> bool:
+        value_lower = value.lower()
+        return any(scheme in value_lower for scheme in _GGUF_REMOTE_URL_SCHEMES)
+
+    @staticmethod
+    def _has_token_boundary(value: str, position: int, token: str) -> bool:
+        before = value[position - 1] if position else ""
+        after_position = position + len(token)
+        after = value[after_position] if after_position < len(value) else ""
+        if before and (before.isalnum() or before in "._-"):
+            return False
+        return not (after and (after.isalnum() or after in "._-"))
+
+    @classmethod
+    def _has_network_api_boundary(cls, value: str, position: int, token: str) -> bool:
+        if token == "fetch" and position > 0 and value[position - 1] == ".":
+            after_position = position + len(token)
+            after = value[after_position] if after_position < len(value) else ""
+            return not (after and (after.isalnum() or after in "._-"))
+        return cls._has_token_boundary(value, position, token)
+
+    @staticmethod
+    def _api_argument_window(value: str, after_position: int) -> str | None:
+        open_position = after_position
+        while open_position < len(value) and value[open_position].isspace():
+            open_position += 1
+        if open_position >= len(value) or value[open_position] != "(":
+            return None
+        end_limit = min(len(value), open_position + 2048)
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        for index in range(open_position, end_limit):
+            character = value[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                    continue
+                if character == "\\":
+                    escaped = True
+                    continue
+                if character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                continue
+            if character == "(":
+                depth += 1
+                continue
+            if character == ")":
+                depth -= 1
+                if depth == 0:
+                    return value[open_position : index + 1]
+        return value[open_position:end_limit]
+
+    @classmethod
+    def _api_argument_window_has_remote_url(cls, value: str, after_position: int) -> bool:
+        argument_window = cls._api_argument_window(value, after_position)
+        return argument_window is not None and cls._has_remote_url(argument_window)
+
+    @staticmethod
+    def _remote_url_variable_assignments(value: str) -> _GgufRemoteUrlAssignments:
+        assignments: list[tuple[int, str]] = []
+        for match in _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN.finditer(value):
+            if len(assignments) >= _GGUF_NETWORK_REFERENCE_LIMIT:
+                return _GgufRemoteUrlAssignments(tuple(assignments), match.start())
+            assignments.append((match.start(), match.group("name")))
+        return _GgufRemoteUrlAssignments(tuple(assignments), None)
+
+    @staticmethod
+    def _remote_url_variable_names_before(assignments: _GgufRemoteUrlAssignments, position: int) -> set[str]:
+        return {name for assignment_position, name in assignments.items if assignment_position < position}
+
+    @staticmethod
+    def _remote_url_assignments_truncated_before(assignments: _GgufRemoteUrlAssignments, position: int) -> bool:
+        return assignments.truncated_after_position is not None and assignments.truncated_after_position < position
+
+    @classmethod
+    def _argument_window_uses_variable(cls, argument_window: str, names: set[str]) -> bool:
+        for name in names:
+            if not name:
+                continue
+            for position in cls._iter_substring_positions(argument_window, name):
+                if cls._has_token_boundary(argument_window, position, name):
+                    return True
+        return False
+
+    @staticmethod
+    def _argument_window_variable_names(argument_window: str) -> set[str]:
+        names: set[str] = set()
+        quote: str | None = None
+        escaped = False
+        cursor = 0
+        for match in re.finditer(r"\b[a-z_][a-z0-9_]*\b", argument_window):
+            for character in argument_window[cursor : match.start()]:
+                if quote is not None:
+                    if escaped:
+                        escaped = False
+                        continue
+                    if character == "\\":
+                        escaped = True
+                        continue
+                    if character == quote:
+                        quote = None
+                    continue
+                if character in {"'", '"'}:
+                    quote = character
+            if quote is not None:
+                cursor = match.end()
+                continue
+            name = match.group(0)
+            if name in {"false", "none", "true"}:
+                cursor = match.end()
+                continue
+            next_position = match.end()
+            while next_position < len(argument_window) and argument_window[next_position].isspace():
+                next_position += 1
+            if next_position < len(argument_window) and argument_window[next_position] in {"=", "("}:
+                cursor = match.end()
+                continue
+            names.add(name)
+            cursor = match.end()
+        return names
+
+    @staticmethod
+    def _hidden_remote_url_variable_assigned_before(
+        value: str,
+        names: set[str],
+        start: int | None,
+        end: int,
+    ) -> bool:
+        if start is None or start >= end:
+            return False
+        search_window = value[start:end]
+        for name in names:
+            pattern = re.compile(
+                rf"""(?is)\b{re.escape(name)}\s*=\s*(?:[rubf]{{0,2}})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
+            )
+            if pattern.search(search_window):
+                return True
+        return False
+
+    @staticmethod
+    def _network_api_alias_tokens(value: str) -> _GgufNetworkApiAliases:
+        tokens: list[str] = []
+        truncated_after_position: int | None = None
+        truncated_tokens: list[str] = []
+
+        def add_token(position: int, token: str) -> None:
+            nonlocal truncated_after_position
+            if len(tokens) < _GGUF_NETWORK_REFERENCE_LIMIT:
+                tokens.append(token)
+                return
+            if truncated_after_position is None:
+                truncated_after_position = position
+            if len(truncated_tokens) < _GGUF_NETWORK_REFERENCE_LIMIT:
+                truncated_tokens.append(token)
+
+        for match in _GGUF_NETWORK_CLIENT_ALIAS_PATTERN.finditer(value):
+            module = match.group("module")
+            alias = match.group("alias")
+            for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]:
+                add_token(match.start(), f"{alias}.{method}")
+
+        for match in _GGUF_URLLIB_REQUEST_ALIAS_PATTERN.finditer(value):
+            alias = match.group("alias")
+            for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS["urllib.request"]:
+                add_token(match.start(), f"{alias}.{method}")
+
+        for match in _GGUF_NETWORK_FUNCTION_IMPORT_PATTERN.finditer(value):
+            module = match.group("module")
+            methods = _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]
+            for imported_name in match.group("imports").split(","):
+                parts = imported_name.strip().split()
+                if not parts:
+                    continue
+                function_name = parts[0]
+                alias = parts[2] if len(parts) >= 3 and parts[1] == "as" else function_name
+                if function_name in methods and _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(alias):
+                    add_token(match.start(), alias)
+        return _GgufNetworkApiAliases(tuple(tokens), truncated_after_position, tuple(truncated_tokens))
+
+    @classmethod
+    def _argument_window_has_remote_variable_evidence(
+        cls,
+        value: str,
+        argument_window: str,
+        assignments: _GgufRemoteUrlAssignments,
+        api_position: int,
+    ) -> bool:
+        remote_url_variables = cls._remote_url_variable_names_before(assignments, api_position)
+        if remote_url_variables and cls._argument_window_uses_variable(argument_window, remote_url_variables):
+            return True
+        if not cls._remote_url_assignments_truncated_before(assignments, api_position):
+            return False
+        return cls._hidden_remote_url_variable_assigned_before(
+            value,
+            cls._argument_window_variable_names(argument_window),
+            assignments.truncated_after_position,
+            api_position,
+        )
+
+    @classmethod
+    def _truncated_alias_remote_fetch_pattern(
+        cls,
+        value: str,
+        aliases: _GgufNetworkApiAliases,
+        assignments: _GgufRemoteUrlAssignments,
+    ) -> bool:
+        if aliases.truncated_after_position is None:
+            return False
+
+        for api_name in aliases.truncated_tokens:
+            for api_position in cls._iter_substring_positions(value, api_name):
+                if api_position < aliases.truncated_after_position:
+                    continue
+                if not cls._has_network_api_boundary(value, api_position, api_name):
+                    continue
+                argument_window = cls._api_argument_window(value, api_position + len(api_name))
+                if argument_window is None:
+                    continue
+                if cls._has_remote_url(argument_window):
+                    return True
+                if cls._argument_window_has_remote_variable_evidence(value, argument_window, assignments, api_position):
+                    return True
+        return False
+
+    @classmethod
+    def _shell_remote_fetch_pattern(cls, value: str) -> str | None:
+        value_lower = value.lower()
+        if not cls._has_remote_url(value_lower):
+            return None
+        if not _GGUF_SHELL_FETCH_COMMAND_PATTERN.search(value):
+            return None
+
+        for pattern_name, commands in _GGUF_METADATA_SHELL_FETCH_COMMANDS:
+            if cls._has_fetch_command_with_url(value, commands):
+                return pattern_name
+        return None
+
+    @classmethod
+    def _network_api_remote_fetch_pattern(cls, value: str) -> str | None:
+        value_lower = value.lower()
+        if not cls._has_remote_url(value_lower):
+            return None
+
+        remote_url_assignments = cls._remote_url_variable_assignments(value_lower)
+        api_aliases = cls._network_api_alias_tokens(value_lower)
+        for api_name in (*_GGUF_METADATA_NETWORK_APIS, *api_aliases.tokens):
+            for api_position in cls._iter_substring_positions(value_lower, api_name):
+                if not cls._has_network_api_boundary(value_lower, api_position, api_name):
+                    continue
+                after_position = api_position + len(api_name)
+                argument_window = cls._api_argument_window(value_lower, after_position)
+                if argument_window is None:
+                    continue
+                if cls._has_remote_url(argument_window):
+                    return "network_api"
+                if cls._argument_window_has_remote_variable_evidence(
+                    value_lower,
+                    argument_window,
+                    remote_url_assignments,
+                    api_position,
+                ):
+                    return "network_api"
+        if cls._truncated_alias_remote_fetch_pattern(value_lower, api_aliases, remote_url_assignments):
+            return "network_api"
+        return None
+
+    @classmethod
+    def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
+        for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
+            if pattern.search(value):
+                return [{"evidence_type": "template_injection", "pattern": f"jinja2_{pattern_type}"}]
+        return []
+
+    @classmethod
+    def _metadata_value_security_evidence(
+        cls,
+        key: str,
+        value: str,
+        *,
+        max_template_size: int = _GGUF_DEFAULT_MAX_TEMPLATE_SIZE,
+    ) -> list[dict[str, str]]:
+        if cls._metadata_value_looks_like_documentation(key, value):
+            return []
+
+        if cls._is_chat_template_key(key):
+            if len(value) <= max_template_size:
+                return []
+            return cls._oversized_chat_template_security_evidence(value)
+
+        evidence: list[dict[str, str]] = []
+        if cls._contains_path_traversal(value):
+            evidence.append({"evidence_type": "path_traversal", "pattern": "dot_dot_path_segment"})
+
+        if cls._destructive_rm_pattern(value):
+            evidence.append({"evidence_type": "command_execution", "pattern": "destructive_rm"})
+        else:
+            command_pattern = cls._metadata_command_pattern(value)
+            if command_pattern is not None:
+                evidence.append({"evidence_type": "command_execution", "pattern": command_pattern})
+
+        shell_remote_fetch_pattern = cls._shell_remote_fetch_pattern(value)
+        if shell_remote_fetch_pattern is not None:
+            evidence.append({"evidence_type": "remote_fetch", "pattern": shell_remote_fetch_pattern})
+            return evidence
+
+        network_remote_fetch_pattern = cls._network_api_remote_fetch_pattern(value)
+        if network_remote_fetch_pattern is not None:
+            evidence.append({"evidence_type": "remote_fetch", "pattern": network_remote_fetch_pattern})
+
+        return evidence
+
+    @classmethod
+    def _iter_metadata_strings(cls, value: Any) -> Iterable[tuple[str, str]]:
+        stack: list[tuple[str, Any]] = [("", value)]
+        while stack:
+            path, current = stack.pop()
+            if isinstance(current, str):
+                yield path, current
+                continue
+            if isinstance(current, list):
+                for index in range(len(current) - 1, -1, -1):
+                    item = current[index]
+                    item_path = f"{path}[{index}]" if path else f"[{index}]"
+                    stack.append((item_path, item))
+
+    def _report_metadata_value_security_checks(self, key: str, value: Any, result: ScanResult) -> None:
+        if self._is_inert_tokenizer_array_key(key, value):
+            return
+
+        reported = sum(
+            1
+            for check in result.checks
+            if check.name == "Metadata Value Security Check" and check.status.value == "failed"
+        )
+        max_template_size = self.config.get("max_template_size", _GGUF_DEFAULT_MAX_TEMPLATE_SIZE)
+
+        for value_path, string_value in self._iter_metadata_strings(value):
+            for evidence in self._metadata_value_security_evidence(
+                key,
+                string_value,
+                max_template_size=max_template_size,
+            ):
+                if reported >= _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS:
+                    result.metadata["metadata_value_security_checks_truncated"] = True
+                    result.metadata["max_metadata_value_security_checks"] = _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS
+                    return
+                result.add_check(
+                    name="Metadata Value Security Check",
+                    passed=False,
+                    message=(
+                        f"Suspicious metadata value for key '{key}' contains "
+                        f"{evidence['evidence_type'].replace('_', ' ')} evidence"
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={
+                        "key": key,
+                        "value_path": value_path,
+                        "value": string_value[:200],
+                        **evidence,
+                    },
+                    rule_code="S902",
+                )
+                reported += 1
+
+    @staticmethod
     def _record_chat_template_occurrence(
         templates: dict[str, str],
         key: str,
@@ -1005,6 +2229,14 @@ class GgufScanner(BaseScanner):
                         metadata["error_reading_metadata"] = str(e)
                         break
 
+                reported_gguf_metadata, truncation = self._metadata_report_view(gguf_metadata)
+                if truncation:
+                    metadata["metadata_arrays_truncated"] = True
+                    metadata["metadata_array_truncation"] = truncation
+                    metadata["max_reported_tokenizer_metadata_array_items"] = (
+                        self.max_reported_tokenizer_metadata_array_items
+                    )
+
                 # Extract key model information
                 model_info = {}
 
@@ -1022,8 +2254,8 @@ class GgufScanner(BaseScanner):
                 ]
 
                 for field in key_fields:
-                    if field in gguf_metadata:
-                        model_info[field.replace(".", "_")] = gguf_metadata[field]
+                    if field in reported_gguf_metadata:
+                        model_info[field.replace(".", "_")] = reported_gguf_metadata[field]
 
                 if model_info:
                     metadata["model_info"] = model_info
