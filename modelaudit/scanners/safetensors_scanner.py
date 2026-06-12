@@ -830,12 +830,16 @@ class SafeTensorsScanner(BaseScanner):
             if chunks and cls._license_document_line_is_wrapped_base64_separator(line):
                 total_lines += 1
                 separator_lines += 1
-                if (
-                    total_lines > _BASE64_LICENSE_WRAP_MAX_LINES
-                    or separator_lines > _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES
-                ):
+                if total_lines > _BASE64_LICENSE_WRAP_MAX_LINES:
+                    if flush() or chunks:
+                        return True
+                    reset()
+                    continue
+                if separator_lines > _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES:
                     if flush() or total_chars >= _BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS:
                         return True
+                    if has_short_fragments:
+                        continue
                     reset()
                     continue
                 continue
