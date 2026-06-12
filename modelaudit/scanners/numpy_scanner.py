@@ -391,7 +391,6 @@ class NumPyScanner(BaseScanner):
                             for index, candidate in enumerate(unmatched_entries)
                             if entry.get("name") == candidate["name"]
                             and entry.get("rule_code") == candidate["rule_code"]
-                            and entry.get("severity") == candidate["severity"]
                         ),
                         None,
                     )
