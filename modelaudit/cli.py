@@ -1929,11 +1929,6 @@ class _ScanPathState:
                 resolved_root = directory_root.resolve()
             except OSError:
                 continue
-            if results_have_inconclusive_outcome(scan_result) or results_have_incomplete_coverage_under_directory(
-                scan_result,
-                str(resolved_root),
-            ):
-                continue
             walk_errors: list[OSError] = []
             walked_directories: set[str] = set()
             for root, _dirs, _files in os.walk(resolved_root, followlinks=False, onerror=walk_errors.append):
@@ -1941,8 +1936,11 @@ class _ScanPathState:
                     resolved_directory = Path(root).resolve()
                 except OSError:
                     continue
-                if resolved_directory.is_relative_to(resolved_root):
-                    walked_directories.add(str(resolved_directory))
+                if not resolved_directory.is_relative_to(resolved_root):
+                    continue
+                if results_have_incomplete_coverage_under_directory(scan_result, str(resolved_directory)):
+                    continue
+                walked_directories.add(str(resolved_directory))
             if not walk_errors:
                 self.dvc_covered_directories.update(walked_directories)
 
