@@ -2756,6 +2756,7 @@ class PickleScanner(BaseScanner):
             self._remove_trusted_joblib_numpy_array_wrapper_findings(result)
         self._downgrade_pickle_parse_error_findings(result)
         if self._has_warning_or_critical_findings(result):
+            result.finish(success=False)
             return
 
         for key in (
