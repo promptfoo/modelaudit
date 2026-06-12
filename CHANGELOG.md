@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - inspect large Keras HDF5 models through file-backed metadata traversal instead of rejecting them at the generic whole-file read cap; aggregate `content_hash` is omitted for these large file-backed HDF5 scans
+- avoid critical pickle `getattr` findings for proven Ultralytics `Detect.forward` reconstruction while preserving unsafe traversal controls
 - detect GGUF curl short-option remote fetches, ignore spaced Python attribute calls, and truncate large tokenizer metadata arrays with explicit counts
 - require concrete GGUF metadata evidence for S902 findings instead of flagging benign URLs, chat-template syntax, slashes, or pipes
 - deduplicate repeated ONNX custom-operator domain findings into bounded per-domain reports while preserving affected-file evidence
