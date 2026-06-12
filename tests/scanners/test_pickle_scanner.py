@@ -1880,10 +1880,56 @@ def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
     bounded_check = next(check for check in result.checks if check.name == "Legacy PyTorch Bounded Analysis")
     coverage_check = next(check for check in result.checks if check.name == "Legacy PyTorch Storage Payload Coverage")
+    serialized_result = result.to_dict(include_private_metadata=True)
     assert bounded_check.status == CheckStatus.PASSED
     assert coverage_check.status == CheckStatus.FAILED
     assert bounded_check.details["max_file_read_size"] == 256
     assert bounded_check.details["tensor_storage_materialized"] is False
+    assert should_cache_scan_result(serialized_result) is False
+
+
+def test_legacy_pytorch_storage_pid_private_evidence_survives_incomplete_downgrade() -> None:
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "analysis_incomplete": True,
+            "pickle_verdict": "suspicious",
+            "scan_outcome": INCONCLUSIVE_SCAN_OUTCOME,
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    layout = pickle_scanner._LegacyPyTorchStreamLayout(
+        boundaries=((0, 1),),
+        storage_keys=("0",),
+        storage_records=(pickle_scanner._LegacyPyTorchStorageRecord(key="0", element_count=1, element_size=1),),
+        storage_end=9,
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    trusted_checks = _trusted_legacy_storage_pid_checks(result)
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert len(trusted_checks) == 1
+    assert trusted_checks[0].status == CheckStatus.PASSED
+    assert any(
+        entry.get("name") == "Standalone Pickle Finding" and entry.get("rule_code") == "S212"
+        for entry in _private_actionable_failed_checks(serialized_result)
+    )
 
 
 def test_large_legacy_pytorch_malicious_control_still_fails(tmp_path: Path) -> None:
@@ -2468,6 +2514,9 @@ def test_legacy_pytorch_container_trusts_canonical_storage_binpersid(tmp_path: P
 
     trusted_checks = _trusted_legacy_storage_pid_checks(result)
     assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.has_errors is False
+    assert result.has_warnings is False
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
     assert result.metadata["legacy_pytorch_storage_end"] == len(payload)

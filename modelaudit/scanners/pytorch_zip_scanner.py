@@ -2713,13 +2713,16 @@ class PyTorchZipScanner(BaseScanner):
             for issue in result.issues
             if not cls._is_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
         ]
-        cls._remove_private_actionable_failed_check_entries(result, downgraded_private_entries)
-        if (
+        clean_trusted_storage_downgrade = (
             downgraded_count
             and not result.has_errors
             and not result.has_warnings
+            and not result.metadata.get("analysis_incomplete")
+            and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
             and result.metadata.get("pickle_verdict") == "suspicious"
-        ):
+        )
+        if clean_trusted_storage_downgrade:
+            cls._remove_private_actionable_failed_check_entries(result, downgraded_private_entries)
             result.metadata["pickle_verdict"] = "clean"
 
     @staticmethod
