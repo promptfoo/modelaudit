@@ -628,6 +628,29 @@ class TestModelAuditResultModel:
         assert "scanner_reported_unsuccessful_without_outcome" in scan_result.metadata["scan_outcome_reasons"]
         assert determine_exit_code(result) == 2
 
+    def test_aggregate_scan_result_direct_security_failure_is_not_marked_inconclusive(self) -> None:
+        """Security findings should not be reclassified as coverage failures."""
+        result = create_initial_audit_result()
+        scan_result = ScanResult(scanner_name="numpy")
+        scan_result.add_issue(
+            "Embedded pickle executes builtins.exec",
+            severity=IssueSeverity.CRITICAL,
+            location="malicious.npy",
+            rule_code="S104",
+        )
+        scan_result.finish(success=False)
+
+        result.aggregate_scan_result_direct(scan_result)
+
+        assert result.success is True
+        assert len(result.issues) == 1
+        metadata = result.file_metadata["<numpy:1>"].model_dump(exclude_none=True)
+        assert "scan_outcome" not in metadata
+        assert "scan_outcome_reasons" not in metadata
+        assert "scan_outcome" not in scan_result.metadata
+        assert "scan_outcome_reasons" not in scan_result.metadata
+        assert determine_exit_code(result) == 1
+
     def test_aggregate_scan_result_direct_operational_flag_sets_error_state(self) -> None:
         """Direct aggregation should honor explicit operational-error metadata."""
         result = create_initial_audit_result()

@@ -615,7 +615,7 @@ def test_object_dtype_numpy_recurses_into_pickle_exec(tmp_path: Path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is True
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
@@ -633,7 +633,7 @@ def test_object_dtype_numpy_recurses_into_pickle_ssl(tmp_path: Path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is True
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
@@ -847,6 +847,75 @@ def test_numpy_object_dtype_benign_direct_scan_success_after_reconstruction_clea
     assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
 
 
+def test_numpy_object_dtype_direct_scan_preserves_retained_embedded_failure_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arr = np.array([{"k": "v"}], dtype=object)
+    path = tmp_path / "malicious_object_direct.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        result = ScanResult(scanner_name="pickle")
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="validated reconstruct",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy._core.multiarray._reconstruct",
+                "module": "numpy._core.multiarray",
+                "name": "_reconstruct",
+                "position": file_obj.tell(),
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="dangerous reduce",
+            severity=IssueSeverity.CRITICAL,
+            location=context_path,
+            details={
+                "associated_global": "builtins.exec",
+                "module": "builtins",
+                "name": "exec",
+                "position": file_obj.tell() + 1,
+            },
+            rule_code="S209",
+        )
+        result.finish(success=False)
+        return result
+
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        lambda _payload: True,
+    )
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["embedded_pickle_scan_success"] is False
+    assert result.has_errors is True
+    assert not any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "numpy._core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_numpy_object_dtype_cleanup_keeps_untrusted_numpy_reconstruction_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -890,6 +959,11 @@ def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
 
     assert determine_exit_code(result) == 1
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    direct_result = NumPyScanner().scan(str(path))
+
+    assert direct_result.success is False
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct_result.issues)
 
 
 def test_numpy_object_dtype_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:

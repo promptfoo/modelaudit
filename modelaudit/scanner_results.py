@@ -186,6 +186,8 @@ def normalize_unclassified_scan_failure(scan_result: "ScanResult") -> None:
         return
     if scan_result_has_inconclusive_outcome(scan_result):
         return
+    if scan_result.has_errors or scan_result.has_warnings:
+        return
     mark_inconclusive_scan_result(scan_result, UNCLASSIFIED_SCAN_FAILURE_REASON)
 
 

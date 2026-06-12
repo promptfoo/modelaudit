@@ -691,7 +691,7 @@ class NumPyScanner(BaseScanner):
                                 )
                                 _finish_with_inconclusive_contract(result, default_success=False)
                             else:
-                                result.finish(success=True)
+                                result.finish(success=not result.has_errors and not result.has_warnings)
                             return result
 
                         self._validate_dtype(dtype)
