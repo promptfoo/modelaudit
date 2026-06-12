@@ -1089,6 +1089,8 @@ class SafeTensorsScanner(BaseScanner):
             return False
         if port is not None and not 0 <= port <= 65535:
             return False
+        if parsed.netloc.rsplit("@", maxsplit=1)[-1].endswith(":"):
+            return False
         if parsed.username or parsed.password:
             return False
         if not parsed.netloc.isascii() or not parsed.path.isascii():

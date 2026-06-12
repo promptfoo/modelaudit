@@ -716,6 +716,10 @@ def test_license_url_residual_encoding_fails_closed() -> None:
         "https://github.com:bad/Lightricks/LTX-2/blob/main/LICENSE"
     )
     assert not SafeTensorsScanner._url_looks_like_license_reference("https://opensource.org:bad/licenses/MIT")
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://github.com:/Lightricks/LTX-2/blob/main/LICENSE"
+    )
+    assert not SafeTensorsScanner._url_looks_like_license_reference("https://opensource.org:/licenses/MIT")
 
 
 def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -> None:
@@ -787,6 +791,8 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://github.com:bad/Lightricks/LTX-2/blob/main/LICENSE",
         "https://opensource.org:bad/licenses/MIT",
+        "https://github.com:/Lightricks/LTX-2/blob/main/LICENSE",
+        "https://opensource.org:/licenses/MIT",
         "https://[",
     ],
 )
