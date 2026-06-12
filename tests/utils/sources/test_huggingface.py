@@ -4679,10 +4679,18 @@ class TestModelDownloadStreaming:
             ),
             (
                 "candidate.txt",
-                b"\x12\xff\xff\xff\xff\xff" + (b"\x00" * ((1024 * 1024) + 1)),
+                (b"B" + bytes([len(("é" * 60).encode("utf-8") + b" x:12")]) + ("é" * 60).encode("utf-8") + b" x:12")
+                * 4097,
                 {".onnx"},
                 {"onnx"},
                 ["model.onnx", "candidate.txt"],
+            ),
+            (
+                "oversized-candidate.txt",
+                b"\x12\xff\xff\xff\xff\xff" + (b"\x00" * ((1024 * 1024) + 1)),
+                {".onnx"},
+                {"onnx"},
+                ["model.onnx", "oversized-candidate.txt"],
             ),
         ],
         ids=[
@@ -4693,6 +4701,7 @@ class TestModelDownloadStreaming:
             "flax-msgpack-key-colon-text-suffix",
             "flax-msgpack-key-line-broken-text-suffix",
             "protobuf-candidate-text-suffix",
+            "protobuf-oversized-candidate-text-suffix",
         ],
     )
     @patch("requests.get")
@@ -4779,6 +4788,30 @@ class TestModelDownloadStreaming:
 
         assert selected_files == ["known.safetensors", "weights.conf"]
 
+    @patch("requests.get")
+    def test_select_streamable_safetensors_suffix_keeps_flax_like_tensor_bytes_as_safetensors(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Only text-suffix SafeTensors near-matches may be promoted to Flax."""
+        tensor = b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        header = json.dumps(
+            {"tensor": {"dtype": "U8", "shape": [len(tensor)], "data_offsets": [0, len(tensor)]}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload = struct.pack("<Q", len(header)) + header + tensor
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.safetensors"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files == ["known.msgpack"]
+
     @pytest.mark.parametrize(
         ("hidden_payload", "expected_filenames"),
         [
@@ -4863,7 +4896,17 @@ class TestModelDownloadStreaming:
     ) -> None:
         """Known-small tokenizer text should not reserve the full text-owner ceiling."""
         payload = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")
-        mock_requests_get.return_value = _FakeRangeResponse(payload)
+        requested_range_ends: list[int] = []
+
+        def get_side_effect(_url: str, *, headers: dict[str, str], **_kwargs: object) -> _FakeRangeResponse:
+            range_header = headers["Range"]
+            start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            requested_end = int(end_text)
+            requested_range_ends.append(requested_end)
+            response_end = min(requested_end, len(payload) - 1)
+            return _fake_content_range_response(payload, int(start_text), response_end)
+
+        mock_requests_get.side_effect = get_side_effect
 
         selected_files = _select_streamable_hf_files(
             "test/model",
@@ -4874,6 +4917,8 @@ class TestModelDownloadStreaming:
         )
 
         assert selected_files == ["known.msgpack"]
+        assert requested_range_ends
+        assert max(requested_range_ends) < len(payload) - 1
 
     @patch("requests.get")
     def test_select_streamable_protobuf_excludes_non_ascii_bpe_text_owner(
