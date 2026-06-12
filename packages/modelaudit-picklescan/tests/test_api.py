@@ -2674,6 +2674,48 @@ def test_scan_bytes_marks_global_pytorch_storage_persistent_id_import_reference(
     assert report.notices == ()
 
 
+def test_scan_bytes_marks_only_pytorch_storage_global_used_by_persistent_id() -> None:
+    payload = (
+        b"\x80\x04("
+        + _short_binunicode(b"storage")
+        + _short_binunicode(b"torch")
+        + _short_binunicode(b"FloatStorage")
+        + b"\x93"
+        + _short_binunicode(b"k")
+        + _short_binunicode(b"cpu")
+        + b"K\x01tQ0"
+        + _short_binunicode(b"torch")
+        + _short_binunicode(b"IntStorage")
+        + b"\x93."
+    )
+
+    report = scan_bytes(payload, source="mixed-pytorch-storage-globals.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    import_references = cast(tuple[dict[str, object], ...], report.metadata.get("import_references", ()))
+    storage_references = [
+        reference
+        for reference in import_references
+        if reference.get("module") == "torch" and str(reference.get("name", "")).endswith("Storage")
+    ]
+    assert [reference.get("name") for reference in storage_references] == ["FloatStorage", "IntStorage"]
+    assert [
+        reference.get("name")
+        for reference in storage_references
+        if reference.get("pytorch_storage_persistent_id") is True
+    ] == ["FloatStorage"]
+    assert "pytorch_storage_persistent_id" not in package_api._canonical_pytorch_storage_import_reference(
+        {
+            "module": "torch",
+            "name": "IntStorage",
+            "position": 999,
+            "pytorch_storage_persistent_id": True,
+        },
+        proven_canonical_storage_ids=True,
+        storage_global_positions={10},
+    )
+
+
 def test_scan_bytes_does_not_warn_for_library_pytorch_storage_persistent_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

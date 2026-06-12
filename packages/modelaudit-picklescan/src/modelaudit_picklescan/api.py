@@ -293,6 +293,7 @@ class _PytorchZipDeadlineExceeded(TimeoutError):
 class _PickleGlobalRef:
     module: str
     name: str
+    position: int
 
 
 @dataclass(frozen=True)
@@ -330,6 +331,7 @@ class _AbstractCallResult:
 @dataclass(frozen=True)
 class _PytorchStorageReferenceParse:
     referenced_keys: set[str]
+    storage_global_positions: set[int]
     parse_complete: bool
     all_persistent_ids_are_pytorch_storage: bool
 
@@ -1470,11 +1472,13 @@ def _pytorch_storage_keys_from_pickle_bytes(
     *,
     opcode_budget_remaining: list[int] | None = None,
     deadline: float | None = None,
+    position_offset: int = 0,
 ) -> _PytorchStorageReferenceParse:
     marker = object()
     memo: dict[int, Any] = {}
     stack: list[Any] = []
     referenced_keys: set[str] = set()
+    storage_global_positions: set[int] = set()
     all_persistent_ids_are_pytorch_storage = True
 
     def pop_marked_tuple() -> tuple[Any, ...] | None:
@@ -1513,13 +1517,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
         ):
             return None
         storage_key = _coerce_pickle_string_arg(pid[2])
-        if storage_key is None or not _is_ascii_decimal_digits(storage_key):
+        if storage_key is None or storage_key == "":
             return None
         if _coerce_pickle_string_arg(pid[3]) is None:
             return None
         storage_size = pid[4]
         if not isinstance(storage_size, int) or isinstance(storage_size, bool) or storage_size < 0:
             return None
+        storage_global_positions.add(storage_type.position)
         return storage_key
 
     try:
@@ -1528,10 +1533,11 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 _check_pytorch_zip_deadline(deadline)
             if opcode_budget_remaining is not None:
                 if opcode_budget_remaining[0] <= 0:
-                    return _PytorchStorageReferenceParse(set(), False, False)
+                    return _PytorchStorageReferenceParse(set(), set(), False, False)
                 opcode_budget_remaining[0] -= 1
             if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
-                return _PytorchStorageReferenceParse(set(), False, False)
+                return _PytorchStorageReferenceParse(set(), set(), False, False)
+            position = position_offset + (_pos if type(_pos) is int else 0)
             opcode_name = opcode.name
             if opcode_name in {"PROTO", "FRAME", "STOP"}:
                 continue
@@ -1553,14 +1559,16 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     stack.append(None)
                 else:
                     parts = global_name.split()
-                    stack.append(_PickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else None)
+                    stack.append(_PickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else None)
             elif opcode_name == "STACK_GLOBAL":
                 if len(stack) < 2:
                     stack.clear()
                     continue
                 name = _coerce_pickle_string_arg(stack.pop())
                 module = _coerce_pickle_string_arg(stack.pop())
-                stack.append(_PickleGlobalRef(module, name) if module is not None and name is not None else None)
+                stack.append(
+                    _PickleGlobalRef(module, name, position) if module is not None and name is not None else None
+                )
             elif opcode_name == "EMPTY_TUPLE":
                 stack.append(())
             elif opcode_name == "TUPLE":
@@ -1621,11 +1629,12 @@ def _pytorch_storage_keys_from_pickle_bytes(
             else:
                 stack.clear()
             if not within_limits():
-                return _PytorchStorageReferenceParse(set(), False, False)
+                return _PytorchStorageReferenceParse(set(), set(), False, False)
     except Exception:
-        return _PytorchStorageReferenceParse(set(), False, False)
+        return _PytorchStorageReferenceParse(set(), set(), False, False)
     return _PytorchStorageReferenceParse(
         referenced_keys=referenced_keys,
+        storage_global_positions=storage_global_positions,
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
     )
@@ -2291,6 +2300,7 @@ def _scan_pickle_payload_native(
         report = _with_canonical_pytorch_storage_persistent_id_metadata(
             _report_from_native_dict(raw_report),
             payload,
+            position_offset=native_position_offset,
         )
         if enrich_call_graph:
             if _call_graph_enrichment_is_redundant(report):
@@ -2345,13 +2355,18 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
     )
 
 
-def _with_canonical_pytorch_storage_persistent_id_metadata(report: PickleReport, payload: bytes) -> PickleReport:
+def _with_canonical_pytorch_storage_persistent_id_metadata(
+    report: PickleReport,
+    payload: bytes,
+    *,
+    position_offset: int = 0,
+) -> PickleReport:
     if not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings):
         return report
     try:
-        storage_reference_parse = _pytorch_storage_keys_from_pickle_bytes(payload)
+        storage_reference_parse = _pytorch_storage_keys_from_pickle_bytes(payload, position_offset=position_offset)
     except Exception:
-        storage_reference_parse = _PytorchStorageReferenceParse(set(), False, False)
+        storage_reference_parse = _PytorchStorageReferenceParse(set(), set(), False, False)
     trusted_storage_keys = storage_reference_parse.referenced_keys
     proven_canonical_storage_ids = (
         storage_reference_parse.parse_complete
@@ -2380,6 +2395,7 @@ def _with_canonical_pytorch_storage_persistent_id_metadata(report: PickleReport,
             _canonical_pytorch_storage_import_reference(
                 _mapping(reference),
                 proven_canonical_storage_ids=proven_canonical_storage_ids,
+                storage_global_positions=storage_reference_parse.storage_global_positions,
             )
             for reference in import_references
         ]
@@ -2415,13 +2431,16 @@ def _canonical_pytorch_storage_import_reference(
     reference: Mapping[str, Any],
     *,
     proven_canonical_storage_ids: bool,
+    storage_global_positions: set[int],
 ) -> dict[str, Any]:
     normalized = dict(reference)
     module = normalized.get("module")
     name = normalized.get("name")
     if type(module) is str and type(name) is str and (module, name) in _PYTORCH_STORAGE_GLOBALS:
-        if proven_canonical_storage_ids:
+        if proven_canonical_storage_ids and _optional_int(normalized.get("position")) in storage_global_positions:
             normalized["pytorch_storage_persistent_id"] = True
+        else:
+            normalized.pop("pytorch_storage_persistent_id", None)
         return normalized
     normalized.pop("pytorch_storage_persistent_id", None)
     return normalized
