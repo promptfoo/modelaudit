@@ -538,12 +538,13 @@ def test_orbax_directory_entry_count_limit_fails_closed(tmp_path: Path) -> None:
     )
 
 
-def test_orbax_directory_probe_cap_selects_owner_and_scan_fails_closed(
+def test_orbax_directory_probe_cap_does_not_select_owner_without_jax_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     checkpoint_dir = tmp_path / "orbax_probe_limit"
     checkpoint_dir.mkdir()
+    monkeypatch.setattr(JaxCheckpointScanner, "DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES", 2)
     entries_yielded = 0
 
     def synthetic_entries(path: Path) -> Iterator[Path]:
@@ -557,24 +558,22 @@ def test_orbax_directory_probe_cap_selects_owner_and_scan_fails_closed(
 
     monkeypatch.setattr(Path, "iterdir", synthetic_entries)
 
-    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is False
     assert entries_yielded == JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1
 
-    entries_yielded = 0
-    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
 
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "jax_orbax_directory_entry_count_limit" in result.metadata["scan_outcome_reasons"]
-    assert entries_yielded == JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1
-    assert any(
-        check.name == "Orbax Directory Entry Count Limit"
-        and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.INFO
-        and check.details["max_orbax_directory_entries"] == JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES
-        and check.details["analysis_incomplete"] is True
-        for check in result.checks
-    )
+def test_orbax_checkpoint_entry_file_routes_without_directory_owner(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "checkpoint_9000"
+    checkpoint_path.write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
+def test_orbax_checkpoint_entry_file_rejects_ordinary_text(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "checkpoint_9000"
+    checkpoint_path.write_text("ordinary training notes", encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
 
 
 def test_orbax_checkpoint_file_count_limit_fails_closed(tmp_path: Path) -> None:

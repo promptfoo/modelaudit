@@ -817,6 +817,12 @@ class JaxCheckpointScanner(BaseScanner):
                         return True
                     return tokenizer_jax_evidence or is_jax_json_checkpoint_file(path)
                 return tokenizer_jax_evidence or is_confirmed_jax_json_checkpoint_file(path)
+            if not ext and cls._is_orbax_checkpoint_entry_name(filename):
+                with suppress(OSError):
+                    path_stat = path_obj.lstat()
+                    if cls._is_regular_file(path_stat):
+                        return cls._probe_numbered_checkpoint_file(path_obj, path_stat) is not False
+                return True
             if ext in cls.supported_extensions:
                 return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
             return is_jax_json_checkpoint_file(path)
@@ -1035,11 +1041,11 @@ class JaxCheckpointScanner(BaseScanner):
             ):
                 return True
 
-        # Keep routing bounded. If the probe cap is hit before a conclusive
-        # answer, the owner scan records the incomplete coverage fail-closed.
+        # Keep routing bounded without treating the cap itself as JAX evidence.
+        # Confirmed owners still report incomplete coverage from scan().
         for entry_index, entry in enumerate(path_obj.iterdir(), start=1):
             if entry_index > cls.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES:
-                return True
+                break
             if not cls._is_orbax_checkpoint_entry_name(entry.name):
                 continue
             try:
@@ -2230,7 +2236,13 @@ class JaxCheckpointScanner(BaseScanner):
                 result.bytes_scanned = file_size
                 result.metadata["file_size"] = file_size
 
-                self._scan_checkpoint_file(path, result)
+                self._scan_checkpoint_file(
+                    path,
+                    result,
+                    treat_legacy_pickle_header_as_checkpoint=self._is_orbax_checkpoint_entry_name(
+                        Path(path).name.lower()
+                    ),
+                )
 
         except Exception as e:
             mark_inconclusive_scan_result(result, "jax_checkpoint_scan_failed")

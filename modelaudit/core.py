@@ -1957,6 +1957,12 @@ def _select_non_hdf5_preferred_scanner_id(
     ):
         return "jax_checkpoint"
 
+    if scanner_policy is not None and scanner_policy.allows("jax_checkpoint") and not ext:
+        from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
+
+        if JaxCheckpointScanner.can_handle(path):
+            return "jax_checkpoint"
+
     return _registry.get_scanner_id_for_header_format(header_format)
 
 

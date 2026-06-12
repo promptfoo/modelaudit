@@ -1870,38 +1870,68 @@ def test_jax_owner_snapshot_prunes_ignored_nested_directories_from_entry_limit(t
     assert determine_exit_code(result) == 1
 
 
-def test_directory_scan_orbax_probe_cap_fails_closed_end_to_end(
+def test_directory_scan_ordinary_probe_cap_does_not_route_jax_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model_dir = tmp_path / "late-orbax-entry"
+    model_dir = tmp_path / "large-ordinary-directory"
     model_dir.mkdir()
     monkeypatch.setattr(JaxCheckpointScanner, "DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES", 2)
+    for index in range(JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1):
+        (model_dir / f"ordinary_{index}.txt").write_text("ordinary notes", encoding="utf-8")
+    (model_dir / "config.json").write_text('{"model_type":"ordinary"}', encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(model_dir)) is False
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert "jax_checkpoint" not in result.scanner_names
+    assert str(model_dir) not in result.file_metadata
+    assert determine_exit_code(result) == 0
+
+
+def test_directory_scan_late_checkpoint_child_scans_without_owner_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "late-checkpoint-entry"
+    model_dir.mkdir()
+    monkeypatch.setattr(JaxCheckpointScanner, "DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES", 2)
+    checkpoint_path = model_dir / "checkpoint_9000"
+    checkpoint_path.write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+    for index in range(JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES):
+        (model_dir / f"unrelated_{index}.txt").write_text("ordinary notes", encoding="utf-8")
+
     original_iterdir = Path.iterdir
-    entries_yielded = 0
 
     def synthetic_entries(path: Path) -> Iterator[Path]:
-        nonlocal entries_yielded
+        if path != model_dir:
+            yield from original_iterdir(path)
+            return
         if not path.is_dir():
             yield from original_iterdir(path)
             return
         for index in range(JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES):
-            entries_yielded += 1
             yield path / f"unrelated_{index}.txt"
-        entries_yielded += 1
-        yield path / "checkpoint_9000"
+        yield checkpoint_path
 
     monkeypatch.setattr(Path, "iterdir", synthetic_entries)
 
+    assert JaxCheckpointScanner.can_handle(str(model_dir)) is False
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
-    owner_metadata = result.file_metadata[str(model_dir)]
 
     assert "jax_checkpoint" in result.scanner_names
-    assert owner_metadata["directory_owner_scan"] is True
-    assert owner_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "jax_orbax_directory_entry_count_limit" in owner_metadata["scan_outcome_reasons"]
-    assert entries_yielded >= (JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1) * 2
-    assert determine_exit_code(result) == 2
+    assert str(model_dir) not in result.file_metadata
+    assert any(
+        issue.rule_code == "S902"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.location == str(checkpoint_path)
+        and issue.details.get("global") in _SYSTEM_GLOBAL_NAMES
+        for issue in result.issues
+    )
+    assert determine_exit_code(result) == 1
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
