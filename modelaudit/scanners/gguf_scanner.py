@@ -263,6 +263,8 @@ class _GgufNetworkApiAliases(NamedTuple):
     tokens: tuple[str, ...]
     truncated_after_position: int | None
     truncated_tokens: tuple[str, ...]
+    truncated_client_aliases: tuple[tuple[str, tuple[str, ...]], ...]
+    truncated_function_aliases: tuple[str, ...]
 
 
 class GgufScanner(BaseScanner):
@@ -1927,27 +1929,36 @@ class GgufScanner(BaseScanner):
         tokens: list[str] = []
         truncated_after_position: int | None = None
         truncated_tokens: list[str] = []
+        truncated_client_aliases: list[tuple[str, tuple[str, ...]]] = []
+        truncated_function_aliases: list[str] = []
 
-        def add_token(position: int, token: str) -> None:
+        def add_token(position: int, token: str) -> bool:
             nonlocal truncated_after_position
             if len(tokens) < _GGUF_NETWORK_REFERENCE_LIMIT:
                 tokens.append(token)
-                return
+                return False
             if truncated_after_position is None:
                 truncated_after_position = position
             if len(truncated_tokens) < _GGUF_NETWORK_REFERENCE_LIMIT:
                 truncated_tokens.append(token)
+            return True
 
         for match in _GGUF_NETWORK_CLIENT_ALIAS_PATTERN.finditer(value):
             module = match.group("module")
             alias = match.group("alias")
+            alias_was_truncated = False
             for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]:
-                add_token(match.start(), f"{alias}.{method}")
+                alias_was_truncated = add_token(match.start(), f"{alias}.{method}") or alias_was_truncated
+            if alias_was_truncated and len(truncated_client_aliases) < _GGUF_NETWORK_REFERENCE_LIMIT:
+                truncated_client_aliases.append((alias, _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]))
 
         for match in _GGUF_URLLIB_REQUEST_ALIAS_PATTERN.finditer(value):
             alias = match.group("alias")
+            alias_was_truncated = False
             for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS["urllib.request"]:
-                add_token(match.start(), f"{alias}.{method}")
+                alias_was_truncated = add_token(match.start(), f"{alias}.{method}") or alias_was_truncated
+            if alias_was_truncated and len(truncated_client_aliases) < _GGUF_NETWORK_REFERENCE_LIMIT:
+                truncated_client_aliases.append((alias, _GGUF_NETWORK_CLIENT_ALIAS_METHODS["urllib.request"]))
 
         for match in _GGUF_NETWORK_FUNCTION_IMPORT_PATTERN.finditer(value):
             module = match.group("module")
@@ -1958,9 +1969,20 @@ class GgufScanner(BaseScanner):
                     continue
                 function_name = parts[0]
                 alias = parts[2] if len(parts) >= 3 and parts[1] == "as" else function_name
-                if function_name in methods and _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(alias):
-                    add_token(match.start(), alias)
-        return _GgufNetworkApiAliases(tuple(tokens), truncated_after_position, tuple(truncated_tokens))
+                if (
+                    function_name in methods
+                    and _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(alias)
+                    and add_token(match.start(), alias)
+                    and len(truncated_function_aliases) < _GGUF_NETWORK_REFERENCE_LIMIT
+                ):
+                    truncated_function_aliases.append(alias)
+        return _GgufNetworkApiAliases(
+            tuple(tokens),
+            truncated_after_position,
+            tuple(truncated_tokens),
+            tuple(truncated_client_aliases),
+            tuple(truncated_function_aliases),
+        )
 
     @classmethod
     def _argument_window_has_remote_variable_evidence(
@@ -2004,6 +2026,49 @@ class GgufScanner(BaseScanner):
                 if cls._has_remote_url(argument_window):
                     return True
                 if cls._argument_window_has_remote_variable_evidence(value, argument_window, assignments, api_position):
+                    return True
+        return cls._truncated_alias_call_remote_fetch_pattern(value, aliases, assignments)
+
+    @classmethod
+    def _truncated_alias_call_remote_fetch_pattern(
+        cls,
+        value: str,
+        aliases: _GgufNetworkApiAliases,
+        assignments: _GgufRemoteUrlAssignments,
+    ) -> bool:
+        if aliases.truncated_after_position is None:
+            return False
+
+        checked_calls = 0
+        patterns: list[re.Pattern[str]] = []
+        for alias, methods in aliases.truncated_client_aliases:
+            client_method_pattern = "|".join(re.escape(method) for method in methods)
+            patterns.append(
+                re.compile(
+                    rf"""(?is)\b{re.escape(alias)}\s*\.\s*(?:{client_method_pattern})\s*\(""",
+                )
+            )
+        if aliases.truncated_function_aliases:
+            function_alias_pattern = "|".join(re.escape(alias) for alias in aliases.truncated_function_aliases)
+            patterns.append(
+                re.compile(
+                    rf"""(?is)\b(?:{function_alias_pattern})\s*\(""",
+                )
+            )
+
+        for pattern in patterns:
+            for match in pattern.finditer(value, aliases.truncated_after_position):
+                checked_calls += 1
+                if checked_calls > _GGUF_NETWORK_REFERENCE_LIMIT:
+                    return False
+                argument_window = cls._api_argument_window(value, match.end() - 1)
+                if argument_window is None:
+                    continue
+                if cls._has_remote_url(argument_window):
+                    return True
+                if cls._argument_window_has_remote_variable_evidence(
+                    value, argument_window, assignments, match.start()
+                ):
                     return True
         return False
 

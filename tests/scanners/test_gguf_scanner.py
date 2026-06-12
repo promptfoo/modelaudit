@@ -1570,6 +1570,19 @@ def test_gguf_metadata_remote_fetch_detects_alias_after_many_benign_aliases(tmp_
     assert all(check.rule_code == "S902" for check in checks)
 
 
+def test_gguf_metadata_remote_fetch_detects_alias_after_truncated_alias_window(tmp_path: Path) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
+    value = f"{benign_aliases}\nimport requests as target_client\ntarget_client.delete('https://evil.example/payload')"
+    path = create_mock_gguf(tmp_path / "truncated-client-aliases.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
 def test_gguf_metadata_remote_fetch_detects_later_alias_after_benign_omitted_alias(tmp_path: Path) -> None:
     benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
     value = (
@@ -1613,6 +1626,26 @@ def test_gguf_metadata_remote_fetch_detects_function_alias_after_many_benign_ali
 def test_gguf_metadata_remote_fetch_alias_cap_non_network_calls_stay_clean(value_suffix: str) -> None:
     benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
     value = f"{benign_aliases}\n{value_suffix}"
+
+    evidence = GgufScanner._metadata_value_security_evidence("callback", value)
+
+    assert evidence == []
+
+
+def test_gguf_metadata_remote_fetch_truncated_alias_non_network_calls_stay_clean() -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
+    value = f"{benign_aliases}\nmodel.delete('https://evil.example/not-a-fetch')"
+
+    evidence = GgufScanner._metadata_value_security_evidence("callback", value)
+
+    assert evidence == []
+
+
+def test_gguf_metadata_remote_fetch_truncated_alias_wrong_method_stays_clean() -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
+    value = (
+        f"{benign_aliases}\nimport urllib.request as url_client\nurl_client.delete('https://evil.example/not-a-fetch')"
+    )
 
     evidence = GgufScanner._metadata_value_security_evidence("callback", value)
 
