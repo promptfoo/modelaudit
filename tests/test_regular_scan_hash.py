@@ -393,9 +393,9 @@ class TestHashGenerationEdgeCases:
         hashed_paths: list[str] = []
         original_hash = core._calculate_file_hash
 
-        def spy_hash(path: str) -> str:
+        def spy_hash(path: str, *, deadline: float | None = None) -> str:
             hashed_paths.append(path)
-            return original_hash(path)
+            return original_hash(path, deadline=deadline)
 
         monkeypatch.setattr(core, "_calculate_file_hash", spy_hash)
 
@@ -418,11 +418,11 @@ class TestHashGenerationEdgeCases:
         original_hash = core._calculate_file_hash
         hashed_paths: list[str] = []
 
-        def fail_if_oversized_hashed(path: str) -> str:
+        def fail_if_oversized_hashed(path: str, *, deadline: float | None = None) -> str:
             hashed_paths.append(path)
             if path == str(oversized):
                 raise AssertionError("oversized file was hashed before max_file_size rejection")
-            return original_hash(path)
+            return original_hash(path, deadline=deadline)
 
         monkeypatch.setattr(core, "_calculate_file_hash", fail_if_oversized_hashed)
 
@@ -513,9 +513,9 @@ class TestHashGenerationEdgeCases:
         original_hash = core._calculate_file_hash
         hashed_paths: list[str] = []
 
-        def track_hash(path: str) -> str:
+        def track_hash(path: str, *, deadline: float | None = None) -> str:
             hashed_paths.append(path)
-            return original_hash(path)
+            return original_hash(path, deadline=deadline)
 
         monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
 
@@ -611,9 +611,9 @@ class TestHashGenerationEdgeCases:
         original_hash = core._calculate_file_hash
         hashed_paths: list[str] = []
 
-        def track_hash(path: str) -> str:
+        def track_hash(path: str, *, deadline: float | None = None) -> str:
             hashed_paths.append(path)
-            return original_hash(path)
+            return original_hash(path, deadline=deadline)
 
         monkeypatch.setattr(core.BaseScanner, "default_max_file_read_size", 1_000_000)
         monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
@@ -768,11 +768,11 @@ class TestHashGenerationEdgeCases:
         original_hash = core._calculate_file_hash
         hashed_paths: list[str] = []
 
-        def track_hash(path: str) -> str:
+        def track_hash(path: str, *, deadline: float | None = None) -> str:
             hashed_paths.append(path)
             if path == str(legacy_path):
                 pytest.fail("deferred legacy PyTorch file was included in aggregate content hashing")
-            return original_hash(path)
+            return original_hash(path, deadline=deadline)
 
         def successful_scan(path: str, _config: dict[str, object]) -> ScanResult:
             scan_result = ScanResult(scanner_name="bounded_test")
@@ -901,9 +901,9 @@ class TestHashGenerationEdgeCases:
                 return
             yield from original_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks)
 
-        def track_hash(path: str) -> str:
+        def track_hash(path: str, *, deadline: float | None = None) -> str:
             hashed_paths.append(path)
-            return original_hash(path)
+            return original_hash(path, deadline=deadline)
 
         def successful_scan(_path: str, _config: dict[str, object]) -> ScanResult:
             scan_result = ScanResult(scanner_name="bounded_test")
@@ -994,9 +994,9 @@ class TestHashGenerationEdgeCases:
         hashed_paths: list[str] = []
         original_hash = core._calculate_file_hash
 
-        def track_hash(path: str) -> str:
+        def track_hash(path: str, *, deadline: float | None = None) -> str:
             hashed_paths.append(path)
-            return original_hash(path)
+            return original_hash(path, deadline=deadline)
 
         monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
         monkeypatch.setattr(core, "scan_file", lambda _path, _config: scan_result)
@@ -1030,10 +1030,10 @@ class TestHashGenerationEdgeCases:
 
         original_hash = core._calculate_file_hash
 
-        def mock_hash(path):
+        def mock_hash(path: str, *, deadline: float | None = None) -> str:
             if "bad.pkl" in str(path):
                 raise OSError("Simulated hash failure")
-            return original_hash(path)
+            return original_hash(path, deadline=deadline)
 
         monkeypatch.setattr(core, "_calculate_file_hash", mock_hash)
 
