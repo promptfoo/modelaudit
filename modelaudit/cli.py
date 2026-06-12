@@ -2764,10 +2764,13 @@ def _scan_local_or_downloaded_path(
         ]
         issue_count = len(visible_issues)
         has_critical = any(issue.severity == IssueSeverity.CRITICAL for issue in visible_issues)
+        is_inconclusive = not scan_results.success
 
         if spinner:
             spinner.text = f"Scanned {style_text(display_path, fg='cyan')}"
-            if issue_count == 0:
+            if issue_count == 0 and is_inconclusive:
+                spinner.fail(style_text("❔ Inconclusive", fg="yellow", bold=True))
+            elif issue_count == 0:
                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
             elif has_critical:
                 spinner.fail(
@@ -2786,7 +2789,9 @@ def _scan_local_or_downloaded_path(
                     ),
                 )
         elif runtime.show_styled_output:
-            if issue_count == 0:
+            if issue_count == 0 and is_inconclusive:
+                click.echo(f"Scanned {display_path}: Inconclusive")
+            elif issue_count == 0:
                 click.echo(f"Scanned {display_path}: Clean")
             else:
                 issues_str = "issue" if issue_count == 1 else "issues"
