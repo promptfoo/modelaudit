@@ -2576,8 +2576,12 @@ def test_cached_scan_skips_persisting_incomplete_record_details(
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
-def test_cached_scan_skips_generic_skipped_bare_analysis_incomplete_check(tmp_path: Path) -> None:
-    """Generic skipped checks with bare analysis_incomplete still represent incomplete coverage."""
+@pytest.mark.parametrize("collection_name", ["issues", "checks"])
+def test_cached_scan_skips_persisting_skipped_bare_analysis_incomplete_record_details(
+    tmp_path: Path,
+    collection_name: str,
+) -> None:
+    """Skipped bare incomplete coverage records must be rescanned unless they are runtime skips."""
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
@@ -2586,19 +2590,19 @@ def test_cached_scan_skips_generic_skipped_bare_analysis_incomplete_check(tmp_pa
     @cached_scan()
     def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
         calls["count"] += 1
-        return {
-            "checks": [
-                {
-                    "message": "Embedded secret scan skipped after bounded read",
-                    "status": "skipped",
-                    "details": {"analysis_incomplete": True},
-                }
-            ],
-            "issues": [],
-            "metadata": {},
-            "scan_count": calls["count"],
-            "success": True,
+        record = {
+            "message": "Scanner skipped before completing coverage",
+            "status": "skipped",
+            "details": {"analysis_incomplete": True},
         }
+        result: dict[str, Any] = {
+            "checks": [],
+            "issues": [],
+            "success": True,
+            "scan_count": calls["count"],
+        }
+        result[collection_name] = [record]
+        return result
 
     first = scan(str(file_path), config)
     second = scan(str(file_path), config)
@@ -2610,7 +2614,7 @@ def test_cached_scan_skips_generic_skipped_bare_analysis_incomplete_check(tmp_pa
 
 
 def test_cached_scan_persists_clean_runtime_version_skipped_check(tmp_path: Path) -> None:
-    """Clean runtime-version applicability skips are stable enough to cache."""
+    """Clean runtime-version applicability skipped checks are stable enough to cache."""
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
@@ -2647,6 +2651,44 @@ def test_cached_scan_persists_clean_runtime_version_skipped_check(tmp_path: Path
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
 
 
+def test_cached_scan_skips_issue_with_runtime_version_skip_details(tmp_path: Path) -> None:
+    """Runtime-version skip metadata only exempts skipped checks, not issue records."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [
+                {
+                    "message": "PyTorch runtime version not available; CVE applicability unknown",
+                    "status": "skipped",
+                    "details": {
+                        "analysis_incomplete": True,
+                        "runtime_version_known": False,
+                        "runtime_cve_applicability": "unknown",
+                        "runtime_cve_version_gate": "local_environment_only",
+                    },
+                }
+            ],
+            "metadata": {},
+            "scan_count": calls["count"],
+            "success": True,
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
 def test_cached_scan_skips_skipped_check_with_explicit_incomplete_reason(tmp_path: Path) -> None:
     """Skipped checks with explicit outcome markers must still bypass cache."""
     file_path = _make_cacheable_file(tmp_path)
@@ -2669,39 +2711,6 @@ def test_cached_scan_skips_skipped_check_with_explicit_incomplete_reason(tmp_pat
                 }
             ],
             "issues": [],
-            "metadata": {},
-            "scan_count": calls["count"],
-            "success": True,
-        }
-
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-
-
-def test_cached_scan_skips_issue_with_skipped_status_and_bare_analysis_incomplete(tmp_path: Path) -> None:
-    """Issue records cannot opt into the skipped-check bare analysis_incomplete exemption."""
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
-        return {
-            "checks": [],
-            "issues": [
-                {
-                    "message": "DVC output coverage incomplete",
-                    "status": "skipped",
-                    "details": {"analysis_incomplete": True},
-                }
-            ],
             "metadata": {},
             "scan_count": calls["count"],
             "success": True,

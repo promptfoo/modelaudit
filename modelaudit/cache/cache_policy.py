@@ -8,7 +8,6 @@ from modelaudit.scanner_results import (
     SCAN_OUTCOME_REASONS_METADATA_KEY,
     SCANNER_DEPENDENCY_IDS_METADATA_KEY,
     SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
-    CheckStatus,
 )
 
 _OPERATIONAL_ERROR_INDICATORS = (
@@ -101,44 +100,19 @@ def _record_disqualifies_cache(
 
 def _record_is_clean_runtime_version_skip(record: dict[str, Any]) -> bool:
     details = record.get("details")
+    if not isinstance(details, dict):
+        return False
+    status = record.get("status")
+    status_value = getattr(status, "value", status)
     if not (
-        _record_status_is_skipped(record)
-        and isinstance(details, dict)
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
         and details.get("analysis_incomplete") is True
-        and not _metadata_has_scan_outcome_or_reason_marker(details)
+        and not _has_incomplete_coverage_outcome_marker(details)
     ):
         return False
 
     return all(details.get(key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
-
-
-def _record_status_is_skipped(record: dict[str, Any]) -> bool:
-    status = record.get("status")
-    if isinstance(status, CheckStatus):
-        return status == CheckStatus.SKIPPED
-    if isinstance(status, str):
-        status_name = status.lower()
-        if status_name.startswith("checkstatus."):
-            status_name = status_name.split(".", 1)[1]
-        return status_name == CheckStatus.SKIPPED.value
-    return False
-
-
-def _metadata_has_scan_outcome_or_reason_marker(metadata: dict[str, Any]) -> bool:
-    if metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
-        return True
-
-    reason = metadata.get("scan_outcome_reason")
-    if isinstance(reason, str) and reason:
-        return True
-
-    reasons = metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
-    if isinstance(reasons, str):
-        return bool(reasons)
-    if isinstance(reasons, (list, tuple, set, frozenset)):
-        return any(bool(item) for item in reasons)
-
-    return False
 
 
 def _metadata_disqualifies_cache(metadata: Any, *, allow_bare_analysis_incomplete: bool) -> bool:
@@ -175,6 +149,22 @@ def _metadata_disqualifies_cache(metadata: Any, *, allow_bare_analysis_incomplet
             details,
             allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
         )
+
+    return False
+
+
+def _has_incomplete_coverage_outcome_marker(metadata: dict[str, Any]) -> bool:
+    if metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        return True
+    reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(item) for item in reasons)
 
     return False
 

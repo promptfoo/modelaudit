@@ -719,9 +719,10 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             self.has_errors = True
 
         # Update success status for operational errors or incomplete coverage.
-        issues_have_incomplete_coverage = any(_record_has_incomplete_coverage(issue) for issue in scan_result.issues)
-        checks_have_incomplete_coverage = any(
-            _record_has_incomplete_coverage(check, allow_skipped_check_exemption=True) for check in scan_result.checks
+        issues_have_incomplete_coverage = _records_have_incomplete_coverage(scan_result.issues)
+        checks_have_incomplete_coverage = _records_have_incomplete_coverage(
+            scan_result.checks,
+            allow_skipped_check_exemption=True,
         )
         if (
             bool(metadata.get("operational_error"))
