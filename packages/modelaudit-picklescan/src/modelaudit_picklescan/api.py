@@ -22,6 +22,7 @@ from .call_graph import (
     _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
     _ensure_shared_source_snapshot_stable,
+    class_static_attribute_lookup_is_proven_source_backed,
     find_analyzed_callable_call_graph_global_positions,
     find_dangerous_call_graphs,
     find_startup_hook_write_call_graphs,
@@ -135,6 +136,12 @@ _TRUSTED_REDUCE_REFERENCES = frozenset(
         ("weakref", "ref"),
     }
 )
+_TRUSTED_STATIC_GETATTR_RECONSTRUCTIONS = frozenset(
+    {
+        ("ultralytics.nn.modules.head", "Detect", "forward"),
+    }
+)
+_GETATTR_RESOLVED_SOURCE_PROOF_POSITION = -10_002
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_EOCD_MIN_SIZE = 22
 _ZIP_MAX_COMMENT_SIZE = 0xFFFF
@@ -2248,6 +2255,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     trusted_import_references: frozenset[tuple[str, str]] = frozenset()
     analyzed_invocation_global_positions: frozenset[int] = frozenset()
     analyzed_invocation_references: frozenset[tuple[str, str]] = frozenset()
+    safe_getattr_reconstruction_keys: frozenset[tuple[int, int]] = frozenset()
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     non_allowlisted_global_imports_complete = not bool(report.metadata.get("non_allowlisted_global_imports_truncated"))
@@ -2312,6 +2320,11 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         except Exception as error:
             enrichment_errors.append(("python_import_invocation_analysis", error))
         try:
+            if callable_invocations_complete:
+                safe_getattr_reconstruction_keys = _proven_safe_getattr_reconstruction_keys(callable_invocations)
+        except Exception as error:
+            enrichment_errors.append(("python_getattr_reconstruction_analysis", error))
+        try:
             inert_initialization_modules = _proven_inert_initialization_modules(report)
         except Exception as error:
             enrichment_errors.append(("python_import_initialization", error))
@@ -2325,6 +2338,12 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             source_snapshot_stable = False
             enrichment_errors.append(("python_call_graph_source_stability", error))
         source_fingerprints = shared_source_fingerprint_metadata()
+
+    if source_snapshot_stable and callable_invocations_complete and safe_getattr_reconstruction_keys:
+        report = _without_proven_safe_getattr_reconstruction_findings(
+            report,
+            safe_getattr_reconstruction_keys,
+        )
 
     if (
         source_snapshot_stable
@@ -2430,6 +2449,130 @@ def _with_import_origin_findings(report: PickleReport) -> PickleReport:
         if enrichment_errors
         else updated_report
     )
+
+
+def _proven_safe_getattr_reconstruction_keys(callable_invocations: object) -> frozenset[tuple[int, int]]:
+    keys: set[tuple[int, int]] = set()
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        if not _trusted_static_getattr_reconstruction(invocation):
+            continue
+        if not _getattr_reconstruction_has_source_backed_proof(invocation):
+            continue
+        if _getattr_reconstruction_reaches_dangerous_call_graph(invocation):
+            continue
+        global_position = _optional_int(invocation.get("global_position"))
+        opcode_position = _optional_int(invocation.get("opcode_position"))
+        if global_position is None or opcode_position is None:
+            continue
+        keys.add((global_position, opcode_position))
+    return frozenset(keys)
+
+
+def _trusted_static_getattr_reconstruction(invocation: Mapping[str, object]) -> bool:
+    if str(invocation.get("opcode", "")) != "REDUCE":
+        return False
+    module = str(invocation.get("module", ""))
+    name = str(invocation.get("name", ""))
+    if module not in {"builtins", "__builtin__", "__builtins__"} or name != "getattr":
+        return False
+    if invocation.get("getattr_reconstruction") is not True:
+        return False
+    if invocation.get("getattr_attribute_is_safe_identifier") is not True:
+        return False
+    if invocation.get("getattr_callable_is_direct") is not True:
+        return False
+    if invocation.get("getattr_target_is_direct") is not True:
+        return False
+    target_module = str(invocation.get("getattr_target_module", ""))
+    target_name = str(invocation.get("getattr_target_name", ""))
+    attribute_name = str(invocation.get("getattr_attribute_name", ""))
+    resolved_module = str(invocation.get("getattr_resolved_module", ""))
+    resolved_name = str(invocation.get("getattr_resolved_name", ""))
+    if (target_module, target_name, attribute_name) not in _TRUSTED_STATIC_GETATTR_RECONSTRUCTIONS:
+        return False
+    return resolved_module == target_module and resolved_name == f"{target_name}.{attribute_name}"
+
+
+def _getattr_reconstruction_has_source_backed_proof(invocation: Mapping[str, object]) -> bool:
+    target_module = str(invocation.get("getattr_target_module", ""))
+    target_name = str(invocation.get("getattr_target_name", ""))
+    attribute_name = str(invocation.get("getattr_attribute_name", ""))
+    if not module_initialization_is_proven_inert(target_module):
+        return False
+    if not class_static_attribute_lookup_is_proven_source_backed(target_module, target_name, attribute_name):
+        return False
+    resolved_invocation = _getattr_reconstruction_resolved_source_proof_invocation(invocation)
+    analyzed_positions = find_analyzed_callable_call_graph_global_positions((resolved_invocation,))
+    return _GETATTR_RESOLVED_SOURCE_PROOF_POSITION in analyzed_positions
+
+
+def _getattr_reconstruction_reaches_dangerous_call_graph(invocation: Mapping[str, object]) -> bool:
+    resolved_invocation = _getattr_reconstruction_resolved_source_proof_invocation(invocation)
+    return bool(find_dangerous_call_graphs((), (resolved_invocation,)))
+
+
+def _getattr_reconstruction_resolved_source_proof_invocation(
+    invocation: Mapping[str, object],
+) -> dict[str, object]:
+    resolved_module = str(invocation.get("getattr_resolved_module", ""))
+    resolved_name = str(invocation.get("getattr_resolved_name", ""))
+    return {
+        "opcode": "REDUCE",
+        "module": resolved_module,
+        "name": resolved_name,
+        "import_reference": f"{resolved_module}.{resolved_name}",
+        "positional_arg_count": 0,
+        "global_position": _GETATTR_RESOLVED_SOURCE_PROOF_POSITION,
+        "opcode_position": invocation.get("opcode_position"),
+    }
+
+
+def _without_proven_safe_getattr_reconstruction_findings(
+    report: PickleReport,
+    safe_getattr_reconstruction_keys: frozenset[tuple[int, int]],
+) -> PickleReport:
+    findings = tuple(
+        finding
+        for finding in report.findings
+        if _dangerous_getattr_call_key(finding) not in safe_getattr_reconstruction_keys
+    )
+    if len(findings) == len(report.findings):
+        return report
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=_verdict_for_findings(report.status, findings),
+        findings=findings,
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        private_metadata=report.private_metadata,
+        duration_s=report.duration_s,
+    )
+
+
+def _dangerous_getattr_call_key(finding: Finding) -> tuple[int, int] | None:
+    if finding.rule_code != "DANGEROUS_CALL" or str(finding.details.get("opcode", "")) != "REDUCE":
+        return None
+    module = str(finding.details.get("module", ""))
+    name = str(finding.details.get("name", ""))
+    if module not in {"builtins", "__builtin__", "__builtins__"} or name != "getattr":
+        return None
+    global_position = _optional_int(finding.details.get("global_position"))
+    opcode_position = _optional_int(finding.details.get("opcode_position"))
+    if global_position is None or opcode_position is None:
+        return None
+    return (global_position, opcode_position)
+
+
+def _verdict_for_findings(status: ScanStatus, findings: tuple[Finding, ...]) -> SafetyVerdict:
+    if any(finding.severity == Severity.CRITICAL for finding in findings):
+        return SafetyVerdict.MALICIOUS
+    if any(finding.severity == Severity.WARNING for finding in findings):
+        return SafetyVerdict.SUSPICIOUS
+    return SafetyVerdict.CLEAN if status == ScanStatus.COMPLETE else SafetyVerdict.UNKNOWN
 
 
 def _proven_inert_initialization_modules(report: PickleReport) -> frozenset[str]:
