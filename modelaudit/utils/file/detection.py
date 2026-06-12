@@ -7588,6 +7588,8 @@ def _is_complete_bounded_text_payload(payload: bytes) -> bool:
 
 def _decoded_text_payload_has_text_shape(decoded: str) -> bool:
     """Reject binary-looking scalar streams while accepting ordinary prose and tokenizer text."""
+    if any(unicodedata.category(character) in {"Cc", "Cs"} and character not in "\t\n\r\f" for character in decoded):
+        return False
     if _decoded_text_payload_is_low_diversity_scalar_stream(decoded):
         return False
     return any(

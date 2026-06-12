@@ -3124,6 +3124,28 @@ class TestModelDownloadStreaming:
 
         assert detected_format == "flax_msgpack"
 
+    @pytest.mark.parametrize("filename", ["README.md", "model_card.md"])
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_control_scalar_documentation_fail_closed(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should not suppress UTF-8 control scalar streams."""
+        payload = b"A\xc2\x80" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 3) + 1)
+        mock_requests_get.side_effect = _fake_bounded_range_response(payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "intfloat/multilingual-e5-small",
+            filename,
+            _HF_MULTILINGUAL_E5_README_REVISION,
+            budget,
+            payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format == "flax_msgpack"
+
     @patch("requests.get")
     def test_detect_huggingface_flax_route_preserves_utf8_scalar_readme_fail_closed(
         self,

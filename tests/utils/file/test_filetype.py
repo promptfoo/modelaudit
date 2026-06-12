@@ -664,6 +664,16 @@ def test_detect_control_byte_merges_still_fails_closed_as_flax(tmp_path: Path) -
     assert detect_file_format(str(merges)) == "flax_msgpack"
 
 
+def test_detect_utf8_control_scalar_merges_still_fails_closed_as_flax(tmp_path: Path) -> None:
+    merges = tmp_path / "merges.txt"
+    merges.write_bytes(b"A\xc2\x80" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 3) + 1))
+
+    assert file_detection._is_complete_declared_text_asset(merges, merges.stat().st_size) is False
+    assert detect_file_format_from_magic(str(merges)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(merges)) == "flax_msgpack"
+    assert detect_file_format(str(merges)) == "flax_msgpack"
+
+
 def test_detect_printable_utf8_non_text_suffix_still_fails_closed_as_flax(tmp_path: Path) -> None:
     payload = _bpe_merges_payload()
     renamed = tmp_path / "merges.jpg"
