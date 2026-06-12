@@ -1111,6 +1111,139 @@ def test_license_metadata_annotated_tiny_base64_chunks_keep_length_pattern_and_s
     )
 
 
+def test_license_metadata_invalid_wrapped_base64_modulo_one_fails_closed(tmp_path: Path) -> None:
+    file_path = tmp_path / "invalid_modulo_one_wrapped_base64_license_metadata.safetensors"
+    invalid_tail = ("QUJD" * 6) + "A"
+    payload = f"{ordinary_license_text_with_url()}\n{invalid_tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert len(invalid_tail) % 4 == 1
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "https?://"}
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [2, 3])
+def test_license_metadata_unpadded_tiny_base64_chunks_reconstruct_active_payload(
+    tmp_path: Path,
+    chunk_size: int,
+) -> None:
+    file_path = tmp_path / f"unpadded_{chunk_size}_char_base64_license_metadata.safetensors"
+    encoded_payload = base64.b64encode(b"import os\nos.system('id')\n#").decode("ascii").rstrip("=")
+    chunks = [encoded_payload[index : index + chunk_size] for index in range(0, len(encoded_payload), chunk_size)]
+    wrapped_tail = "\n".join(f"License grant {chunk} under terms" for chunk in chunks)
+    payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert all(2 <= len(chunk) <= 3 and "=" not in chunk for chunk in chunks)
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "https?://"}
+        for check in result.checks
+    )
+
+
+def test_license_metadata_unpadded_tiny_word_like_chunk_reconstructs_active_payload(tmp_path: Path) -> None:
+    file_path = tmp_path / "unpadded_word_like_base64_license_metadata.safetensors"
+    encoded_payload = base64.b64encode(b"o import os\nos.system('id')\n").decode("ascii").rstrip("=")
+    chunks = [encoded_payload[index : index + 2] for index in range(0, len(encoded_payload), 2)]
+    wrapped_tail = "\n".join(f"License grant {chunk} under terms" for chunk in chunks)
+    payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert "by" in chunks
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+
+
+def test_license_metadata_repeated_short_documentary_words_stays_clean(tmp_path: Path) -> None:
+    file_path = tmp_path / "short_documentary_words_license_metadata.safetensors"
+    repeated_terms = "\n".join("License to use under applicable terms." for _ in range(80))
+    payload = f"{ordinary_license_text_with_url()}\n{repeated_terms}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert all("license" not in issue.message for issue in result.issues)
+
+
+def test_license_metadata_separator_overflow_between_short_chunks_fails_closed(tmp_path: Path) -> None:
+    file_path = tmp_path / "separator_overflow_wrapped_base64_license_metadata.safetensors"
+    encoded_payload = base64.b64encode(b"import os\nos.system('id')\n").decode("ascii").rstrip("=")
+    chunks = [encoded_payload[index : index + 12] for index in range(0, len(encoded_payload), 12)]
+    separator = "\n".join("License terms grant permission reproduce distribute work." for _ in range(5))
+    wrapped_tail = f"\n{separator}\n".join(chunks)
+    payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert all(8 <= len(chunk) <= 20 for chunk in chunks)
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "https?://"}
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     ("payload_tail", "file_stem"),
     [
