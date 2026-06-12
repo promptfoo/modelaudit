@@ -57,6 +57,11 @@ def _metadata_value(metadata: Any, key: str) -> Any:
 
 _COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS = frozenset({"recognized_format_scanner_unavailable"})
 _COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES = ("_routing_incomplete",)
+_RUNTIME_VERSION_SKIP_DETAILS = {
+    "runtime_version_known": False,
+    "runtime_cve_applicability": "unknown",
+    "runtime_cve_version_gate": "local_environment_only",
+}
 
 
 def _metadata_has_coverage_only_operational_error(metadata: Any) -> bool:
@@ -132,6 +137,21 @@ def _details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
     return False
 
 
+def _record_is_clean_runtime_version_skip(record: Any) -> bool:
+    details = _metadata_value(record, "details")
+    status = _metadata_value(record, "status")
+    status_value = getattr(status, "value", status)
+    if not (
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
+        and _metadata_value(details, "analysis_incomplete") is True
+        and not _metadata_has_scan_outcome_or_reason_marker(details)
+    ):
+        return False
+
+    return all(_metadata_value(details, key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
+
+
 def _file_metadata_has_incomplete_coverage(file_metadata: Any) -> bool:
     """Return True when any file metadata entry reports incomplete scan coverage."""
     if not isinstance(file_metadata, dict):
@@ -144,16 +164,9 @@ def _records_have_incomplete_coverage(records: Any) -> bool:
     if not isinstance(records, list):
         return False
     for record in records:
-        details = _metadata_value(record, "details")
-        status = _metadata_value(record, "status")
-        status_value = getattr(status, "value", status)
-        if (
-            isinstance(status_value, str)
-            and status_value.lower().split(".", 1)[-1] == "skipped"
-            and _metadata_value(details, "analysis_incomplete") is True
-            and not _metadata_has_scan_outcome_or_reason_marker(details)
-        ):
+        if _record_is_clean_runtime_version_skip(record):
             continue
+        details = _metadata_value(record, "details")
         if _details_have_incomplete_coverage(details):
             return True
     return False

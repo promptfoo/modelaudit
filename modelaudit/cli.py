@@ -50,6 +50,7 @@ from .core_results import (
     details_have_incomplete_coverage,
     details_match_shard_family_paths,
     metadata_has_incomplete_coverage,
+    record_details_have_incomplete_coverage,
     records_have_incomplete_coverage_for_path,
     results_have_incomplete_coverage_under_directory,
     results_have_inconclusive_outcome,
@@ -1854,7 +1855,7 @@ class _ScanPathState:
                 details = details if isinstance(details, dict) else None
                 if details is None:
                     continue
-                if not (details.get("operational_error") is True or details_have_incomplete_coverage(details)):
+                if not (details.get("operational_error") is True or record_details_have_incomplete_coverage(record)):
                     continue
                 if path_matches_shard_family(getattr(record, "location", None), shard_paths):
                     return True
@@ -5302,7 +5303,7 @@ def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, s
         fallback_location = collection_name[:-1]
         for record in records:
             details = _get_issue_attr(record, "details", {})
-            if not details_have_incomplete_coverage(details):
+            if not record_details_have_incomplete_coverage(record):
                 continue
             location = (
                 _get_issue_attr(record, "location")

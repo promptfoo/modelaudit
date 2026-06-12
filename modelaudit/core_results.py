@@ -33,6 +33,11 @@ SCAN_OUTCOME_REASON_METADATA_KEY = "scan_outcome_reason"
 SCAN_OUTCOME_REASONS_METADATA_KEY = "scan_outcome_reasons"
 _COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS = frozenset({"recognized_format_scanner_unavailable"})
 _COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES = ("_routing_incomplete",)
+_RUNTIME_VERSION_SKIP_DETAILS = {
+    "runtime_version_known": False,
+    "runtime_cve_applicability": "unknown",
+    "runtime_cve_version_gate": "local_environment_only",
+}
 _SHARD_FAMILY_PATH_DETAIL_KEYS = frozenset(
     {
         "duplicate_shards",
@@ -177,6 +182,21 @@ def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
     return _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
 
 
+def _record_is_clean_runtime_version_skip(record: Any) -> bool:
+    details = _metadata_value(record, "details")
+    status = _metadata_value(record, "status")
+    status_value = getattr(status, "value", status)
+    if not (
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
+        and _metadata_value(details, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
+        and not _metadata_has_scan_outcome_or_reason_marker(details)
+    ):
+        return False
+
+    return all(_metadata_value(details, key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
+
+
 def details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
     """Return True when details or consolidated detail findings identify incomplete coverage."""
     if _metadata_has_explicit_incomplete_coverage_marker(details):
@@ -224,16 +244,9 @@ def details_match_shard_family_paths(
 
 def record_details_have_incomplete_coverage(record: Any) -> bool:
     """Return True when a retained issue/check detail object identifies incomplete coverage."""
-    details = _metadata_value(record, "details")
-    status = _metadata_value(record, "status")
-    status_value = getattr(status, "value", status)
-    if (
-        isinstance(status_value, str)
-        and status_value.lower().split(".", 1)[-1] == "skipped"
-        and _metadata_value(details, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
-        and not _metadata_has_scan_outcome_or_reason_marker(details)
-    ):
+    if _record_is_clean_runtime_version_skip(record):
         return False
+    details = _metadata_value(record, "details")
     return details_have_incomplete_coverage(details)
 
 
