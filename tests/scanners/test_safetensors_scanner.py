@@ -1689,6 +1689,8 @@ def test_license_metadata_encoded_backslash_url_delimiters_fail_closed(
         "https%3A%5C%5Cevil.example%5Cx",
         "https:%5C%5Cevil.example%5Cx",
         "h%74tps%3A%5C%5Cevil.example%5Cx",
+        "%48%54%54%50%53%3A%5C%5Cevil.example%5Cx",
+        "%2548%2554%2554%2550%2553%253A%255C%255Cevil.example%255Cx",
     ],
 )
 def test_license_metadata_short_encoded_backslash_url_delimiters_report_s905_without_raw_url(

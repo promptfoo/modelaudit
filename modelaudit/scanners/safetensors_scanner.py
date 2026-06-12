@@ -455,11 +455,11 @@ _BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
 _URL_PATH_NORMALIZATION_PASSES = 4
 _PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
 _ENCODED_URL_SCHEME_LETTERS = (
-    r"(?:h|%(?:25)*68)",
-    r"(?:t|%(?:25)*74)",
-    r"(?:t|%(?:25)*74)",
-    r"(?:p|%(?:25)*70)",
-    r"(?:s|%(?:25)*73)?",
+    r"(?:h|%(?:25)*(?:48|68))",
+    r"(?:t|%(?:25)*(?:54|74))",
+    r"(?:t|%(?:25)*(?:54|74))",
+    r"(?:p|%(?:25)*(?:50|70))",
+    r"(?:s|%(?:25)*(?:53|73))?",
 )
 _ENCODED_URL_DELIMITER_PATTERN = re.compile(
     rf"(?P<scheme>{''.join(_ENCODED_URL_SCHEME_LETTERS)})(?P<colon>%(?:25)*3a|:)"
