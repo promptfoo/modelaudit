@@ -9,6 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- avoid critical `getattr` findings for proven Ultralytics `Detect.forward` reconstruction while preserving unsafe traversal controls
 - avoid routing trusted NumPy extension reconstruction exports through module `__getattr__` fallbacks while preserving legacy dotted-`GLOBAL` hook detection
 - preserve nested and aliased callable opcode evidence for downstream scanners
 
