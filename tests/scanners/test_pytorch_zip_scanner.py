@@ -8711,6 +8711,11 @@ def _static_getattr_with_stack_global_memo_operand_payload(
     return payload + _pickle_binunicode(b"forward") + b"\x86R."
 
 
+def _static_getattr_with_memo_read_args_tuple_payload() -> bytes:
+    args_tuple = _pickle_global(b"ultralytics.nn.modules.head", b"Detect") + _pickle_binunicode(b"forward") + b"\x86"
+    return b"\x80\x04" + _pickle_global(b"__builtin__", b"getattr") + args_tuple + b"q\x000h\x00R."
+
+
 def _static_getattr_protocol0_unicode_payload() -> bytes:
     return b"c__builtin__\ngetattr\ncultralytics.nn.modules.head\nDetect\nVforward\n\x86R."
 
@@ -8860,6 +8865,22 @@ def test_pytorch_zip_static_getattr_stack_global_memo_operands_keep_s115(
         "class Detect:\n    def forward(self):\n        return None\n",
     )
     model_path = _write_getattr_reconstruction_zip(tmp_path, payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_memo_read_args_tuple_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_with_memo_read_args_tuple_payload())
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -9075,6 +9096,22 @@ def test_pytorch_zip_static_getattr_post_class_binding_target_keeps_s115(
         "        return None\n\n"
         "for Detect in [Evil]:\n"
         "    pass\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_class_body_import_rebinding_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n    from os import system as forward\n",
     )
     model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
 

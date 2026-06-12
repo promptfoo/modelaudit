@@ -170,6 +170,34 @@ def _static_getattr_protocol0_unicode_payload() -> bytes:
     return b"c__builtin__\ngetattr\ncultralytics.nn.modules.head\nDetect\nVforward\n\x86R."
 
 
+_TUPLE_MEMO_WRITES: tuple[tuple[str, bytes], ...] = (
+    ("PUT", b"p0\n"),
+    ("BINPUT", b"q\x00"),
+    ("LONG_BINPUT", b"r\x00\x00\x00\x00"),
+    ("MEMOIZE", b"\x94"),
+)
+_TUPLE_MEMO_READS: tuple[tuple[str, bytes], ...] = (
+    ("GET", b"g0\n"),
+    ("BINGET", b"h\x00"),
+    ("LONG_BINGET", b"j\x00\x00\x00\x00"),
+)
+
+
+def _static_getattr_with_memo_read_args_tuple_payload(
+    *,
+    tuple_opcode: bytes,
+    memo_write: bytes,
+    memo_read: bytes,
+) -> bytes:
+    if tuple_opcode == b"\x86":
+        args_tuple = _global(b"ultralytics.nn.modules.head", b"Detect") + _binunicode(b"forward") + tuple_opcode
+    elif tuple_opcode == b"t":
+        args_tuple = b"(" + _global(b"ultralytics.nn.modules.head", b"Detect") + _binunicode(b"forward") + tuple_opcode
+    else:
+        raise ValueError(f"unsupported tuple opcode: {tuple_opcode!r}")
+    return b"\x80\x04" + _global(b"__builtin__", b"getattr") + args_tuple + memo_write + b"0" + memo_read + b"R."
+
+
 def _static_getattr_with_opaque_target_payload() -> bytes:
     return b"\x80\x04" + _global(b"__builtin__", b"getattr") + b"}" + _binunicode(b"forward") + b"\x86R."
 
@@ -470,6 +498,37 @@ def test_scan_bytes_static_getattr_stack_global_memo_operands_stay_critical(
     assert getattr_invocation[direct_field] is False
 
 
+@pytest.mark.parametrize(("tuple_name", "tuple_opcode"), [("TUPLE2", b"\x86"), ("TUPLE", b"t")])
+@pytest.mark.parametrize(("memo_write_name", "memo_write"), _TUPLE_MEMO_WRITES)
+@pytest.mark.parametrize(("memo_read_name", "memo_read"), _TUPLE_MEMO_READS)
+def test_scan_bytes_static_getattr_memo_read_args_tuple_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tuple_name: str,
+    tuple_opcode: bytes,
+    memo_write_name: str,
+    memo_write: bytes,
+    memo_read_name: str,
+    memo_read: bytes,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = _static_getattr_with_memo_read_args_tuple_payload(
+        tuple_opcode=tuple_opcode,
+        memo_write=memo_write,
+        memo_read=memo_read,
+    )
+
+    report = scan_bytes(payload, source=f"memo-read-{tuple_name}-{memo_write_name}-{memo_read_name}.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
 def test_scan_bytes_repeated_static_getattr_reconstructions_suppress_each_position(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -698,6 +757,16 @@ def test_scan_bytes_static_getattr_decorated_class_stays_critical(
             "        return None\n\n"
             "for Detect in [Evil]:\n"
             "    pass\n"
+        ),
+        ("class Detect:\n    def forward(self):\n        return None\n    from os import system as forward\n"),
+        ("class Detect:\n    def forward(self):\n        return None\n    from os import popen as forward\n"),
+        ("class Detect:\n    def forward(self):\n        return None\n    import os as forward\n"),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n"
+            "    if True:\n"
+            "        from os import system as forward\n"
         ),
     ],
 )

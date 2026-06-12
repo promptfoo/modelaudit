@@ -5223,6 +5223,53 @@ impl<'a> ScanState<'a> {
                 end: *end,
                 memo_read: *existing_memo_read || memo_read,
             },
+            StackValue::Tuple(values) => StackValue::Tuple(
+                values
+                    .iter()
+                    .map(|item| Self::memo_read_stack_value(item, memo_read))
+                    .collect(),
+            ),
+            value => value.clone(),
+        }
+    }
+
+    fn memo_read_stack_value(value: &StackValue, memo_read: bool) -> StackValue {
+        if !memo_read {
+            return value.clone();
+        }
+        match value {
+            StackValue::Global(reference) => {
+                let mut reference = reference.clone();
+                reference.memo_read = true;
+                StackValue::Global(reference)
+            }
+            StackValue::Constructed(reference) => {
+                let mut reference = reference.clone();
+                reference.memo_read = true;
+                StackValue::Constructed(reference)
+            }
+            StackValue::Text {
+                value,
+                memo_read: existing_memo_read,
+            } => StackValue::Text {
+                value: value.clone(),
+                memo_read: *existing_memo_read || memo_read,
+            },
+            StackValue::TextSpan {
+                start,
+                end,
+                memo_read: existing_memo_read,
+            } => StackValue::TextSpan {
+                start: *start,
+                end: *end,
+                memo_read: *existing_memo_read || memo_read,
+            },
+            StackValue::Tuple(values) => StackValue::Tuple(
+                values
+                    .iter()
+                    .map(|item| Self::memo_read_stack_value(item, memo_read))
+                    .collect(),
+            ),
             value => value.clone(),
         }
     }

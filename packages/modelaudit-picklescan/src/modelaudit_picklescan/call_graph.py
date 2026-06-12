@@ -4958,6 +4958,10 @@ def _class_base_targets_for_static_lookup(
 def _class_body_statement_binds_name(statement: ast.stmt, name: str) -> bool:
     if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
         return statement.name == name
+    if isinstance(statement, ast.Import):
+        return any((alias.asname or alias.name.split(".")[0]) == name for alias in statement.names)
+    if isinstance(statement, ast.ImportFrom):
+        return any((alias.asname or alias.name) == name for alias in statement.names)
     if isinstance(statement, ast.Assign):
         return any(_assignment_target_binds_name(target, name) for target in statement.targets)
     if isinstance(statement, ast.AnnAssign | ast.AugAssign):
