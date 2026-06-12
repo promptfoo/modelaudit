@@ -2273,6 +2273,59 @@ def test_legacy_pytorch_storage_pid_keeps_unpositioned_import_metadata_without_f
     assert not any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
 
 
+def test_legacy_pytorch_storage_pid_downgrades_origin_finding_by_parser_layout_position() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
+    storage_import_position = payload.index(b"ctorch\nByteStorage\n")
+    assert layout is not None
+
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage"}],
+            "pickle_verdict": "suspicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Found allowlisted global reference from an untrusted module origin: torch.ByteStorage",
+        severity=IssueSeverity.WARNING,
+        location="legacy.pt",
+        details={
+            "opcode": "GLOBAL",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "pickle_rule_code": "NON_ALLOWLISTED_GLOBAL",
+            "position": storage_import_position,
+        },
+        rule_code="S205",
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+    assert _private_actionable_failed_checks(serialized_result) == []
+
+
 def test_legacy_pytorch_storage_pid_keeps_nonallowlisted_global_without_position_match() -> None:
     payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
     layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
@@ -2323,6 +2376,61 @@ def test_legacy_pytorch_storage_pid_keeps_nonallowlisted_global_without_position
     assert any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
     assert any(
         check.rule_code == "NON_ALLOWLISTED_GLOBAL" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert not any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+
+
+def test_legacy_pytorch_storage_pid_keeps_origin_finding_without_parser_layout_position_match() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
+    storage_import_position = payload.index(b"ctorch\nByteStorage\n")
+    assert layout is not None
+
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage"}],
+            "pickle_verdict": "suspicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Found allowlisted global reference from an untrusted module origin: torch.ByteStorage",
+        severity=IssueSeverity.WARNING,
+        location="legacy.pt",
+        details={
+            "opcode": "GLOBAL",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "pickle_rule_code": "NON_ALLOWLISTED_GLOBAL",
+            "position": storage_import_position + 1,
+        },
+        rule_code="S205",
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert any(issue.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+    assert any(
+        check.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL" and check.status == CheckStatus.FAILED
+        for check in result.checks
     )
     assert not any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
 

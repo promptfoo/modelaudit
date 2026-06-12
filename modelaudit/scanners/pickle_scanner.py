@@ -2781,10 +2781,15 @@ class PickleScanner(BaseScanner):
             return False
         if import_reference in trusted_import_references:
             return True
-        return cls._pickle_location_position(location) in trusted_import_positions.get(import_reference, set())
+        return cls._legacy_pytorch_storage_import_position_matches(
+            import_reference,
+            details,
+            trusted_import_positions,
+            location,
+        )
 
     @classmethod
-    def _is_legacy_pytorch_storage_import_global_finding(
+    def _is_legacy_pytorch_storage_import_origin_finding(
         cls,
         details: dict[str, Any],
         trusted_import_positions: Mapping[str, set[int]],
@@ -2794,15 +2799,33 @@ class PickleScanner(BaseScanner):
         opcode = details.get("opcode")
         if not (
             details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+            and "invocation_import_reference" not in details
+            and details.get("invoked") is not True
             and (opcode is None or opcode in {"GLOBAL", "STACK_GLOBAL"})
             and isinstance(import_reference, str)
         ):
             return False
-        trusted_positions = trusted_import_positions.get(import_reference, set())
-        position = details.get("position")
-        return (type(position) is int and position in trusted_positions) or (
-            cls._pickle_location_position(location) in trusted_positions
+        return cls._legacy_pytorch_storage_import_position_matches(
+            import_reference,
+            details,
+            trusted_import_positions,
+            location,
         )
+
+    @staticmethod
+    def _legacy_pytorch_storage_import_position_matches(
+        import_reference: str,
+        details: dict[str, Any],
+        trusted_import_positions: Mapping[str, set[int]],
+        location: str | None,
+    ) -> bool:
+        positions = trusted_import_positions.get(import_reference, set())
+        if not positions:
+            return False
+        detail_position = details.get("position")
+        if type(detail_position) is int and detail_position in positions:
+            return True
+        return PickleScanner._pickle_location_position(location) in positions
 
     @staticmethod
     def _annotate_legacy_pytorch_storage_persistent_id_record(
@@ -2937,14 +2960,22 @@ class PickleScanner(BaseScanner):
             result,
             trusted_storage_import_positions,
         )
-        downgraded_import_count = 0
-        for check in result.checks:
-            if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
-                check.details,
+
+        def is_trusted_storage_import_finding(check_or_issue: Check | Issue) -> bool:
+            return cls._is_legacy_pytorch_storage_import_call_graph_finding(
+                check_or_issue.details,
                 trusted_storage_import_references,
                 trusted_storage_import_positions,
-                check.location,
-            ):
+                check_or_issue.location,
+            ) or cls._is_legacy_pytorch_storage_import_origin_finding(
+                check_or_issue.details,
+                trusted_storage_import_positions,
+                check_or_issue.location,
+            )
+
+        downgraded_import_count = 0
+        for check in result.checks:
+            if not is_trusted_storage_import_finding(check):
                 continue
             if check.rule_code is not None:
                 downgraded_private_entries.append({"name": check.name, "rule_code": check.rule_code})
@@ -2957,45 +2988,7 @@ class PickleScanner(BaseScanner):
 
         if downgraded_import_count:
             result.metadata["legacy_pytorch_trusted_storage_import_count"] = downgraded_import_count
-            result.issues = [
-                issue
-                for issue in result.issues
-                if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
-                    issue.details,
-                    trusted_storage_import_references,
-                    trusted_storage_import_positions,
-                    issue.location,
-                )
-            ]
-
-        downgraded_global_import_count = 0
-        for check in result.checks:
-            if not cls._is_legacy_pytorch_storage_import_global_finding(
-                check.details,
-                trusted_storage_import_positions,
-                check.location,
-            ):
-                continue
-            if check.rule_code is not None:
-                downgraded_private_entries.append({"name": check.name, "rule_code": check.rule_code})
-            check.status = CheckStatus.PASSED
-            check.severity = IssueSeverity.INFO
-            check.message = "PyTorch storage global import found in validated legacy PyTorch stream"
-            check.details["trusted_legacy_pytorch_context"] = True
-            check.details["pytorch_storage_import_reference"] = True
-            downgraded_global_import_count += 1
-
-        if downgraded_global_import_count:
-            result.metadata["legacy_pytorch_trusted_storage_global_import_count"] = downgraded_global_import_count
-            result.issues = [
-                issue
-                for issue in result.issues
-                if not cls._is_legacy_pytorch_storage_import_global_finding(
-                    issue.details,
-                    trusted_storage_import_positions,
-                    issue.location,
-                )
-            ]
+            result.issues = [issue for issue in result.issues if not is_trusted_storage_import_finding(issue)]
 
         if downgraded_count:
             result.metadata["legacy_pytorch_trusted_storage_persistent_id_count"] = downgraded_count
