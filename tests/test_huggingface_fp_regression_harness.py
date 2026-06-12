@@ -213,8 +213,8 @@ def test_huggingface_streaming_selector_respects_selected_scanner_ids() -> None:
             scannable_scanner_ids={"pytorch_zip"},
         )
 
-    assert safetensors_selected == ["model.safetensors"]
-    assert "renamed.payload" in pytorch_selected
+    assert safetensors_selected.filenames == ["model.safetensors"]
+    assert "renamed.payload" in pytorch_selected.filenames
 
 
 @pytest.mark.integration

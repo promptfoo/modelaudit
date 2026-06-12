@@ -101,6 +101,62 @@ def _make_malformed_legacy_pytorch_near_match() -> tuple[bytes, dict[str, int]]:
     return b"".join(control_streams.values()) + b"\x80\x02]" + (b"A" * 2048), offsets
 
 
+def _write_regular_scan_onnx_model(
+    model_path: Path,
+    *,
+    external_location: str | None = None,
+    external_size: int = 4,
+    stale_inline_location: str | None = None,
+) -> None:
+    pytest.importorskip("onnx")
+    import onnx
+    from onnx import TensorProto, helper
+    from onnx.onnx_ml_pb2 import StringStringEntryProto
+
+    if external_location is not None:
+        initializer = onnx.TensorProto()
+        initializer.name = "W"
+        initializer.data_type = TensorProto.UINT8
+        initializer.dims.extend([external_size])
+        initializer.data_location = TensorProto.EXTERNAL
+        entry = StringStringEntryProto()
+        entry.key = "location"
+        entry.value = external_location
+        initializer.external_data.append(entry)
+    else:
+        initializer = helper.make_tensor("W", TensorProto.FLOAT, [1], [1.0])
+        if stale_inline_location is not None:
+            entry = StringStringEntryProto()
+            entry.key = "location"
+            entry.value = stale_inline_location
+            initializer.external_data.append(entry)
+
+    input_info = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    output_info = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    node = helper.make_node("Relu", ["input"], ["output"], name="relu")
+    graph = helper.make_graph([node], "graph", [input_info], [output_info], initializer=[initializer])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.save(model, str(model_path))
+
+
+def _path_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _skip_path_during_directory_prefilter(monkeypatch: pytest.MonkeyPatch, skipped_path: Path) -> None:
+    from modelaudit import core
+
+    original_should_skip_file = core.should_skip_file
+    skipped_path = skipped_path.resolve()
+
+    def should_skip_file(path: str, *args: Any, **kwargs: Any) -> bool:
+        if Path(path).resolve() == skipped_path:
+            return True
+        return original_should_skip_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(core, "should_skip_file", should_skip_file)
+
+
 class _TrackingBinaryFile:
     def __init__(self, raw: BinaryIO) -> None:
         self._raw = raw
@@ -1064,3 +1120,148 @@ class TestHashGenerationEdgeCases:
         assert duration < 2.0
         assert result.content_hash is not None
         assert result.files_scanned == 10
+
+
+class TestOnnxExternalDataContentHash:
+    def test_directory_hash_ignores_stale_external_data_on_inline_tensor(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Inline tensors with stale external_data metadata must not pull stale sidecars into hashes."""
+        model_path = tmp_path / "model.onnx"
+        stale_sidecar = tmp_path / "stale.bin"
+        stale_sidecar.write_bytes(b"stale sidecar bytes")
+        _write_regular_scan_onnx_model(model_path, stale_inline_location=stale_sidecar.name)
+        _skip_path_during_directory_prefilter(monkeypatch, stale_sidecar)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            scanners=["onnx"],
+        )
+
+        assert result.bytes_scanned == model_path.stat().st_size
+        assert result.content_hash == compute_aggregate_hash([_path_sha256(model_path)])
+        assert str(stale_sidecar) not in result.file_metadata
+
+    def test_directory_hash_includes_renamed_onnx_external_data_sidecar(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Content-routed ONNX files should hash declared sidecars even when sidecars are skipped entries."""
+        model_path = tmp_path / "renamed"
+        sidecar = tmp_path / "weights.data"
+        sidecar.write_bytes(b"\x01\x02\x03\x04")
+        _write_regular_scan_onnx_model(model_path, external_location=sidecar.name, external_size=sidecar.stat().st_size)
+        _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            scanners=["onnx"],
+        )
+
+        assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
+        assert result.content_hash == compute_aggregate_hash([_path_sha256(model_path), _path_sha256(sidecar)])
+        assert str(sidecar) not in result.file_metadata
+
+    def test_directory_hash_does_not_double_count_top_level_onnx_sidecar(self, tmp_path: Path) -> None:
+        """External data sidecars that are scanned as entries should not be added again as ONNX context."""
+        model_path = tmp_path / "renamed"
+        sidecar = tmp_path / "weights.pkl"
+        sidecar.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+        _write_regular_scan_onnx_model(model_path, external_location=sidecar.name, external_size=sidecar.stat().st_size)
+
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
+        assert result.content_hash == compute_aggregate_hash([_path_sha256(model_path), _path_sha256(sidecar)])
+        assert str(sidecar) in result.file_metadata
+
+    def test_directory_hash_omits_hash_when_onnx_sidecar_exceeds_max_file_size(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sidecars discovered from ONNX metadata must obey the same max_file_size hash completeness rule."""
+        model_path = tmp_path / "renamed"
+        sidecar = tmp_path / "weights.data"
+        sidecar.write_bytes(b"W" * 2048)
+        _write_regular_scan_onnx_model(model_path, external_location=sidecar.name, external_size=sidecar.stat().st_size)
+        _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            scanners=["onnx"],
+            max_file_size=model_path.stat().st_size,
+        )
+
+        assert result.bytes_scanned == model_path.stat().st_size
+        assert result.content_hash is None
+
+    def test_directory_hash_omits_hash_when_onnx_sidecar_hash_fails(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A present but unreadable declared sidecar must not leave a model-only aggregate hash."""
+        from modelaudit import core
+
+        model_path = tmp_path / "renamed"
+        sidecar = tmp_path / "weights.data"
+        sidecar.write_bytes(b"\x01\x02\x03\x04")
+        _write_regular_scan_onnx_model(model_path, external_location=sidecar.name, external_size=sidecar.stat().st_size)
+        _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+        original_hash = core._calculate_file_hash
+
+        def fail_sidecar_hash(file_path: str, *, deadline: float | None = None) -> str:
+            if Path(file_path).resolve() == sidecar.resolve():
+                raise OSError("simulated sidecar hash failure")
+            return original_hash(file_path, deadline=deadline)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_sidecar_hash)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            scanners=["onnx"],
+        )
+
+        assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
+        assert result.content_hash is None
+
+    def test_directory_hash_omits_hash_when_onnx_sidecar_exceeds_max_total_size(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sidecar bytes should participate in max_total_size accounting."""
+        from modelaudit import core
+
+        model_path = tmp_path / "renamed"
+        sidecar = tmp_path / "weights.data"
+        sidecar.write_bytes(b"\x01\x02\x03\x04")
+        _write_regular_scan_onnx_model(model_path, external_location=sidecar.name, external_size=sidecar.stat().st_size)
+        _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+        original_hash = core._calculate_file_hash
+
+        def track_hash(file_path: str, *, deadline: float | None = None) -> str:
+            if Path(file_path).resolve() == sidecar.resolve():
+                pytest.fail("ONNX external_data sidecar must not be hashed past max_total_size")
+            return original_hash(file_path, deadline=deadline)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            scanners=["onnx"],
+            max_total_size=model_path.stat().st_size,
+        )
+
+        assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
+        assert result.content_hash is None
+        assert determine_exit_code(result) == 2
