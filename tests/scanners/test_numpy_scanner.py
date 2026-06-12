@@ -1,7 +1,11 @@
+import importlib.abc
 import io
+import sys
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from importlib.machinery import ModuleSpec
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -781,6 +785,124 @@ def test_numpy_object_reconstruction_trust_fails_closed_without_picklescan_owner
     )
 
     assert _numpy_object_reconstruction_reference_is_trusted("numpy", "dtype") is False
+
+
+def test_numpy_object_reconstruction_trust_does_not_import_unloaded_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_module = "numpy.core.multiarray"
+    target_name = "_reconstruct"
+    target_reference = f"{target_module}.{target_name}"
+    import_marker = tmp_path / "import-hook-fired"
+    path = tmp_path / "shadowed_numpy_reconstruct.npy"
+    np.save(path, np.array([{"k": "v"}], dtype=object), allow_pickle=True)
+
+    class RecordingImportHook(importlib.abc.MetaPathFinder):
+        def find_spec(
+            self,
+            fullname: str,
+            path: Sequence[str] | None,
+            target: ModuleType | None = None,
+        ) -> ModuleSpec | None:
+            del path, target
+            if fullname == target_module:
+                import_marker.write_text("imported", encoding="utf-8")
+                raise AssertionError("trust fallback must not import after origin proof fails")
+            return None
+
+    def trust_reference(_module: str, _name: str) -> bool:
+        return False
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        del self, payload_size
+        result = ScanResult(scanner_name="pickle")
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="untrusted NumPy reconstruction",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": target_reference,
+                "module": target_module,
+                "name": target_name,
+                "position": file_obj.tell(),
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.finish(success=False)
+        return result
+
+    monkeypatch.delitem(sys.modules, target_module, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [RecordingImportHook(), *sys.meta_path])
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.import_only_reference_is_proven_trusted", trust_reference)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        lambda _payload: True,
+    )
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+
+    result = NumPyScanner().scan(str(path))
+
+    assert import_marker.exists() is False
+    assert result.success is False
+    assert any(
+        check.rule_code == "NON_ALLOWLISTED_GLOBAL" and check.details.get("import_reference") == target_reference
+        for check in result.checks
+    )
+
+
+def test_numpy_object_reconstruction_trust_uses_loaded_numpy_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "loaded_numpy_dtype.npy"
+    np.save(path, np.array([{"k": "v"}], dtype=object), allow_pickle=True)
+
+    def trust_reference(_module: str, _name: str) -> bool:
+        raise RuntimeError("forced primary trust failure")
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        del self, payload_size
+        result = ScanResult(scanner_name="pickle")
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="trusted loaded dtype",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy.dtype",
+                "module": "numpy",
+                "name": "dtype",
+                "position": file_obj.tell(),
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.finish(success=False)
+        return result
+
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.import_only_reference_is_proven_trusted", trust_reference)
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["embedded_pickle_scan_success"] is False
+    assert not result.has_warnings
+    assert not any(check.rule_code == "NON_ALLOWLISTED_GLOBAL" for check in result.checks)
+    assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
 
 
 def test_numpy_object_dtype_benign_exit0(tmp_path: Path) -> None:
