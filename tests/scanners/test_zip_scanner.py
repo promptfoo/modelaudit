@@ -9057,6 +9057,57 @@ class TestZipScanner:
             for check in result.checks
         )
 
+    def test_partial_zip64_streamed_entry_uses_64bit_descriptor_width(self, tmp_path: Path) -> None:
+        class NonSeekableBuffer(io.BytesIO):
+            def seek(self, *_args: Any, **_kwargs: Any) -> int:
+                raise io.UnsupportedOperation("not seekable")
+
+            def seekable(self) -> bool:
+                return False
+
+        archive_buffer = NonSeekableBuffer()
+        with (
+            zipfile.ZipFile(archive_buffer, "w") as archive,
+            archive.open("archive/data/0", "w", force_zip64=True) as member,
+        ):
+            member.write(b"safe")
+
+        archive_bytes = bytearray(archive_buffer.getvalue())
+        local_header = archive_bytes.find(b"PK\x03\x04")
+        assert local_header >= 0
+        filename_size = int.from_bytes(archive_bytes[local_header + 26 : local_header + 28], "little")
+        extra_size = int.from_bytes(archive_bytes[local_header + 28 : local_header + 30], "little")
+        extra_start = local_header + 30 + filename_size
+        assert archive_bytes[extra_start : extra_start + 2] == b"\x01\x00"
+        assert int.from_bytes(archive_bytes[extra_start + 2 : extra_start + 4], "little") == 16
+
+        del archive_bytes[extra_start + 12 : extra_start + 20]
+        archive_bytes[extra_start + 2 : extra_start + 4] = (8).to_bytes(2, "little")
+        archive_bytes[local_header + 18 : local_header + 26] = b"\x00" * 8
+        archive_bytes[local_header + 28 : local_header + 30] = (extra_size - 8).to_bytes(2, "little")
+
+        eocd_index = archive_bytes.rfind(b"PK\x05\x06")
+        assert eocd_index >= 0
+        directory_offset = int.from_bytes(archive_bytes[eocd_index + 16 : eocd_index + 20], "little")
+        archive_bytes[eocd_index + 16 : eocd_index + 20] = (directory_offset - 8).to_bytes(4, "little")
+
+        archive_path = tmp_path / "partial-zip64-streamed.zip"
+        archive_path.write_bytes(archive_bytes)
+
+        assert not ZipScanner.requires_preflight_result(
+            str(archive_path),
+            ZipScanner.DEFAULT_MAX_ENTRIES,
+            ZipScanner.central_directory_size_limit({}),
+        )
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(
+            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
     def test_force_zip64_streamed_entry_rejects_invalid_64bit_descriptor(self, tmp_path: Path) -> None:
         class NonSeekableBuffer(io.BytesIO):
             def seek(self, *_args: Any, **_kwargs: Any) -> int:
