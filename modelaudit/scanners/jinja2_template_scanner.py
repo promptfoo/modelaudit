@@ -29,6 +29,7 @@ import re
 import warnings
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, ClassVar, cast
 
 try:
@@ -40,6 +41,11 @@ except ImportError:
     HAS_RESOURCE_LIMITS = False
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
+from modelaudit.scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from modelaudit.utils.file.detection import (
+    huggingface_tokenizer_json_has_jax_route_evidence,
+    huggingface_tokenizer_json_has_template_route_evidence,
+)
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
@@ -77,6 +83,7 @@ _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
 _JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 _JINJA_TEMPLATE_INDICATOR_BYTES = tuple(indicator.encode("utf-8") for indicator in _JINJA_TEMPLATE_INDICATORS)
 _TEMPLATE_FIELD_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY = "_jinja_skip_jax_json_overlap"
 _DETECTION_MESSAGE_LABELS = {
     "critical_injection": "critical injection",
     "object_traversal": "object hierarchy access",
@@ -459,6 +466,9 @@ class Jinja2TemplateScanner(BaseScanner):
         if ext in [".jinja", ".j2", ".template"]:
             return True
 
+        if huggingface_tokenizer_json_has_template_route_evidence(path):
+            return True
+
         # JSON files containing templates
         if ext == ".json" and any(
             pattern in filename
@@ -469,6 +479,8 @@ class Jinja2TemplateScanner(BaseScanner):
                 "generation_config.json",
             ]
         ):
+            if filename == "tokenizer.json":
+                return huggingface_tokenizer_json_has_template_route_evidence(path)
             return True
 
         # YAML files in ML contexts
@@ -550,10 +562,13 @@ class Jinja2TemplateScanner(BaseScanner):
                     location=path,
                     details={"file_type": context.file_type},
                 )
+                self._scan_jax_json_overlap(path, result)
                 result.finish(success=True)
                 return result
 
-            return self._scan_extracted_templates(path, templates, context, result=result, file_size=file_size)
+            result = self._scan_extracted_templates(path, templates, context, result=result, file_size=file_size)
+            self._scan_jax_json_overlap(path, result)
+            return result
 
         except Exception as e:
             import traceback
@@ -760,6 +775,45 @@ class Jinja2TemplateScanner(BaseScanner):
             return
 
         result.finish(success=True)
+
+    def _merge_filename_owned_result(self, result: ScanResult, owner_result: ScanResult) -> None:
+        """Merge an owner scan without dropping existing incomplete-coverage reasons."""
+        existing_reasons = list(result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY, []))
+        owner_reasons = list(owner_result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY, []))
+        result.merge(owner_result)
+        if existing_reasons or owner_reasons:
+            result.metadata[_INCONCLUSIVE_REASONS_METADATA_KEY] = list(
+                dict.fromkeys([*owner_reasons, *existing_reasons])
+            )
+
+    def _scan_jax_json_overlap(self, path: str, result: ScanResult) -> None:
+        """Preserve JAX analysis for Jinja-owned tokenizer JSON files."""
+        if self.config.get(JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY) is True:
+            return
+        if Path(path).name.lower() not in {
+            "tokenizer",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "tokenizer.txt",
+            "tokenizer.bin",
+        } or not huggingface_tokenizer_json_has_jax_route_evidence(path):
+            return
+
+        from .jax_checkpoint_scanner import JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY, JaxCheckpointScanner
+
+        scanner_selection = policy_from_config(self.config)
+        if scanner_selection.allows("jax_checkpoint"):
+            jax_config = dict(self.config)
+            jax_config[JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY] = True
+            self._merge_filename_owned_result(result, JaxCheckpointScanner(config=jax_config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jax_checkpoint",
+                scanner_selection,
+                context="overlapping JAX JSON analysis",
+            )
 
     def _determine_context(self, path: str) -> MLContext:
         """Determine ML context and file type"""
