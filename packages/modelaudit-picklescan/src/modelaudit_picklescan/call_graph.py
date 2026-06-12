@@ -1677,6 +1677,7 @@ class _ModuleSourceContext:
 class _ClassSourceContext:
     module_name: str
     class_node: ast.ClassDef
+    module_statements: tuple[ast.stmt, ...]
     aliases: dict[str, str]
     local_defs: set[str]
     local_class_nodes: dict[str, ast.ClassDef]
@@ -2007,6 +2008,21 @@ def find_analyzed_callable_call_graph_global_positions(
         if module and name and _call_graph_reference_is_analyzed(module, name, reference):
             positions.add(global_position)
     return frozenset(positions)
+
+
+def class_static_attribute_lookup_is_proven_source_backed(module: str, name: str, attribute: str) -> bool:
+    """Return whether a static class attribute lookup is source-backed as a plain method."""
+    class_target = _resolve_class_target(f"{module}.{name}")
+    if class_target is None:
+        return False
+    context = _source_class_context(class_target)
+    if context is None:
+        return False
+    return (
+        _class_lookup_has_source_backed_plain_metaclass(context)
+        and _class_has_plain_local_method(context.class_node, attribute)
+        and not _class_attribute_rebound_after_definition(context, attribute)
+    )
 
 
 def module_initialization_is_proven_inert(module_name: str) -> bool:
@@ -4844,6 +4860,7 @@ def _collect_local_class_entrypoints(
                 aliases,
                 local_defs,
                 local_class_nodes,
+                statement_tuple,
             )
         )
         entrypoints = tuple(
@@ -4869,12 +4886,225 @@ def _class_method_nodes(class_node: ast.ClassDef) -> dict[str, ast.FunctionDef |
     }
 
 
+def _class_definition_has_dynamic_lookup_context(class_node: ast.ClassDef) -> bool:
+    return bool(class_node.decorator_list) or bool(class_node.keywords)
+
+
+def _class_has_plain_local_method(class_node: ast.ClassDef, method_name: str) -> bool:
+    plain_method_count = 0
+    for child in class_node.body:
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) and child.name == method_name:
+            if child.decorator_list:
+                return False
+            plain_method_count += 1
+            continue
+        if _class_body_statement_or_nested_statement_binds_name(child, method_name):
+            return False
+    return plain_method_count == 1
+
+
+def _class_body_statement_or_nested_statement_binds_name(statement: ast.stmt, name: str) -> bool:
+    return any(
+        _class_body_statement_binds_name(candidate, name) for candidate in _definition_scope_statements((statement,))
+    )
+
+
+def _class_lookup_has_source_backed_plain_metaclass(
+    context: _ClassSourceContext,
+    visited: frozenset[str] = frozenset(),
+) -> bool:
+    class_key = f"{context.module_name}.{context.class_node.name}"
+    if class_key in visited:
+        return True
+    if _class_definition_has_dynamic_lookup_context(context.class_node):
+        return False
+    next_visited = visited | {class_key}
+    base_targets = _class_base_targets_for_static_lookup(
+        context.class_node, context.module_name, context.aliases, context.local_defs
+    )
+    if base_targets is None:
+        return False
+    for base in base_targets:
+        base_context = _class_source_context_for_target(
+            base,
+            context.module_name,
+            context.aliases,
+            context.local_defs,
+            context.local_class_nodes,
+            context.module_statements,
+        )
+        if base_context is None or not _class_lookup_has_source_backed_plain_metaclass(base_context, next_visited):
+            return False
+    return True
+
+
+def _class_base_targets_for_static_lookup(
+    class_node: ast.ClassDef,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+) -> tuple[str, ...] | None:
+    targets: list[str] = []
+    for base in class_node.bases:
+        resolved = _resolve_expr(base, module_name, aliases, local_defs)
+        if resolved in {"object", "builtins.object"}:
+            continue
+        if resolved is None or "." not in resolved:
+            return None
+        targets.append(resolved)
+    return tuple(targets)
+
+
+def _class_body_statement_binds_name(statement: ast.stmt, name: str) -> bool:
+    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        return statement.name == name
+    if isinstance(statement, ast.Import):
+        return any((alias.asname or alias.name.split(".")[0]) == name for alias in statement.names)
+    if isinstance(statement, ast.ImportFrom):
+        return any((alias.asname or alias.name) == name for alias in statement.names)
+    if isinstance(statement, ast.Assign):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    if isinstance(statement, ast.AnnAssign | ast.AugAssign):
+        return _assignment_target_binds_name(statement.target, name)
+    if isinstance(statement, ast.Delete):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    return False
+
+
+def _class_attribute_rebound_after_definition(context: _ClassSourceContext, attribute: str) -> bool:
+    class_aliases = {context.class_node.name}
+    seen_class_definition = False
+    for statement in context.module_statements:
+        if statement is context.class_node:
+            seen_class_definition = True
+            continue
+        if not seen_class_definition:
+            continue
+        for candidate in _definition_scope_statements((statement,)):
+            if _statement_rebinds_name(candidate, context.class_node.name):
+                return True
+            if _statement_writes_class_attribute(candidate, class_aliases, attribute):
+                return True
+            class_aliases.update(_statement_class_alias_targets(candidate, class_aliases))
+        if _statement_contains_runtime_call(statement):
+            return True
+    return False
+
+
+def _statement_rebinds_name(statement: ast.stmt, name: str) -> bool:
+    if isinstance(statement, ast.Assign):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    if isinstance(statement, ast.AnnAssign | ast.AugAssign):
+        return _assignment_target_binds_name(statement.target, name)
+    if isinstance(statement, ast.Delete):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    if isinstance(statement, ast.For | ast.AsyncFor):
+        return _assignment_target_binds_name(statement.target, name)
+    if isinstance(statement, ast.With | ast.AsyncWith):
+        return any(
+            item.optional_vars is not None and _assignment_target_binds_name(item.optional_vars, name)
+            for item in statement.items
+        )
+    if isinstance(statement, ast.ExceptHandler):
+        return statement.name == name
+    return False
+
+
+def _statement_class_alias_targets(statement: ast.stmt, class_aliases: set[str]) -> set[str]:
+    if not isinstance(statement, ast.Assign | ast.AnnAssign) or statement.value is None:
+        return set()
+    targets = statement.targets if isinstance(statement, ast.Assign) else (statement.target,)
+    aliases: set[str] = set()
+    for target in targets:
+        aliases.update(_class_alias_targets_from_assignment(target, statement.value, class_aliases))
+    return aliases
+
+
+def _class_alias_targets_from_assignment(
+    target: ast.AST,
+    value: ast.AST,
+    class_aliases: set[str],
+) -> set[str]:
+    if isinstance(value, ast.Name) and value.id in class_aliases:
+        return _assignment_target_names(target)
+    if (
+        isinstance(target, ast.Tuple | ast.List)
+        and isinstance(value, ast.Tuple | ast.List)
+        and len(target.elts) == len(value.elts)
+    ):
+        aliases: set[str] = set()
+        for nested_target, nested_value in zip(target.elts, value.elts, strict=True):
+            aliases.update(_class_alias_targets_from_assignment(nested_target, nested_value, class_aliases))
+        return aliases
+    return set()
+
+
+def _statement_writes_class_attribute(statement: ast.stmt, class_aliases: set[str], attribute: str) -> bool:
+    if isinstance(statement, ast.Assign):
+        return any(_target_writes_class_attribute(target, class_aliases, attribute) for target in statement.targets)
+    if isinstance(statement, ast.AnnAssign | ast.AugAssign):
+        return _target_writes_class_attribute(statement.target, class_aliases, attribute)
+    if isinstance(statement, ast.Delete):
+        return any(_target_writes_class_attribute(target, class_aliases, attribute) for target in statement.targets)
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+        return _call_may_set_class_attribute(statement.value, class_aliases, attribute)
+    return False
+
+
+def _target_writes_class_attribute(target: ast.AST, class_aliases: set[str], attribute: str) -> bool:
+    return (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id in class_aliases
+        and target.attr == attribute
+    )
+
+
+def _call_may_set_class_attribute(call: ast.Call, class_aliases: set[str], attribute: str) -> bool:
+    if not _is_setattr_like_call(call.func) or len(call.args) < 2:
+        return False
+    receiver, name_arg = call.args[0], call.args[1]
+    if not isinstance(receiver, ast.Name) or receiver.id not in class_aliases:
+        return False
+    return not isinstance(name_arg, ast.Constant) or name_arg.value == attribute
+
+
+def _is_setattr_like_call(func: ast.AST) -> bool:
+    if isinstance(func, ast.Name):
+        return func.id == "setattr"
+    if isinstance(func, ast.Attribute):
+        return func.attr in {"setattr", "__setattr__"}
+    return False
+
+
+def _statement_contains_runtime_call(statement: ast.stmt) -> bool:
+    class RuntimeCallVisitor(ast.NodeVisitor):
+        found = False
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return None
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return None
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return None
+
+        def visit_Call(self, node: ast.Call) -> None:
+            self.found = True
+
+    visitor = RuntimeCallVisitor()
+    visitor.visit(statement)
+    return visitor.found
+
+
 def _inherited_class_methods(
     class_node: ast.ClassDef,
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
     local_class_nodes: dict[str, ast.ClassDef],
+    module_statements: tuple[ast.stmt, ...],
 ) -> dict[str, _InheritedClassMethod]:
     inherited: dict[str, _InheritedClassMethod] = {}
     direct_method_names = set(_class_method_nodes(class_node))
@@ -4909,6 +5139,7 @@ def _inherited_class_methods(
                 context.aliases,
                 context.local_defs,
                 context.local_class_nodes,
+                context.module_statements,
             )
             if nested_context is not None:
                 visit_base(nested_context)
@@ -4920,6 +5151,7 @@ def _inherited_class_methods(
             aliases,
             local_defs,
             local_class_nodes,
+            module_statements,
         )
         if base_context is not None:
             visit_base(base_context)
@@ -4932,12 +5164,14 @@ def _class_source_context_for_target(
     aliases: dict[str, str],
     local_defs: set[str],
     local_class_nodes: dict[str, ast.ClassDef],
+    module_statements: tuple[ast.stmt, ...],
 ) -> _ClassSourceContext | None:
     local_class_node = _local_class_node_from_target(class_target, module_name, local_class_nodes)
     if local_class_node is not None:
         return _ClassSourceContext(
             module_name=module_name,
             class_node=local_class_node,
+            module_statements=module_statements,
             aliases=aliases,
             local_defs=local_defs,
             local_class_nodes=local_class_nodes,
@@ -4990,6 +5224,7 @@ def _inherited_source_function_context(
         aliases,
         local_defs,
         _local_class_nodes(module_statements),
+        tuple(module_statements),
     ).get(method_name)
     if inherited_method is None:
         return None
@@ -5023,6 +5258,7 @@ def _source_class_context(class_name: str) -> _ClassSourceContext | None:
     return _ClassSourceContext(
         module_name=module_name,
         class_node=class_node,
+        module_statements=module_statements,
         aliases=aliases,
         local_defs=local_defs,
         local_class_nodes=_local_class_nodes(module_statements),
@@ -5895,6 +6131,7 @@ def _collect_function_calls(
                 aliases,
                 local_defs,
                 local_class_nodes,
+                statement_tuple,
             ).items():
                 function_name = f"{module_name}.{statement.name}.{method_name}"
                 if function_name in calls_by_function:
