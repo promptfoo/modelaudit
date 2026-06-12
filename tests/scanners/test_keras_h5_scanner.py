@@ -2981,6 +2981,101 @@ def test_keras_h5_scanner_flags_weights_only_soft_linked_external_reference(
     ]
 
 
+@pytest.mark.parametrize("reference_kind", ["ExternalLink", "external_storage", "virtual_dataset"])
+def test_keras_h5_scanner_flags_soft_link_group_nested_external_reference(
+    tmp_path: Path,
+    reference_kind: str,
+) -> None:
+    """A loader-consumed SoftLink group alias must not hide nested external HDF5 references."""
+    weights_path = tmp_path / "soft_link_group.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        vars_group = f.create_group("layers").create_group("dense").create_group("vars")
+        resolved_group = f.create_group("resolved_group")
+        vars_group["0"] = h5py.SoftLink("/resolved_group")
+        expected_reference: dict[str, Any]
+
+        if reference_kind == "ExternalLink":
+            resolved_group["payload"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+            expected_reference = {
+                "kind": "ExternalLink",
+                "hdf5_path": "/layers/dense/vars/0/payload",
+                "filename": "missing_external_source.h5",
+                "path": "/payload",
+            }
+        elif reference_kind == "external_storage":
+            raw_storage = tmp_path / "weights.raw"
+            raw_storage.write_bytes(b"\x00" * 8)
+            resolved_group.create_dataset(
+                "payload",
+                shape=(2,),
+                dtype="float32",
+                external=[(raw_storage.name, 0, 8)],
+            )
+            expected_reference = {
+                "kind": "external_storage",
+                "hdf5_path": "/layers/dense/vars/0/payload",
+                "segments": [{"filename": "weights.raw", "offset": 0, "size": 8}],
+            }
+        else:
+            virtual_source = tmp_path / "virtual_source.h5"
+            with h5py.File(virtual_source, "w") as source_file:
+                source_file.create_dataset("payload", data=[1.0, 2.0])
+            layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+            layout[:] = h5py.VirtualSource(virtual_source.name, "/payload", shape=(2,))
+            resolved_group.create_virtual_dataset("payload", layout)
+            expected_reference = {
+                "kind": "virtual_dataset",
+                "hdf5_path": "/layers/dense/vars/0/payload",
+                "sources": [{"filename": "virtual_source.h5", "path": "/payload"}],
+            }
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [expected_reference]
+
+
+def test_keras_h5_scanner_allows_soft_link_group_with_internal_dataset(tmp_path: Path) -> None:
+    """Clean internal SoftLink group aliases should stay non-findings."""
+    weights_path = tmp_path / "clean_soft_link_group.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        vars_group = f.create_group("layers").create_group("dense").create_group("vars")
+        resolved_group = f.create_group("resolved_group")
+        resolved_group.create_dataset("payload", data=[1.0, 2.0])
+        vars_group["0"] = h5py.SoftLink("/resolved_group")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_keras_h5_scanner_soft_link_group_traversal_respects_link_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    weights_path = tmp_path / "budgeted_soft_link_group.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        vars_group = f.create_group("layers").create_group("dense").create_group("vars")
+        resolved_group = f.create_group("resolved_group")
+        resolved_group["payload"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+        vars_group["0"] = h5py.SoftLink("/resolved_group")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_LINK_VISITS", 1)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    reason = "keras_h5_external_reference_analysis_limit_exceeded"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in result.metadata["scan_outcome_reasons"]
+    limit_checks = [check for check in result.checks if check.details.get("scan_outcome_reason") == reason]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].details["link_visits_truncated"] is True
+
+
 def test_keras_h5_scanner_legacy_h5py_traversal_flags_dangling_external_link(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

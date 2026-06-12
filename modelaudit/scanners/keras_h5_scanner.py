@@ -1792,6 +1792,9 @@ class KerasH5Scanner(BaseScanner):
         visited_virtual_source_count = 0
         soft_link_resolution_incomplete = False
         weight_roots, weight_roots_truncated = self._hdf5_weight_scan_roots(h5_file)
+        visited_link_count = 0
+        link_visits_truncated = False
+        pending_soft_group_roots: list[tuple[str, str, Any]] = []
 
         def record_external_storage(name: str, obj: Any) -> None:
             nonlocal external_reference_count, external_storage_segments_truncated
@@ -1937,6 +1940,8 @@ class KerasH5Scanner(BaseScanner):
                 if isinstance(target_obj, h5py.Dataset):
                     record_external_storage(name, target_obj)
                     record_virtual_dataset_sources(name, target_obj)
+                elif isinstance(target_obj, h5py.Group):
+                    pending_soft_group_roots.append((name, soft_target_path, target_obj))
                 return
 
             if not isinstance(link, h5py.HardLink):
@@ -1948,8 +1953,33 @@ class KerasH5Scanner(BaseScanner):
                 record_external_storage(name, obj)
                 record_virtual_dataset_sources(name, obj)
 
-        visited_link_count = 0
-        link_visits_truncated = False
+        def drain_pending_soft_group_roots() -> None:
+            nonlocal visited_link_count, link_visits_truncated
+            while pending_soft_group_roots and not link_visits_truncated:
+                if visited_link_count >= self._MAX_HDF5_LINK_VISITS:
+                    link_visits_truncated = True
+                    return
+                alias_prefix, source_prefix, soft_group = pending_soft_group_roots.pop(0)
+                remaining_link_visits = self._MAX_HDF5_LINK_VISITS - visited_link_count
+
+                def visit_soft_group(
+                    name: str,
+                    link: Any,
+                    *,
+                    prefix: str = alias_prefix,
+                    resolved_prefix: str = source_prefix,
+                ) -> None:
+                    visit(f"{prefix}/{name}", link, source_name=f"{resolved_prefix}/{name}")
+
+                soft_group_visited, soft_group_truncated = self._visit_hdf5_links(
+                    soft_group,
+                    visit_soft_group,
+                    max_links=remaining_link_visits,
+                )
+                visited_link_count += soft_group_visited
+                if soft_group_truncated:
+                    link_visits_truncated = True
+
         for root_path in weight_roots:
             root_link = h5_file.get(root_path, getlink=True)
             if root_link is None:
@@ -2011,6 +2041,9 @@ class KerasH5Scanner(BaseScanner):
             visited_link_count += root_visited
             if root_truncated:
                 link_visits_truncated = True
+                break
+            drain_pending_soft_group_roots()
+            if link_visits_truncated:
                 break
 
         external_references_truncated = external_reference_count > len(findings)
