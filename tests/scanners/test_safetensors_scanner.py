@@ -797,6 +797,66 @@ def test_license_metadata_short_trusted_url_is_not_suspicious(tmp_path: Path, ur
     assert not [issue for issue in aggregate.issues if issue.rule_code == "S905"]
 
 
+@pytest.mark.parametrize(
+    ("key", "url"),
+    [
+        ("homepage", "HTTPS://evil.example/payload"),
+        ("license", "hTTpS://evil.example/payload"),
+    ],
+)
+def test_metadata_raw_mixed_case_url_reports_s905(tmp_path: Path, key: str, url: str) -> None:
+    file_path = tmp_path / "metadata_mixed_case_url.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {key: url},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.metadata["custom_metadata_security_flags"] == ["suspicious_pattern"]
+    assert any(issue.rule_code == "S905" and key in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": key, "pattern": "https?://"}
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "HTTPS://opensource.org/licenses/MIT",
+        "hTTpS://github.com/Lightricks/LTX-2/blob/main/LICENSE",
+    ],
+)
+def test_license_metadata_mixed_case_trusted_url_is_not_suspicious(tmp_path: Path, url: str) -> None:
+    file_path = tmp_path / "license_metadata_mixed_case_trusted_url.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": url},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Metadata Pattern Check" and check.status == CheckStatus.FAILED
+    ]
+    assert not [issue for issue in result.issues if issue.rule_code == "S905"]
+
+
 def test_license_metadata_short_trusted_url_is_not_suspicious_in_nested_archive(tmp_path: Path) -> None:
     source_file = tmp_path / "nested.safetensors"
     archive_path = tmp_path / "bundle.zip"

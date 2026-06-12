@@ -1039,7 +1039,7 @@ class SafeTensorsScanner(BaseScanner):
             return True
 
         return any(
-            pattern != _GENERIC_URL_METADATA_PATTERN and re.search(pattern, value)
+            pattern != _GENERIC_URL_METADATA_PATTERN and re.search(pattern, value, re.IGNORECASE)
             for pattern in SUSPICIOUS_METADATA_PATTERNS
         )
 
@@ -1107,7 +1107,8 @@ class SafeTensorsScanner(BaseScanner):
                 flags.add("code_like_value")
             if (
                 any(
-                    (pattern != _GENERIC_URL_METADATA_PATTERN or not is_ordinary_license) and re.search(pattern, value)
+                    (pattern != _GENERIC_URL_METADATA_PATTERN or not is_ordinary_license)
+                    and re.search(pattern, value, re.IGNORECASE)
                     for pattern in SUSPICIOUS_METADATA_PATTERNS
                 )
                 or _value_has_encoded_url_delimiter(value)
@@ -1601,7 +1602,7 @@ class SafeTensorsScanner(BaseScanner):
                     for pattern in SUSPICIOUS_METADATA_PATTERNS:
                         if pattern == _GENERIC_URL_METADATA_PATTERN and is_ordinary_license:
                             continue
-                        if re.search(pattern, value):
+                        if re.search(pattern, value, re.IGNORECASE):
                             suspicious_pattern = pattern
                             break
                     if suspicious_pattern is None and _value_has_encoded_url_delimiter(value):
