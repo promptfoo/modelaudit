@@ -29,6 +29,8 @@ from modelaudit.scanner_selection import (
     selected_scanner_filenames,
 )
 from modelaudit.utils.file.detection import (
+    _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES,
+    _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES,
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     MEDIA_ROUTE_TAIL_READ_BYTES,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -40,6 +42,8 @@ from modelaudit.utils.sources.huggingface import (
     _HF_CONTENT_SNIFF_BYTES,
     _HF_CONTENT_SNIFF_MAX_FILES,
     _build_huggingface_model_info,
+    _detect_huggingface_content_route_format,
+    _detect_huggingface_flax_msgpack_route,
     _extract_huggingface_repo_files,
     _get_huggingface_path_sizes,
     _HuggingFaceProbeBudget,
@@ -70,6 +74,27 @@ from tests.helpers.file_creators import malicious_pickle_bytes, valid_jpeg_bytes
 _HF_TEST_REVISION = "a" * 40
 
 
+def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
+    tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+    tokens.extend(f"[unused{index}]" for index in range(2048))
+    tokens.extend(f"token_{index}" for index in range(2048))
+    payload = ("\n".join(tokens) + "\n").encode("utf-8")
+    assert len(payload) > min_bytes
+    return payload
+
+
+def _bpe_merges_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
+    lines = ["#version: 0.2"]
+    total_bytes = len(lines[0]) + 1
+    index = 0
+    while total_bytes <= min_bytes:
+        line = f"token_{index % 8192} token_{(index * 17) % 8192}"
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 class _FakeRangeResponse:
     def __init__(
         self,
@@ -93,6 +118,14 @@ class _FakeRangeResponse:
 
     def iter_content(self, chunk_size: int) -> Iterator[bytes]:
         yield self.payload[:chunk_size]
+
+
+def _large_remote_documentation_payload(label: str) -> bytes:
+    line = f"{label} line-oriented documentation with tokenizer notes and multilingual text café.\n".encode()
+    payload = f"# {label}\n".encode() + line * ((_CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES // len(line)) + 128)
+    assert len(payload) > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    assert len(payload) < _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+    return payload
 
 
 class _FakeTreeResponse:
@@ -141,7 +174,9 @@ def _fake_range_responder(payload: bytes) -> Callable[[str], _FakeRangeResponse]
         range_header = headers.get("Range", "")
         if range_header.startswith("bytes="):
             start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
-            return _fake_content_range_response(payload, int(start_text), int(end_text))
+            start = int(start_text)
+            end = min(int(end_text), len(payload) - 1)
+            return _fake_content_range_response(payload, start, end)
         return _FakeRangeResponse(payload)
 
     return get_response
@@ -4382,6 +4417,179 @@ class TestModelDownloadStreaming:
         _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0, revision=None)
         mock_requests_get.assert_not_called()
         mock_hf_hub_download.assert_not_called()
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_complete_multilingual_readme_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote content routing should treat complete bounded UTF-8 README probes as text."""
+        readme_payload = (
+            "# Model Card\n"
+            + ("This multilingual README has こんにちは, café, naïve, résumé, and 😀 examples.\n" * 256)
+        ).encode()
+        mock_requests_get.side_effect = _fake_range_responder(readme_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            "README.md",
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format is None
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "README.md",
+            "README.rst",
+            "README.txt",
+            "README.markdown",
+            "model_card.md",
+            "model_card.rst",
+            "modelcard.txt",
+            "modelcard.markdown",
+        ],
+    )
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_large_complete_documentation_text(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should use the declared text window, not the 2 MiB cap."""
+        documentation_payload = _large_remote_documentation_payload(filename)
+        assert len(documentation_payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        mock_requests_get.side_effect = _fake_range_responder(documentation_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        budget.record_file_size("test/model", filename, len(documentation_payload))
+        budget.prefixes[filename] = documentation_payload[:_HF_CONTENT_SNIFF_BYTES]
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            filename,
+            _HF_TEST_REVISION,
+            budget,
+            documentation_payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format is None
+
+    @pytest.mark.parametrize("filename", ["README.md", "model_card.md", "modelcard.txt"])
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_binary_documentation_checkpoint(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should not suppress MessagePack checkpoint structure."""
+        msgpack = pytest.importorskip("msgpack")
+        hidden_payload = msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+        mock_requests_get.side_effect = _fake_range_responder(hidden_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            filename,
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @pytest.mark.parametrize("filename", ["README.md", "model_card.md"])
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_control_scalar_documentation_fail_closed(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should not suppress UTF-8 control scalar streams."""
+        payload = b"A\xc2\x80" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 3) + 1)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        budget.record_file_size("test/model", filename, len(payload))
+        budget.prefixes[filename] = payload[:_HF_CONTENT_SNIFF_BYTES]
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            filename,
+            _HF_TEST_REVISION,
+            budget,
+            payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_utf8_scalar_readme_fail_closed(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote low-diversity UTF-8 scalar streams should not claim text ownership."""
+        payload = b"\xc2\xa0" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 2) + 1)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            "README.md",
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_complete_vocabulary_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote Flax routing should treat complete tokenizer vocabularies as text."""
+        vocab_payload = _bert_vocab_payload()
+        mock_requests_get.side_effect = _fake_range_responder(vocab_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            "vocab.txt",
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format is None
+        assert budget.file_sizes["vocab.txt"] == len(vocab_payload)
+        assert len(budget.prefixes["vocab.txt"]) == min(len(vocab_payload), _HF_CONTENT_SNIFF_BYTES)
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_large_complete_merges_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote Flax routing should treat complete BPE merge rules as tokenizer text."""
+        merges_payload = _bpe_merges_payload()
+        assert len(merges_payload) > 2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        mock_requests_get.side_effect = _fake_range_responder(merges_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        budget.record_file_size("test/model", "merges.txt", len(merges_payload))
+        budget.prefixes["merges.txt"] = merges_payload[:_HF_CONTENT_SNIFF_BYTES]
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            "merges.txt",
+            _HF_TEST_REVISION,
+            budget,
+            merges_payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format is None
+        assert budget.file_sizes["merges.txt"] == len(merges_payload)
+        assert len(budget.prefixes["merges.txt"]) == len(merges_payload)
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")
