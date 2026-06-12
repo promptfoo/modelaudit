@@ -3654,6 +3654,71 @@ class TestCVE202523304HydraTarget:
         assert reason in result.metadata["scan_outcome_reasons"]
         assert "operational_error" not in result.metadata
 
+    def test_nested_later_metadata_coverage_reason_is_propagated(self, tmp_path: Path) -> None:
+        extracted_path = str(tmp_path / "nested-payload.tar.gz")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="nemo")
+        nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        nested_result.metadata["scan_outcome_reasons"] = [
+            "xgboost_binary_structure_too_small",
+            "nemo_routing_incomplete",
+        ]
+        nested_result.add_check(
+            name="NeMo Routing",
+            passed=False,
+            message="Bounded route incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+        )
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.tar.gz",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
+    def test_nested_later_detail_coverage_reason_is_propagated(self, tmp_path: Path) -> None:
+        extracted_path = str(tmp_path / "nested-payload.tar.gz")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="nemo")
+        nested_result.add_check(
+            name="NeMo Routing",
+            passed=False,
+            message="Bounded route incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reasons": [
+                    "xgboost_binary_structure_too_small",
+                    "nemo_routing_incomplete",
+                ],
+            },
+        )
+        nested_result.finish(success=True)
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.tar.gz",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
     def test_nested_structural_reject_without_findings_is_not_propagated(self, tmp_path: Path) -> None:
         extracted_path = str(tmp_path / "tokenizer.model")
         result = ScanResult(scanner_name="nemo")
