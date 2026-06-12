@@ -2650,11 +2650,12 @@ class PickleScanner(BaseScanner):
         trusted_import_references: set[str],
     ) -> bool:
         import_reference = details.get("import_reference")
+        opcode = details.get("opcode")
         return (
             details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
             and details.get("analysis") == "python_call_graph"
-            and "opcode" not in details
             and "invocation_import_reference" not in details
+            and (opcode is None or opcode in {"GLOBAL", "STACK_GLOBAL"})
             and isinstance(import_reference, str)
             and import_reference in trusted_import_references
         )
