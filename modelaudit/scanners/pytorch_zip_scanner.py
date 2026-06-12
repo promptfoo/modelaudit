@@ -2694,6 +2694,7 @@ class PyTorchZipScanner(BaseScanner):
     @classmethod
     def _downgrade_trusted_storage_persistent_ids(cls, result: ScanResult, trusted_storage_keys: set[str]) -> None:
         """Treat PyTorch storage persistent IDs as informational inside validated PyTorch ZIP data.pkl."""
+        downgraded_count = 0
         for check in result.checks:
             if not cls._is_pytorch_storage_persistent_id_record(check.details, trusted_storage_keys):
                 continue
@@ -2701,12 +2702,20 @@ class PyTorchZipScanner(BaseScanner):
             check.severity = IssueSeverity.INFO
             check.message = "PyTorch storage persistent ID found in validated PyTorch archive"
             check.details["trusted_pytorch_archive_context"] = True
+            downgraded_count += 1
 
         result.issues = [
             issue
             for issue in result.issues
             if not cls._is_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
         ]
+        if (
+            downgraded_count
+            and not result.has_errors
+            and not result.has_warnings
+            and result.metadata.get("pickle_verdict") == "suspicious"
+        ):
+            result.metadata["pickle_verdict"] = "clean"
 
     def _scan_for_jit_patterns(
         self,

@@ -7669,6 +7669,7 @@ def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path:
     result = PyTorchZipScanner().scan(str(model_path))
 
     assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
     assert not any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues)
     trusted_checks = [check for check in result.checks if check.details.get("trusted_pytorch_archive_context") is True]
     assert trusted_checks
@@ -7721,6 +7722,7 @@ def test_pytorch_zip_scanner_does_not_downgrade_arbitrary_protocol0_persid(
 
     result = PyTorchZipScanner().scan(str(model_path))
 
+    assert result.metadata.get("pickle_verdict") == "suspicious"
     assert any(
         issue.rule_code == "S212"
         and issue.details.get("opcode") == "PERSID"
@@ -7778,6 +7780,7 @@ def test_pytorch_zip_scanner_does_not_trust_noncanonical_protocol0_storage_persi
 
     result = PyTorchZipScanner().scan(str(model_path))
 
+    assert result.metadata.get("pickle_verdict") == "suspicious"
     assert any(issue.rule_code == "S212" and issue.details.get("opcode") == "PERSID" for issue in result.issues)
     assert any(check.rule_code == "S212" and check.status == CheckStatus.FAILED for check in result.checks)
     assert not any(
