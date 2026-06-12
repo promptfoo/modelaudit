@@ -11,6 +11,7 @@ import stat
 import struct
 import sys
 import tarfile
+import unicodedata
 import zipfile
 import zlib
 from collections.abc import Callable, Iterator
@@ -20,7 +21,11 @@ from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal, cast
 
-from ...scanner_registry_metadata import get_extension_format_map, get_registered_scanner_extensions
+from ...scanner_registry_metadata import (
+    TEXT_CONTENT_ROUTED_FILENAMES,
+    get_extension_format_map,
+    get_registered_scanner_extensions,
+)
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 from .hdf5 import find_hdf5_signature_offset
@@ -56,6 +61,7 @@ _TF_METAGRAPH_MAX_ROUTING_FIELDS = 32768
 _TF_METAGRAPH_MAX_ROUTING_DEPTH = 64
 _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
 _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES = 10 * 1024 * 1024
+_CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES = _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
 _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
 _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS = frozenset({"\t", "\n", "\r", "\f"})
 _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"})
@@ -63,6 +69,12 @@ _CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS = frozenset({"\t", "\n", "\r", "\f", "
 _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
     bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
 )
+_CONTENT_ROUTE_DECLARED_TEXT_ASSET_FILENAMES = frozenset(TEXT_CONTENT_ROUTED_FILENAMES) | {
+    "model_card.md",
+    "readme.md",
+}
+_CONTENT_ROUTE_DECLARED_DOCUMENTATION_PREFIXES = ("model_card.", "modelcard.", "readme.")
+_CONTENT_ROUTE_DECLARED_DOCUMENTATION_EXTENSIONS = frozenset({".md", ".markdown", ".rst", ".txt"})
 _TensorFlowProtoRoute = Literal[
     "unknown",
     "tf_metagraph",
@@ -7745,6 +7757,11 @@ def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool
 
 def _has_content_route_text_owner_structure(text: str) -> bool:
     """Return whether printable UTF-8 has ordinary text/config/tokenizer structure."""
+    if any(
+        unicodedata.category(character) in {"Cc", "Cs"} and character not in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS
+        for character in text
+    ):
+        return False
     if not any(char in _CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS for char in text):
         return False
     ordinary_text_lines = 0
@@ -7931,17 +7948,32 @@ def _is_complete_bounded_printable_text_content_owner_bytes(
 ) -> bool:
     """Return whether printable bytes can safely own this complete file."""
     suffix = file_path.suffix.lower()
+    declared_text_filename = is_declared_text_content_filename(file_path.name)
+    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or declared_text_filename
     max_complete_text_bytes = (
         _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
-        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        if has_text_owner_window
         else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
     )
     if file_size > max_complete_text_bytes or len(payload) < file_size:
         return False
     payload = payload[:file_size]
+    if (
+        declared_text_filename
+        and file_size > FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        and b"\n" not in payload
+        and b"\r" not in payload
+    ):
+        return False
     if not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
+        if has_text_owner_window and file_size > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES:
+            try:
+                text = payload.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                return False
+            return _has_content_route_text_owner_structure(text)
         return True
-    if suffix not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+    if not has_text_owner_window:
         return False
     try:
         text = payload.decode("utf-8-sig")
@@ -7952,12 +7984,51 @@ def _is_complete_bounded_printable_text_content_owner_bytes(
     )
 
 
+def _is_complete_bounded_text_payload(payload: bytes) -> bool:
+    """Return whether complete bounded bytes are safe text for declared text assets."""
+    if any(byte in _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES for byte in payload):
+        return False
+    return _is_complete_bounded_printable_text_content_owner_bytes(Path("vocab.txt"), len(payload), payload)
+
+
+def _is_complete_declared_text_payload(payload: bytes) -> bool:
+    """Return whether a declared text asset has complete, line-oriented text content."""
+    if not _is_complete_bounded_text_payload(payload):
+        return False
+    return not (len(payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES and b"\n" not in payload and b"\r" not in payload)
+
+
+def is_declared_text_content_filename(filename: str) -> bool:
+    """Return whether a basename is declared as tokenizer or documentation text."""
+    normalized = PurePosixPath(filename.replace("\\", "/")).name.lower()
+    return normalized in _CONTENT_ROUTE_DECLARED_TEXT_ASSET_FILENAMES or (
+        normalized.startswith(_CONTENT_ROUTE_DECLARED_DOCUMENTATION_PREFIXES)
+        and PurePosixPath(normalized).suffix in _CONTENT_ROUTE_DECLARED_DOCUMENTATION_EXTENSIONS
+    )
+
+
+def _is_complete_declared_text_asset(file_path: Path, file_size: int) -> bool:
+    """Return whether a declared tokenizer/documentation text asset owns the file."""
+    if not is_declared_text_content_filename(file_path.name):
+        return False
+    if file_size > _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    return _is_complete_declared_text_payload(payload)
+
+
 def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
     """Return whether printable text can safely own this complete file."""
     suffix = file_path.suffix.lower()
+    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(
+        file_path.name
+    )
     max_complete_text_bytes = (
         _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
-        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        if has_text_owner_window
         else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
     )
     if file_size > max_complete_text_bytes:
@@ -7976,9 +8047,12 @@ def _is_complete_bounded_ascii_printable_text_content_owner_bytes(
 ) -> bool:
     """Return whether complete ASCII bytes can safely veto a protobuf candidate."""
     suffix = file_path.suffix.lower()
+    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(
+        file_path.name
+    )
     max_complete_text_bytes = (
         _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
-        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        if has_text_owner_window
         else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
     )
     if file_size > max_complete_text_bytes or len(payload) < file_size:
@@ -7990,9 +8064,12 @@ def _is_complete_bounded_ascii_printable_text_content_owner_bytes(
 def _is_complete_bounded_ascii_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
     """Return whether complete ASCII text can safely veto a protobuf candidate."""
     suffix = file_path.suffix.lower()
+    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(
+        file_path.name
+    )
     max_complete_text_bytes = (
         _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
-        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        if has_text_owner_window
         else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
     )
     if file_size > max_complete_text_bytes:

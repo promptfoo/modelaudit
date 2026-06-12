@@ -952,10 +952,13 @@ def _is_huggingface_text_owner_prefix(
         _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS,
         _has_content_route_text_owner_structure,
         _is_complete_bounded_ascii_printable_text_content_owner_bytes,
+        is_declared_text_content_filename,
     )
 
     remote_path = Path(filename)
-    if remote_path.suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+    if remote_path.suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and not is_declared_text_content_filename(
+        filename
+    ):
         return False
     if (
         preserve_protobuf_model_candidates
@@ -1066,9 +1069,12 @@ def _is_complete_huggingface_text_owner_or_json_probe(
     from modelaudit.utils.file.detection import (
         _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
         _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+        is_declared_text_content_filename,
     )
 
-    if Path(filename).suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+    if Path(
+        filename
+    ).suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and not is_declared_text_content_filename(filename):
         return False
     known_size = budget.file_sizes.get(filename)
     if known_size is not None and known_size > _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES:
@@ -1159,12 +1165,17 @@ def _detect_huggingface_flax_msgpack_route(
 ) -> str | None:
     """Return a bounded Flax MessagePack route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
         _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
         FLAX_MSGPACK_STRUCTURE_READ_BYTES,
         _probe_flax_msgpack_checkpoint_stream,
+        is_declared_text_content_filename,
     )
 
-    if Path(filename).suffix.lower() in {".py", ".pyw"}:
+    remote_path = Path(filename)
+    suffix = remote_path.suffix.lower()
+    text_owner_filename = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(filename)
+    if suffix in {".py", ".pyw"}:
         return None
 
     initial_probe_state = _probe_flax_msgpack_checkpoint_stream(
@@ -1182,9 +1193,18 @@ def _detect_huggingface_flax_msgpack_route(
         return "flax_msgpack"
     if len(prefix) < _HF_CONTENT_SNIFF_BYTES:
         return None
-    if initial_probe_state is False and Path(filename).suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+    if initial_probe_state is False and not text_owner_filename:
         return None
     if initial_probe_state is False and _is_huggingface_text_owner_prefix(filename, prefix):
+        known_size = budget.file_sizes.get(filename)
+        if known_size is not None and known_size <= _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES:
+            raw_text_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, known_size)
+            if len(raw_text_probe) >= known_size and _is_complete_huggingface_text_or_json(
+                filename,
+                raw_text_probe[:known_size],
+                sample_is_prefix=False,
+            ):
+                return None
         return _detect_huggingface_text_owner_embedded_binary_route(repo_id, filename, revision, budget, prefix)
     if _is_complete_huggingface_text_owner_or_json_probe(
         repo_id,
@@ -1218,7 +1238,7 @@ def _detect_huggingface_flax_msgpack_route(
     if (
         probe_state is False
         and not require_confirmed
-        and Path(filename).suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        and text_owner_filename
         and _is_printable_non_ascii_huggingface_text_prefix(probe)
     ):
         return "flax_msgpack"
