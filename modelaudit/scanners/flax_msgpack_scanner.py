@@ -2572,15 +2572,15 @@ class FlaxMsgpackScanner(BaseScanner):
         length: int,
         location: str,
         result: ScanResult,
-    ) -> None:
+    ) -> str | None:
         if not first_chunk and remaining == 0:
-            return
+            return None
 
         if _is_text_like_short_binary(first_chunk) or self._binary_stream_requires_full_scan:
-            self._analyze_streamed_binary_text_chunks(first_chunk, cursor, remaining, length, location, result)
-            return
+            return self._analyze_streamed_binary_text_chunks(first_chunk, cursor, remaining, length, location, result)
 
         self._analyze_streamed_binary_anchor_chunks(first_chunk, cursor, remaining, length, location, result)
+        return None
 
     def _analyze_streamed_binary_text_chunks(
         self,
@@ -2590,12 +2590,15 @@ class FlaxMsgpackScanner(BaseScanner):
         length: int,
         location: str,
         result: ScanResult,
-    ) -> None:
+    ) -> str | None:
+        normalized_identity = _BoundedNormalizedTextIdentity(_MAX_STREAMED_VALUE_IDENTITY_CHARS)
+
         def decoded_chunks() -> Iterable[str]:
             nonlocal remaining
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             decoded = decoder.decode(first_chunk, final=False)
             if decoded:
+                normalized_identity.observe(decoded)
                 yield decoded
             while remaining > 0:
                 raw_chunk = cursor._read_exact(min(remaining, _STREAM_TEXT_CHUNK_BYTES))
@@ -2603,9 +2606,11 @@ class FlaxMsgpackScanner(BaseScanner):
                 self._check_timeout()
                 decoded = decoder.decode(raw_chunk, final=False)
                 if decoded:
+                    normalized_identity.observe(decoded)
                     yield decoded
             final_chunk = decoder.decode(b"", final=True)
             if final_chunk:
+                normalized_identity.observe(final_chunk)
                 yield final_chunk
 
         self._analyze_streamed_text_chunks(
@@ -2617,6 +2622,7 @@ class FlaxMsgpackScanner(BaseScanner):
             coverage_details={"binary_size": length},
             check_jax_transform=True,
         )
+        return normalized_identity.value()
 
     def _analyze_streamed_binary_anchor_chunks(
         self,
@@ -2962,8 +2968,16 @@ class FlaxMsgpackScanner(BaseScanner):
         sample = cursor._read_exact(sample_size)
         remaining = length - sample_size
         self._check_timeout()
+        normalized_value_identity = None
         if _is_text_like_short_binary(sample):
-            self._analyze_streamed_binary_chunks(sample, cursor, remaining, length, location, result)
+            normalized_value_identity = self._analyze_streamed_binary_chunks(
+                sample,
+                cursor,
+                remaining,
+                length,
+                location,
+                result,
+            )
         else:
             if is_tensor_like:
                 self._add_binary_pattern_incomplete_check(
@@ -2976,7 +2990,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 )
             cursor.skip(remaining)
             self._check_timeout()
-        return _StreamValue("bytes", value=None)
+        return _StreamValue("bytes", value=None, normalized_value_identity=normalized_value_identity)
 
     def _consume_flax_ndarray_ext_scalar(
         self,

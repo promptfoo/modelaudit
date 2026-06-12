@@ -2794,6 +2794,38 @@ def test_flax_msgpack_detects_short_suspicious_binary_value(tmp_path: Path) -> N
     )
 
 
+def test_flax_msgpack_detects_over_budget_binary_restore_fn_identity(tmp_path: Path) -> None:
+    path = tmp_path / "over_budget_binary_restore_fn.msgpack"
+    restore_fn = b" \n\t eval \r" + b" " * 54
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": restore_fn})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+    restore_check = next(
+        check
+        for check in result.checks
+        if check.name == "Object Attribute Security Check"
+        and check.message == "Suspicious object attribute value detected: restore_fn"
+    )
+
+    assert result.success is False
+    assert restore_check.details["value_sample"] == "eval"
+
+
+def test_flax_msgpack_preserves_benign_over_budget_binary_restore_fn(tmp_path: Path) -> None:
+    path = tmp_path / "benign_over_budget_binary_restore_fn.msgpack"
+    restore_fn = b" custom_deserialize " + b" " * 44
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": restore_fn})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Object Attribute Security Check"
+        and check.message == "Suspicious object attribute value detected: restore_fn"
+        for check in result.checks
+    )
+
+
 def test_flax_msgpack_detects_suspicious_binary_key(tmp_path: Path) -> None:
     path = tmp_path / "binary_code_key.msgpack"
     create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"eval('x')": "safe"})
