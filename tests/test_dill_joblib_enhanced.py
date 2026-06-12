@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,38 @@ class MaliciousPayload:
 
 def _write_joblib_like_pickle(path: Path, *, padding: int = 0) -> None:
     path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00." + b"\x00" * padding)
+
+
+def _binunicode(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return b"X" + struct.pack("<I", len(encoded)) + encoded
+
+
+def _joblib_numpy_raw_segment(prefix_length: int, raw_data: bytes) -> bytes:
+    padding_length = 16 - ((prefix_length + 1) % 16)
+    return bytes([padding_length]) + (b"\xff" * padding_length) + raw_data
+
+
+def _write_joblib_numpy_array_pickle(path: Path) -> None:
+    prefix = (
+        b"\x80\x02]("
+        b"cjoblib.numpy_pickle\nNumpyArrayWrapper\n)\x81}("
+        + _binunicode("subclass")
+        + b"cnumpy\nndarray\n"
+        + _binunicode("shape")
+        + b"K\x04\x85"
+        + _binunicode("order")
+        + _binunicode("C")
+        + _binunicode("dtype")
+        + b"cnumpy\ndtype\n"
+        + _binunicode("i8")
+        + b"\x89\x88\x87R"
+        + _binunicode("allow_mmap")
+        + b"\x88"
+        + _binunicode("numpy_array_alignment_bytes")
+        + b"K\x10ub"
+    )
+    path.write_bytes(prefix + _joblib_numpy_raw_segment(len(prefix), b"\x00" * 32) + b"e.")
 
 
 def test_malicious_joblib_extension_cannot_bypass_rust_scan(tmp_path: Path) -> None:
@@ -50,7 +83,7 @@ def test_joblib_policy_export_remains_narrow() -> None:
     assert "dill" not in ML_SAFE_GLOBALS
 
 
-def test_legitimate_joblib_like_pickle_is_accepted(
+def test_bare_joblib_wrapper_tail_remains_inconclusive_without_raw_array_span(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -72,6 +105,41 @@ def test_legitimate_joblib_like_pickle_is_accepted(
     result = PickleScanner().scan(str(joblib_file))
 
     assert _is_legitimate_serialization_file(str(joblib_file)) is True
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["pickle_verdict"] in {"suspicious", "unknown"}
+    assert "trusted_incomplete_tail" not in result.metadata
+
+
+def test_valid_joblib_raw_array_tail_is_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    joblib_file = tmp_path / "numpy_arrays.joblib"
+    _write_joblib_numpy_array_pickle(joblib_file)
+
+    def trusted_joblib_references(module: str, name: str) -> bool:
+        return (module, name) in {
+            ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+            ("numpy", "ndarray"),
+            ("numpy", "dtype"),
+        }
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        trusted_joblib_references,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+        trusted_joblib_references,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        trusted_joblib_references,
+    )
+
+    result = PickleScanner().scan(str(joblib_file))
+
     assert result.success is True
     assert result.metadata["trusted_incomplete_tail"] is True
     assert result.metadata["trusted_incomplete_tail_reason"] == "joblib_pickle_tail"
