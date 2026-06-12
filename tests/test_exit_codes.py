@@ -688,7 +688,7 @@ def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(
         results = scan_model_directory_or_file(str(test_file))
 
     assert results.has_errors is False
-    assert results.success is True
+    assert results.success is False
     assert determine_exit_code(results) == 1
 
 

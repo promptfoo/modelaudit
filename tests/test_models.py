@@ -594,6 +594,33 @@ class TestModelAuditResultModel:
         assert result.file_metadata["model.bin"]["scan_outcome_reasons"] == ["bounded_probe_exhausted"]
         assert determine_exit_code(result) == 1
 
+    def test_aggregate_scan_result_check_only_security_failure_is_not_operational_failure(self) -> None:
+        """Dict aggregation should classify check-only security findings as completed findings."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": False,
+                "files_scanned": 1,
+                "issues": [],
+                "checks": [
+                    {
+                        "name": "Synthetic Security Check",
+                        "status": "failed",
+                        "message": "Synthetic check-only warning finding",
+                        "severity": "warning",
+                        "location": "synthetic.bin",
+                        "timestamp": 0.0,
+                    }
+                ],
+                "assets": [],
+            }
+        )
+
+        assert result.success is False
+        assert result.issues == []
+        assert len(result.checks) == 1
+        assert determine_exit_code(result) == 1
+
     def test_aggregate_scan_result_issue_only_incomplete_coverage_fails_closed(self) -> None:
         """Dict aggregation should honor incomplete coverage retained only in issue details."""
         result = create_initial_audit_result()
@@ -781,6 +808,34 @@ class TestModelAuditResultModel:
         assert result.success is True
         assert len(result.issues) == 1
         metadata = result.file_metadata["<numpy:1>"].model_dump(exclude_none=True)
+        assert "scan_outcome" not in metadata
+        assert "scan_outcome_reasons" not in metadata
+        assert "scan_outcome" not in scan_result.metadata
+        assert "scan_outcome_reasons" not in scan_result.metadata
+        assert determine_exit_code(result) == 1
+
+    def test_aggregate_scan_result_direct_check_only_security_failure_is_not_marked_inconclusive(self) -> None:
+        """Check-only security findings should not be reclassified as coverage failures."""
+        result = create_initial_audit_result()
+        scan_result = ScanResult(scanner_name="synthetic")
+        scan_result.checks.append(
+            Check(
+                name="Synthetic Security Check",
+                status=CheckStatus.FAILED,
+                message="Synthetic check-only critical finding",
+                severity=IssueSeverity.CRITICAL,
+                location="synthetic.bin",
+                rule_code="S999",
+            )
+        )
+        scan_result.finish(success=False)
+
+        result.aggregate_scan_result_direct(scan_result)
+
+        assert result.success is False
+        assert result.issues == []
+        assert len(result.checks) == 1
+        metadata = result.file_metadata["<synthetic:1>"].model_dump(exclude_none=True)
         assert "scan_outcome" not in metadata
         assert "scan_outcome_reasons" not in metadata
         assert "scan_outcome" not in scan_result.metadata

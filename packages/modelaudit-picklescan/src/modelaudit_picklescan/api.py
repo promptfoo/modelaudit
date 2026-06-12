@@ -327,15 +327,15 @@ class _AbstractCallResult:
     args: object
 
 
-_ABSTRACT_MARK = object()
-_ABSTRACT_UNKNOWN = object()
-
-
 @dataclass(frozen=True)
 class _PytorchStorageReferenceParse:
     referenced_keys: set[str]
     parse_complete: bool
     all_persistent_ids_are_pytorch_storage: bool
+
+
+_ABSTRACT_MARK = object()
+_ABSTRACT_UNKNOWN = object()
 
 
 class PickleScanner:
