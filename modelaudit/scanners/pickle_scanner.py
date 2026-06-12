@@ -56,6 +56,7 @@ _PYTORCH_LEGACY_STREAM_COUNT = 5
 _PYTORCH_LEGACY_MAGIC_BINARY = _PYTORCH_LEGACY_MAGIC_NUMBER.to_bytes(10, "little")
 _PYTORCH_LEGACY_MAGIC_DECIMAL = str(_PYTORCH_LEGACY_MAGIC_NUMBER).encode("ascii")
 _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES = 128
+_PYTORCH_LEGACY_INITIAL_LAYOUT_PROBE_BYTES = 512
 _PYTORCH_LEGACY_SYS_INFO_KEYS = frozenset({"protocol_version", "little_endian", "type_sizes"})
 _PYTORCH_LEGACY_MAX_CONTROL_BYTES = 10 * 1024 * 1024
 _PYTORCH_LEGACY_MAX_STORAGE_KEYS = 10_000
@@ -2773,6 +2774,15 @@ class PickleScanner(BaseScanner):
         )
         return probe_limit if total_size is None else min(max(total_size, 0), probe_limit)
 
+    def _legacy_pytorch_initial_layout_probe_size(self, total_size: int | None) -> int:
+        probe_limit = self._legacy_pytorch_preamble_probe_size(total_size)
+        if self.max_file_read_size and self.max_file_read_size > 0:
+            probe_limit = max(
+                probe_limit,
+                min(self.max_file_read_size, _PYTORCH_LEGACY_INITIAL_LAYOUT_PROBE_BYTES),
+            )
+        return min(probe_limit, self._legacy_pytorch_control_probe_size(total_size))
+
     def _read_legacy_pytorch_preamble_probe(self, path: str, file_size: int) -> bytes:
         probe_size = self._legacy_pytorch_preamble_probe_size(file_size)
         if probe_size <= 0:
@@ -4208,10 +4218,17 @@ class PickleScanner(BaseScanner):
                         initial_payload,
                         total_size=standalone_size,
                     )
-                    if initial_layout is None and (
-                        _legacy_pytorch_incomplete_sys_info_needs_more_bytes(initial_payload)
-                        or _legacy_pytorch_object_probe_needs_more_bytes(initial_payload)
-                    ):
+                    if initial_layout is None and _legacy_pytorch_incomplete_sys_info_needs_more_bytes(initial_payload):
+                        layout_probe_target = self._legacy_pytorch_initial_layout_probe_size(standalone_size)
+                        initial_payload += self._read_stream_bytes(
+                            file_obj,
+                            max(layout_probe_target - len(initial_payload), 0),
+                        )
+                        initial_layout, _initial_storage_valid = self._legacy_pytorch_layout_for_scan(
+                            initial_payload,
+                            total_size=standalone_size,
+                        )
+                    if initial_layout is None and _legacy_pytorch_object_probe_needs_more_bytes(initial_payload):
                         probe_target = self._legacy_pytorch_control_probe_size(standalone_size)
                         initial_payload += self._read_stream_bytes(
                             file_obj,
