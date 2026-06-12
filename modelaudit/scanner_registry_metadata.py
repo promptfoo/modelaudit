@@ -278,7 +278,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "content_routed_filenames": [
             "config.json",
             "model.json",
-            "tokenizer.json",
             "params.json",
             "hyperparams.yaml",
             "training_args.json",
@@ -288,7 +287,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
             "requirements.txt",
             "metadata.json",
             "index.json",
-            "tokenizer_config.json",
             "model_config.json",
         ],
         "priority": 12,
@@ -345,6 +343,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "JaxCheckpointScanner",
         "description": "Scans JAX checkpoint files in various serialization formats",
         "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"],
+        "content_routed_extensions": [".json"],
         "header_formats": ["jax_checkpoint"],
         "priority": 15,
         "dependencies": [],

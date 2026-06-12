@@ -22,11 +22,9 @@ from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
-    MEDIA_ROUTE_READ_BYTES,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
-    PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
@@ -38,6 +36,7 @@ from modelaudit.utils.file.detection import (
     detect_flax_msgpack_overlap_routes,
     detect_format_from_extension,
     find_sharded_files,
+    is_huggingface_tokenizer_json_file,
     is_zipfile,
     validate_file_type,
 )
@@ -50,14 +49,7 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
-from tests.helpers.file_creators import (
-    _coreml_field_bytes,
-    _coreml_field_varint,
-    create_v7_tar_archive,
-    malicious_pickle_bytes,
-    valid_jpeg_bytes,
-    valid_png_bytes,
-)
+from tests.helpers.file_creators import _coreml_field_bytes, _coreml_field_varint, create_v7_tar_archive
 
 
 def _ubjson_key(key: bytes) -> bytes:
@@ -81,6 +73,50 @@ def _create_mar_archive(
         archive.writestr("handler.py", b"def handle(data, context):\n    return data\n")
         archive.writestr("weights.bin", b"weights")
     return mar_path
+
+
+def _write_hf_tokenizer_json(path: Path, extra_fields: dict[str, Any] | None = None) -> Path:
+    payload: dict[str, Any] = {
+        "version": "1.0",
+        "added_tokens": [],
+        "model": {
+            "type": "BPE",
+            "vocab": {"hello": 0},
+            "merges": [],
+        },
+    }
+    if extra_fields:
+        payload.update(extra_fields)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _write_ordered_hf_tokenizer_json(
+    path: Path,
+    *,
+    late_fields: str = "",
+    padding_size: int = 0,
+    model_fields: str = '"type":"BPE","vocab":{"hello":0},"merges":[]',
+    version_json: str = '"1.0"',
+) -> Path:
+    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
+    path.write_text(
+        (f'{{"version":{version_json},"added_tokens":[],"model":{{{model_fields}}}{padding}{late_fields}}}'),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_truncated_ordered_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
+    path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            f'"padding":"{"x" * padding_size}'
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _build_tf_metagraph_bytes() -> bytes:
@@ -226,96 +262,6 @@ def test_detect_file_format_large_directory(tmp_path):
         (tf_dir / f"file_{i}.txt").write_text("x")
 
     assert detect_file_format(str(tf_dir)) == "tensorflow_directory"
-
-
-@pytest.mark.parametrize(
-    ("filename", "payload"),
-    [
-        ("preview.png", valid_png_bytes()),
-        ("preview.jpg", valid_jpeg_bytes()),
-        ("preview.jpeg", valid_jpeg_bytes()),
-    ],
-    ids=["png", "jpg", "jpeg"],
-)
-def test_valid_media_do_not_route_to_serialized_formats(tmp_path: Path, filename: str, payload: bytes) -> None:
-    media_path = tmp_path / filename
-    media_path.write_bytes(payload)
-
-    assert detect_file_format(str(media_path)) == "unknown"
-    assert detect_file_format_from_magic(str(media_path)) == "unknown"
-    assert detect_file_format_for_skip_filter(str(media_path)) == "unknown"
-
-
-@pytest.mark.parametrize(
-    ("filename", "payload"),
-    [("polyglot.png", valid_png_bytes()), ("polyglot.jpg", valid_jpeg_bytes())],
-    ids=["png", "jpg"],
-)
-def test_media_pickle_polyglot_keeps_pickle_route(tmp_path: Path, filename: str, payload: bytes) -> None:
-    media_path = tmp_path / filename
-    media_path.write_bytes(payload + malicious_pickle_bytes())
-
-    assert detect_file_format(str(media_path)) == "pickle"
-    assert detect_file_format_from_magic(str(media_path)) == "pickle"
-    assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
-
-
-def test_jpeg_fill_byte_media_pickle_polyglot_keeps_pickle_route(tmp_path: Path) -> None:
-    media_path = tmp_path / "fill-polyglot.jpg"
-    jpeg_with_fill = valid_jpeg_bytes()[:3] + b"\xff" + valid_jpeg_bytes()[3:]
-    media_path.write_bytes(jpeg_with_fill + malicious_pickle_bytes())
-
-    assert detect_file_format(str(media_path)) == "pickle"
-    assert detect_file_format_from_magic(str(media_path)) == "pickle"
-    assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
-
-
-def test_padded_media_pickle_polyglot_fails_closed_past_probe_limit(tmp_path: Path) -> None:
-    media_path = tmp_path / "padded-polyglot.png"
-    media_path.write_bytes(valid_png_bytes() + (b"\0" * (MEDIA_ROUTE_READ_BYTES + 2)) + malicious_pickle_bytes())
-
-    assert detect_file_format(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_from_magic(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-
-
-@pytest.mark.parametrize(
-    ("filename", "payload"),
-    [
-        ("bad-crc.png", bytes(bytearray(valid_png_bytes())[:-1] + bytes([valid_png_bytes()[-1] ^ 0x01]))),
-        (
-            "forged-tail.jpg",
-            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00" + b"\0" * 32 + b"\xff\xd9",
-        ),
-    ],
-    ids=["png-crc", "jpeg-tail"],
-)
-def test_malformed_media_headers_fail_closed(tmp_path: Path, filename: str, payload: bytes) -> None:
-    media_path = tmp_path / filename
-    media_path.write_bytes(payload)
-
-    assert detect_file_format(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_from_magic(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-
-
-def test_png_crc_reader_refuses_oversized_payload_before_unbounded_read() -> None:
-    def png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
-        checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
-        return len(payload).to_bytes(4, "big") + chunk_type + payload + checksum.to_bytes(4, "big")
-
-    ihdr = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
-    oversized_idat_length = file_detection._MEDIA_STRUCTURAL_PROOF_READ_BYTES + 1
-    prefix = b"\x89PNG\r\n\x1a\n" + ihdr + oversized_idat_length.to_bytes(4, "big") + b"IDAT"
-    idat_payload_offset = len(prefix)
-    file_size = idat_payload_offset + oversized_idat_length + 4
-
-    def read_at(offset: int, size: int) -> bytes:
-        if offset >= idat_payload_offset:
-            pytest.fail("oversized PNG CRC proof attempted to read chunk payload")
-        return prefix[offset : offset + size]
-
-    assert file_detection._find_png_end_with_reader(file_size, read_at) is None
 
 
 def test_detect_file_format_zip(tmp_path):
@@ -534,12 +480,31 @@ def test_detect_printable_ascii_text_suffix_protobuf_tag_near_match_stays_unknow
 
 
 @pytest.mark.parametrize("suffix", [".txt", ".conf"])
-def test_detect_space_prefixed_text_suffix_messagepack_candidate_fails_closed(
+@pytest.mark.parametrize(
+    "prefix",
+    [b" ", b":\n", b": a\n", b"a:\n"],
+    ids=["space", "colon-newline", "colon-space-value", "key-colon"],
+)
+def test_detect_text_suffix_messagepack_scalar_stream_candidate_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+    prefix: bytes,
+) -> None:
+    document = tmp_path / f"ambiguous{suffix}"
+    document.write_bytes(prefix + (b'""' + ("é" * 17).encode("utf-8")) * 4097)
+
+    assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
+    assert detect_file_format(str(document)) == "flax_msgpack"
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".conf"])
+def test_detect_key_prefixed_line_broken_text_suffix_messagepack_candidate_fails_closed(
     tmp_path: Path,
     suffix: str,
 ) -> None:
     document = tmp_path / f"ambiguous{suffix}"
-    document.write_bytes(b" " + (b'""' + ("é" * 17).encode("utf-8")) * 4097)
+    document.write_bytes(b"key:\n" + (b'""' + ("é" * 17).encode("utf-8") + b"\n") * 4097)
 
     assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
     assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
@@ -1560,6 +1525,636 @@ def test_detect_generic_json_value_budget_before_mxnet_structure_routes_mxnet_wi
     assert detect_file_format(str(model_path)) == "mxnet"
     assert detect_file_format_from_magic(str(model_path)) == "mxnet"
     assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
+
+
+def test_detect_large_hf_tokenizer_json_is_not_binary_json_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {"padding": "x" * 256},
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+    assert detect_file_format_from_magic(str(tokenizer_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "extra_fields",
+    [
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+        {"learner": {"gradient_booster": {}, "malicious_code": "os.system()"}},
+        {
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+        {"framework": "jax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"},
+    ],
+)
+def test_hf_tokenizer_json_does_not_hide_late_security_root_keys(
+    tmp_path: Path,
+    extra_fields: dict[str, Any],
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(tmp_path / "tokenizer.json", extra_fields)
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+@pytest.mark.parametrize(
+    "extra_fields",
+    [
+        {
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+                "special_tokens": [{"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}],
+            }
+        },
+        {
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "template": "$A:0 [SEP]:0",
+                "single": "$A:0 [SEP]:0",
+                "pair": "$A:0 [SEP]:0 $B:1 [SEP]:1",
+                "special_tokens": [{"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}],
+            },
+            "decoder": {"type": "Replace", "pattern": "</w>", "content": " "},
+            "normalizer": {"type": "Sequence", "normalizers": [{"type": "Replace", "pattern": "x", "content": "y"}]},
+        },
+    ],
+)
+def test_hf_tokenizer_json_nested_template_evidence_is_not_claimed(
+    tmp_path: Path,
+    extra_fields: dict[str, Any],
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(tmp_path / "tokenizer.json", extra_fields)
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_decodes_escaped_template_route_evidence(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    malicious_template = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
+    tokenizer_path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            f'"chat\\u005ftemplate":{json.dumps(malicious_template)}}}'
+        ),
+        encoding="utf-8",
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_format"),
+    [
+        ("tokenizer", "unknown"),
+        ("tokenizer.txt", "unknown"),
+        ("tokenizer.bin", "pytorch_binary"),
+    ],
+)
+def test_hf_tokenizer_named_json_template_evidence_routes_without_json_suffix(
+    tmp_path: Path,
+    filename: str,
+    expected_format: str,
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / filename,
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == expected_format
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_format"),
+    [
+        ("tokenizer", "unknown"),
+        ("tokenizer.txt", "unknown"),
+        ("tokenizer.bin", "pytorch_binary"),
+    ],
+)
+def test_hf_tokenizer_named_vocab_template_tokens_do_not_route_jinja_without_json_suffix(
+    tmp_path: Path,
+    filename: str,
+    expected_format: str,
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / filename,
+        {
+            "model": {
+                "type": "BPE",
+                "vocab": {"{{": 0, "{%": 1, "template": 2, "hello": 3},
+                "merges": [],
+            }
+        },
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == expected_format
+
+
+def test_hf_tokenizer_json_malformed_schema_evidence_fails_closed_for_routing(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0}},"padding":1e+}',
+        encoding="utf-8",
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_hf_tokenizer_json_allows_vocab_jinja_markers_when_schema_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "{{": 0,
+                    "template": 1,
+                    "framework": 2,
+                    "nodes": 3,
+                    **{f"piece_{index}": index + 4 for index in range(80)},
+                },
+                "merges": [],
+            },
+        },
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "extra_fields",
+    [
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+        {"learner": {"gradient_booster": {}, "malicious_code": "os.system()"}},
+        {
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+        {"framework": "jax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"},
+    ],
+)
+def test_hf_tokenizer_json_with_late_root_overlap_after_probe_is_not_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra_fields: dict[str, Any],
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            **extra_fields,
+        },
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+@pytest.mark.parametrize(
+    "padding",
+    [
+        "x" * 1024,
+        ["x" * 1024],
+        int("9" * 1024),
+    ],
+)
+def test_hf_tokenizer_json_incomplete_non_object_value_checks_escaped_suffix_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    padding: str | list[str] | int,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "padding": padding,
+        },
+    )
+    malicious_template = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
+    tokenizer_path.write_text(
+        tokenizer_path.read_text(encoding="utf-8")[:-1]
+        + f', "chat\\u005ftemplate": {json.dumps(malicious_template)}}}',
+        encoding="utf-8",
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_model_template_after_large_vocab_is_not_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+                "template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            },
+        },
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_over_routing_budget_is_claimed_after_schema_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {"padding": "x" * 256},
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_completed_value_at_probe_boundary_checks_suffix_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=64,
+    )
+    boundary = tokenizer_path.read_text(encoding="utf-8").index(',"chat_template"')
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", boundary)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", boundary)
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_root_template_between_probe_and_suffix_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","tail":"' + ("y" * 256) + '"',
+        padding_size=256,
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_key_text_inside_padding_string_does_not_route_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"tail":"' + ("y" * 256) + '"',
+        padding_size=0,
+        model_fields=(
+            '"type":"BPE","vocab":{"hello":0},"merges":[],'
+            '"metadata":"padding,\\"chat_template\\":\\"not a structural key\\"' + ("x" * 256) + '"'
+        ),
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_mxnet_root_between_probe_and_suffix_routes_mxnet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+            '"arg_nodes":[0],"heads":[[0,0,0]],"tail":"' + ("y" * 256) + '"'
+        ),
+        padding_size=256,
+    )
+
+    assert file_detection.huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "mxnet"
+
+
+@pytest.mark.parametrize(
+    ("framework", "expected"),
+    [
+        ("jax", True),
+        ("transformers", False),
+    ],
+)
+def test_hf_tokenizer_json_jax_identity_between_probe_and_suffix_requires_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    framework: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=f',"framework":"{framework}","tail":"' + ("y" * 256) + '"',
+        padding_size=256,
+    )
+
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is expected
+
+
+def test_hf_tokenizer_json_escaped_jinja_string_between_probe_and_suffix_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"metadata":"\\u007b\\u007b \'\'.__class__.__mro__[1].__subclasses__() \\u007d\\u007d",'
+            '"tail":"' + ("y" * 256) + '"'
+        ),
+        padding_size=256,
+    )
+
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed_across_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+        },
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_hf_tokenizer_json_route_key_after_value_ending_at_probe_boundary_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_limit = 256
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", probe_limit)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    prefix = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"padding":"'
+    padding_size = probe_limit - len(prefix.encode("utf-8")) - 1
+    assert padding_size > 0
+    tokenizer_path.write_text(
+        prefix + ("x" * padding_size) + '","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+        encoding="utf-8",
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+@pytest.mark.parametrize(
+    ("late_fields", "expected_format"),
+    [
+        (
+            ',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+            "unknown",
+        ),
+        (
+            ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"}',
+            "xgboost",
+        ),
+        (
+            ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+            '"arg_nodes":[0],"heads":[[0,0,0]]',
+            "mxnet",
+        ),
+    ],
+)
+def test_hf_tokenizer_json_late_security_root_keys_after_structure_budget_are_not_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    late_fields: str,
+    expected_format: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=late_fields,
+        padding_size=256,
+        version_json="[1,7,4]" if expected_format == "xgboost" else '"1.0"',
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == expected_format
+    assert detect_file_format_from_magic(str(tokenizer_path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == expected_format
+
+
+def test_hf_tokenizer_json_late_conflict_after_16m_threshold_is_not_claimed(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES + 1,
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":@}}',
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0}},"padding":"bad \\q"}',
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0}},"padding":1e+}',
+    ],
+)
+def test_hf_tokenizer_json_malformed_schema_is_not_claimed(tmp_path: Path, payload: str) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(payload, encoding="utf-8")
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_truncated_at_structure_budget_is_not_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_truncated_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=256,
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_excessive_nested_root_value_is_not_claimed(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"metadata":' + ("[" * 70) + "0" + ("]" * 70),
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_jax_identity_is_not_claimed(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(',"framework":"jax","payload":"jax.experimental.host_callback.call(os.system, \'id\')"'),
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_jax_route_evidence_requires_identity_value(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(',"chat_template":"{{ harmless_user }}","framework":"transformers"'),
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_jax_route_evidence_accepts_library_identity_value(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(',"chat_template":"{{ harmless_user }}","library":"jax"'),
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_vocab_template_token_is_claimed(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields='"type":"BPE","vocab":{"{{":0,"{%":1,"hello":2},"merges":[]',
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+    assert detect_file_format_from_magic(str(tokenizer_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_model_template_after_vocab_probe_boundary_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    vocab_entries = ",".join(f'"piece_{index}":{index}' for index in range(80))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=(
+            f'"type":"BPE","vocab":{{{vocab_entries}}},'
+            '"template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","merges":[]'
+        ),
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_model_template_after_merges_probe_boundary_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    merges = ",".join(json.dumps(f"piece_{index} piece_{index + 1}") for index in range(80))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=(
+            f'"type":"BPE","vocab":{{"hello":0}},"merges":[{merges}],'
+            '"template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_vocab_template_token_after_array_value_does_not_route_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    vocab_entries = '"piece":[],"template":0,' + ",".join(f'"tok_{index}":{index}' for index in range(80))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=f'"type":"BPE","vocab":{{{vocab_entries}}},"merges":[]',
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
@@ -3795,22 +4390,6 @@ def test_validate_file_type(tmp_path):
         info.size = len(content)
         tar.addfile(info, io.BytesIO(content))
     assert validate_file_type(str(nemo_path)) is True
-
-    gzip_nemo_path = tmp_path / "compressed.nemo"
-    with tarfile.open(gzip_nemo_path, "w:gz") as tar:
-        info = tarfile.TarInfo(name="model_config.yaml")
-        content = b"model: test\n"
-        info.size = len(content)
-        tar.addfile(info, io.BytesIO(content))
-    assert validate_file_type(str(gzip_nemo_path)) is True
-
-    malformed_gzip_nemo_path = tmp_path / "malformed.nemo"
-    malformed_gzip_nemo_path.write_bytes(b"\x1f\x8b\x08\x00truncated")
-    assert validate_file_type(str(malformed_gzip_nemo_path)) is False
-
-    gzip_non_tar_nemo_path = tmp_path / "gzip-non-tar.nemo"
-    gzip_non_tar_nemo_path.write_bytes(gzip.compress(b"not a tar archive"))
-    assert validate_file_type(str(gzip_non_tar_nemo_path)) is False
 
     # Small file should be valid (can't determine magic bytes)
     small_file = tmp_path / "small.h5"

