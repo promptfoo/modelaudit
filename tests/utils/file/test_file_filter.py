@@ -13,6 +13,7 @@ import pytest
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file import filtering
 from modelaudit.utils.file.detection import (
+    _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
@@ -480,9 +481,25 @@ class TestFileFilter:
         if suffix in {".txt", ".rst"}:
             assert should_skip_file(str(generic_map))
 
+    @pytest.mark.parametrize(("filename", "line"), [("notes.txt", "Ġtoken token\n"), ("settings.conf", "token=olá\n")])
+    def test_large_text_suffix_within_complete_text_bound_stays_skipped(
+        self,
+        tmp_path: Path,
+        filename: str,
+        line: str,
+    ) -> None:
+        document = tmp_path / filename
+        document.write_text("#version: 0.2\n" + (line * 220_000), encoding="utf-8")
+
+        assert (
+            2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES < document.stat().st_size < _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        )
+        assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+        assert should_skip_file(str(document))
+
     def test_oversized_ambiguous_text_suffix_fails_closed_as_flax(self, tmp_path: Path) -> None:
         document = tmp_path / "notes.txt"
-        document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+        document.write_bytes(b"a" * (_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1))
 
         assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
         assert not should_skip_file(str(document))
