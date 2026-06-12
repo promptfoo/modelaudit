@@ -1342,6 +1342,35 @@ def test_pytorch_zip_scanner_keeps_tensor_storage_trust_when_pickle_scanner_is_d
     )
 
 
+def test_pytorch_zip_scanner_probes_mixed_persid_storage_when_pickle_scanner_is_disabled(
+    tmp_path: Path,
+) -> None:
+    model_path = create_mock_pytorch_zip(
+        tmp_path / "scanner_only_mixed_persid_tensor_bytes.pt",
+        with_pickle=False,
+        prefix="archive",
+    )
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+        for check in result.checks
+    )
+    assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/data/0"
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_scanner_probes_unreferenced_numeric_storage_lookalike(tmp_path: Path) -> None:
     """An unreferenced canonical-looking data member remains an executable sidecar."""
     model_path = create_mock_pytorch_zip(tmp_path / "unreferenced_tensor_bytes.pt", with_pickle=False, prefix="archive")
