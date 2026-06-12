@@ -11,8 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - contextualize SafeTensors license metadata so ordinary embedded license text does not produce URL or long-value noise while preserving malformed and executable metadata detections
 - reconstruct bounded wrapped SafeTensors license base64 tails and fail closed on residual URL encodings before suppressing metadata URL and length findings
+- detect GGUF curl short-option remote fetches, ignore spaced Python attribute calls, and truncate large tokenizer metadata arrays with explicit counts
+- require concrete GGUF metadata evidence for S902 findings instead of flagging benign URLs, chat-template syntax, slashes, or pipes
+- deduplicate repeated ONNX custom-operator domain findings into bounded per-domain reports while preserving affected-file evidence
+- avoid Hugging Face streaming body probes for declared-suffix artifacts excluded by scanner selection while preserving selected renamed content routes
+- exclude Hugging Face local-dir cache sidecars from scan inventory, routing, issue locations, and SBOM components while preserving hidden artifact scanning
+- keep strongly identified SentencePiece tokenizer `.model` artifacts, including custom-unknown models with disabled special tokens, out of XGBoost routing while preserving fail-closed `.model` ambiguity for malformed tails.
+- tolerate picklescan reports that omit private metadata
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds
+- distinguish PyTorch checkpoint producer-version metadata from active runtime CVE applicability, resolve runtime torch metadata only from trusted install roots, report unknown runtime applicability explicitly, carry same-revision repository SafeTensors inventory into PyTorch pickle applicability details, and preserve artifact-level pickle and tensor-structure findings
+- omit isolated C&C vocabulary tokens from strongly identified tokenizer vocabularies while preserving active network and command findings
+- downgrade filename/content mismatch findings only after an alternate ONNX scanner validates the protobuf format while keeping malformed, spoofed, polyglot, and incomplete routes actionable
+- restrict Jinja SSTI indicators to executable template spans so prose mentions of request handling do not produce critical findings
+- treat canonical storage persistent IDs as informational only after legacy PyTorch framing, storage tuples, and storage payloads validate completely
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
+- report gated or unauthorized Hugging Face acquisitions as failed, inconclusive source outcomes without claiming artifact coverage, and preserve partial findings from interrupted Hugging Face streaming scans
+- show Hugging Face preview access notices when selected gated files have unknown sizes
+- treat known ONNX Runtime `com.microsoft` optimized-export operators as low-noise vendor metadata while preserving S1111 for unknown custom domains and ambiguous vendor claims
+- recognize current GGUF IQ3_S, IQ4_XS, and BF16 tensor types while preserving bounded inconclusive handling for unsupported or malformed tensor metadata
 - scope both ONNX weight scanners to bounded semantic weight lineage across nested graphs, control flow, local functions, constants, Gather/Einsum, and static views; fail closed on ambiguous or sparse coverage; and evaluate extreme tails per conceptual output without suppressing repeated malicious patterns or flagging clean heavy tails
 - derive PyTorch ZIP pickle opcode summaries from exact opcode evidence instead of matching substrings in finding text
 - accept current SafeTensors FP8, sub-byte float, and complex tensors
