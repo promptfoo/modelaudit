@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - suppress installed source-trusted inert Hugging Face training metadata and safe NumPy RNG-state reconstruction noise while keeping default-install, unresolved, rebound, or shadowed PyTorch ZIP framework metadata suspicious unless trusted source can be inspected
+- validate Basic Auth credentials only in bounded authorization-header context with decodable username/password tokens
 - propagate file-level inconclusive and incomplete-coverage metadata into aggregate success, strict JSON, exit-code, and cache semantics
 - preserve declared ONNX external data sidecars during Hugging Face streaming scans
 - inspect large Keras HDF5 models through file-backed metadata traversal instead of rejecting them at the generic whole-file read cap; aggregate `content_hash` is omitted for these large file-backed HDF5 scans

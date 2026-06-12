@@ -196,7 +196,7 @@ def get_secret_rule_code(secret_type: str) -> str | None:
 
     if "api" in secret_lower and "key" in secret_lower:
         return _rule("S701")
-    elif "password" in secret_lower or "passwd" in secret_lower:
+    elif "password" in secret_lower or "passwd" in secret_lower or "basic auth" in secret_lower:
         return _rule("S702")
     elif "private" in secret_lower and "key" in secret_lower:
         return _rule("S703")
