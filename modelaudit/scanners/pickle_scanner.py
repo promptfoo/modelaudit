@@ -2783,6 +2783,27 @@ class PickleScanner(BaseScanner):
             return True
         return cls._pickle_location_position(location) in trusted_import_positions.get(import_reference, set())
 
+    @classmethod
+    def _is_legacy_pytorch_storage_import_global_finding(
+        cls,
+        details: dict[str, Any],
+        trusted_import_positions: Mapping[str, set[int]],
+        location: str | None,
+    ) -> bool:
+        import_reference = details.get("import_reference")
+        opcode = details.get("opcode")
+        if not (
+            details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+            and (opcode is None or opcode in {"GLOBAL", "STACK_GLOBAL"})
+            and isinstance(import_reference, str)
+        ):
+            return False
+        trusted_positions = trusted_import_positions.get(import_reference, set())
+        position = details.get("position")
+        return (type(position) is int and position in trusted_positions) or (
+            cls._pickle_location_position(location) in trusted_positions
+        )
+
     @staticmethod
     def _annotate_legacy_pytorch_storage_persistent_id_record(
         details: dict[str, Any],
@@ -2942,6 +2963,35 @@ class PickleScanner(BaseScanner):
                 if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
                     issue.details,
                     trusted_storage_import_references,
+                    trusted_storage_import_positions,
+                    issue.location,
+                )
+            ]
+
+        downgraded_global_import_count = 0
+        for check in result.checks:
+            if not cls._is_legacy_pytorch_storage_import_global_finding(
+                check.details,
+                trusted_storage_import_positions,
+                check.location,
+            ):
+                continue
+            if check.rule_code is not None:
+                downgraded_private_entries.append({"name": check.name, "rule_code": check.rule_code})
+            check.status = CheckStatus.PASSED
+            check.severity = IssueSeverity.INFO
+            check.message = "PyTorch storage global import found in validated legacy PyTorch stream"
+            check.details["trusted_legacy_pytorch_context"] = True
+            check.details["pytorch_storage_import_reference"] = True
+            downgraded_global_import_count += 1
+
+        if downgraded_global_import_count:
+            result.metadata["legacy_pytorch_trusted_storage_global_import_count"] = downgraded_global_import_count
+            result.issues = [
+                issue
+                for issue in result.issues
+                if not cls._is_legacy_pytorch_storage_import_global_finding(
+                    issue.details,
                     trusted_storage_import_positions,
                     issue.location,
                 )
