@@ -768,18 +768,18 @@ class SecretsDetector:
             if match_end is not None
             else ""
         )
-        collection_prefix_lower = collection_prefix.lower()
         if SecretsDetector._basic_auth_yaml_list_current_value_prefix(
             line_prefix
         ) and SecretsDetector._basic_auth_match_has_yaml_list_header_context(text, position):
             return True
-        if "auth" in collection_prefix_lower and SecretsDetector._basic_auth_prefix_has_header_value_array_context(
-            collection_prefix
-        ):
+        if SecretsDetector._basic_auth_prefix_may_have_header_value_array_context(
+            collection_prefix,
+            line_prefix,
+        ) and SecretsDetector._basic_auth_prefix_has_header_value_array_context(collection_prefix):
             return True
-        if "headers" in collection_prefix_lower and SecretsDetector._basic_auth_prefix_has_headers_object_context(
-            collection_prefix, collection_suffix
-        ):
+        if SecretsDetector._basic_auth_prefix_may_have_headers_object_context(
+            collection_prefix
+        ) and SecretsDetector._basic_auth_prefix_has_headers_object_context(collection_prefix, collection_suffix):
             return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
@@ -1269,6 +1269,23 @@ class SecretsDetector:
         if item_match is not None:
             end = min(end, item_match.start())
         return suffix[:end]
+
+    @staticmethod
+    def _basic_auth_prefix_may_have_header_value_array_context(prefix: str, line_prefix: str) -> bool:
+        return "[" in prefix or SecretsDetector._basic_auth_yaml_list_current_value_prefix(line_prefix)
+
+    @staticmethod
+    def _basic_auth_prefix_may_have_headers_object_context(prefix: str) -> bool:
+        prefix_lower = prefix.lower()
+        if "headers" not in prefix_lower or (":" not in prefix and "=" not in prefix):
+            return False
+        return (
+            "{" in prefix
+            or BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.search(prefix) is not None
+            or BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN.search(prefix) is not None
+            or BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN.search(prefix) is not None
+            or BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN.search(prefix) is not None
+        )
 
     @staticmethod
     def _basic_auth_brace_state(value: str) -> tuple[int, str | None, bool]:

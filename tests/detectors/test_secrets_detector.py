@@ -921,9 +921,18 @@ class TestSecretsDetector:
 
         assert _basic_auth_findings(findings) == []
 
+    @pytest.mark.parametrize(
+        "token_phrase",
+        [
+            "Basic dXNlcjpwYXNz",
+            "auth Basic dXNlcjpwYXNz",
+            "headers Basic dXNlcjpwYXNz",
+        ],
+    )
     def test_basic_auth_contextless_dense_tokens_skip_broad_context_scans(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        token_phrase: str,
     ) -> None:
         detector = SecretsDetector()
 
@@ -937,7 +946,7 @@ class TestSecretsDetector:
         ):
             monkeypatch.setattr(SecretsDetector, helper_name, staticmethod(fail_broad_context_scan))
 
-        findings = detector.scan_text(" ".join(["Basic dXNlcjpwYXNz"] * 1000), context="README.md")
+        findings = detector.scan_text(" ".join([token_phrase] * 1000), context="README.md")
 
         assert _basic_auth_findings(findings) == []
 
