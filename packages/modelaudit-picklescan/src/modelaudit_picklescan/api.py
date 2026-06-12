@@ -2048,7 +2048,16 @@ def _invoked_allowlisted_import_reference_is_proven_safe(
         return True
     if position in trusted_invocation_global_positions:
         return module in invocation_load_safe_modules
+    if _source_backed_framework_identity_requires_contextual_invocation(module, name):
+        return False
     return position in analyzed_invocation_global_positions and module in invocation_load_safe_modules
+
+
+def _source_backed_framework_identity_requires_contextual_invocation(module: str, name: str) -> bool:
+    reference = (module, name)
+    return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES and not (
+        module == "numpy" or module.startswith("numpy.")
+    )
 
 
 def _proven_trusted_invocation_global_positions(callable_invocations: object) -> frozenset[int]:
@@ -2193,7 +2202,11 @@ def _non_allowlisted_import_finding_is_proven_safe(
         or (
             invocation_is_analyzed
             and (
-                reference not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES or module in invocation_load_safe_modules
+                not _source_backed_framework_identity_requires_contextual_invocation(module, name)
+                and (
+                    reference not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
+                    or module in invocation_load_safe_modules
+                )
             )
         )
     )
