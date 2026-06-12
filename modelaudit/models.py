@@ -88,8 +88,7 @@ def _metadata_has_incomplete_coverage(metadata: Any) -> bool:
     return False
 
 
-def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
-    """Return True when record details explicitly identify incomplete coverage."""
+def _metadata_has_scan_outcome_or_reason_marker(metadata: Any) -> bool:
     if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
         return True
     reason = _metadata_value(metadata, "scan_outcome_reason")
@@ -103,6 +102,13 @@ def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
         return any(bool(reason) for reason in reasons)
 
     return False
+
+
+def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
+    """Return True when record details explicitly identify incomplete coverage."""
+    if _metadata_has_scan_outcome_or_reason_marker(metadata):
+        return True
+    return _metadata_value(metadata, "analysis_incomplete") is True
 
 
 def _details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
@@ -137,7 +143,20 @@ def _records_have_incomplete_coverage(records: Any) -> bool:
     """Return True when any issue/check details identify incomplete scan coverage."""
     if not isinstance(records, list):
         return False
-    return any(_details_have_incomplete_coverage(_metadata_value(record, "details")) for record in records)
+    for record in records:
+        details = _metadata_value(record, "details")
+        status = _metadata_value(record, "status")
+        status_value = getattr(status, "value", status)
+        if (
+            isinstance(status_value, str)
+            and status_value.lower().split(".", 1)[-1] == "skipped"
+            and _metadata_value(details, "analysis_incomplete") is True
+            and not _metadata_has_scan_outcome_or_reason_marker(details)
+        ):
+            continue
+        if _details_have_incomplete_coverage(details):
+            return True
+    return False
 
 
 def _issues_have_security_findings(issues: list[Any]) -> bool:

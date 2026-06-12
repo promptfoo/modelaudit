@@ -154,11 +154,8 @@ def metadata_has_incomplete_coverage(metadata: Any) -> bool:
     return False
 
 
-def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
-    """Return True when record details explicitly identify incomplete coverage."""
+def _metadata_has_scan_outcome_or_reason_marker(metadata: Any) -> bool:
     if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
-        return True
-    if _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True:
         return True
     reason = _metadata_value(metadata, SCAN_OUTCOME_REASON_METADATA_KEY)
     if isinstance(reason, str):
@@ -171,6 +168,13 @@ def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
         return any(bool(reason) for reason in reasons)
 
     return False
+
+
+def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
+    """Return True when record details explicitly identify incomplete coverage."""
+    if _metadata_has_scan_outcome_or_reason_marker(metadata):
+        return True
+    return _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
 
 
 def details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
@@ -220,7 +224,17 @@ def details_match_shard_family_paths(
 
 def record_details_have_incomplete_coverage(record: Any) -> bool:
     """Return True when a retained issue/check detail object identifies incomplete coverage."""
-    return details_have_incomplete_coverage(_metadata_value(record, "details"))
+    details = _metadata_value(record, "details")
+    status = _metadata_value(record, "status")
+    status_value = getattr(status, "value", status)
+    if (
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
+        and _metadata_value(details, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
+        and not _metadata_has_scan_outcome_or_reason_marker(details)
+    ):
+        return False
+    return details_have_incomplete_coverage(details)
 
 
 def _location_matches_file_path(location: str, file_path: str) -> bool:
