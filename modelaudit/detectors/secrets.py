@@ -367,9 +367,14 @@ BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
 )
 BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN = re.compile(
     r"(?:^|[^\w$])(?:"
-    r"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*setRequest(?:Header|Property)"
-    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)+(?:set|append|put)"
+    r"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?:setRequest(?:Header|Property)|setHeader)"
+    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)+(?:set|append|put|add)"
     r")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w$])proxy[-_]?set[-_]?header\s+(?:proxy-authorization|authorization)\s+"
     r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
     re.IGNORECASE,
 )
@@ -391,7 +396,7 @@ BASIC_AUTH_HEADERS_OBJECT_CONTEXT_START_PATTERN = re.compile(
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN = re.compile(
-    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?value|value)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*"
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?values?|values?)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*"
     r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
     re.IGNORECASE,
 )
@@ -410,11 +415,11 @@ BASIC_AUTH_HEADER_VALUE_YAML_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN = re.compile(
-    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?value|value)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*\[",
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?values?|values?)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*\[",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN = re.compile(
-    r"\s*(?:header[-_]?value|value)\s*:\s*",
+    r"\s*(?:header[-_]?values?|values?)\s*:\s*",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN = re.compile(
@@ -437,7 +442,7 @@ BASIC_AUTH_HEADER_NAMES = {
     "proxyauthorizationheader": "Proxy-Authorization",
 }
 BASIC_AUTH_HEADER_OBJECT_NAME_KEYS = frozenset({"header", "headername", "key", "name"})
-BASIC_AUTH_HEADER_OBJECT_VALUE_KEYS = frozenset({"headervalue", "value"})
+BASIC_AUTH_HEADER_OBJECT_VALUE_KEYS = frozenset({"headervalue", "headervalues", "value", "values"})
 BASIC_AUTH_STRING_PREFIX_CHARS = frozenset("rRuUbBfF")
 BASIC_AUTH_QUOTE_CHARS = frozenset({'"', "'", "`"})
 BASIC_AUTH_CONTINUATION_PREFIX_PATTERN = re.compile(r"^\s*(?:-\s*)?[\"']?$")
@@ -715,6 +720,8 @@ class SecretsDetector:
             return True
         if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
+        if BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
         bounded_prefix = text[search_start:position]
         if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(bounded_prefix) is not None:
             return True
@@ -765,6 +772,7 @@ class SecretsDetector:
         return (
             BASIC_AUTH_HEADER_PREFIX_PATTERN.search(previous_line) is not None
             or BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(previous_line) is not None
+            or BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN.search(previous_line) is not None
         )
 
     @staticmethod

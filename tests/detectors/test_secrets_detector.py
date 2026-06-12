@@ -311,8 +311,16 @@ class TestSecretsDetector:
                 _basic_auth_token(b"headers-set:pass"),
             ),
             (
+                f'headers.add("Authorization", "Basic {_basic_auth_token(b"headers-add:pass")}")',
+                _basic_auth_token(b"headers-add:pass"),
+            ),
+            (
                 f"request.setRequestHeader('Authorization', 'Basic {_basic_auth_token(b'set-request-header:pass')}')",
                 _basic_auth_token(b"set-request-header:pass"),
+            ),
+            (
+                f'request.setHeader("Authorization", "Basic {_basic_auth_token(b"set-header:pass")}")',
+                _basic_auth_token(b"set-header:pass"),
             ),
             (
                 f'headers.append("Proxy-Authorization", "Basic {_basic_auth_token(b"headers-append:pass")}")',
@@ -326,6 +334,10 @@ class TestSecretsDetector:
                 "connection.setRequestProperty("
                 f'"Proxy-Authorization", "Basic {_basic_auth_token(b"request-property:pass")}")',
                 _basic_auth_token(b"request-property:pass"),
+            ),
+            (
+                f'proxy_set_header Authorization "Basic {_basic_auth_token(b"proxy-set-header:pass")}";',
+                _basic_auth_token(b"proxy-set-header:pass"),
             ),
             (
                 f'headers.set(\n  "Authorization",\n  "Basic {_basic_auth_token(b"headers-set-multiline:pass")}"\n)',
@@ -416,12 +428,24 @@ class TestSecretsDetector:
                 _basic_auth_token(b"json-object-list-second:pass"),
             ),
             (
+                f'{{"headers":[{{"name":"Authorization","values":["Basic '
+                f'{_basic_auth_token(b"json-object-values:pass")}"]}}]}}',
+                _basic_auth_token(b"json-object-values:pass"),
+            ),
+            (
                 "headers:\n"
                 "  - name: Authorization\n"
                 "    value:\n"
                 "      - Bearer placeholder\n"
                 f"      - Basic {_basic_auth_token(b'yaml-object-list-second:pass')}\n",
                 _basic_auth_token(b"yaml-object-list-second:pass"),
+            ),
+            (
+                "headers:\n"
+                "  - name: Authorization\n"
+                "    values:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-object-values:pass')}\n",
+                _basic_auth_token(b"yaml-object-values:pass"),
             ),
             (
                 f"headers=[('Authorization', 'Basic {_basic_auth_token(b'assignment-tuple:pass')}')]",
@@ -745,6 +769,7 @@ class TestSecretsDetector:
             {b"HTTP_AUTHORIZATION": b"Basic aHR0cC1ieXRlLWtleTpzM2NyM3Q="},
             {"Authorization": ("Basic c3RydWN0dXJlZC10dXBsZTpzM2NyM3Q=",)},
             {"Authorization": {"value": "Basic c3RydWN0dXJlZC13cmFwcGVkOnMzY3IzdA=="}},
+            {"headers": [{"name": "Authorization", "values": ["Basic cGx1cmFsLXZhbHVlczpzM2NyM3Q="]}]},
             {"headers": {"proxy_authorization": ["Basic c3RydWN0dXJlZC1saXN0OnMzY3IzdA=="]}},
         ],
     )
