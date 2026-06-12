@@ -6,6 +6,7 @@ import json
 import os
 import pickletools
 import re
+import stat
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import suppress
@@ -17,9 +18,15 @@ from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils.file.detection import (
+    _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE,
+    _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    _probe_jax_json_checkpoint_file_state,
+    _read_jax_json_checkpoint_prefix,
+    has_jax_json_checkpoint_structure,
     huggingface_tokenizer_json_has_jax_route_evidence,
     huggingface_tokenizer_json_has_template_route_evidence,
+    is_confirmed_jax_json_checkpoint_file,
     is_huggingface_tokenizer_json_file,
     is_jax_json_checkpoint_file,
 )
@@ -79,6 +86,7 @@ class JaxCheckpointScanner(BaseScanner):
         ".checkpoint",  # Explicit checkpoint files
         ".orbax-checkpoint",  # Orbax checkpoint directories
         ".pickle",  # JAX models saved as pickle (when context suggests JAX)
+        "",  # Directory-based Orbax/JAX checkpoints
     ]
     _JAX_INDICATORS: ClassVar[tuple[str, ...]] = (
         "jax",
@@ -130,7 +138,11 @@ class JaxCheckpointScanner(BaseScanner):
     DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
     DEFAULT_MAX_ORBAX_CHECKPOINT_FILES: ClassVar[int] = 4096
     DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES: ClassVar[int] = 8192
+    _DIRECTORY_CHECKPOINT_PROBE_BYTES: ClassVar[int] = 8192
     _ORBAX_CHECKPOINT_ENTRY_PREFIXES: ClassVar[tuple[str, ...]] = ("step_", "params_", "state_", "model_")
+    _ORBAX_NUMBERED_CHECKPOINT_ENTRY_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"^(?:checkpoint|step|params|state|model)_\d+$"
+    )
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
         {
             ("builtins", "__import__"),
@@ -786,6 +798,10 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Handle file-based checkpoints
         if os.path.isfile(path):
+            path_obj = Path(path)
+            filename = path_obj.name.lower()
+            if filename == "_checkpoint":
+                return True
             tokenizer_jax_evidence = huggingface_tokenizer_json_has_jax_route_evidence(path)
             if is_huggingface_tokenizer_json_file(path) and not tokenizer_jax_evidence:
                 return False
@@ -794,11 +810,189 @@ class JaxCheckpointScanner(BaseScanner):
                 return False
             ext = os.path.splitext(path)[1].lower()
             if ext == ".json":
-                return tokenizer_jax_evidence or is_jax_json_checkpoint_file(path)
+                if filename == "orbax_checkpoint_metadata.json":
+                    return True
+                if filename == "metadata.json":
+                    if cls._has_regular_orbax_sibling_marker(path_obj):
+                        return True
+                    return tokenizer_jax_evidence or is_jax_json_checkpoint_file(path)
+                return tokenizer_jax_evidence or is_confirmed_jax_json_checkpoint_file(path)
+            if not ext and cls._is_orbax_checkpoint_entry_name(filename):
+                with suppress(OSError):
+                    path_stat = path_obj.lstat()
+                    if cls._is_regular_file(path_stat):
+                        return cls._probe_numbered_checkpoint_file(path_obj, path_stat) is not False
+                return True
             if ext in cls.supported_extensions:
                 return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
             return is_jax_json_checkpoint_file(path)
 
+        return False
+
+    @staticmethod
+    def _stat_mode(path_stat: os.stat_result) -> int:
+        return int(getattr(path_stat, "st_mode", 0) or 0)
+
+    @classmethod
+    def _is_regular_file(cls, path_stat: os.stat_result) -> bool:
+        return stat.S_ISREG(cls._stat_mode(path_stat))
+
+    @classmethod
+    def _is_directory(cls, path_stat: os.stat_result) -> bool:
+        return stat.S_ISDIR(cls._stat_mode(path_stat))
+
+    @staticmethod
+    def _is_link_like_entry(path_stat: os.stat_result) -> bool:
+        """Return whether an entry is a symlink or Windows reparse point."""
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        file_attributes = getattr(path_stat, "st_file_attributes", 0) or 0
+        return stat.S_ISLNK(JaxCheckpointScanner._stat_mode(path_stat)) or bool(
+            reparse_flag and file_attributes & reparse_flag
+        )
+
+    @classmethod
+    def _has_regular_orbax_sibling_marker(cls, path: Path) -> bool:
+        """Return whether a canonical regular Orbax marker shares this directory."""
+        for marker_name in ("_CHECKPOINT", "orbax_checkpoint_metadata.json"):
+            marker_path = path.parent / marker_name
+            if marker_path == path:
+                continue
+            try:
+                marker_stat = marker_path.lstat()
+            except (FileNotFoundError, OSError):
+                continue
+            if not cls._is_link_like_entry(marker_stat) and cls._is_regular_file(marker_stat):
+                return True
+        return False
+
+    @classmethod
+    def _ambiguous_bare_metadata_requires_owner_dispatch(cls, path: Path) -> bool:
+        """Fail closed when bounded bare metadata leaves later JAX/Orbax evidence unknowable."""
+        snapshot = _read_jax_json_checkpoint_prefix(path)
+        if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE or snapshot is None:
+            return True
+        return True
+
+    @classmethod
+    def _regular_file_matches_snapshot(cls, current_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
+        return cls._is_regular_file(current_stat) and all(
+            getattr(current_stat, field) == getattr(expected_stat, field)
+            for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        )
+
+    @classmethod
+    def _directory_matches_snapshot(cls, current_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
+        return cls._is_directory(current_stat) and all(
+            getattr(current_stat, field) == getattr(expected_stat, field)
+            for field in ("st_dev", "st_ino", "st_mode", "st_mtime_ns", "st_ctime_ns")
+        )
+
+    @classmethod
+    def _read_regular_checkpoint_prefix(
+        cls,
+        path: Path,
+        expected_stat: os.stat_result,
+    ) -> tuple[bytes, bool] | None:
+        """Read a bounded prefix only after binding the opened regular file to its snapshot."""
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = -1
+        try:
+            descriptor = os.open(path, flags)
+            opened_stat = os.fstat(descriptor)
+            if not cls._regular_file_matches_snapshot(opened_stat, expected_stat):
+                return None
+            chunks: list[bytes] = []
+            remaining = cls._DIRECTORY_CHECKPOINT_PROBE_BYTES
+            while remaining > 0:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            prefix = b"".join(chunks)
+            final_stat = os.fstat(descriptor)
+            if not cls._regular_file_matches_snapshot(final_stat, expected_stat):
+                return None
+        except OSError:
+            return None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return prefix, expected_stat.st_size <= len(prefix)
+
+    @classmethod
+    def _bounded_prefix_is_structured_pickle(cls, prefix: bytes, *, sample_complete: bool) -> bool:
+        parsed_opcode = False
+        try:
+            for opcode, _arg, _position in pickletools.genops(prefix):
+                parsed_opcode = True
+                if opcode.name == "STOP":
+                    return True
+        except ValueError as error:
+            return not sample_complete and parsed_opcode and cls._is_truncated_pickle_parse_error(error)
+        return False
+
+    @classmethod
+    def _probe_numbered_checkpoint_file(cls, path: Path, expected_stat: os.stat_result) -> bool | None:
+        """Require bounded serialization structure from a regular numbered checkpoint file."""
+        sample = cls._read_regular_checkpoint_prefix(path, expected_stat)
+        if sample is None:
+            return None
+        prefix, sample_complete = sample
+        if prefix.startswith(b"\x93NUMPY"):
+            return True
+        if prefix.startswith(b"\x80") or cls._header_starts_with_legacy_pickle_opcode(prefix):
+            return cls._bounded_prefix_is_structured_pickle(prefix, sample_complete=sample_complete)
+
+        normalized_prefix = prefix.lstrip()
+        if normalized_prefix.startswith(cls._UTF8_BOM):
+            normalized_prefix = normalized_prefix[len(cls._UTF8_BOM) :].lstrip()
+        if not normalized_prefix.startswith(b"{"):
+            return False
+        if not sample_complete:
+            return cls._contains_jax_indicator(normalized_prefix.decode("utf-8", errors="ignore"))
+        try:
+            payload = json.loads(normalized_prefix.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return False
+        return has_jax_json_checkpoint_structure(payload)
+
+    @classmethod
+    def _probe_numbered_checkpoint_directory(cls, path: Path, expected_stat: os.stat_result) -> bool | None:
+        """Require a trusted regular checkpoint source inside a numbered directory."""
+        for marker_name in ("_CHECKPOINT", "orbax_checkpoint_metadata.json"):
+            marker_path = path / marker_name
+            try:
+                marker_stat = marker_path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return None
+            if cls._is_link_like_entry(marker_stat) or not cls._is_regular_file(marker_stat):
+                return None
+            return True
+
+        checkpoint_path = path / "checkpoint"
+        try:
+            checkpoint_stat = checkpoint_path.lstat()
+        except FileNotFoundError:
+            checkpoint_stat = None
+        except OSError:
+            return None
+        if checkpoint_stat is not None:
+            if cls._is_link_like_entry(checkpoint_stat) or not cls._is_regular_file(checkpoint_stat):
+                return None
+            checkpoint_probe = cls._probe_numbered_checkpoint_file(checkpoint_path, checkpoint_stat)
+            if checkpoint_probe is not False:
+                return checkpoint_probe
+
+        try:
+            final_stat = path.lstat()
+        except OSError:
+            return None
+        if not cls._directory_matches_snapshot(final_stat, expected_stat):
+            return None
         return False
 
     @classmethod
@@ -806,27 +1000,115 @@ class JaxCheckpointScanner(BaseScanner):
         """Check if directory looks like a JAX/Orbax checkpoint."""
         path_obj = Path(path)
 
-        # Orbax checkpoint indicators
-        orbax_files = ["metadata.json", "_CHECKPOINT", "orbax_checkpoint_metadata.json"]
+        # These names are specific to Orbax/JAX. A bare ``metadata.json`` is
+        # common across unrelated packages and must be content-validated.
+        for orbax_file in ("_CHECKPOINT", "orbax_checkpoint_metadata.json"):
+            marker_path = path_obj / orbax_file
+            try:
+                marker_path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            return True
 
-        # Check for Orbax files
-        for orbax_file in orbax_files:
-            if (path_obj / orbax_file).exists():
+        metadata_path = path_obj / "metadata.json"
+        try:
+            metadata_stat = metadata_path.lstat()
+        except FileNotFoundError:
+            metadata_stat = None
+        except OSError:
+            return True
+        if metadata_stat is not None and cls._is_link_like_entry(metadata_stat):
+            # Do not follow the link during routing. Core directory discovery
+            # resolves containment before the deferred owner scan.
+            return True
+        if metadata_stat is not None:
+            if not cls._is_regular_file(metadata_stat):
+                return True
+            metadata_probe = _probe_jax_json_checkpoint_file_state(metadata_path)
+            try:
+                final_metadata_stat = metadata_path.lstat()
+            except OSError:
+                return True
+            if not cls._regular_file_matches_snapshot(final_metadata_stat, metadata_stat):
+                return True
+            if metadata_probe in {True, _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE, None}:
+                return True
+            if (
+                metadata_probe == _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
+                and cls._ambiguous_bare_metadata_requires_owner_dispatch(metadata_path)
+            ):
                 return True
 
-        # Probe once and route oversized directories into the scanner's
-        # fail-closed entry-limit handling.
+        # Keep routing bounded without treating the cap itself as JAX evidence.
+        # Confirmed owners still report incomplete coverage from scan().
         for entry_index, entry in enumerate(path_obj.iterdir(), start=1):
             if entry_index > cls.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES:
+                break
+            if not cls._is_orbax_checkpoint_entry_name(entry.name):
+                continue
+            try:
+                entry_stat = entry.lstat()
+            except OSError:
                 return True
-            if cls._is_orbax_checkpoint_entry_name(entry.name):
+            if cls._is_link_like_entry(entry_stat):
+                # Exact numbered/canonical checkpoint aliases select the owner
+                # so core can reject the link fail-closed. Broad prefixed names
+                # are left to the ordinary contained child walk instead of
+                # creating a directory-owner false positive.
+                if entry.name == "checkpoint" or cls._ORBAX_NUMBERED_CHECKPOINT_ENTRY_RE.fullmatch(entry.name):
+                    return True
+                continue
+            if entry.name == "checkpoint":
                 return True
+            if cls._ORBAX_NUMBERED_CHECKPOINT_ENTRY_RE.fullmatch(entry.name):
+                if cls._is_regular_file(entry_stat):
+                    checkpoint_probe = cls._probe_numbered_checkpoint_file(entry, entry_stat)
+                elif cls._is_directory(entry_stat):
+                    checkpoint_probe = cls._probe_numbered_checkpoint_directory(entry, entry_stat)
+                else:
+                    return True
+                if checkpoint_probe is None:
+                    return True
+                if checkpoint_probe:
+                    return True
+                continue
+            # Broad prefixes such as ``model_`` are common in ordinary model
+            # repositories. Preserve non-numbered legacy checkpoint files only
+            # when their bounded contents independently identify JAX/pickle.
+            if cls._is_regular_file(entry_stat):
+                checkpoint_probe = cls._probe_numbered_checkpoint_file(entry, entry_stat)
+                if checkpoint_probe is None:
+                    return True
+                if checkpoint_probe:
+                    return True
         return False
 
     @classmethod
     def _is_orbax_checkpoint_entry_name(cls, name: str) -> bool:
         """Return whether a top-level entry has a recognized Orbax/JAX checkpoint name."""
         return name == "checkpoint" or name.startswith(("checkpoint_", *cls._ORBAX_CHECKPOINT_ENTRY_PREFIXES))
+
+    @classmethod
+    def directory_owner_source_in_scope(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Bind only top-level files that the Orbax directory scanner can inspect."""
+        if len(relative_parts) != 1:
+            return False
+        name = relative_parts[0]
+        return name in {"metadata.json", "orbax_checkpoint_metadata.json", "_CHECKPOINT"} or (
+            cls._is_orbax_checkpoint_entry_name(name)
+        )
+
+    @classmethod
+    def directory_owner_directory_in_scope(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Bind only top-level directories whose entries Orbax directory analysis can inspect."""
+        return len(relative_parts) == 1
+
+    @classmethod
+    def directory_owner_should_descend_into_directory(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Orbax directory analysis reads top-level entries, not nested directory contents."""
+        return False
 
     @classmethod
     def _header_starts_with_legacy_pickle_opcode(cls, header: bytes) -> bool:
@@ -1136,68 +1418,70 @@ class JaxCheckpointScanner(BaseScanner):
 
         for metadata_file in metadata_files:
             metadata_path = path_obj / metadata_file
-            if metadata_path.exists():
-                if not metadata_path.is_file():
-                    self._add_orbax_metadata_read_failure(
-                        result=result,
-                        metadata_path=metadata_path,
-                        metadata_file=metadata_file,
-                        error="metadata path is not a regular file",
-                    )
-                    continue
-                try:
-                    file_size = metadata_path.stat().st_size
-                except OSError as e:
-                    self._add_orbax_metadata_read_failure(
-                        result=result,
-                        metadata_path=metadata_path,
-                        metadata_file=metadata_file,
-                        error=e,
-                    )
-                    continue
+            try:
+                metadata_stat = metadata_path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                self._add_orbax_metadata_read_failure(
+                    result=result,
+                    metadata_path=metadata_path,
+                    metadata_file=metadata_file,
+                    error=e,
+                )
+                continue
+            if not self._is_regular_file(metadata_stat):
+                self._add_orbax_metadata_read_failure(
+                    result=result,
+                    metadata_path=metadata_path,
+                    metadata_file=metadata_file,
+                    error="metadata path is not a regular file",
+                )
+                continue
 
-                accounting.files_scanned += 1
-                accounting.bytes_scanned += min(file_size, JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES)
+            file_size = metadata_stat.st_size
+            accounting.files_scanned += 1
+            accounting.bytes_scanned += min(file_size, JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES)
 
-                if file_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
-                    self._handle_oversized_orbax_metadata(
-                        metadata_path=metadata_path,
-                        metadata_file=metadata_file,
-                        file_size=file_size,
-                        result=result,
-                    )
-                    continue
+            if file_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+                self._handle_oversized_orbax_metadata(
+                    metadata_path=metadata_path,
+                    metadata_file=metadata_file,
+                    file_size=file_size,
+                    result=result,
+                )
+                continue
 
-                try:
-                    with open(metadata_path, encoding="utf-8") as f:
-                        metadata = json.load(f)
+            try:
+                with open(metadata_path, encoding="utf-8") as f:
+                    metadata = json.load(f)
 
-                    # Analyze metadata for suspicious content
-                    self._analyze_orbax_metadata(metadata, str(metadata_path), result)
+                # Analyze metadata for suspicious content
+                self._analyze_orbax_metadata(metadata, str(metadata_path), result)
 
-                except json.JSONDecodeError as e:
-                    mark_inconclusive_scan_result(result, "jax_orbax_metadata_parse_failed")
-                    result.add_check(
-                        name="Orbax Metadata JSON Validation",
-                        passed=False,
-                        message=f"Invalid JSON in Orbax metadata: {e}",
-                        severity=IssueSeverity.INFO,
-                        location=str(metadata_path),
-                        rule_code="S902",
-                        details={
-                            "error": str(e),
-                            "file": metadata_file,
-                            "analysis_incomplete": True,
-                            "scan_outcome_reason": "jax_orbax_metadata_parse_failed",
-                        },
-                    )
-                except Exception as e:
-                    self._add_orbax_metadata_read_failure(
-                        result=result,
-                        metadata_path=metadata_path,
-                        metadata_file=metadata_file,
-                        error=e,
-                    )
+            except json.JSONDecodeError as e:
+                mark_inconclusive_scan_result(result, "jax_orbax_metadata_parse_failed")
+                result.add_check(
+                    name="Orbax Metadata JSON Validation",
+                    passed=False,
+                    message=f"Invalid JSON in Orbax metadata: {e}",
+                    severity=IssueSeverity.INFO,
+                    location=str(metadata_path),
+                    rule_code="S902",
+                    details={
+                        "error": str(e),
+                        "file": metadata_file,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "jax_orbax_metadata_parse_failed",
+                    },
+                )
+            except Exception as e:
+                self._add_orbax_metadata_read_failure(
+                    result=result,
+                    metadata_path=metadata_path,
+                    metadata_file=metadata_file,
+                    error=e,
+                )
 
         # Scan checkpoint files
         directory_entries_seen = 0
@@ -1747,7 +2031,11 @@ class JaxCheckpointScanner(BaseScanner):
                 rule_code="S902",
             )
             try:
-                self._scan_bounded_json_prefix_patterns(path, result)
+                self._scan_bounded_json_prefix_patterns(
+                    path,
+                    result,
+                    detect_orbax_restore_fn=True,
+                )
             except OSError as e:
                 mark_operational_scan_error(result, self._JSON_PREFIX_PATTERN_READ_FAILED_REASON)
                 result.add_check(
@@ -1770,6 +2058,20 @@ class JaxCheckpointScanner(BaseScanner):
         try:
             with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
+
+            if (
+                isinstance(data, dict)
+                and (
+                    Path(path).name.lower() in {"_checkpoint", "orbax_checkpoint_metadata.json"}
+                    or (
+                        Path(path).name.lower() == "metadata.json"
+                        and self._has_regular_orbax_sibling_marker(Path(path))
+                    )
+                    or has_jax_json_checkpoint_structure(data)
+                )
+                and "restore_fn" in data
+            ):
+                self._add_orbax_restore_fn_check(str(data["restore_fn"]), path, result)
 
             # Analyze JSON content for suspicious patterns
             pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
@@ -1934,10 +2236,17 @@ class JaxCheckpointScanner(BaseScanner):
                 result.bytes_scanned = file_size
                 result.metadata["file_size"] = file_size
 
-                self._scan_checkpoint_file(path, result)
+                self._scan_checkpoint_file(
+                    path,
+                    result,
+                    treat_legacy_pickle_header_as_checkpoint=self._is_orbax_checkpoint_entry_name(
+                        Path(path).name.lower()
+                    ),
+                )
 
         except Exception as e:
             mark_inconclusive_scan_result(result, "jax_checkpoint_scan_failed")
+            mark_operational_scan_error(result, "jax_checkpoint_scan_failed")
             result.add_check(
                 name="JAX Checkpoint Scan",
                 passed=False,

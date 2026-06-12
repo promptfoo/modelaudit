@@ -3,9 +3,11 @@ import codecs
 import json
 import lzma
 import math
+import os
 import pickletools
 import posixpath
 import re
+import stat
 import struct
 import sys
 import tarfile
@@ -3915,7 +3917,12 @@ def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
 SAFETENSORS_ROUTING_HEADER_PARSE_BYTES: int = 16 * 1024 * 1024
 
 
-def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = False) -> bool:
+def _looks_like_proto0_or_1_pickle(
+    sample: bytes,
+    *,
+    sample_is_prefix: bool = False,
+    max_probe_opcodes: int = PROTO0_1_MAX_PROBE_OPCODES,
+) -> bool:
     """Best-effort protocol 0/1 detection via bounded pickle opcode parsing."""
     if len(sample) < 2:
         return False
@@ -3945,10 +3952,11 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = Fa
                     return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(
                         stripped_trailing,
                         sample_is_prefix=sample_is_prefix,
+                        max_probe_opcodes=max_probe_opcodes,
                     )
                 if opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
                     has_non_trivial_opcode = True
-                if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
+                if opcode_count >= max_probe_opcodes:
                     return False
         except ValueError as exc:
             exc_message = str(exc)
@@ -7168,34 +7176,197 @@ def has_jax_json_checkpoint_structure(payload: object) -> bool:
     return False
 
 
-def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
-    """Return True for JAX JSON, None for bounded ambiguity, else False."""
+def _has_jax_json_checkpoint_prefix_identity(prefix: bytes) -> bool:
+    """Recognize explicit top-level JAX identity in a truncated JSON object."""
     try:
-        if not file_path.is_file():
+        prefix_text = prefix.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        # A bounded read may end between the bytes of the final UTF-8 code
+        # point. Preserve complete top-level fields that precede that split,
+        # but do not ignore malformed bytes inside the sampled prefix.
+        if error.end != len(prefix) or error.reason != "unexpected end of data":
             return False
-        file_size = file_path.stat().st_size
-        with file_path.open("rb") as stream:
-            prefix = stream.read(min(file_size, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1))
+        try:
+            prefix_text = prefix[: error.start].decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return False
+
+    def skip_json_whitespace(offset: int) -> int:
+        while offset < len(prefix_text) and prefix_text[offset] in " \t\r\n":
+            offset += 1
+        return offset
+
+    decoder = json.JSONDecoder()
+    offset = skip_json_whitespace(0)
+    if offset >= len(prefix_text) or prefix_text[offset] != "{":
+        return False
+    offset += 1
+
+    while True:
+        offset = skip_json_whitespace(offset)
+        if offset >= len(prefix_text) or prefix_text[offset] == "}":
+            return False
+
+        try:
+            key, key_end = decoder.raw_decode(prefix_text, offset)
+        except (ValueError, RecursionError):
+            return False
+        if not isinstance(key, str):
+            return False
+
+        offset = skip_json_whitespace(key_end)
+        if offset >= len(prefix_text) or prefix_text[offset] != ":":
+            return False
+        offset = skip_json_whitespace(offset + 1)
+
+        if key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+            return True
+
+        try:
+            value, value_end = decoder.raw_decode(prefix_text, offset)
+        except (ValueError, RecursionError):
+            return False
+        if (
+            key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS
+            and isinstance(value, str)
+            and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value)
+        ):
+            return True
+
+        offset = skip_json_whitespace(value_end)
+        if offset >= len(prefix_text) or prefix_text[offset] == "}":
+            return False
+        if prefix_text[offset] != ",":
+            return False
+        offset += 1
+
+
+def _same_regular_file_identity(current: os.stat_result, expected: os.stat_result) -> bool:
+    """Compare a descriptor/path identity used by bounded routing reads."""
+    return stat.S_ISREG(current.st_mode) and all(
+        getattr(current, field) == getattr(expected, field)
+        for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    )
+
+
+_JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE: Literal["unavailable"] = "unavailable"
+_JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS: Literal["ambiguous"] = "ambiguous"
+_JaxJsonCheckpointProbeState = bool | Literal["unavailable", "ambiguous"] | None
+
+
+def _jax_json_checkpoint_prefix_failure_result(
+    file_path: Path,
+    expected_stat: os.stat_result,
+) -> Literal["unavailable"] | None:
+    """Fall through unchanged unavailable files but fail closed on retargets."""
+    try:
+        current_stat = file_path.lstat()
     except OSError:
         return None
+    if _same_regular_file_identity(current_stat, expected_stat):
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+    return None
+
+
+def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Literal["unavailable"] | None:
+    """Read the routing prefix without following a changed lexical entry."""
+    try:
+        expected_stat = file_path.lstat()
+    except OSError:
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+
+    try:
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        file_attributes = getattr(expected_stat, "st_file_attributes", 0) or 0
+        if (
+            not stat.S_ISREG(expected_stat.st_mode)
+            or stat.S_ISLNK(expected_stat.st_mode)
+            or bool(reparse_flag and file_attributes & reparse_flag)
+        ):
+            return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(file_path, flags)
+        except OSError:
+            return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+        try:
+            opened_stat = os.fstat(descriptor)
+            if not _same_regular_file_identity(opened_stat, expected_stat):
+                return None
+            read_limit = min(expected_stat.st_size, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)
+            chunks: list[bytes] = []
+            remaining = read_limit
+            while remaining > 0:
+                try:
+                    chunk = os.read(descriptor, remaining)
+                except OSError:
+                    return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if not _same_regular_file_identity(os.fstat(descriptor), expected_stat):
+                return None
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+    return expected_stat.st_size, b"".join(chunks)
+
+
+def _probe_jax_json_checkpoint_file_state(file_path: Path) -> _JaxJsonCheckpointProbeState:
+    """Return bounded JAX JSON routing state without flattening refusal causes."""
+    snapshot = _read_jax_json_checkpoint_prefix(file_path)
+    if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+    if snapshot is None:
+        return None
+    file_size, prefix = snapshot
 
     if not _could_start_json_object(prefix):
         normalized_prefix = prefix.lstrip()
         if normalized_prefix.startswith(b"\xef\xbb\xbf"):
             normalized_prefix = normalized_prefix[3:].lstrip()
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES and not normalized_prefix:
-            return None
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
 
     try:
         payload = json.loads(prefix.decode("utf-8-sig"))
-    except (UnicodeDecodeError, ValueError, RecursionError):
+    except json.JSONDecodeError:
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
             # A visible non-JAX value cannot prove the unseen tail has no later
             # JAX identity field; preserve bounded ambiguity instead of skipping.
-            return None
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
+    except UnicodeDecodeError:
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
+        if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
+        return False
+    except (ValueError, RecursionError):
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
+        # Python parser limits can reject otherwise valid JSON (for example an
+        # oversized integer). That is not evidence that the file lacks a later
+        # JAX identity field, so retain it as a bounded ambiguous candidate.
+        return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
     return has_jax_json_checkpoint_structure(payload)
+
+
+def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous: bool = False) -> bool | None:
+    """Return True for JAX JSON, None for bounded ambiguity or retargets, else False."""
+    probe_state = _probe_jax_json_checkpoint_file_state(file_path)
+    if probe_state == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
+        return None if unavailable_is_ambiguous else False
+    if probe_state == _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS:
+        return None
+    return probe_state
 
 
 def is_jax_json_checkpoint_file(path: str | Path) -> bool:
