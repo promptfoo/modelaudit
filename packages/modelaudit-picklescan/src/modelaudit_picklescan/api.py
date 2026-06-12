@@ -30,6 +30,7 @@ from .call_graph import (
     import_only_reference_is_proven_trusted,
     import_only_reference_is_proven_trusted_for_pickle_invocation,
     module_initialization_is_proven_inert,
+    module_is_loaded_without_import_hooks,
     shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
 )
@@ -189,6 +190,9 @@ _NUMPY_RECONSTRUCT_REFERENCES = frozenset(
 )
 _NUMPY_NDARRAY_REFERENCES = frozenset({("numpy", "ndarray")})
 _NUMPY_DTYPE_REFERENCES = frozenset({("numpy", "dtype")})
+_NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES = (
+    _NUMPY_RECONSTRUCT_REFERENCES | _NUMPY_NDARRAY_REFERENCES | _NUMPY_DTYPE_REFERENCES
+)
 _CODECS_ENCODE_REFERENCES = frozenset({("_codecs", "encode")})
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_EOCD_MIN_SIZE = 22
@@ -198,6 +202,16 @@ _ZIP64_EOCD_LOCATOR_SIZE = 20
 _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
 _ZIP64_EOCD_MIN_SIZE = 56
 _ZIP64_SENTINEL_ENTRY_COUNT = 0xFFFF
+
+
+def _source_backed_invocation_requires_loaded_identity(
+    reference: tuple[str, str],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
+) -> bool:
+    if suppress_safe_numpy_reconstruct and reference in _NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES:
+        return False
+    return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
 
 
 class _StreamShortReadError(ValueError):
@@ -1770,6 +1784,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
             trusted_reconstruction_global_positions,
             trusted_reconstruction_references,
             trusted_invocation_global_positions,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
         )
     updated_report = _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
     updated_report = (
@@ -2037,6 +2052,7 @@ def _invoked_allowlisted_import_reference_is_proven_safe(
     *,
     suppress_safe_numpy_reconstruct: bool,
 ) -> bool:
+    reference = (module, name)
     if (
         not import_only_reference_is_proven_trusted(module, name)
         and position not in trusted_invocation_global_positions
@@ -2048,6 +2064,11 @@ def _invoked_allowlisted_import_reference_is_proven_safe(
         return True
     if position in trusted_invocation_global_positions:
         return module in invocation_load_safe_modules
+    if _source_backed_invocation_requires_loaded_identity(
+        reference,
+        suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+    ):
+        return False
     return position in analyzed_invocation_global_positions and module in invocation_load_safe_modules
 
 
@@ -2068,7 +2089,8 @@ def _proven_trusted_invocation_global_positions(callable_invocations: object) ->
     trusted_positions: list[int] = []
     for position, invocations in grouped.items():
         if all(
-            import_only_reference_is_proven_trusted_for_pickle_invocation(
+            module_is_loaded_without_import_hooks(str(invocation.get("module", "")))
+            and import_only_reference_is_proven_trusted_for_pickle_invocation(
                 str(invocation.get("module", "")),
                 str(invocation.get("name", "")),
                 invocation,
@@ -2107,6 +2129,8 @@ def _without_proven_safe_import_findings(
     trusted_reconstruction_global_positions: frozenset[int],
     trusted_reconstruction_references: frozenset[tuple[str, str]],
     trusted_invocation_global_positions: frozenset[int],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
 ) -> PickleReport:
     findings = tuple(
         finding
@@ -2123,6 +2147,7 @@ def _without_proven_safe_import_findings(
             trusted_reconstruction_global_positions,
             trusted_reconstruction_references,
             trusted_invocation_global_positions,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
         )
     )
     if len(findings) == len(report.findings):
@@ -2159,6 +2184,8 @@ def _non_allowlisted_import_finding_is_proven_safe(
     trusted_reconstruction_global_positions: frozenset[int],
     trusted_reconstruction_references: frozenset[tuple[str, str]],
     trusted_invocation_global_positions: frozenset[int] = frozenset(),
+    *,
+    suppress_safe_numpy_reconstruct: bool = False,
 ) -> bool:
     module = str(finding.details.get("module", ""))
     name = str(finding.details.get("name", ""))
@@ -2185,19 +2212,28 @@ def _non_allowlisted_import_finding_is_proven_safe(
         if position is not None
         else False
     )
+    requires_loaded_identity = finding_is_invoked and _source_backed_invocation_requires_loaded_identity(
+        reference,
+        suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+    )
     inert_reference_is_proven_safe = position is not None and not finding_is_invoked
     trusted_reference_is_proven_safe = position is not None and (
         not finding_is_invoked
         or invocation_is_trusted_reconstruction
         or invocation_identity_is_trusted
         or (
-            invocation_is_analyzed
+            not requires_loaded_identity
+            and invocation_is_analyzed
             and (
                 reference not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES or module in invocation_load_safe_modules
             )
         )
     )
-    trusted_origin_is_proven = (module, name) in trusted_import_references or invocation_identity_is_trusted
+    trusted_origin_is_proven = (
+        invocation_identity_is_trusted
+        if requires_loaded_identity
+        else (module, name) in trusted_import_references or invocation_identity_is_trusted
+    )
     return (trusted_reference_is_proven_safe and trusted_origin_is_proven) or (
         inert_reference_is_proven_safe and module in inert_initialization_modules
     )
