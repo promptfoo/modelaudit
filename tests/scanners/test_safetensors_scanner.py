@@ -1902,9 +1902,19 @@ def test_license_metadata_short_entity_encoded_url_delimiters_report_s905_withou
     )
 
 
-def test_license_metadata_nested_entity_encoded_url_delimiter_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "encoded_url",
+    [
+        "https&amp;amp;#x3a;&amp;amp;#x2f;&amp;amp;#x2f;evil.example/x",
+        "https&amp;amp;amp;amp;amp;#x3a;&amp;amp;amp;amp;amp;#x2f;&amp;amp;amp;amp;amp;#x2f;evil.example/x",
+        "https&amp;amp;amp;amp;amp;amp;amp;amp;#x3a;&amp;amp;amp;amp;amp;amp;amp;amp;#x2f;&amp;amp;amp;amp;amp;amp;amp;amp;#x2f;evil.example/x",
+    ],
+)
+def test_license_metadata_nested_entity_encoded_url_delimiter_fails_closed(
+    tmp_path: Path,
+    encoded_url: str,
+) -> None:
     file_path = tmp_path / "nested_entity_encoded_url_license_metadata.safetensors"
-    encoded_url = "https&amp;amp;#x3a;&amp;amp;#x2f;&amp;amp;#x2f;evil.example/x"
     payload = f"{ordinary_license_text_without_url()}\nEncoded reference: {encoded_url}"
     write_raw_safetensors(
         file_path,
