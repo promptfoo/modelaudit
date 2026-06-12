@@ -1,5 +1,6 @@
 import ctypes
 import errno
+import hashlib
 import importlib
 import json
 import logging
@@ -40,6 +41,11 @@ from modelaudit.cli import (
 )
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from modelaudit.utils.file import detection as file_detection
+from modelaudit.utils.repository_context import (
+    REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
+    REPOSITORY_SCAN_ROOT_CONFIG_KEY,
+)
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
@@ -65,6 +71,31 @@ def test_local_txt_zip_prefilter_uses_bounded_zip_probe(
 _HF_TEST_REVISION = "a" * 40
 
 
+def _minimal_safetensors_bytes() -> bytes:
+    header = {"weights": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return struct.pack("<Q", len(header_bytes)) + header_bytes + b"\x00\x00\x00\x00"
+
+
+class _FakeRangeResponse:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.headers = {"Content-Length": str(len(payload))}
+        self.status_code = 200
+
+    def __enter__(self) -> "_FakeRangeResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+        yield self.payload[:chunk_size]
+
+
 def default_remote_cache_dir() -> str:
     """Compute the CLI's default remote cache root at assertion time."""
     return str(Path.home() / ".modelaudit" / "cache")
@@ -79,6 +110,46 @@ def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
     """Create a shard parent without inheriting group-write test umasks."""
     path.mkdir(parents=parents)
     path.chmod(0o755)
+
+
+def _write_ordered_hf_tokenizer_json(
+    path: Path,
+    *,
+    late_fields: str = "",
+    padding_size: int = 0,
+) -> Path:
+    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
+    path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            f'"model":{{"type":"BPE","vocab":{{"hello":0}},"merges":[]}}{padding}{late_fields}}}'
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _bert_like_multilingual_vocab_bytes(*tail_tokens: str) -> bytes:
+    tokens = [
+        "[PAD]",
+        "[UNK]",
+        "[CLS]",
+        "[SEP]",
+        "[MASK]",
+        "the",
+        "und",
+        "de",
+        "la",
+        "\u4e2d",
+        "\u56fd",
+        "\u8a9e",
+        "\u03b1",
+        "\u03b2",
+        *[f"token{index}" for index in range(128)],
+        *[f"##piece{index}" for index in range(8)],
+        *tail_tokens,
+    ]
+    return ("\n".join(tokens) + "\n").encode()
 
 
 def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
@@ -377,6 +448,31 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
     assert result.exit_code == 1
     output_payload = parse_click_json_output(result.output)
     assert any(issue.get("rule_code") == "S405" for issue in output_payload.get("issues", []))
+
+
+def test_scan_cli_tokenizer_json_late_chat_template_after_structure_budget_reports_issue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=256,
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--no-cache", "--format", "json", str(tokenizer_path)],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 1
+    output_payload = parse_click_json_output(result.output)
+    assert any(
+        check["name"] == "Jinja2 Template Injection Detection" and check["status"] == "failed"
+        for check in output_payload["checks"]
+    )
 
 
 def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: Path) -> None:
@@ -3419,7 +3515,7 @@ def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> N
     with (
         patch("modelaudit.cli.is_huggingface_url", return_value=True),
         patch(
-            "modelaudit.utils.sources.huggingface.get_model_info",
+            "modelaudit.cli.get_model_info",
             return_value={
                 "model_id": "org/model\nFORGED\u202e",
                 "total_size": 1024,
@@ -3441,6 +3537,112 @@ def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> N
     assert "org/model\nFORGED\u202e" not in result.output
 
 
+def test_scan_huggingface_preview_matches_final_recursive_inventory(tmp_path: Path) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    nested_dir = downloaded_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    config_payload = b'{"model_type":"bert"}'
+    (nested_dir / "config.json").write_bytes(config_payload + (b" " * (512 - len(config_payload))))
+    (nested_dir / "README.md").write_bytes(b"A" * 1024)
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.cli.get_model_info",
+            return_value={
+                "model_id": "org/model",
+                "total_size": 1536,
+                "file_count": 2,
+                "inventory_status": "complete",
+                "inaccessible_gated_bytes": 0,
+                "unknown_size_count": 0,
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "text", "hf://org/model"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: 1.50 KB (2 files)" in output
+    assert "Files: 2" in output
+    assert output.count("Size: 1.50 KB") >= 2
+
+
+def test_scan_huggingface_preview_reports_gated_and_unknown_access(tmp_path: Path) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "config.json").write_text("{}")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.cli.get_model_info",
+            return_value={
+                "model_id": "org/gated-model",
+                "total_size": 4096,
+                "file_count": 3,
+                "inventory_status": "partial_unknown_size",
+                "inaccessible_gated_bytes": 2048,
+                "inaccessible_gated_file_count": 1,
+                "unknown_size_count": 1,
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "text", "hf://org/gated-model"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: At least 4.00 KB (3 files)" in output
+    assert "Access: 1 selected file(s) are gated/inaccessible" in output
+    assert "Access: 1 selected file size(s) unavailable" in output
+
+
+def test_scan_huggingface_preview_reports_unknown_size_gated_access(tmp_path: Path) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "config.json").write_text("{}")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.cli.get_model_info",
+            return_value={
+                "model_id": "org/unknown-size-gated-model",
+                "total_size": 0,
+                "file_count": 1,
+                "inventory_status": "gated_inaccessible",
+                "inaccessible_gated_bytes": 0,
+                "inaccessible_gated_file_count": 1,
+                "unknown_size_count": 1,
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--format", "text", "hf://org/unknown-size-gated-model"],
+        )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: Unknown size (1 files)" in output
+    assert "Access: 1 selected file(s) are gated/inaccessible" in output
+    assert "Access: 1 selected file size(s) unavailable" in output
+
+
 def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -3453,7 +3655,7 @@ def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
     with (
         patch("modelaudit.cli.is_huggingface_url", return_value=True),
         patch(
-            "modelaudit.utils.sources.huggingface.get_model_info",
+            "modelaudit.cli.get_model_info",
             side_effect=RuntimeError(f"metadata failed for {url}\nFORGED"),
         ),
         patch("modelaudit.cli.download_model", return_value=downloaded_dir),
@@ -3879,6 +4081,165 @@ def test_scan_huggingface_file_passes_max_size_and_cleans_temp_dir(
     assert result.exit_code == 0
     assert mock_download_file.call_args.kwargs["max_size"] == 2048
     mock_rmtree.assert_called()
+
+
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_direct_file_stream_selection_bypasses_repo_stream_selector(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_streaming: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Direct HF file URLs are explicit inventory and must not enter repository streaming selection."""
+    downloaded_file = tmp_path / "model-00001-of-00002.safetensors"
+    downloaded_file.write_bytes(b"weights")
+    mock_download_file.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            "--scanners",
+            "metadata",
+            "--quiet",
+            "https://huggingface.co/test/model/resolve/main/model-00001-of-00002.safetensors",
+        ],
+    )
+
+    assert result.exit_code == 0
+    mock_download_file.assert_called_once()
+    mock_download_streaming.assert_not_called()
+    mock_scan.assert_called_once()
+
+
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_direct_file_dry_run_does_not_download(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+) -> None:
+    """Direct HF dry runs should parse and preview the explicit file without SDK download."""
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--dry-run",
+            "--format",
+            "text",
+            "https://huggingface.co/test/model/resolve/main/model-00001-of-00002.safetensors",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Preview for" in result.output
+    assert "model-00001-of-00002.safetensors" in result.output
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_direct_file_dry_run_json_stdout_is_parseable(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+) -> None:
+    """Direct HF dry-run JSON output must not be prefixed by preview text."""
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--dry-run",
+            "--format",
+            "json",
+            "https://huggingface.co/test/model/resolve/main/model-00001-of-00002.safetensors",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Preview for" not in result.output
+    parsed = json.loads(result.output)
+    assert parsed["dry_run"] is True
+    assert parsed["files_scanned"] == 0
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.get_model_info")
+def test_scan_huggingface_streaming_dry_run_uses_metadata_preview_without_download_or_probe(
+    mock_get_model_info: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_model: MagicMock,
+    mock_download_streaming: MagicMock,
+) -> None:
+    """HF model dry runs should not enter download or selective content-probe paths."""
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 4096,
+        "file_count": 258,
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--stream", "--scanners", "xgboost", "--format", "text", "--quiet", "hf://test/model"],
+    )
+
+    assert result.exit_code == 0
+    assert "Preview for" in result.output
+    assert "test/model" in result.output
+    mock_get_model_info.assert_called_once()
+    assert mock_get_model_info.call_args.args == ("hf://test/model",)
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is False
+    assert "xgboost" in preview_kwargs["scannable_scanner_ids"]
+    mock_download_file.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_download_streaming.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.get_model_info")
+def test_scan_huggingface_streaming_dry_run_json_stdout_is_parseable(
+    mock_get_model_info: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_model: MagicMock,
+    mock_download_streaming: MagicMock,
+) -> None:
+    """HF model dry-run JSON output must not be prefixed by preview text."""
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 4096,
+        "file_count": 258,
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--stream", "--scanners", "xgboost", "--format", "json", "hf://test/model"],
+    )
+
+    assert result.exit_code == 0
+    assert "Preview for" not in result.output
+    parsed = json.loads(result.output)
+    assert parsed["dry_run"] is True
+    assert parsed["files_scanned"] == 0
+    mock_get_model_info.assert_called_once()
+    assert mock_get_model_info.call_args.args == ("hf://test/model",)
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is False
+    assert "xgboost" in preview_kwargs["scannable_scanner_ids"]
+    mock_download_file.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_download_streaming.assert_not_called()
 
 
 @patch("modelaudit.cli.download_file_from_hf")
@@ -4472,6 +4833,53 @@ def test_scan_huggingface_cached_stream_reconciles_snapshot_alias_shards(
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+def test_scan_huggingface_streaming_omits_multilingual_vocab_cc_token(
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Streamed Hugging Face tokenizer vocabularies should retain vocabulary context."""
+    mock_is_hf_url.return_value = True
+    model_dir = tmp_path / "huggingface" / "google-bert" / "bert-base-multilingual-uncased"
+    model_dir.mkdir(parents=True)
+    vocab_path = model_dir / "tokenizer-multilingual.txt"
+    vocab_path.write_bytes(_bert_like_multilingual_vocab_bytes("zombie"))
+    mock_download_streaming.return_value = iter([(vocab_path, True)])
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            "--quiet",
+            "--format",
+            "json",
+            "--cache-dir",
+            str(tmp_path),
+            "--scanners",
+            "text",
+            "hf://google-bert/bert-base-multilingual-uncased",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 1
+    assert not output_payload["issues"]
+    assert not [
+        check
+        for check in output_payload["checks"]
+        if check.get("name") == "Network Communication Detection"
+        and check.get("details", {}).get("type") == "cc_pattern"
+    ]
+    assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset(
+        {".txt", ".md", ".markdown", ".rst"}
+    )
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_passes_selected_scanner_extensions(
     mock_scan_streaming: MagicMock,
@@ -4538,6 +4946,84 @@ def test_scan_huggingface_streaming_preserves_selected_extensionless_filenames(
 
 
 @patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_preview_uses_selected_stream_policy(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Streaming preview should use the same selected scanner policy as acquisition."""
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=2048, files_scanned=1, issues=[])
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 2048,
+        "file_count": 1,
+        "inventory_status": "complete",
+        "inaccessible_gated_bytes": 0,
+        "unknown_size_count": 0,
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--timeout", "7", "--scanners", "metadata", "--format", "text", "hf://test/model"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: 2.00 KB (1 files)" in output
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    stream_kwargs = mock_download_streaming.call_args.kwargs
+    assert preview_kwargs["timeout_seconds"] == 7
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is False
+    assert preview_kwargs["scannable_extensions"] == stream_kwargs["scannable_extensions"]
+    assert preview_kwargs["scannable_filenames"] == stream_kwargs["scannable_filenames"]
+    assert preview_kwargs["scannable_scanner_ids"] == stream_kwargs["scannable_scanner_ids"]
+    assert preview_kwargs["scannable_filenames"] == frozenset({"readme", "model_card"})
+    assert "metadata" in preview_kwargs["scannable_scanner_ids"]
+    assert stream_kwargs["timeout_seconds"] == 7
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_preview_preserves_include_all_files_policy(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Default streaming preview should include the bounded unfiltered inventory."""
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=4096, files_scanned=2, issues=[])
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 4096,
+        "file_count": 2,
+        "inventory_status": "complete",
+        "inaccessible_gated_bytes": 0,
+        "unknown_size_count": 0,
+    }
+
+    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/model"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is True
+    assert "scannable_extensions" not in preview_kwargs
+    assert mock_download_streaming.call_args.kwargs["include_all_files"] is True
+
+
+@patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_passes_max_size_to_download(
@@ -4595,6 +5081,48 @@ def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
     cache_dir = mock_download_streaming.call_args.kwargs["cache_dir"]
     assert isinstance(cache_dir, Path)
     assert cache_dir.name.startswith("modelaudit_hf_")
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+@patch("shutil.rmtree")
+def test_scan_huggingface_no_cache_streaming_preserves_repository_scan_root(
+    mock_rmtree: MagicMock,
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """No-cache streaming still needs repository-relative paths for nested artifacts."""
+    mock_is_hf_url.return_value = True
+
+    streamed_file = tmp_path / "sub" / "pytorch_model.bin"
+    streamed_file.parent.mkdir()
+    streamed_file.write_bytes(b"weights")
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        yield (streamed_file, True)
+
+    mock_download_streaming.return_value = file_generator()
+    mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--no-cache", "--quiet", "hf://test/model"])
+
+    assert result.exit_code == 0
+    cache_dir = mock_download_streaming.call_args.kwargs["cache_dir"]
+    assert isinstance(cache_dir, Path)
+    assert cache_dir.name.startswith("modelaudit_hf_")
+
+    scan_kwargs = mock_scan_streaming.call_args.kwargs
+    assert scan_kwargs["scan_root"] == str(cache_dir / "huggingface")
+    assert scan_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] == str(cache_dir / "huggingface" / "test" / "model")
+    assert (
+        scan_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY]
+        is mock_download_streaming.call_args.kwargs["repository_file_inventory"]
+    )
     mock_rmtree.assert_called()
 
 
@@ -4696,7 +5224,9 @@ def test_scan_huggingface_sbom_excludes_download_cache_files(
 
     cache_dir = downloaded_dir / ".cache" / "huggingface" / "download"
     cache_dir.mkdir(parents=True)
-    (cache_dir / "config.json.metadata").write_text("{}")
+    (cache_dir / "config.json.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n"
+    )
     (cache_dir / ".gitignore").write_text("*\n")
 
     mock_download.return_value = downloaded_dir
@@ -4738,7 +5268,9 @@ def test_scan_directory_skips_huggingface_cache_bookkeeping(tmp_path):
 
     cache_dir = model_dir / ".cache" / "huggingface" / "download"
     cache_dir.mkdir(parents=True)
-    (cache_dir / "config.json.metadata").write_text("{}")
+    (cache_dir / "config.json.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n"
+    )
     (cache_dir / ".gitignore").write_text("*\n")
 
     result = scan_model_directory_or_file(str(model_dir))
@@ -4920,7 +5452,14 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
 ) -> None:
     """Bounded unknown-suffix files should preserve benign and malicious content routing."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.unknown", malicious=malicious)
-    mock_hf_hub_download.return_value = str(model_path)
+
+    def fake_hf_hub_download(**download_kwargs: Any) -> str:
+        local_path = Path(download_kwargs["local_dir"]) / str(download_kwargs["filename"])
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(model_path.read_bytes())
+        return str(local_path)
+
+    mock_hf_hub_download.side_effect = fake_hf_hub_download
     mock_run_download.side_effect = lambda _operation, download_kwargs, _deadline, _repo_id, *, direct_download: str(
         direct_download(**download_kwargs)
     )
@@ -4938,6 +5477,65 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     assert (parsed["failed_checks"] > 0) is malicious
     mock_hf_hub_download.assert_called_once()
     mock_run_download.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("repo_filename", "payload", "expected_exit_code", "expect_failed_check"),
+    [
+        ("model.safetensors", _minimal_safetensors_bytes(), 0, False),
+        ("model-00001-of-00002.safetensors", b"cos\nsystem\n(S'echo shard pwn'\ntR.", 1, True),
+    ],
+)
+@patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
+@patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout")
+@patch("requests.get")
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_huggingface_streaming_selected_pickle_scans_shard_shaped_renamed_pickle(
+    mock_hf_hub_download: MagicMock,
+    mock_requests_get: MagicMock,
+    mock_list_repo_files: MagicMock,
+    mock_run_download: MagicMock,
+    tmp_path: Path,
+    repo_filename: str,
+    payload: bytes,
+    expected_exit_code: int,
+    expect_failed_check: bool,
+) -> None:
+    """Pickle-only streaming must scan pickle bytes hidden behind shard-shaped names."""
+    mock_list_repo_files.return_value = ([repo_filename], _HF_TEST_REVISION, None)
+    model_path = tmp_path / repo_filename
+    model_path.write_bytes(payload)
+    mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+    def fake_hf_hub_download(**download_kwargs: Any) -> str:
+        local_path = Path(download_kwargs["local_dir"]) / str(download_kwargs["filename"])
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(model_path.read_bytes())
+        return str(local_path)
+
+    mock_hf_hub_download.side_effect = fake_hf_hub_download
+    mock_run_download.side_effect = lambda _operation, download_kwargs, _deadline, _repo_id, *, direct_download: str(
+        direct_download(**download_kwargs)
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--scanners", "pickle", "--no-cache", "--format", "json", "hf://test/model"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == expected_exit_code
+    assert parsed["has_errors"] is False
+    assert parsed["files_scanned"] == 1
+    assert (parsed["failed_checks"] > 0) is expect_failed_check
+    if expect_failed_check:
+        assert any("pickle" in scanner_name for scanner_name in parsed["scanner_names"])
+    else:
+        assert not parsed["issues"]
+        assert not any("pickle" in scanner_name for scanner_name in parsed["scanner_names"])
+    mock_requests_get.assert_called_once()
+    mock_hf_hub_download.assert_called_once()
+    assert mock_hf_hub_download.call_args.kwargs["filename"] == repo_filename
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -5265,6 +5863,18 @@ def test_scan_path_state_redacts_stream_fallback_for_sbom() -> None:
     path_state.track_streaming_paths_for_sbom(create_initial_audit_result(), url)
 
     assert path_state.scanned_paths == ["stream://https://bucket.s3.amazonaws.com/model.bin"]
+
+
+def test_scan_path_state_omits_empty_local_streaming_inventory_for_sbom(tmp_path: Path) -> None:
+    """A local streamed inventory with no assets must not fall back to re-inventorying the directory."""
+    model_dir = tmp_path / "only-sidecars"
+    model_dir.mkdir()
+    path_state = _ScanPathState()
+
+    path_state.track_streaming_paths_for_sbom(create_initial_audit_result(), str(model_dir))
+
+    assert path_state.sbom_paths_resolved is True
+    assert path_state.scanned_paths == []
 
 
 def test_scan_path_state_preserves_local_asset_path_for_sbom() -> None:
@@ -6284,6 +6894,94 @@ def test_exit_code_streaming_symlink_traversal_without_safe_files(tmp_path: Path
     assert "Path traversal outside scanned directory" in output
     assert "CRITICAL SECURITY ISSUES FOUND" in output
     assert "NO FILES SCANNED" not in output
+
+
+def test_cli_streaming_local_download_sidecars_excluded_from_inventory_and_sbom(tmp_path: Path) -> None:
+    """CLI streaming scans should not count Hugging Face local-dir sidecars."""
+    model_dir = tmp_path / "downloaded-model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+    vocab_path = model_dir / "vocab.txt"
+    vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+    download_root = model_dir / ".cache" / "huggingface" / "download"
+    download_root.mkdir(parents=True)
+    (download_root / "config.json.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+        encoding="utf-8",
+    )
+    (download_root / "config.json.lock").touch()
+    (download_root / "vocab.txt.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+        encoding="utf-8",
+    )
+    (model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG").write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
+        encoding="utf-8",
+    )
+    sbom_file = tmp_path / "stream.sbom.json"
+    file_hashes = [
+        hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        hashlib.sha256(vocab_path.read_bytes()).hexdigest(),
+    ]
+    expected_content_hash = hashlib.sha256("".join(sorted(file_hashes)).encode()).hexdigest()
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--format", "json", "--no-cache", "--sbom", str(sbom_file), str(model_dir)],
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 2
+    assert output_payload["content_hash"] == expected_content_hash
+    assert {Path(asset["path"]).relative_to(model_dir).as_posix() for asset in output_payload["assets"]} == {
+        "config.json",
+        "vocab.txt",
+    }
+    assert not any(".cache/huggingface" in path for path in output_payload["file_metadata"])
+    assert not any(".cache/huggingface" in (check.get("location") or "") for check in output_payload["checks"])
+    assert not any(".cache/huggingface" in (issue.get("location") or "") for issue in output_payload["issues"])
+
+    sbom_data = json.loads(sbom_file.read_text())
+    component_names = {component["name"] for component in sbom_data["components"]}
+    assert component_names == {"config.json", "vocab.txt"}
+
+
+def test_cli_streaming_empty_hf_cache_sidecars_do_not_populate_sbom(tmp_path: Path) -> None:
+    """A zero-asset streaming scan should not re-inventory skipped Hugging Face cache tags for SBOM."""
+    model_dir = tmp_path / "downloaded-model"
+    cachedir_tag = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+    cachedir_tag.parent.mkdir(parents=True)
+    cachedir_tag.write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
+        encoding="utf-8",
+    )
+    sbom_file = tmp_path / "stream-empty.sbom.json"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--format", "json", "--no-cache", "--sbom", str(sbom_file), str(model_dir)],
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 0
+    assert output_payload["assets"] == []
+    assert output_payload["file_metadata"] == {}
+    assert output_payload["success"] is True
+
+    sbom_text = sbom_file.read_text()
+    sbom_data = json.loads(sbom_text)
+    assert sbom_data.get("components", []) == []
+    assert "CACHEDIR.TAG" not in sbom_text
 
 
 def test_exit_code_scan_errors(tmp_path):

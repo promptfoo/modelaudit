@@ -30,7 +30,8 @@ from modelaudit.core import (
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.models import FileMetadataModel, LicenseInfoModel, create_initial_audit_result
 from modelaudit.scanners import safetensors_scanner
-from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import CheckStatus, Issue, IssueSeverity, ScanResult
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
@@ -63,6 +64,25 @@ def create_mock_scan_result(bytes_scanned: int = 1024, with_critical_issue: bool
     return result
 
 
+def write_hf_download_metadata(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+        encoding="utf-8",
+    )
+
+
+def write_hf_cachedir_tag(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
+        encoding="utf-8",
+    )
+
+
 def create_mock_location_scan_result(
     resolved_path: Path,
     *,
@@ -87,6 +107,23 @@ def create_mock_location_scan_result(
     )
     result.finish(success=True)
     return result
+
+
+def _write_ordered_hf_tokenizer_json(
+    path: Path,
+    *,
+    late_fields: str = "",
+    padding_size: int = 0,
+) -> Path:
+    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
+    path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            f'"model":{{"type":"BPE","vocab":{{"hello":0}},"merges":[]}}{padding}{late_fields}}}'
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_scan_model_directory_or_file_streaming_path() -> None:
@@ -1867,6 +1904,33 @@ def test_scan_model_streaming_skips_non_model_files(tmp_path: Path) -> None:
     assert result.files_scanned == 1
 
 
+def test_scan_model_streaming_tokenizer_json_late_chat_template_after_structure_budget_reports_issue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=256,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(tokenizer_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_scan_results=False,
+        skip_file_types=False,
+    )
+
+    assert result.files_scanned == 1
+    assert determine_exit_code(result) == 1
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_scan_model_streaming_preserves_license_metadata_when_skipped(tmp_path: Path) -> None:
     """Skipped license files should still populate file metadata in streaming mode."""
     license_file = tmp_path / "license.txt"
@@ -1946,7 +2010,7 @@ def test_scan_model_streaming_skips_huggingface_cache_metadata(
     snapshots_dir.mkdir(parents=True)
 
     metadata_file = snapshots_dir / "config.json.metadata"
-    metadata_file.write_text("{}")
+    write_hf_download_metadata(metadata_file)
     model_file = snapshots_dir / "model.pkl"
     with model_file.open("wb") as f:
         pickle.dump({"data": "safe"}, f)
@@ -1965,6 +2029,171 @@ def test_scan_model_streaming_skips_huggingface_cache_metadata(
     mock_scan.assert_called_once()
     assert mock_scan.call_args.args[0] == str(model_file)
     assert result.files_scanned == 1
+
+
+def test_scan_model_streaming_skips_local_download_sidecars(tmp_path: Path) -> None:
+    """Streaming directory scans should skip snapshot_download(local_dir=...) sidecars."""
+    model_dir = tmp_path / "downloaded-model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+    vocab_path = model_dir / "vocab.txt"
+    vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+    download_root = model_dir / ".cache" / "huggingface" / "download"
+    config_metadata = download_root / "config.json.metadata"
+    config_lock = download_root / "config.json.lock"
+    vocab_metadata = download_root / "vocab.txt.metadata"
+    cachedir_tag = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+    write_hf_download_metadata(config_metadata)
+    config_lock.touch()
+    write_hf_download_metadata(vocab_metadata)
+    write_hf_cachedir_tag(cachedir_tag)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        result = scan_model_streaming(
+            file_generator=iter(
+                [
+                    (config_metadata, False),
+                    (config_lock, False),
+                    (vocab_metadata, False),
+                    (cachedir_tag, False),
+                    (config_path, False),
+                    (vocab_path, True),
+                ]
+            ),
+            timeout=30,
+            delete_after_scan=False,
+            scan_root=str(model_dir),
+            skip_file_types=True,
+            cache_enabled=False,
+        )
+
+    assert [call.args[0] for call in mock_scan.call_args_list] == [str(config_path), str(vocab_path)]
+    assert result.files_scanned == 2
+
+
+def test_scan_model_streaming_local_download_sidecars_end_to_end_inventory(tmp_path: Path) -> None:
+    """Streaming local-dir scans should exclude HF sidecars from inventory and hashes."""
+    model_dir = tmp_path / "downloaded-model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+    vocab_path = model_dir / "vocab.txt"
+    vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+    download_root = model_dir / ".cache" / "huggingface" / "download"
+    write_hf_download_metadata(download_root / "config.json.metadata")
+    (download_root / "config.json.lock").touch()
+    write_hf_download_metadata(download_root / "vocab.txt.metadata")
+    write_hf_cachedir_tag(model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG")
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(model_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(model_dir),
+        skip_file_types=True,
+        cache_enabled=False,
+    )
+    cache_fragment = ".cache/huggingface"
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(config_path), compute_sha256_hash(vocab_path)])
+
+    assert result.files_scanned == 2
+    assert {Path(asset.path).relative_to(model_dir).as_posix() for asset in result.assets} == {
+        "config.json",
+        "vocab.txt",
+    }
+    assert not any(cache_fragment in path for path in result.file_metadata)
+    assert not any(cache_fragment in (check.location or "") for check in result.checks)
+    assert not any(cache_fragment in (issue.location or "") for issue in result.issues)
+    assert result.content_hash == expected_hash
+
+
+def test_scan_model_streaming_local_download_json_metadata_payload_is_scanned(tmp_path: Path) -> None:
+    """Streaming scans must not trust arbitrary JSON objects as HF download metadata."""
+    model_dir = tmp_path / "downloaded-model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+    sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(
+        '{"chat_template": "{{ cycler.__init__.__globals__.os.popen(\\"id\\").read() }}"}',
+        encoding="utf-8",
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(sidecar, False), (config_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(model_dir),
+        skip_file_types=True,
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 2
+    assert str(sidecar) in result.file_metadata
+
+
+def test_scan_model_streaming_hf_snapshot_metadata_symlink_payload_is_scanned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Streaming scans must not skip a model payload with a snapshot sidecar-like name."""
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_root = hf_home / "hub" / "models--org--repo"
+    snapshot_root = cache_root / "snapshots" / "abc123"
+    blobs_root = cache_root / "blobs"
+    snapshot_root.mkdir(parents=True)
+    blobs_root.mkdir()
+    blob = blobs_root / "blob123"
+    create_malicious_pickle(blob)
+    payload_alias = snapshot_root / "payload.pkl.metadata"
+    payload_alias.symlink_to(Path("../../blobs") / blob.name)
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(snapshot_root),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_root),
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 1
+    assert any(issue.rule_code == "S201" for issue in result.issues)
+
+
+def test_scan_model_streaming_hf_no_exist_marker_skips_only_empty_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming scans skip empty negative-cache markers but scan contentful entries."""
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    no_exist_root = hf_home / "hub" / "models--org--repo" / ".no_exist" / "abc123"
+    empty_marker = no_exist_root / "missing.safetensors"
+    malicious_marker = no_exist_root / "payload.pkl"
+    empty_marker.parent.mkdir(parents=True)
+    empty_marker.touch()
+    create_malicious_pickle(malicious_marker)
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(hf_home / "hub" / "models--org--repo"),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(hf_home / "hub" / "models--org--repo"),
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 1
+    assert str(malicious_marker) in result.file_metadata
+    assert str(empty_marker) not in result.file_metadata
+    assert any(issue.rule_code == "S201" and issue.location == str(malicious_marker) for issue in result.issues)
 
 
 def test_scan_model_streaming_scans_local_file_named_main(tmp_path: Path) -> None:
@@ -2055,6 +2284,38 @@ def test_scan_model_streaming_symlink_outside_directory_without_safe_files_retur
     assert traversal_issues[0].location == str(symlink_path)
     assert traversal_issues[0].severity == IssueSeverity.CRITICAL
     assert determine_exit_code(result) == 1
+
+
+def test_scan_model_streaming_fifo_cache_tag_fails_closed_without_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming scans should reject special files yielded by a source generator before hashing."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo unavailable")
+    fifo = tmp_path / ".cache" / "huggingface" / "CACHEDIR.TAG"
+    fifo.parent.mkdir(parents=True)
+    os.mkfifo(fifo)
+    monkeypatch.setattr(
+        "modelaudit.utils.helpers.file_hash.compute_sha256_hash",
+        lambda _path: pytest.fail("special streamed entries must not be opened for hashing"),
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(fifo, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 0
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.location == str(fifo) and issue.details.get("scan_outcome_reason") == "directory_special_file_unscanned"
+        for issue in result.issues
+    )
 
 
 def test_scan_model_streaming_hf_cache_symlink_allowed(

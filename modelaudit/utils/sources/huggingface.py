@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -12,6 +13,7 @@ import unicodedata
 from collections.abc import Callable, Collection, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import cache
 from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -42,6 +44,15 @@ _MAX_HF_STREAMING_UNFILTERED_FILES = 128
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
+_HF_SAFETENSORS_SHARD_PATTERN = re.compile(
+    r"(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors",
+    re.IGNORECASE,
+)
+_HF_SAFETENSORS_SHARD_SHAPE_PATTERN = re.compile(
+    r".+-\d+-of-\d+\.safetensors",
+    re.IGNORECASE,
+)
+_HF_REPO_BOOKKEEPING_FILENAMES = frozenset({".gitattributes"})
 
 __all__ = [
     "download_file_from_hf",
@@ -707,7 +718,7 @@ def _detect_huggingface_xgboost_ubjson_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
-    if Path(filename).suffix:
+    if Path(filename).suffix and not _has_hf_safetensors_shard_shape(filename):
         return None
 
     from modelaudit.utils.file.detection import (
@@ -1110,6 +1121,8 @@ def _select_huggingface_model_files(
     revision: str,
     model_extensions: Collection[str],
     *,
+    allow_inaccessible_probe_errors: bool = False,
+    inaccessible_probe_files: list[str] | None = None,
     deadline: float | None = None,
 ) -> list[str]:
     """Select extension-matching files plus bounded content-routed renamed model files."""
@@ -1126,13 +1139,28 @@ def _select_huggingface_model_files(
     for filename in repo_files:
         if filename in selected_files:
             continue
+        if _is_huggingface_repo_bookkeeping_file(filename):
+            continue
         if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
             raise ValueError(
                 "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
                 f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_FILES} files)"
             )
         inspected_files += 1
-        detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
+        try:
+            detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
+        except Exception as exc:
+            if allow_inaccessible_probe_errors and _is_huggingface_gated_or_auth_error(exc):
+                logger.debug(
+                    "Skipping inaccessible gated Hugging Face content probe for %s/%s: %s",
+                    repo_id,
+                    filename,
+                    redact_huggingface_urls_in_text(str(exc)),
+                )
+                if inaccessible_probe_files is not None and filename not in inaccessible_probe_files:
+                    inaccessible_probe_files.append(filename)
+                continue
+            raise
         if detected_format is None:
             continue
         model_files.append(filename)
@@ -1228,6 +1256,11 @@ def _is_scannable_hf_file(filename: str, extensions: Collection[str]) -> bool:
     return any(filename_lower.endswith(ext.lower()) for ext in extensions if ext)
 
 
+def _is_huggingface_repo_bookkeeping_file(filename: str) -> bool:
+    """Return whether a Hub repo entry is fixed metadata, not model payload."""
+    return PurePosixPath(filename).name.lower() in _HF_REPO_BOOKKEEPING_FILENAMES
+
+
 def _raise_no_scannable_hf_files(repo_id: str) -> None:
     raise Exception(
         f"Refusing to download full snapshot for {repo_id}: "
@@ -1318,6 +1351,101 @@ def _get_hf_content_route_scanner_ids() -> set[str]:
     return scanner_ids
 
 
+@cache
+def _hf_safetensors_route_scanner_ids() -> frozenset[str]:
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    return scanner_ids_for_detected_format("safetensors")
+
+
+@cache
+def _hf_route_scanner_ids_for_formats(format_names: frozenset[str]) -> frozenset[str]:
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    scanner_ids: set[str] = set()
+    for format_name in format_names:
+        scanner_ids.update(scanner_ids_for_detected_format(format_name))
+    return frozenset(scanner_ids)
+
+
+def _hf_safetensors_shard_excluded_by_selection(
+    filename: str,
+    selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
+    *,
+    complete_safetensors_shard_files: Collection[str] | None = None,
+) -> bool:
+    """Return whether no selected scanner can claim a declared SafeTensors shard."""
+    if _parse_hf_safetensors_shard(filename) is None:
+        return False
+    if complete_safetensors_shard_files is not None and filename not in complete_safetensors_shard_files:
+        return False
+
+    # SafeTensors content routes intentionally include overlap-capable scanners
+    # such as pickle and compressed, not only the SafeTensors scanner itself.
+    safetensors_route_scanner_ids = _hf_safetensors_route_scanner_ids()
+    if selected_route_scanner_ids is not None:
+        selected_safetensors_routes = selected_route_scanner_ids.intersection(safetensors_route_scanner_ids)
+        return not selected_safetensors_routes
+    if selected_route_formats is None:
+        return False
+
+    selected_format_route_scanner_ids = _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+    return not selected_format_route_scanner_ids.intersection(safetensors_route_scanner_ids)
+
+
+def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
+    match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(filename)
+    if match is None:
+        return None
+    index = int(match.group("index"))
+    total = int(match.group("total"))
+    if index < 1 or total < 2 or index > total:
+        return None
+    return match.group("stem"), index, total
+
+
+def _has_hf_safetensors_shard_shape(filename: str) -> bool:
+    return _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename) is not None
+
+
+def _complete_hf_safetensors_shard_files(repo_files: Collection[str]) -> frozenset[str]:
+    """Return canonical SafeTensors shards whose directory-scoped family is complete."""
+    families: dict[tuple[str, int], dict[int, set[str]]] = {}
+    for filename in repo_files:
+        parsed = _parse_hf_safetensors_shard(filename)
+        if parsed is None:
+            continue
+        stem, index, total = parsed
+        families.setdefault((stem, total), {}).setdefault(index, set()).add(filename)
+
+    complete_files: set[str] = set()
+    for (_stem, total), indexed_files in families.items():
+        if len(indexed_files) != total:
+            continue
+        if any(index not in indexed_files or len(indexed_files[index]) != 1 for index in range(1, total + 1)):
+            continue
+        for filenames in indexed_files.values():
+            complete_files.update(filenames)
+    return frozenset(complete_files)
+
+
+def _hf_detected_format_excluded_by_selected_route_formats(
+    detected_format: str,
+    selected_route_formats: set[str],
+) -> bool:
+    """Return whether inferred route formats cannot claim a detected route."""
+    normalized_detected_format = str(detected_format).lower()
+    if normalized_detected_format in selected_route_formats:
+        return False
+
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    selected_route_scanner_ids = _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+    detected_route_scanner_ids = scanner_ids_for_detected_format(normalized_detected_format)
+    return not selected_route_scanner_ids.intersection(detected_route_scanner_ids)
+
+
 def _get_selected_hf_content_route_formats(
     scannable_extensions: Collection[str] | None,
     scannable_filenames: Collection[str] | None,
@@ -1329,14 +1457,40 @@ def _get_selected_hf_content_route_formats(
     from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP, get_scanner_registry_metadata
 
     content_route_formats = _get_hf_content_route_formats()
-    selected_extensions = (
+    selected_extensions: set[str] = (
         set() if scannable_extensions is None else {str(extension).lower() for extension in scannable_extensions}
     )
     selected_filenames = (
         set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
     )
+    for filename in selected_filenames:
+        suffix = PurePosixPath(filename).suffix.lower()
+        if suffix:
+            selected_extensions.add(suffix)
+
+    scanner_metadata = get_scanner_registry_metadata()
+    extension_claimants: dict[str, set[str]] = {extension: set() for extension in selected_extensions if extension}
+    for scanner_id, scanner_info in scanner_metadata.items():
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            for extension in scanner_info.get(key, []):
+                extension_text = str(extension).lower()
+                if extension_text in extension_claimants and extension_text not in remote_excluded_extensions:
+                    extension_claimants[extension_text].add(scanner_id)
+
+    selected_extensions = {
+        extension
+        for extension in selected_extensions
+        if extension in EXTENSION_FORMAT_MAP
+        or (
+            len(extension_claimants.get(extension, set())) == 1
+            and bool(extension_claimants.get(extension, set()).intersection(content_route_formats))
+        )
+    }
     selected_formats: set[str] = set()
-    for scanner_id, scanner_info in get_scanner_registry_metadata().items():
+    for scanner_id, scanner_info in scanner_metadata.items():
         remote_excluded_extensions = {
             str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
         }
@@ -1384,19 +1538,6 @@ def _select_streamable_hf_files(
         selected_route_scanner_ids = {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}.intersection(
             _get_hf_content_route_scanner_ids()
         )
-    elif scannable_filenames:
-        from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP
-
-        authoritative_extensions = (
-            set()
-            if scannable_extensions is None
-            else {
-                str(extension).lower()
-                for extension in scannable_extensions
-                if str(extension).lower() in EXTENSION_FORMAT_MAP
-            }
-        )
-        selected_route_formats = _get_selected_hf_content_route_formats(authoritative_extensions, None)
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
     sniff_renamed_files = not include_all_files and (
@@ -1436,6 +1577,9 @@ def _select_streamable_hf_files(
             model_files.append(file_name)
             continue
 
+        if _is_huggingface_repo_bookkeeping_file(file_name):
+            continue
+
         if include_all_files:
             unfiltered_count += 1
             if unfiltered_count > _MAX_HF_STREAMING_UNFILTERED_FILES:
@@ -1473,11 +1617,23 @@ def _select_streamable_hf_files(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
             deadline=deadline,
         )
-        selected_files = set(model_files)
+        processed_files = set(model_files)
+        complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
+        unskippable_detected_safetensors_shards: list[str] = []
         for file_name in repo_files:
-            if file_name in selected_files:
+            if file_name in processed_files:
+                continue
+            processed_files.add(file_name)
+            if _is_huggingface_repo_bookkeeping_file(file_name):
                 continue
             if file_name in exact_openvino_companion_candidates:
+                continue
+            if _hf_safetensors_shard_excluded_by_selection(
+                file_name,
+                selected_route_scanner_ids,
+                selected_route_formats,
+                complete_safetensors_shard_files=complete_safetensors_shard_files,
+            ):
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -1492,11 +1648,26 @@ def _select_streamable_hf_files(
                 from ...scanner_selection import scanner_ids_for_detected_format
 
                 if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
+                    if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                        unskippable_detected_safetensors_shards.append(file_name)
                     continue
-            elif selected_route_formats is not None and detected_format not in selected_route_formats:
+            elif selected_route_formats is not None and _hf_detected_format_excluded_by_selected_route_formats(
+                detected_format,
+                selected_route_formats,
+            ):
+                if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                    unskippable_detected_safetensors_shards.append(file_name)
                 continue
             model_files.append(file_name)
-            selected_files.add(file_name)
+        if unskippable_detected_safetensors_shards:
+            preview = ", ".join(unskippable_detected_safetensors_shards[:3])
+            if len(unskippable_detected_safetensors_shards) > 3:
+                preview = f"{preview}, ..."
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: detected SafeTensors shard candidates "
+                f"that do not form a complete canonical shard family for {repo_id}: {preview}; "
+                "streaming coverage is incomplete"
+            )
 
     if not model_files:
         _raise_no_scannable_hf_files(repo_id)
@@ -1884,11 +2055,236 @@ def _verify_huggingface_selection_within_max_size(
     return total_size
 
 
-def get_model_info(url: str) -> dict:
+def _huggingface_metadata_size(item: Any) -> int | None:
+    """Extract a non-negative Hub-disclosed size from sibling/tree metadata."""
+    if isinstance(item, dict):
+        raw_size = item.get("size")
+        raw_lfs = item.get("lfs")
+    else:
+        raw_size = getattr(item, "size", None)
+        raw_lfs = getattr(item, "lfs", None)
+
+    if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0:
+        return raw_size
+
+    raw_lfs_size = raw_lfs.get("size") if isinstance(raw_lfs, dict) else getattr(raw_lfs, "size", None)
+    if isinstance(raw_lfs_size, int) and not isinstance(raw_lfs_size, bool) and raw_lfs_size >= 0:
+        return raw_lfs_size
+
+    return None
+
+
+def _extract_huggingface_repo_file_sizes(repo_info: Any) -> dict[str, int]:
+    """Return recursive file sizes disclosed by Hugging Face repo metadata."""
+    siblings = getattr(repo_info, "siblings", None) or ()
+    sizes: dict[str, int] = {}
+    for sibling in siblings:
+        if isinstance(sibling, dict):
+            file_name = sibling.get("rfilename") or sibling.get("path")
+        else:
+            file_name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+        if not isinstance(file_name, str) or not file_name:
+            continue
+        file_size = _huggingface_metadata_size(sibling)
+        if file_size is not None:
+            sizes[file_name] = file_size
+    return sizes
+
+
+def _is_huggingface_gated_or_auth_error(error: BaseException) -> bool:
+    """Return whether a Hub metadata error means selected bytes are inaccessible."""
+    markers = (
+        "gated",
+        "unauthorized",
+        "authorization",
+        "forbidden",
+        "restricted",
+        "401",
+        "403",
+    )
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        error_type = type(current).__name__.lower()
+        error_text = str(current).lower()
+        if any(marker in error_type or marker in error_text for marker in markers):
+            return True
+        response = getattr(current, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code in {401, 403}:
+            return True
+        cause = current.__cause__
+        if cause is not None:
+            pending.append(cause)
+        context = current.__context__
+        if context is not None:
+            pending.append(context)
+    return False
+
+
+def _is_huggingface_gated_repo(repo_info: Any) -> bool:
+    gated = getattr(repo_info, "gated", None)
+    return bool(gated and gated not in {False, "false", "False", "none", "None"})
+
+
+def _build_huggingface_model_info(
+    repo_id: str,
+    repo_info: Any,
+    repo_files: list[str],
+    repo_revision: str,
+    *,
+    deadline: float | None = None,
+    streaming_selection: bool = False,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    include_all_files: bool = False,
+) -> dict[str, Any]:
+    """Build selected recursive inventory metadata using the downloader's selection policy."""
+    inaccessible_probe_files: list[str] = []
+    allow_inaccessible_probe_errors = _is_huggingface_gated_repo(repo_info)
+    if streaming_selection:
+        model_files = _select_streamable_hf_files(
+            repo_id,
+            repo_files,
+            repo_revision,
+            scannable_extensions,
+            scannable_filenames,
+            scannable_scanner_ids,
+            include_all_files=include_all_files,
+            deadline=deadline,
+        )
+        include_openvino_companions = scannable_scanner_ids is None or "openvino" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        model_files = _include_huggingface_openvino_companions(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_files,
+            include_openvino_companions=include_openvino_companions,
+            deadline=deadline,
+        )
+    else:
+        model_extensions = _get_model_extensions()
+        model_files = _select_huggingface_model_files(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_extensions,
+            allow_inaccessible_probe_errors=allow_inaccessible_probe_errors,
+            inaccessible_probe_files=inaccessible_probe_files if allow_inaccessible_probe_errors else None,
+            deadline=deadline,
+        )
+    inventory_files = list(dict.fromkeys([*model_files, *inaccessible_probe_files]))
+    inaccessible_probe_file_set = set(inaccessible_probe_files)
+    repo_metadata_sizes = _extract_huggingface_repo_file_sizes(repo_info)
+    repo_is_gated = _is_huggingface_gated_repo(repo_info)
+
+    path_size_error: str | None = None
+    path_size_gated = False
+    try:
+        selected_sizes, size_revision = _get_huggingface_path_sizes(
+            repo_id,
+            inventory_files,
+            resolved_revision=repo_revision,
+            deadline=deadline,
+        )
+    except Exception as exc:
+        selected_sizes = {}
+        size_revision = repo_revision
+        path_size_gated = _is_huggingface_gated_or_auth_error(exc) or repo_is_gated
+        path_size_error = redact_huggingface_urls_in_text(str(exc))
+
+    files: list[dict[str, Any]] = []
+    accessible_bytes = 0
+    inaccessible_gated_bytes = 0
+    inaccessible_gated_count = 0
+    unknown_size_count = 0
+    unknown_size_files: list[str] = []
+    inaccessible_gated_files: list[str] = []
+
+    for filename in inventory_files:
+        path_size = selected_sizes.get(filename)
+        size = path_size if isinstance(path_size, int) and not isinstance(path_size, bool) else None
+        inaccessible_gated = filename in inaccessible_probe_file_set
+        gated_missing_path_size = repo_is_gated and (filename not in selected_sizes or path_size is None)
+        if size is None and (path_size_gated or inaccessible_gated or gated_missing_path_size):
+            metadata_size = repo_metadata_sizes.get(filename)
+            if metadata_size is not None:
+                size = metadata_size
+            inaccessible_gated = True
+
+        file_info: dict[str, Any] = {"name": filename, "size": size}
+        if inaccessible_gated:
+            inaccessible_gated_count += 1
+            inaccessible_gated_bytes += size or 0
+            inaccessible_gated_files.append(filename)
+            file_info["access"] = "gated"
+            if size is None:
+                unknown_size_count += 1
+                unknown_size_files.append(filename)
+        elif size is None:
+            unknown_size_count += 1
+            unknown_size_files.append(filename)
+            file_info["access"] = "unknown"
+        else:
+            accessible_bytes += size
+            file_info["access"] = "available"
+        files.append(file_info)
+
+    total_size = accessible_bytes + inaccessible_gated_bytes
+    inventory_status = "complete"
+    if inaccessible_gated_count:
+        inventory_status = "gated_inaccessible"
+    elif unknown_size_count:
+        inventory_status = "partial_unknown_size"
+
+    return {
+        "repo_id": repo_id,
+        "revision": size_revision,
+        "total_size": total_size,
+        "accessible_size": accessible_bytes,
+        "inaccessible_gated_bytes": inaccessible_gated_bytes,
+        "inaccessible_gated_file_count": inaccessible_gated_count,
+        "inaccessible_gated_files": inaccessible_gated_files[:20],
+        "unknown_size_count": unknown_size_count,
+        "unknown_size_files": unknown_size_files[:20],
+        "file_count": len(inventory_files),
+        "repo_file_count": len(repo_files),
+        "files": files,
+        "inventory_status": inventory_status,
+        "inventory_error": path_size_error,
+        "gated": repo_is_gated,
+        "model_id": getattr(repo_info, "modelId", repo_id),
+        "author": getattr(repo_info, "author", ""),
+    }
+
+
+def get_model_info(
+    url: str,
+    *,
+    timeout_seconds: float | None = None,
+    streaming_selection: bool = False,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    include_all_files: bool = False,
+) -> dict[str, Any]:
     """Get information about a HuggingFace model without downloading it.
 
     Args:
         url: HuggingFace model URL
+        timeout_seconds: Optional end-to-end preview deadline in seconds
+        streaming_selection: Match streaming acquisition selection instead of snapshot selection
+        scannable_extensions: Optional remote prefilter extensions from scanner selection policy
+        scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
+        scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
+        include_all_files: Include otherwise-unrecognized files under streaming selection bounds
 
     Returns:
         Dictionary with model information including size
@@ -1904,48 +2300,39 @@ def get_model_info(url: str) -> dict:
     namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     api = HfApi()
     try:
-        # Get model info for metadata
-        model_info_kwargs: dict[str, Any] = {}
+        repo_info_kwargs: dict[str, Any] = {"files_metadata": True}
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            repo_info_kwargs["timeout"] = min(30.0, remaining)
         if requested_revision is not None:
-            model_info_kwargs["revision"] = requested_revision
-        model_info = api.model_info(repo_id, **model_info_kwargs)
+            repo_info_kwargs["revision"] = requested_revision
+        model_info = api.repo_info(repo_id, **repo_info_kwargs)
+        repo_files = _extract_huggingface_repo_files(model_info)
+        if repo_files is None:
+            raise Exception("repository listing unavailable")
+        repo_revision = getattr(model_info, "sha", None)
+        if not _is_huggingface_commit_sha(repo_revision):
+            raise Exception("repository listing did not include an immutable commit SHA")
+        assert isinstance(repo_revision, str)
 
-        # Use list_repo_tree to get accurate file sizes
-        # (model_info.siblings often returns None for size)
-        total_size = 0
-        files = []
-        try:
-            list_repo_tree_kwargs: dict[str, Any] = {"recursive": False}
-            if requested_revision is not None:
-                list_repo_tree_kwargs["revision"] = requested_revision
-            repo_files = api.list_repo_tree(repo_id, **list_repo_tree_kwargs)
-            for item in repo_files:
-                # Skip metadata files
-                if hasattr(item, "path") and item.path not in [".gitattributes", "README.md"]:
-                    file_size = getattr(item, "size", 0) or 0
-                    total_size += file_size
-                    files.append({"name": item.path, "size": file_size})
-        except Exception as e:
-            # If list_repo_tree fails, return 0 (will show as "Unknown size" in CLI)
-            logger.debug(f"list_repo_tree failed for {repo_id}, falling back to unknown size: {e}")
-            total_size = 0
-            # Still try to get file count from siblings
-            siblings = model_info.siblings or []
-            for sibling in siblings:
-                if sibling.rfilename not in [".gitattributes", "README.md"]:
-                    files.append({"name": sibling.rfilename, "size": 0})
-
-        return {
-            "repo_id": repo_id,
-            "total_size": total_size,
-            "file_count": len(files),
-            "files": files,
-            "model_id": getattr(model_info, "modelId", repo_id),
-            "author": getattr(model_info, "author", ""),
-        }
+        return _build_huggingface_model_info(
+            repo_id,
+            model_info,
+            repo_files,
+            repo_revision,
+            deadline=deadline,
+            streaming_selection=streaming_selection,
+            scannable_extensions=scannable_extensions,
+            scannable_filenames=scannable_filenames,
+            scannable_scanner_ids=scannable_scanner_ids,
+            include_all_files=include_all_files,
+        )
     except Exception as e:
         raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 
@@ -2025,6 +2412,7 @@ def download_model(
     max_size: int | None = None,
     *,
     timeout_seconds: float | None = None,
+    repository_file_inventory: list[str] | None = None,
 ) -> Path:
     """Download a model from HuggingFace.
 
@@ -2034,6 +2422,7 @@ def download_model(
         show_progress: Whether to show download progress
         max_size: Optional maximum total selected download size in bytes
         timeout_seconds: Optional end-to-end acquisition deadline in seconds
+        repository_file_inventory: Optional list filled with repository member names from metadata
 
     Returns:
         Path to the downloaded model directory
@@ -2110,6 +2499,8 @@ def download_model(
                 "Hugging Face selective filtering incomplete: "
                 f"failed listing files in repository {repo_id}: {repo_listing_error}"
             )
+        if repository_file_inventory is not None:
+            repository_file_inventory[:] = repo_files
         if repo_revision is None:
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
@@ -2217,6 +2608,7 @@ def download_model_streaming(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
+    repository_file_inventory: list[str] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
@@ -2233,6 +2625,7 @@ def download_model_streaming(
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
+        repository_file_inventory: Optional list filled with repository member names from metadata
 
     Yields:
         Tuple of (Path, bool) - (downloaded file path, is_last_file flag)
@@ -2285,6 +2678,8 @@ def download_model_streaming(
             if repo_listing_error and repo_listing_error.startswith("timed out after"):
                 raise Exception(f"Timeout listing files in repository {repo_id}")
             raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+        if repository_file_inventory is not None:
+            repository_file_inventory[:] = repo_files
         if repo_revision is None:
             raise Exception(
                 f"Failed listing files in repository {repo_id}: "
@@ -2452,13 +2847,22 @@ def download_model_streaming(
         ) from e
 
 
-def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int | None = None) -> Path:
+def download_file_from_hf(
+    url: str,
+    cache_dir: Path | None = None,
+    max_size: int | None = None,
+    *,
+    repository_file_inventory: list[str] | None = None,
+    timeout_seconds: float | None = None,
+) -> Path:
     """Download a single file from HuggingFace using direct file URL.
 
     Args:
         url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
         cache_dir: Optional cache directory for downloads
         max_size: Optional maximum file size to download; 0 disables the limit
+        repository_file_inventory: Optional list filled with repository member names from metadata
+        timeout_seconds: Optional end-to-end acquisition deadline in seconds
 
     Returns:
         Path to the downloaded file
@@ -2472,7 +2876,7 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
     display_url = redact_huggingface_url_for_display(url)
 
     try:
-        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub import hf_hub_download
     except ImportError as e:
         raise ImportError(
             "huggingface-hub package is required for HuggingFace URL support. "
@@ -2485,17 +2889,49 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
 
         size_limit = max_size or None
         download_revision = branch
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+        repo_files: list[str] | None = None
+        repo_revision: str | None = None
+        repo_listing_error: str | None = None
+        if size_limit is not None or repository_file_inventory is not None:
+            listing_timeout = 30.0
+            if deadline is not None:
+                listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+                if listing_timeout <= 0:
+                    raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+                repo_id,
+                listing_timeout,
+                revision=branch,
+                deadline=deadline,
+            )
+            inventory_revision: str | None = None
+            if _is_huggingface_commit_sha(repo_revision):
+                assert isinstance(repo_revision, str)
+                inventory_revision = repo_revision
+            elif _is_huggingface_commit_sha(branch):
+                inventory_revision = branch
+            if repository_file_inventory is not None and repo_files is not None and inventory_revision is not None:
+                repository_file_inventory[:] = repo_files
+                download_revision = inventory_revision
+
         if size_limit is not None:
-            api = HfApi()
-            repo_info = api.repo_info(repo_id, revision=branch)
-            pinned_revision = getattr(repo_info, "sha", None)
+            pinned_revision = repo_revision
             if not _is_huggingface_commit_sha(pinned_revision):
-                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+                error_suffix = f": {repo_listing_error}" if repo_listing_error else ""
+                raise ValueError(
+                    f"Unable to determine immutable revision for {display_url}; refusing capped download{error_suffix}"
+                )
             assert isinstance(pinned_revision, str)
 
-            path_info = api.get_paths_info(repo_id, filename, revision=pinned_revision)
-            file_metadata = path_info[0] if path_info else None
-            file_size = getattr(file_metadata, "size", None)
+            path_sizes, _resolved_revision = _get_huggingface_path_sizes(
+                repo_id,
+                [filename],
+                requested_revision=branch,
+                resolved_revision=pinned_revision,
+                deadline=deadline,
+            )
+            file_size = path_sizes.get(filename)
             if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
                 raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
             if file_size > size_limit:
@@ -2504,12 +2940,18 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
                 )
             download_revision = pinned_revision
 
-        # Use hf_hub_download for single file downloads
-        local_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            revision=download_revision,
-            cache_dir=str(cache_dir) if cache_dir else None,
+        download_kwargs: dict[str, Any] = {
+            "repo_id": repo_id,
+            "filename": filename,
+            "revision": download_revision,
+            "cache_dir": str(cache_dir) if cache_dir else None,
+        }
+        local_path = _run_huggingface_download_with_deadline(
+            "hf_hub_download",
+            download_kwargs,
+            deadline,
+            repo_id,
+            direct_download=hf_hub_download,
         )
         downloaded_path = Path(local_path)
         if size_limit is not None:
