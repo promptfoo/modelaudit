@@ -19,7 +19,6 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
-from ...scanner_registry_metadata import TEXT_CONTENT_ROUTED_FILENAMES
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
     extract_model_id_from_path,
@@ -38,7 +37,6 @@ logger = logging.getLogger(__name__)
 _HF_CONTENT_SNIFF_BYTES = 8 * 1024
 _HF_CONTENT_SNIFF_MAX_FILES = 256
 _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
-_HF_TEXT_ROUTE_DECLARED_FILENAMES = frozenset(TEXT_CONTENT_ROUTED_FILENAMES)
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
@@ -931,6 +929,7 @@ def _detect_huggingface_flax_msgpack_route(
         _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES,
         FLAX_MSGPACK_STRUCTURE_READ_BYTES,
         _probe_flax_msgpack_checkpoint_stream,
+        is_declared_text_content_filename,
     )
 
     remote_path = PurePosixPath(filename)
@@ -952,7 +951,7 @@ def _detect_huggingface_flax_msgpack_route(
     )
     if initial_probe_state is True:
         return "flax_msgpack"
-    declared_text_filename = remote_path.name.lower() in _HF_TEXT_ROUTE_DECLARED_FILENAMES
+    declared_text_filename = is_declared_text_content_filename(filename)
     declared_text_asset = suffix in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES or declared_text_filename
     max_probe_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
     raw_probe: bytes | None = None

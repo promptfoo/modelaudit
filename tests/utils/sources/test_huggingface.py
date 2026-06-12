@@ -28,6 +28,8 @@ from modelaudit.scanner_selection import (
     selected_scanner_filenames,
 )
 from modelaudit.utils.file.detection import (
+    _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES,
+    _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES,
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     MEDIA_ROUTE_TAIL_READ_BYTES,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -148,6 +150,14 @@ def _fake_bounded_range_response(payload: bytes) -> Callable[..., _FakeRangeResp
         return _FakeRangeResponse(payload[:max_bytes], headers={"Content-Length": str(len(payload))})
 
     return get_side_effect
+
+
+def _large_remote_documentation_payload(label: str) -> bytes:
+    line = f"{label} line-oriented documentation with tokenizer notes and multilingual text café.\n".encode()
+    payload = f"# {label}\n".encode() + line * ((_CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES // len(line)) + 128)
+    assert len(payload) > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    assert len(payload) < _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+    return payload
 
 
 def _fake_content_range_response(payload: bytes, start: int, end: int) -> _FakeRangeResponse:
@@ -3054,37 +3064,49 @@ class TestModelDownloadStreaming:
 
         assert detected_format is None
 
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "README.md",
+            "README.rst",
+            "README.txt",
+            "README.markdown",
+            "model_card.md",
+            "model_card.rst",
+            "modelcard.txt",
+            "modelcard.markdown",
+        ],
+    )
     @patch("requests.get")
-    def test_detect_huggingface_flax_route_rejects_large_complete_multilingual_readme_text(
+    def test_detect_huggingface_flax_route_rejects_large_complete_documentation_text(
         self,
         mock_requests_get: MagicMock,
+        filename: str,
     ) -> None:
-        """Remote text ownership should use the complete bounded text window, not only 8 KiB."""
-        readme_payload = (
-            "# Model Card\n"
-            + ("This multilingual README has こんにちは, café, naïve, résumé, and 😀 examples.\n" * 12_000)
-        ).encode()
-        assert len(readme_payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES
-        assert len(readme_payload) < 2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES
-        mock_requests_get.side_effect = _fake_bounded_range_response(readme_payload)
+        """Remote documentation names should use the declared text window, not the 2 MiB cap."""
+        documentation_payload = _large_remote_documentation_payload(filename)
+        assert len(documentation_payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        mock_requests_get.side_effect = _fake_bounded_range_response(documentation_payload)
         budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
 
         detected_format = _detect_huggingface_flax_msgpack_route(
             "intfloat/multilingual-e5-small",
-            "README.md",
+            filename,
             _HF_MULTILINGUAL_E5_README_REVISION,
             budget,
-            readme_payload[:8192],
+            documentation_payload[:8192],
         )
 
         assert detected_format is None
 
+    @pytest.mark.parametrize("filename", ["README.md", "model_card.md", "modelcard.txt"])
     @patch("requests.get")
-    def test_detect_huggingface_flax_route_preserves_binary_readme_checkpoint(
+    def test_detect_huggingface_flax_route_preserves_binary_documentation_checkpoint(
         self,
         mock_requests_get: MagicMock,
+        filename: str,
     ) -> None:
-        """Remote README names should not suppress MessagePack checkpoint structure."""
+        """Remote documentation names should not suppress MessagePack checkpoint structure."""
         msgpack = pytest.importorskip("msgpack")
         hidden_payload = msgpack.packb(
             {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
@@ -3095,7 +3117,7 @@ class TestModelDownloadStreaming:
 
         detected_format = _detect_huggingface_content_route_format(
             "intfloat/multilingual-e5-small",
-            "README.md",
+            filename,
             _HF_MULTILINGUAL_E5_README_REVISION,
             budget,
         )
