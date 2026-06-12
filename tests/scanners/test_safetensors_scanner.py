@@ -1327,6 +1327,26 @@ def test_license_metadata_short_documentary_words_with_trailing_separator_stays_
     assert all("license" not in issue.message for issue in result.issues)
 
 
+def test_license_metadata_documentary_heading_with_trailing_separator_stays_clean(tmp_path: Path) -> None:
+    file_path = tmp_path / "documentary_heading_separator_license_metadata.safetensors"
+    separator = "\n".join("License terms grant permission reproduce distribute work." for _ in range(5))
+    payload = f"{ordinary_license_text_with_url()}\nCopyright\n{separator}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert all("license" not in issue.message for issue in result.issues)
+
+
 @pytest.mark.parametrize("line", ["License grant by", "by under terms"])
 def test_license_metadata_short_documentary_prefix_suffix_words_stay_clean(tmp_path: Path, line: str) -> None:
     file_path = tmp_path / "short_documentary_prefix_suffix_words_license_metadata.safetensors"

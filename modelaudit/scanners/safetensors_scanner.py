@@ -655,6 +655,7 @@ class SafeTensorsScanner(BaseScanner):
             len(stripped) >= _BASE64_LICENSE_WRAP_LINE_MIN_CHARS
             and not any(char.isspace() for char in stripped)
             and _BASE64_LICENSE_WRAP_LINE_PATTERN.fullmatch(stripped) is not None
+            and not SafeTensorsScanner._license_document_token_looks_documentary(stripped)
         )
 
     @staticmethod
