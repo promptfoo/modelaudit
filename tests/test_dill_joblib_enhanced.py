@@ -70,7 +70,41 @@ def test_legitimate_joblib_like_pickle_is_accepted(
     result = PickleScanner().scan(str(joblib_file))
 
     assert _is_legitimate_serialization_file(str(joblib_file)) is True
+    assert result.success is True
+    assert result.metadata["trusted_incomplete_tail"] is True
+    assert result.metadata["trusted_incomplete_tail_reason"] == "joblib_pickle_tail"
+    assert "scan_outcome" not in result.metadata
     assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+
+
+def test_joblib_like_pickle_keeps_wrapper_warning_when_origin_is_untrusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    joblib_file = tmp_path / "numpy_arrays.joblib"
+    _write_joblib_like_pickle(joblib_file, padding=16)
+
+    def untrusted_joblib_wrapper(_module: str, _name: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        untrusted_joblib_wrapper,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        untrusted_joblib_wrapper,
+    )
+
+    result = PickleScanner().scan(str(joblib_file))
+
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "joblib.numpy_pickle.NumpyArrayWrapper"
+        for issue in result.issues
+    )
+    assert "trusted_incomplete_tail" not in result.metadata
 
 
 def test_legitimate_serialization_file_rejects_empty_text_and_missing_paths(tmp_path: Path) -> None:

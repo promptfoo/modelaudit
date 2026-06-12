@@ -2678,9 +2678,73 @@ class PickleScanner(BaseScanner):
 
     def _finish_after_wrapper_analysis(self, result: ScanResult, *, base_success: bool) -> None:
         success = base_success
-        if result.metadata.get("operational_error") or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        if result.metadata.get("trusted_incomplete_tail") is True:
+            success = True
+        elif (
+            result.metadata.get("operational_error") or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        ):
             success = False
         result.finish(success=success)
+
+    def _apply_legitimate_joblib_like_pickle_cleanup(self, result: ScanResult, path: str) -> None:
+        if Path(path).suffix.lower() != ".joblib":
+            return
+        if result.metadata.get("scan_outcome_reasons") != ["pickle_analysis_incomplete"]:
+            return
+        if not _is_legitimate_serialization_file(path):
+            return
+
+        if _joblib_numpy_array_wrapper_origin_is_trusted():
+            self._remove_trusted_joblib_numpy_array_wrapper_findings(result)
+        self._downgrade_pickle_parse_error_findings(result)
+        if self._has_warning_or_critical_findings(result):
+            return
+
+        for key in (
+            "analysis_incomplete",
+            "failure_reason",
+            "parsing_failed",
+            "scan_outcome",
+            "scan_outcome_message",
+            "scan_outcome_reasons",
+        ):
+            result.metadata.pop(key, None)
+        if result.metadata.get("pickle_report_status") == "inconclusive":
+            result.metadata["pickle_report_status"] = "complete"
+        if result.metadata.get("pickle_verdict") in {"suspicious", "unknown"}:
+            result.metadata["pickle_verdict"] = "clean"
+        result.trust_merged_child_failures()
+        result.metadata["trusted_incomplete_tail"] = True
+        result.metadata["trusted_incomplete_tail_reason"] = "joblib_pickle_tail"
+
+    @staticmethod
+    def _remove_trusted_joblib_numpy_array_wrapper_findings(result: ScanResult) -> None:
+        def is_trusted_wrapper_finding(finding: Any) -> bool:
+            details = getattr(finding, "details", {})
+            return (
+                getattr(finding, "rule_code", None) == "NON_ALLOWLISTED_GLOBAL"
+                and isinstance(details, dict)
+                and details.get("import_reference") == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
+            )
+
+        result.issues = [issue for issue in result.issues if not is_trusted_wrapper_finding(issue)]
+        result.checks = [check for check in result.checks if not is_trusted_wrapper_finding(check)]
+
+    @staticmethod
+    def _downgrade_pickle_parse_error_findings(result: ScanResult) -> None:
+        for issue in result.issues:
+            if issue.rule_code == "S901" and issue.details.get("category") == "parse_error":
+                issue.severity = IssueSeverity.INFO
+        for check in result.checks:
+            if check.rule_code == "S901" and check.details.get("category") == "parse_error":
+                check.severity = IssueSeverity.INFO
+
+    @staticmethod
+    def _has_warning_or_critical_findings(result: ScanResult) -> bool:
+        return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues) or any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        )
 
     @staticmethod
     def _mark_operational_incomplete(result: ScanResult, reason: str) -> None:
@@ -4543,6 +4607,7 @@ class PickleScanner(BaseScanner):
             except OSError as error:
                 self._record_file_read_failure(result, path, error)
                 return result
+        self._apply_legitimate_joblib_like_pickle_cleanup(result, path)
         self._finish_after_wrapper_analysis(result, base_success=scan_result.success)
         return result
 
