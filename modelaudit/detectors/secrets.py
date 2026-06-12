@@ -402,20 +402,19 @@ BASIC_AUTH_HEADER_VALUE_ARRAY_START_PATTERN = re.compile(
     r"\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*\[",
     re.IGNORECASE,
 )
-BASIC_AUTH_HEADER_VALUE_YAML_LIST_PATTERN = re.compile(
-    r"(?:^|[\r\n])\s*"
+BASIC_AUTH_HEADER_VALUE_YAML_KEY_PATTERN = re.compile(
+    r"\s*"
     r"(?:proxy[-_]?authorization|proxyauthorization|authorization|basic[-_]?auth"
     r"|auth[-_]?header|authorization[-_]?header|proxy[-_]?(?:auth|authorization)[-_]?header)"
-    r"\s*:\s*(?:[\r\n]\s*-\s+[^\r\n]*)*[\r\n]\s*-\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    r"\s*:\s*",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN = re.compile(
     r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?value|value)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*\[",
     re.IGNORECASE,
 )
-BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_LIST_PATTERN = re.compile(
-    r"(?:^|[\r\n])\s*(?:header[-_]?value|value)\s*:\s*"
-    r"(?:[\r\n]\s*-\s+[^\r\n]*)*[\r\n]\s*-\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN = re.compile(
+    r"\s*(?:header[-_]?value|value)\s*:\s*",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN = re.compile(
@@ -437,6 +436,8 @@ BASIC_AUTH_HEADER_NAMES = {
 }
 BASIC_AUTH_HEADER_OBJECT_NAME_KEYS = frozenset({"header", "headername", "key", "name"})
 BASIC_AUTH_HEADER_OBJECT_VALUE_KEYS = frozenset({"headervalue", "value"})
+BASIC_AUTH_STRING_PREFIX_CHARS = frozenset("rRuUbBfF")
+BASIC_AUTH_QUOTE_CHARS = frozenset({'"', "'", "`"})
 BASIC_AUTH_CONTINUATION_PREFIX_PATTERN = re.compile(r"^\s*(?:-\s*)?[\"']?$")
 BASIC_AUTH_HEADER_VALUE_PATTERN = re.compile(rf"^\s*{BASIC_AUTH_PATTERN}", re.IGNORECASE)
 BASIC_AUTH_VALUE_PREFIX_PATTERN = re.compile(r"^\s*Basic\s+", re.IGNORECASE)
@@ -787,7 +788,7 @@ class SecretsDetector:
         if not (
             BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN.search(direct_item_prefix) is not None
             or SecretsDetector._basic_auth_prefix_has_header_object_value_array_context(direct_item_prefix)
-            or BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_LIST_PATTERN.search(item_prefix) is not None
+            or SecretsDetector._basic_auth_prefix_has_header_object_value_yaml_list_context(item_prefix, item_text)
         ):
             return False
 
@@ -798,7 +799,7 @@ class SecretsDetector:
 
     @staticmethod
     def _basic_auth_prefix_has_header_value_array_context(prefix: str) -> bool:
-        if BASIC_AUTH_HEADER_VALUE_YAML_LIST_PATTERN.search(prefix) is not None:
+        if SecretsDetector._basic_auth_prefix_has_header_value_yaml_list_context(prefix):
             return True
         for match in BASIC_AUTH_HEADER_VALUE_ARRAY_START_PATTERN.finditer(prefix):
             if SecretsDetector._basic_auth_headers_init_array_remains_open(prefix[match.end() :]):
@@ -806,11 +807,87 @@ class SecretsDetector:
         return False
 
     @staticmethod
+    def _basic_auth_prefix_has_header_value_yaml_list_context(prefix: str) -> bool:
+        return (
+            SecretsDetector._basic_auth_yaml_list_context_key_line_index(
+                prefix,
+                BASIC_AUTH_HEADER_VALUE_YAML_KEY_PATTERN,
+            )
+            is not None
+        )
+
+    @staticmethod
     def _basic_auth_prefix_has_header_object_value_array_context(prefix: str) -> bool:
         for match in BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN.finditer(prefix):
             if SecretsDetector._basic_auth_headers_init_array_remains_open(prefix[match.end() :]):
                 return True
         return False
+
+    @staticmethod
+    def _basic_auth_prefix_has_header_object_value_yaml_list_context(item_prefix: str, item_text: str) -> bool:
+        key_line_index = SecretsDetector._basic_auth_yaml_list_context_key_line_index(
+            item_prefix,
+            BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN,
+        )
+        if key_line_index is None:
+            return False
+        if key_line_index == 0:
+            return True
+
+        lines = item_prefix.splitlines()
+        key_indent = SecretsDetector._basic_auth_line_indent(lines[key_line_index])
+        return key_indent <= SecretsDetector._basic_auth_header_object_direct_field_indent(item_text)
+
+    @staticmethod
+    def _basic_auth_yaml_list_context_key_line_index(prefix: str, key_pattern: re.Pattern[str]) -> int | None:
+        lines = prefix.splitlines()
+        if not lines or not SecretsDetector._basic_auth_yaml_list_current_value_prefix(lines[-1]):
+            return None
+
+        for line_index in range(len(lines) - 2, -1, -1):
+            line = lines[line_index]
+            if key_pattern.fullmatch(line) is not None:
+                return line_index
+            if not SecretsDetector._basic_auth_yaml_list_item_has_value(line):
+                return None
+        return None
+
+    @staticmethod
+    def _basic_auth_yaml_list_current_value_prefix(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            return False
+
+        value_prefix = stripped[1:].strip()
+        if not value_prefix:
+            return True
+
+        prefix_length = 0
+        while (
+            prefix_length < len(value_prefix)
+            and prefix_length < 3
+            and value_prefix[prefix_length] in BASIC_AUTH_STRING_PREFIX_CHARS
+        ):
+            prefix_length += 1
+
+        quote_prefix = value_prefix[prefix_length:]
+        if quote_prefix.startswith("\\"):
+            quote_prefix = quote_prefix[1:]
+        return len(quote_prefix) == 1 and quote_prefix in BASIC_AUTH_QUOTE_CHARS
+
+    @staticmethod
+    def _basic_auth_yaml_list_item_has_value(line: str) -> bool:
+        stripped = line.lstrip(" \t")
+        return len(stripped) >= 2 and stripped[0] == "-" and stripped[1].isspace()
+
+    @staticmethod
+    def _basic_auth_line_indent(line: str) -> int:
+        return len(line) - len(line.lstrip(" "))
+
+    @staticmethod
+    def _basic_auth_header_object_direct_field_indent(value: str) -> int:
+        indents = [SecretsDetector._basic_auth_line_indent(line) for line in value.splitlines()[1:] if line.strip()]
+        return min(indents) if indents else 0
 
     @staticmethod
     def _basic_auth_header_object_direct_field_text(value: str) -> str:

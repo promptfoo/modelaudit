@@ -483,6 +483,50 @@ class TestSecretsDetector:
         assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
         assert token not in json.dumps(basic_findings, sort_keys=True)
 
+    def test_basic_auth_many_yaml_header_value_list_entries_are_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"many-yaml-list:pass")
+        filler = "".join(f"  - Bearer placeholder-{index}\n" for index in range(96))
+        text = f"Authorization:\n{filler}  - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    def test_basic_auth_many_yaml_header_object_value_list_entries_are_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"many-yaml-object-list:pass")
+        filler = "".join(f"      - Bearer placeholder-{index}\n" for index in range(96))
+        text = f"headers:\n  - name: Proxy-Authorization\n    value:\n{filler}      - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    def test_basic_auth_yaml_header_value_list_context_stops_at_next_key(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"next-key-list:pass")
+        text = f"Authorization:\n  - Bearer placeholder\nmetadata:\n  - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_yaml_header_object_value_list_ignores_nested_metadata(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"nested-metadata-list:pass")
+        text = f"headers:\n  - name: Authorization\n    metadata:\n      value:\n        - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
     @pytest.mark.parametrize(
         "text",
         [
