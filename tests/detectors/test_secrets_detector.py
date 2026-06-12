@@ -208,8 +208,16 @@ class TestSecretsDetector:
                 _basic_auth_token(b"json-list:pass"),
             ),
             (
+                f'"Authorization": ["Bearer placeholder", "Basic {_basic_auth_token(b"json-list-second:pass")}"]',
+                _basic_auth_token(b"json-list-second:pass"),
+            ),
+            (
                 f'"Authorization": [\n  "Basic {_basic_auth_token(b"json-multiline:pass")}"\n]',
                 _basic_auth_token(b"json-multiline:pass"),
+            ),
+            (
+                f"Authorization:\n  - Bearer placeholder\n  - Basic {_basic_auth_token(b'yaml-list-second:pass')}\n",
+                _basic_auth_token(b"yaml-list-second:pass"),
             ),
             (f"Authorization: >\n  Basic {_basic_auth_token(b'block:pass')}", _basic_auth_token(b"block:pass")),
             (f"Authorization: |-\n  Basic {_basic_auth_token(b'chomp:pass')}", _basic_auth_token(b"chomp:pass")),
@@ -388,6 +396,19 @@ class TestSecretsDetector:
                 _basic_auth_token(b"json-header-object-reordered:pass"),
             ),
             (
+                f'{{"headers":[{{"name":"Authorization","value":["Bearer placeholder","Basic '
+                f'{_basic_auth_token(b"json-object-list-second:pass")}"]}}]}}',
+                _basic_auth_token(b"json-object-list-second:pass"),
+            ),
+            (
+                "headers:\n"
+                "  - name: Authorization\n"
+                "    value:\n"
+                "      - Bearer placeholder\n"
+                f"      - Basic {_basic_auth_token(b'yaml-object-list-second:pass')}\n",
+                _basic_auth_token(b"yaml-object-list-second:pass"),
+            ),
+            (
                 f"headers=[('Authorization', 'Basic {_basic_auth_token(b'assignment-tuple:pass')}')]",
                 _basic_auth_token(b"assignment-tuple:pass"),
             ),
@@ -503,6 +524,17 @@ class TestSecretsDetector:
                 f"  - value: Basic {_basic_auth_token(b'wrong-yaml-object-reordered:pass')}\n"
                 "  - name: Authorization\n"
             ),
+            (
+                f'headers: [{{ value: "Basic {_basic_auth_token(b"nested-metadata-name:pass")}", '
+                'metadata: { name: "Authorization" } }]'
+            ),
+            (
+                "headers:\n"
+                f"  - value: Basic {_basic_auth_token(b'yaml-nested-metadata-name:pass')}\n"
+                "    metadata:\n"
+                "      name: Authorization\n"
+            ),
+            (f'Authorization: ["Bearer placeholder"]\nNotes: ["Basic {_basic_auth_token(b"closed-list:pass")}"]'),
             f'notes.append("Authorization notes", "Basic {_basic_auth_token(b"notes:pass")}")',
             f"\u0391uthorization: Basic {_basic_auth_token(b'confusable-alpha:pass')}",
             f"Authorizati\u043en: Basic {_basic_auth_token(b'confusable-o:pass')}",

@@ -395,12 +395,35 @@ BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN = re.compile(
     r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
     re.IGNORECASE,
 )
+BASIC_AUTH_HEADER_VALUE_ARRAY_START_PATTERN = re.compile(
+    r"(?:^|[^\w-])(?:\\?[\"']\s*)?"
+    r"(?:http[-_]?)?(?:proxy[-_]?authorization|proxyauthorization|authorization|basic[-_]?auth"
+    r"|auth[-_]?header|authorization[-_]?header|proxy[-_]?(?:auth|authorization)[-_]?header)"
+    r"\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*\[",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_VALUE_YAML_LIST_PATTERN = re.compile(
+    r"(?:^|[\r\n])\s*"
+    r"(?:proxy[-_]?authorization|proxyauthorization|authorization|basic[-_]?auth"
+    r"|auth[-_]?header|authorization[-_]?header|proxy[-_]?(?:auth|authorization)[-_]?header)"
+    r"\s*:\s*(?:[\r\n]\s*-\s+[^\r\n]*)*[\r\n]\s*-\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?value|value)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*\[",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_LIST_PATTERN = re.compile(
+    r"(?:^|[\r\n])\s*(?:header[-_]?value|value)\s*:\s*"
+    r"(?:[\r\n]\s*-\s+[^\r\n]*)*[\r\n]\s*-\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
 BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN = re.compile(
     r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?name|header|key|name)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*"
     r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*(?P<name>[A-Za-z0-9_. -]{1,96})",
     re.IGNORECASE,
 )
-BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN = re.compile(r"[\r\n]\s*-\s*")
+BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN = re.compile(r"[\r\n](?P<indent>[ \t]*)-\s*")
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
 BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS = 4096
 BASIC_AUTH_HEADER_NAMES = {
@@ -711,6 +734,8 @@ class SecretsDetector:
             if match_end is not None
             else ""
         )
+        if SecretsDetector._basic_auth_prefix_has_header_value_array_context(collection_prefix):
+            return True
         if SecretsDetector._basic_auth_prefix_has_headers_object_context(collection_prefix, collection_suffix):
             return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
@@ -739,9 +764,6 @@ class SecretsDetector:
 
     @staticmethod
     def _basic_auth_prefix_has_headers_object_context(prefix: str, suffix: str = "") -> bool:
-        if BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN.search(prefix) is None:
-            return False
-
         headers_match: re.Match[str] | None = None
         for match in BASIC_AUTH_HEADERS_OBJECT_CONTEXT_START_PATTERN.finditer(prefix):
             headers_match = match
@@ -750,16 +772,94 @@ class SecretsDetector:
 
         headers_prefix = prefix[headers_match.end() :]
         item_start = headers_prefix.rfind("{")
-        for match in BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.finditer(headers_prefix):
-            item_start = max(item_start, match.end())
+        item_matches = list(BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.finditer(headers_prefix))
+        if item_matches:
+            direct_item_indent = min(len(match.group("indent")) for match in item_matches)
+            for match in item_matches:
+                if len(match.group("indent")) == direct_item_indent:
+                    item_start = max(item_start, match.end())
         item_prefix = headers_prefix[item_start if item_start >= 0 else 0 :]
         item_suffix = SecretsDetector._basic_auth_header_object_item_suffix(suffix)
         item_text = item_prefix + item_suffix
+        direct_item_prefix = SecretsDetector._basic_auth_header_object_direct_field_text(item_prefix)
+        direct_item_text = SecretsDetector._basic_auth_header_object_direct_field_text(item_text)
 
-        for match in BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN.finditer(item_text):
+        if not (
+            BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN.search(direct_item_prefix) is not None
+            or SecretsDetector._basic_auth_prefix_has_header_object_value_array_context(direct_item_prefix)
+            or BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_LIST_PATTERN.search(item_prefix) is not None
+        ):
+            return False
+
+        for match in BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN.finditer(direct_item_text):
             if _canonical_basic_auth_header_key(match.group("name")) is not None:
                 return True
         return False
+
+    @staticmethod
+    def _basic_auth_prefix_has_header_value_array_context(prefix: str) -> bool:
+        if BASIC_AUTH_HEADER_VALUE_YAML_LIST_PATTERN.search(prefix) is not None:
+            return True
+        for match in BASIC_AUTH_HEADER_VALUE_ARRAY_START_PATTERN.finditer(prefix):
+            if SecretsDetector._basic_auth_headers_init_array_remains_open(prefix[match.end() :]):
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_prefix_has_header_object_value_array_context(prefix: str) -> bool:
+        for match in BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN.finditer(prefix):
+            if SecretsDetector._basic_auth_headers_init_array_remains_open(prefix[match.end() :]):
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_header_object_direct_field_text(value: str) -> str:
+        if "{" not in value:
+            lines = value.splitlines(keepends=True)
+            if len(lines) <= 1:
+                return value
+            indents = [len(line) - len(line.lstrip(" ")) for line in lines[1:] if line.strip()]
+            direct_indent = min(indents) if indents else 0
+            direct_lines = [lines[0]]
+            for line in lines[1:]:
+                if not line.strip() or len(line) - len(line.lstrip(" ")) <= direct_indent:
+                    direct_lines.append(line)
+            return "".join(direct_lines)
+
+        direct_chars: list[str] = []
+        brace_depth = 0
+        quote: str | None = None
+        escaped = False
+        for character in value:
+            include = brace_depth <= 1
+            if escaped:
+                escaped = False
+                if include:
+                    direct_chars.append(character)
+                continue
+            if quote is not None:
+                if character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                if include:
+                    direct_chars.append(character)
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+                if include:
+                    direct_chars.append(character)
+            elif character == "{":
+                brace_depth += 1
+                if brace_depth <= 1:
+                    direct_chars.append(character)
+            elif character == "}":
+                if brace_depth <= 1:
+                    direct_chars.append(character)
+                brace_depth = max(0, brace_depth - 1)
+            elif include or character in {",", "\n", "\r"}:
+                direct_chars.append(character)
+        return "".join(direct_chars)
 
     @staticmethod
     def _basic_auth_header_object_item_suffix(suffix: str) -> str:
