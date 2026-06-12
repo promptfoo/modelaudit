@@ -53,6 +53,8 @@ def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str
         resolved_revision = operation_kwargs.get("resolved_revision")
         if resolved_revision is None:
             path_repo_info_kwargs: dict[str, Any] = {"files_metadata": False}
+            if operation_kwargs.get("request_timeout") is not None:
+                path_repo_info_kwargs["timeout"] = operation_kwargs["request_timeout"]
             requested_revision = operation_kwargs.get("requested_revision")
             if requested_revision is not None:
                 path_repo_info_kwargs["revision"] = requested_revision
