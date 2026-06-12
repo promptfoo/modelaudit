@@ -614,7 +614,23 @@ def test_detect_large_bpe_merges_text_does_not_route_as_flax(tmp_path: Path) -> 
     assert detect_file_format(str(merges)) == "unknown"
 
 
-@pytest.mark.parametrize("filename", ["README.md", "model_card.md"])
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "README.md",
+        "README.markdown",
+        "README.rst",
+        "README.txt",
+        "model_card.md",
+        "model_card.markdown",
+        "model_card.rst",
+        "model_card.txt",
+        "modelcard.md",
+        "modelcard.markdown",
+        "modelcard.rst",
+        "modelcard.txt",
+    ],
+)
 def test_detect_large_declared_model_docs_do_not_route_as_flax(tmp_path: Path, filename: str) -> None:
     document = tmp_path / filename
     payload = _large_model_card_payload()

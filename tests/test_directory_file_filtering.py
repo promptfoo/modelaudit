@@ -551,8 +551,9 @@ class TestDirectoryFileFiltering:
         assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
         assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
 
-    def test_large_readme_stays_on_text_route(self, tmp_path: Path) -> None:
-        readme = tmp_path / "README.md"
+    @pytest.mark.parametrize("filename", ["README.md", "README.rst", "model_card.txt"])
+    def test_large_declared_documentation_stays_on_text_route(self, tmp_path: Path, filename: str) -> None:
+        readme = tmp_path / filename
         readme.write_text(_large_model_card_text(), encoding="utf-8")
 
         assert readme.stat().st_size > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
