@@ -2062,6 +2062,27 @@ def _merge_pytorch_binary_supplemental_analysis(
     )
 
 
+def _merge_jax_metadata_supplemental_analysis(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any],
+    scanner_selection: ScannerSelectionPolicy,
+) -> None:
+    """Preserve JAX/Orbax metadata findings when a generic manifest scanner owns the file."""
+    if result.scanner_name == "jax_checkpoint":
+        return
+    if _registry.get_scanner_id_for_content_routed_filename(path) != "jax_checkpoint":
+        return
+    _merge_supplemental_scanner_analysis(
+        path,
+        result,
+        config,
+        scanner_selection,
+        "jax_checkpoint",
+        context="supplemental JAX metadata analysis",
+    )
+
+
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
     """Return whether the detected header directly maps to this scanner."""
     return header_format != "unknown" and HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
@@ -6332,6 +6353,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             scanner_selection,
             pytorch_binary_supplemental_scanner_id,
         )
+
+    if ext == ".json":
+        _merge_jax_metadata_supplemental_analysis(path, result, config, scanner_selection)
 
     if discrepancy_msg:
         validated_alternate_format = (

@@ -344,7 +344,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "description": "Scans JAX checkpoint files in various serialization formats",
         "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle", ""],
         "content_routed_extensions": [".json"],
-        "content_routed_filenames": ["orbax_checkpoint_metadata.json"],
+        "content_routed_filenames": ["metadata.json", "orbax_checkpoint_metadata.json"],
         "header_formats": ["jax_checkpoint"],
         "priority": 11,
         "dependencies": [],
