@@ -2709,15 +2709,12 @@ class PickleScanner(BaseScanner):
         return f"{record.storage_type_module}.{record.storage_type_name}"
 
     @classmethod
-    def _trusted_legacy_pytorch_storage_import_references(
+    def _trusted_legacy_pytorch_storage_import_positions(
         cls,
-        result: ScanResult,
         layout: _LegacyPyTorchStreamLayout,
         *,
         position_offset: int = 0,
-    ) -> set[str]:
-        if result.metadata.get("import_references_truncated") is True:
-            return set()
+    ) -> dict[str, set[int]]:
         storage_records = layout.storage_records or ()
         trusted_import_positions: dict[str, set[int]] = {}
         for record in storage_records:
@@ -2726,6 +2723,15 @@ class PickleScanner(BaseScanner):
             trusted_import_positions.setdefault(cls._legacy_pytorch_storage_import_reference(record), set()).add(
                 position_offset + record.storage_type_position
             )
+        return trusted_import_positions
+
+    @staticmethod
+    def _trusted_legacy_pytorch_storage_import_references(
+        result: ScanResult,
+        trusted_import_positions: Mapping[str, set[int]],
+    ) -> set[str]:
+        if result.metadata.get("import_references_truncated") is True:
+            return set()
         if not trusted_import_positions:
             return set()
 
@@ -2755,21 +2761,27 @@ class PickleScanner(BaseScanner):
             and observed_positions <= trusted_positions
         }
 
-    @staticmethod
+    @classmethod
     def _is_legacy_pytorch_storage_import_call_graph_finding(
+        cls,
         details: dict[str, Any],
         trusted_import_references: set[str],
+        trusted_import_positions: Mapping[str, set[int]],
+        location: str | None,
     ) -> bool:
         import_reference = details.get("import_reference")
         opcode = details.get("opcode")
-        return (
+        if not (
             details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
             and details.get("analysis") == "python_call_graph"
             and "invocation_import_reference" not in details
             and (opcode is None or opcode in {"GLOBAL", "STACK_GLOBAL"})
             and isinstance(import_reference, str)
-            and import_reference in trusted_import_references
-        )
+        ):
+            return False
+        if import_reference in trusted_import_references:
+            return True
+        return cls._pickle_location_position(location) in trusted_import_positions.get(import_reference, set())
 
     @staticmethod
     def _annotate_legacy_pytorch_storage_persistent_id_record(
@@ -2894,16 +2906,23 @@ class PickleScanner(BaseScanner):
             for issue in result.issues
             if not cls._is_legacy_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
         ]
-        trusted_storage_import_references = cls._trusted_legacy_pytorch_storage_import_references(
-            result,
+        trusted_storage_import_positions = cls._trusted_legacy_pytorch_storage_import_positions(
             layout,
             position_offset=position_offset,
+        )
+        if result.metadata.get("import_references_truncated") is True:
+            trusted_storage_import_positions = {}
+        trusted_storage_import_references = cls._trusted_legacy_pytorch_storage_import_references(
+            result,
+            trusted_storage_import_positions,
         )
         downgraded_import_count = 0
         for check in result.checks:
             if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
                 check.details,
                 trusted_storage_import_references,
+                trusted_storage_import_positions,
+                check.location,
             ):
                 continue
             if check.rule_code is not None:
@@ -2923,6 +2942,8 @@ class PickleScanner(BaseScanner):
                 if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
                     issue.details,
                     trusted_storage_import_references,
+                    trusted_storage_import_positions,
+                    issue.location,
                 )
             ]
 
