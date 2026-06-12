@@ -749,6 +749,13 @@ class SafeTensorsScanner(BaseScanner):
                 "".join(chunks)
             )
 
+        def reset() -> None:
+            nonlocal chunks, total_chars, total_lines, separator_lines
+            chunks = []
+            total_chars = 0
+            total_lines = 0
+            separator_lines = 0
+
         for line in [*lines, ""]:
             fragments = cls._license_document_line_base64_fragments(line)
             if fragments:
@@ -756,7 +763,10 @@ class SafeTensorsScanner(BaseScanner):
                 separator_lines = 0
                 total_chars += sum(len(fragment) for fragment in fragments)
                 if total_lines > _BASE64_LICENSE_WRAP_MAX_LINES or total_chars > _BASE64_LICENSE_WRAP_MAX_CHARS:
-                    return True
+                    if flush():
+                        return True
+                    reset()
+                    continue
                 chunks.extend(fragments)
                 continue
 
@@ -767,15 +777,15 @@ class SafeTensorsScanner(BaseScanner):
                     total_lines > _BASE64_LICENSE_WRAP_MAX_LINES
                     or separator_lines > _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES
                 ):
-                    return True
+                    if flush():
+                        return True
+                    reset()
+                    continue
                 continue
 
             if flush():
                 return True
-            chunks = []
-            total_chars = 0
-            total_lines = 0
-            separator_lines = 0
+            reset()
 
         return False
 

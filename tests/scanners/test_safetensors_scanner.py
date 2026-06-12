@@ -441,6 +441,48 @@ def test_license_metadata_document_url_and_length_are_not_suspicious(tmp_path: P
     assert not [issue for issue in result.issues if issue.rule_code == "S905"]
 
 
+def test_license_metadata_dmca_trusted_url_prose_stays_clean(tmp_path: Path) -> None:
+    file_path = tmp_path / "license_metadata_dmca_trusted_url.safetensors"
+    legal_lines = [
+        "License grant DMCA reference https://opensource.org/licenses/MIT",
+        "License terms grant permission use reproduce distribute work.",
+        "License agreement terms grant permission reproduce work.",
+        "Copyright license terms use reproduce distribute work.",
+        "Patent license terms grant use reproduce work.",
+        "Liability license terms permission use work.",
+        "Permission license terms reproduce distribute derivative work.",
+    ]
+    license_text = f"{ordinary_license_text_with_url()}\n" + "\n".join(legal_lines)
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": license_text},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+    summary = SafeTensorsScanner._summarize_custom_metadata({"license": license_text})
+    failed_metadata_checks = [
+        check
+        for check in result.checks
+        if check.name in {"Metadata Length Check", "Metadata Pattern Check"} and check.status == CheckStatus.FAILED
+    ]
+    flags = set(result.metadata["custom_metadata_security_flags"])
+
+    assert len(license_text) > 1000
+    assert SafeTensorsScanner._looks_like_ordinary_license_document(license_text)
+    assert result.success is True
+    assert result.metadata["custom_metadata_valid"] is True
+    assert "suspicious_pattern" not in flags
+    assert "unusually_long_value" not in flags
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert summary["custom_metadata_security_flags"] == []
+    assert failed_metadata_checks == []
+    assert not [issue for issue in result.issues if issue.rule_code == "S905"]
+
+
 def test_license_document_reconstructs_standard_wrapped_base64_tail() -> None:
     license_text = ordinary_license_text_with_url()
     payload = f"{license_text}\n{standard_wrapped_base64_tail(line_count=3)}"
