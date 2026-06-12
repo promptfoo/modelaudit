@@ -427,6 +427,7 @@ _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
 _BASE64_LICENSE_WRAP_METADATA_SCAN_MAX_LINES = _BASE64_LICENSE_WRAP_MAX_LINES * 2
 _BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS = 4
 _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO = 0.15
+_BASE64_LICENSE_WRAP_ANNOTATED_OPAQUE_MIN_CHARS = 64
 _BASE64_LICENSE_WRAP_TRAILING_DOCUMENTARY_TOKENS = frozenset({"and", "or"})
 _BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
 _BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(
@@ -967,7 +968,10 @@ class SafeTensorsScanner(BaseScanner):
                 fragment_chars = sum(len(fragment) for fragment in fragments)
                 nonspace_chars = sum(1 for char in line if not char.isspace())
                 if line_has_documentary_annotation and nonspace_chars > 0:
-                    if fragment_chars / nonspace_chars < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO:
+                    if any(len(fragment) >= _BASE64_LICENSE_WRAP_ANNOTATED_OPAQUE_MIN_CHARS for fragment in fragments):
+                        high_ratio_documentary_fragment_chars += fragment_chars
+                        high_ratio_documentary_fragment_lines += 1
+                    elif fragment_chars / nonspace_chars < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO:
                         has_low_ratio_documentary_annotations = True
                     elif any(len(fragment) >= _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS for fragment in fragments):
                         high_ratio_documentary_fragment_chars += fragment_chars
@@ -1746,11 +1750,19 @@ class SafeTensorsScanner(BaseScanner):
                         suspicious_pattern = _ENCODED_URL_DELIMITER_METADATA_PATTERN
                     if suspicious_pattern is None and _value_has_raw_backslash_url_delimiter(value):
                         suspicious_pattern = _BACKSLASH_URL_DELIMITER_METADATA_PATTERN
-                    if suspicious_pattern is None and self._metadata_value_has_wrapped_opaque_token(value):
+                    has_wrapped_opaque_token = self._metadata_value_has_wrapped_opaque_token(value)
+                    if suspicious_pattern is None and has_wrapped_opaque_token:
                         suspicious_pattern = _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN
                     if suspicious_pattern is not None:
                         custom_metadata_security_flags.add("suspicious_pattern")
                         self._add_metadata_pattern_check(result, path, key, suspicious_pattern)
+                        if has_wrapped_opaque_token and suspicious_pattern != _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN:
+                            self._add_metadata_pattern_check(
+                                result,
+                                path,
+                                key,
+                                _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN,
+                            )
 
                 if "__metadata__" in header:
                     result.metadata["custom_metadata_security_flags"] = sorted(custom_metadata_security_flags)

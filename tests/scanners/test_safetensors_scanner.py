@@ -1095,6 +1095,73 @@ def test_long_license_metadata_annotated_wrapped_opaque_tail_reports_wrapped_opa
     )
 
 
+def test_long_license_metadata_verbose_annotated_wrapped_opaque_tail_reports_wrapped_opaque_token(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "long_license_metadata_verbose_annotated_opaque_wrapped_base64_tail.safetensors"
+    license_text = long_ordinary_license_text_with_incidental_tokens()
+    prefix = "License grant terms permission reproduce distribute applicable law " * 3
+    suffix = " under license terms permission reproduce distribute applicable law" * 3
+    tail = "\n".join(f"{prefix}{line}{suffix}" for line in opaque_wrapped_base64_lines())
+    payload = f"{license_text}\n{tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert len(payload) > 1000
+    assert "http://" not in payload
+    assert "https://" not in payload
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "wrapped-opaque-token"}
+        for check in result.checks
+    )
+
+
+def test_license_metadata_url_bearing_wrapped_opaque_tail_reports_wrapped_opaque_token(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "url_bearing_license_metadata_opaque_wrapped_base64_tail.safetensors"
+    tail = "\n".join(f"License grant continuation {line}" for line in opaque_wrapped_base64_lines())
+    payload = f"{ordinary_license_text_with_url()}\n{tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "https?://"}
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "wrapped-opaque-token"}
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     ("tail", "file_stem"),
     [
@@ -2269,14 +2336,22 @@ def test_license_metadata_comment_separated_wrapped_base64_tail_routes_in_direct
     def slash_location(value: str | Path) -> str:
         return str(value).replace("\\", "/")
 
+    def check_has_license_pattern(check: Any, pattern: str) -> bool:
+        if check.details.get("key") == "license" and check.details.get("pattern") == pattern:
+            return True
+        findings = check.details.get("findings", [])
+        return isinstance(findings, list) and any(
+            isinstance(finding, dict) and finding.get("key") == "license" and finding.get("pattern") == pattern
+            for finding in findings
+        )
+
     metadata_pattern_locations = {
         slash_location(check.location)
         for check in result.checks
         if check.location
         if check.name == "Metadata Pattern Check"
         and check.status.value == "failed"
-        and check.details.get("key") == "license"
-        and check.details.get("pattern") == "https?://"
+        and check_has_license_pattern(check, "wrapped-opaque-token")
     }
     s905_locations = {
         slash_location(issue.location) for issue in result.issues if issue.rule_code == "S905" and issue.location
