@@ -3,9 +3,11 @@ import codecs
 import json
 import lzma
 import math
+import os
 import pickletools
 import posixpath
 import re
+import stat
 import struct
 import sys
 import tarfile
@@ -53,7 +55,11 @@ _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES = _TF_METAGRAPH_MAX_VALIDATE_BYTES
 _TF_METAGRAPH_MAX_ROUTING_FIELDS = 32768
 _TF_METAGRAPH_MAX_ROUTING_DEPTH = 64
 _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
+_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES = 10 * 1024 * 1024
 _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
+_CONTENT_ROUTE_TEXT_WHITESPACE_CHARS = frozenset({"\t", "\n", "\r", "\f"})
+_CONTENT_ROUTE_TEXT_OWNER_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"})
+_CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS = frozenset({"\t", "\n", "\r", "\f", "=", ":", "#", "[", "{"})
 _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
     bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
 )
@@ -3911,7 +3917,12 @@ def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
 SAFETENSORS_ROUTING_HEADER_PARSE_BYTES: int = 16 * 1024 * 1024
 
 
-def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = False) -> bool:
+def _looks_like_proto0_or_1_pickle(
+    sample: bytes,
+    *,
+    sample_is_prefix: bool = False,
+    max_probe_opcodes: int = PROTO0_1_MAX_PROBE_OPCODES,
+) -> bool:
     """Best-effort protocol 0/1 detection via bounded pickle opcode parsing."""
     if len(sample) < 2:
         return False
@@ -3941,10 +3952,11 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = Fa
                     return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(
                         stripped_trailing,
                         sample_is_prefix=sample_is_prefix,
+                        max_probe_opcodes=max_probe_opcodes,
                     )
                 if opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
                     has_non_trivial_opcode = True
-                if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
+                if opcode_count >= max_probe_opcodes:
                     return False
         except ValueError as exc:
             exc_message = str(exc)
@@ -5255,6 +5267,13 @@ def _detect_safetensors_content_route(path: Path | None, magic8: bytes, file_siz
     if pickle_state is None:
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     return "safetensors"
+
+
+def _resolve_safetensors_flax_overlap(path: Path) -> str | None:
+    """Prefer a proven Flax route for renamed text-suffix SafeTensors overlaps."""
+    if path.suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+        return None
+    return "flax_msgpack" if _probe_flax_msgpack_checkpoint_file(path) is True else None
 
 
 def _resolve_safetensors_tensorflow_overlap(path: Path, file_size: int) -> str:
@@ -7157,34 +7176,197 @@ def has_jax_json_checkpoint_structure(payload: object) -> bool:
     return False
 
 
-def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
-    """Return True for JAX JSON, None for bounded ambiguity, else False."""
+def _has_jax_json_checkpoint_prefix_identity(prefix: bytes) -> bool:
+    """Recognize explicit top-level JAX identity in a truncated JSON object."""
     try:
-        if not file_path.is_file():
+        prefix_text = prefix.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        # A bounded read may end between the bytes of the final UTF-8 code
+        # point. Preserve complete top-level fields that precede that split,
+        # but do not ignore malformed bytes inside the sampled prefix.
+        if error.end != len(prefix) or error.reason != "unexpected end of data":
             return False
-        file_size = file_path.stat().st_size
-        with file_path.open("rb") as stream:
-            prefix = stream.read(min(file_size, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1))
+        try:
+            prefix_text = prefix[: error.start].decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return False
+
+    def skip_json_whitespace(offset: int) -> int:
+        while offset < len(prefix_text) and prefix_text[offset] in " \t\r\n":
+            offset += 1
+        return offset
+
+    decoder = json.JSONDecoder()
+    offset = skip_json_whitespace(0)
+    if offset >= len(prefix_text) or prefix_text[offset] != "{":
+        return False
+    offset += 1
+
+    while True:
+        offset = skip_json_whitespace(offset)
+        if offset >= len(prefix_text) or prefix_text[offset] == "}":
+            return False
+
+        try:
+            key, key_end = decoder.raw_decode(prefix_text, offset)
+        except (ValueError, RecursionError):
+            return False
+        if not isinstance(key, str):
+            return False
+
+        offset = skip_json_whitespace(key_end)
+        if offset >= len(prefix_text) or prefix_text[offset] != ":":
+            return False
+        offset = skip_json_whitespace(offset + 1)
+
+        if key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+            return True
+
+        try:
+            value, value_end = decoder.raw_decode(prefix_text, offset)
+        except (ValueError, RecursionError):
+            return False
+        if (
+            key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS
+            and isinstance(value, str)
+            and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value)
+        ):
+            return True
+
+        offset = skip_json_whitespace(value_end)
+        if offset >= len(prefix_text) or prefix_text[offset] == "}":
+            return False
+        if prefix_text[offset] != ",":
+            return False
+        offset += 1
+
+
+def _same_regular_file_identity(current: os.stat_result, expected: os.stat_result) -> bool:
+    """Compare a descriptor/path identity used by bounded routing reads."""
+    return stat.S_ISREG(current.st_mode) and all(
+        getattr(current, field) == getattr(expected, field)
+        for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    )
+
+
+_JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE: Literal["unavailable"] = "unavailable"
+_JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS: Literal["ambiguous"] = "ambiguous"
+_JaxJsonCheckpointProbeState = bool | Literal["unavailable", "ambiguous"] | None
+
+
+def _jax_json_checkpoint_prefix_failure_result(
+    file_path: Path,
+    expected_stat: os.stat_result,
+) -> Literal["unavailable"] | None:
+    """Fall through unchanged unavailable files but fail closed on retargets."""
+    try:
+        current_stat = file_path.lstat()
     except OSError:
         return None
+    if _same_regular_file_identity(current_stat, expected_stat):
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+    return None
+
+
+def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Literal["unavailable"] | None:
+    """Read the routing prefix without following a changed lexical entry."""
+    try:
+        expected_stat = file_path.lstat()
+    except OSError:
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+
+    try:
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        file_attributes = getattr(expected_stat, "st_file_attributes", 0) or 0
+        if (
+            not stat.S_ISREG(expected_stat.st_mode)
+            or stat.S_ISLNK(expected_stat.st_mode)
+            or bool(reparse_flag and file_attributes & reparse_flag)
+        ):
+            return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(file_path, flags)
+        except OSError:
+            return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+        try:
+            opened_stat = os.fstat(descriptor)
+            if not _same_regular_file_identity(opened_stat, expected_stat):
+                return None
+            read_limit = min(expected_stat.st_size, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)
+            chunks: list[bytes] = []
+            remaining = read_limit
+            while remaining > 0:
+                try:
+                    chunk = os.read(descriptor, remaining)
+                except OSError:
+                    return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if not _same_regular_file_identity(os.fstat(descriptor), expected_stat):
+                return None
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+    return expected_stat.st_size, b"".join(chunks)
+
+
+def _probe_jax_json_checkpoint_file_state(file_path: Path) -> _JaxJsonCheckpointProbeState:
+    """Return bounded JAX JSON routing state without flattening refusal causes."""
+    snapshot = _read_jax_json_checkpoint_prefix(file_path)
+    if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+    if snapshot is None:
+        return None
+    file_size, prefix = snapshot
 
     if not _could_start_json_object(prefix):
         normalized_prefix = prefix.lstrip()
         if normalized_prefix.startswith(b"\xef\xbb\xbf"):
             normalized_prefix = normalized_prefix[3:].lstrip()
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES and not normalized_prefix:
-            return None
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
 
     try:
         payload = json.loads(prefix.decode("utf-8-sig"))
-    except (UnicodeDecodeError, ValueError, RecursionError):
+    except json.JSONDecodeError:
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
             # A visible non-JAX value cannot prove the unseen tail has no later
             # JAX identity field; preserve bounded ambiguity instead of skipping.
-            return None
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
+    except UnicodeDecodeError:
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
+        if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
+        return False
+    except (ValueError, RecursionError):
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
+        # Python parser limits can reject otherwise valid JSON (for example an
+        # oversized integer). That is not evidence that the file lacks a later
+        # JAX identity field, so retain it as a bounded ambiguous candidate.
+        return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
     return has_jax_json_checkpoint_structure(payload)
+
+
+def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous: bool = False) -> bool | None:
+    """Return True for JAX JSON, None for bounded ambiguity or retargets, else False."""
+    probe_state = _probe_jax_json_checkpoint_file_state(file_path)
+    if probe_state == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
+        return None if unavailable_is_ambiguous else False
+    if probe_state == _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS:
+        return None
+    return probe_state
 
 
 def is_jax_json_checkpoint_file(path: str | Path) -> bool:
@@ -7547,14 +7729,279 @@ def _is_complete_structured_json_content_owner(file_path: Path, file_size: int) 
 
 
 def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool:
-    """Return whether a small complete file cannot contain binary structure tags."""
+    """Return whether a small complete file is ordinary UTF-8 text."""
     if file_size > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES:
         return False
     try:
         payload = read_magic_bytes(str(file_path), file_size)
     except OSError:
         return False
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return all(char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text)
+
+
+def _has_content_route_text_owner_structure(text: str) -> bool:
+    """Return whether printable UTF-8 has ordinary text/config/tokenizer structure."""
+    if not any(char in _CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS for char in text):
+        return False
+    ordinary_text_lines = 0
+    suspicious_scalar_lines = 0
+    for line in text.splitlines() or [text]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        ascii_alnum_count = sum(1 for char in stripped if char.isascii() and char.isalnum())
+        if (
+            len(stripped) >= 8
+            and any(not char.isascii() for char in stripped)
+            and any(char in {'"', "'", "`"} for char in stripped)
+            and len(set(stripped)) <= 8
+        ):
+            suspicious_scalar_lines += 1
+            continue
+        if ascii_alnum_count >= 2:
+            ordinary_text_lines += 1
+    return ordinary_text_lines > suspicious_scalar_lines
+
+
+def _looks_like_onnx_opset_import_proto_prefix(data: bytes) -> bool:
+    """Return whether a value resembles ONNX OperatorSetIdProto."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(data) and fields_seen < 16:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return False
+            length, _value_start, _value_end, actual_value_end = bounds
+            return 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES and actual_value_end <= len(data)
+        if field_number == 2 and wire_type == 0:
+            value_result = _read_proto_varint(data, value_offset)
+            return value_result is not None and 0 < value_result[0] <= 10000
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+    return False
+
+
+def _looks_like_onnx_string_entry_proto_prefix(data: bytes) -> bool:
+    """Return whether a value resembles ONNX StringStringEntryProto."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(data) and fields_seen < 16:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number in {1, 2} and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return False
+            length, _value_start, _value_end, actual_value_end = bounds
+            return 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES and actual_value_end <= len(data)
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+    return False
+
+
+def _has_bounded_onnx_model_text_candidate_field_signal(
+    payload: bytes,
+    field_number: int,
+    wire_type: int,
+    value_offset: int,
+) -> bool:
+    """Return whether a known ONNX field has a model-like value."""
+    expected_wire_type = _ONNX_MODEL_FIELD_WIRE_TYPES.get(field_number)
+    if expected_wire_type != wire_type:
+        return False
+    if wire_type == 0:
+        value_result = _read_proto_varint(payload, value_offset)
+        return value_result is not None and field_number in {1, 5} and 0 < value_result[0] <= 10000
+    if wire_type != 2:
+        return _skip_proto_value(payload, value_offset, wire_type) is not None
+
+    bounds = _read_length_delimited_proto_value(payload, value_offset)
+    if bounds is None:
+        return False
+    length, value_start, value_end, actual_value_end = bounds
+    if length <= 0 or actual_value_end > len(payload):
+        return False
+    value = payload[value_start:value_end]
+    if field_number == 7:
+        graph_status = _looks_like_onnx_graph_proto_stream(
+            BytesIO(value),
+            len(value),
+            [_ONNX_GRAPH_MAX_ROUTING_FIELDS],
+        )
+        return graph_status is not False
+    if field_number == 8:
+        return _looks_like_onnx_opset_import_proto_prefix(value)
+    if field_number == 14:
+        return _looks_like_onnx_string_entry_proto_prefix(value)
+    if field_number in {20, 25, 26}:
+        return _looks_like_proto_message_prefix(value) and bool(
+            value.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES)
+        )
+    return False
+
+
+def _has_bounded_coreml_model_text_candidate_field_signal(
+    payload: bytes,
+    field_number: int,
+    wire_type: int,
+    value_offset: int,
+) -> bool:
+    """Return whether a known CoreML field has a model-like value."""
+    if field_number == 1 and wire_type == 0:
+        value_result = _read_proto_varint(payload, value_offset)
+        return value_result is not None and 0 < value_result[0] <= 10000
+    if not ((field_number == 2 or field_number in _COREML_MODEL_TYPE_FIELDS) and wire_type == 2):
+        return False
+
+    bounds = _read_length_delimited_proto_value(payload, value_offset)
+    if bounds is None:
+        return False
+    length, value_start, value_end, actual_value_end = bounds
+    if length <= 0 or actual_value_end > len(payload):
+        return False
+    value = payload[value_start:value_end]
+    if field_number == 2:
+        return _looks_like_coreml_description_proto_prefix(value) is not False
+    return _looks_like_proto_message_prefix(value) and bool(value.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES))
+
+
+def _has_bounded_protobuf_model_text_candidate_signal_bytes(payload: bytes) -> bool:
+    """Return whether text-like bytes use known protobuf model fields."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(payload) and fields_seen < 64:
+        tag_result = _read_proto_varint(payload, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if _has_bounded_onnx_model_text_candidate_field_signal(payload, field_number, wire_type, value_offset):
+            return True
+        if _has_bounded_coreml_model_text_candidate_field_signal(payload, field_number, wire_type, value_offset):
+            return True
+
+        next_offset = _skip_proto_value(payload, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+    return False
+
+
+def _has_bounded_protobuf_model_text_candidate_signal(file_path: Path, file_size: int) -> bool:
+    """Return whether a text-like protobuf prefix uses known model fields."""
+    try:
+        payload = read_magic_bytes(str(file_path), min(file_size, _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES))
+    except OSError:
+        return False
+    return _has_bounded_protobuf_model_text_candidate_signal_bytes(payload)
+
+
+def _is_complete_bounded_printable_text_content_owner_bytes(
+    file_path: Path,
+    file_size: int,
+    payload: bytes,
+) -> bool:
+    """Return whether printable bytes can safely own this complete file."""
+    suffix = file_path.suffix.lower()
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes or len(payload) < file_size:
+        return False
+    payload = payload[:file_size]
+    if not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
+        return True
+    if suffix not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+        return False
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return _has_content_route_text_owner_structure(text) and all(
+        char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text
+    )
+
+
+def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
+    """Return whether printable text can safely own this complete file."""
+    suffix = file_path.suffix.lower()
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    return _is_complete_bounded_printable_text_content_owner_bytes(file_path, file_size, payload)
+
+
+def _is_complete_bounded_ascii_printable_text_content_owner_bytes(
+    file_path: Path,
+    file_size: int,
+    payload: bytes,
+) -> bool:
+    """Return whether complete ASCII bytes can safely veto a protobuf candidate."""
+    suffix = file_path.suffix.lower()
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes or len(payload) < file_size:
+        return False
+    payload = payload[:file_size]
     return not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES)
+
+
+def _is_complete_bounded_ascii_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
+    """Return whether complete ASCII text can safely veto a protobuf candidate."""
+    suffix = file_path.suffix.lower()
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    return _is_complete_bounded_ascii_printable_text_content_owner_bytes(file_path, file_size, payload)
 
 
 def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: int) -> bool:
@@ -7563,9 +8010,14 @@ def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: in
         return False
     if is_huggingface_tokenizer_json_file(file_path):
         return False
-    return not _is_complete_structured_json_content_owner(
-        file_path, file_size
-    ) and not _is_complete_bounded_printable_text(file_path, file_size)
+    if _is_complete_structured_json_content_owner(file_path, file_size):
+        return False
+    if (
+        file_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        and _has_bounded_protobuf_model_text_candidate_signal(file_path, file_size)
+    ):
+        return not _is_complete_bounded_ascii_printable_text_content_owner(file_path, file_size)
+    return not _is_complete_bounded_ascii_printable_text_content_owner(file_path, file_size)
 
 
 def _detect_media_pickle_polyglot_route(trailing: bytes, *, sample_is_prefix: bool) -> str | None:
@@ -7847,7 +8299,7 @@ def _detect_complete_media_route_from_trailing(trailing: bytes, *, sample_is_pre
     return VALID_MEDIA_ROUTING_FORMAT
 
 
-def _could_start_bounded_media_route(file_path: Path, sample: bytes) -> bool:
+def _could_start_bounded_media_route(file_path: Path, sample: bytes, *, sample_is_prefix: bool = True) -> bool:
     """Return whether bounded bytes plausibly begin a supported media stream."""
     if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
         return False
@@ -7861,7 +8313,19 @@ def _could_start_bounded_media_route(file_path: Path, sample: bytes) -> bool:
     marker_offset = 2
     while marker_offset < len(sample) and sample[marker_offset] == 0xFF:
         marker_offset += 1
-    return marker_offset >= len(sample) or sample[marker_offset] != 0x00
+    if marker_offset >= len(sample):
+        return True
+    marker = sample[marker_offset]
+    if marker == 0x00:
+        return False
+    if marker in _JPEG_STANDALONE_MARKERS:
+        return True
+    if marker_offset + 3 > len(sample):
+        return sample_is_prefix
+    segment_length = int.from_bytes(sample[marker_offset + 1 : marker_offset + 3], "big")
+    if segment_length < 2:
+        return False
+    return sample_is_prefix or marker_offset + 1 + segment_length <= len(sample)
 
 
 def _detect_bounded_media_route_from_sample(
@@ -7871,7 +8335,7 @@ def _detect_bounded_media_route_from_sample(
     sample_is_prefix: bool,
 ) -> str | None:
     """Return clean-media or strong media/pickle polyglot routing evidence."""
-    if not _could_start_bounded_media_route(file_path, sample):
+    if not _could_start_bounded_media_route(file_path, sample, sample_is_prefix=sample_is_prefix):
         return None
     if sample.startswith(_PNG_SIGNATURE):
         media_end = _find_bounded_png_end(sample)
@@ -7886,7 +8350,7 @@ def _detect_bounded_media_route_from_sample(
 
 def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail: bytes) -> str | None:
     """Return bounded media routing evidence from remote head and tail probes."""
-    if not prefix or not tail or not _could_start_bounded_media_route(file_path, prefix):
+    if not prefix or not tail or not _could_start_bounded_media_route(file_path, prefix, sample_is_prefix=True):
         return None
 
     prefix_route = _detect_bounded_media_route_from_sample(file_path, prefix, sample_is_prefix=tail != prefix)
@@ -7972,9 +8436,14 @@ def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
     )
     if sample_route is not None:
         return sample_route
-    if sample.startswith(_PNG_SIGNATURE) and _could_start_bounded_media_route(file_path, sample):
+    sample_is_prefix = file_size > len(sample)
+    if sample.startswith(_PNG_SIGNATURE) and _could_start_bounded_media_route(
+        file_path, sample, sample_is_prefix=sample_is_prefix
+    ):
         return _detect_seekable_png_media_route(file_path, file_size, sample)
-    if sample.startswith(b"\xff\xd8") and _could_start_bounded_media_route(file_path, sample):
+    if sample.startswith(b"\xff\xd8") and _could_start_bounded_media_route(
+        file_path, sample, sample_is_prefix=sample_is_prefix
+    ):
         return _detect_seekable_jpeg_media_route(file_path, file_size, sample)
     return None
 
@@ -7996,7 +8465,7 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
             return False
         if json_document_probe is None and ext not in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES:
             return True
-        if _is_complete_bounded_printable_text(file_path, size):
+        if _is_complete_bounded_printable_text_content_owner(file_path, size):
             return False
     if ext == "":
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(
@@ -8166,6 +8635,9 @@ def detect_format_from_magic_bytes(
     safetensors_route = _detect_safetensors_content_route(file_path, magic8, file_size)
     if safetensors_route is not None:
         if safetensors_route == "safetensors" and file_path is not None:
+            flax_overlap_route = _resolve_safetensors_flax_overlap(file_path)
+            if flax_overlap_route is not None:
+                return flax_overlap_route
             return _resolve_safetensors_tensorflow_overlap(file_path, file_size)
         return safetensors_route
     if structural_torch7_route:
@@ -8698,6 +9170,9 @@ def detect_file_format(path: str) -> str:
         safetensors_route = _detect_safetensors_content_route(file_path, magic8, size)
         if safetensors_route is not None:
             if safetensors_route == "safetensors":
+                flax_overlap_route = _resolve_safetensors_flax_overlap(file_path)
+                if flax_overlap_route is not None:
+                    return flax_overlap_route
                 return _resolve_safetensors_tensorflow_overlap(file_path, size)
             return safetensors_route
         if structural_torch7_route:
@@ -8810,6 +9285,9 @@ def detect_file_format(path: str) -> str:
         return renamed_tensorflow_format
 
     if _is_safetensors_routing_candidate(file_path, magic8, size):
+        flax_overlap_route = _resolve_safetensors_flax_overlap(file_path)
+        if flax_overlap_route is not None:
+            return flax_overlap_route
         if renamed_tensorflow_format == "inconclusive":
             return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
         return "safetensors"

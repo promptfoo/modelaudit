@@ -2153,7 +2153,7 @@ def _mlflow_entry_is_reparse_point(path: Path, path_stat: os.stat_result) -> boo
         return True
 
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0) or 0
     return bool(reparse_flag and file_attributes & reparse_flag)
 
 

