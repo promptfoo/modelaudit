@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- propagate file-level inconclusive and incomplete-coverage metadata into aggregate success, strict JSON, exit-code, and cache semantics
 - preserve declared ONNX external data sidecars during Hugging Face streaming scans
 - inspect large Keras HDF5 models through file-backed metadata traversal instead of rejecting them at the generic whole-file read cap; aggregate `content_hash` is omitted for these large file-backed HDF5 scans
 - paginate and bound large Hugging Face repository inventories before streaming so unfiltered scans preserve complete coverage

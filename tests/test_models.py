@@ -30,6 +30,7 @@ from modelaudit.models import (
     create_initial_audit_result,
     rebuild_models,
 )
+from modelaudit.scanner_results import Check, CheckStatus
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
 
@@ -548,6 +549,141 @@ class TestModelAuditResultModel:
         assert result.file_metadata["trailing.npy"]["scan_outcome"] == "inconclusive"
         assert determine_exit_code(result) == 2
 
+    def test_aggregate_scan_result_analysis_incomplete_metadata_fails_closed(self) -> None:
+        """Dict aggregation should not require scan_outcome when coverage is incomplete."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "file_metadata": {"model.bin": {"analysis_incomplete": True}},
+                "issues": [],
+                "checks": [],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert result.file_metadata["model.bin"]["analysis_incomplete"] is True
+        assert determine_exit_code(result) == 2
+
+    def test_aggregate_scan_result_incomplete_reason_with_finding_fails_coverage_success(self) -> None:
+        """Security findings keep exit 1 while incomplete coverage makes success false."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "file_metadata": {"model.bin": {"scan_outcome_reasons": ["bounded_probe_exhausted"]}},
+                "issues": [
+                    {
+                        "message": "Dangerous reference found beyond bounded coverage",
+                        "severity": "warning",
+                        "location": "model.bin",
+                        "timestamp": 0.0,
+                    }
+                ],
+                "checks": [],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert result.file_metadata["model.bin"]["scan_outcome_reasons"] == ["bounded_probe_exhausted"]
+        assert determine_exit_code(result) == 1
+
+    def test_aggregate_scan_result_issue_only_incomplete_coverage_fails_closed(self) -> None:
+        """Dict aggregation should honor incomplete coverage retained only in issue details."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "issues": [
+                    {
+                        "message": "DVC output limit exceeded - not all declared outputs were scanned",
+                        "severity": "info",
+                        "location": "model.dvc",
+                        "type": "dvc_output_limit_exceeded",
+                        "details": {
+                            "analysis_incomplete": True,
+                            "scan_outcome": "inconclusive",
+                            "reason": "dvc_output_limit_exceeded",
+                        },
+                        "timestamp": 0.0,
+                    }
+                ],
+                "checks": [],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert result.issues[0].details["reason"] == "dvc_output_limit_exceeded"
+        assert determine_exit_code(result) == 2
+
+    def test_aggregate_scan_result_runtime_version_skip_does_not_fail_coverage_success(self) -> None:
+        """Expected CVE applicability skips are not scanner coverage failures."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "issues": [],
+                "checks": [
+                    {
+                        "name": "CVE PyTorch Version Check",
+                        "status": "skipped",
+                        "message": "PyTorch runtime version unavailable",
+                        "severity": "info",
+                        "location": "weights.pt",
+                        "details": {
+                            "analysis_incomplete": True,
+                            "runtime_version_known": False,
+                            "runtime_cve_applicability": "unknown",
+                            "runtime_cve_version_gate": "local_environment_only",
+                        },
+                        "timestamp": 0.0,
+                    }
+                ],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+
+    def test_aggregate_scan_result_skipped_bare_analysis_incomplete_fails_closed(self) -> None:
+        """Skipped incomplete checks need runtime-version metadata to remain clean."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "issues": [],
+                "checks": [
+                    {
+                        "name": "Embedded Secret Scan",
+                        "status": "skipped",
+                        "message": "Embedded secret scan skipped after bounded read",
+                        "severity": "info",
+                        "location": "model.bin",
+                        "details": {"analysis_incomplete": True},
+                        "timestamp": 0.0,
+                    }
+                ],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+
     def test_aggregate_scanner_names_wraps_scalar_strings(self) -> None:
         """Scalar scanner fields should not be split into characters."""
         result = create_initial_audit_result()
@@ -627,6 +763,53 @@ class TestModelAuditResultModel:
         assert scan_result.metadata["scan_outcome"] == "inconclusive"
         assert "scanner_reported_unsuccessful_without_outcome" in scan_result.metadata["scan_outcome_reasons"]
         assert determine_exit_code(result) == 2
+
+    def test_aggregate_scan_result_direct_check_only_incomplete_coverage_fails_closed(self) -> None:
+        """Direct aggregation should honor incomplete coverage retained only in check details."""
+        result = create_initial_audit_result()
+        scan_result = ScanResult(scanner_name="dvc")
+        scan_result.add_check(
+            name="DVC Output Resolution",
+            passed=False,
+            message="DVC output resolution incomplete",
+            severity=IssueSeverity.INFO,
+            location="model.dvc",
+            details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+        )
+        scan_result.finish(success=True)
+
+        result.aggregate_scan_result_direct(scan_result)
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert result.checks[0].details["scan_outcome_reason"] == "dvc_analysis_incomplete"
+        assert determine_exit_code(result) == 2
+
+    def test_aggregate_scan_result_direct_runtime_version_skip_does_not_fail_coverage_success(self) -> None:
+        """Direct aggregation should also exempt expected runtime-version skips."""
+        result = create_initial_audit_result()
+        scan_result = ScanResult(scanner_name="pytorch_zip")
+        scan_result.checks.append(
+            Check(
+                name="CVE PyTorch Version Check",
+                status=CheckStatus.SKIPPED,
+                message="PyTorch runtime version unavailable",
+                severity=IssueSeverity.INFO,
+                location="weights.pt",
+                details={
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+            )
+        )
+
+        result.aggregate_scan_result_direct(scan_result)
+
+        assert result.has_errors is False
+        assert result.success is True
+        assert determine_exit_code(result) == 0
 
     def test_aggregate_scan_result_direct_operational_flag_sets_error_state(self) -> None:
         """Direct aggregation should honor explicit operational-error metadata."""

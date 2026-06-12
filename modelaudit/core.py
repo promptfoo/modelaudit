@@ -9,7 +9,7 @@ import shutil
 import stat
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -216,6 +216,13 @@ _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
 _mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
 _mark_operational_scan_error = core_results.mark_operational_scan_error
+_metadata_has_coverage_only_operational_error = core_results.metadata_has_coverage_only_operational_error
+_details_match_shard_family_paths = core_results.details_match_shard_family_paths
+_metadata_has_incomplete_coverage = core_results.metadata_has_incomplete_coverage
+_record_details_have_incomplete_coverage = core_results.record_details_have_incomplete_coverage
+_records_have_incomplete_coverage_for_path = core_results.records_have_incomplete_coverage_for_path
+_results_have_incomplete_coverage_under_directory = core_results.results_have_incomplete_coverage_under_directory
+_results_have_operational_error = core_results.results_have_operational_error
 _results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
 _scan_result_has_operational_error = core_results.scan_result_has_operational_error
 _serialize_streamed_records = core_results.serialize_streamed_records
@@ -249,7 +256,6 @@ def _record_dvc_output_limit_incomplete(
         return
 
     scan_metadata["success"] = False
-    scan_metadata["has_operational_errors"] = True
     _add_issue_to_model(
         results,
         "DVC output limit exceeded - not all declared outputs were scanned",
@@ -283,12 +289,46 @@ def _dvc_omitted_outputs_covered_by_directory_walk(
 ) -> bool:
     """Return whether a directory walk independently covers every bounded omitted DVC target."""
 
+    def directory_files_are_covered(target: Path) -> bool:
+        walk_errors: list[OSError] = []
+        for root, dirs, files in os.walk(target, followlinks=False, onerror=walk_errors.append):
+            for directory_name in dirs:
+                directory_path = Path(root) / directory_name
+                if directory_path.is_symlink():
+                    return False
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                if _is_huggingface_cache_file(file_path):
+                    continue
+                if (
+                    skip_file_types
+                    and should_skip_file(
+                        file_path,
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
+                    )
+                    and not _preserve_hf_download_sidecar_asset(file_path, scanner_selection_extensions)
+                ):
+                    continue
+                try:
+                    file_path_obj = Path(file_path)
+                    if file_path_obj.is_symlink() or not file_path_obj.is_file():
+                        return False
+                    resolved_file = str(file_path_obj.resolve())
+                except OSError:
+                    return False
+                if resolved_file not in directory_walk_covered_paths:
+                    return False
+        return not walk_errors
+
     def is_covered(target: Path) -> bool:
         target_str = str(target)
         if target.is_file():
             return target_str in directory_walk_covered_paths
-        if not target.is_dir() or target_str not in directory_walk_covered_directories:
+        if not target.is_dir():
             return False
+        if target_str not in directory_walk_covered_directories:
+            return directory_files_are_covered(target)
 
         walk_errors: list[OSError] = []
         for root, dirs, files in os.walk(target, followlinks=False, onerror=walk_errors.append):
@@ -360,6 +400,55 @@ _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
 DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
 DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
+_INCOMPLETE_SHARD_CHECK_NAMES = frozenset(
+    {
+        "Shard Scan",
+        "Sharded Model Coverage Check",
+        "Sharded Model Membership Check",
+    }
+)
+
+
+def _path_matches_shard_family(candidate_path: str | None, shard_paths: set[str]) -> bool:
+    if not isinstance(candidate_path, str):
+        return False
+    try:
+        resolved_candidate = Path(candidate_path).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    resolved_candidate_str = str(resolved_candidate)
+    if resolved_candidate_str in shard_paths:
+        return True
+    if not resolved_candidate.is_dir():
+        return False
+    return any(Path(shard_path).is_relative_to(resolved_candidate) for shard_path in shard_paths)
+
+
+def _shard_family_has_incomplete_coverage(
+    records: Iterable[Any],
+    shard_paths: set[str],
+    *,
+    only_detected_shard_family: bool = True,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    for record in records:
+        if not _record_details_have_incomplete_coverage(
+            record,
+            allow_skipped_check_exemption=allow_skipped_check_exemption,
+        ):
+            continue
+        if _path_matches_shard_family(getattr(record, "location", None), shard_paths):
+            return True
+        details = getattr(record, "details", None)
+        if _details_match_shard_family_paths(
+            details, lambda candidate: _path_matches_shard_family(candidate, shard_paths)
+        ):
+            return True
+        if only_detected_shard_family and getattr(record, "name", None) in _INCOMPLETE_SHARD_CHECK_NAMES:
+            return True
+    return False
+
+
 _OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY = "_openvino_scanned_xml_companions"
 
 
@@ -1621,12 +1710,20 @@ def _update_missing_shard_coverage_record(record: Check | Issue, reason: str, me
 
 def _results_have_explicit_operational_error(results: ModelAuditResultModel) -> bool:
     """Return whether retained result evidence identifies an operational failure."""
-    if any(bool(metadata.get("operational_error")) for metadata in results.file_metadata.values()):
+    if any(
+        bool(metadata.get("operational_error")) and not _metadata_has_coverage_only_operational_error(metadata)
+        for metadata in results.file_metadata.values()
+    ):
         return True
     if any(asset.type == "error" for asset in results.assets):
         return True
     records: list[Check | Issue] = [*results.checks, *results.issues]
-    return any(isinstance(record.details, dict) and bool(record.details.get("operational_error")) for record in records)
+    return any(
+        isinstance(record.details, dict)
+        and bool(record.details.get("operational_error"))
+        and not _metadata_has_coverage_only_operational_error(record.details)
+        for record in records
+    )
 
 
 def _results_have_retained_incomplete_outcome(results: ModelAuditResultModel) -> bool:
@@ -1964,7 +2061,7 @@ def _resolve_discovered_shard_path(shard_path: str, results: ModelAuditResultMod
     """Resolve a detected shard without aborting if it changes during discovery."""
     try:
         return str(Path(shard_path).resolve(strict=True))
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         _add_issue_to_model(
             results,
             "Shard path changed during directory discovery",
@@ -5017,6 +5114,7 @@ def scan_model_directory_or_file(
                     except Exception as e:
                         logger.warning(f"Error scanning file {representative_file}: {e!s}")
                         scan_metadata["success"] = False
+                        scan_metadata["has_operational_errors"] = True
 
                         _add_issue_to_model(
                             results,
@@ -5037,8 +5135,14 @@ def scan_model_directory_or_file(
                         continue
                     metadata = results.file_metadata.get(asset.path)
                     if metadata is not None and (
-                        metadata.get("operational_error") is True or metadata.get("scan_outcome") == "inconclusive"
+                        metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                     ):
+                        continue
+                    if _records_have_incomplete_coverage_for_path(
+                        results.checks,
+                        asset.path,
+                        allow_skipped_check_exemption=True,
+                    ) or _records_have_incomplete_coverage_for_path(results.issues, asset.path):
                         continue
                     if scanner_selection.active and get_scanner_for_file(asset.path, config=config) is None:
                         continue
@@ -5180,18 +5284,26 @@ def scan_model_directory_or_file(
                         and not (
                             (metadata := nested_result.file_metadata.get(asset.path)) is not None
                             and (
-                                metadata.get("operational_error") is True
-                                or metadata.get("scan_outcome") == "inconclusive"
+                                metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                             )
+                        )
+                        and not (
+                            _records_have_incomplete_coverage_for_path(
+                                nested_result.checks,
+                                asset.path,
+                                allow_skipped_check_exemption=True,
+                            )
+                            or _records_have_incomplete_coverage_for_path(nested_result.issues, asset.path)
                         )
                     }
                     scanned_dvc_paths.update(nested_scanned_paths)
                     internally_scanned_dvc_paths.update(nested_scanned_paths)
-                    if nested_result.success and not nested_result.has_errors:
-                        for root, _dirs, _files in os.walk(target, followlinks=False):
-                            resolved_directory = str(Path(root).resolve())
-                            dvc_scanned_directories.add(resolved_directory)
-                            internally_scanned_dvc_directories.add(resolved_directory)
+                    for root, _dirs, _files in os.walk(target, followlinks=False):
+                        resolved_directory = str(Path(root).resolve())
+                        if _results_have_incomplete_coverage_under_directory(nested_result, resolved_directory):
+                            continue
+                        dvc_scanned_directories.add(resolved_directory)
+                        internally_scanned_dvc_directories.add(resolved_directory)
                     if nested_result.has_errors or (
                         nested_result.files_scanned > 0 and nested_result.content_hash is None
                     ):
@@ -5251,21 +5363,31 @@ def scan_model_directory_or_file(
                     results.aggregate_scan_result(nested_result)
                     for asset in nested_result.assets:
                         asset_path = Path(asset.path)
-                        if asset_path.is_file():
-                            resolved_asset_path = str(asset_path.resolve())
-                            scanned_dvc_paths.add(resolved_asset_path)
-                            internally_scanned_dvc_paths.add(resolved_asset_path)
+                        if not asset_path.is_file():
+                            continue
+                        metadata = nested_result.file_metadata.get(asset.path)
+                        if metadata is not None and (
+                            metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
+                        ):
+                            continue
+                        if _records_have_incomplete_coverage_for_path(
+                            nested_result.checks,
+                            asset.path,
+                            allow_skipped_check_exemption=True,
+                        ) or _records_have_incomplete_coverage_for_path(nested_result.issues, asset.path):
+                            continue
+                        resolved_asset_path = str(asset_path.resolve())
+                        scanned_dvc_paths.add(resolved_asset_path)
+                        internally_scanned_dvc_paths.add(resolved_asset_path)
                     for root, _dirs, _files in os.walk(target, followlinks=False):
                         resolved_directory = str(Path(root).resolve())
+                        if _results_have_incomplete_coverage_under_directory(nested_result, resolved_directory):
+                            continue
                         dvc_scanned_directories.add(resolved_directory)
                         internally_scanned_dvc_directories.add(resolved_directory)
-                    if nested_result.has_errors or not nested_result.success:
+                    if _results_have_operational_error(nested_result):
                         scan_metadata["success"] = False
-                        scan_metadata["has_operational_errors"] = bool(
-                            scan_metadata["has_operational_errors"]
-                            or nested_result.has_errors
-                            or not nested_result.success
-                        )
+                        scan_metadata["has_operational_errors"] = True
                     results.content_hash = None
                     aggregate_hash_complete = False
                     continue
@@ -5328,20 +5450,44 @@ def scan_model_directory_or_file(
                 if (
                     is_dvc_pointer
                     and not _scan_result_has_operational_error(file_result)
-                    and (file_result.metadata or {}).get("scan_outcome") != "inconclusive"
+                    and not _metadata_has_incomplete_coverage(file_result.metadata or {})
                 ):
-                    scanned_dvc_paths.add(resolved_target)
-                    internally_scanned_dvc_paths.add(resolved_target)
+                    target_has_incomplete_record = _records_have_incomplete_coverage_for_path(
+                        file_result.checks,
+                        target,
+                        allow_skipped_check_exemption=True,
+                    ) or _records_have_incomplete_coverage_for_path(file_result.issues, target)
+                    if not target_has_incomplete_record:
+                        scanned_dvc_paths.add(resolved_target)
+                        internally_scanned_dvc_paths.add(resolved_target)
+                    sharded_detection_families: list[set[str]] = []
                     for check in file_result.checks:
                         shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
                         if check.name == "Sharded Model Detection" and isinstance(shard_paths, list):
-                            resolved_shard_paths = {
-                                str(Path(shard_path).resolve())
-                                for shard_path in shard_paths
-                                if isinstance(shard_path, str)
-                            }
-                            scanned_dvc_paths.update(resolved_shard_paths)
-                            internally_scanned_dvc_paths.update(resolved_shard_paths)
+                            sharded_detection_families.append(
+                                {
+                                    resolved_shard_path
+                                    for shard_path in shard_paths
+                                    if isinstance(shard_path, str)
+                                    and (resolved_shard_path := _resolve_discovered_shard_path(shard_path, results))
+                                    is not None
+                                }
+                            )
+                    only_detected_shard_family = len(sharded_detection_families) <= 1
+                    for resolved_shard_paths in sharded_detection_families:
+                        if _shard_family_has_incomplete_coverage(
+                            file_result.checks,
+                            resolved_shard_paths,
+                            only_detected_shard_family=only_detected_shard_family,
+                            allow_skipped_check_exemption=True,
+                        ) or _shard_family_has_incomplete_coverage(
+                            file_result.issues,
+                            resolved_shard_paths,
+                            only_detected_shard_family=only_detected_shard_family,
+                        ):
+                            continue
+                        scanned_dvc_paths.update(resolved_shard_paths)
+                        internally_scanned_dvc_paths.update(resolved_shard_paths)
                 _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                 # Collect and apply license metadata for all files
@@ -5431,6 +5577,7 @@ def scan_model_directory_or_file(
     except KeyboardInterrupt:
         logger.debug("Scan interrupted by user")
         scan_metadata["success"] = False
+        scan_metadata["has_operational_errors"] = True
         _add_issue_to_model(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
         )
@@ -5442,6 +5589,7 @@ def scan_model_directory_or_file(
         else:
             logger.exception(f"Error during scan: {report_error}")
         scan_metadata["success"] = False
+        scan_metadata["has_operational_errors"] = True
         _add_issue_to_model(
             results,
             f"Error during scan: {report_error}",
@@ -5480,7 +5628,7 @@ def scan_model_directory_or_file(
         logger.warning(f"Error checking license warnings: {e!s}")
 
     # Determine if there were operational scan errors vs security findings.
-    results.has_errors = bool(scan_metadata.get("has_operational_errors", False) or not scan_metadata["success"])
+    results.has_errors = bool(scan_metadata.get("has_operational_errors", False))
 
     # Set success flag for backward compatibility
     results.success = not _results_should_be_unsuccessful(results)
@@ -6309,7 +6457,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         and header_format != "unknown"
         and ext_format != "unknown"
         and not (
-            (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
+            (ext_format == "pytorch_binary" and header_format in ["onnx", "zip", "pickle"] and ext == ".bin")
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
             or (ext_format == "pickle" and header_format == "jax_checkpoint" and ext in [".ckpt", ".pickle"])
             or (ext_format == "keras" and header_format in ["zip", "hdf5"])
