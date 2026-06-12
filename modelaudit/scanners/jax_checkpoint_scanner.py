@@ -98,7 +98,6 @@ class JaxCheckpointScanner(BaseScanner):
         "device_array",
     )
     _NON_JAX_NEAR_MATCH_PREFIXES: ClassVar[frozenset[str]] = frozenset({"a"})
-    _BOUNDED_ORBAX_RESTORE_FN_KEY_RE: ClassVar[re.Pattern[bytes]] = re.compile(rb'"restore_fn"\s*:')
     _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
         {
             "description",
@@ -816,7 +815,7 @@ class JaxCheckpointScanner(BaseScanner):
                 if filename == "metadata.json":
                     if cls._has_regular_orbax_sibling_marker(path_obj):
                         return True
-                    return tokenizer_jax_evidence or is_confirmed_jax_json_checkpoint_file(path)
+                    return tokenizer_jax_evidence or is_jax_json_checkpoint_file(path)
                 return tokenizer_jax_evidence or is_confirmed_jax_json_checkpoint_file(path)
             if ext in cls.supported_extensions:
                 return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
@@ -862,12 +861,11 @@ class JaxCheckpointScanner(BaseScanner):
 
     @classmethod
     def _ambiguous_bare_metadata_requires_owner_dispatch(cls, path: Path) -> bool:
-        """Fail closed only when bounded bare metadata still exposes Orbax-specific risk."""
+        """Fail closed when bounded bare metadata leaves later JAX/Orbax evidence unknowable."""
         snapshot = _read_jax_json_checkpoint_prefix(path)
         if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE or snapshot is None:
             return True
-        _file_size, prefix = snapshot
-        return cls._BOUNDED_ORBAX_RESTORE_FN_KEY_RE.search(prefix) is not None
+        return True
 
     @classmethod
     def _regular_file_matches_snapshot(cls, current_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
@@ -1037,12 +1035,11 @@ class JaxCheckpointScanner(BaseScanner):
             ):
                 return True
 
-        # Keep routing bounded without treating entry count alone as a JAX
-        # signal. Canonical owner-only markers were checked by direct lookup;
-        # ordinary child routing remains responsible for later file entries.
+        # Keep routing bounded. If the probe cap is hit before a conclusive
+        # answer, the owner scan records the incomplete coverage fail-closed.
         for entry_index, entry in enumerate(path_obj.iterdir(), start=1):
             if entry_index > cls.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES:
-                return False
+                return True
             if not cls._is_orbax_checkpoint_entry_name(entry.name):
                 continue
             try:

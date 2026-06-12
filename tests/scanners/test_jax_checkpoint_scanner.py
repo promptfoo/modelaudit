@@ -538,7 +538,7 @@ def test_orbax_directory_entry_count_limit_fails_closed(tmp_path: Path) -> None:
     )
 
 
-def test_orbax_directory_probe_does_not_route_on_entry_count_alone(
+def test_orbax_directory_probe_cap_selects_owner_and_scan_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -549,14 +549,32 @@ def test_orbax_directory_probe_does_not_route_on_entry_count_alone(
     def synthetic_entries(path: Path) -> Iterator[Path]:
         nonlocal entries_yielded
         assert path == checkpoint_dir
-        for index in range(JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1):
+        for index in range(JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES):
             entries_yielded += 1
             yield checkpoint_dir / f"unrelated_{index}.txt"
+        entries_yielded += 1
+        yield checkpoint_dir / "checkpoint_9000"
 
     monkeypatch.setattr(Path, "iterdir", synthetic_entries)
 
-    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is False
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
     assert entries_yielded == JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1
+
+    entries_yielded = 0
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_directory_entry_count_limit" in result.metadata["scan_outcome_reasons"]
+    assert entries_yielded == JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1
+    assert any(
+        check.name == "Orbax Directory Entry Count Limit"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        and check.details["max_orbax_directory_entries"] == JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
 
 
 def test_orbax_checkpoint_file_count_limit_fails_closed(tmp_path: Path) -> None:
@@ -2600,7 +2618,7 @@ def test_generic_metadata_json_is_not_routed_as_jax(tmp_path: Path) -> None:
     assert determine_exit_code(result) == 0
 
 
-def test_large_ambiguous_generic_metadata_json_is_not_routed_as_jax(tmp_path: Path) -> None:
+def test_large_ambiguous_generic_metadata_json_fails_closed_as_orbax_owner(tmp_path: Path) -> None:
     ordinary_directory = tmp_path / "large-backup-package"
     ordinary_directory.mkdir()
     (ordinary_directory / "metadata.json").write_text(
@@ -2608,16 +2626,19 @@ def test_large_ambiguous_generic_metadata_json_is_not_routed_as_jax(tmp_path: Pa
         encoding="utf-8",
     )
 
-    assert JaxCheckpointScanner.can_handle(str(ordinary_directory)) is False
+    metadata_path = ordinary_directory / "metadata.json"
+    assert JaxCheckpointScanner.can_handle(str(ordinary_directory)) is True
+    assert JaxCheckpointScanner.can_handle(str(metadata_path)) is True
 
     result = scan_model_directory_or_file(str(ordinary_directory), cache_scan_results=False)
+    owner_metadata = result.file_metadata[str(ordinary_directory)]
 
-    assert "jax_checkpoint" not in result.scanner_names
+    assert "jax_checkpoint" in result.scanner_names
+    assert owner_metadata["directory_owner_scan"] is True
+    assert owner_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert not any(issue.rule_code == "S302" for issue in result.issues)
-    assert not any(
-        "jax_orbax_metadata_analysis_size_limit" in metadata["scan_outcome_reasons"]
-        for metadata in result.file_metadata.values()
-    )
+    assert "jax_orbax_metadata_analysis_size_limit" in owner_metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 2
 
 
 def test_late_jax_identity_routes_visible_dangerous_restore_fn(tmp_path: Path) -> None:
@@ -2647,7 +2668,9 @@ def test_late_jax_identity_routes_visible_dangerous_restore_fn(tmp_path: Path) -
     )
 
 
-def test_late_jax_identity_without_bounded_orbax_evidence_stays_off_child_jax_routing(tmp_path: Path) -> None:
+def test_late_jax_identity_without_visible_orbax_evidence_fails_closed_with_owner_dispatch(
+    tmp_path: Path,
+) -> None:
     checkpoint_dir = tmp_path / "late-jax-identity-and-restore"
     checkpoint_dir.mkdir()
     metadata_path = checkpoint_dir / "metadata.json"
@@ -2659,18 +2682,21 @@ def test_late_jax_identity_without_bounded_orbax_evidence_stays_off_child_jax_ro
     )
     assert metadata_path.stat().st_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
 
-    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is False
-    assert JaxCheckpointScanner.can_handle(str(metadata_path)) is False
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+    assert JaxCheckpointScanner.can_handle(str(metadata_path)) is True
 
     result = scan_model_directory_or_file(str(checkpoint_dir), cache_scan_results=False)
+    owner_metadata = result.file_metadata[str(checkpoint_dir)]
 
-    assert "jax_checkpoint" not in result.scanner_names
+    assert "jax_checkpoint" in result.scanner_names
+    assert owner_metadata["directory_owner_scan"] is True
+    assert owner_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert not any(
-        "jax_json_checkpoint_analysis_size_limit" in metadata.get("scan_outcome_reasons", [])
-        for metadata in result.file_metadata.values()
+        issue.rule_code == "S302" and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for issue in result.issues
     )
-    assert not any(issue.rule_code == "S302" for issue in result.issues)
-    assert determine_exit_code(result) == 0
+    assert "jax_orbax_metadata_analysis_size_limit" in owner_metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 2
 
 
 def test_jax_identity_before_split_utf8_boundary_remains_confirmed(tmp_path: Path) -> None:

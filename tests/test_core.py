@@ -1815,6 +1815,40 @@ def test_jax_owner_snapshot_prunes_ignored_nested_directories_from_entry_limit(t
     assert determine_exit_code(result) == 1
 
 
+def test_directory_scan_orbax_probe_cap_fails_closed_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "late-orbax-entry"
+    model_dir.mkdir()
+    monkeypatch.setattr(JaxCheckpointScanner, "DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES", 2)
+    original_iterdir = Path.iterdir
+    entries_yielded = 0
+
+    def synthetic_entries(path: Path) -> Iterator[Path]:
+        nonlocal entries_yielded
+        if not path.is_dir():
+            yield from original_iterdir(path)
+            return
+        for index in range(JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES):
+            entries_yielded += 1
+            yield path / f"unrelated_{index}.txt"
+        entries_yielded += 1
+        yield path / "checkpoint_9000"
+
+    monkeypatch.setattr(Path, "iterdir", synthetic_entries)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+    owner_metadata = result.file_metadata[str(model_dir)]
+
+    assert "jax_checkpoint" in result.scanner_names
+    assert owner_metadata["directory_owner_scan"] is True
+    assert owner_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_directory_entry_count_limit" in owner_metadata["scan_outcome_reasons"]
+    assert entries_yielded >= (JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1) * 2
+    assert determine_exit_code(result) == 2
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
 def test_calculate_file_hash_rejects_fifo_swap_without_blocking(
     tmp_path: Path,
@@ -2147,7 +2181,7 @@ def test_nested_generic_metadata_near_match_stays_clean(tmp_path: Path) -> None:
     assert determine_exit_code(result) == 0
 
 
-def test_nested_ambiguous_generic_metadata_stays_off_jax_child_routing(tmp_path: Path) -> None:
+def test_nested_ambiguous_generic_metadata_fails_closed_as_orbax_owner(tmp_path: Path) -> None:
     nested_dir = tmp_path / "bundle" / "backup-package"
     nested_dir.mkdir(parents=True)
     metadata_path = nested_dir / "metadata.json"
@@ -2157,14 +2191,13 @@ def test_nested_ambiguous_generic_metadata_stays_off_jax_child_routing(tmp_path:
     )
 
     result = scan_model_directory_or_file(str(tmp_path / "bundle"), cache_scan_results=False)
+    metadata = result.file_metadata[str(metadata_path)]
 
-    assert "jax_checkpoint" not in result.scanner_names
+    assert "jax_checkpoint" in metadata["scanner_dependency_ids"]
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert not any(issue.rule_code == "S302" for issue in result.issues)
-    assert not any(
-        "jax_json_checkpoint_analysis_size_limit" in metadata.get("scan_outcome_reasons", [])
-        for metadata in result.file_metadata.values()
-    )
-    assert determine_exit_code(result) == 0
+    assert "jax_json_checkpoint_analysis_size_limit" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 2
 
 
 def test_directory_scan_without_logical_owner_keeps_file_walk_semantics(tmp_path: Path) -> None:
