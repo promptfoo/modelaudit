@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restrict Jinja SSTI indicators to executable template spans so prose mentions of request handling do not produce critical findings
 - treat canonical storage persistent IDs as informational only after legacy PyTorch framing, storage tuples, and storage payloads validate completely
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
+- preview Hugging Face repository and direct-file scans under `--dry-run` without downloading or scanning, backed by an opt-in pinned false-positive regression harness
 - make Hugging Face streaming dry runs emit metadata-only previews without artifact downloads, scanner execution, or full scan-result JSON
 - report gated or unauthorized Hugging Face acquisitions as failed, inconclusive source outcomes without claiming artifact coverage, and preserve partial findings from interrupted Hugging Face streaming scans
 - show Hugging Face preview access notices when selected gated files have unknown sizes
