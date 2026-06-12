@@ -2631,6 +2631,12 @@ def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
     cache_manager = get_cache_manager(str(cache_dir), enabled=True)
     assert cache_manager.cache is not None
+    pre_scan_identity = cache_manager.cache.capture_file_identity(str(file_path))
+
+    def get_cached_result_with_identity(*_args: Any, **_kwargs: Any) -> tuple[dict[str, Any] | None, Any]:
+        return None, pre_scan_identity
+
+    monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", get_cached_result_with_identity)
     release_calls = 0
     original_release = cache_manager.cache.release_ancestor_identity
 
@@ -2669,6 +2675,12 @@ def test_cached_scan_skips_persisting_scan_timed_out_messages(
     calls = {"count": 0}
     cache_manager = get_cache_manager(str(cache_dir), enabled=True)
     assert cache_manager.cache is not None
+    pre_scan_identities = [cache_manager.cache.capture_file_identity(str(file_path)) for _ in range(2)]
+
+    def get_cached_result_with_identity(*_args: Any, **_kwargs: Any) -> tuple[dict[str, Any] | None, Any]:
+        return None, pre_scan_identities.pop(0)
+
+    monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", get_cached_result_with_identity)
     release_calls = 0
     original_release = cache_manager.cache.release_ancestor_identity
 
@@ -2694,6 +2706,7 @@ def test_cached_scan_skips_persisting_scan_timed_out_messages(
     assert first["timeout_count"] == 1
     assert second["timeout_count"] == 2
     assert calls["count"] == 2
+    assert pre_scan_identities == []
     assert cache_manager.get_stats()["total_entries"] == 0
     assert release_calls == 2
 
