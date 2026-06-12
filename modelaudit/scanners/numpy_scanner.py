@@ -355,8 +355,14 @@ class NumPyScanner(BaseScanner):
                 return False
             return _numpy_object_reconstruction_reference_is_trusted(module, name)
 
+        removed_private_entries = [
+            {"name": check.name, "rule_code": check.rule_code}
+            for check in result.checks
+            if check.rule_code is not None and is_validated_numpy_object_reconstruction(check)
+        ]
         result.issues = [issue for issue in result.issues if not is_validated_numpy_object_reconstruction(issue)]
         result.checks = [check for check in result.checks if not is_validated_numpy_object_reconstruction(check)]
+        PickleScanner._remove_private_actionable_failed_check_entries(result, removed_private_entries)
 
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""

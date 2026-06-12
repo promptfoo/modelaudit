@@ -12,9 +12,11 @@ import numpy as np
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
+from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.numpy_scanner import (
     NUMPY_HEADER_MAX_SIZE,
@@ -967,6 +969,11 @@ def test_numpy_object_dtype_benign_direct_scan_success_after_reconstruction_clea
     assert not result.has_errors
     assert not any(check.rule_code == "NON_ALLOWLISTED_GLOBAL" for check in result.checks)
     assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+    serialized_result = result.to_dict(include_private_metadata=True)
+    private_metadata = serialized_result.get("_private_metadata", {})
+    assert isinstance(private_metadata, dict)
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in private_metadata
+    assert should_cache_scan_result(serialized_result) is True
 
 
 def test_numpy_object_dtype_direct_scan_preserves_retained_embedded_failure_after_cleanup(
