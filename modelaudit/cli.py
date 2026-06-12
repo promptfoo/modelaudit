@@ -345,11 +345,18 @@ def _huggingface_stream_preview_budget_files(
     if runtime.hf_stream_include_all_files:
         return _huggingface_preview_stream_selection_files(metadata, runtime)
 
-    files = metadata.get("files", [])
     if not _huggingface_stream_preview_needs_content_route_budget(runtime):
         return selected_files
 
-    return [*selected_files, *_huggingface_preview_unselected_files(files, selected_files)]
+    files = metadata.get("files", [])
+    openvino_companion_names = _huggingface_stream_preview_openvino_companion_names(files, selected_files, runtime)
+    openvino_companion_files = _huggingface_preview_files_by_name(files, list(openvino_companion_names))
+    content_route_candidates = _huggingface_stream_preview_content_route_candidate_files(
+        metadata,
+        selected_files,
+        runtime,
+    )
+    return [*selected_files, *openvino_companion_files, *content_route_candidates]
 
 
 def _huggingface_stream_preview_openvino_companion_names(
@@ -384,17 +391,7 @@ def _huggingface_stream_preview_unbudgeted_content_route_files(
     runtime: "_ScanRuntimeConfig",
 ) -> list[dict[str, Any]]:
     """Return unselected files that make no-max stream dry-run coverage inconclusive."""
-    if runtime.hf_stream_include_all_files or not _huggingface_stream_preview_needs_content_route_budget(runtime):
-        return []
-
-    files = metadata.get("files", [])
-    openvino_companion_names = _huggingface_stream_preview_openvino_companion_names(files, selected_files, runtime)
-    unselected_files = _huggingface_preview_unselected_files(files, selected_files)
-    return [
-        item
-        for item in unselected_files
-        if not (isinstance(item.get("name"), str) and item["name"] in openvino_companion_names)
-    ]
+    return _huggingface_stream_preview_content_route_candidate_files(metadata, selected_files, runtime)
 
 
 def _huggingface_stream_preview_content_route_candidate_files(
@@ -409,7 +406,18 @@ def _huggingface_stream_preview_content_route_candidate_files(
     from .utils.sources import huggingface as huggingface_source
 
     files = metadata.get("files", [])
+    file_names = _huggingface_preview_file_names(files)
     openvino_companion_names = _huggingface_stream_preview_openvino_companion_names(files, selected_files, runtime)
+    selected_route_scanner_ids = (
+        {str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids}
+        if runtime.scannable_scanner_ids is not None
+        else None
+    )
+    selected_route_formats = huggingface_source._get_selected_hf_content_route_formats(
+        runtime.scannable_extensions,
+        runtime.scannable_filenames,
+    )
+    complete_safetensors_shard_files = huggingface_source._complete_hf_safetensors_shard_files(file_names)
     candidates: list[dict[str, Any]] = []
     for item in _huggingface_preview_unselected_files(files, selected_files):
         name = item.get("name")
@@ -418,6 +426,13 @@ def _huggingface_stream_preview_content_route_candidate_files(
         if huggingface_source._is_huggingface_repo_bookkeeping_file(name):
             continue
         if name in openvino_companion_names:
+            continue
+        if huggingface_source._hf_safetensors_shard_excluded_by_selection(
+            name,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            complete_safetensors_shard_files=complete_safetensors_shard_files,
+        ):
             continue
         candidates.append(item)
     return candidates

@@ -1169,6 +1169,56 @@ def test_hf_stream_dry_run_max_size_displays_budgeted_content_route_candidates()
     mock_scan.assert_not_called()
 
 
+def test_hf_stream_dry_run_max_size_skips_complete_safetensors_shards_for_unrelated_scanner() -> None:
+    runner = CliRunner()
+    shard_count = 257
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 20 + shard_count,
+        "file_count": 1 + shard_count,
+        "files": [
+            {"name": "model.mlmodel", "size": 20},
+            *[
+                {"name": f"model-{index:05d}-of-{shard_count:05d}.safetensors", "size": 1}
+                for index in range(1, shard_count + 1)
+            ],
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "--max-size",
+                "1MB",
+                "--scanners",
+                "coreml",
+                "hf://test/model",
+            ],
+        )
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert parsed["files_scanned"] == 0
+    assert "Scannable files: 1 of 258" in result.stderr
+    assert "Scannable size: 20 B" in result.stderr
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_repo_dry_run_preview_rejects_negative_max_size_without_metadata_lookup() -> None:
     runner = CliRunner()
 
