@@ -23,6 +23,7 @@ from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from ..scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
     RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY,
     RAW_DETECTOR_FAILURES_METADATA_KEY,
@@ -2695,9 +2696,12 @@ class PyTorchZipScanner(BaseScanner):
     def _downgrade_trusted_storage_persistent_ids(cls, result: ScanResult, trusted_storage_keys: set[str]) -> None:
         """Treat PyTorch storage persistent IDs as informational inside validated PyTorch ZIP data.pkl."""
         downgraded_count = 0
+        downgraded_private_entries: list[dict[str, str]] = []
         for check in result.checks:
             if not cls._is_pytorch_storage_persistent_id_record(check.details, trusted_storage_keys):
                 continue
+            if check.rule_code is not None:
+                downgraded_private_entries.append({"name": check.name, "rule_code": check.rule_code})
             check.status = CheckStatus.PASSED
             check.severity = IssueSeverity.INFO
             check.message = "PyTorch storage persistent ID found in validated PyTorch archive"
@@ -2709,6 +2713,7 @@ class PyTorchZipScanner(BaseScanner):
             for issue in result.issues
             if not cls._is_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
         ]
+        cls._remove_private_actionable_failed_check_entries(result, downgraded_private_entries)
         if (
             downgraded_count
             and not result.has_errors
@@ -2716,6 +2721,37 @@ class PyTorchZipScanner(BaseScanner):
             and result.metadata.get("pickle_verdict") == "suspicious"
         ):
             result.metadata["pickle_verdict"] = "clean"
+
+    @staticmethod
+    def _remove_private_actionable_failed_check_entries(
+        result: ScanResult,
+        entries_to_remove: list[dict[str, str]],
+    ) -> None:
+        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+        if not entries_to_remove or not isinstance(private_failed_checks, list):
+            return
+
+        unmatched_entries = list(entries_to_remove)
+        filtered_entries: list[Any] = []
+        for entry in private_failed_checks:
+            if isinstance(entry, dict):
+                matched_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(unmatched_entries)
+                        if entry.get("name") == candidate["name"] and entry.get("rule_code") == candidate["rule_code"]
+                    ),
+                    None,
+                )
+                if matched_index is not None:
+                    del unmatched_entries[matched_index]
+                    continue
+            filtered_entries.append(entry)
+
+        if filtered_entries:
+            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
+        else:
+            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
 
     def _scan_for_jit_patterns(
         self,

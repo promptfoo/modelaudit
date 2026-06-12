@@ -21,11 +21,18 @@ import pytest
 from modelaudit_picklescan.call_graph import import_only_module_requires_origin_review
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors import network_comm as network_comm_module
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult, mark_inconclusive_scan_result
+from modelaudit.scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    Check,
+    ScanResult,
+    mark_inconclusive_scan_result,
+)
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
@@ -192,6 +199,16 @@ def _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload(key: str) ->
     payload = _pytorch_storage_protocol0_persistent_id_payload(key)
     assert payload.endswith(b".")
     return payload[:-1] + b"Parbitrary-storage-key\n0."
+
+
+def _private_actionable_failed_checks(scan_result: dict[str, Any]) -> list[dict[str, Any]]:
+    private_metadata = scan_result.get("_private_metadata")
+    if not isinstance(private_metadata, dict):
+        return []
+    actionable_failed_checks = private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+    if not isinstance(actionable_failed_checks, list):
+        return []
+    return [entry for entry in actionable_failed_checks if isinstance(entry, dict)]
 
 
 def _pytorch_storage_persistent_id_sequence_payload(keys: list[str]) -> bytes:
@@ -7670,11 +7687,17 @@ def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path:
 
     assert result.success is True
     assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.has_errors is False
+    assert result.has_warnings is False
+    assert result.issues == []
     assert not any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues)
     trusted_checks = [check for check in result.checks if check.details.get("trusted_pytorch_archive_context") is True]
     assert trusted_checks
     assert all(check.status == CheckStatus.PASSED for check in trusted_checks)
     assert all(check.severity == IssueSeverity.INFO for check in trusted_checks)
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert _private_actionable_failed_checks(serialized_result) == []
+    assert should_cache_scan_result(serialized_result) is True
 
 
 def test_pytorch_zip_scanner_trusts_protocol0_storage_persid_in_data_pkl(tmp_path: Path) -> None:
@@ -7735,6 +7758,9 @@ def test_pytorch_zip_scanner_does_not_downgrade_arbitrary_protocol0_persid(
         and check.details.get("persistent_id_preview") == 'str:"arbitrary-storage-key"'
         for check in result.checks
     )
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert any(entry.get("rule_code") == "S212" for entry in _private_actionable_failed_checks(serialized_result))
+    assert should_cache_scan_result(serialized_result) is False
 
 
 def test_pytorch_zip_scanner_does_not_downgrade_protocol0_storage_persid_when_arbitrary_persid_follows(
@@ -7783,6 +7809,9 @@ def test_pytorch_zip_scanner_does_not_trust_noncanonical_protocol0_storage_persi
     assert result.metadata.get("pickle_verdict") == "suspicious"
     assert any(issue.rule_code == "S212" and issue.details.get("opcode") == "PERSID" for issue in result.issues)
     assert any(check.rule_code == "S212" and check.status == CheckStatus.FAILED for check in result.checks)
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert any(entry.get("rule_code") == "S212" for entry in _private_actionable_failed_checks(serialized_result))
+    assert should_cache_scan_result(serialized_result) is False
     assert not any(
         check.details.get("opcode") == "PERSID" and check.details.get("trusted_pytorch_archive_context") is True
         for check in result.checks

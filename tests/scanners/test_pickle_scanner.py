@@ -11,9 +11,11 @@ from typing import Any
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import merge_scan_result
 from modelaudit.models import create_initial_audit_result
+from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners import pickle_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
@@ -318,6 +320,16 @@ def _persistent_id_issues(result: ScanResult, *, opcode: str | None = None) -> l
 
 def _trusted_legacy_storage_pid_checks(result: ScanResult) -> list[Any]:
     return [check for check in result.checks if check.details.get("trusted_legacy_pytorch_context") is True]
+
+
+def _private_actionable_failed_checks(scan_result: dict[str, Any]) -> list[dict[str, Any]]:
+    private_metadata = scan_result.get("_private_metadata")
+    if not isinstance(private_metadata, dict):
+        return []
+    actionable_failed_checks = private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+    if not isinstance(actionable_failed_checks, list):
+        return []
+    return [entry for entry in actionable_failed_checks if isinstance(entry, dict)]
 
 
 def _assert_legacy_storage_layout_incomplete(result: ScanResult) -> None:
@@ -2467,6 +2479,9 @@ def test_legacy_pytorch_container_trusts_canonical_storage_binpersid(tmp_path: P
     assert trusted_checks[0].rule_code == "S212"
     assert trusted_checks[0].details["opcode"] == "BINPERSID"
     assert trusted_checks[0].details["pytorch_storage_key"] == "0"
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert _private_actionable_failed_checks(serialized_result) == []
+    assert should_cache_scan_result(serialized_result) is True
 
 
 def test_legacy_pytorch_bin_extension_uses_framing_not_suffix_for_storage_trust(tmp_path: Path) -> None:

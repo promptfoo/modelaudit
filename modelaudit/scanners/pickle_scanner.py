@@ -19,7 +19,7 @@ from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
-from ..scanner_results import Check, Issue, mark_inconclusive_scan_result
+from ..scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, Check, Issue, mark_inconclusive_scan_result
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
@@ -2706,9 +2706,12 @@ class PickleScanner(BaseScanner):
                 cls._annotate_legacy_pytorch_storage_persistent_id_record(issue.details, record)
 
         downgraded_count = 0
+        downgraded_private_entries: list[dict[str, str]] = []
         for check in result.checks:
             if not cls._is_legacy_pytorch_storage_persistent_id_record(check.details, trusted_storage_keys):
                 continue
+            if check.rule_code is not None:
+                downgraded_private_entries.append({"name": check.name, "rule_code": check.rule_code})
             check.status = CheckStatus.PASSED
             check.severity = IssueSeverity.INFO
             check.message = "PyTorch storage persistent ID found in validated legacy PyTorch stream"
@@ -2720,6 +2723,7 @@ class PickleScanner(BaseScanner):
             for issue in result.issues
             if not cls._is_legacy_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
         ]
+        cls._remove_private_actionable_failed_check_entries(result, downgraded_private_entries)
         if downgraded_count:
             result.metadata["legacy_pytorch_trusted_storage_persistent_id_count"] = downgraded_count
             if (
@@ -2728,6 +2732,37 @@ class PickleScanner(BaseScanner):
                 and result.metadata.get("pickle_verdict") == "suspicious"
             ):
                 result.metadata["pickle_verdict"] = "clean"
+
+    @staticmethod
+    def _remove_private_actionable_failed_check_entries(
+        result: ScanResult,
+        entries_to_remove: list[dict[str, str]],
+    ) -> None:
+        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+        if not entries_to_remove or not isinstance(private_failed_checks, list):
+            return
+
+        unmatched_entries = list(entries_to_remove)
+        filtered_entries: list[Any] = []
+        for entry in private_failed_checks:
+            if isinstance(entry, dict):
+                matched_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(unmatched_entries)
+                        if entry.get("name") == candidate["name"] and entry.get("rule_code") == candidate["rule_code"]
+                    ),
+                    None,
+                )
+                if matched_index is not None:
+                    del unmatched_entries[matched_index]
+                    continue
+            filtered_entries.append(entry)
+
+        if filtered_entries:
+            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
+        else:
+            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
 
     @staticmethod
     def _mark_legacy_pytorch_storage_layout_incomplete(
