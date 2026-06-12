@@ -527,7 +527,7 @@ class TestCreateRun:
     def test_invocation_properties_treat_dry_run_as_successful_invocation(self) -> None:
         """Dry-run previews should be successful invocations even without scanned files."""
         result = create_initial_audit_result()
-        result.dry_run = True
+        setattr(result, "dry_run", True)
         result.files_scanned = 0
         result.finalize_statistics()
 
