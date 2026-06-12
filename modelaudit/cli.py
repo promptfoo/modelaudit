@@ -15,7 +15,7 @@ import time
 import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PureWindowsPath
 from typing import Any, NoReturn, cast
 
 import click
@@ -106,6 +106,7 @@ from .utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
     extract_model_id_from_path,
+    get_model_info,
     is_huggingface_file_url,
     is_huggingface_url,
     parse_huggingface_file_url,
@@ -178,676 +179,311 @@ def _display_error(error: object, path: str) -> str:
     return _escape_terminal_text(display_error)
 
 
-def get_model_info(path: str, **kwargs: Any) -> dict[str, Any]:
-    """Delegate Hugging Face metadata lookup through the source module."""
-    from .utils.sources import huggingface as huggingface_source
+def _preview_size_text(size_bytes: object) -> str:
+    """Return a stable human-readable byte size for dry-run previews."""
+    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+        return "Unknown size"
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    return f"{size_bytes} bytes"
 
-    return huggingface_source.get_model_info(path, **kwargs)
+
+def _preview_inventory_size_text(size_bytes: object, unknown_size_count: object) -> str:
+    """Return a dry-run size string that marks incomplete selected-size inventory."""
+    if (
+        isinstance(size_bytes, int)
+        and not isinstance(size_bytes, bool)
+        and size_bytes > 0
+        and isinstance(unknown_size_count, int)
+        and not isinstance(unknown_size_count, bool)
+        and unknown_size_count > 0
+    ):
+        return f"At least {_preview_size_text(size_bytes)}"
+    return _preview_size_text(size_bytes)
 
 
-def get_huggingface_file_info(
+def _build_huggingface_dry_run_preview(
     path: str,
+    runtime: "_ScanRuntimeConfig",
     *,
-    max_size: int | None = None,
+    source_kind: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a compact dry-run preview that is not a scan result payload."""
+    preview: dict[str, Any] = {
+        "dry_run": True,
+        "source": "huggingface",
+        "source_kind": source_kind,
+        "target": _display_scan_path(path),
+        "mode": "streaming" if runtime.scan_and_delete else "standard",
+        "artifact_downloads": 0,
+        "scanner_execution": False,
+    }
+    preview.update(metadata)
+    if runtime.scanner_selection_metadata is not None:
+        preview["scanner_selection"] = dict(runtime.scanner_selection_metadata)
+    return preview
+
+
+def _format_huggingface_dry_run_preview_text(preview: dict[str, Any]) -> str:
+    """Render one Hugging Face dry-run preview for human-readable output."""
+    target = _escape_terminal_text(preview.get("target", ""))
+    source_kind = _escape_terminal_text(str(preview.get("source_kind", "source")).replace("_", " "))
+    lines = [
+        f"📊 Preview for {style_text(target, fg='cyan')}:",
+        f"   Source: Hugging Face {source_kind}",
+    ]
+    if model_id := preview.get("model_id"):
+        lines.append(f"   Model: {_escape_terminal_text(model_id)}")
+    if filename := preview.get("filename"):
+        lines.append(f"   File: {_escape_terminal_text(filename)}")
+    if revision := preview.get("revision"):
+        lines.append(f"   Revision: {_escape_terminal_text(revision)}")
+    if resolved_revision := preview.get("resolved_revision"):
+        lines.append(f"   Resolved revision: {_escape_terminal_text(resolved_revision)}")
+    if "file_count" in preview:
+        lines.append(f"   Files: {_escape_terminal_text(preview['file_count'])}")
+    if "total_size_bytes" in preview or "size_bytes" in preview:
+        lines.append(f"   Size: {_escape_terminal_text(preview.get('human_size', 'Unknown size'))}")
+    inaccessible_gated_file_count = preview.get("inaccessible_gated_file_count")
+    if (
+        isinstance(inaccessible_gated_file_count, int)
+        and not isinstance(inaccessible_gated_file_count, bool)
+        and inaccessible_gated_file_count > 0
+    ):
+        gated_file_count = _escape_terminal_text(str(inaccessible_gated_file_count))
+        lines.append(f"   Access: {gated_file_count} selected file(s) are gated/inaccessible")
+    unknown_size_count = preview.get("unknown_size_count")
+    if isinstance(unknown_size_count, int) and not isinstance(unknown_size_count, bool) and unknown_size_count > 0:
+        lines.append(f"   Access: {_escape_terminal_text(str(unknown_size_count))} selected file size(s) unavailable")
+    lines.append(f"   Mode: {'Streaming dry run' if preview.get('mode') == 'streaming' else 'Dry run'}")
+    lines.append("   Artifact downloads: 0")
+    lines.append("   Scanner execution: none")
+    return "\n".join(lines)
+
+
+def _format_huggingface_dry_run_previews(previews: list[dict[str, Any]], output_format: str) -> str:
+    """Render collected Hugging Face dry-run previews."""
+    if output_format == "json":
+        payload: Any
+        payload = previews[0] if len(previews) == 1 else {"dry_run": True, "previews": previews}
+        return json.dumps(_JSON_VALUE_ADAPTER.dump_python(payload, mode="json"), indent=2)
+    return "\n\n".join(_format_huggingface_dry_run_preview_text(preview) for preview in previews)
+
+
+def _is_huggingface_dry_run_preview_path(path: str) -> bool:
+    """Return whether a path is handled by the Hugging Face dry-run preview planner."""
+    return is_huggingface_file_url(path) or is_huggingface_url(path)
+
+
+def _remaining_huggingface_plan_timeout_seconds(plan: Any) -> float | None:
+    """Return the remaining plan deadline for follow-up metadata requests."""
+    raw_deadline = getattr(plan, "deadline", None)
+    deadline = raw_deadline if isinstance(raw_deadline, (int, float)) and not isinstance(raw_deadline, bool) else None
+    if deadline is None:
+        return None
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        repo_id = getattr(plan, "repo_id", "repository")
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    return remaining
+
+
+def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
+    """Preview a Hugging Face repository scan without artifact downloads or scanners."""
+    from .utils.sources.huggingface import (
+        get_model_info,
+        plan_huggingface_model_download,
+        plan_huggingface_streaming_download,
+    )
+
+    if runtime.scan_and_delete:
+        plan = plan_huggingface_streaming_download(
+            path,
+            runtime.max_download_bytes,
+            timeout_seconds=runtime.timeout,
+            scannable_extensions=runtime.scannable_extensions,
+            scannable_filenames=runtime.scannable_filenames,
+            scannable_scanner_ids=runtime.scannable_scanner_ids,
+            allow_content_probes=False,
+            include_all_files=runtime.hf_stream_include_all_files,
+        )
+    else:
+        plan = plan_huggingface_model_download(
+            path,
+            runtime.max_download_bytes,
+            timeout_seconds=runtime.timeout,
+            allow_content_probes=False,
+        )
+
+    preview_timeout = _remaining_huggingface_plan_timeout_seconds(plan)
+    model_info_kwargs: dict[str, Any] = {"allow_content_probes": False}
+    if preview_timeout is not None:
+        model_info_kwargs["timeout_seconds"] = preview_timeout
+    if runtime.scan_and_delete:
+        model_info_kwargs["streaming_selection"] = True
+        model_info_kwargs["scannable_extensions"] = runtime.scannable_extensions
+        model_info_kwargs["scannable_filenames"] = runtime.scannable_filenames
+        model_info_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
+        model_info_kwargs["include_all_files"] = runtime.hf_stream_include_all_files
+    model_info = get_model_info(path, **model_info_kwargs)
+    total_size = model_info.get("total_size")
+    preserved_metadata = {
+        key: model_info[key]
+        for key in (
+            "inaccessible_gated_file_count",
+            "inaccessible_gated_bytes",
+            "inaccessible_gated_files",
+            "unknown_size_count",
+            "unknown_size_files",
+            "inventory_status",
+            "inventory_error",
+            "gated",
+            "repo_file_count",
+        )
+        if key in model_info
+    }
+    return _build_huggingface_dry_run_preview(
+        path,
+        runtime,
+        source_kind="model",
+        metadata={
+            "model_id": model_info.get("model_id") or model_info.get("repo_id") or _display_scan_path(path),
+            "file_count": model_info.get("file_count", 0),
+            "total_size_bytes": total_size
+            if isinstance(total_size, int) and not isinstance(total_size, bool)
+            else None,
+            "human_size": _preview_inventory_size_text(total_size, model_info.get("unknown_size_count")),
+            "selected_file_count": len(plan.selected_files),
+            "metadata_only": True,
+            **preserved_metadata,
+        },
+    )
+
+
+def _get_huggingface_file_metadata(
+    repo_id: str,
+    revision: str,
+    filename: str,
+    *,
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Delegate Hugging Face direct-file metadata lookup through the source module."""
-    from .utils.sources import huggingface as huggingface_source
+    """Fetch direct Hugging Face file metadata without downloading file content."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from exc
 
-    return huggingface_source.get_huggingface_file_info(path, max_size=max_size, timeout_seconds=timeout_seconds)
+    def remaining_request_timeout() -> float | None:
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+        return min(30.0, remaining)
 
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    if deadline is not None:
+        from .utils.sources.huggingface import _run_huggingface_worker_with_deadline
 
-def _preview_echo(message: str, *, err: bool) -> None:
-    """Emit dry-run preview lines without contaminating structured stdout."""
-    click.echo(message, err=err)
-
-
-def _format_preview_size(size_bytes: object) -> str:
-    """Return a human-readable size for source previews."""
-    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
-        return "unknown"
-    size = float(size_bytes)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024.0:
-            return f"{size:.2f} {unit}" if unit != "B" else f"{int(size)} B"
-        size /= 1024.0
-    return f"{size:.2f} PB"
-
-
-def _huggingface_preview_file_size(item: dict[str, Any]) -> int | None:
-    """Return a trusted preview size, or None when Hugging Face metadata is inconclusive."""
-    size = item.get("size")
-    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
-        return None
-    return size
-
-
-def _huggingface_preview_size_limit(max_size: int | None) -> int | None:
-    """Normalize Hugging Face preview size caps to match download semantics."""
-    if max_size is None or max_size == 0:
-        return None
-    if max_size < 0:
-        raise ValueError("Maximum download size must be non-negative")
-    return max_size
-
-
-def _require_huggingface_preview_immutable_revision(metadata: dict[str, Any]) -> None:
-    """Fail closed unless repository metadata was resolved to an immutable revision."""
-    from .utils.sources import huggingface as huggingface_source
-
-    revision = metadata.get("revision")
-    if huggingface_source._is_huggingface_commit_sha(revision):
-        return
-
-    repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
-    raise ValueError(
-        f"Hugging Face get_model_info() metadata revision for {repo_id} is not an immutable commit SHA; "
-        "refusing dry-run with max size"
-    )
-
-
-def _huggingface_preview_file_names(files: object) -> list[str]:
-    """Return stable file names from Hugging Face preview metadata."""
-    if not isinstance(files, list):
-        return []
-
-    names: list[str] = []
-    for item in files:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        if isinstance(name, str) and name:
-            names.append(name)
-    return list(dict.fromkeys(names))
-
-
-def _huggingface_preview_files_by_name(files: object, names: list[str]) -> list[dict[str, Any]]:
-    """Map selected Hugging Face file names back to their metadata entries."""
-    if not isinstance(files, list):
-        return []
-
-    items_by_name = {item.get("name"): item for item in files if isinstance(item, dict)}
-    selected: list[dict[str, Any]] = []
-    for name in names:
-        item = items_by_name.get(name)
-        if isinstance(item, dict):
-            selected.append(item)
-    return selected
-
-
-def _huggingface_preview_include_openvino_companions(
-    file_names: list[str],
-    selected_names: list[str],
-    *,
-    include_openvino_companions: bool,
-) -> list[str]:
-    """Include exact OpenVINO BIN companions for metadata-only dry-run budgeting."""
-    if not include_openvino_companions:
-        return selected_names
-
-    from .utils.sources import huggingface as huggingface_source
-
-    repo_file_set = set(file_names)
-    selected_file_set = set(selected_names)
-    expanded_names = list(selected_names)
-    for selected_name in selected_names:
-        companion = huggingface_source._openvino_bin_companion_name(selected_name, file_names)
-        if companion is not None and companion in repo_file_set and companion not in selected_file_set:
-            expanded_names.append(companion)
-            selected_file_set.add(companion)
-    return expanded_names
-
-
-def _huggingface_preview_has_uncertain_unselected_files(files: object, selected_files: list[dict[str, Any]]) -> bool:
-    """Return whether unselected metadata may hide content-routed model bytes."""
-    return bool(_huggingface_preview_unselected_files(files, selected_files))
-
-
-def _huggingface_preview_unselected_files(files: object, selected_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return Hugging Face metadata entries not selected without content sniffing."""
-    if not isinstance(files, list):
-        return []
-
-    all_names = set(_huggingface_preview_file_names(files))
-    selected_names: set[str] = set()
-    for item in selected_files:
-        name = item.get("name")
-        if isinstance(name, str) and name in all_names:
-            selected_names.add(name)
-
-    unselected: list[dict[str, Any]] = []
-    for item in files:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        if isinstance(name, str) and name in all_names and name not in selected_names:
-            unselected.append(item)
-    return unselected
-
-
-def _huggingface_stream_preview_needs_content_route_budget(runtime: "_ScanRuntimeConfig") -> bool:
-    """Return whether stream dry-run must budget files only content sniffing could prove."""
-    if runtime.hf_stream_include_all_files or runtime.scannable_scanner_ids is None:
-        return False
-
-    from .utils.sources import huggingface as huggingface_source
-
-    selected_scanners = {str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids}
-    return bool(selected_scanners.intersection(huggingface_source._get_hf_content_route_scanner_ids()))
-
-
-def _huggingface_stream_preview_budget_files(
-    metadata: dict[str, Any],
-    selected_files: list[dict[str, Any]],
-    runtime: "_ScanRuntimeConfig",
-) -> list[dict[str, Any]]:
-    """Return stream dry-run files whose metadata sizes must count toward max-size."""
-    if runtime.hf_stream_include_all_files:
-        return _huggingface_preview_stream_selection_files(metadata, runtime)
-
-    if not _huggingface_stream_preview_needs_content_route_budget(runtime):
-        return selected_files
-
-    files = metadata.get("files", [])
-    openvino_companion_names = _huggingface_stream_preview_openvino_companion_names(files, selected_files, runtime)
-    openvino_companion_files = _huggingface_preview_files_by_name(files, list(openvino_companion_names))
-    content_route_candidates = _huggingface_stream_preview_content_route_candidate_files(
-        metadata,
-        selected_files,
-        runtime,
-    )
-    return [*selected_files, *openvino_companion_files, *content_route_candidates]
-
-
-def _huggingface_stream_preview_openvino_companion_names(
-    files: object,
-    selected_files: list[dict[str, Any]],
-    runtime: "_ScanRuntimeConfig",
-) -> set[str]:
-    """Return exact OpenVINO BIN companions intentionally suppressed from no-max previews."""
-    from .utils.sources import huggingface as huggingface_source
-
-    if runtime.scannable_scanner_ids is None:
-        return set()
-    selected_route_scanner_ids = {str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids}.intersection(
-        huggingface_source._get_hf_content_route_scanner_ids()
-    )
-    if selected_route_scanner_ids != {"openvino"}:
-        return set()
-
-    file_names = _huggingface_preview_file_names(files)
-    repo_file_set = set(file_names)
-    companion_names: set[str] = set()
-    for selected_name in _huggingface_preview_file_names(selected_files):
-        companion = huggingface_source._openvino_bin_companion_name(selected_name, file_names)
-        if companion is not None and companion in repo_file_set:
-            companion_names.add(companion)
-    return companion_names
-
-
-def _huggingface_stream_preview_unbudgeted_content_route_files(
-    metadata: dict[str, Any],
-    selected_files: list[dict[str, Any]],
-    runtime: "_ScanRuntimeConfig",
-) -> list[dict[str, Any]]:
-    """Return unselected files that make no-max stream dry-run coverage inconclusive."""
-    return _huggingface_stream_preview_content_route_candidate_files(metadata, selected_files, runtime)
-
-
-def _huggingface_stream_preview_content_route_candidate_files(
-    metadata: dict[str, Any],
-    selected_files: list[dict[str, Any]],
-    runtime: "_ScanRuntimeConfig",
-) -> list[dict[str, Any]]:
-    """Return unselected files that the streaming selector would content-probe."""
-    if runtime.hf_stream_include_all_files or not _huggingface_stream_preview_needs_content_route_budget(runtime):
-        return []
-
-    from .utils.sources import huggingface as huggingface_source
-
-    files = metadata.get("files", [])
-    file_names = _huggingface_preview_file_names(files)
-    openvino_companion_names = _huggingface_stream_preview_openvino_companion_names(files, selected_files, runtime)
-    selected_route_scanner_ids = (
-        {str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids}
-        if runtime.scannable_scanner_ids is not None
-        else None
-    )
-    selected_route_formats = huggingface_source._get_selected_hf_content_route_formats(
-        runtime.scannable_extensions,
-        runtime.scannable_filenames,
-    )
-    complete_safetensors_shard_files = huggingface_source._complete_hf_safetensors_shard_files(file_names)
-    candidates: list[dict[str, Any]] = []
-    for item in _huggingface_preview_unselected_files(files, selected_files):
-        name = item.get("name")
-        if not isinstance(name, str):
-            continue
-        if huggingface_source._is_huggingface_repo_bookkeeping_file(name):
-            continue
-        if name in openvino_companion_names:
-            continue
-        if huggingface_source._hf_safetensors_shard_excluded_by_selection(
-            name,
-            selected_route_scanner_ids,
-            selected_route_formats,
-            complete_safetensors_shard_files=complete_safetensors_shard_files,
-        ):
-            continue
-        candidates.append(item)
-    return candidates
-
-
-def _huggingface_preview_content_probe_bytes(item: dict[str, Any]) -> int:
-    """Return the bounded byte charge for a metadata-only content-route probe."""
-    from .utils.sources import huggingface as huggingface_source
-
-    size = _huggingface_preview_file_size(item)
-    if size is None:
-        return huggingface_source._HF_CONTENT_SNIFF_BYTES
-    return min(size, huggingface_source._HF_CONTENT_SNIFF_BYTES)
-
-
-def _huggingface_stream_preview_enforce_content_route_candidate_limit(
-    metadata: dict[str, Any],
-    selected_files: list[dict[str, Any]],
-    runtime: "_ScanRuntimeConfig",
-) -> None:
-    """Mirror the streaming selector's bounded content-probe candidate budgets."""
-    candidates = _huggingface_stream_preview_content_route_candidate_files(metadata, selected_files, runtime)
-    from .utils.sources import huggingface as huggingface_source
-
-    if len(candidates) > huggingface_source._HF_CONTENT_SNIFF_MAX_FILES:
-        repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
-        raise ValueError(
-            "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
-            f"for {repo_id} ({huggingface_source._HF_CONTENT_SNIFF_MAX_FILES} files)"
+        worker_result = _run_huggingface_worker_with_deadline(
+            "get_path_sizes",
+            {
+                "repo_id": repo_id,
+                "filenames": [filename],
+                "requested_revision": revision,
+                "resolved_revision": None,
+                "request_timeout": remaining_request_timeout(),
+            },
+            deadline,
+            repo_id,
         )
-    candidate_size = sum(_huggingface_preview_content_probe_bytes(item) for item in candidates)
-    if candidate_size > huggingface_source._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES:
-        repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
-        raise ValueError(
-            "Hugging Face selective filtering incomplete: skipped file inspection byte limit exceeded "
-            f"for {repo_id} ({huggingface_source._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES} bytes)"
-        )
+        value = worker_result.get("value")
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        resolved_revision = value.get("revision")
+        raw_sizes = value.get("sizes")
+        if not isinstance(raw_sizes, list):
+            raise RuntimeError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        file_size: int | None = None
+        found_file = False
+        for item in raw_sizes:
+            if not isinstance(item, dict) or item.get("path") != filename:
+                continue
+            found_file = True
+            raw_size = item.get("size")
+            file_size = (
+                raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+            )
+            break
+        if not found_file:
+            raise FileNotFoundError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        bounded_metadata: dict[str, Any] = {"size_bytes": file_size}
+        if isinstance(resolved_revision, str) and resolved_revision and resolved_revision != revision:
+            bounded_metadata["resolved_revision"] = resolved_revision
+        return bounded_metadata
+
+    api = HfApi()
+    repo_info_kwargs: dict[str, Any] = {"revision": revision, "files_metadata": False}
+    repo_info = api.repo_info(repo_id, **repo_info_kwargs)
+    resolved_revision = getattr(repo_info, "sha", None)
+    metadata_revision = resolved_revision if isinstance(resolved_revision, str) and resolved_revision else revision
+    paths_info_kwargs: dict[str, Any] = {"revision": metadata_revision}
+    paths_info = api.get_paths_info(repo_id, [filename], **paths_info_kwargs)
+    file_info = next((item for item in paths_info if getattr(item, "path", None) == filename), None)
+    if file_info is None:
+        raise FileNotFoundError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+
+    raw_size = getattr(file_info, "size", None)
+    size_bytes = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+    metadata: dict[str, Any] = {"size_bytes": size_bytes}
+    if isinstance(resolved_revision, str) and resolved_revision and resolved_revision != revision:
+        metadata["resolved_revision"] = resolved_revision
+    return metadata
 
 
-def _huggingface_preview_item_is_gated(item: dict[str, Any]) -> bool:
-    """Return whether Hugging Face metadata says this file is inaccessible."""
-    access = str(item.get("access") or "").lower()
-    inventory_status = str(item.get("inventory_status") or "").lower()
-    return (
-        bool(item.get("gated"))
-        or access in {"gated", "inaccessible", "gated_inaccessible"}
-        or "gated" in inventory_status
-    )
+def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
+    """Preview a direct Hugging Face file scan without downloading it."""
+    from .utils.sources.huggingface import _format_size, _is_huggingface_commit_sha, parse_huggingface_file_url
 
-
-def _huggingface_preview_reject_gated_files(
-    metadata: dict[str, Any],
-    selected_files: list[dict[str, Any]],
-) -> None:
-    """Fail closed when a dry-run-selected file would be blocked by Hub access."""
-    selected_names = _huggingface_preview_file_names(selected_files)
-    if not selected_names:
-        return
-
-    gated_names = {str(name) for name in metadata.get("inaccessible_gated_files", []) if isinstance(name, str) and name}
-    blocked_names: list[str] = []
-    for item in selected_files:
-        name = item.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        if name in gated_names or _huggingface_preview_item_is_gated(item):
-            blocked_names.append(name)
-
-    raw_gated_count = metadata.get("inaccessible_gated_file_count")
-    gated_count = raw_gated_count if isinstance(raw_gated_count, int) and not isinstance(raw_gated_count, bool) else 0
-    if (
-        not blocked_names
-        and str(metadata.get("inventory_status") or "").lower() == "gated_inaccessible"
-        and gated_count > 0
-    ):
-        blocked_names = selected_names
-
-    if blocked_names:
-        preview = ", ".join(blocked_names[:3])
-        if len(blocked_names) > 3:
-            preview = f"{preview}, ..."
-        raise ValueError(f"Selected Hugging Face files are gated/inaccessible ({preview}); refusing dry-run")
-
-
-def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return metadata entries the downloader can select without reading model bytes."""
-    files = metadata.get("files", [])
-    from .utils.sources import huggingface as huggingface_source
-
-    file_names = _huggingface_preview_file_names(files)
-    model_extensions = huggingface_source._get_model_extensions()
-    selected_names = huggingface_source._select_huggingface_model_files(
-        str(metadata.get("repo_id") or metadata.get("model_id") or "unknown"),
-        file_names,
-        str(metadata.get("revision") or ""),
-        model_extensions,
-        sniff_content=False,
-    )
-    selected_names = _huggingface_preview_include_openvino_companions(
-        file_names,
-        selected_names,
-        include_openvino_companions=True,
-    )
-    return _huggingface_preview_files_by_name(files, selected_names)
-
-
-def _huggingface_preview_stream_files(metadata: dict[str, Any], runtime: "_ScanRuntimeConfig") -> list[dict[str, Any]]:
-    """Return metadata entries that the streaming Hugging Face downloader would select."""
-    files = metadata.get("files", [])
-    if runtime.scanner_selection_metadata is not None and runtime.scannable_extensions is None:
-        return _selected_huggingface_preview_files(files, runtime)
-
-    return _huggingface_preview_stream_selection_files(metadata, runtime)
-
-
-def _huggingface_preview_stream_selection_files(
-    metadata: dict[str, Any],
-    runtime: "_ScanRuntimeConfig",
-) -> list[dict[str, Any]]:
-    """Return metadata entries selected by the streaming downloader without content probes."""
-    files = metadata.get("files", [])
-
-    file_names = _huggingface_preview_file_names(files)
-    repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
-    revision = str(metadata.get("revision") or "")
-
-    from .utils.sources import huggingface as huggingface_source
-
-    stream_kwargs: dict[str, Any] = {}
-    if runtime.scannable_extensions is not None:
-        stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
-    if runtime.scannable_filenames is not None:
-        stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
-    if runtime.scannable_scanner_ids is not None:
-        stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
-    if runtime.hf_stream_include_all_files:
-        stream_kwargs["include_all_files"] = True
-    selected_names = huggingface_source._select_streamable_hf_files(
-        repo_id,
-        file_names,
-        revision,
-        **stream_kwargs,
-        sniff_content=False,
-    )
-    return _huggingface_preview_files_by_name(files, selected_names)
-
-
-def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeConfig") -> list[dict[str, Any]]:
-    """Return filename-selected Hugging Face preview entries without probing file content."""
-    if not isinstance(files, list):
-        return []
-
-    extensions = None
-    if runtime.scannable_extensions is not None:
-        extensions = {str(extension).lower() for extension in runtime.scannable_extensions if str(extension)}
-    filenames = {str(filename).lower() for filename in runtime.scannable_filenames or ()}
-    scanner_route_ids = _huggingface_preview_scanner_route_ids(runtime)
-
-    selected: list[dict[str, Any]] = []
-    for item in files:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        name_lower = name.lower()
-        if extensions is None:
-            if runtime.scanner_selection_metadata is None or _huggingface_preview_filename_matches_scanner_route(
-                name,
-                scanner_route_ids,
-            ):
-                selected.append(item)
-            continue
-        if (
-            any(name_lower.endswith(extension) for extension in extensions)
-            or PurePosixPath(name_lower).name in filenames
-            or _huggingface_preview_filename_matches_scanner_route(name, scanner_route_ids)
-        ):
-            selected.append(item)
-    return selected
-
-
-def _scanner_selection_metadata_id_set(value: object) -> set[str]:
-    """Return normalized scanner IDs from scanner-selection metadata."""
-    if not isinstance(value, (list, tuple, set, frozenset)):
-        return set()
-    return {str(item).lower() for item in value if str(item)}
-
-
-def _huggingface_preview_scanner_route_ids(runtime: "_ScanRuntimeConfig") -> set[str]:
-    """Return scanner IDs whose registry routes may prove metadata-only HF previews."""
-    scanner_selection_metadata = getattr(runtime, "scanner_selection_metadata", None)
-    if scanner_selection_metadata is None:
-        return set()
-    enabled_scanners = _scanner_selection_metadata_id_set(scanner_selection_metadata.get("enabled_scanner_ids"))
-    requested_scanners = _scanner_selection_metadata_id_set(scanner_selection_metadata.get("requested_scanner_ids"))
-    return requested_scanners.intersection(enabled_scanners) if requested_scanners else enabled_scanners
-
-
-def _huggingface_preview_filename_matches_scanner_route(filename: str, scanner_ids: set[str]) -> bool:
-    """Return whether selected scanner metadata proves a Hugging Face filename route."""
-    if not scanner_ids:
-        return False
-
-    from .scanner_registry_metadata import get_scanner_registry_metadata
-
-    filename_lower = filename.lower()
-    basename = PurePosixPath(filename_lower).name
-    scanner_metadata = get_scanner_registry_metadata()
-    for scanner_id in scanner_ids:
-        scanner_info = scanner_metadata.get(scanner_id, {})
-        remote_excluded_extensions = {
-            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
-        }
-        for known_name in scanner_info.get("content_routed_filenames", ()):
-            if basename == str(known_name).lower():
-                return True
-        for prefix in scanner_info.get("content_routed_filename_prefixes", ()):
-            if basename.startswith(str(prefix).lower()):
-                return True
-        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
-            for extension in scanner_info.get(key, ()):
-                extension_text = str(extension).lower()
-                if (
-                    extension_text
-                    and extension_text not in remote_excluded_extensions
-                    and filename_lower.endswith(extension_text)
-                ):
-                    return True
-    return False
-
-
-def _huggingface_direct_preview_matches_exact_selected_scanner(
-    filename: str,
-    runtime: "_ScanRuntimeConfig",
-) -> bool:
-    """Allow exact-selected direct-file previews proven by scanner suffix metadata."""
-    if runtime.scanner_selection_metadata is None or runtime.scannable_extensions is not None:
-        return False
-
-    requested_scanners = _scanner_selection_metadata_id_set(
-        runtime.scanner_selection_metadata.get("requested_scanner_ids")
-    )
-    enabled_scanners = _scanner_selection_metadata_id_set(runtime.scanner_selection_metadata.get("enabled_scanner_ids"))
-    scanner_ids = requested_scanners.intersection(enabled_scanners)
-    return _huggingface_preview_filename_matches_scanner_route(filename, scanner_ids)
-
-
-def _huggingface_direct_preview_matches_metadata_route(filename: str, runtime: "_ScanRuntimeConfig") -> bool:
-    """Return whether a direct Hub file can be proven scannable from metadata alone."""
-    remote_path = PurePosixPath(filename)
-    name_lower = remote_path.name.lower()
-    filename_lower = filename.lower()
-
-    def text_like_route_is_proven() -> bool:
-        from .scanners.metadata_scanner import MetadataScanner
-        from .scanners.text_scanner import TextScanner
-
-        return TextScanner.can_handle(name_lower) or MetadataScanner.can_handle(name_lower)
-
-    text_like_extensions = {".txt", ".md", ".markdown", ".rst"}
-    suffix = remote_path.suffix.lower()
-    if suffix in text_like_extensions and not text_like_route_is_proven():
-        return False
-
-    if runtime.scanner_selection_metadata is not None:
-        filenames = {str(value).lower() for value in runtime.scannable_filenames or ()}
-        if name_lower in filenames:
-            return True
-        if runtime.scannable_extensions is not None:
-            extensions = {str(extension).lower() for extension in runtime.scannable_extensions if str(extension)}
-            return any(filename_lower.endswith(extension) for extension in extensions)
-        if _huggingface_direct_preview_matches_exact_selected_scanner(filename, runtime):
-            return True
-        requested_scanners = runtime.scanner_selection_metadata.get("requested_scanner_ids")
-        excluded_scanners = runtime.scanner_selection_metadata.get("excluded_scanner_ids")
-        if requested_scanners or not excluded_scanners:
-            return False
-        return _huggingface_preview_filename_matches_scanner_route(
-            filename,
-            _huggingface_preview_scanner_route_ids(runtime),
-        )
-
-    if runtime.skip_non_model_files and suffix in {".py", ".js", ".html", ".css"}:
-        return False
-    if text_like_route_is_proven():
-        return True
-
-    from .scanner_registry_metadata import get_scanner_registry_metadata
-
-    for scanner_info in get_scanner_registry_metadata().values():
-        for known_name in scanner_info.get("content_routed_filenames", ()):
-            if name_lower == str(known_name).lower():
-                return True
-
-    from .utils.sources import huggingface as huggingface_source
-
-    model_extensions = {str(extension).lower() for extension in huggingface_source._get_model_extensions() if extension}
-    return any(filename_lower.endswith(extension) for extension in model_extensions)
-
-
-def _preview_huggingface_file_source(
-    path: str,
-    runtime: "_ScanRuntimeConfig",
-    *,
-    err: bool = False,
-    max_size: int | None = None,
-) -> None:
-    """Print a no-download preview for a direct Hugging Face file URL."""
-    display_path = _display_path(path)
     repo_id, revision, filename = parse_huggingface_file_url(path)
-    metadata = get_huggingface_file_info(
+    file_metadata = _get_huggingface_file_metadata(repo_id, revision, filename, timeout_seconds=runtime.timeout)
+    size_bytes = file_metadata.get("size_bytes")
+    size_limit = runtime.max_download_bytes
+    if isinstance(size_limit, int) and not isinstance(size_limit, bool) and size_limit > 0:
+        resolved_revision = file_metadata.get("resolved_revision")
+        checked_revision = resolved_revision if isinstance(resolved_revision, str) else revision
+        if not _is_huggingface_commit_sha(checked_revision):
+            raise ValueError(
+                f"Unable to determine immutable revision for {_display_scan_path(path)}; refusing capped download"
+            )
+        if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
+            raise ValueError(f"Unable to determine file size for {_display_scan_path(path)}; refusing capped download")
+        if size_bytes > size_limit:
+            raise ValueError(
+                f"File size ({_format_size(size_bytes)}) exceeds maximum allowed size ({_format_size(size_limit)})"
+            )
+    return _build_huggingface_dry_run_preview(
         path,
-        max_size=_huggingface_preview_size_limit(max_size),
-        timeout_seconds=runtime.timeout,
+        runtime,
+        source_kind="file",
+        metadata={
+            "model_id": repo_id,
+            "revision": revision,
+            "filename": filename,
+            "total_size_bytes": size_bytes,
+            "human_size": _preview_size_text(size_bytes),
+            "metadata_only": True,
+            **file_metadata,
+        },
     )
-    preview_revision = str(metadata.get("resolved_revision") or revision)
-    if not _huggingface_direct_preview_matches_metadata_route(filename, runtime):
-        raise ValueError(
-            "Hugging Face direct-file dry-run cannot prove this file would be scanned from metadata; refusing dry-run"
-        )
-
-    _preview_echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:", err=err)
-    _preview_echo("   Type: Hugging Face file", err=err)
-    _preview_echo(f"   Repository: {_escape_terminal_text(repo_id)}", err=err)
-    _preview_echo(f"   Revision: {_escape_terminal_text(preview_revision)}", err=err)
-    _preview_echo(f"   File: {_escape_terminal_text(filename)}", err=err)
-    _preview_echo(f"   Size: {_format_preview_size(metadata.get('size'))}", err=err)
-    _preview_echo("   Download: skipped (--dry-run)", err=err)
-    _preview_echo("   Scan: skipped (--dry-run)", err=err)
-
-
-def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", *, err: bool = False) -> None:
-    """Print a no-download preview for a Hugging Face repository URL."""
-    display_path = _display_path(path)
-    max_download_bytes = _huggingface_preview_size_limit(runtime.max_download_bytes)
-    metadata = get_model_info(
-        path,
-        timeout_seconds=runtime.timeout,
-        include_metadata_files=True,
-        sniff_content=False,
-    )
-    if max_download_bytes is not None:
-        _require_huggingface_preview_immutable_revision(metadata)
-    files = metadata.get("files", [])
-    selected_files = (
-        _huggingface_preview_stream_files(metadata, runtime)
-        if runtime.scan_and_delete
-        else _selected_huggingface_preview_files(files, runtime)
-    )
-    if runtime.scan_and_delete and runtime.hf_stream_include_all_files:
-        _huggingface_preview_stream_selection_files(metadata, runtime)
-    if runtime.scanner_selection_metadata is not None and not selected_files:
-        raise ValueError("No metadata-routed Hugging Face files match the active scanner selection; refusing dry-run")
-    download_files: list[dict[str, Any]] | None = None
-    if not runtime.scan_and_delete:
-        download_files = _huggingface_preview_download_files(metadata)
-    if runtime.scanner_selection_metadata is None and not runtime.scan_and_delete and not download_files:
-        raise ValueError("No metadata-routed ModelAudit-scannable Hugging Face files found; refusing dry-run")
-    budget_files = (
-        _huggingface_stream_preview_budget_files(metadata, selected_files, runtime)
-        if runtime.scan_and_delete
-        else (download_files or selected_files)
-    )
-    _huggingface_preview_reject_gated_files(metadata, budget_files)
-    total_size = metadata.get("total_size")
-    budget_sizes = [_huggingface_preview_file_size(item) for item in budget_files]
-    budget_size = sum(size for size in budget_sizes if size is not None)
-    display_files = budget_files if runtime.scan_and_delete and max_download_bytes is not None else selected_files
-    display_sizes = [_huggingface_preview_file_size(item) for item in display_files]
-    display_size = sum(size for size in display_sizes if size is not None)
-    if runtime.scan_and_delete and max_download_bytes is not None:
-        _huggingface_stream_preview_enforce_content_route_candidate_limit(metadata, selected_files, runtime)
-    if max_download_bytes is not None and any(size is None for size in budget_sizes):
-        raise ValueError("Selected Hugging Face file sizes are unknown; refusing dry-run with max size")
-    if (
-        not runtime.scan_and_delete
-        and download_files is not None
-        and _huggingface_preview_has_uncertain_unselected_files(files, download_files)
-    ):
-        raise ValueError(
-            "Hugging Face dry-run cannot account for content-routed files without reading model bytes; refusing dry-run"
-        )
-    if (
-        runtime.scan_and_delete
-        and max_download_bytes is None
-        and _huggingface_stream_preview_unbudgeted_content_route_files(metadata, selected_files, runtime)
-    ):
-        raise ValueError(
-            "Hugging Face stream dry-run cannot account for content-routed files without --max-size "
-            "or reading model bytes; refusing dry-run"
-        )
-    if max_download_bytes is not None and budget_size > max_download_bytes:
-        raise ValueError(
-            f"Selected Hugging Face files total {budget_size} bytes exceeds max size {max_download_bytes} bytes"
-        )
-
-    _preview_echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:", err=err)
-    _preview_echo("   Type: Hugging Face repository", err=err)
-    _preview_echo(
-        f"   Model: {_escape_terminal_text(str(metadata.get('model_id') or metadata.get('repo_id') or 'unknown'))}",
-        err=err,
-    )
-    _preview_echo(f"   Files: {_escape_terminal_text(str(metadata.get('file_count', 0)))}", err=err)
-    _preview_echo(f"   Total size: {_format_preview_size(total_size)}", err=err)
-    if runtime.scannable_extensions is not None or runtime.scannable_filenames is not None:
-        _preview_echo(f"   Scannable files: {len(display_files)} of {metadata.get('file_count', 0)}", err=err)
-        _preview_echo(f"   Scannable size: {_format_preview_size(display_size)}", err=err)
-    if runtime.scan_and_delete:
-        _preview_echo("   Mode: Streaming", err=err)
-    if runtime.scanner_selection_metadata is not None:
-        enabled = runtime.scanner_selection_metadata.get("enabled_scanner_ids", [])
-        _preview_echo(f"   Enabled scanners: {', '.join(str(scanner) for scanner in enabled)}", err=err)
-    _preview_echo("   Download: skipped (--dry-run)", err=err)
-    _preview_echo("   Scan: skipped (--dry-run)", err=err)
 
 
 class _OutputWriteError(click.ClickException):
@@ -2042,9 +1678,9 @@ class _ScanPathState:
     """Bookkeeping for scanned artifacts and deferred cleanup."""
 
     collect_dvc_coverage: bool = False
+    dry_run_previews: list[dict[str, Any]] = field(default_factory=list)
     scanned_paths: list[str] = field(default_factory=list)
     temp_cleanup_entries: list[tuple[str, bool]] = field(default_factory=list)
-    dry_run_preview_count: int = 0
     sbom_paths_resolved: bool = False
     dvc_covered_paths: set[str] = field(default_factory=set)
     dvc_covered_directories: set[str] = field(default_factory=set)
@@ -2057,9 +1693,20 @@ class _ScanPathState:
         self.has_errors_outside_reconciled_shards = True
         audit_result.has_errors = True
 
-    def mark_dry_run_preview(self) -> None:
-        """Record one path whose dry-run intentionally skipped download and scan."""
-        self.dry_run_preview_count += 1
+    def record_dry_run_preview(self, preview: dict[str, Any]) -> None:
+        """Record a source that was previewed without scanning."""
+        self.dry_run_previews.append(preview)
+
+    def has_no_scan_content(self, audit_result: ModelAuditResultModel) -> bool:
+        """Return whether no scanner populated the aggregate result."""
+        return (
+            audit_result.files_scanned == 0
+            and audit_result.bytes_scanned == 0
+            and not audit_result.issues
+            and not audit_result.checks
+            and not audit_result.assets
+            and not audit_result.scanner_names
+        )
 
     def record_non_shard_result_errors(self, scan_result: ModelAuditResultModel) -> None:
         """Preserve errors from results that cannot join final CLI shard reconciliation."""
@@ -2205,11 +1852,11 @@ class _ScanPathState:
 _HF_ACQUISITION_ERROR_REASON = "huggingface_acquisition_error"
 _HF_ACQUISITION_BLOCKED_REASON = "huggingface_acquisition_blocked"
 _HF_AUTH_BLOCKED_MARKERS = (
-    "gated/inaccessible",
-    "gated_inaccessible",
     "gatedrepoerror",
     "gated repo",
     "gated repository",
+    "gated/inaccessible",
+    "gated_inaccessible",
     "401",
     "403",
     "unauthorized",
@@ -2955,6 +2602,9 @@ def _configure_scan_logging(verbose: bool) -> None:
     logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
     logging.getLogger("modelaudit.utils.helpers.secure_hasher").setLevel(logging.WARNING)
     logging.getLogger("modelaudit.cache.cache_manager").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub.utils._http").setLevel(logging.WARNING)
 
 
 def _initialize_progress_tracking(
@@ -3128,6 +2778,23 @@ def _emit_scan_output(
     click.echo(output_text)
 
 
+def _emit_huggingface_dry_run_output(
+    output_text: str,
+    *,
+    output: str | None,
+    output_format: str,
+) -> None:
+    """Write dry-run preview output without scan-result summaries."""
+    if output:
+        _write_output_text_file(output, output_text)
+        click.echo(f"Preview written to {_display_path(output)}")
+        return
+
+    if output_format == "text":
+        click.echo("\n" + "─" * 80)
+    click.echo(output_text)
+
+
 def _format_scanner_catalog(output_format: str) -> str:
     """Render registered scanners for CLI discovery."""
     scanners = scanner_catalog()
@@ -3194,13 +2861,7 @@ def _record_suppressed_preferred_scanners(audit_result: ModelAuditResultModel) -
     return suppressions
 
 
-def _record_scan_end_and_exit(
-    audit_result: ModelAuditResultModel,
-    scan_start_time: float,
-    *,
-    dry_run: bool = False,
-    dry_run_preview_only: bool = False,
-) -> NoReturn:
+def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_time: float) -> NoReturn:
     """Record final telemetry and exit with the scan result's status code."""
     scan_duration = time.time() - scan_start_time
     try:
@@ -3216,24 +2877,6 @@ def _record_scan_end_and_exit(
     finally:
         flush_telemetry()
 
-    if (
-        dry_run
-        and dry_run_preview_only
-        and audit_result.files_scanned == 0
-        and not audit_result.has_errors
-        and not audit_result.issues
-        and audit_result.success is not False
-    ):
-        sys.exit(0)
-    if (
-        dry_run
-        and not dry_run_preview_only
-        and audit_result.files_scanned == 0
-        and not audit_result.has_errors
-        and not audit_result.issues
-        and audit_result.success is not False
-    ):
-        sys.exit(2)
     sys.exit(determine_exit_code(audit_result))
 
 
@@ -3543,16 +3186,19 @@ def _resolve_scan_source_for_path(
         display_path = _display_path(path)
         if dry_run:
             try:
-                _preview_huggingface_file_source(
-                    path,
-                    runtime,
-                    err=not runtime.show_styled_output,
-                    max_size=runtime.max_download_bytes,
+                preview = _build_huggingface_file_dry_run_preview(path, runtime)
+                source_model_id, source_model_source = extract_model_id_from_path(path)
+                path_state.record_dry_run_preview(preview)
+                return _SourceDispatchResult(
+                    actual_path=path,
+                    local_scan_required=False,
+                    source_model_id=source_model_id,
+                    source_model_source=source_model_source,
                 )
-                path_state.mark_dry_run_preview()
             except Exception as exc:
                 error_msg = _display_error(exc, path)
-                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
+                logger.error(f"Failed to preview Hugging Face file {display_path}: {error_msg}")
+                click.echo(f"Error previewing file from {display_path}: {error_msg}", err=True)
                 _record_huggingface_acquisition_error(
                     audit_result,
                     path_state,
@@ -3560,7 +3206,6 @@ def _resolve_scan_source_for_path(
                     error_msg=error_msg,
                 )
                 return None
-            return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
         download_spinner = None
         temp_dir = None
@@ -3636,18 +3281,26 @@ def _resolve_scan_source_for_path(
         display_path = _display_path(path)
         if dry_run:
             try:
-                _preview_huggingface_model_source(path, runtime, err=not runtime.show_styled_output)
-                path_state.mark_dry_run_preview()
+                preview = _build_huggingface_model_dry_run_preview(path, runtime)
+                source_model_id, source_model_source = extract_model_id_from_path(path)
+                path_state.record_dry_run_preview(preview)
+                return _SourceDispatchResult(
+                    actual_path=path,
+                    local_scan_required=False,
+                    source_model_id=source_model_id,
+                    source_model_source=source_model_source,
+                )
             except Exception as exc:
                 error_msg = _display_error(exc, path)
-                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
+                logger.error(f"Failed to preview Hugging Face model {display_path}: {error_msg}")
+                click.echo(f"Error previewing model from {display_path}: {error_msg}", err=True)
                 _record_huggingface_acquisition_error(
                     audit_result,
                     path_state,
                     path=path,
                     error_msg=error_msg,
                 )
-            return _SourceDispatchResult(actual_path=path, local_scan_required=False)
+                return None
 
         hf_stream_kwargs: dict[str, Any] = {}
         if runtime.scan_and_delete:
@@ -3664,6 +3317,7 @@ def _resolve_scan_source_for_path(
             hf_preview_kwargs.update(hf_stream_kwargs)
             hf_preview_kwargs["streaming_selection"] = True
             hf_preview_kwargs.setdefault("include_all_files", False)
+
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
@@ -4000,23 +3654,17 @@ def _resolve_scan_source_for_path(
             from .utils.sources.cloud_storage import analyze_cloud_target
 
             try:
-                preview_err = not runtime.show_styled_output
                 metadata = asyncio.run(analyze_cloud_target(path))
-                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:", err=preview_err)
-                click.echo(f"   Type: {metadata['type']}", err=preview_err)
+                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
+                click.echo(f"   Type: {metadata['type']}")
 
                 if metadata["type"] == "file":
-                    click.echo(f"   Size: {metadata.get('human_size', 'unknown')}", err=preview_err)
-                    click.echo(
-                        f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}", err=preview_err
-                    )
+                    click.echo(f"   Size: {metadata.get('human_size', 'unknown')}")
+                    click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
                 elif metadata["type"] == "directory":
-                    click.echo(f"   Files: {metadata.get('file_count', 0)}", err=preview_err)
-                    click.echo(f"   Total size: {metadata.get('human_size', 'unknown')}", err=preview_err)
-                    click.echo(
-                        f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}",
-                        err=preview_err,
-                    )
+                    click.echo(f"   Files: {metadata.get('file_count', 0)}")
+                    click.echo(f"   Total size: {metadata.get('human_size', 'unknown')}")
+                    click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
 
                     if runtime.selective_download:
                         from .utils.sources.cloud_storage import filter_scannable_files
@@ -4026,10 +3674,7 @@ def _resolve_scan_source_for_path(
                             scannable_extensions=runtime.scannable_extensions,
                             scannable_filenames=runtime.scannable_filenames,
                         )
-                        click.echo(
-                            f"   Scannable files: {len(scannable)} of {metadata.get('file_count', 0)}",
-                            err=preview_err,
-                        )
+                        click.echo(f"   Scannable files: {len(scannable)} of {metadata.get('file_count', 0)}")
 
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
@@ -4929,6 +4574,22 @@ def scan_command(
     record_scan_started(list(paths), telemetry_options)
 
     expanded_paths = _resolve_scan_paths(paths, scan_start_time)
+    huggingface_preview_paths: list[str] = []
+    if dry_run:
+        huggingface_preview_paths = [path for path in expanded_paths if _is_huggingface_dry_run_preview_path(path)]
+        if huggingface_preview_paths and len(huggingface_preview_paths) != len(expanded_paths):
+            non_preview_paths = [
+                _display_path(path) for path in expanded_paths if not _is_huggingface_dry_run_preview_path(path)
+            ]
+            click.echo(
+                "Error: Hugging Face dry-run previews cannot be combined with paths that require scanning: "
+                f"{', '.join(non_preview_paths)}",
+                err=True,
+            )
+            record_scan_failed(time.time() - scan_start_time, "Mixed Hugging Face dry-run preview inputs")
+            flush_telemetry()
+            sys.exit(2)
+
     runtime = _resolve_scan_runtime_config(
         expanded_paths,
         format=format,
@@ -4949,6 +4610,14 @@ def scan_command(
         severity=severity,
         scan_start_time=scan_start_time,
     )
+    if dry_run and huggingface_preview_paths and runtime.output_format == "sarif":
+        click.echo(
+            "Error: Hugging Face dry-run previews support text or json output, not sarif",
+            err=True,
+        )
+        record_scan_failed(time.time() - scan_start_time, "Unsupported Hugging Face dry-run preview output")
+        flush_telemetry()
+        sys.exit(2)
     _show_scan_runtime_defaults(
         runtime,
         expanded_paths,
@@ -5057,6 +4726,32 @@ def scan_command(
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
 
+    if dry_run and huggingface_preview_paths and path_state.has_no_scan_content(audit_result):
+        try:
+            try:
+                if audit_result.has_errors:
+                    record_scan_failed(time.time() - scan_start_time, "Dry-run preview completed with errors")
+                    flush_telemetry()
+                    sys.exit(2)
+                if path_state.dry_run_previews:
+                    output_text = _format_huggingface_dry_run_previews(
+                        path_state.dry_run_previews, runtime.output_format
+                    )
+                    _emit_huggingface_dry_run_output(
+                        output_text,
+                        output=output,
+                        output_format=runtime.output_format,
+                    )
+            finally:
+                _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
+        except _OutputWriteError:
+            record_scan_failed(time.time() - scan_start_time, "Unable to write scan output")
+            flush_telemetry()
+            raise
+        record_scan_completed(time.time() - scan_start_time, {"dry_run": True, "previews": path_state.dry_run_previews})
+        flush_telemetry()
+        sys.exit(0)
+
     try:
         try:
             _write_scan_sbom(
@@ -5090,14 +4785,7 @@ def scan_command(
         flush_telemetry()
         raise
 
-    _record_scan_end_and_exit(
-        audit_result,
-        scan_start_time,
-        dry_run=dry_run,
-        dry_run_preview_only=dry_run
-        and path_state.dry_run_preview_count > 0
-        and path_state.dry_run_preview_count == len(expanded_paths),
-    )
+    _record_scan_end_and_exit(audit_result, scan_start_time)
 
 
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
