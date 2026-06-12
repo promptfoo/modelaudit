@@ -468,6 +468,8 @@ type CallableInvocationDedupeKey = (
     String,
     String,
     Option<usize>,
+    Option<usize>,
+    Option<usize>,
     Option<bool>,
     Option<Vec<String>>,
 );
@@ -503,6 +505,111 @@ fn pending_global_import_finding_content_bytes(finding: &PendingGlobalImportFind
         })
 }
 
+fn is_builtin_getattr_reference(reference: &GlobalRef) -> bool {
+    matches!(
+        (reference.module.as_str(), reference.name.as_str()),
+        ("builtins" | "__builtin__" | "__builtins__", "getattr")
+    )
+}
+
+fn direct_literal_text(value: &StackValue, payload: &[u8], max_bytes: usize) -> Option<String> {
+    match value {
+        StackValue::Text {
+            value,
+            memo_read: false,
+        } if value.len() <= max_bytes => Some(value.clone()),
+        StackValue::TextSpan {
+            start,
+            end,
+            memo_read: false,
+        } if start <= end && *end <= payload.len() && end.saturating_sub(*start) <= max_bytes => {
+            Some(String::from_utf8_lossy(&payload[*start..*end]).to_string())
+        }
+        _ => None,
+    }
+}
+
+fn stack_value_memo_read(value: Option<&StackValue>) -> bool {
+    match value {
+        Some(StackValue::Text { memo_read, .. } | StackValue::TextSpan { memo_read, .. }) => {
+            *memo_read
+        }
+        Some(StackValue::Global(reference) | StackValue::Constructed(reference)) => {
+            reference.memo_read
+        }
+        _ => false,
+    }
+}
+
+fn safe_static_getattr_attribute(attribute_name: &str) -> bool {
+    let mut chars = attribute_name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn static_getattr_reconstruction_details(
+    reconstruction: &StaticGetattrReconstruction,
+) -> Vec<(String, DetailValue)> {
+    let mut details = vec![
+        (
+            "getattr_reconstruction".to_string(),
+            DetailValue::Bool(true),
+        ),
+        (
+            "getattr_target_module".to_string(),
+            DetailValue::String(reconstruction.target.module.clone()),
+        ),
+        (
+            "getattr_target_name".to_string(),
+            DetailValue::String(reconstruction.target.name.clone()),
+        ),
+        (
+            "getattr_target_import_reference".to_string(),
+            DetailValue::String(reconstruction.target.symbol()),
+        ),
+        (
+            "getattr_target_global_position".to_string(),
+            DetailValue::UInt(reconstruction.target.position as u64),
+        ),
+        (
+            "getattr_attribute_name".to_string(),
+            DetailValue::String(reconstruction.attribute_name.clone()),
+        ),
+        (
+            "getattr_attribute_is_safe_identifier".to_string(),
+            DetailValue::Bool(reconstruction.attribute_is_safe_identifier),
+        ),
+        (
+            "getattr_callable_is_direct".to_string(),
+            DetailValue::Bool(reconstruction.callable_is_direct),
+        ),
+        (
+            "getattr_target_is_direct".to_string(),
+            DetailValue::Bool(reconstruction.target_is_direct),
+        ),
+    ];
+    if let Some(resolved) = &reconstruction.resolved {
+        details.extend([
+            (
+                "getattr_resolved_module".to_string(),
+                DetailValue::String(resolved.module.clone()),
+            ),
+            (
+                "getattr_resolved_name".to_string(),
+                DetailValue::String(resolved.name.clone()),
+            ),
+            (
+                "getattr_resolved_import_reference".to_string(),
+                DetailValue::String(resolved.symbol()),
+            ),
+        ]);
+    }
+    details
+}
+
 #[derive(Clone)]
 struct CallableInvocation {
     reference: GlobalRef,
@@ -512,6 +619,15 @@ struct CallableInvocation {
     build_uses_slot_state: Option<bool>,
     keyword_arg_names: Option<Vec<String>>,
     args: Vec<StackValue>,
+}
+
+struct StaticGetattrReconstruction {
+    target: GlobalRef,
+    attribute_name: String,
+    attribute_is_safe_identifier: bool,
+    callable_is_direct: bool,
+    target_is_direct: bool,
+    resolved: Option<GlobalRef>,
 }
 
 struct DynamicTypeCallableAttribute {
@@ -992,7 +1108,7 @@ impl<'a> ScanState<'a> {
             return false;
         }
 
-        let stack_value = Self::memo_value_for_stack(index, &value);
+        let stack_value = Self::memo_value_for_stack(index, &value, false);
         self.tracked_state_bytes = projected_state_bytes;
         self.replace_top_stack_value_with_tracked_cost(stack_value, 0, "memo_stack_reference");
         self.memo.insert(index, value);
@@ -1008,7 +1124,9 @@ impl<'a> ScanState<'a> {
             return MAX_TRACKED_STATE_BYTES.saturating_add(1);
         }
         match value {
-            StackValue::Text(value) | StackValue::StringTemplate { template: value } => value.len(),
+            StackValue::Text { value, .. } | StackValue::StringTemplate { template: value } => {
+                value.len()
+            }
             StackValue::Global(reference)
             | StackValue::Constructed(reference)
             | StackValue::DefaultDict {
@@ -1099,7 +1217,7 @@ impl<'a> ScanState<'a> {
             StackValue::Tuple(values) => values
                 .iter()
                 .any(Self::tracked_dict_value_is_security_relevant),
-            StackValue::Text(_)
+            StackValue::Text { .. }
             | StackValue::TextSpan { .. }
             | StackValue::Bytes { .. }
             | StackValue::Primitive { .. }
@@ -1564,7 +1682,7 @@ impl<'a> ScanState<'a> {
                     if let Some(value) = self
                         .memo
                         .get(&index)
-                        .map(|value| Self::memo_value_for_stack(index, value))
+                        .map(|value| Self::memo_value_for_stack(index, value, true))
                     {
                         let cost = Self::stack_value_state_cost(&value);
                         self.push_stack_value_with_tracked_cost(value, cost, "memo_stack_value");
@@ -1580,6 +1698,8 @@ impl<'a> ScanState<'a> {
                     name,
                     position,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 };
                 self.push_stack_value(StackValue::Global(reference.clone()));
                 self.record_global_ref(&reference, opcode.name);
@@ -1598,6 +1718,8 @@ impl<'a> ScanState<'a> {
                     name: format!("code_{}", extension_code),
                     position,
                     malformed: true,
+                    memo_index: None,
+                    memo_read: false,
                 };
                 self.push_stack_value(StackValue::Global(reference.clone()));
                 self.add_finding(Finding {
@@ -1786,6 +1908,10 @@ impl<'a> ScanState<'a> {
                                     "global_position".to_string(),
                                     DetailValue::UInt(callable_ref.position as u64),
                                 ),
+                                (
+                                    "opcode_position".to_string(),
+                                    DetailValue::UInt(position as u64),
+                                ),
                             ],
                             why: Some(
                                 "This pickle opcode can invoke attacker-controlled callables during deserialization.",
@@ -1933,14 +2059,14 @@ impl<'a> ScanState<'a> {
                 self.push_stack_value(StackValue::Other);
                 return;
             }
-            let stack_value = Self::memo_value_for_stack(index, &shared);
+            let stack_value = Self::memo_value_for_stack(index, &shared, false);
             self.push_stack_value_with_tracked_cost(stack_value, 0, "memo_stack_reference");
         } else {
             let stack_value = match value {
                 StackValue::TrackedDict {
                     memo_index: Some(index),
                     ..
-                } => Self::memo_value_for_stack(index, &value),
+                } => Self::memo_value_for_stack(index, &value, false),
                 _ => value,
             };
             let cost = Self::stack_value_state_cost(&stack_value);
@@ -2300,6 +2426,8 @@ impl<'a> ScanState<'a> {
                     name,
                     position,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 };
                 self.record_global_ref(&reference, opcode.name);
                 self.push_stack_value(StackValue::Constructed(reference.clone()));
@@ -4457,17 +4585,16 @@ impl<'a> ScanState<'a> {
     fn is_format_string_argument(value: Option<&StackValue>) -> bool {
         matches!(
             value,
-            Some(StackValue::Text(_) | StackValue::TextSpan { .. })
+            Some(StackValue::Text { .. } | StackValue::TextSpan { .. })
         )
     }
 
     fn is_definitely_non_empty_iterable_argument(value: Option<&StackValue>) -> bool {
         match value {
             Some(StackValue::Tuple(items)) => !items.is_empty(),
-            Some(StackValue::Text(value)) => !value.is_empty(),
-            Some(StackValue::TextSpan { start, end }) | Some(StackValue::Bytes { start, end }) => {
-                start < end
-            }
+            Some(StackValue::Text { value, .. }) => !value.is_empty(),
+            Some(StackValue::TextSpan { start, end, .. })
+            | Some(StackValue::Bytes { start, end }) => start < end,
             _ => false,
         }
     }
@@ -4983,6 +5110,8 @@ impl<'a> ScanState<'a> {
             name: format!("{}.{}", reference.name, method_name),
             position: reference.position,
             malformed: reference.malformed,
+            memo_index: reference.memo_index,
+            memo_read: reference.memo_read,
         }
     }
 
@@ -5005,6 +5134,14 @@ impl<'a> ScanState<'a> {
             StackValue::FutureCallbacks(mut callbacks) => {
                 callbacks.memo_index = Some(index);
                 StackValue::FutureCallbacks(callbacks)
+            }
+            StackValue::Global(mut reference) => {
+                reference.memo_index = Some(index);
+                StackValue::Global(reference)
+            }
+            StackValue::Constructed(mut reference) => {
+                reference.memo_index = Some(index);
+                StackValue::Constructed(reference)
             }
             StackValue::DynamicType { type_name, .. } => StackValue::DynamicType {
                 type_name,
@@ -5038,7 +5175,7 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn memo_value_for_stack(index: i64, value: &StackValue) -> StackValue {
+    fn memo_value_for_stack(index: i64, value: &StackValue, memo_read: bool) -> StackValue {
         match value {
             StackValue::TrackedDict {
                 unknown_key_values_overflowed,
@@ -5058,6 +5195,81 @@ impl<'a> ScanState<'a> {
                 callbacks.memo_index = Some(index);
                 StackValue::FutureCallbacks(callbacks)
             }
+            StackValue::Global(reference) => {
+                let mut reference = reference.clone();
+                reference.memo_index = Some(index);
+                reference.memo_read |= memo_read;
+                StackValue::Global(reference)
+            }
+            StackValue::Constructed(reference) => {
+                let mut reference = reference.clone();
+                reference.memo_index = Some(index);
+                reference.memo_read |= memo_read;
+                StackValue::Constructed(reference)
+            }
+            StackValue::Text {
+                value,
+                memo_read: existing_memo_read,
+            } => StackValue::Text {
+                value: value.clone(),
+                memo_read: *existing_memo_read || memo_read,
+            },
+            StackValue::TextSpan {
+                start,
+                end,
+                memo_read: existing_memo_read,
+            } => StackValue::TextSpan {
+                start: *start,
+                end: *end,
+                memo_read: *existing_memo_read || memo_read,
+            },
+            StackValue::Tuple(values) => StackValue::Tuple(
+                values
+                    .iter()
+                    .map(|item| Self::memo_read_stack_value(item, memo_read))
+                    .collect(),
+            ),
+            value => value.clone(),
+        }
+    }
+
+    fn memo_read_stack_value(value: &StackValue, memo_read: bool) -> StackValue {
+        if !memo_read {
+            return value.clone();
+        }
+        match value {
+            StackValue::Global(reference) => {
+                let mut reference = reference.clone();
+                reference.memo_read = true;
+                StackValue::Global(reference)
+            }
+            StackValue::Constructed(reference) => {
+                let mut reference = reference.clone();
+                reference.memo_read = true;
+                StackValue::Constructed(reference)
+            }
+            StackValue::Text {
+                value,
+                memo_read: existing_memo_read,
+            } => StackValue::Text {
+                value: value.clone(),
+                memo_read: *existing_memo_read || memo_read,
+            },
+            StackValue::TextSpan {
+                start,
+                end,
+                memo_read: existing_memo_read,
+            } => StackValue::TextSpan {
+                start: *start,
+                end: *end,
+                memo_read: *existing_memo_read || memo_read,
+            },
+            StackValue::Tuple(values) => StackValue::Tuple(
+                values
+                    .iter()
+                    .map(|item| Self::memo_read_stack_value(item, memo_read))
+                    .collect(),
+            ),
             value => value.clone(),
         }
     }
@@ -5163,7 +5375,65 @@ impl<'a> ScanState<'a> {
             self.push_stack_value(future);
             return;
         }
+        if let Some(resolved) = self.static_getattr_reconstruction_result(values) {
+            self.push_stack_value(StackValue::Global(resolved));
+            return;
+        }
         self.push_constructed_result(values.first());
+    }
+
+    fn static_getattr_reconstruction_result(&self, values: &[StackValue]) -> Option<GlobalRef> {
+        let Some(StackValue::Global(callable)) = values.first() else {
+            return None;
+        };
+        let arguments = Self::tuple_argument_values(values.get(1))?;
+        self.static_getattr_reconstruction(callable, "REDUCE", &arguments)
+            .and_then(|reconstruction| reconstruction.resolved)
+    }
+
+    fn static_getattr_reconstruction(
+        &self,
+        callable: &GlobalRef,
+        op_name: &'static str,
+        arguments: &[StackValue],
+    ) -> Option<StaticGetattrReconstruction> {
+        if op_name != "REDUCE" || callable.malformed || !is_builtin_getattr_reference(callable) {
+            return None;
+        }
+        let [target_value, attribute_value] = arguments else {
+            return None;
+        };
+        let StackValue::Global(target) = target_value else {
+            return None;
+        };
+        if target.malformed {
+            return None;
+        }
+        let attribute_name = direct_literal_text(
+            attribute_value,
+            self.payload,
+            self.options.max_string_literal_scan_chars,
+        )?;
+        let attribute_is_safe_identifier = safe_static_getattr_attribute(&attribute_name);
+        let callable_is_direct = !callable.memo_read;
+        let target_is_direct = !target.memo_read;
+        let resolved = (attribute_is_safe_identifier && callable_is_direct && target_is_direct)
+            .then(|| GlobalRef {
+                module: target.module.clone(),
+                name: format!("{}.{}", target.name, attribute_name),
+                position: target.position,
+                malformed: false,
+                memo_index: None,
+                memo_read: false,
+            });
+        Some(StaticGetattrReconstruction {
+            target: target.clone(),
+            attribute_name,
+            attribute_is_safe_identifier,
+            callable_is_direct,
+            target_is_direct,
+            resolved,
+        })
     }
 
     fn dynamic_type_result(&self, values: &[StackValue]) -> Option<StackValue> {
@@ -5534,7 +5804,10 @@ impl<'a> ScanState<'a> {
             }
             result.push_str(&item);
         }
-        Some(StackValue::Text(result))
+        Some(StackValue::Text {
+            value: result,
+            memo_read: false,
+        })
     }
 
     fn stack_value_tuple_index(value: &StackValue, len: usize) -> Option<usize> {
@@ -5795,6 +6068,8 @@ impl<'a> ScanState<'a> {
                         .unwrap_or_else(|| "__dynamic__".to_string()),
                     position: 0,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 }));
             }
             _ => self.push_stack_value(StackValue::Other),
@@ -5807,6 +6082,8 @@ impl<'a> ScanState<'a> {
         name_value: Option<StackValue>,
         position: usize,
     ) -> GlobalRef {
+        let memo_read = stack_value_memo_read(module_value.as_ref())
+            || stack_value_memo_read(name_value.as_ref());
         let module = resolve_global_operand(module_value.as_ref(), self.payload);
         let name = resolve_global_operand(name_value.as_ref(), self.payload);
 
@@ -5816,6 +6093,8 @@ impl<'a> ScanState<'a> {
                 name,
                 position,
                 malformed: false,
+                memo_index: None,
+                memo_read,
             },
             (module, name) => {
                 let malformed = GlobalRef {
@@ -5823,6 +6102,8 @@ impl<'a> ScanState<'a> {
                     name: name.unwrap_or_else(|| "__unknown__".to_string()),
                     position,
                     malformed: true,
+                    memo_index: None,
+                    memo_read,
                 };
                 self.add_finding(Finding {
                     message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution"
@@ -6617,7 +6898,10 @@ impl<'a> ScanState<'a> {
         let persistent_id = if opcode.name == "BINPERSID" {
             self.pop_stack_value()
         } else {
-            Some(StackValue::Text(opcode.arg.coerce_text(self.payload)))
+            Some(StackValue::Text {
+                value: opcode.arg.coerce_text(self.payload),
+                memo_read: false,
+            })
         };
         self.push_stack_value(StackValue::Other);
         let storage_descriptor = persistent_id
@@ -6826,6 +7110,10 @@ impl<'a> ScanState<'a> {
             invocation.reference.module.clone(),
             invocation.reference.name.clone(),
             invocation.op_name.to_string(),
+            is_builtin_getattr_reference(&invocation.reference)
+                .then_some(invocation.reference.position),
+            is_builtin_getattr_reference(&invocation.reference)
+                .then_some(invocation.opcode_position),
             invocation.positional_arg_count,
             invocation.build_uses_slot_state,
             invocation.keyword_arg_names.clone(),
@@ -6892,6 +7180,13 @@ impl<'a> ScanState<'a> {
                     ),
                 ));
             }
+        }
+        if let Some(reconstruction) = self.static_getattr_reconstruction(
+            &invocation.reference,
+            invocation.op_name,
+            &invocation.args,
+        ) {
+            details.extend(static_getattr_reconstruction_details(&reconstruction));
         }
         self.callable_invocations.push(details);
     }
@@ -7828,6 +8123,18 @@ impl<'a> ScanState<'a> {
             return None;
         }
         let opcode = detail_string(details, "opcode")?;
+        let global_position = matches!(
+            (module.as_str(), name.as_str()),
+            ("builtins" | "__builtin__" | "__builtins__", "getattr")
+        )
+        .then(|| detail_usize(details, "global_position"))
+        .flatten();
+        let opcode_position = matches!(
+            (module.as_str(), name.as_str()),
+            ("builtins" | "__builtin__" | "__builtins__", "getattr")
+        )
+        .then(|| detail_usize(details, "opcode_position"))
+        .flatten();
         let positional_arg_count = detail_usize(details, "positional_arg_count");
         let build_uses_slot_state = details.iter().find_map(|(key, value)| {
             if key != "build_uses_slot_state" {
@@ -7857,6 +8164,8 @@ impl<'a> ScanState<'a> {
             module,
             name,
             opcode,
+            global_position,
+            opcode_position,
             positional_arg_count,
             build_uses_slot_state,
             keyword_arg_names,
@@ -8110,8 +8419,11 @@ fn nested_scan_has_only_allowlisted_constructor_refs(scan: &ScanState<'_>) -> bo
 
 fn post_budget_owned_stack_value(value: &StackValue, payload: &[u8]) -> StackValue {
     match value {
-        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
-            StackValue::Text(String::from_utf8_lossy(&payload[*start..*end]).to_string())
+        StackValue::TextSpan { start, end, .. } if start <= end && *end <= payload.len() => {
+            StackValue::Text {
+                value: String::from_utf8_lossy(&payload[*start..*end]).to_string(),
+                memo_read: false,
+            }
         }
         StackValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
             StackValue::Bytes {
@@ -8287,6 +8599,8 @@ mod tests {
                     name: "help".to_string(),
                     position: 0,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 }),
             )],
             unknown_key_values: Vec::new(),
@@ -8403,6 +8717,8 @@ mod tests {
                     name: "call".to_string(),
                     position: 0,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 }),
             );
             scan.pop_stack_value();
@@ -8514,6 +8830,8 @@ mod tests {
                     name: "call".to_string(),
                     position: 0,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 }),
             );
         }
@@ -8569,6 +8887,8 @@ mod tests {
                 name: "system".to_string(),
                 position: 0,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             },
         });
         let mapping = StackValue::MappingWrapper {
@@ -8577,6 +8897,8 @@ mod tests {
                 name: "ChainMap".to_string(),
                 position: 0,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             },
             mappings,
         };
@@ -8626,6 +8948,8 @@ mod tests {
                 name: "ChainMap".to_string(),
                 position: 0,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             },
             mappings: vec![
                 first_mapping,
@@ -8635,6 +8959,8 @@ mod tests {
                         name: "system".to_string(),
                         position: 0,
                         malformed: false,
+                        memo_index: None,
+                        memo_read: false,
                     },
                 },
             ],
@@ -8667,6 +8993,8 @@ mod tests {
                 name: "ChainMap".to_string(),
                 position: 0,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             },
             mappings: vec![
                 StackValue::TrackedDict {
@@ -8681,6 +9009,8 @@ mod tests {
                         name: "system".to_string(),
                         position: 0,
                         malformed: false,
+                        memo_index: None,
+                        memo_read: false,
                     },
                 },
             ],
@@ -8732,6 +9062,8 @@ mod tests {
                 name: "ChainMap".to_string(),
                 position: 0,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             },
             mappings: vec![
                 StackValue::TrackedDict {
@@ -8746,6 +9078,8 @@ mod tests {
                         name: "system".to_string(),
                         position: 0,
                         malformed: false,
+                        memo_index: None,
+                        memo_read: false,
                     },
                 },
             ],
@@ -8791,6 +9125,8 @@ mod tests {
                     name: "MappingProxyType".to_string(),
                     position: 0,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 },
                 mappings: vec![value],
             };
@@ -8879,6 +9215,8 @@ mod tests {
                     name: "help".to_string(),
                     position: 0,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 },
             );
         }
@@ -8941,30 +9279,50 @@ mod tests {
             name: "str.join".to_string(),
             position: 0,
             malformed: false,
+            memo_index: None,
+            memo_read: false,
         });
 
         let within_bound = vec![
             callable.clone(),
             StackValue::Tuple(vec![
-                StackValue::Text("x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 2)),
+                StackValue::Text {
+                    value: "x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 2),
+                    memo_read: false,
+                },
                 StackValue::Tuple(vec![
-                    StackValue::Text("a".to_string()),
-                    StackValue::Text("b".to_string()),
+                    StackValue::Text {
+                        value: "a".to_string(),
+                        memo_read: false,
+                    },
+                    StackValue::Text {
+                        value: "b".to_string(),
+                        memo_read: false,
+                    },
                 ]),
             ]),
         ];
         assert!(matches!(
             scan.str_join_result(&within_bound),
-            Some(StackValue::Text(value)) if value.len() == MAX_TRACKED_STR_JOIN_RESULT_BYTES
+            Some(StackValue::Text { value, .. }) if value.len() == MAX_TRACKED_STR_JOIN_RESULT_BYTES
         ));
 
         let over_bound = vec![
             callable,
             StackValue::Tuple(vec![
-                StackValue::Text("x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 1)),
+                StackValue::Text {
+                    value: "x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 1),
+                    memo_read: false,
+                },
                 StackValue::Tuple(vec![
-                    StackValue::Text("a".to_string()),
-                    StackValue::Text("b".to_string()),
+                    StackValue::Text {
+                        value: "a".to_string(),
+                        memo_read: false,
+                    },
+                    StackValue::Text {
+                        value: "b".to_string(),
+                        memo_read: false,
+                    },
                 ]),
             ]),
         ];
@@ -8996,9 +9354,13 @@ mod tests {
             name: "system".to_string(),
             position: 7,
             malformed: true,
+            memo_index: None,
+            memo_read: false,
         };
         let well_formed = GlobalRef {
             malformed: false,
+            memo_index: None,
+            memo_read: false,
             ..malformed.clone()
         };
 
@@ -9828,7 +10190,10 @@ mod tests {
             0,
             None,
         );
-        scan.stack.push(StackValue::Text("survivor".to_string()));
+        scan.stack.push(StackValue::Text {
+            value: "survivor".to_string(),
+            memo_read: false,
+        });
 
         assert!(scan.consume_top_operand_values(2).is_none());
 
@@ -10157,6 +10522,8 @@ mod tests {
                     name: format!("call_{index}"),
                     position: index,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 },
                 "REDUCE",
                 index,
@@ -10230,6 +10597,8 @@ mod tests {
                 name: "Gadget".to_string(),
                 position: 4,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             },
             "NEWOBJ",
             20,
@@ -10241,6 +10610,8 @@ mod tests {
                 name: "Gadget".to_string(),
                 position: 24,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             },
             "REDUCE",
             40,
@@ -10252,6 +10623,8 @@ mod tests {
                 name: "Gadget".to_string(),
                 position: 44,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             },
             "REDUCE",
             60,
@@ -10323,6 +10696,8 @@ mod tests {
                     name: format!("call_{index}"),
                     position: index,
                     malformed: false,
+                    memo_index: None,
+                    memo_read: false,
                 },
                 "REDUCE",
                 index,
