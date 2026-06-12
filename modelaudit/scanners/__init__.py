@@ -322,6 +322,21 @@ class ScannerRegistry:
                 content_routed_extensions = scanner_info.get("content_routed_extensions", [])
                 if candidate_extension not in extensions and candidate_extension not in content_routed_extensions:
                     continue
+                if (
+                    scanner_selection is None
+                    and scanner_id == "jax_checkpoint"
+                    and candidate_extension in content_routed_extensions
+                ):
+                    from modelaudit.utils.file.detection import (
+                        huggingface_tokenizer_json_has_jax_route_evidence,
+                        is_confirmed_jax_json_checkpoint_file,
+                    )
+
+                    if not (
+                        is_confirmed_jax_json_checkpoint_file(path)
+                        or (candidate_extension == ".json" and huggingface_tokenizer_json_has_jax_route_evidence(path))
+                    ):
+                        continue
 
                 scanner_class = self._load_scanner(scanner_id)
                 unreadable_extension_owner = (
@@ -367,6 +382,11 @@ class ScannerRegistry:
         # If stricter extension-specific scanners all decline, fall back to the
         # generic ZIP scanner so helper-level routing does not drop coverage.
         if is_zip_file and (scanner_selection is None or scanner_selection.allows("zip")):
+            if file_ext == ".model":
+                from modelaudit.utils.file.detection import _is_malformed_sentencepiece_model_proto_candidate_file
+
+                if _is_malformed_sentencepiece_model_proto_candidate_file(path):
+                    return None
             scanner_class = self._load_scanner("zip")
             if scanner_class and scanner_class.can_handle(path):
                 return scanner_class
