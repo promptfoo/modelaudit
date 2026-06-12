@@ -1147,6 +1147,9 @@ def _select_huggingface_model_files(
         dict.fromkeys(filename for filename in repo_files if _is_scannable_hf_file(filename, model_extensions))
     )
     if not allow_content_probes:
+        candidate_files = _metadata_only_hf_content_probe_candidates(repo_files, model_files)
+        if candidate_files:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
         return model_files
 
     selected_files = set(model_files)
@@ -1187,6 +1190,33 @@ def _select_huggingface_model_files(
         selected_files.add(filename)
 
     return model_files
+
+
+def _metadata_only_hf_content_probe_candidates(repo_files: list[str], selected_files: Collection[str]) -> list[str]:
+    """Return unselected repo files whose inclusion cannot be proven without content probes."""
+    selected_file_set = set(selected_files)
+    return list(
+        dict.fromkeys(
+            filename
+            for filename in repo_files
+            if filename not in selected_file_set and not _is_huggingface_repo_bookkeeping_file(filename)
+        )
+    )
+
+
+def _raise_metadata_only_hf_selection_incomplete(repo_id: str, candidate_files: Collection[str]) -> None:
+    """Fail closed when metadata-only dry-runs cannot prove content-routed selection."""
+    candidates = list(candidate_files)
+    preview = ", ".join(candidates[:3])
+    if len(candidates) > 3:
+        preview = f"{preview}, ..."
+    candidate_label = "file" if len(candidates) == 1 else "files"
+    raise ValueError(
+        "Hugging Face metadata-only dry-run selection incomplete: "
+        f"dry-run refuses for {repo_id} because it cannot prove selection without content probes; "
+        f"{len(candidates)} unselected non-bookkeeping repository {candidate_label} would require "
+        f"artifact content probing: {preview}"
+    )
 
 
 def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
@@ -1542,6 +1572,37 @@ def _get_selected_hf_content_route_formats(
     return selected_formats
 
 
+def _streamable_hf_content_probe_candidates(
+    repo_files: list[str],
+    selected_files: Collection[str],
+    selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
+    exact_openvino_companion_candidates: Collection[str],
+) -> list[str]:
+    """Return streaming files that the renamed-file sniff loop would inspect."""
+    processed_files = set(selected_files)
+    exact_openvino_companion_candidate_set = set(exact_openvino_companion_candidates)
+    complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
+    candidates: list[str] = []
+    for file_name in repo_files:
+        if file_name in processed_files:
+            continue
+        processed_files.add(file_name)
+        if _is_huggingface_repo_bookkeeping_file(file_name):
+            continue
+        if file_name in exact_openvino_companion_candidate_set:
+            continue
+        if _hf_safetensors_shard_excluded_by_selection(
+            file_name,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            complete_safetensors_shard_files=complete_safetensors_shard_files,
+        ):
+            continue
+        candidates.append(file_name)
+    return candidates
+
+
 def _select_streamable_hf_files(
     repo_id: str,
     repo_files: list[str],
@@ -1563,15 +1624,12 @@ def _select_streamable_hf_files(
         )
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
-    sniff_renamed_files = (
-        allow_content_probes
-        and not include_all_files
-        and (
-            bool(selected_route_scanner_ids)
-            if selected_route_scanner_ids is not None
-            else selected_route_formats is None or bool(selected_route_formats)
-        )
+    sniff_renamed_files_would_be_active = not include_all_files and (
+        bool(selected_route_scanner_ids)
+        if selected_route_scanner_ids is not None
+        else selected_route_formats is None or bool(selected_route_formats)
     )
+    sniff_renamed_files = allow_content_probes and sniff_renamed_files_would_be_active
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
         filenames = (
@@ -1638,30 +1696,31 @@ def _select_streamable_hf_files(
         else set()
     )
 
+    if not allow_content_probes and sniff_renamed_files_would_be_active:
+        candidate_files = _streamable_hf_content_probe_candidates(
+            repo_files,
+            model_files,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            exact_openvino_companion_candidates,
+        )
+        if candidate_files:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
+
     if sniff_renamed_files:
         inspected_files = 0
         probe_budget = _HuggingFaceProbeBudget(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
             deadline=deadline,
         )
-        processed_files = set(model_files)
-        complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
         unskippable_detected_safetensors_shards: list[str] = []
-        for file_name in repo_files:
-            if file_name in processed_files:
-                continue
-            processed_files.add(file_name)
-            if _is_huggingface_repo_bookkeeping_file(file_name):
-                continue
-            if file_name in exact_openvino_companion_candidates:
-                continue
-            if _hf_safetensors_shard_excluded_by_selection(
-                file_name,
-                selected_route_scanner_ids,
-                selected_route_formats,
-                complete_safetensors_shard_files=complete_safetensors_shard_files,
-            ):
-                continue
+        for file_name in _streamable_hf_content_probe_candidates(
+            repo_files,
+            model_files,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            exact_openvino_companion_candidates,
+        ):
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
