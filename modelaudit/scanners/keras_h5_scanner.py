@@ -1512,6 +1512,31 @@ class KerasH5Scanner(BaseScanner):
                 ):
                     break
 
+        def add_keras3_roots(*, require_layers: bool) -> None:
+            layers_link = h5_file.get("layers", getlink=True)
+            if isinstance(layers_link, (h5py.ExternalLink, h5py.SoftLink)):
+                add_root("layers")
+                excluded_prefixes: tuple[str, ...] = ()
+                if isinstance(layers_link, h5py.SoftLink):
+                    target_path, target_link, incomplete = cls._resolve_hdf5_soft_link(h5_file, "layers", layers_link)
+                    if not incomplete and target_path is not None and isinstance(target_link, h5py.HardLink):
+                        excluded_prefixes = (target_path,)
+                add_keras3_saveable_var_roots(excluded_prefixes=excluded_prefixes)
+                return
+            if not isinstance(layers_link, h5py.HardLink):
+                if not require_layers:
+                    add_keras3_saveable_var_roots()
+                return
+
+            layers = h5_file.get("layers", getlink=False)
+            if not isinstance(layers, h5py.Group):
+                if not require_layers:
+                    add_keras3_saveable_var_roots()
+                return
+
+            add_keras3_layer_roots(layers, layer_prefix="layers")
+            add_keras3_saveable_var_roots()
+
         if cls._hdf5_attribute_exists(h5_file.attrs, "model_config"):
             for root_name in cls._KERAS_WEIGHT_ROOT_GROUPS:
                 root_link = h5_file.get(root_name, getlink=True)
@@ -1526,6 +1551,8 @@ class KerasH5Scanner(BaseScanner):
                     add_legacy_group_roots(root_group, root_name)
                 if roots_truncated:
                     break
+            if not roots_truncated:
+                add_keras3_roots(require_layers=False)
             return roots, roots_truncated
 
         layer_names, layer_names_truncated = cls._read_bounded_hdf5_name_attribute(h5_file.attrs, "layer_names")
@@ -1535,26 +1562,7 @@ class KerasH5Scanner(BaseScanner):
             add_legacy_group_roots(h5_file, "")
             return roots, roots_truncated
 
-        layers_link = h5_file.get("layers", getlink=True)
-        if isinstance(layers_link, (h5py.ExternalLink, h5py.SoftLink)):
-            add_root("layers")
-            excluded_prefixes: tuple[str, ...] = ()
-            if isinstance(layers_link, h5py.SoftLink):
-                target_path, target_link, incomplete = cls._resolve_hdf5_soft_link(h5_file, "layers", layers_link)
-                if not incomplete and target_path is not None and isinstance(target_link, h5py.HardLink):
-                    excluded_prefixes = (target_path,)
-            add_keras3_saveable_var_roots(excluded_prefixes=excluded_prefixes)
-            return roots, roots_truncated
-        if not isinstance(layers_link, h5py.HardLink):
-            return roots, False
-
-        layers = h5_file.get("layers", getlink=False)
-        if not isinstance(layers, h5py.Group):
-            return roots, False
-
-        add_keras3_layer_roots(layers, layer_prefix="layers")
-        add_keras3_saveable_var_roots()
-
+        add_keras3_roots(require_layers=True)
         return roots, roots_truncated
 
     @staticmethod

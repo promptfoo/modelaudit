@@ -1044,6 +1044,102 @@ def test_keras_h5_same_file_virtual_dataset_source_stays_clean(tmp_path: Path) -
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_flags_model_config_keras3_layer_vars_external_link(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="keras3_layer_vars_with_model_config.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        legacy_dense = f.require_group("model_weights").create_group("dense")
+        legacy_dense.attrs["weight_names"] = [b"legacy_kernel"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        legacy_dense["legacy_kernel"] = h5py.ExternalLink("missing_legacy_source.h5", "/payload")
+        f.create_group("layers").create_group("dense").create_group("vars")["0"] = h5py.ExternalLink(
+            "missing_keras3_source.h5",
+            "/payload",
+        )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/model_weights/dense/legacy_kernel",
+            "filename": "missing_legacy_source.h5",
+            "path": "/payload",
+        },
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense/vars/0",
+            "filename": "missing_keras3_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_keras_h5_scanner_allows_model_config_keras3_same_file_virtual_dataset(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="keras3_same_file_vds_with_model_config.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        f.create_dataset("internal_payload", data=[1.0, 2.0])
+        vars_group = f.create_group("layers").create_group("dense").create_group("vars")
+        layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+        layout[:] = h5py.VirtualSource(".", "/internal_payload", shape=(2,))
+        vars_group.create_virtual_dataset("0", layout)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+@pytest.mark.parametrize("root_path", ["vars", "optimizer/vars"])
+def test_keras_h5_scanner_flags_model_config_keras3_root_vars_external_link(
+    tmp_path: Path,
+    root_path: str,
+) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="keras3_root_vars_with_model_config.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        vars_group = f.require_group(root_path)
+        vars_group["0"] = h5py.ExternalLink("missing_keras3_root_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": f"/{root_path}/0",
+            "filename": "missing_keras3_root_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
 @pytest.mark.parametrize("root_path", ["vars", "optimizer/vars"])
 def test_keras_h5_scanner_flags_keras3_root_vars_external_link(tmp_path: Path, root_path: str) -> None:
     weights_path = tmp_path / "keras3_root_vars.weights.h5"
