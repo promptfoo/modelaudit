@@ -561,6 +561,14 @@ class TestSecretsDetector:
         [
             {"metadata": [{"name": "Authorization", "value": f"Basic {_basic_auth_token(b'object-leak:pass')}"}]},
             {"headers": [{"name": "Authorization", "description": f"Basic {_basic_auth_token(b'field-leak:pass')}"}]},
+            {"headers": {"Authorization": {"description": f"Basic {_basic_auth_token(b'description-leak:pass')}"}}},
+            {
+                "headers": {
+                    "Authorization": {
+                        "metadata": {"description": f"Basic {_basic_auth_token(b'nested-description-leak:pass')}"}
+                    }
+                }
+            },
         ],
     )
     def test_basic_auth_structured_header_object_context_does_not_leak(

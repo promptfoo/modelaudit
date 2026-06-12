@@ -945,7 +945,17 @@ class SecretsDetector:
         if isinstance(value, bytes):
             return self._scan_basic_auth_header_bytes_value(value, header_name, context)
         if isinstance(value, dict):
-            return self.scan_dict(value, context, header_name)
+            if header_name is None:
+                return self.scan_dict(value, context)
+            findings: list[dict[str, Any]] = []
+            for key, item in value.items():
+                if self._findings_truncated:
+                    break
+                key_context = f"{context}/{key}" if context else str(key)
+                findings.extend(self.scan_text(str(key), f"{key_context}[key]"))
+                value_header_name = header_name if _is_basic_auth_header_object_value_key(key) else None
+                findings.extend(self._scan_basic_auth_structured_header_value(item, value_header_name, key_context))
+            return findings
         if isinstance(value, list | tuple):
             findings: list[dict[str, Any]] = []
             for i, item in enumerate(value):
