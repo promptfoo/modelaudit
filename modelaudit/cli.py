@@ -1939,6 +1939,8 @@ _HF_AUTH_BLOCKED_MARKERS = (
     "gatedrepoerror",
     "gated repo",
     "gated repository",
+    "gated/inaccessible",
+    "gated_inaccessible",
     "401",
     "403",
     "unauthorized",
@@ -2823,7 +2825,12 @@ def _format_scan_output(
         return format_sarif_output(audit_result, expanded_paths, verbose)
 
     redacted_result = redact_source_value(audit_result.model_dump(mode="python"))
-    return format_text_output(redacted_result if isinstance(redacted_result, dict) else {}, verbose)
+    output_text = format_text_output(redacted_result if isinstance(redacted_result, dict) else {}, verbose)
+    previews = getattr(audit_result, "previews", None)
+    if isinstance(previews, list) and previews:
+        preview_text = _format_huggingface_dry_run_previews(previews, "text")
+        return f"{preview_text}\n\n{output_text}" if output_text else preview_text
+    return output_text
 
 
 def _emit_scan_output(
@@ -3290,7 +3297,12 @@ def _resolve_scan_source_for_path(
                 error_msg = _display_error(exc, path)
                 logger.error(f"Failed to preview Hugging Face file {display_path}: {error_msg}")
                 click.echo(f"Error previewing file from {display_path}: {error_msg}", err=True)
-                path_state.mark_non_shard_error(audit_result)
+                _record_huggingface_acquisition_error(
+                    audit_result,
+                    path_state,
+                    path=path,
+                    error_msg=error_msg,
+                )
                 return None
 
         download_spinner = None
@@ -3380,7 +3392,12 @@ def _resolve_scan_source_for_path(
                 error_msg = _display_error(exc, path)
                 logger.error(f"Failed to preview Hugging Face model {display_path}: {error_msg}")
                 click.echo(f"Error previewing model from {display_path}: {error_msg}", err=True)
-                path_state.mark_non_shard_error(audit_result)
+                _record_huggingface_acquisition_error(
+                    audit_result,
+                    path_state,
+                    path=path,
+                    error_msg=error_msg,
+                )
                 return None
 
         hf_stream_kwargs: dict[str, Any] = {}
@@ -4832,6 +4849,9 @@ def scan_command(
         record_scan_completed(time.time() - scan_start_time, {"dry_run": True, "previews": path_state.dry_run_previews})
         flush_telemetry()
         sys.exit(0)
+
+    if dry_run and path_state.dry_run_previews:
+        cast(Any, audit_result).previews = path_state.dry_run_previews
 
     try:
         try:
