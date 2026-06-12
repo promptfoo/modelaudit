@@ -419,7 +419,7 @@ _BASE64_LICENSE_WRAP_MAX_LINES = 128
 _BASE64_LICENSE_WRAP_MAX_CHARS = 8192
 _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
 _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
-_BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS = 8
+_BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS = 4
 _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO = 0.15
 _BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
 _BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(
@@ -717,23 +717,25 @@ class SafeTensorsScanner(BaseScanner):
             return []
 
         token_matches = list(_BASE64_LICENSE_WRAP_SHORT_TOKEN_PATTERN.finditer(stripped))
-        if len(token_matches) != 1:
-            return []
-
-        match = token_matches[0]
-        token = match.group(0)
-        if SafeTensorsScanner._license_document_span_is_inside_url(stripped, match.start(), match.end()):
-            return []
-        before = stripped[: match.start()]
-        after = stripped[match.end() :]
-        annotations = [annotation for annotation in (before, after) if annotation.strip()]
-        if not annotations:
-            return []
-        if not all(
-            SafeTensorsScanner._license_document_annotation_looks_documentary(annotation) for annotation in annotations
-        ):
-            return []
-        return [token]
+        fragments: list[str] = []
+        for match in token_matches:
+            token = match.group(0)
+            if SafeTensorsScanner._license_document_span_is_inside_url(stripped, match.start(), match.end()):
+                continue
+            before = stripped[: match.start()]
+            after = stripped[match.end() :]
+            annotations = [annotation for annotation in (before, after) if annotation.strip()]
+            if not annotations:
+                continue
+            if not all(
+                SafeTensorsScanner._license_document_annotation_looks_documentary(annotation)
+                for annotation in annotations
+            ):
+                continue
+            if len(token_matches) > 1 and SafeTensorsScanner._license_document_token_looks_documentary(token):
+                continue
+            fragments.append(token)
+        return fragments
 
     @staticmethod
     def _license_document_token_looks_documentary(token: str) -> bool:
