@@ -1081,10 +1081,13 @@ class SafeTensorsScanner(BaseScanner):
         cleaned_url = raw_url.rstrip(").,;:]}")
         try:
             parsed = urlparse(cleaned_url)
+            port = parsed.port
             hostname = parsed.hostname.lower() if parsed.hostname else ""
         except ValueError:
             return False
         if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+            return False
+        if port is not None and not 0 <= port <= 65535:
             return False
         if parsed.username or parsed.password:
             return False
