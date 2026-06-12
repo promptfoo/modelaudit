@@ -7777,9 +7777,8 @@ def _is_complete_bounded_printable_text_content_owner_bytes(
 ) -> bool:
     """Return whether printable bytes can safely own this complete file."""
     suffix = file_path.suffix.lower()
-    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(
-        file_path.name
-    )
+    declared_text_filename = is_declared_text_content_filename(file_path.name)
+    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or declared_text_filename
     max_complete_text_bytes = (
         _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
         if has_text_owner_window
@@ -7788,6 +7787,13 @@ def _is_complete_bounded_printable_text_content_owner_bytes(
     if file_size > max_complete_text_bytes or len(payload) < file_size:
         return False
     payload = payload[:file_size]
+    if (
+        declared_text_filename
+        and file_size > FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        and b"\n" not in payload
+        and b"\r" not in payload
+    ):
+        return False
     if not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
         if has_text_owner_window and file_size > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES:
             try:
@@ -7818,9 +7824,7 @@ def _is_complete_declared_text_payload(payload: bytes) -> bool:
     """Return whether a declared text asset has complete, line-oriented text content."""
     if not _is_complete_bounded_text_payload(payload):
         return False
-    return not (
-        len(payload) > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES and b"\n" not in payload and b"\r" not in payload
-    )
+    return not (len(payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES and b"\n" not in payload and b"\r" not in payload)
 
 
 def is_declared_text_content_filename(filename: str) -> bool:
