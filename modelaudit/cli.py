@@ -5317,7 +5317,10 @@ def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, s
         fallback_location = collection_name[:-1]
         for record in records:
             details = _get_issue_attr(record, "details", {})
-            if not details_have_incomplete_coverage(details):
+            if not record_details_have_incomplete_coverage(
+                record,
+                allow_skipped_check_exemption=collection_name == "checks",
+            ):
                 continue
             location = (
                 _get_issue_attr(record, "location")

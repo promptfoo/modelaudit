@@ -3533,6 +3533,38 @@ def test_format_text_output_check_only_incomplete_coverage_without_findings_is_n
     assert "NO ISSUES FOUND" not in clean_output
 
 
+def test_format_text_output_skipped_check_bare_analysis_incomplete_remains_clean() -> None:
+    """Skipped applicability checks without outcome markers should not render coverage incomplete."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": "PyTorch Runtime Version",
+                "status": "skipped",
+                "message": "PyTorch runtime version not available; CVE applicability unknown",
+                "severity": "info",
+                "location": "model.pt",
+                "details": {
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                },
+            },
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" not in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" not in clean_output
+    assert "NO ISSUES FOUND" in clean_output
+
+
 def test_format_text_output_consolidated_check_incomplete_coverage_is_not_clean() -> None:
     """Consolidated check findings should still surface incomplete coverage."""
     results = {
