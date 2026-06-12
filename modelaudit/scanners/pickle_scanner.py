@@ -2641,7 +2641,7 @@ class PickleScanner(BaseScanner):
         return {
             import_reference
             for import_reference, expected_count in trusted_import_counts.items()
-            if observed_import_counts.get(import_reference) == expected_count
+            if 0 < observed_import_counts.get(import_reference, 0) <= expected_count
         }
 
     @staticmethod
