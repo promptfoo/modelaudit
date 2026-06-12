@@ -912,10 +912,16 @@ class SafeTensorsScanner(BaseScanner):
         separator_lines = 0
         has_short_fragments = False
         has_non_documentary_short_fragment = False
-        has_documentary_annotations = False
+        has_low_ratio_documentary_annotations = False
+        high_ratio_documentary_fragment_chars = 0
+        high_ratio_documentary_fragment_lines = 0
 
         def requires_active_pattern() -> bool:
-            return has_short_fragments or has_documentary_annotations
+            has_annotated_wrapped_payload = (
+                high_ratio_documentary_fragment_lines >= 2
+                and high_ratio_documentary_fragment_chars >= _OPAQUE_LICENSE_TOKEN_MIN_CHARS
+            )
+            return has_short_fragments or (has_low_ratio_documentary_annotations and not has_annotated_wrapped_payload)
 
         def flush() -> bool:
             return total_chars >= _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS and cls._base64_candidate_decodes(
@@ -926,14 +932,17 @@ class SafeTensorsScanner(BaseScanner):
 
         def reset() -> None:
             nonlocal chunks, total_chars, total_lines, separator_lines, has_short_fragments
-            nonlocal has_non_documentary_short_fragment, has_documentary_annotations
+            nonlocal has_non_documentary_short_fragment, has_low_ratio_documentary_annotations
+            nonlocal high_ratio_documentary_fragment_chars, high_ratio_documentary_fragment_lines
             chunks = []
             total_chars = 0
             total_lines = 0
             separator_lines = 0
             has_short_fragments = False
             has_non_documentary_short_fragment = False
-            has_documentary_annotations = False
+            has_low_ratio_documentary_annotations = False
+            high_ratio_documentary_fragment_chars = 0
+            high_ratio_documentary_fragment_lines = 0
 
         for line in [*lines, ""]:
             fragments, line_has_documentary_annotation = cls._license_document_line_base64_fragments(line)
@@ -955,12 +964,21 @@ class SafeTensorsScanner(BaseScanner):
                 total_lines += 1
                 separator_lines = 0
                 has_short_fragments = has_short_fragments or short_fragments
-                has_documentary_annotations = has_documentary_annotations or line_has_documentary_annotation
+                fragment_chars = sum(len(fragment) for fragment in fragments)
+                nonspace_chars = sum(1 for char in line if not char.isspace())
+                if line_has_documentary_annotation and nonspace_chars > 0:
+                    if fragment_chars / nonspace_chars < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO:
+                        has_low_ratio_documentary_annotations = True
+                    elif any(len(fragment) >= _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS for fragment in fragments):
+                        high_ratio_documentary_fragment_chars += fragment_chars
+                        high_ratio_documentary_fragment_lines += 1
+                    else:
+                        has_low_ratio_documentary_annotations = True
                 if short_fragments:
                     has_non_documentary_short_fragment = has_non_documentary_short_fragment or any(
                         not cls._license_document_token_looks_documentary(fragment) for fragment in fragments
                     )
-                total_chars += sum(len(fragment) for fragment in fragments)
+                total_chars += fragment_chars
                 if total_lines > _BASE64_LICENSE_WRAP_MAX_LINES or total_chars > _BASE64_LICENSE_WRAP_MAX_CHARS:
                     if flush():
                         return True
