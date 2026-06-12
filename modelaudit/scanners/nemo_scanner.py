@@ -18,6 +18,7 @@ from ..core_results import (
     OPERATIONAL_ERROR_REASON_METADATA_KEY,
     mark_operational_scan_error,
     metadata_has_incomplete_coverage,
+    record_details_have_incomplete_coverage,
     records_have_incomplete_coverage,
     scan_result_has_operational_error,
 )
@@ -1286,8 +1287,15 @@ def _incomplete_coverage_reasons_from_details(details: Any, *, _depth: int = 0) 
 
 def _nested_record_incomplete_coverage_reasons(nested_result: ScanResult) -> tuple[str, ...]:
     reasons: list[str] = []
-    for record in (*nested_result.checks, *nested_result.issues):
-        for reason in _incomplete_coverage_reasons_from_details(getattr(record, "details", None)):
+    for check in nested_result.checks:
+        if not record_details_have_incomplete_coverage(check, allow_skipped_check_exemption=True):
+            continue
+        for reason in _incomplete_coverage_reasons_from_details(getattr(check, "details", None)):
+            _append_incomplete_coverage_reason(reasons, reason)
+    for issue in nested_result.issues:
+        if not record_details_have_incomplete_coverage(issue):
+            continue
+        for reason in _incomplete_coverage_reasons_from_details(getattr(issue, "details", None)):
             _append_incomplete_coverage_reason(reasons, reason)
     return tuple(reasons)
 
@@ -3077,7 +3085,7 @@ class NemoScanner(BaseScanner):
         operational_reason = reason_candidates[0] if reason_candidates else _NESTED_OPERATIONAL_REASON_FALLBACK
         nested_incomplete = (
             metadata_has_incomplete_coverage(nested_result.metadata)
-            or records_have_incomplete_coverage(nested_result.checks)
+            or records_have_incomplete_coverage(nested_result.checks, allow_skipped_check_exemption=True)
             or records_have_incomplete_coverage(nested_result.issues)
         )
         nested_operational = scan_result_has_operational_error(nested_result)

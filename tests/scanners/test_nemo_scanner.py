@@ -20,7 +20,7 @@ except ImportError:
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners import nemo_scanner as nemo_scanner_module
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 from modelaudit.utils.file import detection as file_detection
 
@@ -3652,6 +3652,44 @@ class TestCVE202523304HydraTarget:
         assert result.issues == []
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert reason in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
+    def test_nested_skipped_bare_analysis_incomplete_check_without_findings_is_not_propagated(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        extracted_path = str(tmp_path / "nested-payload.pt")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="pytorch_zip")
+        nested_result.checks.append(
+            Check(
+                name="PyTorch Runtime Version",
+                status=CheckStatus.SKIPPED,
+                message="PyTorch runtime version not available; CVE applicability unknown",
+                severity=IssueSeverity.INFO,
+                location=extracted_path,
+                details={
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+            )
+        )
+        nested_result.finish(success=True)
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.pt",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert "scan_outcome" not in result.metadata
+        assert "scan_outcome_reasons" not in result.metadata
         assert "operational_error" not in result.metadata
 
     def test_nested_later_metadata_coverage_reason_is_propagated(self, tmp_path: Path) -> None:
