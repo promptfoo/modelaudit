@@ -18,8 +18,9 @@ def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str
             "timeout": operation_kwargs.get("request_timeout"),
             "files_metadata": False,
         }
-        if operation_kwargs.get("revision") is not None:
-            repo_info_kwargs["revision"] = operation_kwargs["revision"]
+        requested_revision = operation_kwargs.get("revision")
+        if requested_revision is not None:
+            repo_info_kwargs["revision"] = requested_revision
         repo_info = HfApi().repo_info(operation_kwargs["repo_id"], **repo_info_kwargs)
         siblings = getattr(repo_info, "siblings", None)
         files: list[str] | None = None
