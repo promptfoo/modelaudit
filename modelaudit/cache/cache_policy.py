@@ -105,6 +105,8 @@ def _has_incomplete_coverage_reasons(metadata: dict[str, Any]) -> bool:
     reason = metadata.get("scan_outcome_reason")
     if isinstance(reason, str) and reason:
         return True
+    if metadata.get("analysis_incomplete") is True:
+        return True
 
     reasons = metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
     if isinstance(reasons, str):

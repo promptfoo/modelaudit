@@ -212,6 +212,7 @@ _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
 _mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
 _mark_operational_scan_error = core_results.mark_operational_scan_error
+_metadata_has_coverage_only_operational_error = core_results.metadata_has_coverage_only_operational_error
 _details_match_shard_family_paths = core_results.details_match_shard_family_paths
 _metadata_has_incomplete_coverage = core_results.metadata_has_incomplete_coverage
 _record_details_have_incomplete_coverage = core_results.record_details_have_incomplete_coverage
@@ -252,7 +253,6 @@ def _record_dvc_output_limit_incomplete(
         return
 
     scan_metadata["success"] = False
-    scan_metadata["has_operational_errors"] = True
     _add_issue_to_model(
         results,
         "DVC output limit exceeded - not all declared outputs were scanned",
@@ -1117,12 +1117,20 @@ def _update_missing_shard_coverage_record(record: Check | Issue, reason: str, me
 
 def _results_have_explicit_operational_error(results: ModelAuditResultModel) -> bool:
     """Return whether retained result evidence identifies an operational failure."""
-    if any(bool(metadata.get("operational_error")) for metadata in results.file_metadata.values()):
+    if any(
+        bool(metadata.get("operational_error")) and not _metadata_has_coverage_only_operational_error(metadata)
+        for metadata in results.file_metadata.values()
+    ):
         return True
     if any(asset.type == "error" for asset in results.assets):
         return True
     records: list[Check | Issue] = [*results.checks, *results.issues]
-    return any(isinstance(record.details, dict) and bool(record.details.get("operational_error")) for record in records)
+    return any(
+        isinstance(record.details, dict)
+        and bool(record.details.get("operational_error"))
+        and not _metadata_has_coverage_only_operational_error(record.details)
+        for record in records
+    )
 
 
 def _results_have_retained_incomplete_outcome(results: ModelAuditResultModel) -> bool:
@@ -3401,6 +3409,7 @@ def scan_model_directory_or_file(
                     except Exception as e:
                         logger.warning(f"Error scanning file {representative_file}: {e!s}")
                         scan_metadata["success"] = False
+                        scan_metadata["has_operational_errors"] = True
 
                         _add_issue_to_model(
                             results,
@@ -3831,6 +3840,7 @@ def scan_model_directory_or_file(
     except KeyboardInterrupt:
         logger.debug("Scan interrupted by user")
         scan_metadata["success"] = False
+        scan_metadata["has_operational_errors"] = True
         _add_issue_to_model(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
         )
@@ -3842,6 +3852,7 @@ def scan_model_directory_or_file(
         else:
             logger.exception(f"Error during scan: {report_error}")
         scan_metadata["success"] = False
+        scan_metadata["has_operational_errors"] = True
         _add_issue_to_model(
             results,
             f"Error during scan: {report_error}",
@@ -3880,7 +3891,7 @@ def scan_model_directory_or_file(
         logger.warning(f"Error checking license warnings: {e!s}")
 
     # Determine if there were operational scan errors vs security findings.
-    results.has_errors = bool(scan_metadata.get("has_operational_errors", False) or not scan_metadata["success"])
+    results.has_errors = bool(scan_metadata.get("has_operational_errors", False))
 
     # Set success flag for backward compatibility
     results.success = not _results_should_be_unsuccessful(results)

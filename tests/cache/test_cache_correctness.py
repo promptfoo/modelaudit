@@ -2571,6 +2571,38 @@ def test_cached_scan_skips_persisting_incomplete_record_details(
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
+def test_cached_scan_persists_clean_result_with_benign_details(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [
+                {
+                    "message": "Synthetic clean coverage check",
+                    "status": "passed",
+                    "details": {"scan_outcome_reason": "", "scan_outcome_reasons": []},
+                }
+            ],
+            "issues": [],
+            "metadata": {},
+            "scan_count": calls["count"],
+            "success": True,
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second == first
+    assert calls["count"] == 1
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+
+
 def test_cached_scan_skips_persisting_bare_unsuccessful_results(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"

@@ -55,6 +55,20 @@ def _metadata_value(metadata: Any, key: str) -> Any:
     return getattr(metadata, key, None)
 
 
+_COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS = frozenset({"recognized_format_scanner_unavailable"})
+_COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES = ("_routing_incomplete",)
+
+
+def _metadata_has_coverage_only_operational_error(metadata: Any) -> bool:
+    """Return True when operational_error marks fail-closed coverage, not a scanner failure."""
+    if _metadata_value(metadata, "operational_error") is not True:
+        return False
+    reason = _metadata_value(metadata, "operational_error_reason")
+    return isinstance(reason, str) and (
+        reason in _COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS or reason.endswith(_COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES)
+    )
+
+
 def _metadata_has_incomplete_coverage(metadata: Any) -> bool:
     """Return True when metadata identifies incomplete scan coverage."""
     if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
@@ -613,7 +627,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         self.files_scanned += 1  # Each ScanResult represents one file scan
 
         metadata = scan_result.metadata or {}
-        if bool(metadata.get("operational_error")):
+        if bool(metadata.get("operational_error")) and not _metadata_has_coverage_only_operational_error(metadata):
             self.has_errors = True
 
         # Update success status for operational errors or incomplete coverage.

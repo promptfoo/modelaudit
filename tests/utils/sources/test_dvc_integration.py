@@ -57,6 +57,53 @@ def _patch_metadata_only_incomplete_scan(
     monkeypatch.setattr(core_module, "scan_file", patched_scan_file)
 
 
+def _patch_detail_only_incomplete_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    *,
+    record_kind: str,
+    reason: str = "synthetic_detail_only_incomplete",
+    location_suffix: str | None = None,
+) -> None:
+    original_scan_file = core_module.scan_file
+
+    def patched_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        if Path(path).name != filename:
+            return original_scan_file(path, config)
+
+        result = ScanResult(scanner_name="synthetic_incomplete")
+        result.bytes_scanned = Path(path).stat().st_size
+        details = {"analysis_incomplete": True, "scan_outcome_reason": reason}
+        location = f"{path}:{location_suffix}" if location_suffix is not None else path
+        if record_kind == "issue":
+            result.issues.append(
+                Issue(
+                    message="Synthetic issue-only incomplete coverage",
+                    severity=IssueSeverity.INFO,
+                    location=location,
+                    details=details,
+                    type="synthetic_incomplete_coverage",
+                )
+            )
+        elif record_kind == "check":
+            result.checks.append(
+                Check(
+                    name="Synthetic Detail Coverage",
+                    status=CheckStatus.FAILED,
+                    message="Synthetic check-only incomplete coverage",
+                    severity=IssueSeverity.INFO,
+                    location=location,
+                    details=details,
+                )
+            )
+        else:
+            raise AssertionError(f"unsupported record kind: {record_kind}")
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", patched_scan_file)
+
+
 def _patch_issue_only_incomplete_scan(
     monkeypatch: pytest.MonkeyPatch,
     filename: str,
@@ -81,6 +128,29 @@ def _patch_issue_only_incomplete_scan(
                 "scan_outcome_reason": reason,
             },
         )
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", patched_scan_file)
+
+
+def _patch_clean_detail_scan(monkeypatch: pytest.MonkeyPatch, filename: str) -> None:
+    original_scan_file = core_module.scan_file
+
+    def patched_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        if Path(path).name != filename:
+            return original_scan_file(path, config)
+
+        result = ScanResult(scanner_name="synthetic_clean")
+        result.bytes_scanned = Path(path).stat().st_size
+        result.checks.append(
+            Check(
+                name="Synthetic Clean Coverage",
+                status=CheckStatus.PASSED,
+                message="Synthetic clean sibling coverage",
+                details={"scan_outcome_reason": "", "scan_outcome_reasons": []},
+            )
+        )
+        result.finish(success=True)
         return result
 
     monkeypatch.setattr(core_module, "scan_file", patched_scan_file)
@@ -1225,7 +1295,7 @@ class TestDvcSecurity:
 
         assert result.files_scanned == 100
         assert result.success is False
-        assert result.has_errors is True
+        assert result.has_errors is False
         assert determine_exit_code(result) == 2
         asset_paths = {asset.path for asset in result.assets}
         assert str(late_malicious) not in asset_paths
@@ -1250,6 +1320,38 @@ class TestDvcSecurity:
         assert cached_result.success is False
         assert determine_exit_code(cached_result) == 2
         assert any(issue.type == "dvc_output_limit_exceeded" for issue in cached_result.issues)
+
+    def test_over_limit_dvc_with_security_finding_keeps_exit_code_1(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DVC output-limit gaps stay visible without masking scanned security findings."""
+        monkeypatch.setattr("modelaudit.utils.sources.dvc.MAX_DVC_OUTPUTS", 1)
+        malicious = tmp_path / "malicious.pkl"
+        with malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+        omitted = tmp_path / "omitted.pkl"
+        with omitted.open("wb") as f:
+            pickle.dump({"omitted": True}, f)
+        dvc_file = tmp_path / "over_limit_with_finding.dvc"
+        dvc_file.write_text("outs:\n- path: malicious.pkl\n- path: omitted.pkl\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.success is False
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.rule_code == "S201" and issue.location is not None and str(malicious) in issue.location
+            for issue in result.issues
+        )
+        output_limit_issues = [issue for issue in result.issues if issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON]
+        assert len(output_limit_issues) == 1
+        assert output_limit_issues[0].details["analysis_incomplete"] is True
+        assert output_limit_issues[0].details["scan_outcome"] == "inconclusive"
+        assert output_limit_issues[0].details["omitted_output_count"] == 1
 
     def test_duplicate_dvc_outputs_do_not_exhaust_cap_or_fail_closed(self, tmp_path: Path) -> None:
         """Duplicate declarations do not omit any unique artifact or trigger repeated scans."""
@@ -1496,6 +1598,105 @@ class TestDvcSecurity:
         assert result.has_errors is False
         assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
 
+    @pytest.mark.parametrize("record_kind", ["issue", "check"])
+    def test_directory_scan_rejects_detail_only_incomplete_dvc_tail_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        record_kind: str,
+    ) -> None:
+        """Detail-only incomplete scans must not discharge a DVC output cap."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        late = tmp_path / "late.pkl"
+        with late.open("wb") as f:
+            pickle.dump({"late": True}, f)
+        dvc_lines.append(f"- path: {late.name}")
+
+        dvc_file = tmp_path / "directory_over_limit_detail_only_incomplete.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+        _patch_detail_only_incomplete_scan(monkeypatch, late.name, record_kind=record_kind)
+
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert result.files_scanned == 101
+        assert result.success is False
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    @pytest.mark.parametrize("record_kind", ["issue", "check"])
+    def test_directory_scan_rejects_archive_member_detail_only_incomplete_dvc_tail_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        record_kind: str,
+    ) -> None:
+        """Archive-member incomplete diagnostics must not discharge a DVC output cap."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        late = tmp_path / "late_archive_location.pkl"
+        with late.open("wb") as f:
+            pickle.dump({"late": True}, f)
+        dvc_lines.append(f"- path: {late.name}")
+
+        dvc_file = tmp_path / "directory_over_limit_archive_location_incomplete.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+        _patch_detail_only_incomplete_scan(
+            monkeypatch,
+            late.name,
+            record_kind=record_kind,
+            location_suffix="nested/member.pkl",
+        )
+
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert result.files_scanned == 101
+        assert result.success is False
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_accepts_clean_detail_dvc_tail_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Benign issue/check details should not block completed DVC tail coverage."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        late = tmp_path / "late.pkl"
+        with late.open("wb") as f:
+            pickle.dump({"late": True}, f)
+        dvc_lines.append(f"- path: {late.name}")
+
+        dvc_file = tmp_path / "directory_over_limit_clean_detail.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+        _patch_clean_detail_scan(monkeypatch, late.name)
+
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert result.files_scanned == 101
+        assert result.success is True
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 0
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
     def test_directory_scan_detects_malicious_omitted_output(self, tmp_path: Path) -> None:
         """Discharging the DVC cap must still scan and report a malicious omitted output."""
         dvc_lines = ["outs:"]
@@ -1623,7 +1824,7 @@ class TestDvcSecurity:
         result = scan_model_directory_or_file(str(tmp_path))
 
         assert result.success is False
-        assert result.has_errors is True
+        assert result.has_errors is False
         assert determine_exit_code(result) == 2
         assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
 
@@ -1670,7 +1871,7 @@ class TestDvcSecurity:
         result = scan_model_directory_or_file(str(tmp_path))
 
         assert result.success is False
-        assert result.has_errors is True
+        assert result.has_errors is False
         assert determine_exit_code(result) == 2
         output_limit_issues = [issue for issue in result.issues if issue.type == "dvc_output_limit_exceeded"]
         assert len(output_limit_issues) == 1
@@ -1811,6 +2012,54 @@ class TestDvcSecurity:
                     message="Incomplete coverage retained only in check details",
                     severity=IssueSeverity.INFO,
                     location=str(incomplete_path),
+                    details=details,
+                )
+            )
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(incomplete_path), incomplete_result)
+
+        assert path_state.dvc_covered_paths == set()
+        assert path_state.dvc_covered_directories == set()
+
+    @pytest.mark.parametrize("record_kind", ["issue", "check"])
+    def test_cli_archive_member_detail_only_incomplete_asset_does_not_count_as_dvc_coverage(
+        self,
+        tmp_path: Path,
+        record_kind: str,
+    ) -> None:
+        """Relative asset:member diagnostics still apply to the outer DVC asset."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        incomplete_path = tmp_path / f"{record_kind}_archive_location_incomplete.pkl"
+        incomplete_path.write_bytes(pickle.dumps({"incomplete": True}))
+        incomplete_result = create_initial_audit_result()
+        incomplete_result.success = True
+        incomplete_result.assets.append(AssetModel(path=str(incomplete_path), type="pickle"))
+        details = {
+            "analysis_incomplete": True,
+            "scan_outcome_reason": "synthetic_detail_only_incomplete",
+        }
+        location = f"{incomplete_path.name}:nested/member.pkl"
+        if record_kind == "issue":
+            incomplete_result.issues.append(
+                Issue(
+                    message="Synthetic issue-only archive member incomplete coverage",
+                    severity=IssueSeverity.INFO,
+                    location=location,
+                    details=details,
+                    type="synthetic_incomplete_coverage",
+                )
+            )
+        else:
+            incomplete_result.checks.append(
+                Check(
+                    name="Synthetic Archive Member Detail Coverage",
+                    status=CheckStatus.FAILED,
+                    message="Synthetic check-only archive member incomplete coverage",
+                    severity=IssueSeverity.INFO,
+                    location=location,
                     details=details,
                 )
             )
@@ -2395,7 +2644,8 @@ class TestDvcSecurity:
 
         assert result.files_scanned == 100
         assert result.success is False
-        assert determine_exit_code(result) == 2
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 1
         assert any(
             issue.rule_code == "S201" and issue.location is not None and str(nested_malicious) in issue.location
             for issue in result.issues
@@ -3246,7 +3496,7 @@ class TestDvcCliIntegration:
         assert result.exit_code == 2, result.output
         output_data = json.loads(result.output[result.output.index("{") :])
         assert output_data["success"] is False
-        assert output_data["has_errors"] is True
+        assert output_data["has_errors"] is False
         assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
     def test_cli_dvc_file_expansion(self, tmp_path: Path) -> None:
@@ -3293,6 +3543,68 @@ class TestDvcCliIntegration:
         assert output_data["success"] is True
         assert output_data["has_errors"] is False
         assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    @pytest.mark.parametrize("record_kind", ["issue", "check"])
+    def test_cli_capped_pointer_rejects_detail_only_incomplete_sibling_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        record_kind: str,
+    ) -> None:
+        """A detail-only incomplete sibling scan must not cover an omitted DVC output."""
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        late = tmp_path / "late.pkl"
+        late.write_bytes(pickle.dumps({"late": True}))
+        dvc_file = tmp_path / "late-output.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late.pkl\n")
+        _patch_detail_only_incomplete_scan(monkeypatch, late.name, record_kind=record_kind)
+
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        result = CliRunner().invoke(cli, ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"])
+
+        assert result.exit_code == 2, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
+        assert output_data["files_scanned"] == 2
+        assert output_data["success"] is False
+        assert output_data["has_errors"] is False
+        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+        detail_records = output_data["issues"] if record_kind == "issue" else output_data["checks"]
+        assert any(
+            record.get("details", {}).get("scan_outcome_reason") == "synthetic_detail_only_incomplete"
+            for record in detail_records
+        )
+
+    def test_cli_capped_pointer_accepts_clean_detail_sibling_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A clean sibling with benign details should still cover an omitted DVC output."""
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        late = tmp_path / "late.pkl"
+        late.write_bytes(pickle.dumps({"late": True}))
+        dvc_file = tmp_path / "late-output.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late.pkl\n")
+        _patch_clean_detail_scan(monkeypatch, late.name)
+
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        result = CliRunner().invoke(cli, ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"])
+
+        assert result.exit_code == 0, result.output
+        output_data = json.loads(result.output)
+        assert output_data["files_scanned"] == 2
+        assert output_data["success"] is True
+        assert output_data["has_errors"] is False
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+        assert any(check.get("name") == "Synthetic Clean Coverage" for check in output_data["checks"])
 
     def test_cli_sibling_malicious_file_is_reported_when_cap_is_discharged(self, tmp_path: Path) -> None:
         """Coverage reconciliation must preserve findings from the late output."""

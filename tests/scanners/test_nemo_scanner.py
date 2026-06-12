@@ -3462,17 +3462,26 @@ class TestCVE202523304HydraTarget:
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert result.has_errors is False
         assert result.metadata["operational_error"] is True
         assert result.metadata["operational_error_reason"] == "nemo_routing_incomplete"
         assert any(
             check.name == "NeMo Routing"
             and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.INFO
             and "assets/payload.tar.gz" in str(check.location)
             for check in result.checks
         )
         assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
 
-    def test_referenced_incomplete_nemo_route_takes_precedence_over_security_findings(
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False, "max_tar_entries": 100},
+        )
+        assert aggregate.has_errors is False
+        assert determine_exit_code(aggregate) == 2
+
+    def test_referenced_incomplete_nemo_route_preserves_security_exit_code(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -3495,7 +3504,8 @@ class TestCVE202523304HydraTarget:
         )
 
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert determine_exit_code(result) == 2
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 1
 
     def test_nested_incomplete_nemo_route_does_not_promote_unrelated_info_checks(self, tmp_path: Path) -> None:
         extracted_path = str(tmp_path / "nested-payload.tar.gz")
@@ -3531,9 +3541,11 @@ class TestCVE202523304HydraTarget:
             "assets/payload.tar.gz",
         )
 
-        assert [check.name for check in result.checks] == ["NeMo Routing"]
+        assert result.checks == []
         assert result.issues == []
-        assert result.metadata["operational_error"] is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
 
     @pytest.mark.parametrize(
         ("reason", "check_name"),
@@ -3543,7 +3555,7 @@ class TestCVE202523304HydraTarget:
             ("xml_model_routing_incomplete", "XML Model Routing"),
         ],
     )
-    def test_nested_operational_incomplete_outcomes_are_propagated(
+    def test_nested_coverage_only_incomplete_outcomes_without_findings_are_propagated(
         self,
         tmp_path: Path,
         reason: str,
@@ -3572,10 +3584,72 @@ class TestCVE202523304HydraTarget:
             "assets/payload.bin",
         )
 
-        assert [check.name for check in result.checks] == [check_name]
+        assert result.checks == []
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert reason in result.metadata["scan_outcome_reasons"]
-        assert result.metadata["operational_error_reason"] == reason
+        assert "operational_error" not in result.metadata
+
+    @pytest.mark.parametrize("reason", ["compressed_decompression_limit_exceeded", "joblib_read_failed"])
+    def test_nested_fail_closed_incomplete_outcome_without_findings_is_propagated(
+        self,
+        tmp_path: Path,
+        reason: str,
+    ) -> None:
+        extracted_path = str(tmp_path / "nested-payload.tar.gz")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="joblib" if reason == "joblib_read_failed" else "compressed")
+        nested_result.metadata["analysis_incomplete"] = True
+        nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        nested_result.metadata["scan_outcome_reasons"] = [reason]
+        nested_result.add_check(
+            name="Nested Scanner Analysis",
+            passed=False,
+            message="Nested scanner analysis was incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+            details={"scan_outcome_reason": reason},
+        )
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.tar.gz",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
+    def test_nested_structural_reject_without_findings_is_not_propagated(self, tmp_path: Path) -> None:
+        extracted_path = str(tmp_path / "tokenizer.model")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="xgboost")
+        nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        nested_result.metadata["scan_outcome_reasons"] = ["xgboost_binary_structure_too_small"]
+        nested_result.add_check(
+            name="XGBoost Binary Structure",
+            passed=False,
+            message="XGBoost binary payload is too small to validate",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+        )
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "artifacts/tokenizer.model",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert "scan_outcome" not in result.metadata
+        assert "operational_error" not in result.metadata
 
     def test_referenced_joblib_operational_failure_is_not_hidden_by_nemo_composition(self, tmp_path: Path) -> None:
         path = tmp_path / "referenced-joblib-container.jpg"

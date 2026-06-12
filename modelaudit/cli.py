@@ -1477,11 +1477,14 @@ class _ScanPathState:
         if scanner_policy.active:
             from modelaudit.scanners import get_scanner_for_file
 
-        def resolve_coverage_path(file_path: str | None) -> Path | None:
+        def resolve_coverage_path(file_path: str | None, *, base: Path | None = None) -> Path | None:
             if not isinstance(file_path, str):
                 return None
             try:
-                return Path(file_path).resolve()
+                path = Path(file_path)
+                if base is not None and not path.is_absolute():
+                    path = base / path
+                return path.resolve()
             except (OSError, RuntimeError, ValueError):
                 return None
 
@@ -1505,6 +1508,8 @@ class _ScanPathState:
                 return any(shard_path.is_relative_to(resolved_candidate) for shard_path in shard_paths)
             return False
 
+        scan_records: tuple[Any, ...] = (*scan_result.checks, *scan_result.issues)
+
         def shard_family_has_incomplete_coverage(
             shard_paths: set[Path],
             *,
@@ -1521,8 +1526,7 @@ class _ScanPathState:
                 "Sharded Model Coverage Check",
                 "Sharded Model Membership Check",
             }
-            records: tuple[Any, ...] = (*scan_result.checks, *scan_result.issues)
-            for record in records:
+            for record in scan_records:
                 details = getattr(record, "details", None)
                 details = details if isinstance(details, dict) else None
                 if details is None:

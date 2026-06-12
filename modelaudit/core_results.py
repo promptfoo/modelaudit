@@ -31,6 +31,8 @@ ANALYSIS_INCOMPLETE_METADATA_KEY = "analysis_incomplete"
 SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
 SCAN_OUTCOME_REASON_METADATA_KEY = "scan_outcome_reason"
 SCAN_OUTCOME_REASONS_METADATA_KEY = "scan_outcome_reasons"
+_COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS = frozenset({"recognized_format_scanner_unavailable"})
+_COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES = ("_routing_incomplete",)
 _SHARD_FAMILY_PATH_DETAIL_KEYS = frozenset(
     {
         "duplicate_shards",
@@ -50,6 +52,37 @@ _SHARD_FAMILY_PATH_DETAIL_KEYS = frozenset(
 _SHARD_FAMILY_NESTED_DETAIL_KEYS = frozenset({"details", "findings"})
 
 
+def _metadata_value(metadata: Any, key: str) -> Any:
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        return metadata.get(key)
+
+    getter = getattr(metadata, "get", None)
+    if callable(getter):
+        try:
+            return getter(key)
+        except Exception:
+            return None
+
+    return getattr(metadata, key, None)
+
+
+def _reason_is_coverage_only_operational_error(reason: str) -> bool:
+    return reason in _COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS or reason.endswith(
+        _COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES
+    )
+
+
+def metadata_has_coverage_only_operational_error(metadata: Any) -> bool:
+    """Return True when operational_error marks fail-closed coverage, not a scanner failure."""
+    if _metadata_value(metadata, OPERATIONAL_ERROR_METADATA_KEY) is not True:
+        return False
+
+    operational_reason = _metadata_value(metadata, OPERATIONAL_ERROR_REASON_METADATA_KEY)
+    return isinstance(operational_reason, str) and _reason_is_coverage_only_operational_error(operational_reason)
+
+
 def mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
     """Mark a scan result as an operational failure for exit-code aggregation."""
     scan_result.metadata[OPERATIONAL_ERROR_METADATA_KEY] = True
@@ -67,7 +100,7 @@ def scan_result_has_operational_error(scan_result: ScanResult) -> bool:
     metadata = scan_result.metadata or {}
     explicit_flag = metadata.get(OPERATIONAL_ERROR_METADATA_KEY)
     if explicit_flag is not None:
-        return bool(explicit_flag)
+        return bool(explicit_flag) and not metadata_has_coverage_only_operational_error(metadata)
 
     return False
 
@@ -78,7 +111,9 @@ def results_have_operational_error(results: ModelAuditResultModel) -> bool:
         return True
 
     return any(
-        bool(metadata.get(OPERATIONAL_ERROR_METADATA_KEY)) for metadata in (results.file_metadata or {}).values()
+        bool(metadata.get(OPERATIONAL_ERROR_METADATA_KEY))
+        and not metadata_has_coverage_only_operational_error(metadata)
+        for metadata in (results.file_metadata or {}).values()
     )
 
 
@@ -98,22 +133,6 @@ def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
             return False
 
     return getattr(metadata, SCAN_OUTCOME_METADATA_KEY, None) == outcome
-
-
-def _metadata_value(metadata: Any, key: str) -> Any:
-    if metadata is None:
-        return None
-    if isinstance(metadata, dict):
-        return metadata.get(key)
-
-    getter = getattr(metadata, "get", None)
-    if callable(getter):
-        try:
-            return getter(key)
-        except Exception:
-            return None
-
-    return getattr(metadata, key, None)
 
 
 def metadata_has_incomplete_coverage(metadata: Any) -> bool:
@@ -222,6 +241,9 @@ def record_has_incomplete_coverage_for_path(record: Any, file_path: str) -> bool
 
     file_path_str = str(file_path)
     if _location_matches_file_path(location, file_path_str):
+        return True
+    file_name = Path(file_path_str).name
+    if file_name and _location_matches_file_path(location, file_name):
         return True
 
     try:
