@@ -22,7 +22,7 @@ import numpy as np
 from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
-from ..scanner_results import mark_inconclusive_scan_result
+from ..scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils.file.detection import read_magic_bytes
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
@@ -821,6 +821,8 @@ class JoblibScanner(BaseScanner):
             result.metadata["trusted_incomplete_tail"] = True
             result.metadata["trusted_incomplete_tail_reason"] = "joblib_numpy_array_payload"
             result.metadata["joblib_numpy_array_payload_count"] = raw_array_count
+            if result.metadata.get("pickle_verdict") in {"suspicious", "unknown"}:
+                result.metadata["pickle_verdict"] = "clean"
         else:
             self._downgrade_embedded_pickle_parse_errors(result)
         result.bytes_scanned = len(payload)
@@ -945,12 +947,25 @@ class JoblibScanner(BaseScanner):
             ) and reference_origin_is_trusted(finding):
                 validated_finding_ids.add(builtins.id(finding))
 
-        removed = bool(validated_finding_ids) or origin_review_references_are_validated()
+        origin_review_validated = origin_review_references_are_validated()
+        if origin_review_validated:
+            for _position, _sequence, _import_reference, finding in candidates:
+                details = getattr(finding, "details", {})
+                if (
+                    isinstance(details, dict)
+                    and details.get("notice_code") == "call_graph_source_unavailable"
+                    and reference_origin_is_trusted(finding)
+                ):
+                    validated_finding_ids.add(builtins.id(finding))
+
+        removed = bool(validated_finding_ids) or origin_review_validated
         if not removed:
             return
 
+        removed_checks = [check for check in result.checks if builtins.id(check) in validated_finding_ids]
         result.issues = [issue for issue in result.issues if builtins.id(issue) not in validated_finding_ids]
         result.checks = [check for check in result.checks if builtins.id(check) not in validated_finding_ids]
+        JoblibScanner._remove_private_actionable_failed_checks(result, removed_checks)
         has_security_findings = any(
             issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
         ) or any(
@@ -966,6 +981,42 @@ class JoblibScanner(BaseScanner):
             result.metadata["pickle_report_status"] = "complete"
         if result.metadata.get("pickle_verdict") in {"suspicious", "unknown"}:
             result.metadata["pickle_verdict"] = "clean"
+
+    @staticmethod
+    def _remove_private_actionable_failed_checks(result: ScanResult, removed_checks: list[Any]) -> None:
+        entries_to_remove = [
+            {"name": check.name, "rule_code": check.rule_code}
+            for check in removed_checks
+            if getattr(check, "rule_code", None) is not None
+        ]
+        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+        if not entries_to_remove or not isinstance(private_failed_checks, list):
+            return
+
+        unmatched_entries = list(entries_to_remove)
+        retained_entries: list[Any] = []
+        for entry in private_failed_checks:
+            if not isinstance(entry, dict):
+                retained_entries.append(entry)
+                continue
+            match_index = next(
+                (
+                    index
+                    for index, removed_entry in enumerate(unmatched_entries)
+                    if entry.get("name") == removed_entry["name"]
+                    and entry.get("rule_code") == removed_entry["rule_code"]
+                ),
+                None,
+            )
+            if match_index is None:
+                retained_entries.append(entry)
+                continue
+            unmatched_entries.pop(match_index)
+
+        if retained_entries:
+            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = retained_entries
+        else:
+            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
 
     @staticmethod
     def _downgrade_embedded_pickle_parse_errors(result: ScanResult) -> None:
