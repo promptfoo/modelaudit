@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - validate Basic Auth credentials only in bounded authorization-header context with decodable username/password tokens
+- dispatch logical model directories through their owning scanners, preserving bounded complete SavedModel asset probes before supplemental child-file coverage
 - stream large Flax MessagePack tensor bodies by declared length without tripping the 512 MiB decode budget
 - avoid critical pickle `getattr` findings for proven Ultralytics `Detect.forward` reconstruction while preserving unsafe traversal controls
 - detect GGUF curl short-option remote fetches, ignore spaced Python attribute calls, and truncate large tokenizer metadata arrays with explicit counts
