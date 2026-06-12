@@ -2854,7 +2854,7 @@ def _scan_local_or_downloaded_path(
         if spinner:
             spinner.text = f"Scanned {style_text(display_path, fg='cyan')}"
             if issue_count == 0 and has_incomplete_coverage:
-                spinner.ok(style_text("⚠️  Coverage incomplete", fg="yellow", bold=True))
+                spinner.fail(style_text("❔ Inconclusive (coverage incomplete)", fg="yellow", bold=True))
             elif issue_count == 0:
                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
             elif has_critical:
@@ -2881,7 +2881,7 @@ def _scan_local_or_downloaded_path(
                 )
         elif runtime.show_styled_output:
             if issue_count == 0 and has_incomplete_coverage:
-                click.echo(f"Scanned {display_path}: Coverage incomplete")
+                click.echo(f"Scanned {display_path}: Inconclusive (coverage incomplete)")
             elif issue_count == 0:
                 click.echo(f"Scanned {display_path}: Clean")
             else:

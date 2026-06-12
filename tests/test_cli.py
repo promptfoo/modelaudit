@@ -335,6 +335,21 @@ def test_format_scan_json_preserves_pydantic_json_serialization() -> None:
     }
 
 
+def test_format_scan_json_preserves_partial_sha256_prefix_only() -> None:
+    result = create_mock_scan_result(
+        file_metadata={
+            "/models/legacy.pt": {
+                "file_size": 2048,
+                "file_hashes": {"sha256_prefix": "c" * 64},
+            }
+        }
+    )
+
+    payload = json.loads(_format_scan_output(result, [], output_format="json", verbose=True))
+
+    assert payload["file_metadata"]["/models/legacy.pt"]["file_hashes"] == {"sha256_prefix": "c" * 64}
+
+
 def test_cli_help():
     """Test the CLI help command."""
     runner = CliRunner()
@@ -3580,7 +3595,8 @@ def test_text_cli_incomplete_coverage_path_status_is_not_clean(tmp_path: Path) -
 
     clean_output = strip_ansi(result.output)
     assert result.exit_code == 2
-    assert f"Scanned {test_file}: Coverage incomplete" in clean_output
+    assert f"Scanned {test_file}: Inconclusive" in clean_output
+    assert "coverage incomplete" in clean_output
     assert f"Scanned {test_file}: Clean" not in clean_output
     assert "No security issues detected" not in clean_output
     assert "SCAN COVERAGE INCOMPLETE" in clean_output
@@ -5813,6 +5829,48 @@ def test_scan_huggingface_streaming_scan_errors(mock_scan_streaming, mock_downlo
     # Verify streaming functions were called
     mock_download_streaming.assert_called_once()
     mock_scan_streaming.assert_called_once()
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_inconclusive_without_issues_reports_inconclusive(
+    mock_scan: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Scans with incomplete coverage should not be reported as clean."""
+    test_file = tmp_path / "large.bin"
+    test_file.write_bytes(b"weights")
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=7,
+        files_scanned=1,
+        success=False,
+        has_errors=False,
+        file_metadata={
+            str(test_file): {
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reasons": ["pickle_analysis_incomplete"],
+            }
+        },
+    )
+
+    result = CliRunner().invoke(cli, ["scan", "--format", "json", str(test_file)])
+
+    assert result.exit_code == 2
+    output_payload = json.loads(result.output)
+    assert output_payload["success"] is False
+    assert output_payload["has_errors"] is False
+    assert output_payload["issues"] == []
+    assert output_payload["checks"] == []
+    assert output_payload["file_metadata"][str(test_file)]["scan_outcome"] == "inconclusive"
+    assert output_payload["file_metadata"][str(test_file)]["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
+    assert "Inconclusive" not in result.output
+    assert "Clean" not in result.output
+
+    text_result = CliRunner().invoke(cli, ["scan", "--format", "text", str(test_file)])
+
+    assert text_result.exit_code == 2
+    assert "Inconclusive" in text_result.output
+    assert "Clean" not in text_result.output
+    assert mock_scan.call_count == 2
 
 
 def test_scan_stream_help():
