@@ -847,11 +847,12 @@ class SecretsDetector:
         current_item_indent = SecretsDetector._basic_auth_line_indent(lines[-1])
         for line_index in range(len(lines) - 2, -1, -1):
             line = lines[line_index]
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent > current_item_indent:
+                continue
             if key_pattern.fullmatch(line) is not None:
                 return line_index
-            if not SecretsDetector._basic_auth_yaml_list_item_has_value(line):
-                return None
-            if SecretsDetector._basic_auth_line_indent(line) != current_item_indent:
+            if line_indent != current_item_indent or not SecretsDetector._basic_auth_yaml_list_item_has_value(line):
                 return None
         return None
 
