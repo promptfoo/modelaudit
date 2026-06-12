@@ -353,6 +353,10 @@ def _metadata_newobj_build_payload(module: str, name: str) -> bytes:
     return _reference_global(module, name) + b")\x81}b"
 
 
+def _metadata_build_payload(module: str, name: str) -> bytes:
+    return _reference_global(module, name) + b"}b"
+
+
 def _metadata_memoized_newobj_build_then_reduce_payload(module: str, name: str) -> bytes:
     return _reference_global(module, name) + b"q\x00)\x81}b0h\x00)R"
 
@@ -7386,6 +7390,67 @@ def test_scan_file_warns_when_trusted_framework_reference_is_rebound_before_scan
     assert any(
         finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
         and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_framework_metadata_rebound_to_buildable_instance_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-rebound-instance-optimizer.pkl"
+    payload_path.write_bytes(_metadata_build_payload("transformers.training_args", "OptimizerNames") + b".")
+    marker = tmp_path / "preimport-rebound-instance.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "class ReboundOptimizerInstance:\n"
+        "    def __setstate__(self, state):\n"
+        "        marker.write_text('instance-setstate', encoding='utf-8')\n"
+        "ReboundOptimizerInstance.__module__ = 'transformers.training_args'\n"
+        "training_args.OptimizerNames = ReboundOptimizerInstance()\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'severity': finding.severity.value,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert not (output["status"] == ScanStatus.COMPLETE.value and output["verdict"] == SafetyVerdict.CLEAN.value)
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
         for finding in output["findings"]
     )
 
