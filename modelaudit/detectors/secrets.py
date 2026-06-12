@@ -949,17 +949,38 @@ class SecretsDetector:
 
         headers_prefix = prefix[headers_match.end() :]
         item_start = headers_prefix.rfind("{")
+        yaml_item_indent: int | None = None
+        yaml_item_direct_field_indent: int | None = None
         item_matches = list(BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.finditer(headers_prefix))
         if item_matches:
             direct_item_indent = min(len(match.group("indent")) for match in item_matches)
+            yaml_item_start = -1
             for match in item_matches:
-                if len(match.group("indent")) == direct_item_indent:
-                    item_start = max(item_start, match.end())
+                if len(match.group("indent")) == direct_item_indent and match.end() > yaml_item_start:
+                    yaml_item_start = match.end()
+                    yaml_item_indent = len(match.group("indent"))
+                    yaml_item_direct_field_indent = SecretsDetector._basic_auth_text_column_at(
+                        headers_prefix,
+                        match.end(),
+                    )
+            item_start = max(item_start, yaml_item_start)
         item_prefix = headers_prefix[item_start if item_start >= 0 else 0 :]
         item_suffix = SecretsDetector._basic_auth_header_object_item_suffix(item_prefix, suffix)
         item_text = item_prefix + item_suffix
-        direct_item_prefix = SecretsDetector._basic_auth_header_object_direct_field_text(item_prefix)
-        direct_item_text = SecretsDetector._basic_auth_header_object_direct_field_text(item_text)
+        if yaml_item_indent is not None and yaml_item_direct_field_indent is not None and "{" not in item_prefix:
+            direct_item_prefix = SecretsDetector._basic_auth_yaml_header_object_direct_field_text(
+                item_prefix,
+                yaml_item_indent,
+                yaml_item_direct_field_indent,
+            )
+            direct_item_text = SecretsDetector._basic_auth_yaml_header_object_direct_field_text(
+                item_text,
+                yaml_item_indent,
+                yaml_item_direct_field_indent,
+            )
+        else:
+            direct_item_prefix = SecretsDetector._basic_auth_header_object_direct_field_text(item_prefix)
+            direct_item_text = SecretsDetector._basic_auth_header_object_direct_field_text(item_text)
 
         if not (
             BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN.search(direct_item_prefix) is not None
@@ -1077,6 +1098,36 @@ class SecretsDetector:
     def _basic_auth_header_object_direct_field_indent(value: str) -> int:
         indents = [SecretsDetector._basic_auth_line_indent(line) for line in value.splitlines()[1:] if line.strip()]
         return min(indents) if indents else 0
+
+    @staticmethod
+    def _basic_auth_text_column_at(value: str, index: int) -> int:
+        line_start = max(value.rfind("\n", 0, index), value.rfind("\r", 0, index)) + 1
+        return index - line_start
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_direct_field_text(
+        value: str,
+        item_indent: int,
+        direct_field_indent: int,
+    ) -> str:
+        lines = value.splitlines(keepends=True)
+        if len(lines) <= 1:
+            return value
+
+        direct_lines = [lines[0]]
+        for line in lines[1:]:
+            if not line.strip():
+                direct_lines.append(line)
+                continue
+
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent <= item_indent and SecretsDetector._basic_auth_yaml_list_line_starts_item(line):
+                break
+            if line_indent < direct_field_indent:
+                break
+            if line_indent == direct_field_indent:
+                direct_lines.append(line)
+        return "".join(direct_lines)
 
     @staticmethod
     def _basic_auth_header_object_direct_field_text(value: str) -> str:

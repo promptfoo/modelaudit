@@ -570,6 +570,15 @@ class TestSecretsDetector:
 
         assert _basic_auth_findings(findings) == []
 
+    def test_basic_auth_yaml_header_object_value_list_ignores_reordered_nested_metadata(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"nested-metadata-after:pass")
+        text = f"headers:\n  - metadata:\n      value:\n        - Basic {token}\n    name: Authorization\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
     @pytest.mark.parametrize(
         "text",
         [
