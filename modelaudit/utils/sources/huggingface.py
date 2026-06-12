@@ -18,6 +18,7 @@ from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
@@ -40,7 +41,13 @@ _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
-_MAX_HF_STREAMING_UNFILTERED_FILES = 128
+_MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES = 128
+_MAX_HF_REPOSITORY_INVENTORY_FILES = 8192
+_MAX_HF_REPOSITORY_INVENTORY_PAGES = 128
+_MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES = 10 * 1024 * 1024
+_MAX_HF_REPOSITORY_PATH_CHARS = 4096
+_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES = 64 * 1024
+_HF_PATH_INFO_BATCH_SIZE = 512
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
@@ -1598,6 +1605,38 @@ def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
     return files
 
 
+def _validate_huggingface_repo_filename(repo_id: str, filename: str) -> str:
+    """Return a safe POSIX repository filename or fail closed."""
+    if len(filename) > _MAX_HF_REPOSITORY_PATH_CHARS:
+        raise ValueError(
+            "Hugging Face repository inventory incomplete: repository filename exceeds "
+            f"the bounded path length ({_MAX_HF_REPOSITORY_PATH_CHARS}) for {repo_id}"
+        )
+    if not filename or filename.startswith("/") or "\x00" in filename or "\\" in filename:
+        raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in filename):
+        raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
+
+    parts = filename.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
+    return filename
+
+
+def _normalize_huggingface_repo_files(repo_id: str, filenames: Collection[str]) -> list[str]:
+    """Validate, deduplicate, bound, and deterministically order repository filenames."""
+    normalized: set[str] = set()
+    for filename in filenames:
+        safe_filename = _validate_huggingface_repo_filename(repo_id, filename)
+        normalized.add(safe_filename)
+        if len(normalized) > _MAX_HF_REPOSITORY_INVENTORY_FILES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: repository file count exceeds "
+                f"the bounded inventory limit ({_MAX_HF_REPOSITORY_INVENTORY_FILES}) for {repo_id}"
+            )
+    return sorted(normalized)
+
+
 def _is_scannable_hf_file(filename: str, extensions: Collection[str]) -> bool:
     """Return whether a listed Hugging Face file has a supported suffix."""
     filename_lower = filename.lower()
@@ -1909,6 +1948,7 @@ def _select_streamable_hf_files(
     *,
     allow_content_probes: bool = True,
     include_all_files: bool = False,
+    include_all_files_unbounded_extra_limit: int | None = None,
     deadline: float | None = None,
 ) -> list[str]:
     """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
@@ -1940,7 +1980,7 @@ def _select_streamable_hf_files(
         )
     model_files: list[str] = []
     extensionless_count = 0
-    unfiltered_count = 0
+    include_all_extra_count = 0
     seen_files: set[str] = set()
 
     for file_name in repo_files:
@@ -1962,13 +2002,15 @@ def _select_streamable_hf_files(
             continue
 
         if include_all_files:
-            unfiltered_count += 1
-            if unfiltered_count > _MAX_HF_STREAMING_UNFILTERED_FILES:
-                raise Exception(
-                    f"Refusing to stream-download unfiltered files from {repo_id}: "
-                    f"repository listing exceeds the bounded unfiltered candidate limit "
-                    f"({_MAX_HF_STREAMING_UNFILTERED_FILES}); streaming coverage is incomplete"
-                )
+            if include_all_files_unbounded_extra_limit is not None:
+                include_all_extra_count += 1
+                if include_all_extra_count > include_all_files_unbounded_extra_limit:
+                    raise ValueError(
+                        "Refusing to stream-download all files from "
+                        f"{repo_id}: include_all_files=True without max_size selected more than "
+                        f"{include_all_files_unbounded_extra_limit} otherwise-unrecognized file(s); "
+                        "set max_size to bound aggregate transfer size"
+                    )
             model_files.append(file_name)
             continue
 
@@ -2109,6 +2151,17 @@ def _is_within_directory(base_dir: Path, target: Path) -> bool:
     return target_path.is_relative_to(base_path)
 
 
+def _is_huggingface_cache_blob_target(downloaded_path: Path, target: Path) -> bool:
+    """Return True when target is a Hub cache blob for the snapshot path."""
+    target_path = target.resolve()
+    current_path = downloaded_path.resolve()
+    for candidate in [current_path, *current_path.parents]:
+        if candidate.parent.name == "snapshots":
+            blob_dir = candidate.parent.parent / "blobs"
+            return _is_within_directory(blob_dir, target_path)
+    return False
+
+
 def _build_huggingface_download_path(cache_dir: Path, namespace: str, repo_name: str) -> Path:
     """Build and containment-check the local HuggingFace download path."""
     cache_root = (cache_dir / "huggingface").resolve()
@@ -2125,15 +2178,17 @@ def _list_repo_files_with_timeout(
     repo_id: str,
     timeout_seconds: float = 30,
     *,
+    requested_revision: str | None = None,
     deadline: float | None = None,
     revision: str | None = None,
 ) -> tuple[list[str] | None, str | None, str | None]:
     """Return repository files, their immutable revision, or a failure reason."""
+    effective_revision = revision if revision is not None else requested_revision
     if deadline is not None:
+        operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": timeout_seconds}
+        if effective_revision is not None:
+            operation_kwargs["revision"] = effective_revision
         try:
-            operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": timeout_seconds}
-            if revision is not None:
-                operation_kwargs["revision"] = revision
             worker_result = _run_huggingface_worker_with_deadline(
                 "list_repo_files",
                 operation_kwargs,
@@ -2150,32 +2205,25 @@ def _list_repo_files_with_timeout(
             return None, None, "repository listing unavailable"
         if not isinstance(raw_files, list) or not all(isinstance(file_name, str) for file_name in raw_files):
             return None, None, "repository listing returned invalid filenames"
-        worker_files = cast(list[str], raw_files)
-        revision = value.get("revision")
-        if not _is_huggingface_commit_sha(revision):
-            return worker_files, None, "repository listing did not include an immutable commit SHA"
-        assert isinstance(revision, str)
-        return worker_files, revision, None
-
-    from huggingface_hub import HfApi
+        worker_revision = value.get("revision")
+        if not _is_huggingface_commit_sha(worker_revision):
+            return None, None, "repository listing did not include an immutable commit SHA"
+        assert isinstance(worker_revision, str)
+        try:
+            worker_files = _normalize_huggingface_repo_files(repo_id, cast(list[str], raw_files))
+        except ValueError as exc:
+            return None, None, str(exc)
+        return worker_files, worker_revision, None
 
     try:
-        repo_info_kwargs: dict[str, Any] = {"timeout": timeout_seconds, "files_metadata": False}
-        if revision is not None:
-            repo_info_kwargs["revision"] = revision
-        repo_info = HfApi().repo_info(repo_id, **repo_info_kwargs)
+        files, resolved_revision = _list_huggingface_repo_files_at_revision(
+            repo_id,
+            requested_revision=effective_revision,
+            timeout_seconds=timeout_seconds,
+        )
     except Exception as exc:
         return None, None, str(exc)
-
-    files = _extract_huggingface_repo_files(repo_info)
-    if files is None:
-        return None, None, "repository listing unavailable"
-
-    revision = getattr(repo_info, "sha", None)
-    if not _is_huggingface_commit_sha(revision):
-        return files, None, "repository listing did not include an immutable commit SHA"
-
-    return files, revision, None
+    return files, resolved_revision, None
 
 
 def _run_huggingface_worker_with_deadline(
@@ -2281,19 +2329,195 @@ def _terminate_huggingface_download_process(process: subprocess.Popen[str]) -> N
         process.communicate()
 
 
-def _list_huggingface_repo_files_at_revision(repo_id: str, timeout_seconds: float = 30) -> tuple[list[str], str]:
+def _extract_huggingface_tree_page_files(repo_id: str, page_items: object) -> list[str]:
+    """Extract file paths from one Hugging Face tree API page."""
+    if not isinstance(page_items, list):
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree page for {repo_id}")
+
+    files: list[str] = []
+    for item in page_items:
+        if not isinstance(item, dict):
+            raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree item for {repo_id}")
+        item_type = item.get("type")
+        if item_type not in {"file", "directory"}:
+            raise ValueError(f"Hugging Face repository inventory incomplete: unknown tree item type for {repo_id}")
+        path = item.get("path")
+        if not isinstance(path, str):
+            raise ValueError(f"Hugging Face repository inventory incomplete: invalid repository filename for {repo_id}")
+        safe_path = _validate_huggingface_repo_filename(repo_id, path)
+        if item_type == "directory":
+            continue
+        files.append(safe_path)
+    return files
+
+
+def _read_bounded_huggingface_tree_response(response: Any, repo_id: str) -> object:
+    """Read and decode one bounded Hugging Face tree API page."""
+    headers = getattr(response, "headers", {})
+    content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
+    if content_length is not None:
+        try:
+            response_size = int(content_length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Hugging Face repository inventory incomplete: invalid tree page size for {repo_id}"
+            ) from exc
+        if response_size < 0 or response_size > _MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: tree page response exceeds "
+                f"the bounded response limit ({_MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES} bytes) for {repo_id}"
+            )
+
+    payload = bytearray()
+    iter_bytes = getattr(response, "iter_bytes", None)
+    iter_content = getattr(response, "iter_content", None)
+    if callable(iter_bytes):
+        chunks = iter_bytes(chunk_size=_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES)
+    elif callable(iter_content):
+        chunks = iter_content(chunk_size=_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES)
+    else:
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree page response for {repo_id}")
+    for chunk in chunks:
+        if not chunk:
+            continue
+        payload.extend(chunk)
+        if len(payload) > _MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: tree page response exceeds "
+                f"the bounded response limit ({_MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES} bytes) for {repo_id}"
+            )
+
+    try:
+        return json.loads(bytes(payload))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree page JSON for {repo_id}") from exc
+
+
+def _canonical_huggingface_tree_page_url(url: str) -> str:
+    """Normalize tree page URLs enough to detect equivalent pagination loops."""
+    parts = urlsplit(url)
+    query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)), doseq=True)
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, query, ""))
+
+
+def _validate_huggingface_tree_next_url(repo_id: str, current_url: str, next_url: str) -> str:
+    """Return a safe same-origin tree pagination URL or fail closed."""
+    if next_url.strip() != next_url or any(ord(char) < 32 or ord(char) == 127 for char in next_url):
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid pagination link for {repo_id}")
+
+    try:
+        current_parts = urlsplit(current_url)
+        next_parts = urlsplit(next_url)
+        _ = (current_parts.port, next_parts.port)
+    except ValueError as exc:
+        raise ValueError(
+            f"Hugging Face repository inventory incomplete: invalid pagination link for {repo_id}"
+        ) from exc
+
+    if (
+        not next_parts.scheme
+        or not next_parts.netloc
+        or next_parts.username is not None
+        or next_parts.password is not None
+    ):
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid pagination link for {repo_id}")
+
+    if (
+        next_parts.scheme.lower() != current_parts.scheme.lower()
+        or next_parts.netloc.lower() != current_parts.netloc.lower()
+    ):
+        raise ValueError(f"Hugging Face repository inventory incomplete: pagination link changed origin for {repo_id}")
+
+    return next_url
+
+
+def _list_huggingface_repo_files_paginated(
+    repo_id: str,
+    revision: str,
+    timeout_seconds: float = 30,
+) -> list[str]:
+    """Return a complete bounded repository file inventory at an immutable revision."""
+    from huggingface_hub import HfApi
+    from huggingface_hub.utils import build_hf_headers, get_session
+
+    api = HfApi()
+    next_url: str | None = f"{api.endpoint}/api/models/{repo_id}/tree/{quote(revision, safe='')}"
+    params: dict[str, bool] | None = {"recursive": True, "expand": False}
+    headers = build_hf_headers(token=None)
+    session = get_session()
+    seen_page_urls: set[str] = set()
+    files: set[str] = set()
+    page_count = 0
+
+    while next_url is not None:
+        canonical_next_url = _canonical_huggingface_tree_page_url(next_url)
+        if canonical_next_url in seen_page_urls:
+            raise ValueError(f"Hugging Face repository inventory incomplete: pagination cursor repeated for {repo_id}")
+        seen_page_urls.add(canonical_next_url)
+        page_count += 1
+        if page_count > _MAX_HF_REPOSITORY_INVENTORY_PAGES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: repository tree page count exceeds "
+                f"the bounded pagination limit ({_MAX_HF_REPOSITORY_INVENTORY_PAGES}) for {repo_id}"
+            )
+
+        stream_response = getattr(session, "stream", None)
+        if callable(stream_response):
+            response_context = stream_response(
+                "GET",
+                next_url,
+                headers=headers,
+                params=params,
+                timeout=timeout_seconds,
+            )
+        else:
+            response_context = cast(Any, session).get(
+                next_url, headers=headers, params=params, timeout=timeout_seconds, stream=True
+            )
+        with response_context as response:
+            response.raise_for_status()
+            page_items = _read_bounded_huggingface_tree_response(response, repo_id)
+
+        for filename in _extract_huggingface_tree_page_files(repo_id, page_items):
+            files.add(_validate_huggingface_repo_filename(repo_id, filename))
+            if len(files) > _MAX_HF_REPOSITORY_INVENTORY_FILES:
+                raise ValueError(
+                    "Hugging Face repository inventory incomplete: repository file count exceeds "
+                    f"the bounded inventory limit ({_MAX_HF_REPOSITORY_INVENTORY_FILES}) for {repo_id}"
+                )
+
+        links = getattr(response, "links", {})
+        next_link = links.get("next") if isinstance(links, dict) else None
+        next_candidate = next_link.get("url") if isinstance(next_link, dict) else None
+        next_url = (
+            _validate_huggingface_tree_next_url(repo_id, next_url, next_candidate)
+            if isinstance(next_candidate, str) and next_candidate
+            else None
+        )
+        params = None
+
+    return sorted(files)
+
+
+def _list_huggingface_repo_files_at_revision(
+    repo_id: str,
+    *,
+    requested_revision: str | None = None,
+    timeout_seconds: float = 30,
+) -> tuple[list[str], str]:
     """Return repository filenames and the revision that produced the listing."""
     from huggingface_hub import HfApi
 
-    repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
+    repo_info_kwargs: dict[str, Any] = {"timeout": timeout_seconds, "files_metadata": False}
+    if requested_revision is not None:
+        repo_info_kwargs["revision"] = requested_revision
+    repo_info = HfApi().repo_info(repo_id, **repo_info_kwargs)
     raw_revision = getattr(repo_info, "sha", None)
     if not _is_huggingface_commit_sha(raw_revision):
-        raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+        raise Exception("repository listing did not include an immutable commit SHA")
     assert isinstance(raw_revision, str)
 
-    files = _extract_huggingface_repo_files(repo_info)
-    if files is None:
-        raise Exception(f"Cannot enforce max-size for {repo_id}: repository listing unavailable")
+    files = _list_huggingface_repo_files_paginated(repo_id, raw_revision, timeout_seconds=timeout_seconds)
     return files, raw_revision
 
 
@@ -2336,9 +2560,14 @@ def _get_huggingface_path_sizes(
             if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                 continue
             raw_size = item.get("size")
-            worker_sizes[item["path"]] = (
-                raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
-            )
+            size = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+            path = item["path"]
+            previous_size = worker_sizes.get(path)
+            if path in worker_sizes and previous_size != size:
+                raise Exception(
+                    f"Cannot enforce max-size for {repo_id}: inconsistent size metadata for selected file {path}"
+                )
+            worker_sizes[path] = size
         return worker_sizes, raw_revision
 
     from huggingface_hub import HfApi
@@ -2355,16 +2584,28 @@ def _get_huggingface_path_sizes(
         assert isinstance(raw_revision, str)
         resolved_revision = raw_revision
     assert resolved_revision is not None
-    path_info = api.get_paths_info(repo_id, filenames, revision=resolved_revision)
+    path_info = []
+    for start in range(0, len(filenames), _HF_PATH_INFO_BATCH_SIZE):
+        path_info.extend(
+            api.get_paths_info(
+                repo_id,
+                filenames[start : start + _HF_PATH_INFO_BATCH_SIZE],
+                revision=resolved_revision,
+            )
+        )
     sizes: dict[str, int | None] = {}
     for item in path_info:
         path = getattr(item, "path", None)
         if not isinstance(path, str):
             continue
         raw_size = getattr(item, "size", None)
-        sizes[path] = (
-            raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
-        )
+        size = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+        previous_size = sizes.get(path)
+        if path in sizes and previous_size != size:
+            raise Exception(
+                f"Cannot enforce max-size for {repo_id}: inconsistent size metadata for selected file {path}"
+            )
+        sizes[path] = size
     return sizes, resolved_revision
 
 
@@ -2419,7 +2660,24 @@ def _verify_huggingface_selection_within_max_size(
 
     total_size = initial_size
     for filename in dict.fromkeys(filenames):
+        _validate_huggingface_repo_filename(repo_id, filename)
         file_path = downloaded_path / filename
+        parent_path = file_path.parent.resolve()
+        if not _is_within_directory(downloaded_path, parent_path):
+            raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file path escaped: {filename}")
+        if file_path.is_symlink():
+            try:
+                symlink_target = file_path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(
+                    f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}"
+                ) from exc
+            if not _is_within_directory(downloaded_path, symlink_target) and not _is_huggingface_cache_blob_target(
+                downloaded_path, symlink_target
+            ):
+                raise ValueError(
+                    f"Cannot verify max-size for {repo_id}: downloaded selected file symlink target escaped: {filename}"
+                )
         if not file_path.is_file():
             raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}")
         try:
@@ -3061,6 +3319,9 @@ def plan_huggingface_streaming_download(
         scannable_scanner_ids,
         allow_content_probes=allow_content_probes,
         include_all_files=include_all_files,
+        include_all_files_unbounded_extra_limit=(
+            _MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES if include_all_files and size_limit is None else None
+        ),
         deadline=deadline,
     )
     openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
@@ -3356,7 +3617,7 @@ def download_file_from_hf(
         repo_files: list[str] | None = None
         repo_revision: str | None = None
         repo_listing_error: str | None = None
-        if size_limit is not None or repository_file_inventory is not None:
+        if repository_file_inventory is not None:
             listing_timeout = 30.0
             if deadline is not None:
                 listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
@@ -3379,21 +3640,29 @@ def download_file_from_hf(
                 download_revision = inventory_revision
 
         if size_limit is not None:
-            pinned_revision = repo_revision
-            if not _is_huggingface_commit_sha(pinned_revision):
+            if repository_file_inventory is not None and not _is_huggingface_commit_sha(repo_revision):
                 error_suffix = f": {repo_listing_error}" if repo_listing_error else ""
                 raise ValueError(
                     f"Unable to determine immutable revision for {display_url}; refusing capped download{error_suffix}"
                 )
-            assert isinstance(pinned_revision, str)
+            pinned_revision = repo_revision if repository_file_inventory is not None else None
 
-            path_sizes, _resolved_revision = _get_huggingface_path_sizes(
-                repo_id,
-                [filename],
-                requested_revision=branch,
-                resolved_revision=pinned_revision,
-                deadline=deadline,
-            )
+            try:
+                path_sizes, resolved_revision = _get_huggingface_path_sizes(
+                    repo_id,
+                    [filename],
+                    requested_revision=branch,
+                    resolved_revision=pinned_revision,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                if "repository revision unavailable" in str(exc):
+                    raise ValueError(
+                        f"Unable to determine immutable revision for {display_url}; refusing capped download"
+                    ) from exc
+                raise
+            if not _is_huggingface_commit_sha(resolved_revision):
+                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
             file_size = path_sizes.get(filename)
             if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
                 raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
@@ -3401,7 +3670,7 @@ def download_file_from_hf(
                 raise ValueError(
                     f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
                 )
-            download_revision = pinned_revision
+            download_revision = resolved_revision
 
         download_kwargs: dict[str, Any] = {
             "repo_id": repo_id,
