@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
 from ..core_results import mark_operational_scan_error
+from ..scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
@@ -334,6 +335,19 @@ class NumPyScanner(BaseScanner):
         safe_numpy_reconstruct_payload: bool,
         validated_position_limit: int | None = None,
     ) -> None:
+        def private_actionable_failed_check_entry(check: Check) -> dict[str, str] | None:
+            if (
+                check.status != CheckStatus.FAILED
+                or check.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+                or check.rule_code is None
+            ):
+                return None
+            return {
+                "name": check.name,
+                "rule_code": check.rule_code,
+                "severity": check.severity.value,
+            }
+
         def is_validated_numpy_object_reconstruction(item: Check | Issue) -> bool:
             if (
                 item.rule_code != "NON_ALLOWLISTED_GLOBAL"
@@ -355,8 +369,41 @@ class NumPyScanner(BaseScanner):
                 return False
             return _numpy_object_reconstruction_reference_is_trusted(module, name)
 
+        private_entries_to_remove: list[dict[str, str]] = []
+        for check in result.checks:
+            if not is_validated_numpy_object_reconstruction(check):
+                continue
+            private_entry = private_actionable_failed_check_entry(check)
+            if private_entry is not None:
+                private_entries_to_remove.append(private_entry)
+
         result.issues = [issue for issue in result.issues if not is_validated_numpy_object_reconstruction(issue)]
         result.checks = [check for check in result.checks if not is_validated_numpy_object_reconstruction(check)]
+        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+        if private_entries_to_remove and isinstance(private_failed_checks, list):
+            unmatched_entries = list(private_entries_to_remove)
+            filtered_entries: list[Any] = []
+            for entry in private_failed_checks:
+                if isinstance(entry, dict):
+                    matched_index = next(
+                        (
+                            index
+                            for index, candidate in enumerate(unmatched_entries)
+                            if entry.get("name") == candidate["name"]
+                            and entry.get("rule_code") == candidate["rule_code"]
+                            and entry.get("severity") == candidate["severity"]
+                        ),
+                        None,
+                    )
+                    if matched_index is not None:
+                        del unmatched_entries[matched_index]
+                        continue
+                filtered_entries.append(entry)
+
+            if filtered_entries:
+                result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
+            else:
+                result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
 
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""

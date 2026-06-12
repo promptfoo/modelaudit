@@ -15,6 +15,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
+from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.numpy_scanner import (
     NUMPY_HEADER_MAX_SIZE,
@@ -1070,6 +1071,57 @@ def test_numpy_object_dtype_cleanup_keeps_untrusted_numpy_reconstruction_warning
 
     assert [check.details.get("position") for check in result.checks] == [209]
     assert [issue.details.get("position") for issue in result.issues] == [209]
+
+
+def test_numpy_object_dtype_cleanup_filters_matching_private_failed_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def add_validated_dtype_check(scan_result: ScanResult) -> None:
+        scan_result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="validated dtype",
+            severity=IssueSeverity.WARNING,
+            details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 209},
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+
+    benign_result = ScanResult("numpy")
+    add_validated_dtype_check(benign_result)
+
+    result = ScanResult("numpy")
+    add_validated_dtype_check(result)
+    result.add_check(
+        name="Dangerous Embedded Code",
+        passed=False,
+        message="dangerous global",
+        severity=IssueSeverity.CRITICAL,
+        details={"import_reference": "builtins.exec", "module": "builtins", "name": "exec", "position": 212},
+        rule_code="S101",
+    )
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+
+    NumPyScanner._remove_validated_numpy_object_reconstruction_findings(
+        benign_result,
+        safe_numpy_reconstruct_payload=True,
+    )
+    NumPyScanner._remove_validated_numpy_object_reconstruction_findings(
+        result,
+        safe_numpy_reconstruct_payload=True,
+    )
+
+    assert benign_result.checks == []
+    assert benign_result.issues == []
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in benign_result._private_metadata
+    assert [(check.name, check.rule_code) for check in result.checks] == [("Dangerous Embedded Code", "S101")]
+    assert [(issue.message, issue.rule_code) for issue in result.issues] == [("dangerous global", "S101")]
+    assert result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] == [
+        {"name": "Dangerous Embedded Code", "rule_code": "S101", "severity": "critical"}
+    ]
 
 
 def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
