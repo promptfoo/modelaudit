@@ -1633,7 +1633,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
 
         except Exception:
             if parsed_streams == 0:
-                return ()
+                break
             del builders[stream_builder_start:]
             last_literal_index = None
             break

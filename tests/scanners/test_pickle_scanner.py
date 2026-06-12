@@ -1634,6 +1634,14 @@ def test_scan_stream_allows_large_inert_url_literal_at_raw_scan_budget_boundary(
     )
 
 
+def test_scan_stream_preserves_inert_url_literal_when_first_stream_truncates() -> None:
+    payload = b"Vhttps://docs.example.invalid/reference/requests.get(url)\nX"
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="truncated-url-metadata.pkl")
+
+    assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_scan_stream_allows_inert_url_literal_in_concatenated_stream_without_critical_network() -> None:
     first_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
     second_stream = pickle.dumps(

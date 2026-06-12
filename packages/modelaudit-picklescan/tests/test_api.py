@@ -3096,6 +3096,19 @@ def test_scan_bytes_allows_fragmented_inert_url_literals_with_executable_terms()
     assert report.findings == ()
 
 
+def test_scan_bytes_allows_inert_url_literal_with_base64_execution_query() -> None:
+    encoded = base64.b64encode(b"os.system('id')").decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps({"metadata_url": f"https://example.invalid/path?q={encoded}"}, protocol=4),
+        source="url-base64-metadata.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
 @pytest.mark.parametrize(
     ("payload", "import_reference"),
     [

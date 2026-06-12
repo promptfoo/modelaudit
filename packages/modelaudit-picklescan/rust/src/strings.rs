@@ -69,14 +69,14 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
 
     let plain_value = strip_http_url_spans(value);
     let has_plain_seed = has_suspicious_ascii_seed(plain_value.as_bytes());
-    let has_encoded_seed = has_base64_dangerous_seed(value);
+    let has_encoded_seed = has_base64_dangerous_seed(plain_value.as_ref());
     if !has_plain_seed && !has_encoded_seed {
         return Vec::new();
     }
 
     let mut matches = Vec::new();
     if has_encoded_seed {
-        matches.extend(encoded_dangerous_string_matches(value));
+        matches.extend(encoded_dangerous_string_matches(plain_value.as_ref()));
     }
     if !has_plain_seed {
         return matches;
@@ -1516,5 +1516,13 @@ mod tests {
 
         assert!(matches.contains(&"base64 os.system".to_string()));
         assert!(suspicious_string_matches("ZXZhbCh4KQ==").contains(&"base64 eval(".to_string()));
+        assert!(
+            suspicious_string_matches("https://example.invalid/path?q=b3Muc3lzdGVtKCdpZCcp")
+                .is_empty()
+        );
+        assert!(suspicious_string_matches(
+            "loader=b3Muc3lzdGVtKCdpZCcp; docs=https://example.invalid/path"
+        )
+        .contains(&"base64 os.system".to_string()));
     }
 }
