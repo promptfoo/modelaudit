@@ -2559,6 +2559,20 @@ def _write_large_benign_keras_hdf5(path: Path) -> None:
         handle.truncate(core_module.DEFAULT_MAX_FILE_READ_SIZE + 4096)
 
 
+def _write_large_valid_userblock_keras_hdf5(path: Path) -> int:
+    h5py = pytest.importorskip("h5py")
+    userblock_size = 16 * 1024 * 1024
+    assert userblock_size > HDF5_SIGNATURE_SCAN_MAX_BYTES
+    with h5py.File(path, "w", userblock_size=userblock_size) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]}},
+        )
+        h5_file.attrs["keras_version"] = "3.13.2"
+    with path.open("ab") as handle:
+        handle.truncate(core_module.DEFAULT_MAX_FILE_READ_SIZE + 4096)
+    return userblock_size
+
+
 def _write_safe_r_serialized(path: Path) -> None:
     path.write_bytes(b"X\nsafe\nmodel\nweights")
 
@@ -8662,6 +8676,76 @@ def test_scan_file_routes_runtime_h5py_failure_for_extensionless_userblock(
     assert "keras_h5" in audit_result.scanner_names
     assert "keras_h5_scan_failed" in metadata["scan_outcome_reasons"]
     assert any(check.name == "Keras H5 File Scan" for check in audit_result.checks)
+    assert determine_exit_code(audit_result) == 2
+
+
+def test_scan_file_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "large-userblock-model.h5"
+    userblock_size = _write_large_valid_userblock_keras_hdf5(model_path)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_cache_file_size": core_module.DEFAULT_MAX_FILE_READ_SIZE * 2,
+    }
+
+    def fail_if_cache_hashes_large_hdf5(_self: SecureFileHasher, path: str) -> str:
+        if Path(path).resolve() == model_path.resolve():
+            pytest.fail("large valid HDF5 userblock file was whole-file hashed for cache lookup")
+        return "0" * 64
+
+    monkeypatch.setattr(SecureFileHasher, "hash_file", fail_if_cache_hashes_large_hdf5)
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file_with_stat",
+        lambda self, path, _stat: fail_if_cache_hashes_large_hdf5(self, path),
+    )
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(model_path), config=config)
+        cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+    finally:
+        reset_cache_manager()
+
+    assert result.scanner_name == "keras_h5"
+    assert result.success is False
+    assert "hdf5_userblock_zip_probe_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["file_backed_scan"] is True
+    assert cache_entries == 0
+
+
+def test_directory_scan_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "large-userblock-model.h5"
+    userblock_size = _write_large_valid_userblock_keras_hdf5(model_path)
+    original_hash = core_module._calculate_file_hash
+
+    def fail_if_directory_hashes_large_hdf5(path: str, *, deadline: float | None = None) -> str:
+        if Path(path).resolve() == model_path.resolve():
+            pytest.fail("large valid HDF5 userblock file was whole-file hashed during directory scan")
+        return original_hash(path, deadline=deadline)
+
+    monkeypatch.setattr(core_module, "_calculate_file_hash", fail_if_directory_hashes_large_hdf5)
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+
+    audit_result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    metadata = audit_result.file_metadata[str(model_path)]
+
+    assert "keras_h5" in audit_result.scanner_names
+    assert metadata["content_hash"].startswith("unhashable_file_backed_hdf5_")
+    assert metadata["file_backed_scan"] is True
+    assert "hdf5_userblock_zip_probe_incomplete" in metadata["scan_outcome_reasons"]
+    assert audit_result.content_hash is None
     assert determine_exit_code(audit_result) == 2
 
 

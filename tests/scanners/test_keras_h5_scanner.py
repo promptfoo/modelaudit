@@ -1018,6 +1018,96 @@ def test_keras_h5_virtual_dataset_source_inspection_limit_fails_closed(
     assert limit_checks[0].details["virtual_dataset_sources_truncated"] is True
 
 
+def test_keras_h5_virtual_dataset_external_source_before_scan_wide_budget_still_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    external_source = tmp_path / "early_virtual_source.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0, 2.0])
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="virtual_dataset_external_before_budget.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        f.create_dataset("internal_payload", data=[1.0, 2.0])
+        dense = f.require_group("model_weights").create_group("dense")
+        dense.attrs["weight_names"] = [b"virtual_kernel"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+        layout[0] = h5py.VirtualSource(external_source.name, "/payload", shape=(2,))[0]
+        layout[1] = h5py.VirtualSource(".", "/internal_payload", shape=(2,))[1]
+        dense.create_virtual_dataset("virtual_kernel", layout)
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_VIRTUAL_SOURCE_INSPECTIONS", 1)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "virtual_dataset",
+            "hdf5_path": "/model_weights/dense/virtual_kernel",
+            "sources": [{"filename": "early_virtual_source.h5", "path": "/payload"}],
+            "source_count": 2,
+            "sources_truncated": True,
+        },
+    ]
+    assert cve_issues[0].details["virtual_dataset_sources_truncated"] is True
+    limit_checks = [check for check in result.checks if check.name == "HDF5 External Reference Analysis Limit"]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].details["visited_virtual_source_count"] == 1
+    assert limit_checks[0].details["max_virtual_source_inspections"] == 1
+
+
+def test_keras_h5_virtual_dataset_source_inspection_budget_is_scan_wide(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="virtual_dataset_scan_wide_budget.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        f.create_dataset("internal_payload", data=[1.0, 2.0])
+        dense = f.require_group("model_weights").create_group("dense")
+        dense.attrs["weight_names"] = [b"virtual_a", b"virtual_b"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        same_file_source = h5py.VirtualSource(".", "/internal_payload", shape=(2,))
+        for dataset_name in ("virtual_a", "virtual_b"):
+            layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+            for index in range(2):
+                layout[index] = same_file_source[index]
+            dense.create_virtual_dataset(dataset_name, layout)
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_VIRTUAL_SOURCE_INSPECTIONS", 3)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    reason = "keras_h5_external_reference_analysis_limit_exceeded"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    limit_checks = [check for check in result.checks if check.name == "HDF5 External Reference Analysis Limit"]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].status == CheckStatus.FAILED
+    assert limit_checks[0].details["visited_virtual_source_count"] == 3
+    assert limit_checks[0].details["max_virtual_source_inspections"] == 3
+    assert limit_checks[0].details["virtual_dataset_sources_truncated"] is True
+
+
 def test_keras_h5_same_file_virtual_dataset_source_stays_clean(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
@@ -1508,6 +1598,32 @@ def test_variable_string_vector_custom_objects_does_not_skip_training_config(tmp
         check.name == "Custom Loss Detection" and check.details.get("identifier") == "malicious_loss"
         for check in result.checks
     )
+
+
+def test_empty_variable_string_name_attribute_is_not_truncated(tmp_path: Path) -> None:
+    import numpy as np
+
+    model_path = tmp_path / "empty_variable_names.h5"
+    with h5py.File(model_path, "w") as f:
+        f.attrs.create(
+            "layer_names",
+            np.array([], dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+
+    with h5py.File(model_path, "r") as f:
+        names, truncated = KerasH5Scanner._read_bounded_hdf5_name_attribute(f.attrs, "layer_names")
+        attr_id = f.attrs.get_id("layer_names")
+        direct_names, direct_truncated = KerasH5Scanner._read_hdf5_variable_string_name_attribute(
+            attr_id,
+            max_bytes=KerasH5Scanner._MAX_HDF5_NAME_ATTRIBUTE_BYTES,
+            point_count=0,
+        )
+
+    assert names == []
+    assert truncated is False
+    assert direct_names == []
+    assert direct_truncated is False
 
 
 def test_large_legacy_weight_name_attributes_are_batched_in_worker(

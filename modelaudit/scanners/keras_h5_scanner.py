@@ -1703,7 +1703,9 @@ class KerasH5Scanner(BaseScanner):
         if point_count is None:
             with suppress(Exception):
                 point_count = int(attr_id.get_space().get_simple_extent_npoints())
-        if point_count is None or point_count <= 0 or point_count > cls._MAX_HDF5_LINK_VISITS:
+        if point_count == 0:
+            return [], False
+        if point_count is None or point_count < 0 or point_count > cls._MAX_HDF5_LINK_VISITS:
             return [], True
 
         attr_value, truncated, _attr_size = cls._read_hdf5_variable_string_attribute(
@@ -1785,6 +1787,7 @@ class KerasH5Scanner(BaseScanner):
         external_reference_count = 0
         external_storage_segments_truncated = False
         virtual_dataset_sources_truncated = False
+        visited_virtual_source_count = 0
         soft_link_resolution_incomplete = False
         weight_roots, weight_roots_truncated = self._hdf5_weight_scan_roots(h5_file)
 
@@ -1829,7 +1832,7 @@ class KerasH5Scanner(BaseScanner):
             findings.append(external_storage_finding)
 
         def record_virtual_dataset_sources(name: str, obj: Any) -> None:
-            nonlocal external_reference_count, virtual_dataset_sources_truncated
+            nonlocal external_reference_count, virtual_dataset_sources_truncated, visited_virtual_source_count
             storage_properties = obj.id.get_create_plist()
             if storage_properties.get_layout() != h5py.h5d.VIRTUAL:
                 return
@@ -1839,8 +1842,13 @@ class KerasH5Scanner(BaseScanner):
 
             sources: list[dict[str, Any]] = []
             external_source_count = 0
-            inspected_source_count = min(virtual_source_count, self._MAX_HDF5_VIRTUAL_SOURCE_INSPECTIONS)
+            remaining_source_inspections = max(
+                self._MAX_HDF5_VIRTUAL_SOURCE_INSPECTIONS - visited_virtual_source_count,
+                0,
+            )
+            inspected_source_count = min(virtual_source_count, remaining_source_inspections)
             for index in range(inspected_source_count):
+                visited_virtual_source_count += 1
                 raw_filename = storage_properties.get_virtual_filename(index)
                 if self._is_same_file_virtual_source(raw_filename):
                     continue
@@ -2031,6 +2039,8 @@ class KerasH5Scanner(BaseScanner):
                     "reported_external_reference_count": len(findings),
                     "external_references_truncated": external_references_truncated,
                     "external_storage_segments_truncated": external_storage_segments_truncated,
+                    "visited_virtual_source_count": visited_virtual_source_count,
+                    "max_virtual_source_inspections": self._MAX_HDF5_VIRTUAL_SOURCE_INSPECTIONS,
                     "virtual_dataset_sources_truncated": virtual_dataset_sources_truncated,
                     "soft_link_resolution_incomplete": soft_link_resolution_incomplete,
                 },
