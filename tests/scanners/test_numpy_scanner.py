@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
@@ -1088,6 +1089,8 @@ def test_numpy_object_dtype_cleanup_filters_matching_private_failed_checks(
 
     benign_result = ScanResult("numpy")
     add_validated_dtype_check(benign_result)
+    benign_result.checks[0].severity = IssueSeverity.INFO
+    benign_result.issues[0].severity = IssueSeverity.INFO
 
     result = ScanResult("numpy")
     add_validated_dtype_check(result)
@@ -1122,6 +1125,69 @@ def test_numpy_object_dtype_cleanup_filters_matching_private_failed_checks(
     assert result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] == [
         {"name": "Dangerous Embedded Code", "rule_code": "S101", "severity": "critical"}
     ]
+
+
+def test_numpy_object_dtype_direct_scan_preserves_info_downgraded_embedded_private_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arr = np.array([{"k": "v"}], dtype=object)
+    path = tmp_path / "info_downgraded_private.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        result = ScanResult(scanner_name="pickle")
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="validated reconstruct",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy._core.multiarray._reconstruct",
+                "module": "numpy._core.multiarray",
+                "name": "_reconstruct",
+                "position": file_obj.tell(),
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.add_check(
+            name="Dangerous Embedded Code",
+            passed=False,
+            message="dangerous global",
+            severity=IssueSeverity.CRITICAL,
+            location=context_path,
+            details={"import_reference": "builtins.exec", "module": "builtins", "name": "exec", "position": 212},
+            rule_code="S101",
+        )
+        result.checks[-1].severity = IssueSeverity.INFO
+        result.issues[-1].severity = IssueSeverity.INFO
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        lambda _payload: True,
+    )
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is True
+    assert not result.has_warnings
+    assert result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] == [
+        {"name": "Dangerous Embedded Code", "rule_code": "S101", "severity": "critical"}
+    ]
+    assert not should_cache_scan_result(result.to_dict(include_private_metadata=True))
 
 
 def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:

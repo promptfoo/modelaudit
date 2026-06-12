@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import io
 import struct
 import sys
@@ -336,16 +337,11 @@ class NumPyScanner(BaseScanner):
         validated_position_limit: int | None = None,
     ) -> None:
         def private_actionable_failed_check_entry(check: Check) -> dict[str, str] | None:
-            if (
-                check.status != CheckStatus.FAILED
-                or check.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-                or check.rule_code is None
-            ):
+            if check.status != CheckStatus.FAILED or check.rule_code is None:
                 return None
             return {
                 "name": check.name,
                 "rule_code": check.rule_code,
-                "severity": check.severity.value,
             }
 
         def is_validated_numpy_object_reconstruction(item: Check | Issue) -> bool:
@@ -403,6 +399,15 @@ class NumPyScanner(BaseScanner):
                 result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
             else:
                 result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
+
+    @staticmethod
+    def _merge_embedded_pickle_private_metadata(result: ScanResult, embedded_result: ScanResult) -> None:
+        for key, value in embedded_result._private_metadata.items():
+            existing = result._private_metadata.get(key)
+            if isinstance(existing, list) and isinstance(value, list):
+                existing.extend(copy.deepcopy(value))
+            else:
+                result._private_metadata[key] = copy.deepcopy(value)
 
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
@@ -654,6 +659,7 @@ class NumPyScanner(BaseScanner):
                                         )
                                     )
                                 trailing_bytes = file_size - pickle_end_offset
+                                self._merge_embedded_pickle_private_metadata(result, embedded_result)
                                 result.issues.extend(
                                     issue
                                     for issue in embedded_result.issues
@@ -689,6 +695,7 @@ class NumPyScanner(BaseScanner):
                                 _finish_with_inconclusive_contract(result, default_success=False)
                                 return result
 
+                            self._merge_embedded_pickle_private_metadata(result, embedded_result)
                             result.issues.extend(embedded_result.issues)
                             result.checks.extend(embedded_result.checks)
                             self._remove_validated_numpy_object_reconstruction_findings(

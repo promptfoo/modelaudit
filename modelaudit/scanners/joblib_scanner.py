@@ -848,16 +848,11 @@ class JoblibScanner(BaseScanner):
 
     @staticmethod
     def _private_actionable_failed_check_entry(check: Check) -> dict[str, str] | None:
-        if (
-            check.status != CheckStatus.FAILED
-            or check.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-            or check.rule_code is None
-        ):
+        if check.status != CheckStatus.FAILED or check.rule_code is None:
             return None
         return {
             "name": check.name,
             "rule_code": check.rule_code,
-            "severity": check.severity.value,
         }
 
     @staticmethod

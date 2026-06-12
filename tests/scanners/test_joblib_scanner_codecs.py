@@ -926,6 +926,8 @@ def test_validated_joblib_wrapper_cleanup_clears_private_actionable_failed_check
         rule_code="NON_ALLOWLISTED_GLOBAL",
     )
     assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY in result._private_metadata
+    result.checks[0].severity = IssueSeverity.INFO
+    result.issues[0].severity = IssueSeverity.INFO
 
     JoblibScanner._remove_validated_numpy_array_wrapper_findings(
         result,
