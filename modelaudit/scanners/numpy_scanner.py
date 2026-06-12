@@ -8,7 +8,6 @@ import struct
 import sys
 import warnings
 from collections.abc import Callable
-from importlib import import_module
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
@@ -19,15 +18,25 @@ from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, Is
 from .pickle_scanner import PickleScanner
 
 _PicklescanOwnerProof = Callable[[str, str, object], bool]
+_PicklescanLoadedReferenceState = Callable[[str, str], tuple[bool, object | None]]
+_PicklescanModuleOriginKind = Callable[[str], str | None]
 _PicklescanPayloadProof = Callable[[bytes | None], bool]
+_picklescan_current_loaded_interpreter_reference_state: _PicklescanLoadedReferenceState | None
 _picklescan_loaded_site_package_reference_owner_matches: _PicklescanOwnerProof | None
+_picklescan_trusted_module_origin_kind: _PicklescanModuleOriginKind | None
 _picklescan_payload_has_only_safe_numpy_ndarray_reconstruction: _PicklescanPayloadProof | None
 try:
     from modelaudit_picklescan.call_graph import (
+        _current_loaded_interpreter_reference_state as _picklescan_current_loaded_interpreter_reference_state,
+    )
+    from modelaudit_picklescan.call_graph import (
         _loaded_site_package_reference_owner_matches as _picklescan_loaded_site_package_reference_owner_matches,
     )
+    from modelaudit_picklescan.call_graph import _trusted_module_origin_kind as _picklescan_trusted_module_origin_kind
 except ImportError:
+    _picklescan_current_loaded_interpreter_reference_state = None
     _picklescan_loaded_site_package_reference_owner_matches = None
+    _picklescan_trusted_module_origin_kind = None
 try:
     from modelaudit_picklescan import api as _picklescan_api
 
@@ -104,8 +113,7 @@ NUMPY_V3_HEADER_MAX_BYTES = NUMPY_HEADER_MAX_SIZE * 4
 
 def _numpy_object_reconstruction_reference_is_trusted(module: str, name: str) -> bool:
     try:
-        if import_only_reference_is_proven_trusted(module, name):
-            return True
+        return import_only_reference_is_proven_trusted(module, name)
     except Exception as error:
         warnings.warn(
             f"Falling back to loaded NumPy reconstruction owner proof for {module}.{name}: {error}",
@@ -114,10 +122,16 @@ def _numpy_object_reconstruction_reference_is_trusted(module: str, name: str) ->
         )
 
     try:
-        if _picklescan_loaded_site_package_reference_owner_matches is None:
+        if (
+            _picklescan_current_loaded_interpreter_reference_state is None
+            or _picklescan_loaded_site_package_reference_owner_matches is None
+            or _picklescan_trusted_module_origin_kind is None
+            or _picklescan_trusted_module_origin_kind(module) != "site_packages"
+        ):
             return False
-        module_object = import_module(module)
-        value = getattr(module_object, name)
+        loaded, value = _picklescan_current_loaded_interpreter_reference_state(module, name)
+        if not loaded:
+            return False
         return _picklescan_loaded_site_package_reference_owner_matches(module, name, value)
     except Exception:
         return False

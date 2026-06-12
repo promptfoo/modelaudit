@@ -2454,9 +2454,10 @@ def _loaded_site_package_reference_owner_matches(
         ) and _trusted_reference_runtime_dependencies_are_source_independent(value)
     if callable(value):
         return False
-    return _non_callable_instance_pickle_owner_matches_trusted_source(
+    return _loaded_site_package_instance_owner_matches_trusted_source(
         value,
         expected_module=module_name,
+        expected_name=name,
         pickle_entrypoint_methods=pickle_entrypoint_methods,
     )
 
@@ -2465,10 +2466,11 @@ def _reference_leaf_name(name: str) -> str:
     return name.rpartition(".")[2]
 
 
-def _non_callable_instance_pickle_owner_matches_trusted_source(
+def _loaded_site_package_instance_owner_matches_trusted_source(
     value: object,
     *,
     expected_module: str,
+    expected_name: str,
     pickle_entrypoint_methods: tuple[str, ...] | None,
 ) -> bool:
     if pickle_entrypoint_methods is None:
@@ -2477,7 +2479,15 @@ def _non_callable_instance_pickle_owner_matches_trusted_source(
     if not any(method in _PICKLE_BUILD_ENTRYPOINT_METHODS for method in entrypoint_methods):
         return True
     class_ = type(value)
-    if not _instance_class_origin_matches_reference_owner(class_, expected_module=expected_module):
+    class_module = type.__getattribute__(class_, "__module__")
+    class_name = type.__getattribute__(class_, "__name__")
+    if (
+        type(class_module) is not str
+        or class_module != expected_module
+        or type(class_name) is not str
+        or class_name != _reference_leaf_name(expected_name)
+        or _trusted_python_module_source_path(class_module) is None
+    ):
         return False
     return _class_pickle_owner_matches_trusted_source(
         class_,
@@ -2489,15 +2499,6 @@ def _non_callable_instance_pickle_owner_matches_trusted_source(
         pickle_entrypoint_methods=entrypoint_methods,
         pickle_invokes_metaclass_call=False,
     )
-
-
-def _instance_class_origin_matches_reference_owner(class_: type[object], *, expected_module: str) -> bool:
-    class_module = type.__getattribute__(class_, "__module__")
-    if type(class_module) is not str:
-        return False
-    if class_module == "builtins" or _trusted_module_origin_kind(class_module) == "stdlib":
-        return True
-    return class_module == expected_module and _trusted_python_module_source_path(class_module) is not None
 
 
 def _pickle_owner_proof_for_reference(
