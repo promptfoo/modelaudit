@@ -1348,6 +1348,9 @@ class KerasH5Scanner(BaseScanner):
         if not isinstance(layers, h5py.Group):
             return False
 
+        if cls._has_keras3_root_vars_layout(h5_file):
+            return True
+
         for index, layer_name in enumerate(layers):
             if index >= cls._MAX_HDF5_LAYOUT_PROBE_ITEMS:
                 return True
@@ -1373,6 +1376,18 @@ class KerasH5Scanner(BaseScanner):
                 return True
 
         return False
+
+    @classmethod
+    def _has_keras3_root_vars_layout(cls, h5_file: Any) -> bool:
+        if cls._has_group_or_external_link(h5_file, "vars"):
+            return True
+
+        optimizer_link = h5_file.get("optimizer", getlink=True)
+        if not isinstance(optimizer_link, h5py.HardLink):
+            return False
+
+        optimizer = h5_file.get("optimizer", getlink=False)
+        return isinstance(optimizer, h5py.Group) and cls._has_group_or_external_link(optimizer, "vars")
 
     @classmethod
     def _hdf5_weight_scan_roots(cls, h5_file: Any) -> tuple[list[str], bool]:

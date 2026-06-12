@@ -1234,7 +1234,7 @@ def test_keras_h5_scanner_flags_model_config_keras3_root_vars_external_link(
 def test_keras_h5_scanner_flags_keras3_root_vars_external_link(tmp_path: Path, root_path: str) -> None:
     weights_path = tmp_path / "keras3_root_vars.weights.h5"
     with h5py.File(weights_path, "w") as f:
-        f.create_group("layers").create_group("dense").create_group("vars").create_dataset("0", data=[1.0])
+        f.create_group("layers").create_group("dense")
         vars_group = f.require_group(root_path)
         vars_group["0"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
 
@@ -1253,13 +1253,41 @@ def test_keras_h5_scanner_flags_keras3_root_vars_external_link(tmp_path: Path, r
 
 
 @pytest.mark.parametrize("root_path", ["vars", "optimizer/vars"])
+def test_keras_h5_scanner_flags_keras3_root_vars_external_storage(tmp_path: Path, root_path: str) -> None:
+    raw_storage = tmp_path / "root_weights.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+    weights_path = tmp_path / "keras3_root_external_storage.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_group("layers").create_group("dense")
+        vars_group = f.require_group(root_path)
+        vars_group.create_dataset(
+            "0",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "external_storage",
+            "hdf5_path": f"/{root_path}/0",
+            "segments": [{"filename": "root_weights.raw", "offset": 0, "size": 8}],
+        },
+    ]
+
+
+@pytest.mark.parametrize("root_path", ["vars", "optimizer/vars"])
 def test_keras_h5_scanner_flags_keras3_root_vars_virtual_dataset_source(tmp_path: Path, root_path: str) -> None:
     virtual_source = tmp_path / "root_virtual_source.h5"
     with h5py.File(virtual_source, "w") as f:
         f.create_dataset("payload", data=[1.0, 2.0])
     weights_path = tmp_path / "keras3_root_virtual_vars.weights.h5"
     with h5py.File(weights_path, "w") as f:
-        f.create_group("layers").create_group("dense").create_group("vars").create_dataset("0", data=[1.0])
+        f.create_group("layers").create_group("dense")
         vars_group = f.require_group(root_path)
         layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
         layout[:] = h5py.VirtualSource(virtual_source.name, "/payload", shape=(2,))
@@ -2602,11 +2630,12 @@ def test_keras_h5_scanner_skips_generic_nested_weight_like_groups(tmp_path: Path
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
-def test_keras_h5_scanner_skips_generic_root_weight_like_groups(tmp_path: Path) -> None:
+@pytest.mark.parametrize("root_path", ["vars", "optimizer/vars"])
+def test_keras_h5_scanner_skips_generic_root_weight_like_groups(tmp_path: Path, root_path: str) -> None:
     """Generic root vars/weights groups are common outside Keras and should stay quiet."""
     generic_path = tmp_path / "generic_root_vars.h5"
     with h5py.File(generic_path, "w") as f:
-        f["vars"] = h5py.ExternalLink("external_source.h5", "/payload")
+        f.require_group(root_path)["0"] = h5py.ExternalLink("external_source.h5", "/payload")
 
     result = KerasH5Scanner().scan(str(generic_path))
 
