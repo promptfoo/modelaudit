@@ -5352,6 +5352,68 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_renamed_candidate_b
     mock_format_scan_output.assert_not_called()
 
 
+def test_scan_huggingface_streaming_dry_run_refuses_unprobed_openvino_companion_before_preview() -> None:
+    """OpenVINO sidecar expansion must not succeed in metadata-only dry-runs without probing the XML."""
+    repo_files = ["document.xml", "document.bin"]
+
+    def path_sizes_side_effect(
+        _repo_id: str,
+        filenames: list[str],
+        **_kwargs: object,
+    ) -> tuple[dict[str, int | None], str]:
+        sizes: dict[str, int | None] = dict.fromkeys(filenames, 256)
+        return sizes, _HF_TEST_REVISION
+
+    with (
+        patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(repo_files, _HF_TEST_REVISION, None),
+        ) as mock_list_repo_files,
+        patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect_content,
+        patch(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            side_effect=path_sizes_side_effect,
+        ) as mock_path_sizes,
+        patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
+        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
+        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "--max-size",
+                "1KB",
+                "--scanners",
+                "openvino",
+                "hf://test/model",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2
+    assert "metadata-only dry-run selection incomplete" in result.output
+    assert "cannot prove selection without content probes" in result.output
+    assert "document.bin" in result.output
+    assert "dry_run" not in result.output
+    mock_list_repo_files.assert_called_once()
+    mock_detect_content.assert_not_called()
+    mock_path_sizes.assert_not_called()
+    mock_get_model_info.assert_not_called()
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan_local.assert_not_called()
+    mock_format_scan_output.assert_not_called()
+
+
 @patch(
     "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
     return_value=(["model.safetensors"], _HF_TEST_REVISION, None),

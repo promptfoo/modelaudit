@@ -1273,10 +1273,12 @@ def _include_huggingface_openvino_companions(
         if companion is None or companion not in repo_file_set or companion in selected_files:
             continue
 
-        if allow_content_probes:
-            detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
-            if detected_format not in {"openvino", XML_MODEL_INCONCLUSIVE_FORMAT}:
-                continue
+        if not allow_content_probes:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, [companion])
+
+        detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
+        if detected_format not in {"openvino", XML_MODEL_INCONCLUSIVE_FORMAT}:
+            continue
 
         expanded_files.append(companion)
         selected_files.add(companion)
