@@ -2086,7 +2086,7 @@ class TestDvcSecurity:
                 message="Incomplete coverage belongs to a sibling",
                 severity=IssueSeverity.INFO,
                 location=str(sibling_path),
-                details={"analysis_incomplete": True},
+                details={"analysis_incomplete": True, "scan_outcome_reason": "synthetic_detail_only_incomplete"},
             )
         )
         path_state = _ScanPathState(collect_dvc_coverage=True)
@@ -2109,7 +2109,7 @@ class TestDvcSecurity:
                 message="Incomplete coverage in nested member",
                 severity=IssueSeverity.INFO,
                 location=f"{model_path}:member.pkl",
-                details={"analysis_incomplete": True},
+                details={"analysis_incomplete": True, "scan_outcome_reason": "synthetic_detail_only_incomplete"},
             )
         )
         path_state = _ScanPathState(collect_dvc_coverage=True)

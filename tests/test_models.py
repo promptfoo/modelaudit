@@ -600,6 +600,38 @@ class TestModelAuditResultModel:
         assert result.issues[0].details["reason"] == "dvc_output_limit_exceeded"
         assert determine_exit_code(result) == 2
 
+    def test_aggregate_scan_result_runtime_version_skip_does_not_fail_coverage_success(self) -> None:
+        """Expected CVE applicability skips are not scanner coverage failures."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "issues": [],
+                "checks": [
+                    {
+                        "name": "CVE PyTorch Version Check",
+                        "status": "skipped",
+                        "message": "PyTorch runtime version unavailable",
+                        "severity": "info",
+                        "location": "weights.pt",
+                        "details": {
+                            "analysis_incomplete": True,
+                            "runtime_version_known": False,
+                            "runtime_cve_applicability": "unknown",
+                            "runtime_cve_version_gate": "local_environment_only",
+                        },
+                        "timestamp": 0.0,
+                    }
+                ],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+
     def test_aggregate_scanner_names_wraps_scalar_strings(self) -> None:
         """Scalar scanner fields should not be split into characters."""
         result = create_initial_audit_result()

@@ -88,9 +88,26 @@ def _metadata_has_incomplete_coverage(metadata: Any) -> bool:
     return False
 
 
+def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
+    """Return True when record details explicitly identify incomplete coverage."""
+    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
+        return True
+    reason = _metadata_value(metadata, "scan_outcome_reason")
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = _metadata_value(metadata, "scan_outcome_reasons")
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(reason) for reason in reasons)
+
+    return False
+
+
 def _details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
     """Return True when details or consolidated detail findings identify incomplete coverage."""
-    if _metadata_has_incomplete_coverage(details):
+    if _metadata_has_explicit_incomplete_coverage_marker(details):
         return True
     if _depth >= 4:
         return False

@@ -49,7 +49,7 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
     if scan_result.get("success") is False:
         return False
 
-    if _metadata_disqualifies_cache(scan_result.get("metadata")):
+    if _metadata_disqualifies_cache(scan_result.get("metadata"), allow_bare_analysis_incomplete=True):
         return False
 
     private_metadata = scan_result.get("_private_metadata")
@@ -65,7 +65,7 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
             if not isinstance(entry, dict):
                 continue
 
-            if _metadata_disqualifies_cache(entry.get("details")):
+            if _metadata_disqualifies_cache(entry.get("details"), allow_bare_analysis_incomplete=False):
                 return False
 
             message = entry.get("message")
@@ -77,35 +77,53 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
     return True
 
 
-def _metadata_disqualifies_cache(metadata: Any) -> bool:
+def _metadata_disqualifies_cache(metadata: Any, *, allow_bare_analysis_incomplete: bool) -> bool:
     if not isinstance(metadata, dict):
         return False
     if (
         bool(metadata.get("operational_error"))
-        or bool(metadata.get("analysis_incomplete"))
         or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-        or _has_incomplete_coverage_reasons(metadata)
+        or _has_incomplete_coverage_reasons(
+            metadata,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+        )
     ):
         return True
 
     findings = metadata.get("findings")
     if isinstance(findings, dict):
-        return _metadata_disqualifies_cache(findings)
+        return _metadata_disqualifies_cache(
+            findings,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+        )
     if isinstance(findings, (list, tuple, set, frozenset)):
-        return any(_metadata_disqualifies_cache(finding) for finding in findings)
+        return any(
+            _metadata_disqualifies_cache(
+                finding,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+            )
+            for finding in findings
+        )
 
     details = metadata.get("details")
     if isinstance(details, dict):
-        return _metadata_disqualifies_cache(details)
+        return _metadata_disqualifies_cache(
+            details,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+        )
 
     return False
 
 
-def _has_incomplete_coverage_reasons(metadata: dict[str, Any]) -> bool:
+def _has_incomplete_coverage_reasons(
+    metadata: dict[str, Any],
+    *,
+    allow_bare_analysis_incomplete: bool,
+) -> bool:
     reason = metadata.get("scan_outcome_reason")
     if isinstance(reason, str) and reason:
         return True
-    if metadata.get("analysis_incomplete") is True:
+    if allow_bare_analysis_incomplete and metadata.get("analysis_incomplete") is True:
         return True
 
     reasons = metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)

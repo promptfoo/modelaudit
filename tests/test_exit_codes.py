@@ -62,6 +62,31 @@ def test_exit_code_clean_scan_with_debug_issues():
     assert determine_exit_code(results) == 0
 
 
+def test_exit_code_clean_scan_with_runtime_version_skip_check() -> None:
+    """Expected CVE applicability skips should not become incomplete coverage exits."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="CVE PyTorch Version Check",
+                status=CheckStatus.SKIPPED,
+                message="PyTorch runtime version unavailable",
+                severity=IssueSeverity.INFO,
+                location="weights.pt",
+                details={
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is False
+    assert determine_exit_code(results) == 0
+
+
 def test_exit_code_security_issues():
     """Test exit code 1 for security issues found."""
     results = _create_result_model(
