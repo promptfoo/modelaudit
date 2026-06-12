@@ -2125,7 +2125,7 @@ class TestDvcSecurity:
     ) -> None:
         """A complete subdirectory remains DVC coverage when a sibling is incomplete."""
         from modelaudit.cli import _ScanPathState
-        from modelaudit.models import AssetModel, create_initial_audit_result
+        from modelaudit.models import AssetModel, FileMetadataModel, create_initial_audit_result
 
         models_dir = tmp_path / "models"
         covered_dir = models_dir / "covered"
@@ -2138,11 +2138,11 @@ class TestDvcSecurity:
         directory_result.success = False
         directory_result.assets.append(AssetModel(path=str(covered_payload), type="pickle"))
         directory_result.assets.append(AssetModel(path=str(incomplete), type="pickle"))
-        directory_result.file_metadata[str(incomplete)] = {
-            "analysis_incomplete": True,
-            "scan_outcome": INCONCLUSIVE_SCAN_OUTCOME,
-            "scan_outcome_reasons": ["synthetic_metadata_only_incomplete"],
-        }
+        directory_result.file_metadata[str(incomplete)] = FileMetadataModel(
+            analysis_incomplete=True,
+            scan_outcome=INCONCLUSIVE_SCAN_OUTCOME,
+            scan_outcome_reasons=["synthetic_metadata_only_incomplete"],
+        )
         path_state = _ScanPathState(collect_dvc_coverage=True)
 
         path_state.record_dvc_coverage(str(models_dir), directory_result)
