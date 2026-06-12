@@ -10254,11 +10254,11 @@ def _pickle_global_bytes(module: bytes, name: bytes) -> bytes:
     return b"c" + module + b"\n" + name + b"\n"
 
 
-def _pickle_binunicode(data: bytes) -> bytes:
+def _pickle_binunicode_bytes(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
-def _pickle_short_binunicode(data: bytes) -> bytes:
+def _pickle_short_binunicode_bytes(data: bytes) -> bytes:
     if len(data) > 0xFF:
         raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
     return b"\x8c" + bytes([len(data)]) + data
@@ -10288,20 +10288,20 @@ def _static_getattr_reduce_payload(
     if non_literal_attribute:
         payload += b"K\x01"
     elif alias_attribute:
-        payload += _pickle_binunicode(b"forward") + b"q\x020h\x02"
+        payload += _pickle_binunicode_bytes(b"forward") + b"q\x020h\x02"
     else:
-        payload += _pickle_binunicode(attribute)
+        payload += _pickle_binunicode_bytes(attribute)
     payload += b"\x86R"
     return payload + (b"." if stop else b"")
 
 
 def _memoized_stack_global_operand(module: bytes, name: bytes, module_index: int, name_index: int) -> bytes:
     return (
-        _pickle_short_binunicode(module)
+        _pickle_short_binunicode_bytes(module)
         + b"q"
         + bytes([module_index])
         + b"0"
-        + _pickle_short_binunicode(name)
+        + _pickle_short_binunicode_bytes(name)
         + b"q"
         + bytes([name_index])
         + b"0"
@@ -10327,12 +10327,12 @@ def _static_getattr_with_stack_global_memo_operand_payload(
         payload += _memoized_stack_global_operand(b"ultralytics.nn.modules.head", b"Detect", 2, 3)
     else:
         payload += _pickle_global_bytes(b"ultralytics.nn.modules.head", b"Detect")
-    return payload + _pickle_binunicode(b"forward") + b"\x86R."
+    return payload + _pickle_binunicode_bytes(b"forward") + b"\x86R."
 
 
 def _static_getattr_with_memo_read_args_tuple_payload() -> bytes:
     args_tuple = (
-        _pickle_global_bytes(b"ultralytics.nn.modules.head", b"Detect") + _pickle_binunicode(b"forward") + b"\x86"
+        _pickle_global_bytes(b"ultralytics.nn.modules.head", b"Detect") + _pickle_binunicode_bytes(b"forward") + b"\x86"
     )
     return b"\x80\x04" + _pickle_global_bytes(b"__builtin__", b"getattr") + args_tuple + b"q\x000h\x00R."
 

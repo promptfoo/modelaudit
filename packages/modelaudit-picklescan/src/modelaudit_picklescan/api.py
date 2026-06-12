@@ -2024,9 +2024,11 @@ def _safe_getattr_global_position_fallbacks(
     for finding in findings:
         if _optional_int(finding.details.get("opcode_position")) is not None:
             continue
-        global_position = _dangerous_getattr_call_global_position(finding)
-        if global_position is not None:
-            missing_opcode_counts[global_position] = missing_opcode_counts.get(global_position, 0) + 1
+        missing_opcode_global_position = _dangerous_getattr_call_global_position(finding)
+        if missing_opcode_global_position is not None:
+            missing_opcode_counts[missing_opcode_global_position] = (
+                missing_opcode_counts.get(missing_opcode_global_position, 0) + 1
+            )
     return frozenset(
         global_position
         for global_position, count in missing_opcode_counts.items()
