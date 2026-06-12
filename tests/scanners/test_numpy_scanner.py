@@ -843,6 +843,8 @@ def test_numpy_object_dtype_benign_direct_scan_success_after_reconstruction_clea
     assert result.metadata["embedded_pickle_scan_success"] is False
     assert not result.has_warnings
     assert not result.has_errors
+    assert not any(check.rule_code == "NON_ALLOWLISTED_GLOBAL" for check in result.checks)
+    assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
 
 
 def test_numpy_object_dtype_cleanup_keeps_untrusted_numpy_reconstruction_warning(
