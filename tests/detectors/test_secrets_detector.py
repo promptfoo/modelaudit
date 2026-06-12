@@ -6,7 +6,12 @@ import pickle
 
 import pytest
 
-from modelaudit.detectors.secrets import BASIC_AUTH_TOKEN_MAX_LENGTH, SecretsDetector, detect_secrets_in_file
+from modelaudit.detectors.secrets import (
+    BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS,
+    BASIC_AUTH_TOKEN_MAX_LENGTH,
+    SecretsDetector,
+    detect_secrets_in_file,
+)
 from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
@@ -486,9 +491,10 @@ class TestSecretsDetector:
     def test_basic_auth_many_yaml_header_value_list_entries_are_detected(self) -> None:
         detector = SecretsDetector()
         token = _basic_auth_token(b"many-yaml-list:pass")
-        filler = "".join(f"  - Bearer placeholder-{index}\n" for index in range(96))
+        filler = "".join(f"  - Bearer placeholder-{index:03d}-padding-padding\n" for index in range(176))
         text = f"Authorization:\n{filler}  - Basic {token}\n"
 
+        assert text.index("Basic ") - text.index("Authorization:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
         findings = detector.scan_text(text, context="headers.yaml")
 
         basic_findings = _basic_auth_findings(findings)
@@ -499,9 +505,10 @@ class TestSecretsDetector:
     def test_basic_auth_many_yaml_header_object_value_list_entries_are_detected(self) -> None:
         detector = SecretsDetector()
         token = _basic_auth_token(b"many-yaml-object-list:pass")
-        filler = "".join(f"      - Bearer placeholder-{index}\n" for index in range(96))
+        filler = "".join(f"      - Bearer placeholder-{index:03d}-padding-padding\n" for index in range(176))
         text = f"headers:\n  - name: Proxy-Authorization\n    value:\n{filler}      - Basic {token}\n"
 
+        assert text.index("Basic ") - text.index("value:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
         findings = detector.scan_text(text, context="headers.yaml")
 
         basic_findings = _basic_auth_findings(findings)

@@ -425,6 +425,8 @@ BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN = re.compile(
 BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN = re.compile(r"[\r\n](?P<indent>[ \t]*)-\s*")
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
 BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS = 4096
+BASIC_AUTH_YAML_LIST_CONTEXT_MAX_CHARS = 64 * 1024
+BASIC_AUTH_YAML_LIST_CONTEXT_MAX_LINES = 512
 BASIC_AUTH_HEADER_NAMES = {
     "authorization": "Authorization",
     "proxyauthorization": "Proxy-Authorization",
@@ -735,6 +737,8 @@ class SecretsDetector:
             if match_end is not None
             else ""
         )
+        if SecretsDetector._basic_auth_match_has_yaml_list_header_context(text, position):
+            return True
         if SecretsDetector._basic_auth_prefix_has_header_value_array_context(collection_prefix):
             return True
         if SecretsDetector._basic_auth_prefix_has_headers_object_context(collection_prefix, collection_suffix):
@@ -762,6 +766,178 @@ class SecretsDetector:
             BASIC_AUTH_HEADER_PREFIX_PATTERN.search(previous_line) is not None
             or BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(previous_line) is not None
         )
+
+    @staticmethod
+    def _basic_auth_match_has_yaml_list_header_context(text: str, position: int) -> bool:
+        lines = SecretsDetector._basic_auth_yaml_list_context_lines(text, position)
+        if not lines:
+            return False
+        if (
+            SecretsDetector._basic_auth_yaml_list_context_key_line_index_from_lines(
+                lines,
+                BASIC_AUTH_HEADER_VALUE_YAML_KEY_PATTERN,
+            )
+            is not None
+        ):
+            return True
+        return SecretsDetector._basic_auth_yaml_list_has_header_object_context(text, position, lines)
+
+    @staticmethod
+    def _basic_auth_yaml_list_context_lines(text: str, position: int) -> list[str]:
+        context_start = max(0, position - BASIC_AUTH_YAML_LIST_CONTEXT_MAX_CHARS)
+        lines = text[context_start:position].splitlines()
+        return lines[-BASIC_AUTH_YAML_LIST_CONTEXT_MAX_LINES:]
+
+    @staticmethod
+    def _basic_auth_yaml_list_suffix_lines(text: str, position: int) -> list[str]:
+        next_line_start = SecretsDetector._basic_auth_next_line_start(text, position)
+        if next_line_start is None:
+            return []
+        context_end = min(len(text), next_line_start + BASIC_AUTH_YAML_LIST_CONTEXT_MAX_CHARS)
+        return text[next_line_start:context_end].splitlines()[:BASIC_AUTH_YAML_LIST_CONTEXT_MAX_LINES]
+
+    @staticmethod
+    def _basic_auth_next_line_start(text: str, position: int) -> int | None:
+        newline_positions = [index for index in (text.find("\n", position), text.find("\r", position)) if index != -1]
+        if not newline_positions:
+            return None
+        line_end = min(newline_positions)
+        if text[line_end : line_end + 2] == "\r\n":
+            return line_end + 2
+        return line_end + 1
+
+    @staticmethod
+    def _basic_auth_yaml_list_has_header_object_context(text: str, position: int, lines: list[str]) -> bool:
+        key_line_index = SecretsDetector._basic_auth_yaml_list_context_key_line_index_from_lines(
+            lines,
+            BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN,
+        )
+        if key_line_index is None:
+            return False
+
+        key_indent = SecretsDetector._basic_auth_line_indent(lines[key_line_index])
+        item_start_index = SecretsDetector._basic_auth_yaml_header_object_item_start_line_index(lines, key_line_index)
+        if item_start_index is None:
+            return False
+
+        direct_field_indent = SecretsDetector._basic_auth_yaml_header_object_direct_field_indent(
+            lines,
+            item_start_index,
+        )
+        if direct_field_indent is None or key_indent > direct_field_indent:
+            return False
+        if not SecretsDetector._basic_auth_yaml_header_object_has_headers_container(lines, item_start_index):
+            return False
+
+        direct_fields = SecretsDetector._basic_auth_yaml_header_object_direct_field_lines(
+            lines,
+            SecretsDetector._basic_auth_yaml_list_suffix_lines(text, position),
+            item_start_index,
+            direct_field_indent,
+        )
+        for field_line in direct_fields:
+            match = BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN.match(field_line.strip())
+            if match is not None and _canonical_basic_auth_header_key(match.group("name")) is not None:
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_item_start_line_index(lines: list[str], key_line_index: int) -> int | None:
+        key_indent = SecretsDetector._basic_auth_line_indent(lines[key_line_index])
+        for line_index in range(key_line_index, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                continue
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent >= key_indent:
+                continue
+            if SecretsDetector._basic_auth_yaml_list_line_starts_item(line):
+                return line_index
+            return None
+        return None
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_direct_field_indent(lines: list[str], item_start_index: int) -> int | None:
+        item_line = lines[item_start_index]
+        item_indent = SecretsDetector._basic_auth_line_indent(item_line)
+        direct_field_indent = SecretsDetector._basic_auth_yaml_list_item_value_indent(item_line)
+        for line in lines[item_start_index + 1 :]:
+            if not line.strip():
+                continue
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent <= item_indent:
+                break
+            direct_field_indent = line_indent if direct_field_indent is None else min(direct_field_indent, line_indent)
+        return direct_field_indent
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_has_headers_container(lines: list[str], item_start_index: int) -> bool:
+        item_indent = SecretsDetector._basic_auth_line_indent(lines[item_start_index])
+        for line_index in range(item_start_index - 1, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                continue
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent >= item_indent:
+                continue
+            return SecretsDetector._basic_auth_yaml_line_is_headers_key(line)
+        return False
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_direct_field_lines(
+        lines: list[str],
+        suffix_lines: list[str],
+        item_start_index: int,
+        direct_field_indent: int,
+    ) -> list[str]:
+        item_line = lines[item_start_index]
+        item_indent = SecretsDetector._basic_auth_line_indent(item_line)
+        direct_fields: list[str] = []
+        item_value = SecretsDetector._basic_auth_yaml_list_item_value_text(item_line)
+        if item_value and SecretsDetector._basic_auth_yaml_list_item_value_indent(item_line) == direct_field_indent:
+            direct_fields.append(item_value)
+
+        for line in lines[item_start_index + 1 : -1]:
+            if line.strip() and SecretsDetector._basic_auth_line_indent(line) == direct_field_indent:
+                direct_fields.append(line.strip())
+
+        for line in suffix_lines:
+            if not line.strip():
+                continue
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent <= item_indent and SecretsDetector._basic_auth_yaml_list_line_starts_item(line):
+                break
+            if line_indent < direct_field_indent:
+                break
+            if line_indent == direct_field_indent:
+                direct_fields.append(line.strip())
+        return direct_fields
+
+    @staticmethod
+    def _basic_auth_yaml_line_is_headers_key(line: str) -> bool:
+        key, separator, value = line.strip().partition(":")
+        if not separator or value.strip():
+            return False
+        key = key.strip().strip("\"'")
+        return _normalize_basic_auth_structured_key(key) == "headers"
+
+    @staticmethod
+    def _basic_auth_yaml_list_line_starts_item(line: str) -> bool:
+        stripped = line.lstrip(" \t")
+        return stripped.startswith("-") and (len(stripped) == 1 or stripped[1].isspace())
+
+    @staticmethod
+    def _basic_auth_yaml_list_item_value_text(line: str) -> str:
+        if not SecretsDetector._basic_auth_yaml_list_line_starts_item(line):
+            return ""
+        return line.lstrip(" \t")[1:].strip()
+
+    @staticmethod
+    def _basic_auth_yaml_list_item_value_indent(line: str) -> int | None:
+        item_value = SecretsDetector._basic_auth_yaml_list_item_value_text(line)
+        if not item_value:
+            return None
+        return line.index(item_value)
 
     @staticmethod
     def _basic_auth_prefix_has_headers_object_context(prefix: str, suffix: str = "") -> bool:
@@ -840,7 +1016,16 @@ class SecretsDetector:
 
     @staticmethod
     def _basic_auth_yaml_list_context_key_line_index(prefix: str, key_pattern: re.Pattern[str]) -> int | None:
-        lines = prefix.splitlines()
+        return SecretsDetector._basic_auth_yaml_list_context_key_line_index_from_lines(
+            prefix.splitlines(),
+            key_pattern,
+        )
+
+    @staticmethod
+    def _basic_auth_yaml_list_context_key_line_index_from_lines(
+        lines: list[str],
+        key_pattern: re.Pattern[str],
+    ) -> int | None:
         if not lines or not SecretsDetector._basic_auth_yaml_list_current_value_prefix(lines[-1]):
             return None
 
