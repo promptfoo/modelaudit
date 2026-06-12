@@ -1475,7 +1475,7 @@ class _ScanPathState:
                 return None
             try:
                 return Path(file_path).resolve()
-            except OSError:
+            except (OSError, RuntimeError, ValueError):
                 return None
 
         def record_covered_file(file_path: str) -> None:
