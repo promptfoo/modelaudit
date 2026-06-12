@@ -2646,10 +2646,44 @@ def _should_defer_hash_for_max_total_size(
     return hashed_bytes > max_total_size
 
 
+_FILE_BACKED_HDF5_UNHASHABLE_PREFIX = "unhashable_file_backed_hdf5_"
+
+
+def _is_file_backed_hdf5_hash_placeholder(content_hash: str) -> bool:
+    return content_hash.startswith(_FILE_BACKED_HDF5_UNHASHABLE_PREFIX)
+
+
+def _directory_owner_hash_is_unverifiable(
+    content_hash: str,
+    *,
+    allow_file_backed_hdf5: bool,
+) -> bool:
+    if not content_hash.startswith("unhashable_"):
+        return False
+    return not (allow_file_backed_hdf5 and _is_file_backed_hdf5_hash_placeholder(content_hash))
+
+
+def _directory_owner_hash_changed(
+    before_hash: str | None,
+    after_hash: str | None,
+    *,
+    allow_file_backed_hdf5: bool,
+) -> bool:
+    if before_hash == after_hash:
+        return False
+    return not (
+        allow_file_backed_hdf5
+        and isinstance(before_hash, str)
+        and isinstance(after_hash, str)
+        and _is_file_backed_hdf5_hash_placeholder(before_hash)
+        and _is_file_backed_hdf5_hash_placeholder(after_hash)
+    )
+
+
 def _is_incomplete_aggregate_hash_placeholder(content_hash: str) -> bool:
     return content_hash.startswith(
         (
-            "unhashable_file_backed_hdf5_",
+            _FILE_BACKED_HDF5_UNHASHABLE_PREFIX,
             "unhashable_max_file_size_",
             "unhashable_max_total_size_",
             "unhashable_timeout_",
@@ -2813,6 +2847,7 @@ def _directory_owner_scan_path(
     config: dict[str, Any],
     deadline: float,
     force_staged: bool = False,
+    require_bound: bool = False,
     source_paths_by_owner_path: dict[str, str] | None = None,
 ) -> Iterator[str]:
     """Yield a bound or hash-verified copied path for logical directory-owner scanning."""
@@ -2821,6 +2856,8 @@ def _directory_owner_scan_path(
             try:
                 owner_scan_path = scan_path_stack.enter_context(_bound_directory_owner_scan_path(root_path))
             except OSError:
+                if require_bound:
+                    raise
                 owner_scan_path = scan_path_stack.enter_context(
                     _staged_directory_owner_scan_path(
                         root_path,
@@ -2832,6 +2869,8 @@ def _directory_owner_scan_path(
                     ),
                 )
         else:
+            if require_bound:
+                raise OSError("Descriptor-backed directory owner path required for deferred source hashes")
             owner_scan_path = scan_path_stack.enter_context(
                 _staged_directory_owner_scan_path(
                     root_path,
@@ -4253,11 +4292,41 @@ def scan_model_directory_or_file(
                         source: owner_hash_for_source(hashes_by_source, source) or f"unhashable_{id(source)}"
                         for source in owner_sources
                     }
-                    if owner_block_reason is None and any(
-                        hash_value.startswith("unhashable_") for hash_value in owner_hashes_before.values()
-                    ):
-                        owner_block_reason = "directory_owner_snapshot_incomplete"
-                        owner_block_details = {"unhashable_source_count": 1}
+                    file_backed_hdf5_owner_source_count = sum(
+                        _is_file_backed_hdf5_hash_placeholder(hash_value) for hash_value in owner_hashes_before.values()
+                    )
+                    allow_file_backed_hdf5_owner_hashes = False
+                    if owner_block_reason is None:
+                        unverifiable_owner_hash_count = sum(
+                            _directory_owner_hash_is_unverifiable(
+                                hash_value,
+                                allow_file_backed_hdf5=True,
+                            )
+                            for hash_value in owner_hashes_before.values()
+                        )
+                        if unverifiable_owner_hash_count:
+                            owner_block_reason = "directory_owner_snapshot_incomplete"
+                            owner_block_details = {"unhashable_source_count": unverifiable_owner_hash_count}
+                        elif file_backed_hdf5_owner_source_count:
+                            if directory_owner_content_source_paths:
+                                owner_block_reason = "directory_owner_snapshot_incomplete"
+                                owner_block_details = {
+                                    "requires_descriptor_bound_owner": True,
+                                    "unhashable_source_count": file_backed_hdf5_owner_source_count,
+                                }
+                            else:
+                                try:
+                                    with _bound_directory_owner_scan_path(owner_root_path):
+                                        pass
+                                except OSError as error:
+                                    owner_block_reason = "directory_owner_snapshot_incomplete"
+                                    owner_block_details = {
+                                        "error_type": type(error).__name__,
+                                        "requires_descriptor_bound_owner": True,
+                                        "unhashable_source_count": file_backed_hdf5_owner_source_count,
+                                    }
+                                else:
+                                    allow_file_backed_hdf5_owner_hashes = True
 
                     owner_snapshot_before_dispatch = directory_owner_initial_snapshot
                     if owner_block_reason is None:
@@ -4326,6 +4395,7 @@ def scan_model_directory_or_file(
                                 config=owner_hash_config,
                                 deadline=start_time + timeout,
                                 force_staged=bool(directory_owner_content_source_paths),
+                                require_bound=allow_file_backed_hdf5_owner_hashes,
                                 source_paths_by_owner_path=directory_owner_content_source_paths,
                             ) as directory_owner_scan_path:
                                 owner_scan_started = True
@@ -4415,16 +4485,26 @@ def scan_model_directory_or_file(
                         changed_owner_sources = [
                             source
                             for source in owner_sources
-                            if owner_hashes_before.get(source) != owner_hashes_after.get(source)
+                            if _directory_owner_hash_changed(
+                                owner_hashes_before.get(source),
+                                owner_hashes_after.get(source),
+                                allow_file_backed_hdf5=allow_file_backed_hdf5_owner_hashes,
+                            )
                         ]
                         if post_snapshot_reason is None and changed_owner_sources:
                             post_snapshot_reason = "directory_owner_source_changed"
                             post_snapshot_details = {"changed_source_count": len(changed_owner_sources)}
-                        if post_snapshot_reason is None and any(
-                            hash_value.startswith("unhashable_") for hash_value in owner_hashes_after.values()
-                        ):
-                            post_snapshot_reason = "directory_owner_snapshot_incomplete"
-                            post_snapshot_details = {"unhashable_source_count": 1}
+                        if post_snapshot_reason is None:
+                            unverifiable_owner_hash_count = sum(
+                                _directory_owner_hash_is_unverifiable(
+                                    hash_value,
+                                    allow_file_backed_hdf5=allow_file_backed_hdf5_owner_hashes,
+                                )
+                                for hash_value in owner_hashes_after.values()
+                            )
+                            if unverifiable_owner_hash_count:
+                                post_snapshot_reason = "directory_owner_snapshot_incomplete"
+                                post_snapshot_details = {"unhashable_source_count": unverifiable_owner_hash_count}
 
                         assert directory_owner_result is not None
                         if post_snapshot_reason is not None:

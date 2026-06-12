@@ -2190,6 +2190,103 @@ def test_savedmodel_owner_supplemental_root_file_honors_max_file_size(
     assert determine_exit_code(result) == 2
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
+def test_savedmodel_owner_allows_large_file_backed_hdf5_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_tf_protos()
+    from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
+    from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    _write_safe_savedmodel(model_dir / "saved_model.pb")
+    variables_dir = model_dir / "variables"
+    variables_dir.mkdir()
+    hdf5_path = variables_dir / "large-benign.json"
+    _write_large_benign_keras_hdf5(hdf5_path)
+
+    hdf5_scans: list[Path] = []
+    owner_calls: list[Path] = []
+    original_hdf5_scan = KerasH5Scanner.scan
+    original_owner_scan = TensorFlowSavedModelScanner.scan
+    original_hash = core_module._calculate_file_hash
+
+    def record_hdf5_scan(scanner: KerasH5Scanner, path: str) -> ScanResult:
+        if Path(path).resolve() == hdf5_path.resolve():
+            hdf5_scans.append(Path(path).resolve())
+        return original_hdf5_scan(scanner, path)
+
+    def record_owner_scan(scanner: TensorFlowSavedModelScanner, owner_path: str) -> ScanResult:
+        if Path(owner_path).is_dir():
+            owner_calls.append(Path(owner_path).resolve())
+        return original_owner_scan(scanner, owner_path)
+
+    def reject_large_hdf5_hash(path: str, *, deadline: float | None = None) -> str:
+        if Path(path).resolve() == hdf5_path.resolve():
+            pytest.fail("large file-backed HDF5 child must not be whole-file hashed")
+        return original_hash(path, deadline=deadline)
+
+    monkeypatch.setattr(KerasH5Scanner, "scan", record_hdf5_scan)
+    monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", record_owner_scan)
+    monkeypatch.setattr(core_module, "_calculate_file_hash", reject_large_hdf5_hash)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_enabled=False)
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    hdf5_metadata = result.file_metadata[str(hdf5_path)]
+    assert owner_calls == [model_dir.resolve()]
+    assert hdf5_scans == [hdf5_path.resolve()]
+    assert owner_metadata["directory_owner_scan"] is True
+    assert "directory_owner_snapshot_incomplete" not in owner_metadata.get("scan_outcome_reasons", [])
+    assert hdf5_metadata["content_hash"].startswith("unhashable_file_backed_hdf5_")
+    assert hdf5_metadata["file_backed_scan"] is True
+    assert result.content_hash is None
+    assert "tf_savedmodel" in result.scanner_names
+    assert "keras_h5" in result.scanner_names
+    assert determine_exit_code(result) == 0
+
+
+def test_savedmodel_owner_rejects_large_file_backed_hdf5_without_descriptor_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_tf_protos()
+    from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    _write_safe_savedmodel(model_dir / "saved_model.pb")
+    variables_dir = model_dir / "variables"
+    variables_dir.mkdir()
+    hdf5_path = variables_dir / "large-benign.json"
+    _write_large_benign_keras_hdf5(hdf5_path)
+    _force_staged_directory_owner_scan(monkeypatch)
+
+    original_owner_scan = TensorFlowSavedModelScanner.scan
+
+    def reject_directory_owner_scan(scanner: TensorFlowSavedModelScanner, owner_path: str) -> ScanResult:
+        if Path(owner_path).is_dir():
+            raise AssertionError("deferred HDF5 owner sources require descriptor-bound dispatch")
+        return original_owner_scan(scanner, owner_path)
+
+    monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", reject_directory_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_enabled=False)
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_snapshot_incomplete" in owner_metadata["scan_outcome_reasons"]
+    assert owner_metadata["operational_error"] is True
+    assert result.file_metadata[str(hdf5_path)]["content_hash"].startswith("unhashable_file_backed_hdf5_")
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
 def test_mixed_savedmodel_and_orbax_root_preserves_both_security_scans(tmp_path: Path) -> None:
     _require_tf_protos()
     model_dir = tmp_path / "mixed-model"
@@ -2449,6 +2546,17 @@ def _write_safe_pytorch_binary(path: Path) -> None:
 
 def _write_safe_savedmodel(path: Path) -> None:
     path.write_bytes(_build_collection_only_tf_savedmodel(value=b"documentation: https://example.invalid/runtime"))
+
+
+def _write_large_benign_keras_hdf5(path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(path, "w") as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]}},
+        )
+        h5_file.attrs["keras_version"] = "3.13.2"
+    with path.open("ab") as handle:
+        handle.truncate(core_module.DEFAULT_MAX_FILE_READ_SIZE + 4096)
 
 
 def _write_safe_r_serialized(path: Path) -> None:
