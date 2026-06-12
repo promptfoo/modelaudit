@@ -33,6 +33,7 @@ from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     MEDIA_ROUTE_TAIL_READ_BYTES,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     detect_file_format_for_skip_filter,
 )
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
@@ -70,27 +71,6 @@ from tests.helpers import create_mock_coreml, create_mock_onnx
 from tests.helpers.file_creators import malicious_pickle_bytes, valid_jpeg_bytes, valid_png_bytes
 
 _HF_TEST_REVISION = "a" * 40
-_HF_MULTILINGUAL_E5_README_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
-_HF_MULTILINGUAL_E5_README_URL = (
-    f"https://huggingface.co/intfloat/multilingual-e5-small/resolve/{_HF_MULTILINGUAL_E5_README_REVISION}/README.md"
-)
-_HF_BERT_MULTILINGUAL_CASED_REVISION = "3f076fdb1ab68d5b2880cb87a0886f315b8146f8"
-_HF_BERT_MULTILINGUAL_CASED_VOCAB_URL = (
-    "https://huggingface.co/google-bert/bert-base-multilingual-cased/resolve/"
-    f"{_HF_BERT_MULTILINGUAL_CASED_REVISION}/vocab.txt"
-)
-_HF_QWEN2_VL_2B_MERGES_REVISION = "895c3a49bc3fa70a340399125c650a463535e71c"
-_HF_QWEN2_VL_2B_MERGES_URL = (
-    f"https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct/resolve/{_HF_QWEN2_VL_2B_MERGES_REVISION}/merges.txt"
-)
-_HF_HOLO_31_4B_MERGES_REVISION = "b63fb9bacd968a20b31d0c704b14429c0aad3a84"
-_HF_HOLO_31_4B_MERGES_URL = (
-    f"https://huggingface.co/Hcompany/Holo-3.1-4B/resolve/{_HF_HOLO_31_4B_MERGES_REVISION}/merges.txt"
-)
-_HF_QWEN2_15B_MERGES_REVISION = "ba1cf1846d7df0a0591d6c00649f57e798519da8"
-_HF_QWEN2_15B_MERGES_URL = (
-    f"https://huggingface.co/Qwen/Qwen2-1.5B-Instruct/resolve/{_HF_QWEN2_15B_MERGES_REVISION}/merges.txt"
-)
 
 
 def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
@@ -139,19 +119,6 @@ class _FakeRangeResponse:
         yield self.payload[:chunk_size]
 
 
-def _fake_bounded_range_response(payload: bytes) -> Callable[..., _FakeRangeResponse]:
-    def get_side_effect(_url: str, **kwargs: object) -> _FakeRangeResponse:
-        max_bytes = len(payload)
-        headers = kwargs.get("headers", {})
-        if isinstance(headers, dict):
-            range_header = headers.get("Range")
-            if isinstance(range_header, str) and range_header.startswith("bytes=0-"):
-                max_bytes = int(range_header.removeprefix("bytes=0-")) + 1
-        return _FakeRangeResponse(payload[:max_bytes], headers={"Content-Length": str(len(payload))})
-
-    return get_side_effect
-
-
 def _large_remote_documentation_payload(label: str) -> bytes:
     line = f"{label} line-oriented documentation with tokenizer notes and multilingual text café.\n".encode()
     payload = f"# {label}\n".encode() + line * ((_CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES // len(line)) + 128)
@@ -174,7 +141,9 @@ def _fake_range_responder(payload: bytes) -> Callable[[str], _FakeRangeResponse]
         range_header = headers.get("Range", "")
         if range_header.startswith("bytes="):
             start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
-            return _fake_content_range_response(payload, int(start_text), int(end_text))
+            start = int(start_text)
+            end = min(int(end_text), len(payload) - 1)
+            return _fake_content_range_response(payload, start, end)
         return _FakeRangeResponse(payload)
 
     return get_response
@@ -233,6 +202,14 @@ def _make_large_valid_jpeg_payload() -> bytes:
     scan_header = b"\xff\xda\x00\x08\x01\x01\x00\x00?\x00"
     entropy = b"\x11" * ((8 * 1024) + MEDIA_ROUTE_TAIL_READ_BYTES)
     return app0_header + scan_header + entropy + b"\xff\xd9"
+
+
+def _make_printable_utf8_messagepack_candidate() -> bytes:
+    return (b'""' + ("é" * 17).encode("utf-8")) * 4097
+
+
+def _make_line_broken_printable_utf8_messagepack_candidate() -> bytes:
+    return (b'""' + ("é" * 17).encode("utf-8") + b"\n") * 4097
 
 
 def _ubjson_key(key: bytes) -> bytes:
@@ -3042,193 +3019,6 @@ class TestModelDownloadStreaming:
         assert all(call.kwargs["revision"] == _HF_TEST_REVISION for call in mock_hf_hub_download.call_args_list)
         assert all(f"/resolve/{_HF_TEST_REVISION}/" in call.args[0] for call in mock_requests_get.call_args_list)
 
-    @patch("requests.get")
-    def test_detect_huggingface_flax_route_rejects_complete_multilingual_readme_text(
-        self,
-        mock_requests_get: MagicMock,
-    ) -> None:
-        """Remote content routing should treat complete bounded UTF-8 README probes as text."""
-        readme_payload = (
-            "# Model Card\n"
-            + ("This multilingual README has こんにちは, café, naïve, résumé, and 😀 examples.\n" * 256)
-        ).encode()
-        mock_requests_get.side_effect = _fake_bounded_range_response(readme_payload)
-        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-
-        detected_format = _detect_huggingface_content_route_format(
-            "intfloat/multilingual-e5-small",
-            "README.md",
-            _HF_MULTILINGUAL_E5_README_REVISION,
-            budget,
-        )
-
-        assert detected_format is None
-
-    @pytest.mark.parametrize(
-        "filename",
-        [
-            "README.md",
-            "README.rst",
-            "README.txt",
-            "README.markdown",
-            "model_card.md",
-            "model_card.rst",
-            "modelcard.txt",
-            "modelcard.markdown",
-        ],
-    )
-    @patch("requests.get")
-    def test_detect_huggingface_flax_route_rejects_large_complete_documentation_text(
-        self,
-        mock_requests_get: MagicMock,
-        filename: str,
-    ) -> None:
-        """Remote documentation names should use the declared text window, not the 2 MiB cap."""
-        documentation_payload = _large_remote_documentation_payload(filename)
-        assert len(documentation_payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES
-        mock_requests_get.side_effect = _fake_bounded_range_response(documentation_payload)
-        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-
-        detected_format = _detect_huggingface_flax_msgpack_route(
-            "intfloat/multilingual-e5-small",
-            filename,
-            _HF_MULTILINGUAL_E5_README_REVISION,
-            budget,
-            documentation_payload[:8192],
-        )
-
-        assert detected_format is None
-
-    @pytest.mark.parametrize("filename", ["README.md", "model_card.md", "modelcard.txt"])
-    @patch("requests.get")
-    def test_detect_huggingface_flax_route_preserves_binary_documentation_checkpoint(
-        self,
-        mock_requests_get: MagicMock,
-        filename: str,
-    ) -> None:
-        """Remote documentation names should not suppress MessagePack checkpoint structure."""
-        msgpack = pytest.importorskip("msgpack")
-        hidden_payload = msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
-        )
-        mock_requests_get.side_effect = _fake_bounded_range_response(hidden_payload)
-        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-
-        detected_format = _detect_huggingface_content_route_format(
-            "intfloat/multilingual-e5-small",
-            filename,
-            _HF_MULTILINGUAL_E5_README_REVISION,
-            budget,
-        )
-
-        assert detected_format == "flax_msgpack"
-
-    @pytest.mark.parametrize("filename", ["README.md", "model_card.md"])
-    @patch("requests.get")
-    def test_detect_huggingface_flax_route_preserves_control_scalar_documentation_fail_closed(
-        self,
-        mock_requests_get: MagicMock,
-        filename: str,
-    ) -> None:
-        """Remote documentation names should not suppress UTF-8 control scalar streams."""
-        payload = b"A\xc2\x80" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 3) + 1)
-        mock_requests_get.side_effect = _fake_bounded_range_response(payload)
-        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-
-        detected_format = _detect_huggingface_flax_msgpack_route(
-            "intfloat/multilingual-e5-small",
-            filename,
-            _HF_MULTILINGUAL_E5_README_REVISION,
-            budget,
-            payload[:_HF_CONTENT_SNIFF_BYTES],
-        )
-
-        assert detected_format == "flax_msgpack"
-
-    @patch("requests.get")
-    def test_detect_huggingface_flax_route_preserves_utf8_scalar_readme_fail_closed(
-        self,
-        mock_requests_get: MagicMock,
-    ) -> None:
-        """Remote low-diversity UTF-8 scalar streams should not claim text ownership."""
-        payload = b"\xc2\xa0" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 2) + 1)
-        mock_requests_get.side_effect = _fake_bounded_range_response(payload)
-        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-
-        detected_format = _detect_huggingface_content_route_format(
-            "intfloat/multilingual-e5-small",
-            "README.md",
-            _HF_MULTILINGUAL_E5_README_REVISION,
-            budget,
-        )
-
-        assert detected_format == "flax_msgpack"
-
-    @patch("requests.get")
-    def test_detect_huggingface_flax_route_rejects_complete_vocabulary_text(
-        self,
-        mock_requests_get: MagicMock,
-    ) -> None:
-        """Remote Flax routing should treat complete tokenizer vocabularies as text."""
-        vocab_payload = _bert_vocab_payload()
-        mock_requests_get.side_effect = _fake_bounded_range_response(vocab_payload)
-        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-
-        detected_format = _detect_huggingface_content_route_format(
-            "google-bert/bert-base-multilingual-cased",
-            "vocab.txt",
-            _HF_BERT_MULTILINGUAL_CASED_REVISION,
-            budget,
-        )
-
-        assert detected_format is None
-        assert budget.file_sizes["vocab.txt"] == len(vocab_payload)
-        assert len(budget.prefixes["vocab.txt"]) == len(vocab_payload)
-
-    @patch("requests.get")
-    def test_detect_huggingface_flax_route_rejects_large_complete_merges_text(
-        self,
-        mock_requests_get: MagicMock,
-    ) -> None:
-        """Remote Flax routing should treat complete BPE merge rules as tokenizer text."""
-        merges_payload = _bpe_merges_payload()
-        assert len(merges_payload) > 2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES
-        mock_requests_get.side_effect = _fake_bounded_range_response(merges_payload)
-        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-
-        detected_format = _detect_huggingface_flax_msgpack_route(
-            "Hcompany/Holo-3.1-4B",
-            "merges.txt",
-            _HF_HOLO_31_4B_MERGES_REVISION,
-            budget,
-            merges_payload[:8192],
-        )
-
-        assert detected_format is None
-        assert budget.file_sizes["merges.txt"] == len(merges_payload)
-        assert len(budget.prefixes["merges.txt"]) == len(merges_payload)
-
-    @patch("requests.get")
-    def test_detect_huggingface_flax_route_preserves_generic_large_text_suffix_fail_closed(
-        self,
-        mock_requests_get: MagicMock,
-    ) -> None:
-        """Generic large text suffixes should not inherit tokenizer-text ownership."""
-        payload = _bpe_merges_payload()
-        mock_requests_get.side_effect = _fake_bounded_range_response(payload)
-        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-
-        detected_format = _detect_huggingface_flax_msgpack_route(
-            "test/model",
-            "notes.txt",
-            _HF_TEST_REVISION,
-            budget,
-            payload[:8192],
-        )
-
-        assert detected_format == "flax_msgpack"
-
     @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -3262,6 +3052,179 @@ class TestModelDownloadStreaming:
         _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0, revision=None)
         mock_requests_get.assert_not_called()
         mock_hf_hub_download.assert_not_called()
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_complete_multilingual_readme_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote content routing should treat complete bounded UTF-8 README probes as text."""
+        readme_payload = (
+            "# Model Card\n"
+            + ("This multilingual README has こんにちは, café, naïve, résumé, and 😀 examples.\n" * 256)
+        ).encode()
+        mock_requests_get.side_effect = _fake_range_responder(readme_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            "README.md",
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format is None
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "README.md",
+            "README.rst",
+            "README.txt",
+            "README.markdown",
+            "model_card.md",
+            "model_card.rst",
+            "modelcard.txt",
+            "modelcard.markdown",
+        ],
+    )
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_large_complete_documentation_text(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should use the declared text window, not the 2 MiB cap."""
+        documentation_payload = _large_remote_documentation_payload(filename)
+        assert len(documentation_payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        mock_requests_get.side_effect = _fake_range_responder(documentation_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        budget.record_file_size("test/model", filename, len(documentation_payload))
+        budget.prefixes[filename] = documentation_payload[:_HF_CONTENT_SNIFF_BYTES]
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            filename,
+            _HF_TEST_REVISION,
+            budget,
+            documentation_payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format is None
+
+    @pytest.mark.parametrize("filename", ["README.md", "model_card.md", "modelcard.txt"])
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_binary_documentation_checkpoint(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should not suppress MessagePack checkpoint structure."""
+        msgpack = pytest.importorskip("msgpack")
+        hidden_payload = msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+        mock_requests_get.side_effect = _fake_range_responder(hidden_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            filename,
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @pytest.mark.parametrize("filename", ["README.md", "model_card.md"])
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_control_scalar_documentation_fail_closed(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should not suppress UTF-8 control scalar streams."""
+        payload = b"A\xc2\x80" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 3) + 1)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        budget.record_file_size("test/model", filename, len(payload))
+        budget.prefixes[filename] = payload[:_HF_CONTENT_SNIFF_BYTES]
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            filename,
+            _HF_TEST_REVISION,
+            budget,
+            payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_utf8_scalar_readme_fail_closed(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote low-diversity UTF-8 scalar streams should not claim text ownership."""
+        payload = b"\xc2\xa0" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 2) + 1)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            "README.md",
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_complete_vocabulary_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote Flax routing should treat complete tokenizer vocabularies as text."""
+        vocab_payload = _bert_vocab_payload()
+        mock_requests_get.side_effect = _fake_range_responder(vocab_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            "vocab.txt",
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format is None
+        assert budget.file_sizes["vocab.txt"] == len(vocab_payload)
+        assert len(budget.prefixes["vocab.txt"]) == min(len(vocab_payload), _HF_CONTENT_SNIFF_BYTES)
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_large_complete_merges_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote Flax routing should treat complete BPE merge rules as tokenizer text."""
+        merges_payload = _bpe_merges_payload()
+        assert len(merges_payload) > 2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        mock_requests_get.side_effect = _fake_range_responder(merges_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        budget.record_file_size("test/model", "merges.txt", len(merges_payload))
+        budget.prefixes["merges.txt"] = merges_payload[:_HF_CONTENT_SNIFF_BYTES]
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            "merges.txt",
+            _HF_TEST_REVISION,
+            budget,
+            merges_payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format is None
+        assert budget.file_sizes["merges.txt"] == len(merges_payload)
+        assert len(budget.prefixes["merges.txt"]) == len(merges_payload)
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")
@@ -4901,6 +4864,186 @@ class TestModelDownloadStreaming:
         mock_detect_content.assert_called_once_with("test/model", "renamed.jpg", _HF_TEST_REVISION, ANY)
 
     @pytest.mark.parametrize(
+        ("filename", "payload", "scannable_extensions", "scannable_scanner_ids", "expected_files"),
+        [
+            (
+                "weights.txt",
+                b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights.txt"],
+            ),
+            (
+                "weights.conf",
+                b":" + _make_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights.conf"],
+            ),
+            (
+                "weights-colon-newline.conf",
+                b":\n" + _make_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights-colon-newline.conf"],
+            ),
+            (
+                "weights-colon-space.conf",
+                b": a\n" + _make_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights-colon-space.conf"],
+            ),
+            (
+                "weights-key-colon.txt",
+                b"a:\n" + _make_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights-key-colon.txt"],
+            ),
+            (
+                "weights-key-lines.conf",
+                b"key:\n" + _make_line_broken_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights-key-lines.conf"],
+            ),
+            (
+                "candidate.txt",
+                (b"B" + bytes([len(("é" * 60).encode("utf-8") + b" x:12")]) + ("é" * 60).encode("utf-8") + b" x:12")
+                * 4097,
+                {".onnx"},
+                {"onnx"},
+                ["model.onnx", "candidate.txt"],
+            ),
+            (
+                "oversized-candidate.txt",
+                b"\x12\xff\xff\xff\xff\xff" + (b"\x00" * ((1024 * 1024) + 1)),
+                {".onnx"},
+                {"onnx"},
+                ["model.onnx", "oversized-candidate.txt"],
+            ),
+        ],
+        ids=[
+            "flax-msgpack-text-suffix",
+            "flax-msgpack-colon-inline-text-suffix",
+            "flax-msgpack-structure-prefixed-text-suffix",
+            "flax-msgpack-colon-space-text-suffix",
+            "flax-msgpack-key-colon-text-suffix",
+            "flax-msgpack-key-line-broken-text-suffix",
+            "protobuf-candidate-text-suffix",
+            "protobuf-oversized-candidate-text-suffix",
+        ],
+    )
+    @patch("requests.get")
+    def test_select_streamable_text_suffix_retains_binary_routes(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+        payload: bytes,
+        scannable_extensions: set[str],
+        scannable_scanner_ids: set[str],
+        expected_files: list[str],
+    ) -> None:
+        """Text-owner suffix handling must not suppress binary model candidates."""
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        repo_files = [expected_files[0], filename]
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            repo_files,
+            _HF_TEST_REVISION,
+            scannable_extensions=scannable_extensions,
+            scannable_scanner_ids=scannable_scanner_ids,
+        )
+
+        assert selected_files == expected_files
+
+    @patch("requests.get")
+    def test_select_streamable_text_suffix_safetensors_near_match_preserves_flax_route(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """SafeTensors near-matches must not hide a delayed Flax route for text suffixes."""
+        header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+        disclosed_size = 8 + header_len
+        flax_root = b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        root_offset = _HF_CONTENT_SNIFF_BYTES + 817
+        payload = struct.pack("<Q", header_len) + b"{" + (b"\x00" * (root_offset - 9)) + flax_root
+        assert root_offset + len(flax_root) < FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        payload = payload.ljust(FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1, b"\x00")
+
+        def get_side_effect(_url: str, *, headers: dict[str, str], **_kwargs: object) -> _FakeRangeResponse:
+            range_header = headers["Range"]
+            max_bytes = int(range_header.rsplit("-", 1)[1]) + 1
+            probe = payload[:max_bytes]
+            return _FakeRangeResponse(
+                probe,
+                headers={"Content-Range": f"bytes 0-{len(probe) - 1}/{disclosed_size}"},
+                status_code=206,
+            )
+
+        mock_requests_get.side_effect = get_side_effect
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.conf"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files == ["known.msgpack", "weights.conf"]
+
+    @patch("requests.get")
+    def test_select_streamable_text_suffix_safetensors_inconclusive_flax_preserves_safetensors(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """A real SafeTensors frame must not be overridden by only inconclusive Flax probing."""
+        tensor = b"\xdb\xff\xff\xff\xff" + (b"x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 16))
+        header = json.dumps(
+            {"tensor": {"dtype": "U8", "shape": [len(tensor)], "data_offsets": [0, len(tensor)]}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload = struct.pack("<Q", len(header)) + header + tensor
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.safetensors", "weights.conf"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".safetensors"},
+            scannable_scanner_ids={"safetensors"},
+        )
+
+        assert selected_files == ["known.safetensors", "weights.conf"]
+
+    @patch("requests.get")
+    def test_select_streamable_safetensors_suffix_keeps_flax_like_tensor_bytes_as_safetensors(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Only text-suffix SafeTensors near-matches may be promoted to Flax."""
+        tensor = b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        header = json.dumps(
+            {"tensor": {"dtype": "U8", "shape": [len(tensor)], "data_offsets": [0, len(tensor)]}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload = struct.pack("<Q", len(header)) + header + tensor
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.safetensors"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files == ["known.msgpack"]
+
+    @pytest.mark.parametrize(
         ("hidden_payload", "expected_filenames"),
         [
             (
@@ -4957,211 +5100,178 @@ class TestModelDownloadStreaming:
         assert [path.name for path, _is_last in results] == expected_filenames
         assert results[-1][1] is True
 
-    @patch(
-        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-        return_value=(["known.msgpack", "README.md"], _HF_TEST_REVISION, None),
-    )
     @patch("requests.get")
-    @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_flax_skips_multilingual_readme_text(
+    def test_select_streamable_flax_excludes_large_text_owner_merges(
         self,
-        mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
-        _mock_list_repo_files: MagicMock,
-        tmp_path: Path,
     ) -> None:
-        """Remote Flax selection should not promote complete UTF-8 README text."""
-        readme_payload = (
-            "# Model Card\n"
-            + ("This multilingual README has こんにちは, café, naïve, résumé, and 😀 examples.\n" * 256)
-        ).encode()
+        """A complete large tokenizer text file must not be promoted to Flax."""
+        payload = ("#version: 0.2\n" + "e n\n" * 600_000).encode("utf-8")
+        mock_requests_get.side_effect = _fake_range_responder(payload)
 
-        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
-            path = tmp_path / filename
-            path.write_bytes(b"\x81\xa6params\x80")
-            return str(path)
-
-        mock_hf_hub_download.side_effect = download_side_effect
-        mock_requests_get.side_effect = _fake_bounded_range_response(readme_payload)
-
-        results = list(
-            download_model_streaming(
-                "https://huggingface.co/test/model",
-                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
-                scannable_scanner_ids={"flax_msgpack"},
-            )
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert [path.name for path, _is_last in results] == ["known.msgpack"]
-        mock_hf_hub_download.assert_called_once()
-        assert mock_hf_hub_download.call_args.kwargs["filename"] == "known.msgpack"
-        assert all(
-            f"/resolve/{_HF_TEST_REVISION}/README.md" in call.args[0] for call in mock_requests_get.call_args_list
-        )
+        assert selected_files == ["known.msgpack"]
 
-    @patch(
-        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-        return_value=(["known.msgpack", "vocab.txt"], _HF_TEST_REVISION, None),
-    )
     @patch("requests.get")
-    @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_flax_skips_vocabulary_text(
+    def test_select_streamable_text_owner_prefix_preserves_embedded_flax_route(
         self,
-        mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
-        _mock_list_repo_files: MagicMock,
-        tmp_path: Path,
     ) -> None:
-        """Remote Flax selection should not promote complete tokenizer vocabulary text."""
-        vocab_payload = _bert_vocab_payload()
+        """A text-looking remote prefix must not skip later bounded binary model bytes."""
+        text_prefix = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")[:_HF_CONTENT_SNIFF_BYTES]
+        payload = text_prefix + b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        mock_requests_get.side_effect = _fake_range_responder(payload)
 
-        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
-            path = tmp_path / filename
-            path.write_bytes(b"\x81\xa6params\x80")
-            return str(path)
-
-        mock_hf_hub_download.side_effect = download_side_effect
-        mock_requests_get.side_effect = _fake_bounded_range_response(vocab_payload)
-
-        results = list(
-            download_model_streaming(
-                "https://huggingface.co/test/model",
-                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
-                scannable_scanner_ids={"flax_msgpack"},
-            )
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert [path.name for path, _is_last in results] == ["known.msgpack"]
-        mock_hf_hub_download.assert_called_once()
-        assert mock_hf_hub_download.call_args.kwargs["filename"] == "known.msgpack"
-        assert all(
-            f"/resolve/{_HF_TEST_REVISION}/vocab.txt" in call.args[0] for call in mock_requests_get.call_args_list
-        )
+        assert selected_files == ["known.msgpack", "weights.txt"]
 
-    @patch(
-        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-        return_value=(["known.msgpack", "merges.txt"], _HF_TEST_REVISION, None),
-    )
     @patch("requests.get")
-    @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_flax_skips_large_merges_text(
+    def test_select_streamable_text_owner_prefix_preserves_mid_window_flax_route(
         self,
-        mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
-        _mock_list_repo_files: MagicMock,
-        tmp_path: Path,
     ) -> None:
-        """Remote Flax selection should not promote complete BPE merge rules."""
-        merges_payload = _bpe_merges_payload()
+        """The post-prefix guard must cover the Flax structure window, not only one sniff chunk."""
+        text_prefix = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")[:_HF_CONTENT_SNIFF_BYTES]
+        payload = (
+            text_prefix + (b" " * ((_HF_CONTENT_SNIFF_BYTES * 2) + 100)) + b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        )
+        mock_requests_get.side_effect = _fake_range_responder(payload)
 
-        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
-            path = tmp_path / filename
-            path.write_bytes(b"\x81\xa6params\x80")
-            return str(path)
-
-        mock_hf_hub_download.side_effect = download_side_effect
-        mock_requests_get.side_effect = _fake_bounded_range_response(merges_payload)
-
-        results = list(
-            download_model_streaming(
-                "https://huggingface.co/test/model",
-                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
-                scannable_scanner_ids={"flax_msgpack"},
-            )
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert [path.name for path, _is_last in results] == ["known.msgpack"]
-        mock_hf_hub_download.assert_called_once()
-        assert mock_hf_hub_download.call_args.kwargs["filename"] == "known.msgpack"
-        assert all(
-            f"/resolve/{_HF_TEST_REVISION}/merges.txt" in call.args[0] for call in mock_requests_get.call_args_list
-        )
+        assert selected_files == ["known.msgpack", "weights.txt"]
 
-    @patch(
-        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-        return_value=(["known.msgpack", "README.md"], _HF_TEST_REVISION, None),
-    )
     @patch("requests.get")
-    @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_flax_preserves_binary_readme_checkpoint(
+    def test_select_streamable_text_owner_prefix_preserves_embedded_protobuf_route(
         self,
-        mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
-        _mock_list_repo_files: MagicMock,
-        tmp_path: Path,
     ) -> None:
-        """Remote README names must not suppress structurally valid Flax MessagePack."""
-        msgpack = pytest.importorskip("msgpack")
-        hidden_payload = msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
+        """Ordinary text prefixes must not hide later protobuf model-candidate bytes."""
+        text_prefix = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")[:_HF_CONTENT_SNIFF_BYTES]
+        proto_value = ("é" * 60).encode("utf-8") + b" x:12"
+        payload = text_prefix + b"B" + bytes([len(proto_value)]) + proto_value
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["model.onnx", "candidate.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
         )
 
-        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
-            path = tmp_path / filename
-            path.write_bytes(hidden_payload if filename == "README.md" else b"\x81\xa6params\x80")
-            return str(path)
+        assert selected_files == ["model.onnx", "candidate.txt"]
 
-        mock_hf_hub_download.side_effect = download_side_effect
-        mock_requests_get.side_effect = _fake_bounded_range_response(hidden_payload)
-
-        results = list(
-            download_model_streaming(
-                "https://huggingface.co/test/model",
-                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
-                scannable_scanner_ids={"flax_msgpack"},
-            )
-        )
-
-        assert [path.name for path, _is_last in results] == ["known.msgpack", "README.md"]
-        assert results[-1][1] is True
-        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
-            "known.msgpack",
-            "README.md",
-        ]
-
-    @patch(
-        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-        return_value=(["known.msgpack", "merges.txt"], _HF_TEST_REVISION, None),
-    )
+    @patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES", 4 * 1024 * 1024)
     @patch("requests.get")
-    @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_flax_preserves_binary_merges_checkpoint(
+    def test_select_streamable_text_owner_uses_known_size_for_complete_probe_budget(
         self,
-        mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
-        _mock_list_repo_files: MagicMock,
-        tmp_path: Path,
     ) -> None:
-        """Remote merges.txt names must not suppress structurally valid Flax MessagePack."""
-        msgpack = pytest.importorskip("msgpack")
-        hidden_payload = msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
+        """Known-small tokenizer text should not reserve the full text-owner ceiling."""
+        payload = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")
+        requested_ranges: list[tuple[int, int]] = []
+
+        def get_side_effect(_url: str, *, headers: dict[str, str], **_kwargs: object) -> _FakeRangeResponse:
+            range_header = headers["Range"]
+            start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            requested_start = int(start_text)
+            requested_end = int(end_text)
+            requested_ranges.append((requested_start, requested_end))
+            response_end = min(requested_end, len(payload) - 1)
+            return _fake_content_range_response(payload, requested_start, response_end)
+
+        mock_requests_get.side_effect = get_side_effect
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "a.txt", "b.txt", "c.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
         )
 
-        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
-            path = tmp_path / filename
-            path.write_bytes(hidden_payload if filename == "merges.txt" else b"\x81\xa6params\x80")
-            return str(path)
+        assert selected_files == ["known.msgpack"]
+        assert requested_ranges
+        assert all((end - start + 1) <= FLAX_MSGPACK_STRUCTURE_READ_BYTES for start, end in requested_ranges)
+        assert (0, len(payload) - 1) not in requested_ranges
 
-        mock_hf_hub_download.side_effect = download_side_effect
-        mock_requests_get.side_effect = _fake_bounded_range_response(hidden_payload)
+    @patch("requests.get")
+    def test_select_streamable_protobuf_excludes_non_ascii_bpe_text_owner(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """BPE merge text with non-ASCII tokens must not become a protobuf candidate."""
+        payload = ("#version: 0.2\n" + "Ġ hello\n" * 300_000).encode("utf-8")
+        mock_requests_get.side_effect = _fake_range_responder(payload)
 
-        results = list(
-            download_model_streaming(
-                "https://huggingface.co/test/model",
-                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
-                scannable_scanner_ids={"flax_msgpack"},
-            )
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["model.onnx", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
         )
 
-        assert [path.name for path, _is_last in results] == ["known.msgpack", "merges.txt"]
-        assert results[-1][1] is True
-        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
-            "known.msgpack",
-            "merges.txt",
-        ]
+        assert selected_files == ["model.onnx"]
+
+    @patch("requests.get")
+    def test_select_streamable_flax_excludes_non_ascii_bpe_text_owner(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Printable non-ASCII tokenizer text must not be selected as inconclusive Flax."""
+        payload = ("#version: 0.2\n" + "Ġ hello\n" * 300_000).encode("utf-8")
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files == ["known.msgpack"]
+
+    @patch("requests.get")
+    def test_select_streamable_protobuf_excludes_ascii_varint_text_near_match(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """ASCII text starting with a weak ONNX varint tag must remain text-owned."""
+        payload = (b"(h benign ascii text\n") * 4097
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["model.onnx", "notes.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+
+        assert selected_files == ["model.onnx"]
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -6875,200 +6985,3 @@ class TestHuggingFaceFileURLs:
             mock_import.side_effect = side_effect
             with pytest.raises(ImportError, match="huggingface-hub package is required"):
                 download_file_from_hf("https://huggingface.co/test/model/resolve/main/file.bin")
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(
-    os.environ.get("MODELAUDIT_RUN_LIVE_HF_QA") != "1",
-    reason="Set MODELAUDIT_RUN_LIVE_HF_QA=1 to run live pinned Hugging Face QA",
-)
-def test_live_pinned_multilingual_e5_readme_does_not_emit_flax_routing_incomplete(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pinned live README QA for the multilingual-e5-small Flax routing regression."""
-    from click.testing import CliRunner
-
-    from modelaudit.cli import cli
-
-    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
-    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf-cache"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
-    monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
-    monkeypatch.setenv("NO_ANALYTICS", "1")
-    for token_env in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
-        monkeypatch.delenv(token_env, raising=False)
-
-    output_path = tmp_path / "scan.json"
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            "--quiet",
-            "--format",
-            "json",
-            "--output",
-            str(output_path),
-            "--no-cache",
-            "--max-size",
-            "1MB",
-            "--timeout",
-            "30",
-            _HF_MULTILINGUAL_E5_README_URL,
-        ],
-        catch_exceptions=False,
-    )
-
-    assert result.exit_code == 0, result.output
-    report = json.loads(output_path.read_text())
-    metadata = next(iter(report["file_metadata"].values()))
-    assert report["success"] is True
-    assert report["has_errors"] is False
-    assert report["files_scanned"] == 1
-    assert report["scanner_names"] == ["text"]
-    assert metadata["file_size"] == 497538
-    assert metadata["scanner_dependency_ids"] == ["text"]
-    assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
-    assert "MessagePack Routing Analysis Incomplete" not in [check["name"] for check in report.get("checks", [])]
-    assert all(issue["severity"] == "info" for issue in report["issues"])
-    assert "flax_msgpack_routing_incomplete" not in [
-        issue.get("details", {}).get("scan_outcome_reason") for issue in report["issues"]
-    ]
-    assert "token=" not in result.output
-    assert "Authorization" not in result.output
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(
-    os.environ.get("MODELAUDIT_RUN_LIVE_HF_QA") != "1",
-    reason="Set MODELAUDIT_RUN_LIVE_HF_QA=1 to run live pinned Hugging Face QA",
-)
-def test_live_pinned_bert_vocab_does_not_emit_flax_routing_incomplete(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pinned live vocab.txt QA for the BERT Flax routing regression."""
-    from click.testing import CliRunner
-
-    from modelaudit.cli import cli
-
-    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
-    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf-cache"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
-    monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
-    monkeypatch.setenv("NO_ANALYTICS", "1")
-    for token_env in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
-        monkeypatch.delenv(token_env, raising=False)
-
-    output_path = tmp_path / "scan.json"
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            "--quiet",
-            "--format",
-            "json",
-            "--output",
-            str(output_path),
-            "--no-cache",
-            "--max-size",
-            "2MB",
-            "--timeout",
-            "60",
-            _HF_BERT_MULTILINGUAL_CASED_VOCAB_URL,
-        ],
-        catch_exceptions=False,
-    )
-
-    assert result.exit_code == 0, result.output
-    report = json.loads(output_path.read_text())
-    metadata = next(iter(report["file_metadata"].values()))
-    assert report["success"] is True
-    assert report["has_errors"] is False
-    assert report["files_scanned"] == 1
-    assert report["scanner_names"] == ["text"]
-    assert metadata["file_size"] == 995526
-    assert metadata["scanner_dependency_ids"] == ["text"]
-    assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
-    assert "MessagePack Routing Analysis Incomplete" not in [check["name"] for check in report.get("checks", [])]
-    assert all(issue["severity"] == "info" for issue in report["issues"])
-    assert "flax_msgpack_routing_incomplete" not in [
-        issue.get("details", {}).get("scan_outcome_reason") for issue in report["issues"]
-    ]
-    assert "token=" not in result.output
-    assert "Authorization" not in result.output
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(
-    os.environ.get("MODELAUDIT_RUN_LIVE_HF_QA") != "1",
-    reason="Set MODELAUDIT_RUN_LIVE_HF_QA=1 to run live pinned Hugging Face QA",
-)
-@pytest.mark.parametrize(
-    ("url", "expected_size"),
-    [
-        (_HF_QWEN2_VL_2B_MERGES_URL, 1_671_839),
-        (_HF_HOLO_31_4B_MERGES_URL, 3_353_259),
-        (_HF_QWEN2_15B_MERGES_URL, 1_671_839),
-    ],
-    ids=["rank-257-qwen2-vl", "rank-259-holo", "rank-260-qwen2-15b"],
-)
-def test_live_pinned_tokenizer_merges_does_not_emit_flax_routing_incomplete(
-    url: str,
-    expected_size: int,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pinned live merges.txt QA for tokenizer text routing regressions."""
-    from click.testing import CliRunner
-
-    from modelaudit.cli import cli
-
-    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
-    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf-cache"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
-    monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
-    monkeypatch.setenv("NO_ANALYTICS", "1")
-    for token_env in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
-        monkeypatch.delenv(token_env, raising=False)
-
-    output_path = tmp_path / "scan.json"
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            "--quiet",
-            "--format",
-            "json",
-            "--output",
-            str(output_path),
-            "--no-cache",
-            "--max-size",
-            "5MB",
-            "--timeout",
-            "120",
-            url,
-        ],
-        catch_exceptions=False,
-    )
-
-    assert result.exit_code == 0, result.output
-    report = json.loads(output_path.read_text())
-    metadata = next(iter(report["file_metadata"].values()))
-    assert report["success"] is True
-    assert report["has_errors"] is False
-    assert report["files_scanned"] == 1
-    assert report["scanner_names"] == ["text"]
-    assert metadata["file_size"] == expected_size
-    assert metadata["scanner_dependency_ids"] == ["text"]
-    assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
-    assert "MessagePack Routing Analysis Incomplete" not in [check["name"] for check in report.get("checks", [])]
-    assert all(issue["severity"] == "info" for issue in report["issues"])
-    assert "flax_msgpack_routing_incomplete" not in [
-        issue.get("details", {}).get("scan_outcome_reason") for issue in report["issues"]
-    ]
-    assert "token=" not in result.output
-    assert "Authorization" not in result.output

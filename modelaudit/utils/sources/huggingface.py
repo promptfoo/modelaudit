@@ -856,22 +856,35 @@ def _probe_huggingface_executorch_prefix(prefix: bytes, *, sample_is_prefix: boo
 
 
 def _is_complete_huggingface_text_or_json(
+    filename: str,
     probe: bytes,
     *,
     sample_is_prefix: bool,
-    declared_text_asset: bool = False,
+    preserve_protobuf_model_candidates: bool = False,
 ) -> bool:
     """Return whether a complete bounded probe is owned by benign text or JSON."""
     if sample_is_prefix:
         return False
 
-    from modelaudit.utils.file.detection import _is_complete_bounded_text_payload, _is_complete_declared_text_payload
-
-    text_owned = (
-        _is_complete_declared_text_payload(probe) if declared_text_asset else _is_complete_bounded_text_payload(probe)
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+        _has_bounded_protobuf_model_text_candidate_signal_bytes,
+        _is_complete_bounded_ascii_printable_text_content_owner_bytes,
+        _is_complete_bounded_printable_text_content_owner_bytes,
     )
-    if text_owned:
+
+    remote_path = Path(filename)
+    if (
+        preserve_protobuf_model_candidates
+        and remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        and _has_bounded_protobuf_model_text_candidate_signal_bytes(probe)
+        and not _is_complete_bounded_ascii_printable_text_content_owner_bytes(remote_path, len(probe), probe)
+    ):
+        return False
+
+    if _is_complete_bounded_printable_text_content_owner_bytes(remote_path, len(probe), probe):
         return True
+
     normalized = probe.lstrip()
     if normalized.startswith(b"\xef\xbb\xbf"):
         normalized = normalized[3:].lstrip()
@@ -883,6 +896,181 @@ def _is_complete_huggingface_text_or_json(
         return False
 
 
+def _starts_with_non_ascii_length_delimited_proto_prefix(probe: bytes) -> bool:
+    """Return whether a text-like prefix starts with a non-ASCII length-delimited proto field."""
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES,
+        _read_length_delimited_proto_value,
+        _read_proto_varint,
+    )
+
+    tag_result = _read_proto_varint(probe, 0)
+    if tag_result is None:
+        return False
+    tag, value_offset = tag_result
+    if tag >> 3 == 0 or tag & 0x07 != 2:
+        return False
+    bounds = _read_length_delimited_proto_value(probe, value_offset)
+    if bounds is None:
+        return False
+    length, value_start, value_end, actual_value_end = bounds
+    if length <= 0 or actual_value_end > len(probe):
+        return False
+    return bool(probe[value_start:value_end].translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES))
+
+
+def _is_huggingface_text_owner_prefix(
+    filename: str,
+    probe: bytes,
+    *,
+    preserve_protobuf_model_candidates: bool = False,
+) -> bool:
+    """Return whether an already-read remote prefix has ordinary text-owner structure."""
+    if not probe:
+        return False
+
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+        _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS,
+        _has_content_route_text_owner_structure,
+        _is_complete_bounded_ascii_printable_text_content_owner_bytes,
+        is_declared_text_content_filename,
+    )
+
+    remote_path = Path(filename)
+    if remote_path.suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and not is_declared_text_content_filename(
+        filename
+    ):
+        return False
+    if (
+        preserve_protobuf_model_candidates
+        and _starts_with_non_ascii_length_delimited_proto_prefix(probe)
+        and not _is_complete_bounded_ascii_printable_text_content_owner_bytes(remote_path, len(probe), probe)
+    ):
+        return False
+    try:
+        text = probe.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return _has_content_route_text_owner_structure(text) and all(
+        char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text
+    )
+
+
+def _is_printable_non_ascii_huggingface_text_prefix(probe: bytes) -> bool:
+    """Return whether a prefix is printable UTF-8 text with non-ASCII bytes."""
+    if not probe:
+        return False
+    return any(byte >= 0x80 for byte in probe) and not any(
+        (byte < 0x20 and byte not in {0x09, 0x0A, 0x0C, 0x0D}) or byte == 0x7F for byte in probe
+    )
+
+
+def _detect_huggingface_text_owner_embedded_binary_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a bounded route for binary/model bytes embedded after a text-owned prefix."""
+    known_size = budget.file_sizes.get(filename)
+    if known_size is None or known_size <= len(prefix):
+        return None
+
+    from modelaudit.utils.file.detection import (
+        FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        _has_bounded_protobuf_model_text_candidate_signal_bytes,
+        _looks_like_proto0_or_1_pickle,
+        _probe_flax_msgpack_checkpoint_stream,
+        detect_format_from_magic_bytes,
+    )
+
+    def detect_sample_route(sample: bytes) -> str | None:
+        if not sample:
+            return None
+        flax_state = _probe_flax_msgpack_checkpoint_stream(
+            BytesIO(sample),
+            len(sample),
+            sample_is_prefix=True,
+            incomplete_prefix_is_inconclusive=True,
+        )
+        if flax_state is True:
+            return "flax_msgpack"
+        if _starts_with_non_ascii_length_delimited_proto_prefix(
+            sample
+        ) or _has_bounded_protobuf_model_text_candidate_signal_bytes(sample):
+            return PROTOBUF_MODEL_CANDIDATE_FORMAT
+        if _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True):
+            return "pickle"
+        detected_format = detect_format_from_magic_bytes(
+            sample[:4],
+            sample[:8],
+            sample[:16],
+            max(len(sample), 1),
+            None,
+            pickle_probe_sample=sample,
+            pickle_probe_is_prefix=True,
+        )
+        return None if detected_format == "unknown" else detected_format
+
+    sample_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+    post_prefix = _read_huggingface_range(repo_id, filename, revision, budget, prefix, len(prefix), sample_size)
+    post_prefix_route = detect_sample_route(post_prefix)
+    if post_prefix_route is not None:
+        return post_prefix_route
+
+    tail_start = max(0, known_size - min(known_size, sample_size))
+    if tail_start <= len(prefix) + len(post_prefix):
+        return None
+    tail = _read_huggingface_tail(repo_id, filename, revision, budget, prefix, sample_size)
+    return detect_sample_route(tail)
+
+
+def _is_complete_huggingface_text_owner_or_json_probe(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    raw_probe: bytes,
+    max_probe_size: int,
+    *,
+    preserve_protobuf_model_candidates: bool = False,
+) -> bool:
+    """Return whether a bounded remote probe proves text or JSON ownership."""
+    probe = raw_probe[:max_probe_size]
+    if _is_complete_huggingface_text_or_json(
+        filename,
+        probe,
+        sample_is_prefix=_huggingface_sample_is_prefix(budget, filename, probe, max_probe_size),
+        preserve_protobuf_model_candidates=preserve_protobuf_model_candidates,
+    ):
+        return True
+
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+        is_declared_text_content_filename,
+    )
+
+    if Path(
+        filename
+    ).suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and not is_declared_text_content_filename(filename):
+        return False
+    known_size = budget.file_sizes.get(filename)
+    if known_size is not None and known_size > _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES:
+        return False
+    if known_size is None or known_size > len(probe):
+        return False
+
+    return _is_huggingface_text_owner_prefix(
+        filename,
+        probe,
+        preserve_protobuf_model_candidates=preserve_protobuf_model_candidates,
+    )
+
+
 def _detect_huggingface_protobuf_model_route(
     repo_id: str,
     filename: str,
@@ -892,6 +1080,7 @@ def _detect_huggingface_protobuf_model_route(
 ) -> str | None:
     """Return a bounded TensorFlow, CoreML, ONNX, or unresolved protobuf model route."""
     from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
         _COREML_PROTO_SIGNATURE_READ_BYTES,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
@@ -901,6 +1090,8 @@ def _detect_huggingface_protobuf_model_route(
         _looks_like_onnx_model_proto_stream,
     )
 
+    if Path(filename).suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and prefix.startswith(b":"):
+        return None
     if not _could_start_coreml_model_proto(prefix):
         return None
 
@@ -908,7 +1099,15 @@ def _detect_huggingface_protobuf_model_route(
     raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
     sample_is_prefix = len(raw_probe) > max_probe_size
     probe = raw_probe[:max_probe_size]
-    if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        raw_probe,
+        max_probe_size,
+        preserve_protobuf_model_candidates=True,
+    ):
         return None
 
     coreml_status = _looks_like_coreml_model_proto_prefix(probe, sample_is_prefix=sample_is_prefix)
@@ -926,6 +1125,12 @@ def _detect_huggingface_protobuf_model_route(
         return "tf_metagraph"
     if tensorflow_route in {"oversized_candidate", "inconclusive"}:
         return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    if Path(
+        filename
+    ).suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and _starts_with_non_ascii_length_delimited_proto_prefix(
+        prefix
+    ):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
     if sample_is_prefix or coreml_status is None or onnx_status is None:
         return PROTOBUF_MODEL_CANDIDATE_FORMAT
     return None
@@ -937,74 +1142,74 @@ def _detect_huggingface_flax_msgpack_route(
     revision: str,
     budget: _HuggingFaceProbeBudget,
     prefix: bytes,
+    *,
+    require_confirmed: bool = False,
 ) -> str | None:
     """Return a bounded Flax MessagePack route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
-        _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES,
-        _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES,
-        _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES,
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
         FLAX_MSGPACK_STRUCTURE_READ_BYTES,
         _probe_flax_msgpack_checkpoint_stream,
         is_declared_text_content_filename,
     )
 
-    remote_path = PurePosixPath(filename)
+    remote_path = Path(filename)
     suffix = remote_path.suffix.lower()
+    text_owner_filename = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(filename)
     if suffix in {".py", ".pyw"}:
         return None
 
-    sample_is_prefix = _huggingface_sample_is_prefix(
-        budget,
-        filename,
-        prefix,
-        _HF_CONTENT_SNIFF_BYTES,
-    )
     initial_probe_state = _probe_flax_msgpack_checkpoint_stream(
         BytesIO(prefix),
         len(prefix),
-        sample_is_prefix=sample_is_prefix,
+        sample_is_prefix=_huggingface_sample_is_prefix(
+            budget,
+            filename,
+            prefix,
+            _HF_CONTENT_SNIFF_BYTES,
+        ),
         incomplete_prefix_is_inconclusive=True,
     )
     if initial_probe_state is True:
         return "flax_msgpack"
-    declared_text_filename = is_declared_text_content_filename(filename)
-    declared_text_asset = suffix in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES or declared_text_filename
-    max_probe_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
-    raw_probe: bytes | None = None
-    should_probe_complete_text = initial_probe_state is False or (initial_probe_state is None and declared_text_asset)
-    if should_probe_complete_text:
-        if len(prefix) < _HF_CONTENT_SNIFF_BYTES or not declared_text_asset:
-            return None
-        text_probe_limit = (
-            _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
-            if declared_text_filename
-            else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
-        )
-        raw_text_probe = _read_huggingface_probe(
-            repo_id,
-            filename,
-            revision,
-            budget,
-            prefix,
-            text_probe_limit + 1,
-        )
-        text_sample_is_prefix = len(raw_text_probe) > text_probe_limit
-        text_probe = raw_text_probe[:text_probe_limit]
-        if _is_complete_huggingface_text_or_json(
-            text_probe,
-            sample_is_prefix=text_sample_is_prefix,
-            declared_text_asset=declared_text_filename,
-        ):
-            return None
-        raw_probe = raw_text_probe
-    elif len(prefix) < _HF_CONTENT_SNIFF_BYTES:
+    if len(prefix) < _HF_CONTENT_SNIFF_BYTES:
+        return None
+    if initial_probe_state is False and not text_owner_filename:
+        return None
+    if initial_probe_state is False and _is_huggingface_text_owner_prefix(filename, prefix):
+        known_size = budget.file_sizes.get(filename)
+        if known_size is not None and known_size <= _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES:
+            raw_text_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, known_size)
+            if len(raw_text_probe) >= known_size and _is_complete_huggingface_text_or_json(
+                filename,
+                raw_text_probe[:known_size],
+                sample_is_prefix=False,
+            ):
+                return None
+        return _detect_huggingface_text_owner_embedded_binary_route(repo_id, filename, revision, budget, prefix)
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        prefix,
+        _HF_CONTENT_SNIFF_BYTES,
+    ):
         return None
 
-    if raw_probe is None:
-        raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
+    max_probe_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+    raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
     sample_is_prefix = len(raw_probe) > max_probe_size
     probe = raw_probe[:max_probe_size]
-    if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        raw_probe,
+        max_probe_size,
+    ):
         return None
     probe_state = _probe_flax_msgpack_checkpoint_stream(
         BytesIO(probe),
@@ -1012,7 +1217,14 @@ def _detect_huggingface_flax_msgpack_route(
         sample_is_prefix=sample_is_prefix,
         incomplete_prefix_is_inconclusive=True,
     )
-    if probe_state is not False:
+    if (
+        probe_state is False
+        and not require_confirmed
+        and text_owner_filename
+        and _is_printable_non_ascii_huggingface_text_prefix(probe)
+    ):
+        return "flax_msgpack"
+    if probe_state is True or (probe_state is not False and not require_confirmed):
         return "flax_msgpack"
     return None
 
@@ -1030,11 +1242,13 @@ def _detect_huggingface_content_route_format(
         return None
 
     from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
         _MEDIA_ROUTING_SUFFIXES,
         _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS,
         MEDIA_ROUTE_TAIL_READ_BYTES,
         PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         PROTO0_1_MAX_PROBE_BYTES,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
         VALID_MEDIA_ROUTING_FORMAT,
         _allows_renamed_binary_content_route,
         _could_start_bounded_media_route,
@@ -1052,6 +1266,17 @@ def _detect_huggingface_content_route_format(
         return llamafile_route
 
     if _looks_like_safetensors_prefix(repo_id, filename, revision, budget, prefix):
+        if remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+            flax_route = _detect_huggingface_flax_msgpack_route(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                require_confirmed=True,
+            )
+            if flax_route is not None:
+                return flax_route
         return "safetensors"
     if _looks_like_uncompressed_tar_header(prefix):
         return "tar"
@@ -1168,6 +1393,30 @@ def _detect_huggingface_content_route_format(
         return "tflite"
     if detected_format != "unknown":
         return detected_format
+
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        prefix,
+        _HF_CONTENT_SNIFF_BYTES,
+        preserve_protobuf_model_candidates=True,
+    ):
+        return None
+    if _is_huggingface_text_owner_prefix(
+        filename,
+        prefix,
+        preserve_protobuf_model_candidates=True,
+    ):
+        return _detect_huggingface_text_owner_embedded_binary_route(repo_id, filename, revision, budget, prefix)
+
+    if (
+        remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        and not prefix.startswith(b":")
+        and _starts_with_non_ascii_length_delimited_proto_prefix(prefix)
+    ):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
     protobuf_route = _detect_huggingface_protobuf_model_route(repo_id, filename, revision, budget, prefix)
     if protobuf_route is not None:

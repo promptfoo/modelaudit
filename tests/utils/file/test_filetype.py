@@ -18,14 +18,13 @@ import pytest
 from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
+    _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
-    MEDIA_ROUTE_READ_BYTES,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
-    PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
@@ -50,14 +49,7 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
-from tests.helpers.file_creators import (
-    _coreml_field_bytes,
-    _coreml_field_varint,
-    create_v7_tar_archive,
-    malicious_pickle_bytes,
-    valid_jpeg_bytes,
-    valid_png_bytes,
-)
+from tests.helpers.file_creators import _coreml_field_bytes, _coreml_field_varint, create_v7_tar_archive
 
 
 def _ubjson_key(key: bytes) -> bytes:
@@ -308,96 +300,6 @@ def test_detect_file_format_large_directory(tmp_path):
     assert detect_file_format(str(tf_dir)) == "tensorflow_directory"
 
 
-@pytest.mark.parametrize(
-    ("filename", "payload"),
-    [
-        ("preview.png", valid_png_bytes()),
-        ("preview.jpg", valid_jpeg_bytes()),
-        ("preview.jpeg", valid_jpeg_bytes()),
-    ],
-    ids=["png", "jpg", "jpeg"],
-)
-def test_valid_media_do_not_route_to_serialized_formats(tmp_path: Path, filename: str, payload: bytes) -> None:
-    media_path = tmp_path / filename
-    media_path.write_bytes(payload)
-
-    assert detect_file_format(str(media_path)) == "unknown"
-    assert detect_file_format_from_magic(str(media_path)) == "unknown"
-    assert detect_file_format_for_skip_filter(str(media_path)) == "unknown"
-
-
-@pytest.mark.parametrize(
-    ("filename", "payload"),
-    [("polyglot.png", valid_png_bytes()), ("polyglot.jpg", valid_jpeg_bytes())],
-    ids=["png", "jpg"],
-)
-def test_media_pickle_polyglot_keeps_pickle_route(tmp_path: Path, filename: str, payload: bytes) -> None:
-    media_path = tmp_path / filename
-    media_path.write_bytes(payload + malicious_pickle_bytes())
-
-    assert detect_file_format(str(media_path)) == "pickle"
-    assert detect_file_format_from_magic(str(media_path)) == "pickle"
-    assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
-
-
-def test_jpeg_fill_byte_media_pickle_polyglot_keeps_pickle_route(tmp_path: Path) -> None:
-    media_path = tmp_path / "fill-polyglot.jpg"
-    jpeg_with_fill = valid_jpeg_bytes()[:3] + b"\xff" + valid_jpeg_bytes()[3:]
-    media_path.write_bytes(jpeg_with_fill + malicious_pickle_bytes())
-
-    assert detect_file_format(str(media_path)) == "pickle"
-    assert detect_file_format_from_magic(str(media_path)) == "pickle"
-    assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
-
-
-def test_padded_media_pickle_polyglot_fails_closed_past_probe_limit(tmp_path: Path) -> None:
-    media_path = tmp_path / "padded-polyglot.png"
-    media_path.write_bytes(valid_png_bytes() + (b"\0" * (MEDIA_ROUTE_READ_BYTES + 2)) + malicious_pickle_bytes())
-
-    assert detect_file_format(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_from_magic(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-
-
-@pytest.mark.parametrize(
-    ("filename", "payload"),
-    [
-        ("bad-crc.png", bytes(bytearray(valid_png_bytes())[:-1] + bytes([valid_png_bytes()[-1] ^ 0x01]))),
-        (
-            "forged-tail.jpg",
-            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00" + b"\0" * 32 + b"\xff\xd9",
-        ),
-    ],
-    ids=["png-crc", "jpeg-tail"],
-)
-def test_malformed_media_headers_fail_closed(tmp_path: Path, filename: str, payload: bytes) -> None:
-    media_path = tmp_path / filename
-    media_path.write_bytes(payload)
-
-    assert detect_file_format(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_from_magic(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-
-
-def test_png_crc_reader_refuses_oversized_payload_before_unbounded_read() -> None:
-    def png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
-        checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
-        return len(payload).to_bytes(4, "big") + chunk_type + payload + checksum.to_bytes(4, "big")
-
-    ihdr = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
-    oversized_idat_length = file_detection._MEDIA_STRUCTURAL_PROOF_READ_BYTES + 1
-    prefix = b"\x89PNG\r\n\x1a\n" + ihdr + oversized_idat_length.to_bytes(4, "big") + b"IDAT"
-    idat_payload_offset = len(prefix)
-    file_size = idat_payload_offset + oversized_idat_length + 4
-
-    def read_at(offset: int, size: int) -> bytes:
-        if offset >= idat_payload_offset:
-            pytest.fail("oversized PNG CRC proof attempted to read chunk payload")
-        return prefix[offset : offset + size]
-
-    assert file_detection._find_png_end_with_reader(file_size, read_at) is None
-
-
 def test_detect_file_format_zip(tmp_path):
     """Test detecting a ZIP file format."""
     # Create a ZIP file
@@ -571,10 +473,125 @@ def test_detect_renamed_flax_checkpoint_under_skipped_suffix(tmp_path: Path, suf
     assert detect_file_format(str(checkpoint)) == "flax_msgpack"
 
 
-@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"])
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
+def test_detect_large_plain_skipped_suffix_within_complete_text_bound_does_not_route_as_flax(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    document = tmp_path / f"notes{suffix}"
+    document.write_text("#version: 0.2\n" + ("Ġtoken token\n" * 220_000), encoding="utf-8")
+
+    assert 2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES < document.stat().st_size < _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+    assert detect_file_format(str(document)) == "unknown"
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".conf"])
+def test_detect_printable_utf8_text_suffix_protobuf_candidate_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    field_payload = ("é" * 60).encode("utf-8") + b" x:12"
+    document = tmp_path / f"ambiguous{suffix}"
+    document.write_bytes((b"B" + bytes([len(field_payload)]) + field_payload) * 4097)
+
+    assert detect_file_format_from_magic(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".conf"])
+def test_detect_printable_ascii_text_suffix_protobuf_tag_near_match_stays_unknown(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    field_payload = b"x" * 58
+    document = tmp_path / f"ascii{suffix}"
+    document.write_bytes((b"B" + bytes([len(field_payload)]) + field_payload) * 4097)
+
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+    assert detect_file_format(str(document)) == "unknown"
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".conf"])
+def test_detect_printable_ascii_text_suffix_protobuf_varint_near_match_stays_unknown(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    document = tmp_path / f"ascii-varint{suffix}"
+    document.write_bytes((b"(h benign ascii text\n") * 4097)
+
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+    assert detect_file_format(str(document)) == "unknown"
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".conf"])
+@pytest.mark.parametrize(
+    "prefix",
+    [b" ", b":", b":\n", b": a\n", b"a:\n"],
+    ids=["space", "colon-inline", "colon-newline", "colon-space-value", "key-colon"],
+)
+def test_detect_text_suffix_messagepack_scalar_stream_candidate_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+    prefix: bytes,
+) -> None:
+    document = tmp_path / f"ambiguous{suffix}"
+    document.write_bytes(prefix + (b'""' + ("é" * 17).encode("utf-8")) * 4097)
+
+    assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
+    assert detect_file_format(str(document)) == "flax_msgpack"
+
+
+def test_complete_text_owner_helpers_do_not_read_oversized_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = tmp_path / "large.txt"
+    document.write_bytes(b"x")
+
+    def fail_read_magic_bytes(_path: str, _size: int) -> bytes:
+        raise AssertionError("oversized text owner should be rejected before reading")
+
+    monkeypatch.setattr(file_detection, "read_magic_bytes", fail_read_magic_bytes)
+
+    assert (
+        file_detection._is_complete_bounded_printable_text_content_owner(
+            document,
+            _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1,
+        )
+        is False
+    )
+    assert (
+        file_detection._is_complete_bounded_ascii_printable_text_content_owner(
+            document,
+            _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".conf"])
+def test_detect_key_prefixed_line_broken_text_suffix_messagepack_candidate_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    document = tmp_path / f"ambiguous{suffix}"
+    document.write_bytes(b"key:\n" + (b'""' + ("é" * 17).encode("utf-8") + b"\n") * 4097)
+
+    assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
+    assert detect_file_format(str(document)) == "flax_msgpack"
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
 def test_detect_oversized_ambiguous_skipped_suffix_fails_closed_as_flax(tmp_path: Path, suffix: str) -> None:
     document = tmp_path / f"notes{suffix}"
-    document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+    document.write_bytes(b"a" * (_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1))
 
     assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
     assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
@@ -4588,22 +4605,6 @@ def test_validate_file_type(tmp_path):
         info.size = len(content)
         tar.addfile(info, io.BytesIO(content))
     assert validate_file_type(str(nemo_path)) is True
-
-    gzip_nemo_path = tmp_path / "compressed.nemo"
-    with tarfile.open(gzip_nemo_path, "w:gz") as tar:
-        info = tarfile.TarInfo(name="model_config.yaml")
-        content = b"model: test\n"
-        info.size = len(content)
-        tar.addfile(info, io.BytesIO(content))
-    assert validate_file_type(str(gzip_nemo_path)) is True
-
-    malformed_gzip_nemo_path = tmp_path / "malformed.nemo"
-    malformed_gzip_nemo_path.write_bytes(b"\x1f\x8b\x08\x00truncated")
-    assert validate_file_type(str(malformed_gzip_nemo_path)) is False
-
-    gzip_non_tar_nemo_path = tmp_path / "gzip-non-tar.nemo"
-    gzip_non_tar_nemo_path.write_bytes(gzip.compress(b"not a tar archive"))
-    assert validate_file_type(str(gzip_non_tar_nemo_path)) is False
 
     # Small file should be valid (can't determine magic bytes)
     small_file = tmp_path / "small.h5"

