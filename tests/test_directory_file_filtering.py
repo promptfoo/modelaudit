@@ -31,7 +31,7 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
 )
-from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
+from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT, should_skip_file
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import (
     create_malicious_pickle,
@@ -640,6 +640,41 @@ class TestDirectoryFileFiltering:
         assert metadata["scanner_dependency_ids"] == ["text"]
         assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
         assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_explicit_pickle_selection_scans_protocol0_pickle_in_declared_vocab_text(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        vocab = tmp_path / "vocab.txt"
+        vocab.write_bytes(b"cos\nsystem\n(S'echo vocab-pickle'\ntR.")
+
+        assert file_detection.detect_file_format_for_skip_filter(str(vocab)) == "pickle"
+        assert (
+            should_skip_file(
+                str(vocab),
+                scanner_selection_extensions=frozenset(
+                    {".pkl", ".pickle", ".dill", ".joblib", ".bin", ".pt", ".pth", ".ckpt"}
+                ),
+            )
+            is False
+        )
+
+        results = scan_model_directory_or_file(
+            str(tmp_path),
+            scanners=["pickle"],
+            cache_scan_results=False,
+        )
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["pickle"]
+        assert determine_exit_code(results) == 1
+        assert str(vocab) in results.file_metadata
+        assert any(
+            issue.rule_code == "S201"
+            and issue.details.get("associated_global") == "os.system"
+            and issue.location == str(vocab)
+            for issue in results.issues
+        )
 
     def test_large_merges_text_stays_on_text_route_in_directory_scan(self, tmp_path: Path) -> None:
         merges = tmp_path / "merges.txt"

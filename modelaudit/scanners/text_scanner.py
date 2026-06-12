@@ -1773,12 +1773,8 @@ class TextScanner(BaseScanner):
         payload: bytes,
         findings: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        if not cls._is_passive_data_sidecar(path):
-            return findings
-        return [
-            {**finding, "severity": "INFO"} if cls._is_bare_data_secret_token(payload, finding) else finding
-            for finding in findings
-        ]
+        # Whole-line Basic/Bearer matches in passive sidecars can be real credentials.
+        return findings
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:

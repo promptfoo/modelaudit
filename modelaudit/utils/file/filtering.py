@@ -367,9 +367,6 @@ def should_skip_file(
         if any(candidate in selected_extensions for candidate in candidate_extensions):
             return False
 
-    if use_default_skip_extensions and ext in skip_extensions and _has_complete_declared_text_content(path):
-        return scanner_selection_extensions is not None
-
     # Preserve scanner coverage for archive/metadata formats that are otherwise
     # part of the default skip list.
     if use_default_skip_extensions and any(
@@ -380,6 +377,9 @@ def should_skip_file(
 
     if use_default_skip_extensions and ext in skip_extensions and _has_scannable_content(path):
         return False
+
+    if use_default_skip_extensions and ext in skip_extensions and _has_complete_declared_text_content(path):
+        return scanner_selection_extensions is not None
 
     # Skip based on extension
     if ext in skip_extensions:
