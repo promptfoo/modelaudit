@@ -5587,6 +5587,7 @@ def scan_model_streaming(
             openvino_companion_bytes_scanned = 0
             onnx_external_data_pre_scan_identities: dict[Path, _FileIdentitySnapshot] = {}
             onnx_external_data_bytes_scanned = 0
+            suppress_consumed_onnx_external_data_accounting = False
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -5653,8 +5654,15 @@ def scan_model_streaming(
                     source_identity = _snapshot_file_identity(scan_path)
                     source_target_key = _file_target_identity_key(scan_path, source_identity)
                     if source_target_key == consumed_onnx_external_data_target:
-                        continue
-                    consumed_onnx_external_data_aliases.pop(source_key, None)
+                        scanner_class = _registry.get_scanner_for_path(
+                            str(scan_path),
+                            scanner_selection=scanner_selection if scanner_selection.active else None,
+                        )
+                        if scanner_class is None:
+                            continue
+                        suppress_consumed_onnx_external_data_accounting = True
+                    else:
+                        consumed_onnx_external_data_aliases.pop(source_key, None)
 
                 # Build config before skip filtering so bin-first OpenVINO
                 # sidecars can wait for their selected XML owner.
@@ -5794,6 +5802,7 @@ def scan_model_streaming(
                     scan_config,
                     progress_label=source_path.name,
                     track_stream_source=True,
+                    skip_if_stream_target_seen=suppress_consumed_onnx_external_data_accounting,
                 )
                 if openvino_scan_companion_path is not None:
                     append_streamed_openvino_companion_hash(
@@ -5864,6 +5873,8 @@ def scan_model_streaming(
                     str(scan_path),
                     config=scan_config,
                 )
+                if suppress_consumed_onnx_external_data_accounting:
+                    scan_result.bytes_scanned = 0
                 scan_result.bytes_scanned += openvino_companion_bytes_scanned
                 scan_result.bytes_scanned += onnx_external_data_bytes_scanned
                 if (

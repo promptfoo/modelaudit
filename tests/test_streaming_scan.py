@@ -3270,6 +3270,35 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_dedupes_yielded_alias_
     assert determine_exit_code(result) == 0
 
 
+def test_scan_model_streaming_scans_consumed_scannable_onnx_external_data_alias(tmp_path: Path) -> None:
+    """A consumed ONNX sidecar alias must still dispatch to an enabled scanner."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "payload.bin"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path, external_path=sidecar_path.name))
+    create_malicious_pickle(sidecar_path)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+    duplicate_sidecar_hash = compute_aggregate_hash(
+        [compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path), compute_sha256_hash(sidecar_path)]
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, False), (sidecar_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx", "pickle"],
+    )
+
+    pickle_issues = [
+        issue
+        for issue in result.issues
+        if issue.location == str(sidecar_path) and issue.severity == IssueSeverity.CRITICAL
+    ]
+    assert any("system" in issue.message.lower() for issue in pickle_issues)
+    assert result.content_hash == expected_hash
+    assert result.content_hash != duplicate_sidecar_hash
+
+
 def test_scan_model_streaming_hf_cache_context_only_onnx_external_data_contributes_hash_and_size(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
