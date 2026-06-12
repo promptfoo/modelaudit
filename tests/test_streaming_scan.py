@@ -315,7 +315,7 @@ def test_scan_model_directory_or_file_partial_streaming_security_finding_returns
 
     metadata = result.file_metadata[stream_url].model_dump()
     assert metadata["scan_outcome"] == "inconclusive"
-    assert result.success is True
+    assert result.success is False
     assert determine_exit_code(result) == 1
 
 
@@ -3646,7 +3646,7 @@ def test_scan_model_streaming_informational_failed_scan_does_not_set_operational
         )
 
     assert result.files_scanned == 2
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is False
     assert determine_exit_code(result) == 1
 

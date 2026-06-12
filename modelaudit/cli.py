@@ -46,6 +46,15 @@ from .core import (
     determine_exit_code,
     scan_model_directory_or_file,
 )
+from .core_results import (
+    details_have_incomplete_coverage,
+    details_match_shard_family_paths,
+    metadata_has_incomplete_coverage,
+    record_details_have_incomplete_coverage,
+    records_have_incomplete_coverage_for_path,
+    results_have_incomplete_coverage_under_directory,
+    results_have_inconclusive_outcome,
+)
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .integrations.source_redaction import redact_source_value
@@ -1784,39 +1793,123 @@ class _ScanPathState:
         *,
         scanner_config: dict[str, Any] | None = None,
     ) -> None:
-        """Record concrete artifacts and successful directory walks for later DVC pointers."""
-        if not self.collect_dvc_coverage or not scan_result.success:
+        """Record concrete artifacts and completed directory walks for later DVC pointers."""
+        if not self.collect_dvc_coverage:
             return
 
         scanner_policy = policy_from_config(scanner_config)
         if scanner_policy.active:
             from modelaudit.scanners import get_scanner_for_file
 
+        def resolve_coverage_path(file_path: str | None, *, base: Path | None = None) -> Path | None:
+            if not isinstance(file_path, str):
+                return None
+            try:
+                path = Path(file_path)
+                if base is not None and not path.is_absolute():
+                    path = base / path
+                return path.resolve()
+            except (OSError, RuntimeError, ValueError):
+                return None
+
         def record_covered_file(file_path: str) -> None:
             if scanner_policy.active and get_scanner_for_file(file_path, config=scanner_config) is None:
                 return
-            try:
-                resolved_path = Path(file_path).resolve()
-            except OSError:
+            resolved_path = resolve_coverage_path(file_path)
+            if resolved_path is None:
                 return
             if not resolved_path.is_file():
                 return
             self.dvc_covered_paths.add(str(resolved_path))
-            self.dvc_covered_directories.update(str(parent) for parent in resolved_path.parents)
+
+        def path_matches_shard_family(candidate_path: str | None, shard_paths: set[Path]) -> bool:
+            resolved_candidate = resolve_coverage_path(candidate_path)
+            if resolved_candidate is None:
+                return False
+            if resolved_candidate in shard_paths:
+                return True
+            if resolved_candidate.is_dir():
+                return any(shard_path.is_relative_to(resolved_candidate) for shard_path in shard_paths)
+            return False
+
+        def shard_family_has_incomplete_coverage(
+            shard_paths: set[Path],
+            *,
+            only_detected_shard_family: bool,
+        ) -> bool:
+            for metadata_path, metadata in scan_result.file_metadata.items():
+                if not (metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)):
+                    continue
+                if path_matches_shard_family(metadata_path, shard_paths):
+                    return True
+
+            incomplete_shard_checks = {
+                "Shard Scan",
+                "Sharded Model Coverage Check",
+                "Sharded Model Membership Check",
+            }
+            for records, allow_skipped_check_exemption in (
+                (scan_result.checks, True),
+                (scan_result.issues, False),
+            ):
+                for record in records:
+                    details = getattr(record, "details", None)
+                    details = details if isinstance(details, dict) else None
+                    if details is None:
+                        continue
+                    if not (
+                        details.get("operational_error") is True
+                        or record_details_have_incomplete_coverage(
+                            record,
+                            allow_skipped_check_exemption=allow_skipped_check_exemption,
+                        )
+                    ):
+                        continue
+                    if path_matches_shard_family(getattr(record, "location", None), shard_paths):
+                        return True
+                    if details_match_shard_family_paths(
+                        details,
+                        lambda candidate: path_matches_shard_family(candidate, shard_paths),
+                    ):
+                        return True
+                    if only_detected_shard_family and getattr(record, "name", None) in incomplete_shard_checks:
+                        return True
+
+            return False
 
         for asset in scan_result.assets:
             if not asset.path or asset.type == "error":
                 continue
             metadata = scan_result.file_metadata.get(asset.path)
             if metadata is not None and (
-                metadata.get("operational_error") is True or metadata.get("scan_outcome") == "inconclusive"
+                metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)
             ):
+                continue
+            if records_have_incomplete_coverage_for_path(
+                scan_result.checks,
+                asset.path,
+                allow_skipped_check_exemption=True,
+            ) or records_have_incomplete_coverage_for_path(scan_result.issues, asset.path):
                 continue
             record_covered_file(asset.path)
 
+        sharded_detection_families: list[tuple[list[Any], set[Path]]] = []
         for check in scan_result.checks:
             shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
             if check.name != "Sharded Model Detection" or not isinstance(shard_paths, list):
+                continue
+            resolved_shard_paths = {
+                resolved_path
+                for shard_path in shard_paths
+                if isinstance(shard_path, str) and (resolved_path := resolve_coverage_path(shard_path)) is not None
+            }
+            sharded_detection_families.append((shard_paths, resolved_shard_paths))
+        only_detected_shard_family = len(sharded_detection_families) <= 1
+        for shard_paths, resolved_shard_paths in sharded_detection_families:
+            if shard_family_has_incomplete_coverage(
+                resolved_shard_paths,
+                only_detected_shard_family=only_detected_shard_family,
+            ):
                 continue
             for shard_path in shard_paths:
                 if isinstance(shard_path, str):
@@ -1843,8 +1936,11 @@ class _ScanPathState:
                     resolved_directory = Path(root).resolve()
                 except OSError:
                     continue
-                if resolved_directory.is_relative_to(resolved_root):
-                    walked_directories.add(str(resolved_directory))
+                if not resolved_directory.is_relative_to(resolved_root):
+                    continue
+                if results_have_incomplete_coverage_under_directory(scan_result, str(resolved_directory)):
+                    continue
+                walked_directories.add(str(resolved_directory))
             if not walk_errors:
                 self.dvc_covered_directories.update(walked_directories)
 
@@ -3114,41 +3210,50 @@ def _scan_local_or_downloaded_path(
         ]
         issue_count = len(visible_issues)
         has_critical = any(issue.severity == IssueSeverity.CRITICAL for issue in visible_issues)
-        is_inconclusive = not scan_results.success
+        has_incomplete_coverage = results_have_inconclusive_outcome(scan_results)
 
         if spinner:
             spinner.text = f"Scanned {style_text(display_path, fg='cyan')}"
-            if issue_count == 0 and is_inconclusive:
-                spinner.fail(style_text("❔ Inconclusive", fg="yellow", bold=True))
+            if issue_count == 0 and has_incomplete_coverage:
+                spinner.fail(style_text("❔ Inconclusive (coverage incomplete)", fg="yellow", bold=True))
             elif issue_count == 0:
                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
             elif has_critical:
+                status = f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)"
+                if has_incomplete_coverage:
+                    status += ", coverage incomplete"
                 spinner.fail(
                     style_text(
-                        f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
+                        status,
                         fg="red",
                         bold=True,
                     ),
                 )
             else:
+                status = f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}"
+                if has_incomplete_coverage:
+                    status += " (coverage incomplete)"
                 spinner.ok(
                     style_text(
-                        f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
+                        status,
                         fg="yellow",
                         bold=True,
                     ),
                 )
         elif runtime.show_styled_output:
-            if issue_count == 0 and is_inconclusive:
-                click.echo(f"Scanned {display_path}: Inconclusive")
+            if issue_count == 0 and has_incomplete_coverage:
+                click.echo(f"Scanned {display_path}: Inconclusive (coverage incomplete)")
             elif issue_count == 0:
                 click.echo(f"Scanned {display_path}: Clean")
             else:
                 issues_str = "issue" if issue_count == 1 else "issues"
                 if has_critical:
-                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str} (CRITICAL)")
+                    status = f"Scanned {display_path}: Found {issue_count} {issues_str} (CRITICAL)"
                 else:
-                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str}")
+                    status = f"Scanned {display_path}: Found {issue_count} {issues_str}"
+                if has_incomplete_coverage:
+                    status += ", coverage incomplete"
+                click.echo(status)
     except Exception as exc:
         display_error = _display_error(exc, path)
         if spinner:
@@ -4799,6 +4904,7 @@ def scan_command(
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
+    has_incomplete_coverage = _results_have_incomplete_coverage(results)
 
     # Add scan summary header
     output_lines.append(style_text("\n📊 SCAN SUMMARY", fg="white", bold=True))
@@ -4970,6 +5076,19 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         if len(check_groups) > 5:
             output_lines.append(f"    ... and {len(check_groups) - 5} more check types")
 
+    if has_incomplete_coverage:
+        incomplete_summaries = _incomplete_coverage_summaries(results)
+        output_lines.append("")
+        output_lines.append(style_text("  Scan Coverage:", fg="bright_black"))
+        output_lines.append(
+            "  " + style_text("⚠️  Incomplete security coverage", fg="yellow", bold=True),
+        )
+        for file_path, reason in incomplete_summaries[:5]:
+            output_lines.append(f"    • {_escape_terminal_text(file_path)}: {_escape_terminal_text(reason)}")
+        incomplete_count = len(incomplete_summaries)
+        if incomplete_count > 5:
+            output_lines.append(f"    ... and {incomplete_count - 5} more incomplete files")
+
     # Add issue summary
     issues = results.get("issues", [])
     # Filter out DEBUG severity issues when not in verbose mode
@@ -5082,6 +5201,10 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             output_lines.append(
                 "  " + style_text("⚠️  No model files found to scan", fg="yellow", bold=True),
             )
+        elif has_incomplete_coverage:
+            output_lines.append(
+                "  " + style_text("⚠️  Security coverage incomplete", fg="yellow", bold=True),
+            )
         else:
             output_lines.append(
                 "  " + style_text("✅ No security issues detected", fg="green", bold=True),
@@ -5128,6 +5251,8 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             status_icon = "⚠️"
             status_msg = "WARNINGS DETECTED"
             status_color = "yellow"
+        if has_incomplete_coverage:
+            status_msg += "; COVERAGE INCOMPLETE"
         status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
         output_lines.append(f"  {status_line}")
     elif is_dry_run:
@@ -5141,6 +5266,12 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(
             f"  {style_text('Warning: No model files were found at the specified location.', fg='yellow')}"
         )
+    elif has_incomplete_coverage:
+        status_icon = "⚠️"
+        status_msg = "SCAN COVERAGE INCOMPLETE"
+        status_color = "yellow"
+        output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
+        output_lines.append(f"  {style_text('Some selected files could not be fully analyzed.', fg='yellow')}")
     elif visible_issues:
         if has_critical_findings:
             status_icon = "❌"
@@ -5176,6 +5307,107 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(encouragement_line)
 
     return "\n".join(output_lines)
+
+
+def _results_have_incomplete_coverage(results: dict[str, Any]) -> bool:
+    return bool(_incomplete_coverage_summaries(results))
+
+
+def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, str]]:
+    summaries: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    file_metadata = results.get("file_metadata")
+    if isinstance(file_metadata, dict):
+        for file_path, metadata in file_metadata.items():
+            if metadata_has_incomplete_coverage(metadata):
+                _append_incomplete_coverage_summary(
+                    summaries,
+                    seen,
+                    str(file_path),
+                    _incomplete_coverage_reason(metadata),
+                )
+
+    for collection_name in ("issues", "checks"):
+        records = results.get(collection_name)
+        if not isinstance(records, list):
+            continue
+        fallback_location = collection_name[:-1]
+        for record in records:
+            details = _get_issue_attr(record, "details", {})
+            if not record_details_have_incomplete_coverage(
+                record,
+                allow_skipped_check_exemption=collection_name == "checks",
+            ):
+                continue
+            location = (
+                _get_issue_attr(record, "location")
+                or _get_issue_attr(record, "name")
+                or _get_issue_attr(record, "type")
+                or fallback_location
+            )
+            _append_incomplete_coverage_summary(
+                summaries,
+                seen,
+                str(location),
+                _incomplete_coverage_reason(details),
+            )
+
+    return summaries
+
+
+def _append_incomplete_coverage_summary(
+    summaries: list[tuple[str, str]],
+    seen: set[tuple[str, str]],
+    location: str,
+    reason: str,
+) -> None:
+    summary = (location, reason)
+    if summary in seen:
+        return
+    seen.add(summary)
+    summaries.append(summary)
+
+
+def _incomplete_coverage_reason(metadata: Any, *, _depth: int = 0) -> str:
+    if not isinstance(metadata, dict):
+        return "incomplete coverage"
+
+    reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+
+    reason = metadata.get("reason")
+    if isinstance(reason, str) and reason:
+        return reason
+
+    reason = metadata.get("incomplete_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+
+    reasons = metadata.get("scan_outcome_reasons")
+    if isinstance(reasons, str) and reasons:
+        return reasons
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        joined_reasons = ", ".join(str(reason) for reason in reasons if reason)
+        if joined_reasons:
+            return joined_reasons
+
+    if metadata.get("analysis_incomplete") is True:
+        return "analysis_incomplete"
+    if metadata.get("scan_outcome") == "inconclusive":
+        return "inconclusive"
+
+    if _depth < 4:
+        findings = metadata.get("findings")
+        if isinstance(findings, dict) and details_have_incomplete_coverage(findings):
+            return _incomplete_coverage_reason(findings, _depth=_depth + 1)
+        if isinstance(findings, (list, tuple, set, frozenset)):
+            for finding in findings:
+                if details_have_incomplete_coverage(finding):
+                    return _incomplete_coverage_reason(finding, _depth=_depth + 1)
+
+    return "incomplete coverage"
 
 
 def _get_issue_attr(issue: dict[str, Any] | Any, attr: str, default: Any = None) -> Any:

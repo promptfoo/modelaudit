@@ -38,10 +38,10 @@ use crate::report::{
     ScanError,
 };
 use crate::stack::{
-    collapse_tuple_values, operand_preview, pytorch_storage_descriptor_ref, pytorch_storage_key,
-    resolve_global_operand, stack_value_from_integer_arg, stack_value_from_text_arg,
-    stack_value_preview, stack_value_string, FutureCallbacks, GlobalRef, RegexScannerRule,
-    StackValue,
+    collapse_tuple_values, is_known_pytorch_storage_global, operand_preview,
+    pytorch_storage_descriptor_ref, pytorch_storage_key, resolve_global_operand,
+    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
+    stack_value_string, FutureCallbacks, GlobalRef, RegexScannerRule, StackValue,
 };
 use crate::strings::{
     is_repeated_single_byte, is_suspicious_magic_method, suspicious_string_matches,
@@ -7029,7 +7029,7 @@ impl<'a> ScanState<'a> {
     ) -> Option<ImportReferenceDedupeKey> {
         let module = detail_string(details, "module")?;
         let name = detail_string(details, "name")?;
-        if module == "torch" && name.ends_with("Storage") {
+        if is_known_pytorch_storage_global(&module, &name) {
             return None;
         }
         Some((module, name, detail_string(details, "opcode")?))
