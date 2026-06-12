@@ -616,7 +616,7 @@ class TestModelAuditResultModel:
             }
         )
 
-        assert result.success is True
+        assert result.success is False
         assert result.issues == []
         assert len(result.checks) == 1
         assert determine_exit_code(result) == 1
@@ -832,7 +832,7 @@ class TestModelAuditResultModel:
 
         result.aggregate_scan_result_direct(scan_result)
 
-        assert result.success is True
+        assert result.success is False
         assert result.issues == []
         assert len(result.checks) == 1
         metadata = result.file_metadata["<synthetic:1>"].model_dump(exclude_none=True)

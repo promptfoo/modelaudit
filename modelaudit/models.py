@@ -221,12 +221,12 @@ def _record_has_security_severity(record: Any) -> bool:
     }
 
 
-def _records_have_security_findings(records: list[Any]) -> bool:
-    """Return True when incoming issue/check records contain WARNING/CRITICAL findings."""
+def _issues_have_security_findings(records: list[Any]) -> bool:
+    """Return True when incoming issue records contain WARNING/CRITICAL findings."""
     return any(_record_has_security_severity(record) for record in records)
 
 
-def _checks_have_security_findings(checks: list[Any]) -> bool:
+def _checks_have_failed_security_findings(checks: list[Any]) -> bool:
     for check in checks:
         if _normalized_enum_value(_metadata_value(check, "status")) == CheckStatus.FAILED.value and (
             _record_has_security_severity(check)
@@ -638,11 +638,8 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
         incoming_issues = results_dict.get("issues", [])
         incoming_checks = results_dict.get("checks", [])
-        incoming_has_security_findings = any(
-            (
-                _records_have_security_findings(incoming_issues) if isinstance(incoming_issues, list) else False,
-                _checks_have_security_findings(incoming_checks) if isinstance(incoming_checks, list) else False,
-            )
+        incoming_has_security_findings = (
+            _issues_have_security_findings(incoming_issues) if isinstance(incoming_issues, list) else False
         )
         incoming_has_incomplete_coverage = _metadata_has_incomplete_coverage(results_dict.get("metadata")) or any(
             (
@@ -741,6 +738,11 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             or _metadata_has_incomplete_coverage(metadata)
             or issues_have_incomplete_coverage
             or checks_have_incomplete_coverage
+            or (
+                scan_result.success is False
+                and _checks_have_failed_security_findings(scan_result.checks)
+                and not scan_result.has_errors
+            )
         ):
             self.success = False
 
