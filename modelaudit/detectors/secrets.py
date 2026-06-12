@@ -354,6 +354,7 @@ BINARY_FALSE_POSITIVE_TYPES = frozenset(
 )
 FLOAT_LIKE_PATTERN = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
 REDACTED_CONTEXT_SECRET = "<redacted-secret>"
+BASIC_AUTH_ARGUMENT_GAP = r"(?:\s|/\*[^*]*\*+(?:[^/*][^*]*\*+)*/)*"
 BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
     r"(?:^|[^\w-])(?:"
     r"(?:http[-_]?)?(?:"
@@ -364,16 +365,25 @@ BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
     r")"
     r"\s*(?:\\?[\"'])?\s*(?:\\?\])?\s*(?:=>|[:=])\s*"
     r"(?:[rRuUbBfF]{0,3}\\?[\"'`]|\[\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?"
-    r"|\(\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?)?\s*(?:[>|][+-]?\s*)?$",
+    r"|\(\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?"
+    r"|(?:\[\]\s*)?[A-Za-z_$][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*"
+    r"\s*\{\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?)?\s*(?:[>|][+-]?\s*)?$",
     re.IGNORECASE,
 )
 BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN = re.compile(
     r"(?:^|[^\w$])(?:"
     r"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?:setRequest(?:Header|Property)|setHeader)"
-    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)+(?:set|append|put)"
-    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?:headers?|[A-Za-z_$][A-Za-z0-9_$]*Headers?)\s*\.\s*add"
-    r")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*"
+    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*"
+    r"(?:headers?|[A-Za-z_$][A-Za-z0-9_$]*Headers?)\s*\.\s*(?:set|append|put|add)"
+    rf")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,{BASIC_AUTH_ARGUMENT_GAP}"
     r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_PROPERTY_APPEND_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*"
+    r"(?:headers?|[A-Za-z_$][A-Za-z0-9_$]*Headers?)"
+    r"\s*\[\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*\]\s*"
+    r"\.\s*append\s*\(\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
     re.IGNORECASE,
 )
 BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN = re.compile(
@@ -416,9 +426,10 @@ BASIC_AUTH_HEADER_VALUE_ARRAY_START_PATTERN = re.compile(
 )
 BASIC_AUTH_HEADER_VALUE_YAML_KEY_PATTERN = re.compile(
     r"\s*"
+    r"(?:\\?[\"']\s*)?"
     r"(?:proxy[-_]?authorization|proxyauthorization|authorization|basic[-_]?auth"
     r"|auth[-_]?header|authorization[-_]?header|proxy[-_]?(?:auth|authorization)[-_]?header)"
-    r"\s*:\s*",
+    r"\s*(?:\\?[\"'])?\s*:\s*",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN = re.compile(
@@ -727,12 +738,16 @@ class SecretsDetector:
             return True
         if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
+        if BASIC_AUTH_HEADER_PROPERTY_APPEND_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
         if BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
         if BASIC_AUTH_XML_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
         bounded_prefix = text[search_start:position]
         if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(bounded_prefix) is not None:
+            return True
+        if BASIC_AUTH_HEADER_PROPERTY_APPEND_PREFIX_PATTERN.search(bounded_prefix) is not None:
             return True
         if SecretsDetector._basic_auth_prefix_has_headers_constructor_context(bounded_prefix):
             return True

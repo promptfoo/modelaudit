@@ -265,6 +265,10 @@ class TestSecretsDetector:
                 _basic_auth_token(b"bracket:pass"),
             ),
             (
+                f'http.Header{{"Authorization": []string{{"Basic {_basic_auth_token(b"go-header:pass")}"}}}}',
+                _basic_auth_token(b"go-header:pass"),
+            ),
+            (
                 f'headers["Authorization"] = f"Basic {_basic_auth_token(b"prefixed-fstring:pass")}"',
                 _basic_auth_token(b"prefixed-fstring:pass"),
             ),
@@ -333,6 +337,10 @@ class TestSecretsDetector:
                 _basic_auth_token(b"headers-set:pass"),
             ),
             (
+                f'headers.set("Authorization", /* default */ "Basic {_basic_auth_token(b"headers-set-comment:pass")}")',
+                _basic_auth_token(b"headers-set-comment:pass"),
+            ),
+            (
                 f'headers.add("Authorization", "Basic {_basic_auth_token(b"headers-add:pass")}")',
                 _basic_auth_token(b"headers-add:pass"),
             ),
@@ -351,6 +359,10 @@ class TestSecretsDetector:
             (
                 f'headers.append("Proxy-Authorization", "Basic {_basic_auth_token(b"headers-append:pass")}")',
                 _basic_auth_token(b"headers-append:pass"),
+            ),
+            (
+                f'headers["Authorization"].append("Basic {_basic_auth_token(b"property-append:pass")}")',
+                _basic_auth_token(b"property-append:pass"),
             ),
             (
                 f'headers.put("Authorization", "Basic {_basic_auth_token(b"headers-put:pass")}")',
@@ -579,6 +591,20 @@ class TestSecretsDetector:
         text = f"Authorization:\n{filler}  - Basic {token}\n"
 
         assert text.index("Basic ") - text.index("Authorization:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    def test_basic_auth_many_yaml_quoted_header_value_list_entries_are_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"many-yaml-quoted-list:pass")
+        filler = "".join(f"  - Bearer placeholder-{index:03d}-padding-padding\n" for index in range(176))
+        text = f'"Authorization":\n{filler}  - Basic {token}\n'
+
+        assert text.index("Basic ") - text.index('"Authorization":') > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
         findings = detector.scan_text(text, context="headers.yaml")
 
         basic_findings = _basic_auth_findings(findings)
@@ -821,6 +847,11 @@ class TestSecretsDetector:
             (f'Authorization: ["Bearer placeholder"]\nNotes: ["Basic {_basic_auth_token(b"closed-list:pass")}"]'),
             f'notes.append("Authorization notes", "Basic {_basic_auth_token(b"notes:pass")}")',
             f'cache.add("Authorization", "Basic {_basic_auth_token(b"cache-add:pass")}")',
+            f'cache.set("Authorization", /* default */ "Basic {_basic_auth_token(b"cache-set-comment:pass")}")',
+            f'data.set("Proxy-Authorization", /* default */ "Basic {_basic_auth_token(b"data-set-comment:pass")}")',
+            f'cache["Authorization"].append("Basic {_basic_auth_token(b"cache-property-append:pass")}")',
+            f'data["Proxy-Authorization"].append("Basic {_basic_auth_token(b"data-property-append:pass")}")',
+            f'http.Header{{"X-Trace": []string{{"Basic {_basic_auth_token(b"go-non-header:pass")}"}}}}',
             f"\u0391uthorization: Basic {_basic_auth_token(b'confusable-alpha:pass')}",
             f"Authorizati\u043en: Basic {_basic_auth_token(b'confusable-o:pass')}",
             (
