@@ -1626,6 +1626,57 @@ def test_empty_variable_string_name_attribute_is_not_truncated(tmp_path: Path) -
     assert direct_truncated is False
 
 
+def test_large_empty_variable_string_name_attributes_scan_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    model_path = tmp_path / "large_empty_variable_names.h5"
+    model_config = {"class_name": "Sequential", "config": {"layers": []}}
+    empty_names = np.array([], dtype=object)
+    with h5py.File(model_path, "w") as f:
+        f.attrs["model_config"] = json.dumps(model_config)
+        weights = f.require_group("model_weights")
+        weights.attrs.create(
+            "weight_names",
+            empty_names,
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        weights.attrs.create(
+            "layer_names",
+            empty_names,
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+    inflate_h5_file_to_size(model_path)
+
+    worker_name_attrs: list[str] = []
+    original_batch_reader: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] = (
+        KerasH5Scanner._read_hdf5_attributes_in_worker
+    )
+
+    def counting_batch_reader(cls: type[KerasH5Scanner], requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        worker_name_attrs.extend(str(request["attr_name"]) for request in requests if request.get("mode") == "names")
+        return original_batch_reader(requests)
+
+    monkeypatch.setattr(KerasH5Scanner, "_read_hdf5_attributes_in_worker", classmethod(counting_batch_reader))
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is True
+    assert_not_rejected_by_read_cap(result)
+    assert worker_name_attrs.count("weight_names") >= 1
+    assert worker_name_attrs.count("layer_names") >= 1
+    assert "keras_h5_external_reference_analysis_limit_exceeded" not in result.metadata.get(
+        "scan_outcome_reasons",
+        [],
+    )
+    assert not any(
+        check.name == "HDF5 External Reference Analysis Limit" and check.details.get("weight_roots_truncated") is True
+        for check in result.checks
+    )
+
+
 def test_large_legacy_weight_name_attributes_are_batched_in_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
