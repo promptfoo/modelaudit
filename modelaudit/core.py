@@ -391,9 +391,13 @@ def _shard_family_has_incomplete_coverage(
     shard_paths: set[str],
     *,
     only_detected_shard_family: bool = True,
+    allow_skipped_check_exemption: bool = False,
 ) -> bool:
     for record in records:
-        if not _record_details_have_incomplete_coverage(record):
+        if not _record_details_have_incomplete_coverage(
+            record,
+            allow_skipped_check_exemption=allow_skipped_check_exemption,
+        ):
             continue
         if _path_matches_shard_family(getattr(record, "location", None), shard_paths):
             return True
@@ -3433,7 +3437,11 @@ def scan_model_directory_or_file(
                         metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                     ):
                         continue
-                    if _records_have_incomplete_coverage_for_path((*results.checks, *results.issues), asset.path):
+                    if _records_have_incomplete_coverage_for_path(
+                        results.checks,
+                        asset.path,
+                        allow_skipped_check_exemption=True,
+                    ) or _records_have_incomplete_coverage_for_path(results.issues, asset.path):
                         continue
                     if scanner_selection.active and get_scanner_for_file(asset.path, config=config) is None:
                         continue
@@ -3578,9 +3586,13 @@ def scan_model_directory_or_file(
                                 metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                             )
                         )
-                        and not _records_have_incomplete_coverage_for_path(
-                            (*nested_result.checks, *nested_result.issues),
-                            asset.path,
+                        and not (
+                            _records_have_incomplete_coverage_for_path(
+                                nested_result.checks,
+                                asset.path,
+                                allow_skipped_check_exemption=True,
+                            )
+                            or _records_have_incomplete_coverage_for_path(nested_result.issues, asset.path)
                         )
                     }
                     scanned_dvc_paths.update(nested_scanned_paths)
@@ -3659,9 +3671,10 @@ def scan_model_directory_or_file(
                         ):
                             continue
                         if _records_have_incomplete_coverage_for_path(
-                            (*nested_result.checks, *nested_result.issues),
+                            nested_result.checks,
                             asset.path,
-                        ):
+                            allow_skipped_check_exemption=True,
+                        ) or _records_have_incomplete_coverage_for_path(nested_result.issues, asset.path):
                             continue
                         resolved_asset_path = str(asset_path.resolve())
                         scanned_dvc_paths.add(resolved_asset_path)
@@ -3720,13 +3733,16 @@ def scan_model_directory_or_file(
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
 
                 _add_asset_to_results(results, target, file_result)
-                file_records = (*file_result.checks, *file_result.issues)
                 if (
                     is_dvc_pointer
                     and not _scan_result_has_operational_error(file_result)
                     and not _metadata_has_incomplete_coverage(file_result.metadata or {})
                 ):
-                    target_has_incomplete_record = _records_have_incomplete_coverage_for_path(file_records, target)
+                    target_has_incomplete_record = _records_have_incomplete_coverage_for_path(
+                        file_result.checks,
+                        target,
+                        allow_skipped_check_exemption=True,
+                    ) or _records_have_incomplete_coverage_for_path(file_result.issues, target)
                     if not target_has_incomplete_record:
                         scanned_dvc_paths.add(resolved_target)
                         internally_scanned_dvc_paths.add(resolved_target)
@@ -3744,7 +3760,12 @@ def scan_model_directory_or_file(
                     only_detected_shard_family = len(sharded_detection_families) <= 1
                     for resolved_shard_paths in sharded_detection_families:
                         if _shard_family_has_incomplete_coverage(
-                            file_records,
+                            file_result.checks,
+                            resolved_shard_paths,
+                            only_detected_shard_family=only_detected_shard_family,
+                            allow_skipped_check_exemption=True,
+                        ) or _shard_family_has_incomplete_coverage(
+                            file_result.issues,
                             resolved_shard_paths,
                             only_detected_shard_family=only_detected_shard_family,
                         ):

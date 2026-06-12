@@ -50,6 +50,7 @@ from .core_results import (
     details_have_incomplete_coverage,
     details_match_shard_family_paths,
     metadata_has_incomplete_coverage,
+    record_details_have_incomplete_coverage,
     records_have_incomplete_coverage_for_path,
     results_have_incomplete_coverage_under_directory,
     results_have_inconclusive_outcome,
@@ -1485,7 +1486,7 @@ class _ScanPathState:
                 if base is not None and not path.is_absolute():
                     path = base / path
                 return path.resolve()
-            except OSError:
+            except (OSError, RuntimeError, ValueError):
                 return None
 
         def record_covered_file(file_path: str) -> None:
@@ -1508,8 +1509,6 @@ class _ScanPathState:
                 return any(shard_path.is_relative_to(resolved_candidate) for shard_path in shard_paths)
             return False
 
-        scan_records: tuple[Any, ...] = (*scan_result.checks, *scan_result.issues)
-
         def shard_family_has_incomplete_coverage(
             shard_paths: set[Path],
             *,
@@ -1526,22 +1525,32 @@ class _ScanPathState:
                 "Sharded Model Coverage Check",
                 "Sharded Model Membership Check",
             }
-            for record in scan_records:
-                details = getattr(record, "details", None)
-                details = details if isinstance(details, dict) else None
-                if details is None:
-                    continue
-                if not (details.get("operational_error") is True or details_have_incomplete_coverage(details)):
-                    continue
-                if path_matches_shard_family(getattr(record, "location", None), shard_paths):
-                    return True
-                if details_match_shard_family_paths(
-                    details,
-                    lambda candidate: path_matches_shard_family(candidate, shard_paths),
-                ):
-                    return True
-                if only_detected_shard_family and getattr(record, "name", None) in incomplete_shard_checks:
-                    return True
+            for records, allow_skipped_check_exemption in (
+                (scan_result.checks, True),
+                (scan_result.issues, False),
+            ):
+                for record in records:
+                    details = getattr(record, "details", None)
+                    details = details if isinstance(details, dict) else None
+                    if details is None:
+                        continue
+                    if not (
+                        details.get("operational_error") is True
+                        or record_details_have_incomplete_coverage(
+                            record,
+                            allow_skipped_check_exemption=allow_skipped_check_exemption,
+                        )
+                    ):
+                        continue
+                    if path_matches_shard_family(getattr(record, "location", None), shard_paths):
+                        return True
+                    if details_match_shard_family_paths(
+                        details,
+                        lambda candidate: path_matches_shard_family(candidate, shard_paths),
+                    ):
+                        return True
+                    if only_detected_shard_family and getattr(record, "name", None) in incomplete_shard_checks:
+                        return True
 
             return False
 
@@ -1553,7 +1562,11 @@ class _ScanPathState:
                 metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)
             ):
                 continue
-            if records_have_incomplete_coverage_for_path((*scan_result.checks, *scan_result.issues), asset.path):
+            if records_have_incomplete_coverage_for_path(
+                scan_result.checks,
+                asset.path,
+                allow_skipped_check_exemption=True,
+            ) or records_have_incomplete_coverage_for_path(scan_result.issues, asset.path):
                 continue
             record_covered_file(asset.path)
 

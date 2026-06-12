@@ -69,11 +69,11 @@ def _metadata_has_coverage_only_operational_error(metadata: Any) -> bool:
     )
 
 
-def _metadata_has_incomplete_coverage(metadata: Any) -> bool:
+def _metadata_has_incomplete_coverage(metadata: Any, *, allow_bare_analysis_incomplete: bool = True) -> bool:
     """Return True when metadata identifies incomplete scan coverage."""
     if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
         return True
-    if _metadata_value(metadata, "analysis_incomplete") is True:
+    if allow_bare_analysis_incomplete and _metadata_value(metadata, "analysis_incomplete") is True:
         return True
     reason = _metadata_value(metadata, "scan_outcome_reason")
     if isinstance(reason, str):
@@ -88,22 +88,39 @@ def _metadata_has_incomplete_coverage(metadata: Any) -> bool:
     return False
 
 
-def _details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
+def _details_have_incomplete_coverage(
+    details: Any,
+    *,
+    allow_bare_analysis_incomplete: bool = True,
+    _depth: int = 0,
+) -> bool:
     """Return True when details or consolidated detail findings identify incomplete coverage."""
-    if _metadata_has_incomplete_coverage(details):
+    if _metadata_has_incomplete_coverage(details, allow_bare_analysis_incomplete=allow_bare_analysis_incomplete):
         return True
     if _depth >= 4:
         return False
 
     findings = _metadata_value(details, "findings")
     if isinstance(findings, dict):
-        return _details_have_incomplete_coverage(findings, _depth=_depth + 1)
+        return _details_have_incomplete_coverage(
+            findings,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+            _depth=_depth + 1,
+        )
     if isinstance(findings, (list, tuple, set, frozenset)):
         for finding in findings:
-            if _details_have_incomplete_coverage(finding, _depth=_depth + 1):
+            if _details_have_incomplete_coverage(
+                finding,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+                _depth=_depth + 1,
+            ):
                 return True
             nested_details = _metadata_value(finding, "details")
-            if nested_details is not finding and _details_have_incomplete_coverage(nested_details, _depth=_depth + 1):
+            if nested_details is not finding and _details_have_incomplete_coverage(
+                nested_details,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+                _depth=_depth + 1,
+            ):
                 return True
 
     return False
@@ -116,11 +133,44 @@ def _file_metadata_has_incomplete_coverage(file_metadata: Any) -> bool:
     return any(_metadata_has_incomplete_coverage(metadata) for metadata in file_metadata.values())
 
 
-def _records_have_incomplete_coverage(records: Any) -> bool:
+def _records_have_incomplete_coverage(
+    records: Any,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
     """Return True when any issue/check details identify incomplete scan coverage."""
     if not isinstance(records, list):
         return False
-    return any(_details_have_incomplete_coverage(_metadata_value(record, "details")) for record in records)
+    return any(
+        _record_has_incomplete_coverage(
+            record,
+            allow_skipped_check_exemption=allow_skipped_check_exemption,
+        )
+        for record in records
+    )
+
+
+def _record_has_incomplete_coverage(
+    record: Any,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    return _details_have_incomplete_coverage(
+        _metadata_value(record, "details"),
+        allow_bare_analysis_incomplete=not (allow_skipped_check_exemption and _record_status_is_skipped(record)),
+    )
+
+
+def _record_status_is_skipped(record: Any) -> bool:
+    status = _metadata_value(record, "status")
+    if isinstance(status, CheckStatus):
+        return status == CheckStatus.SKIPPED
+    if isinstance(status, str):
+        status_name = status.lower()
+        if status_name.startswith("checkstatus."):
+            status_name = status_name.split(".", 1)[1]
+        return status_name == CheckStatus.SKIPPED.value
+    return False
 
 
 def _issues_have_security_findings(issues: list[Any]) -> bool:
@@ -548,7 +598,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             (
                 _file_metadata_has_incomplete_coverage(results_dict.get("file_metadata")),
                 _records_have_incomplete_coverage(incoming_issues),
-                _records_have_incomplete_coverage(incoming_checks),
+                _records_have_incomplete_coverage(incoming_checks, allow_skipped_check_exemption=True),
             )
         )
 
@@ -631,14 +681,15 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             self.has_errors = True
 
         # Update success status for operational errors or incomplete coverage.
-        records_have_incomplete_coverage = any(
-            _details_have_incomplete_coverage(_metadata_value(record, "details"))
-            for record in [*scan_result.issues, *scan_result.checks]
+        issues_have_incomplete_coverage = any(_record_has_incomplete_coverage(issue) for issue in scan_result.issues)
+        checks_have_incomplete_coverage = any(
+            _record_has_incomplete_coverage(check, allow_skipped_check_exemption=True) for check in scan_result.checks
         )
         if (
             bool(metadata.get("operational_error"))
             or _metadata_has_incomplete_coverage(metadata)
-            or records_have_incomplete_coverage
+            or issues_have_incomplete_coverage
+            or checks_have_incomplete_coverage
         ):
             self.success = False
 

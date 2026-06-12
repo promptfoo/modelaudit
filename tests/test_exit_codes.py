@@ -329,6 +329,70 @@ def test_exit_code_check_details_incomplete_without_security_findings() -> None:
     assert determine_exit_code(results) == 2
 
 
+def test_exit_code_skipped_check_bare_analysis_incomplete_is_not_coverage_failure() -> None:
+    """Informational skipped checks are not file coverage failures without an outcome marker."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="PyTorch Runtime CVE Applicability",
+                status=CheckStatus.SKIPPED,
+                message="PyTorch runtime version is unknown",
+                severity=IssueSeverity.INFO,
+                location="model.pt",
+                details={"analysis_incomplete": True, "runtime_cve_applicability": "unknown"},
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is False
+    assert determine_exit_code(results) == 0
+
+
+def test_exit_code_issue_with_skipped_status_still_treats_bare_analysis_incomplete_as_coverage_failure() -> None:
+    """Only skipped checks get the bare analysis_incomplete exemption; issues stay fail-closed."""
+    results = _create_result_model(
+        issues=[
+            Issue(
+                message="DVC output coverage incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True},
+                timestamp=0.0,
+                why=None,
+                type="dvc_analysis_incomplete",
+                status="skipped",
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_skipped_check_explicit_incomplete_reason_fails_closed() -> None:
+    """Skipped checks with explicit coverage outcome markers still fail closed."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="PyTorch Runtime CVE Applicability",
+                status=CheckStatus.SKIPPED,
+                message="PyTorch runtime version is unknown",
+                severity=IssueSeverity.INFO,
+                location="model.pt",
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "pytorch_runtime_version_unknown",
+                },
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
 def test_exit_code_consolidated_check_findings_preserve_incomplete_coverage() -> None:
     """Consolidated check findings should not hide detail-only incomplete coverage."""
     child = _create_result_model(

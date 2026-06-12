@@ -2263,6 +2263,48 @@ class TestDvcSecurity:
             str(failed_first),
         }
 
+    def test_cli_malformed_incomplete_shard_record_path_is_ignored_for_dvc_coverage(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Malformed retained record paths must not crash DVC coverage accounting."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        first_shard = tmp_path / "model-00001-of-00002.safetensors"
+        second_shard = tmp_path / "model-00002-of-00002.safetensors"
+        first_shard.write_bytes(b"first")
+        second_shard.write_bytes(b"second")
+        shard_result = create_initial_audit_result()
+        shard_result.assets.append(AssetModel(path=str(first_shard), type="safetensors"))
+        shard_result.checks.extend(
+            [
+                Check(
+                    name="Sharded Model Detection",
+                    status=CheckStatus.PASSED,
+                    message="Detected complete sharded model",
+                    details={"shards": [str(first_shard), str(second_shard)]},
+                ),
+                Check(
+                    name="Synthetic Incomplete Coverage",
+                    status=CheckStatus.FAILED,
+                    message="Malformed retained incomplete path",
+                    severity=IssueSeverity.INFO,
+                    location=f"{tmp_path}\0retained.pkl",
+                    details={
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "malformed_retained_path",
+                    },
+                ),
+            ]
+        )
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(first_shard), shard_result)
+
+        assert path_state.dvc_covered_paths == {str(first_shard), str(second_shard)}
+
     def test_cli_incomplete_shard_check_paths_do_not_count_as_dvc_coverage(self, tmp_path: Path) -> None:
         """Incomplete shard-family scans must not discharge omitted DVC shard outputs."""
         from modelaudit.cli import _ScanPathState

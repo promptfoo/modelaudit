@@ -14,6 +14,7 @@ from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
     Check,
+    CheckStatus,
     Issue,
     IssueSeverity,
     ScanResult,
@@ -135,11 +136,11 @@ def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
     return getattr(metadata, SCAN_OUTCOME_METADATA_KEY, None) == outcome
 
 
-def metadata_has_incomplete_coverage(metadata: Any) -> bool:
+def metadata_has_incomplete_coverage(metadata: Any, *, allow_bare_analysis_incomplete: bool = True) -> bool:
     """Return True when metadata identifies incomplete scan coverage."""
     if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
         return True
-    if _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True:
+    if allow_bare_analysis_incomplete and _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True:
         return True
     reason = _metadata_value(metadata, SCAN_OUTCOME_REASON_METADATA_KEY)
     if isinstance(reason, str):
@@ -154,22 +155,39 @@ def metadata_has_incomplete_coverage(metadata: Any) -> bool:
     return False
 
 
-def details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
+def details_have_incomplete_coverage(
+    details: Any,
+    *,
+    allow_bare_analysis_incomplete: bool = True,
+    _depth: int = 0,
+) -> bool:
     """Return True when details or consolidated detail findings identify incomplete coverage."""
-    if metadata_has_incomplete_coverage(details):
+    if metadata_has_incomplete_coverage(details, allow_bare_analysis_incomplete=allow_bare_analysis_incomplete):
         return True
     if _depth >= 4:
         return False
 
     findings = _metadata_value(details, "findings")
     if isinstance(findings, dict):
-        return details_have_incomplete_coverage(findings, _depth=_depth + 1)
+        return details_have_incomplete_coverage(
+            findings,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+            _depth=_depth + 1,
+        )
     if isinstance(findings, (list, tuple, set, frozenset)):
         for finding in findings:
-            if details_have_incomplete_coverage(finding, _depth=_depth + 1):
+            if details_have_incomplete_coverage(
+                finding,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+                _depth=_depth + 1,
+            ):
                 return True
             nested_details = _metadata_value(finding, "details")
-            if nested_details is not finding and details_have_incomplete_coverage(nested_details, _depth=_depth + 1):
+            if nested_details is not finding and details_have_incomplete_coverage(
+                nested_details,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+                _depth=_depth + 1,
+            ):
                 return True
 
     return False
@@ -199,9 +217,28 @@ def details_match_shard_family_paths(
     return False
 
 
-def record_details_have_incomplete_coverage(record: Any) -> bool:
+def record_details_have_incomplete_coverage(
+    record: Any,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
     """Return True when a retained issue/check detail object identifies incomplete coverage."""
-    return details_have_incomplete_coverage(_metadata_value(record, "details"))
+    return details_have_incomplete_coverage(
+        _metadata_value(record, "details"),
+        allow_bare_analysis_incomplete=not (allow_skipped_check_exemption and _record_status_is_skipped(record)),
+    )
+
+
+def _record_status_is_skipped(record: Any) -> bool:
+    status = _metadata_value(record, "status")
+    if isinstance(status, CheckStatus):
+        return status == CheckStatus.SKIPPED
+    if isinstance(status, str):
+        status_name = status.lower()
+        if status_name.startswith("checkstatus."):
+            status_name = status_name.split(".", 1)[1]
+        return status_name == CheckStatus.SKIPPED.value
+    return False
 
 
 def _location_matches_file_path(location: str, file_path: str) -> bool:
@@ -220,19 +257,37 @@ def _location_matches_file_path(location: str, file_path: str) -> bool:
     return suffix[:1] in separators
 
 
-def records_have_incomplete_coverage(records: Iterable[Any] | None) -> bool:
+def records_have_incomplete_coverage(
+    records: Iterable[Any] | None,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
     """Return True when any retained issue/check carries incomplete coverage details."""
     if records is None:
         return False
     try:
-        return any(record_details_have_incomplete_coverage(record) for record in records)
+        return any(
+            record_details_have_incomplete_coverage(
+                record,
+                allow_skipped_check_exemption=allow_skipped_check_exemption,
+            )
+            for record in records
+        )
     except TypeError:
         return False
 
 
-def record_has_incomplete_coverage_for_path(record: Any, file_path: str) -> bool:
+def record_has_incomplete_coverage_for_path(
+    record: Any,
+    file_path: str,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
     """Return True when a retained issue/check marks a specific file's coverage incomplete."""
-    if not record_details_have_incomplete_coverage(record):
+    if not record_details_have_incomplete_coverage(
+        record,
+        allow_skipped_check_exemption=allow_skipped_check_exemption,
+    ):
         return False
 
     location = _metadata_value(record, "location")
@@ -259,12 +314,24 @@ def record_has_incomplete_coverage_for_path(record: Any, file_path: str) -> bool
     return False
 
 
-def records_have_incomplete_coverage_for_path(records: Iterable[Any] | None, file_path: str) -> bool:
+def records_have_incomplete_coverage_for_path(
+    records: Iterable[Any] | None,
+    file_path: str,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
     """Return True when retained issue/check details make a file unsafe to treat as covered."""
     if records is None:
         return False
     try:
-        return any(record_has_incomplete_coverage_for_path(record, file_path) for record in records)
+        return any(
+            record_has_incomplete_coverage_for_path(
+                record,
+                file_path,
+                allow_skipped_check_exemption=allow_skipped_check_exemption,
+            )
+            for record in records
+        )
     except TypeError:
         return False
 
@@ -285,9 +352,17 @@ def _location_is_within_directory(location: str, directory_path: str) -> bool:
         return False
 
 
-def record_has_incomplete_coverage_under_directory(record: Any, directory_path: str) -> bool:
+def record_has_incomplete_coverage_under_directory(
+    record: Any,
+    directory_path: str,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
     """Return True when a retained issue/check makes a directory unsafe to blanket-cover."""
-    if not record_details_have_incomplete_coverage(record):
+    if not record_details_have_incomplete_coverage(
+        record,
+        allow_skipped_check_exemption=allow_skipped_check_exemption,
+    ):
         return False
 
     location = _metadata_value(record, "location")
@@ -297,12 +372,24 @@ def record_has_incomplete_coverage_under_directory(record: Any, directory_path: 
     return _location_is_within_directory(location, str(directory_path))
 
 
-def records_have_incomplete_coverage_under_directory(records: Iterable[Any] | None, directory_path: str) -> bool:
+def records_have_incomplete_coverage_under_directory(
+    records: Iterable[Any] | None,
+    directory_path: str,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
     """Return True when retained issue/check details make a directory unsafe to blanket-cover."""
     if records is None:
         return False
     try:
-        return any(record_has_incomplete_coverage_under_directory(record, directory_path) for record in records)
+        return any(
+            record_has_incomplete_coverage_under_directory(
+                record,
+                directory_path,
+                allow_skipped_check_exemption=allow_skipped_check_exemption,
+            )
+            for record in records
+        )
     except TypeError:
         return False
 
@@ -327,8 +414,13 @@ def results_have_incomplete_coverage_under_directory(
         ):
             return True
 
-    records = (*(results.issues or []), *(results.checks or []))
-    return records_have_incomplete_coverage_under_directory(records, directory_path)
+    if records_have_incomplete_coverage_under_directory(results.issues, directory_path):
+        return True
+    return records_have_incomplete_coverage_under_directory(
+        results.checks,
+        directory_path,
+        allow_skipped_check_exemption=True,
+    )
 
 
 def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
@@ -337,7 +429,7 @@ def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
         return True
     if records_have_incomplete_coverage(results.issues):
         return True
-    return records_have_incomplete_coverage(results.checks)
+    return records_have_incomplete_coverage(results.checks, allow_skipped_check_exemption=True)
 
 
 def results_have_security_findings(results: ModelAuditResultModel) -> bool:

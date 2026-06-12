@@ -2571,6 +2571,108 @@ def test_cached_scan_skips_persisting_incomplete_record_details(
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
+def test_cached_scan_persists_skipped_bare_analysis_incomplete_check(tmp_path: Path) -> None:
+    """Skipped informational checks without outcome markers are stable enough to cache."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [
+                {
+                    "message": "PyTorch runtime version is unknown",
+                    "status": "skipped",
+                    "details": {"analysis_incomplete": True, "runtime_cve_applicability": "unknown"},
+                }
+            ],
+            "issues": [],
+            "metadata": {},
+            "scan_count": calls["count"],
+            "success": True,
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second == first
+    assert calls["count"] == 1
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+
+
+def test_cached_scan_skips_skipped_check_with_explicit_incomplete_reason(tmp_path: Path) -> None:
+    """Skipped checks with explicit outcome markers must still bypass cache."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [
+                {
+                    "message": "PyTorch runtime version is unknown",
+                    "status": "skipped",
+                    "details": {
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "pytorch_runtime_version_unknown",
+                    },
+                }
+            ],
+            "issues": [],
+            "metadata": {},
+            "scan_count": calls["count"],
+            "success": True,
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_skips_issue_with_skipped_status_and_bare_analysis_incomplete(tmp_path: Path) -> None:
+    """Issue records cannot opt into the skipped-check bare analysis_incomplete exemption."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [
+                {
+                    "message": "DVC output coverage incomplete",
+                    "status": "skipped",
+                    "details": {"analysis_incomplete": True},
+                }
+            ],
+            "metadata": {},
+            "scan_count": calls["count"],
+            "success": True,
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
 def test_cached_scan_persists_clean_result_with_benign_details(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
