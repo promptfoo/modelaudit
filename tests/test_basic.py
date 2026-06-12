@@ -1,3 +1,4 @@
+import pickle
 import re
 from importlib.metadata import PackageNotFoundError, version
 
@@ -39,7 +40,7 @@ def test_directory_scan(tmp_path):
     test_dir.mkdir()
 
     # Create a few test files with model-like extensions
-    (test_dir / "file1.pkl").write_bytes(b"test content 1")
+    (test_dir / "file1.pkl").write_bytes(pickle.dumps({"safe": True}))
     (test_dir / "file2.dat").write_bytes(b"test content 2")
 
     # Create a subdirectory with a file

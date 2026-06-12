@@ -12,9 +12,11 @@ import modelaudit_picklescan.api as picklescan_api
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import merge_scan_result
 from modelaudit.models import create_initial_audit_result
+from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners import pickle_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
@@ -414,7 +416,22 @@ def _persistent_id_issues(result: ScanResult, *, opcode: str | None = None) -> l
 
 
 def _trusted_legacy_storage_pid_checks(result: ScanResult) -> list[Any]:
-    return [check for check in result.checks if check.details.get("trusted_legacy_pytorch_context") is True]
+    return [
+        check
+        for check in result.checks
+        if check.details.get("trusted_legacy_pytorch_context") is True
+        and check.details.get("pytorch_storage_persistent_id") is True
+    ]
+
+
+def _private_actionable_failed_checks(scan_result: dict[str, Any]) -> list[dict[str, Any]]:
+    private_metadata = scan_result.get("_private_metadata")
+    if not isinstance(private_metadata, dict):
+        return []
+    actionable_failed_checks = private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+    if not isinstance(actionable_failed_checks, list):
+        return []
+    return [entry for entry in actionable_failed_checks if isinstance(entry, dict)]
 
 
 def _assert_legacy_storage_layout_incomplete(result: ScanResult) -> None:
@@ -989,7 +1006,7 @@ def test_nested_probe_limit_operational_semantics_and_cache_policy(tmp_path: Pat
         )
         metadata = aggregate_result.file_metadata[str(path)]
 
-        assert aggregate_result.success is True
+        assert aggregate_result.success is False
         assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert metadata["scan_outcome_reasons"] == ["nested_probe_limit"]
         assert determine_exit_code(aggregate_result) == 1
@@ -1967,10 +1984,600 @@ def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
     bounded_check = next(check for check in result.checks if check.name == "Legacy PyTorch Bounded Analysis")
     coverage_check = next(check for check in result.checks if check.name == "Legacy PyTorch Storage Payload Coverage")
+    serialized_result = result.to_dict(include_private_metadata=True)
     assert bounded_check.status == CheckStatus.PASSED
     assert coverage_check.status == CheckStatus.FAILED
     assert bounded_check.details["max_file_read_size"] == 256
     assert bounded_check.details["tensor_storage_materialized"] is False
+    assert should_cache_scan_result(serialized_result) is False
+
+
+def test_legacy_pytorch_storage_pid_private_evidence_survives_incomplete_downgrade() -> None:
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "analysis_incomplete": True,
+            "pickle_verdict": "suspicious",
+            "scan_outcome": INCONCLUSIVE_SCAN_OUTCOME,
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    layout = pickle_scanner._LegacyPyTorchStreamLayout(
+        boundaries=((0, 1),),
+        storage_keys=("0",),
+        storage_records=(
+            pickle_scanner._LegacyPyTorchStorageRecord(
+                key="0",
+                element_count=1,
+                element_size=1,
+                storage_type_module="torch",
+                storage_type_name="ByteStorage",
+                storage_type_position=153,
+            ),
+        ),
+        storage_end=9,
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    trusted_checks = _trusted_legacy_storage_pid_checks(result)
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert len(trusted_checks) == 1
+    assert trusted_checks[0].status == CheckStatus.PASSED
+    assert any(
+        entry.get("name") == "Standalone Pickle Finding" and entry.get("rule_code") == "S212"
+        for entry in _private_actionable_failed_checks(serialized_result)
+    )
+
+
+def test_legacy_pytorch_storage_pid_downgrades_companion_storage_import_call_graph() -> None:
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage", "position": 153}],
+            "pickle_verdict": "malicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+    layout = pickle_scanner._LegacyPyTorchStreamLayout(
+        boundaries=((0, 1),),
+        storage_keys=("0",),
+        storage_records=(
+            pickle_scanner._LegacyPyTorchStorageRecord(
+                key="0",
+                element_count=1,
+                element_size=1,
+                storage_type_module="torch",
+                storage_type_name="ByteStorage",
+                storage_type_position=153,
+            ),
+        ),
+        storage_end=9,
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    trusted_import_checks = [
+        check for check in result.checks if check.details.get("pytorch_storage_import_reference") is True
+    ]
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert trusted_import_checks
+    assert all(check.status == CheckStatus.PASSED for check in trusted_import_checks)
+    assert all(check.severity == IssueSeverity.INFO for check in trusted_import_checks)
+    assert _private_actionable_failed_checks(serialized_result) == []
+
+
+def test_legacy_pytorch_storage_pid_downgrades_parser_layout_storage_import_position() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
+    storage_import_position = payload.index(b"ctorch\nByteStorage\n")
+    assert layout is not None
+    assert layout.storage_records is not None
+    assert layout.storage_records[0].storage_type_position == storage_import_position
+
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage", "position": storage_import_position}],
+            "pickle_verdict": "malicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+
+
+def test_legacy_pytorch_storage_pid_downgrades_wrapped_parser_layout_storage_import_position() -> None:
+    prefix = b"WRAPPED:"
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
+    storage_import_position = payload.index(b"ctorch\nByteStorage\n")
+    assert layout is not None
+    assert layout.storage_records is not None
+
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [
+                {"import_reference": "torch.ByteStorage", "position": len(prefix) + storage_import_position}
+            ],
+            "pickle_verdict": "malicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location=f"wrapped.pt (pos {len(prefix)})",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location="wrapped.pt",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(
+        result,
+        layout,
+        position_offset=len(prefix),
+    )
+
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+
+
+def test_legacy_pytorch_storage_pid_downgrades_duplicate_same_position_storage_import_call_graph() -> None:
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [
+                {"import_reference": "torch.ByteStorage", "position": 153},
+                {"import_reference": "torch.ByteStorage", "position": 153},
+            ],
+            "pickle_verdict": "malicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+    layout = pickle_scanner._LegacyPyTorchStreamLayout(
+        boundaries=((0, 1),),
+        storage_keys=("0",),
+        storage_records=(
+            pickle_scanner._LegacyPyTorchStorageRecord(
+                key="0",
+                element_count=1,
+                element_size=1,
+                storage_type_module="torch",
+                storage_type_name="ByteStorage",
+                storage_type_position=153,
+            ),
+        ),
+        storage_end=9,
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    trusted_import_checks = [
+        check for check in result.checks if check.details.get("pytorch_storage_import_reference") is True
+    ]
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert trusted_import_checks
+    assert all(check.status == CheckStatus.PASSED for check in trusted_import_checks)
+    assert _private_actionable_failed_checks(serialized_result) == []
+
+
+def test_legacy_pytorch_storage_pid_downgrades_memoized_multi_storage_import_call_graph() -> None:
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage", "position": 153}],
+            "pickle_verdict": "malicious",
+        }
+    )
+    for key in ("0", "1"):
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="Persistent ID usage detected",
+            severity=IssueSeverity.CRITICAL,
+            location=f"legacy.pt (pos {key})",
+            details={
+                "opcode": "BINPERSID",
+                "pickle_rule_code": "PERSISTENT_ID",
+                "pytorch_storage_key": key,
+                "pytorch_storage_persistent_id": True,
+            },
+            rule_code="S212",
+        )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+    layout = pickle_scanner._LegacyPyTorchStreamLayout(
+        boundaries=((0, 1),),
+        storage_keys=("0", "1"),
+        storage_records=(
+            pickle_scanner._LegacyPyTorchStorageRecord(
+                key="0",
+                element_count=1,
+                element_size=1,
+                storage_type_module="torch",
+                storage_type_name="ByteStorage",
+                storage_type_position=153,
+            ),
+            pickle_scanner._LegacyPyTorchStorageRecord(
+                key="1",
+                element_count=1,
+                element_size=1,
+                storage_type_module="torch",
+                storage_type_name="ByteStorage",
+                storage_type_position=153,
+            ),
+        ),
+        storage_end=9,
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    trusted_pid_checks = _trusted_legacy_storage_pid_checks(result)
+    trusted_import_checks = [
+        check for check in result.checks if check.details.get("pytorch_storage_import_reference") is True
+    ]
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert len(trusted_pid_checks) == 2
+    assert trusted_import_checks
+    assert all(check.status == CheckStatus.PASSED for check in trusted_import_checks)
+    assert _private_actionable_failed_checks(serialized_result) == []
+
+
+def test_legacy_pytorch_storage_pid_keeps_memoized_storage_import_with_extra_position_call_graph() -> None:
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [
+                {"import_reference": "torch.ByteStorage", "position": 153},
+                {"import_reference": "torch.ByteStorage", "position": 250},
+            ],
+            "pickle_verdict": "suspicious",
+        }
+    )
+    for key in ("0", "1"):
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="Persistent ID usage detected",
+            severity=IssueSeverity.CRITICAL,
+            location=f"legacy.pt (pos {key})",
+            details={
+                "opcode": "BINPERSID",
+                "pickle_rule_code": "PERSISTENT_ID",
+                "pytorch_storage_key": key,
+                "pytorch_storage_persistent_id": True,
+            },
+            rule_code="S212",
+        )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+    layout = pickle_scanner._LegacyPyTorchStreamLayout(
+        boundaries=((0, 1),),
+        storage_keys=("0", "1"),
+        storage_records=(
+            pickle_scanner._LegacyPyTorchStorageRecord(
+                key="0",
+                element_count=1,
+                element_size=1,
+                storage_type_module="torch",
+                storage_type_name="ByteStorage",
+                storage_type_position=153,
+            ),
+            pickle_scanner._LegacyPyTorchStorageRecord(
+                key="1",
+                element_count=1,
+                element_size=1,
+                storage_type_module="torch",
+                storage_type_name="ByteStorage",
+                storage_type_position=153,
+            ),
+        ),
+        storage_end=9,
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
+    assert any(
+        check.rule_code == "DANGEROUS_CALL_GRAPH" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert not any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+
+
+def test_legacy_pytorch_storage_pid_keeps_extra_storage_import_call_graph() -> None:
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [
+                {"import_reference": "torch.ByteStorage", "position": 153},
+                {"import_reference": "torch.ByteStorage", "position": 250},
+            ],
+            "pickle_verdict": "suspicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+    layout = pickle_scanner._LegacyPyTorchStreamLayout(
+        boundaries=((0, 1),),
+        storage_keys=("0",),
+        storage_records=(
+            pickle_scanner._LegacyPyTorchStorageRecord(
+                key="0",
+                element_count=1,
+                element_size=1,
+                storage_type_module="torch",
+                storage_type_name="ByteStorage",
+                storage_type_position=153,
+            ),
+        ),
+        storage_end=9,
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
+    assert any(
+        check.rule_code == "DANGEROUS_CALL_GRAPH" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_legacy_pytorch_storage_pid_keeps_invoked_storage_import_call_graph() -> None:
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage", "position": 153}],
+            "pickle_verdict": "suspicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "invocation_import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "REDUCE",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+    layout = pickle_scanner._LegacyPyTorchStreamLayout(
+        boundaries=((0, 1),),
+        storage_keys=("0",),
+        storage_records=(
+            pickle_scanner._LegacyPyTorchStorageRecord(
+                key="0",
+                element_count=1,
+                element_size=1,
+                storage_type_module="torch",
+                storage_type_name="ByteStorage",
+                storage_type_position=153,
+            ),
+        ),
+        storage_end=9,
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
+    assert any(
+        check.rule_code == "DANGEROUS_CALL_GRAPH" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert not any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
 
 
 def test_large_legacy_pytorch_malicious_control_still_fails(tmp_path: Path) -> None:
@@ -2557,6 +3164,9 @@ def test_legacy_pytorch_container_trusts_canonical_storage_binpersid(tmp_path: P
 
     trusted_checks = _trusted_legacy_storage_pid_checks(result)
     assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.has_errors is False
+    assert result.has_warnings is False
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
     assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
@@ -2568,6 +3178,9 @@ def test_legacy_pytorch_container_trusts_canonical_storage_binpersid(tmp_path: P
     assert trusted_checks[0].rule_code == "S212"
     assert trusted_checks[0].details["opcode"] == "BINPERSID"
     assert trusted_checks[0].details["pytorch_storage_key"] == "0"
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert _private_actionable_failed_checks(serialized_result) == []
+    assert should_cache_scan_result(serialized_result) is True
 
 
 def test_legacy_pytorch_bin_extension_uses_framing_not_suffix_for_storage_trust(tmp_path: Path) -> None:

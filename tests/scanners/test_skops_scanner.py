@@ -1075,7 +1075,7 @@ class TestSkopsScannerEdgeCases:
             first, second = _scan_twice_with_cache(skops_file, cache_dir)
 
             for result in (first, second):
-                assert result.success is True
+                assert result.success is False
                 assert determine_exit_code(result) == 1
                 metadata = result.file_metadata[str(skops_file)]
                 _assert_inconclusive_reason(metadata, "skops_not_zip_archive")
