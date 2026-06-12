@@ -3665,16 +3665,16 @@ def test_text_scanner_bare_active_vocabulary_tokens_are_informational(
 
 
 @pytest.mark.parametrize(
-    ("credential", "secret_type"),
+    "credential",
     [
-        ("Basic configuration", "Basic Auth Credentials"),
-        ("Bearer configuration", "Bearer Token"),
+        "Basic configuration",
+        "Bearer configuration",
+        "Basic Y29uZmlndXJhdGlvbg==",
     ],
 )
-def test_text_scanner_bare_merges_basic_token_pair_remains_actionable(
+def test_text_scanner_bare_merges_auth_token_pairs_are_informational(
     tmp_path: Path,
     credential: str,
-    secret_type: str,
 ) -> None:
     text_dir = tmp_path / "text_tokenizer"
     text_dir.mkdir()
@@ -3689,10 +3689,8 @@ def test_text_scanner_bare_merges_basic_token_pair_remains_actionable(
         for check in result.checks
         if check.name == "Embedded Secrets Detection" and check.status == CheckStatus.FAILED
     ]
-    assert secret_checks
-    assert any(check.details.get("secret_type") == secret_type for check in secret_checks)
-    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in secret_checks)
-    assert determine_exit_code(aggregate) == 1
+    assert not secret_checks
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(
@@ -3712,8 +3710,16 @@ def test_text_scanner_merges_whole_line_basic_bearer_credentials_remain_actionab
     text_path = text_dir / "merges.txt"
     text_path.write_text(f"#version: 0.2\nsafe token\n{credential}\n", encoding="utf-8")
 
+    result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_dir), cache_enabled=False)
 
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == secret_type
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
     assert determine_exit_code(aggregate) == 1
     assert any(
         check.name == "Embedded Secrets Detection"

@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.detectors.network_comm import redact_url_for_finding
+from modelaudit.detectors.secrets import SecretsDetector
 from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FILENAMES
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
@@ -80,10 +81,15 @@ DOCUMENTATION_NETWORK_FINDING_PRIORITY = {
 PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt", "merges.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
 PASSIVE_DATA_SECRET_TYPES = frozenset({"Basic Auth Credentials", "Bearer Token"})
-PASSIVE_DATA_AUTH_LINE_PATTERN = re.compile(
-    rb"^[ \t]*(?P<scheme>basic|bearer)[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{2,8192}={0,2})[ \t]*\r?$",
+PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN = re.compile(
+    rb"^[ \t]*basic[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{2,8192}={0,2})[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )
+PASSIVE_DATA_BEARER_AUTH_LINE_PATTERN = re.compile(
+    rb"^[ \t]*bearer[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{20,8192}={0,2})[ \t]*\r?$",
+    re.IGNORECASE,
+)
+PASSIVE_DATA_BEARER_TOKEN_MARKER_BYTES = b"0123456789._~+/-"
 TOKENIZER_VOCABULARY_FILENAMES = frozenset(TOKENIZER_VOCABULARY_CONTENT_FILENAMES)
 TOKENIZER_VOCABULARY_PREFIXES = ("tokenizer_vocab", "tokenizer-vocab", "vocab")
 TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS = frozenset({"trojan", "zombie"})
@@ -2329,6 +2335,30 @@ class TextScanner(BaseScanner):
             return False
         return line[position : position + length].strip() == stripped
 
+    @staticmethod
+    def _passive_data_basic_token_decodes_to_credentials(token: bytes) -> bool:
+        return SecretsDetector._basic_auth_token_decodes_to_credentials(token.decode("ascii"))
+
+    @staticmethod
+    def _passive_data_bearer_token_is_credential_like(token: bytes) -> bool:
+        unpadded_token = token.rstrip(b"=")
+        return any(byte in PASSIVE_DATA_BEARER_TOKEN_MARKER_BYTES for byte in unpadded_token)
+
+    @classmethod
+    def _passive_data_bare_secret_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        line = cls._finding_line(payload, finding)
+        if line is None:
+            return False
+
+        secret_type = finding.get("secret_type")
+        if secret_type == "Basic Auth Credentials":
+            match = PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN.match(line)
+            return match is not None and cls._passive_data_basic_token_decodes_to_credentials(match.group("token"))
+        if secret_type == "Bearer Token":
+            match = PASSIVE_DATA_BEARER_AUTH_LINE_PATTERN.match(line)
+            return match is not None and cls._passive_data_bearer_token_is_credential_like(match.group("token"))
+        return True
+
     @classmethod
     def _passive_data_auth_line_has_existing_finding(
         cls,
@@ -2361,10 +2391,12 @@ class TextScanner(BaseScanner):
             return []
 
         passive_findings: list[dict[str, Any]] = []
-        for match in PASSIVE_DATA_AUTH_LINE_PATTERN.finditer(payload):
-            scheme = match.group("scheme").decode("ascii").casefold()
+        for match in PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN.finditer(payload):
             token = match.group("token")
-            secret_type = "Basic Auth Credentials" if scheme == "basic" else "Bearer Token"
+            if not cls._passive_data_basic_token_decodes_to_credentials(token):
+                continue
+
+            secret_type = "Basic Auth Credentials"
             line_start, line_end, _line_number = cls._documentation_line_bounds(payload, match.start())
             if cls._passive_data_auth_line_has_existing_finding(
                 payload,
@@ -2375,7 +2407,6 @@ class TextScanner(BaseScanner):
             ):
                 continue
 
-            redacted_scheme = "Basic" if scheme == "basic" else "Bearer"
             token_position = match.start("token")
             passive_findings.append(
                 {
@@ -2386,7 +2417,7 @@ class TextScanner(BaseScanner):
                     "length": len(token),
                     "confidence": 0.8,
                     "pattern": "passive_data_auth_line",
-                    "redacted_value": f"{redacted_scheme} <redacted>",
+                    "redacted_value": "Basic <redacted>",
                     "message": f"{secret_type} detected in passive data sidecar (confidence: 80%)",
                     "context": f"{path} pos:{token_position}",
                     "recommendation": f"Remove {secret_type} from model data immediately",
@@ -3203,6 +3234,15 @@ class TextScanner(BaseScanner):
         payload: bytes,
         findings: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        if not cls._is_passive_data_sidecar(path):
+            return findings
+
+        findings = [
+            finding
+            for finding in findings
+            if not cls._is_bare_data_secret_token(payload, finding)
+            or cls._passive_data_bare_secret_finding_is_actionable(payload, finding)
+        ]
         # Whole-line Basic/Bearer matches in passive sidecars can be real credentials.
         return findings + cls._passive_data_auth_line_secret_findings(path, payload, findings)
 
