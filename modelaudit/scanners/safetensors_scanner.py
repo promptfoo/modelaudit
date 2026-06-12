@@ -601,7 +601,10 @@ class SafeTensorsScanner(BaseScanner):
             token = match.group(0)
             before = stripped[: match.start()]
             after = stripped[match.end() :]
-            if len(token) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO:
+            if (
+                len(token) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO
+                and not SafeTensorsScanner._base64_candidate_decodes(token)
+            ):
                 continue
             annotations = [annotation for annotation in (before, after) if annotation.strip()]
             if not all(

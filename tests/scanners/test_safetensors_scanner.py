@@ -21,7 +21,11 @@ from safetensors.numpy import load_file, save_file
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.safetensors_scanner import SAFETENSORS_READ_INCONCLUSIVE_REASON, SafeTensorsScanner
+from modelaudit.scanners.safetensors_scanner import (
+    _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO,
+    SAFETENSORS_READ_INCONCLUSIVE_REASON,
+    SafeTensorsScanner,
+)
 
 CYRILLIC_SMALL_A = chr(0x0430)
 FULLWIDTH_PERCENT = chr(0xFF05)
@@ -873,6 +877,45 @@ def test_license_metadata_annotated_wrapped_base64_tail_keeps_length_and_s905(
     result = SafeTensorsScanner().scan(str(file_path))
 
     assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Length Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("key") == "license"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "https?://"}
+        for check in result.checks
+    )
+
+
+def test_license_metadata_padded_short_import_gadget_base64_keeps_length_and_s905(tmp_path: Path) -> None:
+    file_path = tmp_path / "padded_short_import_gadget_license_metadata.safetensors"
+    encoded_gadget = short_import_gadget_base64_tail()
+    padded_tail = (
+        "License grant terms permission reproduce distribute applicable law " * 8
+        + encoded_gadget
+        + " license terms permission reproduce distribute applicable law" * 8
+    )
+    nonspace_len = sum(1 for char in padded_tail if not char.isspace())
+    payload = f"{ordinary_license_text_with_url()}\n{padded_tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert len(encoded_gadget) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
     assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
     assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
     assert any(
