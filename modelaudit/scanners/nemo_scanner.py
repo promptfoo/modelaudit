@@ -18,6 +18,7 @@ from ..core_results import (
     OPERATIONAL_ERROR_REASON_METADATA_KEY,
     mark_operational_scan_error,
     metadata_has_incomplete_coverage,
+    records_have_incomplete_coverage,
     scan_result_has_operational_error,
 )
 from ..utils import is_absolute_archive_path, sanitize_archive_path
@@ -1239,6 +1240,53 @@ def _is_nested_coverage_only_incomplete_reason(reason: str) -> bool:
 
 def _is_nested_non_propagating_incomplete_reason(reason: str) -> bool:
     return reason in _NESTED_NON_PROPAGATING_INCOMPLETE_REASONS
+
+
+def _first_incomplete_coverage_reason_from_details(details: Any, *, _depth: int = 0) -> str | None:
+    if not isinstance(details, dict) or _depth >= 4:
+        return None
+
+    reason = details.get("scan_outcome_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+    reasons = details.get("scan_outcome_reasons")
+    if isinstance(reasons, str) and reasons:
+        return reasons
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        for candidate in reasons:
+            if isinstance(candidate, str) and candidate:
+                return candidate
+
+    findings = details.get("findings")
+    if isinstance(findings, dict):
+        return _first_incomplete_coverage_reason_from_details(findings, _depth=_depth + 1)
+    if isinstance(findings, (list, tuple, set, frozenset)):
+        for finding in findings:
+            if isinstance(finding, dict):
+                nested_reason = _first_incomplete_coverage_reason_from_details(finding, _depth=_depth + 1)
+                if nested_reason is not None:
+                    return nested_reason
+                nested_details = finding.get("details")
+                nested_reason = _first_incomplete_coverage_reason_from_details(
+                    nested_details,
+                    _depth=_depth + 1,
+                )
+                if nested_reason is not None:
+                    return nested_reason
+
+    nested_details = details.get("details")
+    if nested_details is not details:
+        return _first_incomplete_coverage_reason_from_details(nested_details, _depth=_depth + 1)
+
+    return None
+
+
+def _first_nested_record_incomplete_coverage_reason(nested_result: ScanResult) -> str | None:
+    for record in (*nested_result.checks, *nested_result.issues):
+        reason = _first_incomplete_coverage_reason_from_details(getattr(record, "details", None))
+        if reason is not None:
+            return reason
+    return None
 
 
 def _get_nested_scanner_for_file(path: str, *, config: dict[str, Any]) -> BaseScanner | None:
@@ -2997,6 +3045,7 @@ class NemoScanner(BaseScanner):
         raw_operational_reason = nested_result.metadata.get(OPERATIONAL_ERROR_REASON_METADATA_KEY)
         raw_incomplete_reason = nested_result.metadata.get("scan_outcome_reason")
         raw_incomplete_reasons = nested_result.metadata.get("scan_outcome_reasons")
+        record_incomplete_reason = _first_nested_record_incomplete_coverage_reason(nested_result)
         if isinstance(raw_operational_reason, str):
             operational_reason = raw_operational_reason
         elif isinstance(raw_incomplete_reason, str):
@@ -3007,9 +3056,15 @@ class NemoScanner(BaseScanner):
             and isinstance(raw_incomplete_reasons[0], str)
         ):
             operational_reason = raw_incomplete_reasons[0]
+        elif record_incomplete_reason is not None:
+            operational_reason = record_incomplete_reason
         else:
             operational_reason = _NESTED_OPERATIONAL_REASON_FALLBACK
-        nested_incomplete = metadata_has_incomplete_coverage(nested_result.metadata)
+        nested_incomplete = (
+            metadata_has_incomplete_coverage(nested_result.metadata)
+            or records_have_incomplete_coverage(nested_result.checks)
+            or records_have_incomplete_coverage(nested_result.issues)
+        )
         nested_operational = scan_result_has_operational_error(nested_result)
         nested_has_actionable_finding = any(
             check.status == CheckStatus.FAILED and check.severity in actionable_severities

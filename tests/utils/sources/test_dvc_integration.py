@@ -2184,6 +2184,43 @@ class TestDvcSecurity:
         assert path_state.dvc_covered_paths == {str(first_shard)}
         assert str(second_shard) not in path_state.dvc_covered_paths
 
+    def test_core_malformed_detected_shard_path_keeps_dvc_gap_explicit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Malformed detected shard paths must not crash DVC coverage bookkeeping."""
+        shard = tmp_path / "model-00001-of-00001.safetensors"
+        shard.write_bytes(b"safe")
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text(f"outs:\n- path: {shard.name}\n")
+
+        def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+            result = ScanResult(scanner_name="safetensors")
+            result.bytes_scanned = Path(path).stat().st_size
+            result.add_check(
+                name="Sharded Model Detection",
+                passed=True,
+                message="Detected sharded model with malformed retained path",
+                severity=IssueSeverity.INFO,
+                details={"shards": [path, "archive\x00member"]},
+            )
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(
+            issue.message == "Shard path changed during directory discovery"
+            and issue.location == "archive\x00member"
+            and issue.details.get("scan_outcome_reason") == "shard_path_changed"
+            for issue in result.issues
+        )
+
     def test_core_incomplete_shard_family_matching_is_family_scoped(self, tmp_path: Path) -> None:
         """Incomplete shard records should not poison unrelated detected families."""
         complete_first = tmp_path / "complete-00001-of-00002.safetensors"

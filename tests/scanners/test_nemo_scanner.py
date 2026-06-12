@@ -3624,6 +3624,36 @@ class TestCVE202523304HydraTarget:
         assert reason in result.metadata["scan_outcome_reasons"]
         assert "operational_error" not in result.metadata
 
+    def test_nested_detail_only_incomplete_outcome_without_findings_is_propagated(self, tmp_path: Path) -> None:
+        """Nested detail-only coverage gaps should mark the NeMo archive incomplete."""
+        reason = "synthetic_nested_coverage_incomplete"
+        extracted_path = str(tmp_path / "nested-payload.pkl")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="pickle")
+        nested_result.add_check(
+            name="Nested Scanner Analysis",
+            passed=False,
+            message="Nested scanner analysis was incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+            details={"analysis_incomplete": True, "scan_outcome_reason": reason},
+        )
+        nested_result.finish(success=True)
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.pkl",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
     def test_nested_structural_reject_without_findings_is_not_propagated(self, tmp_path: Path) -> None:
         extracted_path = str(tmp_path / "tokenizer.model")
         result = ScanResult(scanner_name="nemo")

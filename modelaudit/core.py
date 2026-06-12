@@ -1468,7 +1468,7 @@ def _resolve_discovered_shard_path(shard_path: str, results: ModelAuditResultMod
     """Resolve a detected shard without aborting if it changes during discovery."""
     try:
         return str(Path(shard_path).resolve(strict=True))
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         _add_issue_to_model(
             results,
             "Shard path changed during directory discovery",
@@ -3736,9 +3736,11 @@ def scan_model_directory_or_file(
                         if check.name == "Sharded Model Detection" and isinstance(shard_paths, list):
                             sharded_detection_families.append(
                                 {
-                                    str(Path(shard_path).resolve())
+                                    resolved_shard_path
                                     for shard_path in shard_paths
                                     if isinstance(shard_path, str)
+                                    and (resolved_shard_path := _resolve_discovered_shard_path(shard_path, results))
+                                    is not None
                                 }
                             )
                     only_detected_shard_family = len(sharded_detection_families) <= 1

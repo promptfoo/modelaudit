@@ -83,12 +83,13 @@ def _create_run(
     exit_code = determine_exit_code(audit_result)
     has_operational_errors = results_have_operational_error(audit_result)
     has_incomplete_coverage = results_have_inconclusive_outcome(audit_result)
+    is_dry_run = bool(getattr(audit_result, "dry_run", False))
     process_completed = not has_operational_errors
     security_coverage_complete = (
         process_completed
         and not has_incomplete_coverage
         and audit_result.success is not False
-        and audit_result.files_scanned > 0
+        and (is_dry_run or audit_result.files_scanned > 0)
     )
 
     run = {

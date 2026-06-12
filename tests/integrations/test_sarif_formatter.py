@@ -524,6 +524,22 @@ class TestCreateRun:
         assert props["incompleteCoverage"] is False
         assert props["operationalErrors"] is False
 
+    def test_invocation_properties_treat_dry_run_as_successful_invocation(self) -> None:
+        """Dry-run previews should be successful invocations even without scanned files."""
+        result = create_initial_audit_result()
+        result.dry_run = True
+        result.files_scanned = 0
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 0
+        assert invocation["executionSuccessful"] is True
+        assert invocation["properties"]["processCompleted"] is True
+        assert invocation["properties"]["securityCoverageComplete"] is True
+        assert invocation["properties"]["incompleteCoverage"] is False
+
     def test_invocation_properties_mark_incomplete_coverage_without_findings(self) -> None:
         """Incomplete coverage without findings should be an unsuccessful SARIF invocation."""
         result = create_initial_audit_result()
