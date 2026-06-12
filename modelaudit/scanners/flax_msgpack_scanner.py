@@ -2147,9 +2147,16 @@ class FlaxMsgpackScanner(BaseScanner):
             },
         )
 
-    def _record_stream_tensor_size(self, size: int, location: str, summary: _FlaxStreamSummary) -> None:
-        if size >= 16 and size % 4 == 0:
-            summary.parameter_count += size // 4
+    def _record_stream_tensor_size(
+        self,
+        size: int,
+        location: str,
+        summary: _FlaxStreamSummary,
+        *,
+        item_size: int = 4,
+    ) -> None:
+        if size >= item_size and size % item_size == 0:
+            summary.parameter_count += size // item_size
         if not self._is_tensor_like_binary_size(size):
             return
 
@@ -2160,7 +2167,7 @@ class FlaxMsgpackScanner(BaseScanner):
             return
 
         summary.large_tensor_count += 1
-        elements = size // 4
+        elements = size // item_size
         potential_shapes: list[tuple[int, int]] = []
         for dim1 in (64, 128, 256, 512, 768, 1024, 1536, 2048, 4096, 8192):
             if elements % dim1 == 0:
@@ -2784,7 +2791,7 @@ class FlaxMsgpackScanner(BaseScanner):
         shape_values: list[int],
         dtype: str,
         data_length: int,
-    ) -> None:
+    ) -> int:
         item_size = self._flax_ndarray_dtype_item_size(dtype)
         if data_length % item_size != 0:
             raise _MsgpackStreamFormatError("Flax ndarray tensor byte length is not aligned to dtype item size")
@@ -2798,7 +2805,7 @@ class FlaxMsgpackScanner(BaseScanner):
         if has_zero_dimension:
             if data_length != 0:
                 raise _MsgpackStreamFormatError("Flax ndarray shape and dtype do not match declared tensor byte length")
-            return
+            return item_size
 
         max_elements = data_length // item_size
         element_count = 1
@@ -2809,6 +2816,35 @@ class FlaxMsgpackScanner(BaseScanner):
 
         if element_count != max_elements:
             raise _MsgpackStreamFormatError("Flax ndarray shape and dtype do not match declared tensor byte length")
+        return item_size
+
+    def _read_stream_complex_component(self, cursor: _MsgpackStreamCursor) -> int | float:
+        marker = cursor.read_marker()
+        if marker <= 0x7F:
+            return marker
+        if marker >= 0xE0:
+            return marker - 256
+        if marker == 0xCA:
+            return struct.unpack(">f", cursor._read_exact(4))[0]
+        if marker == 0xCB:
+            return struct.unpack(">d", cursor._read_exact(8))[0]
+        if marker == 0xCC:
+            return cursor.read_uint(1)
+        if marker == 0xCD:
+            return cursor.read_uint(2)
+        if marker == 0xCE:
+            return cursor.read_uint(4)
+        if marker == 0xCF:
+            return cursor.read_uint(8)
+        if marker == 0xD0:
+            return cursor.read_int(1)
+        if marker == 0xD1:
+            return cursor.read_int(2)
+        if marker == 0xD2:
+            return cursor.read_int(4)
+        if marker == 0xD3:
+            return cursor.read_int(8)
+        raise _MsgpackStreamFormatError(f"expected Flax complex numeric component, found marker 0x{marker:02x}")
 
     def _check_stream_shape_values(self, shape_values: list[int], location: str, result: ScanResult) -> None:
         shape_summary = _StreamSequenceSummary(
@@ -2898,10 +2934,10 @@ class FlaxMsgpackScanner(BaseScanner):
         data_length = self._read_stream_binary_header(cursor)
         if cursor.tell() + data_length > body_end:
             raise OutOfData
-        self._validate_flax_ndarray_payload_length(shape_values, dtype, data_length)
+        item_size = self._validate_flax_ndarray_payload_length(shape_values, dtype, data_length)
 
         value_location = f"{location}[2]"
-        self._record_stream_tensor_size(data_length, value_location, summary)
+        self._record_stream_tensor_size(data_length, value_location, summary, item_size=item_size)
         self._check_timeout()
         cursor.skip(data_length)
         self._check_timeout()
@@ -2909,6 +2945,26 @@ class FlaxMsgpackScanner(BaseScanner):
         if cursor.tell() != body_end:
             raise _MsgpackStreamFormatError("Flax ndarray extension contains trailing bytes after tensor payload")
         return _StreamValue("ExtType", value=None)
+
+    def _consume_flax_native_complex_ext_scalar(
+        self,
+        cursor: _MsgpackStreamCursor,
+        length: int,
+        location: str,
+    ) -> _StreamValue:
+        body_start = cursor.tell()
+        body_end = body_start + length
+        field_count = cursor.read_array_header()
+        if field_count != 2:
+            raise _MsgpackStreamFormatError("unexpected Flax native complex extension field count")
+
+        real = self._read_stream_complex_component(cursor)
+        imaginary = self._read_stream_complex_component(cursor)
+        self._check_timeout()
+
+        if cursor.tell() != body_end:
+            raise _MsgpackStreamFormatError("Flax native complex extension contains trailing bytes")
+        return _StreamValue("complex", value=complex(real, imaginary))
 
     def _read_stream_string_scalar(
         self,
@@ -2981,8 +3037,10 @@ class FlaxMsgpackScanner(BaseScanner):
                 return _StreamValue("ExtType", value=msgpack.ExtType(code, data))
             return _StreamValue("ExtType", value=data)
 
-        if code == 1:
+        if code in {1, 3}:
             return self._consume_flax_ndarray_ext_scalar(cursor, length, location, result, summary, path=path)
+        if code == 2:
+            return self._consume_flax_native_complex_ext_scalar(cursor, length, location)
 
         if length > self.max_msgpack_decode_bytes:
             self._consume_large_binary_scalar(cursor, length, value_location, result, summary, state, path=path)

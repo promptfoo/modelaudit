@@ -39,6 +39,16 @@ def create_msgpack_file(path: Path, data: Any) -> None:
         f.write(msgpack.packb(data, use_bin_type=True))
 
 
+def _flax_ndarray_ext_value(
+    shape_values: list[int],
+    dtype: str,
+    payload: bytes,
+    *,
+    code: int = 1,
+) -> Any:
+    return msgpack.ExtType(code, msgpack.packb((shape_values, dtype, payload), use_bin_type=True))
+
+
 def _write_msgpack_str(output: Any, value: str) -> None:
     encoded = value.encode()
     if len(encoded) <= 31:
@@ -115,6 +125,7 @@ def _write_sparse_large_flax_ndarray_ext(
     path: Path,
     tensor_size: int,
     *,
+    code: int = 1,
     dtype: str = "float32",
     shape_values: list[int] | None = None,
     body_prefix: bytes = b"",
@@ -131,7 +142,7 @@ def _write_sparse_large_flax_ndarray_ext(
             _write_msgpack_str(output, "params")
             output.write(b"\x81")
             _write_msgpack_str(output, "embedding")
-        output.write(b"\xc9" + struct.pack(">I", ext_size) + b"\x01")
+        output.write(b"\xc9" + struct.pack(">I", ext_size) + bytes([code]))
         output.write(b"\x93")
         if len(shape_values) > 15:
             raise ValueError("test helper only supports fixarray shape metadata")
@@ -1667,6 +1678,87 @@ def test_flax_msgpack_flax_ndarray_ext_above_reduced_decode_budget_uses_ndarray_
     assert result.success is True
     assert "scan_outcome" not in result.metadata
     assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+
+
+def test_flax_msgpack_flax_scalar_ext_above_reduced_decode_budget_uses_ndarray_parser(tmp_path: Path) -> None:
+    path = tmp_path / "scalar_ext_above_reduced_budget.msgpack"
+    create_msgpack_file(
+        path,
+        {
+            "params": {
+                "embedding": _flax_ndarray_ext_value([1024], "float32", b"\0" * 4096),
+                "scale": _flax_ndarray_ext_value([], "float64", b"\0" * 8, code=3),
+            }
+        },
+    )
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["estimated_parameters"] == 1025
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_flax_native_complex_ext_above_reduced_decode_budget_is_structural(tmp_path: Path) -> None:
+    path = tmp_path / "native_complex_ext_above_reduced_budget.msgpack"
+    complex_body = msgpack.packb((1.0, -2.0), use_bin_type=True)
+    create_msgpack_file(
+        path,
+        {
+            "params": {
+                "embedding": _flax_ndarray_ext_value([1024], "float32", b"\0" * 4096),
+                "complex": msgpack.ExtType(2, complex_body),
+            }
+        },
+    )
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_malformed_native_complex_ext_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "malformed_native_complex_ext.msgpack"
+    malformed_body = msgpack.packb(("eval('x')", -2.0), use_bin_type=True)
+    create_msgpack_file(path, {"params": {"complex": msgpack.ExtType(2, malformed_body)}})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is False
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert "expected Flax complex numeric component" in parse_check.details["parse_error"]
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shape_values", "tensor_size", "expected_parameters"),
+    [
+        ("int8", [64], 64, 64),
+        ("float16", [32], 64, 32),
+        ("float64", [8], 64, 8),
+    ],
+)
+def test_flax_msgpack_streamed_ndarray_parameter_count_uses_dtype_item_size(
+    tmp_path: Path,
+    dtype: str,
+    shape_values: list[int],
+    tensor_size: int,
+    expected_parameters: int,
+) -> None:
+    path = tmp_path / f"{dtype}_ndarray_parameter_count.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size, dtype=dtype, shape_values=shape_values)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["estimated_parameters"] == expected_parameters
+    assert result.metadata["jax_metadata"]["parameter_count"] == expected_parameters
     assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
 
 
