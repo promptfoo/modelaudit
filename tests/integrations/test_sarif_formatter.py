@@ -742,7 +742,7 @@ class TestCreateArtifacts:
         assert "sha-256" in artifacts[0]["hashes"]
         assert "md5" in artifacts[0]["hashes"]
 
-    def test_artifact_omits_partial_sha256_prefix_hash(self):
+    def test_artifact_omits_partial_sha256_prefix_hash(self) -> None:
         """Partial prefix hashes must not be emitted as complete SARIF hashes."""
         result = create_initial_audit_result()
         result.assets = [AssetModel(path="/test/model.pt", type="pickle")]
