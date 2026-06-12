@@ -1362,7 +1362,7 @@ class ScanResultsCache:
                 continue
             current /= component
             component_stat = os.lstat(current)
-            if stat.S_ISLNK(component_stat.st_mode) or getattr(component_stat, "st_file_attributes", 0) & 0x400:
+            if stat.S_ISLNK(component_stat.st_mode) or (getattr(component_stat, "st_file_attributes", 0) or 0) & 0x400:
                 if ScanResultsCache._is_stable_platform_symlink_component(current):
                     continue
                 return True
