@@ -518,6 +518,29 @@ class TestSecretsDetector:
 
         assert _basic_auth_findings(findings) == []
 
+    @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
+    def test_basic_auth_yaml_header_value_list_detects_after_mapping_sibling(self, header_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"direct-mapping-sibling:pass")
+        text = f"{header_name}:\n  - metadata: placeholder\n  - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
+    def test_basic_auth_yaml_header_value_list_ignores_nested_metadata(self, header_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"nested-direct-metadata-list:pass")
+        text = f"{header_name}:\n  - metadata:\n      - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
     def test_basic_auth_yaml_header_object_value_list_ignores_nested_metadata(self) -> None:
         detector = SecretsDetector()
         token = _basic_auth_token(b"nested-metadata-list:pass")

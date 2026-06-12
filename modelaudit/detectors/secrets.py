@@ -844,11 +844,14 @@ class SecretsDetector:
         if not lines or not SecretsDetector._basic_auth_yaml_list_current_value_prefix(lines[-1]):
             return None
 
+        current_item_indent = SecretsDetector._basic_auth_line_indent(lines[-1])
         for line_index in range(len(lines) - 2, -1, -1):
             line = lines[line_index]
             if key_pattern.fullmatch(line) is not None:
                 return line_index
             if not SecretsDetector._basic_auth_yaml_list_item_has_value(line):
+                return None
+            if SecretsDetector._basic_auth_line_indent(line) != current_item_indent:
                 return None
         return None
 
