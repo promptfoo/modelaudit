@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import html
 import json
 import os
 import re
@@ -453,7 +454,9 @@ _BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
     "wget ",
 )
 _URL_PATH_NORMALIZATION_PASSES = 4
+_URL_DELIMITER_ENTITY_DECODE_PASSES = 2
 _PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
+_HTML_ENTITY_REFERENCE_PATTERN = re.compile(r"&(?:#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[A-Za-z][A-Za-z0-9]{1,31};)")
 _ENCODED_URL_SCHEME_LETTERS = (
     r"(?:h|%(?:25)*(?:48|68))",
     r"(?:t|%(?:25)*(?:54|74))",
@@ -472,11 +475,70 @@ def _url_path_has_unsafe_decoded_char(path: str) -> bool:
     return any(char == "\\" or ord(char) < 0x20 or ord(char) == 0x7F for char in path)
 
 
+def _html_unescape_with_entity_mask(value: str, entity_mask: bytearray) -> tuple[str, bytearray, bool]:
+    decoded_parts: list[str] = []
+    decoded_entity_mask = bytearray()
+    cursor = 0
+    changed = False
+
+    for match in _HTML_ENTITY_REFERENCE_PATTERN.finditer(value):
+        start, end = match.span()
+        decoded_parts.append(value[cursor:start])
+        decoded_entity_mask.extend(entity_mask[cursor:start])
+
+        raw_entity = match.group(0)
+        decoded_entity = html.unescape(raw_entity)
+        if decoded_entity != raw_entity:
+            decoded_parts.append(decoded_entity)
+            decoded_entity_mask.extend(b"\x01" * len(decoded_entity))
+            changed = True
+        else:
+            decoded_parts.append(raw_entity)
+            decoded_entity_mask.extend(entity_mask[start:end])
+
+        cursor = end
+
+    decoded_parts.append(value[cursor:])
+    decoded_entity_mask.extend(entity_mask[cursor:])
+    return "".join(decoded_parts), decoded_entity_mask, changed
+
+
+def _encoded_url_delimiter_match_has_encoded_component(
+    value: str,
+    match: re.Match[str],
+    *,
+    entity_mask: bytearray | None = None,
+) -> bool:
+    for group_name in ("scheme", "colon", "slash1", "slash2"):
+        start, end = match.span(group_name)
+        if "%" in value[start:end]:
+            return True
+        if entity_mask is not None and any(entity_mask[start:end]):
+            return True
+    return False
+
+
 def _value_has_encoded_url_delimiter(value: str) -> bool:
-    return any(
-        "%" in f"{match.group('scheme')}{match.group('colon')}{match.group('slash1')}{match.group('slash2')}"
+    if any(
+        _encoded_url_delimiter_match_has_encoded_component(value, match)
         for match in _ENCODED_URL_DELIMITER_PATTERN.finditer(value)
-    )
+    ):
+        return True
+    if "&" not in value:
+        return False
+
+    decoded_value = value
+    entity_mask = bytearray(len(value))
+    for _ in range(_URL_DELIMITER_ENTITY_DECODE_PASSES):
+        decoded_value, entity_mask, changed = _html_unescape_with_entity_mask(decoded_value, entity_mask)
+        if not changed:
+            return False
+        if any(
+            _encoded_url_delimiter_match_has_encoded_component(decoded_value, match, entity_mask=entity_mask)
+            for match in _ENCODED_URL_DELIMITER_PATTERN.finditer(decoded_value)
+        ):
+            return True
+    return False
 
 
 class SafeTensorsScanner(BaseScanner):
