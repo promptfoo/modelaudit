@@ -422,6 +422,7 @@ _BASE64_LICENSE_WRAP_MAX_LINES = 128
 _BASE64_LICENSE_WRAP_MAX_CHARS = 8192
 _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
 _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
+_BASE64_LICENSE_WRAP_METADATA_SCAN_MAX_LINES = _BASE64_LICENSE_WRAP_MAX_LINES * 2
 _BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS = 4
 _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO = 0.15
 _BASE64_LICENSE_WRAP_TRAILING_DOCUMENTARY_TOKENS = frozenset({"and", "or"})
@@ -454,9 +455,16 @@ _BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
     "wget ",
 )
 _URL_PATH_NORMALIZATION_PASSES = 4
-_URL_DELIMITER_ENTITY_DECODE_PASSES = 2
+_URL_DELIMITER_ENTITY_DECODE_PASSES = 4
 _PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
-_HTML_ENTITY_REFERENCE_PATTERN = re.compile(r"&(?:#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[A-Za-z][A-Za-z0-9]{1,31};)")
+_HTML_ENTITY_REFERENCE_SOURCE = r"&(?:#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[A-Za-z][A-Za-z0-9]{1,31};)"
+_HTML_ENTITY_REFERENCE_PATTERN = re.compile(_HTML_ENTITY_REFERENCE_SOURCE)
+_RESIDUAL_ENTITY_URL_DELIMITER_PATTERN = re.compile(
+    rf"https?(?:{_HTML_ENTITY_REFERENCE_SOURCE}|:)"
+    rf"(?:{_HTML_ENTITY_REFERENCE_SOURCE}|/|\\)"
+    rf"(?:{_HTML_ENTITY_REFERENCE_SOURCE}|/|\\)",
+    re.IGNORECASE,
+)
 _ENCODED_URL_SCHEME_LETTERS = (
     r"(?:h|%(?:25)*(?:48|68))",
     r"(?:t|%(?:25)*(?:54|74))",
@@ -538,7 +546,10 @@ def _value_has_encoded_url_delimiter(value: str) -> bool:
             for match in _ENCODED_URL_DELIMITER_PATTERN.finditer(decoded_value)
         ):
             return True
-    return False
+    return any(
+        _HTML_ENTITY_REFERENCE_PATTERN.search(match.group(0)) is not None
+        for match in _RESIDUAL_ENTITY_URL_DELIMITER_PATTERN.finditer(decoded_value)
+    )
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -736,16 +747,17 @@ class SafeTensorsScanner(BaseScanner):
         )
 
     @staticmethod
-    def _license_document_line_base64_fragments(line: str) -> list[str]:
+    def _license_document_line_base64_fragments(line: str) -> tuple[list[str], bool]:
         stripped = line.strip()
         if SafeTensorsScanner._license_document_line_is_wrapped_base64_fragment(stripped):
-            return [stripped]
+            return [stripped], False
 
         nonspace_len = sum(1 for char in stripped if not char.isspace())
         if nonspace_len == 0:
-            return []
+            return [], False
 
         fragments: list[str] = []
+        has_documentary_annotation = False
         token_matches = list(_BASE64_LICENSE_WRAP_TOKEN_PATTERN.finditer(stripped))
         for match in token_matches:
             token = match.group(0)
@@ -766,10 +778,11 @@ class SafeTensorsScanner(BaseScanner):
                 for annotation in annotations
             ):
                 continue
+            has_documentary_annotation = has_documentary_annotation or bool(annotations)
             if not token_decodes and SafeTensorsScanner._license_document_token_looks_documentary(token):
                 continue
             fragments.append(token)
-        return fragments
+        return fragments, has_documentary_annotation
 
     @staticmethod
     def _license_document_span_is_inside_url(line: str, start: int, end: int) -> bool:
@@ -878,34 +891,50 @@ class SafeTensorsScanner(BaseScanner):
         separator_lines = 0
         has_short_fragments = False
         has_non_documentary_short_fragment = False
+        has_documentary_annotations = False
+
+        def requires_active_pattern() -> bool:
+            return has_short_fragments or has_documentary_annotations
 
         def flush() -> bool:
             return total_chars >= _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS and cls._base64_candidate_decodes(
                 "".join(chunks),
-                require_active_pattern=has_short_fragments,
-                fail_on_invalid_padding=not has_short_fragments or has_non_documentary_short_fragment,
+                require_active_pattern=requires_active_pattern(),
+                fail_on_invalid_padding=not requires_active_pattern() or has_non_documentary_short_fragment,
             )
 
         def reset() -> None:
             nonlocal chunks, total_chars, total_lines, separator_lines, has_short_fragments
-            nonlocal has_non_documentary_short_fragment
+            nonlocal has_non_documentary_short_fragment, has_documentary_annotations
             chunks = []
             total_chars = 0
             total_lines = 0
             separator_lines = 0
             has_short_fragments = False
             has_non_documentary_short_fragment = False
+            has_documentary_annotations = False
 
         for line in [*lines, ""]:
-            fragments = cls._license_document_line_base64_fragments(line)
+            fragments, line_has_documentary_annotation = cls._license_document_line_base64_fragments(line)
             short_fragments = False
             if not fragments:
                 fragments = cls._license_document_line_short_base64_fragments(line)
                 short_fragments = bool(fragments)
             if fragments:
+                current_line_decodes_active = not short_fragments and cls._base64_candidate_decodes(
+                    "".join(fragments),
+                    require_active_pattern=True,
+                    fail_on_invalid_padding=False,
+                )
+                starts_distinct_payload = not line_has_documentary_annotation or current_line_decodes_active
+                if chunks and not short_fragments and starts_distinct_payload and requires_active_pattern():
+                    if flush():
+                        return True
+                    reset()
                 total_lines += 1
                 separator_lines = 0
                 has_short_fragments = has_short_fragments or short_fragments
+                has_documentary_annotations = has_documentary_annotations or line_has_documentary_annotation
                 if short_fragments:
                     has_non_documentary_short_fragment = has_non_documentary_short_fragment or any(
                         not cls._license_document_token_looks_documentary(fragment) for fragment in fragments
@@ -923,14 +952,14 @@ class SafeTensorsScanner(BaseScanner):
                 total_lines += 1
                 separator_lines += 1
                 if total_lines > _BASE64_LICENSE_WRAP_MAX_LINES:
-                    if flush() or chunks:
+                    if flush() or (chunks and not requires_active_pattern()):
                         return True
                     reset()
                     continue
                 if separator_lines > _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES:
                     if flush():
                         return True
-                    if has_short_fragments:
+                    if requires_active_pattern():
                         continue
                     if total_chars >= _BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS:
                         return True
@@ -946,9 +975,10 @@ class SafeTensorsScanner(BaseScanner):
 
     @classmethod
     def _metadata_value_has_wrapped_opaque_token(cls, value: str) -> bool:
-        if len(value) > 1000:
-            return False
-        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        scan_value = value[-_LICENSE_DOCUMENT_MAX_CHARS:]
+        lines = [line.strip() for line in scan_value.splitlines() if line.strip()]
+        if len(lines) > _BASE64_LICENSE_WRAP_METADATA_SCAN_MAX_LINES:
+            lines = lines[-_BASE64_LICENSE_WRAP_METADATA_SCAN_MAX_LINES:]
         return len(lines) > 1 and cls._license_document_has_wrapped_opaque_token(lines)
 
     @classmethod
