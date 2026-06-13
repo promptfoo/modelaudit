@@ -532,6 +532,56 @@ class TestFalsePositiveFixes:
             f"issues={result['issues']!r}; stdout={result['stdout']!r}; stderr={result['stderr']!r}"
         )
 
+    def test_real_cli_scan_survives_legacy_cp1252_output_encoding(self, tmp_path: Path) -> None:
+        """The production CLI should not crash on decorative text under cp1252 stdout."""
+        model_dir = tmp_path / "gpt2_model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "gpt2", "architectures": ["GPT2LMHeadModel"]}),
+            encoding="utf-8",
+        )
+        output_file = tmp_path / "report.json"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "\n".join(
+                    [
+                        "import runpy",
+                        "import sys",
+                        "if sys.platform == 'darwin':",
+                        "    import modelaudit.cli as cli",
+                        "    cli._darwin_fd_has_extended_acl = lambda _fd: False",
+                        "sys.argv = [",
+                        "    'modelaudit', 'scan', sys.argv[1],",
+                        "    '--format', 'json', '--output', sys.argv[2],",
+                        "]",
+                        "runpy.run_module('modelaudit', run_name='__main__')",
+                    ]
+                ),
+                str(model_dir),
+                str(output_file),
+            ],
+            check=False,
+            capture_output=True,
+            encoding="cp1252",
+            env={
+                **os.environ,
+                "PROMPTFOO_DISABLE_TELEMETRY": "1",
+                "NO_ANALYTICS": "1",
+                "PYTHONIOENCODING": "cp1252",
+            },
+        )
+
+        assert completed.returncode == 0, (
+            "CLI should tolerate legacy cp1252 redirected output; "
+            f"stdout={completed.stdout!r}; stderr={completed.stderr!r}"
+        )
+        assert "\\u2500" in completed.stdout
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        assert report.get("issues") == []
+        assert report.get("files_scanned", 0) >= 1
+
     def _run_cli_scan(self, path):
         """Helper method to run CLI scan and parse results."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -626,9 +676,7 @@ class TestFalsePositiveFixes:
                 ],
                 check=False,
                 capture_output=True,
-                text=True,
                 encoding="utf-8",
-                errors="replace",
                 env={
                     **os.environ,
                     "PROMPTFOO_DISABLE_TELEMETRY": "1",
