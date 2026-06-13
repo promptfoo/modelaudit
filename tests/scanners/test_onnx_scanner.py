@@ -2007,6 +2007,151 @@ def create_constant_of_shape_weight_model(
     return path
 
 
+def create_generated_zero_value_transform_model(
+    tmp_path: Path,
+    *,
+    op_type: str,
+    malicious: bool,
+) -> Path:
+    generated_shape = [100, 9] if op_type == "Pad" else [100, 1]
+    generated_name = "generated_weight" if op_type == "Pad" else "generated_column"
+    nodes = [
+        helper.make_node(
+            "ConstantOfShape",
+            ["generated_shape"],
+            [generated_name],
+            value=helper.make_tensor("fill", TensorProto.FLOAT, [1], [0.0]),
+        )
+    ]
+    initializers = [onnx.numpy_helper.from_array(np.asarray(generated_shape, dtype=np.int64), name="generated_shape")]
+    value_info = [helper.make_tensor_value_info(generated_name, TensorProto.FLOAT, generated_shape)]
+    if op_type == "Pad":
+        nodes.append(helper.make_node("Pad", [generated_name, "pads", "pad_value"], ["W"]))
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.asarray([0, 0, 0, 1], dtype=np.int64), name="pads"),
+                onnx.numpy_helper.from_array(
+                    np.asarray(100.0 if malicious else 0.0, dtype=np.float32),
+                    name="pad_value",
+                ),
+            ]
+        )
+    elif op_type == "Clip":
+        nodes.extend(
+            [
+                helper.make_node("Clip", [generated_name, "minimum"], ["generated_weight"]),
+                helper.make_node("Concat", ["generated_weight", "zero_columns"], ["W"], axis=1),
+            ]
+        )
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(
+                    np.asarray(100.0 if malicious else 0.0, dtype=np.float32),
+                    name="minimum",
+                ),
+                onnx.numpy_helper.from_array(np.zeros((100, 9), dtype=np.float32), name="zero_columns"),
+            ]
+        )
+        value_info.append(helper.make_tensor_value_info("generated_weight", TensorProto.FLOAT, [100, 1]))
+    else:  # pragma: no cover - test helper contract
+        raise ValueError(f"unsupported generated-value transform: {op_type}")
+    value_info.append(helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10]))
+    nodes.append(helper.make_node("MatMul", ["X", "W"], ["Y"]))
+    graph = helper.make_graph(
+        nodes,
+        f"generated_zero_{op_type.lower()}_weight",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=initializers,
+        value_info=value_info,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"generated-zero-{op_type.lower()}-{'malicious' if malicious else 'benign'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_generated_zero_adjacent_transform_model(
+    tmp_path: Path,
+    *,
+    op_type: str,
+    parameter: float | None = None,
+) -> Path:
+    nodes = [
+        helper.make_node(
+            "ConstantOfShape",
+            ["shape"],
+            ["generated_weight"],
+            value=helper.make_tensor("fill", TensorProto.FLOAT, [1], [0.0]),
+        )
+    ]
+    initializers = [onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="shape")]
+    if parameter is None:
+        nodes.append(helper.make_node(op_type, ["generated_weight"], ["W"]))
+    else:
+        nodes.append(helper.make_node(op_type, ["generated_weight", "parameter"], ["W"]))
+        initializers.append(onnx.numpy_helper.from_array(np.asarray(parameter, dtype=np.float32), name="parameter"))
+    nodes.append(helper.make_node("MatMul", ["X", "W"], ["Y"]))
+    graph = helper.make_graph(
+        nodes,
+        f"generated_zero_{op_type.lower()}_weight",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=initializers,
+        value_info=[
+            helper.make_tensor_value_info("generated_weight", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10]),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"generated-zero-{op_type.lower()}-{parameter}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_generated_value_parameter_model(tmp_path: Path) -> Path:
+    nodes = [
+        helper.make_node(
+            "ConstantOfShape",
+            ["scalar_shape"],
+            ["generated_zero"],
+            value=helper.make_tensor("fill", TensorProto.FLOAT, [1], [0.0]),
+        ),
+        helper.make_node("Clip", ["generated_zero", "minimum"], ["pad_value"]),
+        helper.make_node("Pad", ["dynamic_base", "pads", "pad_value"], ["W"]),
+        helper.make_node("MatMul", ["X", "W"], ["Y"]),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "generated_value_parameter_weight",
+        [
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100]),
+            helper.make_tensor_value_info("dynamic_base", TensorProto.FLOAT, [100, 9]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[
+            onnx.numpy_helper.from_array(np.asarray([1], dtype=np.int64), name="scalar_shape"),
+            onnx.numpy_helper.from_array(np.asarray(100.0, dtype=np.float32), name="minimum"),
+            onnx.numpy_helper.from_array(np.asarray([0, 0, 0, 1], dtype=np.int64), name="pads"),
+        ],
+        value_info=[
+            helper.make_tensor_value_info("generated_zero", TensorProto.FLOAT, [1]),
+            helper.make_tensor_value_info("pad_value", TensorProto.FLOAT, [1]),
+            helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10]),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "generated-value-parameter.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
 def create_registered_standard_weight_transform_model(
     tmp_path: Path,
     *,
@@ -8280,6 +8425,121 @@ class TestWeightDistributionSemantics:
             sample = semantics["unresolved_lineage_samples"][0]
             assert sample["initializer"] == "generated_weight"
             assert sample["reason"] == "generated_constant_of_shape_lineage"
+
+    @pytest.mark.parametrize("op_type", ["Pad", "Clip"])
+    def test_generated_zero_value_transform_fails_closed_when_parameter_introduces_weights(
+        self,
+        tmp_path: Path,
+        op_type: str,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(create_generated_zero_value_transform_model(tmp_path, op_type=op_type, malicious=True))
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] >= 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"].get("unresolved_initializer_lineage", 0) >= 1
+        assert "generated_value_lineage_unproven" in {
+            sample["reason"] for sample in semantics["unresolved_lineage_samples"]
+        }
+        materialized_weights = np.zeros((100, 10), dtype=np.float32)
+        materialized_weights[:, 9 if op_type == "Pad" else 0] = 100.0
+        materialized = OnnxScanner().scan(
+            str(
+                create_onnx_weight_model(
+                    tmp_path,
+                    materialized_weights,
+                    op_type="MatMul",
+                    filename=f"materialized-{op_type.lower()}-weight.onnx",
+                )
+            )
+        )
+        anomaly_checks = [
+            check
+            for check in materialized.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert len(anomaly_checks) == 1
+        assert anomaly_checks[0].details["outlier_neurons"] == [9 if op_type == "Pad" else 0]
+
+    @pytest.mark.parametrize("op_type", ["Pad", "Clip"])
+    def test_generated_zero_value_transform_stays_clean_when_output_is_proven_zero(
+        self,
+        tmp_path: Path,
+        op_type: str,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(create_generated_zero_value_transform_model(tmp_path, op_type=op_type, malicious=False))
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is True
+        assert semantics["eligible_initializer_count"] == 0
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize(
+        ("op_type", "parameter", "expected_success"),
+        [
+            pytest.param("Abs", None, True, id="zero-preserving-unary"),
+            pytest.param("Add", 0.0, True, id="zero-preserving-binary"),
+            pytest.param("Add", 100.0, False, id="constant-injecting-binary"),
+            pytest.param("Exp", None, False, id="zero-changing-unary"),
+        ],
+    )
+    def test_generated_zero_value_proof_is_compositional_across_adjacent_operators(
+        self,
+        tmp_path: Path,
+        op_type: str,
+        parameter: float | None,
+        expected_success: bool,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(create_generated_zero_adjacent_transform_model(tmp_path, op_type=op_type, parameter=parameter))
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is expected_success
+        assert semantics["analyzed_initializer_count"] == 0
+        if expected_success:
+            assert semantics["eligible_initializer_count"] == 0
+            assert semantics["coverage_gaps"] == {}
+        else:
+            assert semantics["eligible_initializer_count"] >= 1
+            assert semantics["coverage_gaps"].get("unresolved_initializer_lineage", 0) >= 1
+            assert "generated_value_lineage_unproven" in {
+                sample["reason"] for sample in semantics["unresolved_lineage_samples"]
+            }
+
+    def test_generated_zero_value_proof_depth_exhaustion_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("modelaudit.scanners.onnx_scanner._ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT", 0)
+
+        result = OnnxScanner().scan(str(create_generated_zero_adjacent_transform_model(tmp_path, op_type="Abs")))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "generated_value_proof_depth_limit"
+
+    def test_generated_value_parameter_lineage_remains_compositional(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(create_generated_value_parameter_model(tmp_path)))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        sample = semantics["unresolved_lineage_samples"][0]
+        assert sample["initializer"] == "generated_zero"
+        assert sample["reason"] == "generated_value_lineage_unproven"
 
     def test_matmul_integer_non_unit_add_scale_chain_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_scale_chain_model(tmp_path, duplicate_add_input=True)

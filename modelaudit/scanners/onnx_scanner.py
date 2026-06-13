@@ -131,6 +131,7 @@ _ONNX_WEIGHT_RETAINED_ARRAY_BUDGET_MULTIPLIER = 8
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
 _ONNX_WEIGHT_METADATA_TEXT_LIMIT = 256
 _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT = 64
+_ONNX_GENERATED_VALUE_PROOF_MAX_BYTES = 1024 * 1024
 _ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT = 5
 _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT = 20
 _ONNX_CUSTOM_OPERATOR_TEXT_LIMIT = 256
@@ -268,6 +269,52 @@ _STANDARD_DATA_LINEAGE_INPUT_INDEXES: dict[str, frozenset[int]] = {
     "TopK": frozenset({0}),
     "Where": frozenset({1, 2}),
 }
+_STANDARD_VALUE_LINEAGE_INPUT_INDEXES: dict[str, frozenset[int]] = {
+    "Clip": frozenset({0, 1, 2}),
+    "Pad": frozenset({0, 2}),
+    "Where": frozenset({1, 2}),
+}
+_ZERO_PRESERVING_DATA_OPERATORS: frozenset[str] = frozenset(
+    {
+        "Abs",
+        "Cast",
+        "Ceil",
+        "Compress",
+        "Expand",
+        "Flatten",
+        "Gather",
+        "GatherElements",
+        "GatherND",
+        "Identity",
+        "Neg",
+        "Relu",
+        "Reshape",
+        "Round",
+        "Sign",
+        "Sin",
+        "Sinh",
+        "Slice",
+        "Split",
+        "Sqrt",
+        "Squeeze",
+        "Tan",
+        "Tanh",
+        "Tile",
+        "Transpose",
+        "Unsqueeze",
+    }
+)
+_ALL_ZERO_INPUTS_PRESERVE_ZERO_OPERATORS: frozenset[str] = frozenset(
+    {
+        "Add",
+        "Concat",
+        "Max",
+        "Mean",
+        "Min",
+        "Sub",
+        "Sum",
+    }
+)
 
 
 def resolve_onnx_raw_detector_max_bytes(config: dict[str, Any] | None = None) -> int:
@@ -1066,6 +1113,9 @@ class _OnnxWeightLineage:
     transforms: tuple[_OnnxWeightTransform, ...] = ()
     unresolved_reason: str | None = None
     quantization: _OnnxWeightQuantization | None = None
+    generated_value: bool = False
+    zero_value_proven: bool = False
+    zero_proof_depth: int = 0
 
 
 @dataclass
@@ -2290,7 +2340,136 @@ def _build_onnx_weight_analysis_plan(
                 transforms=existing.transforms,
                 unresolved_reason=unresolved_reason,
                 quantization=existing.quantization if existing.quantization == lineage.quantization else None,
+                generated_value=existing.generated_value or lineage.generated_value,
+                zero_value_proven=False,
+                zero_proof_depth=max(existing.zero_proof_depth, lineage.zero_proof_depth),
             )
+
+    def bounded_constant_array(tensor: Any) -> Any | None:
+        try:
+            if _onnx_tensor_uses_external_storage(tensor, onnx=onnx):
+                return None
+            estimated_bytes = _onnx_tensor_expected_storage_nbytes(tensor, onnx=onnx)
+            proof_limit = _ONNX_GENERATED_VALUE_PROOF_MAX_BYTES
+            if max_array_size is not None and max_array_size > 0:
+                proof_limit = min(proof_limit, max_array_size)
+            if estimated_bytes < 0 or estimated_bytes > proof_limit:
+                return None
+            array = onnx.numpy_helper.to_array(tensor)
+            if int(array.nbytes) > proof_limit:
+                return None
+            return array
+        except Exception:
+            return None
+
+    def constant_is_all_zero(tensor: Any) -> bool:
+        array = bounded_constant_array(tensor)
+        if array is None:
+            return False
+        try:
+            return bool(np.all(np.equal(array, 0)))
+        except (TypeError, ValueError):
+            return False
+
+    def constant_scalar_number(tensor: Any) -> float | None:
+        array = bounded_constant_array(tensor)
+        if array is None or int(array.size) != 1:
+            return None
+        try:
+            return float(array.reshape(-1)[0])
+        except (OverflowError, TypeError, ValueError):
+            return None
+
+    def value_is_proven_zero(
+        name: str,
+        value_lineages: dict[str, dict[int, _OnnxWeightLineage]],
+        constants: dict[str, Any],
+    ) -> bool:
+        lineages = value_lineages.get(name, {})
+        if lineages and all(
+            lineage.zero_value_proven and lineage.unresolved_reason is None for lineage in lineages.values()
+        ):
+            return True
+        constant = constants.get(name)
+        return constant is not None and constant_is_all_zero(constant)
+
+    def standard_node_output_is_proven_zero(
+        node: Any,
+        value_lineages: dict[str, dict[int, _OnnxWeightLineage]],
+        constants: dict[str, Any],
+        *,
+        is_model_local_function: bool,
+        is_registered_standard_operator: bool,
+    ) -> bool:
+        if (
+            is_model_local_function
+            or not is_registered_standard_operator
+            or getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
+            or any(getattr(attribute, "ref_attr_name", "") for attribute in getattr(node, "attribute", ()))
+        ):
+            return False
+
+        input_names = [str(input_name) for input_name in node.input]
+
+        def input_is_zero(input_index: int) -> bool:
+            return (
+                input_index < len(input_names)
+                and bool(input_names[input_index])
+                and value_is_proven_zero(input_names[input_index], value_lineages, constants)
+            )
+
+        def input_scalar_number(input_index: int) -> float | None:
+            if input_index >= len(input_names) or not input_names[input_index]:
+                return None
+            name = input_names[input_index]
+            lineages = value_lineages.get(name, {})
+            if lineages and all(
+                lineage.zero_value_proven
+                and lineage.unresolved_reason is None
+                and lineage.shape is not None
+                and math.prod(lineage.shape) == 1
+                for lineage in lineages.values()
+            ):
+                return 0.0
+            tensor = constants.get(name)
+            return constant_scalar_number(tensor) if tensor is not None else None
+
+        if node.op_type in _ZERO_PRESERVING_DATA_OPERATORS:
+            data_indexes = _STANDARD_DATA_LINEAGE_INPUT_INDEXES.get(node.op_type, frozenset({0}))
+            return bool(data_indexes) and all(input_is_zero(input_index) for input_index in data_indexes)
+        if node.op_type in _ALL_ZERO_INPUTS_PRESERVE_ZERO_OPERATORS:
+            populated_indexes = [index for index, name in enumerate(input_names) if name]
+            return bool(populated_indexes) and all(input_is_zero(input_index) for input_index in populated_indexes)
+        if node.op_type == "Where":
+            return input_is_zero(1) and input_is_zero(2)
+        if node.op_type == "Pad":
+            if not input_is_zero(0):
+                return False
+            mode_attributes = [attribute for attribute in node.attribute if attribute.name == "mode"]
+            if len(mode_attributes) > 1:
+                return False
+            mode = "constant" if not mode_attributes else _onnx_text_attribute(node, "mode")
+            if mode in {"edge", "reflect", "wrap"}:
+                return True
+            if mode != "constant":
+                return False
+            return len(input_names) <= 2 or not input_names[2] or input_is_zero(2)
+        if node.op_type == "Clip":
+            if not input_is_zero(0):
+                return False
+            minimum = None
+            maximum = None
+            if len(input_names) > 1 and input_names[1] and (minimum := input_scalar_number(1)) is None:
+                return False
+            if len(input_names) > 2 and input_names[2] and (maximum := input_scalar_number(2)) is None:
+                return False
+            for attribute in node.attribute:
+                if attribute.name == "min":
+                    minimum = float(attribute.f)
+                elif attribute.name == "max":
+                    maximum = float(attribute.f)
+            return (minimum is None or minimum <= 0) and (maximum is None or maximum >= 0)
+        return False
 
     def has_registered_standard_operator(node: Any, opset_versions: dict[str, int]) -> bool:
         domain = str(getattr(node, "domain", "") or "")
@@ -2552,10 +2731,23 @@ def _build_onnx_weight_analysis_plan(
                     and node.op_type in _STANDARD_DATA_LINEAGE_INPUT_INDEXES
                     and input_index not in _STANDARD_DATA_LINEAGE_INPUT_INDEXES[node.op_type]
                 )
-                if not is_array_feature_selector and not is_non_data_standard_input:
+                generated_value_parameter_lineages = (
+                    {
+                        initializer_index: lineage
+                        for initializer_index, lineage in input_lineages.items()
+                        if lineage.generated_value
+                    }
+                    if is_non_data_standard_input
+                    and input_index in _STANDARD_VALUE_LINEAGE_INPUT_INDEXES.get(node.op_type, frozenset())
+                    else {}
+                )
+                propagated_input_lineages = (
+                    generated_value_parameter_lineages if is_non_data_standard_input else input_lineages
+                )
+                if not is_array_feature_selector and propagated_input_lineages:
                     merge_lineages(
                         all_input_lineages,
-                        input_lineages,
+                        propagated_input_lineages,
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
                 for initializer_index, lineage in input_lineages.items():
@@ -2568,13 +2760,9 @@ def _build_onnx_weight_analysis_plan(
                     )
                     if invalid_clip_bound:
                         record_unresolved_lineage(
-                            _OnnxWeightLineage(
-                                initializer_index=initializer_index,
-                                shape=lineage.shape,
-                                data_type=lineage.data_type,
-                                transforms=lineage.transforms,
+                            replace(
+                                lineage,
                                 unresolved_reason="invalid_clip_bound_shape",
-                                quantization=lineage.quantization,
                             ),
                             node,
                             current_node_index,
@@ -2592,6 +2780,9 @@ def _build_onnx_weight_analysis_plan(
                         terminal_weight_lineages.add(initializer_index)
                     terminal_consumer_counts[initializer_index] += 1
                     total_consumer_count += 1
+                    if potential_weight_input and lineage.zero_value_proven and lineage.unresolved_reason is None:
+                        record_exclusion(initializer_index, "proven_zero_compositional_weight", node, input_index)
+                        continue
                     if lineage.unresolved_reason is not None:
                         opposite_resolved_weight = any(
                             resolved_index != input_index for resolved_index in resolved_weight_input_indexes
@@ -2619,13 +2810,10 @@ def _build_onnx_weight_analysis_plan(
                     if has_referenced_attributes and not (supported_transform and input_index == 0):
                         if potential_weight_input:
                             record_unresolved_lineage(
-                                _OnnxWeightLineage(
-                                    initializer_index=initializer_index,
+                                replace(
+                                    lineage,
                                     shape=None,
-                                    data_type=lineage.data_type,
-                                    transforms=lineage.transforms,
                                     unresolved_reason="referenced_function_attribute",
-                                    quantization=lineage.quantization,
                                 ),
                                 node,
                                 current_node_index,
@@ -2643,13 +2831,10 @@ def _build_onnx_weight_analysis_plan(
                     if output_axes is None:
                         if reason != "non_weight_input" and potential_weight_input:
                             record_unresolved_lineage(
-                                _OnnxWeightLineage(
-                                    initializer_index=initializer_index,
+                                replace(
+                                    lineage,
                                     shape=None,
-                                    data_type=lineage.data_type,
-                                    transforms=lineage.transforms,
                                     unresolved_reason="unsupported_weight_consumer",
-                                    quantization=lineage.quantization,
                                 ),
                                 node,
                                 current_node_index,
@@ -2672,13 +2857,9 @@ def _build_onnx_weight_analysis_plan(
                     )
                     if quantization_gap is not None:
                         record_unresolved_lineage(
-                            _OnnxWeightLineage(
-                                initializer_index=initializer_index,
-                                shape=lineage.shape,
-                                data_type=lineage.data_type,
-                                transforms=lineage.transforms,
+                            replace(
+                                lineage,
                                 unresolved_reason=quantization_gap,
-                                quantization=lineage.quantization,
                             ),
                             node,
                             current_node_index,
@@ -2772,15 +2953,12 @@ def _build_onnx_weight_analysis_plan(
             if function is not None and function_depth >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
                 plan.record_coverage_gap("function_call_depth_limit")
                 for input_index, input_name in enumerate(node.input):
-                    for initializer_index, lineage in value_lineages.get(str(input_name), {}).items():
+                    for lineage in value_lineages.get(str(input_name), {}).values():
                         record_unresolved_lineage(
-                            _OnnxWeightLineage(
-                                initializer_index=initializer_index,
+                            replace(
+                                lineage,
                                 shape=None,
-                                data_type=lineage.data_type,
-                                transforms=lineage.transforms,
                                 unresolved_reason="function_call_depth_limit",
-                                quantization=lineage.quantization,
                             ),
                             node,
                             current_node_index,
@@ -2962,11 +3140,13 @@ def _build_onnx_weight_analysis_plan(
             ):
                 value_attributes = [attribute for attribute in node.attribute if attribute.name == "value"]
                 fill_is_zero = not value_attributes
+                generated_data_type = int(onnx.TensorProto.FLOAT)
                 if len(value_attributes) == 1:
                     resolved_value = resolve_attribute(value_attributes[0])
                     if resolved_value is not None:
                         try:
                             fill_tensor = resolved_value.t
+                            generated_data_type = int(fill_tensor.data_type)
                             fill_is_zero = (
                                 resolved_value.HasField("t")
                                 and math.prod(int(dimension) for dimension in fill_tensor.dims) == 1
@@ -2977,27 +3157,77 @@ def _build_onnx_weight_analysis_plan(
                             )
                         except Exception:
                             fill_is_zero = False
-                if not fill_is_zero:
-                    output_names = [str(output_name) for output_name in node.output if output_name]
-                    generated_tensor = onnx.TensorProto()
-                    generated_tensor.name = output_names[0] if output_names else "ConstantOfShape"
-                    generated_tensor.data_type = int(onnx.TensorProto.FLOAT)
-                    registered_lineage = register_initializer(
-                        generated_tensor,
-                        current_graph_index,
-                        source_key=(*source_scope, "node", local_node_index, "constant_of_shape"),
+                output_names = [str(output_name) for output_name in node.output if output_name]
+                generated_tensor = onnx.TensorProto()
+                generated_tensor.name = output_names[0] if output_names else "ConstantOfShape"
+                generated_tensor.data_type = generated_data_type
+                registered_lineage = register_initializer(
+                    generated_tensor,
+                    current_graph_index,
+                    source_key=(*source_scope, "node", local_node_index, "constant_of_shape"),
+                )
+                declared_shapes = {known_value_shapes.get(output_name) for output_name in output_names}
+                generated_shape = (
+                    next(iter(declared_shapes)) if len(declared_shapes) == 1 and None not in declared_shapes else None
+                )
+                output_lineages[registered_lineage.initializer_index] = replace(
+                    registered_lineage,
+                    shape=generated_shape,
+                    data_type=generated_data_type if fill_is_zero else None,
+                    unresolved_reason=None if fill_is_zero else "generated_constant_of_shape_lineage",
+                    generated_value=True,
+                    zero_value_proven=fill_is_zero,
+                )
+
+            zero_source_indexes = {
+                initializer_index
+                for input_name in node.input
+                for initializer_index, lineage in value_lineages.get(str(input_name), {}).items()
+                if lineage.zero_value_proven and lineage.unresolved_reason is None
+            }
+            zero_output_proven = standard_node_output_is_proven_zero(
+                node,
+                value_lineages,
+                constants,
+                is_model_local_function=is_model_local_function,
+                is_registered_standard_operator=is_registered_standard_operator,
+            )
+            if zero_output_proven and zero_source_indexes:
+                generic_zero_safe_reasons = {
+                    None,
+                    "dtype_changing_cast_lineage",
+                    "dynamic_input_lineage",
+                    "unsupported_lineage_operator",
+                }
+                for initializer_index, lineage in tuple(output_lineages.items()):
+                    if initializer_index not in zero_source_indexes:
+                        output_lineages.pop(initializer_index)
+                        continue
+                    if lineage.unresolved_reason not in generic_zero_safe_reasons:
+                        continue
+                    if lineage.zero_proof_depth >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+                        output_lineages[initializer_index] = replace(
+                            lineage,
+                            zero_value_proven=False,
+                            unresolved_reason="generated_value_proof_depth_limit",
+                        )
+                        continue
+                    output_lineages[initializer_index] = replace(
+                        lineage,
+                        unresolved_reason=None,
+                        zero_value_proven=True,
+                        zero_proof_depth=lineage.zero_proof_depth + 1,
                     )
-                    declared_shapes = {known_value_shapes.get(output_name) for output_name in output_names}
-                    generated_shape = (
-                        next(iter(declared_shapes))
-                        if len(declared_shapes) == 1 and None not in declared_shapes
-                        else None
-                    )
-                    output_lineages[registered_lineage.initializer_index] = replace(
-                        registered_lineage,
-                        shape=generated_shape,
-                        data_type=None,
-                        unresolved_reason="generated_constant_of_shape_lineage",
+            elif zero_source_indexes:
+                for initializer_index in zero_source_indexes & output_lineages.keys():
+                    lineage = output_lineages[initializer_index]
+                    unresolved_reason = lineage.unresolved_reason
+                    if unresolved_reason in {None, "dynamic_input_lineage", "unsupported_lineage_operator"}:
+                        unresolved_reason = "generated_value_lineage_unproven"
+                    output_lineages[initializer_index] = replace(
+                        lineage,
+                        zero_value_proven=False,
+                        unresolved_reason=unresolved_reason,
                     )
 
             output_lineages = bounded_lineages(output_lineages)
@@ -3134,13 +3364,12 @@ def _build_onnx_weight_analysis_plan(
                 )
                 if subgraph_output_dynamic[output_index] and per_output_lineages:
                     per_output_lineages = {
-                        initializer_index: _OnnxWeightLineage(
-                            initializer_index=initializer_index,
+                        initializer_index: replace(
+                            lineage,
                             shape=None,
                             data_type=None,
-                            transforms=lineage.transforms,
                             unresolved_reason=lineage.unresolved_reason or "dynamic_subgraph_output_lineage",
-                            quantization=lineage.quantization,
+                            zero_value_proven=False,
                         )
                         for initializer_index, lineage in per_output_lineages.items()
                     }
