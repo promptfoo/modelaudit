@@ -1972,19 +1972,25 @@ def _build_onnx_weight_analysis_plan(
                     unresolved_reason=lineage.unresolved_reason or "blocked_dequantize_lineage_unsupported",
                     quantization=lineage.quantization,
                 )
-            axis = _onnx_int_attribute(node, "axis", 1)
-            axis = axis if axis >= 0 else len(lineage.shape) + axis
-            if lineage.shape and (axis < 0 or axis >= len(lineage.shape)):
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
-                    shape=lineage.shape,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
-                    unresolved_reason=lineage.unresolved_reason or "invalid_dequantize_axis",
-                    quantization=lineage.quantization,
-                )
+            scale_is_scalar = math.prod(int(dimension) for dimension in constants[scale_name].dims) == 1
+            zero_point_is_scalar = zero_point_name is None or (
+                math.prod(int(dimension) for dimension in constants[zero_point_name].dims) == 1
+            )
+            axis: int | None = None
+            if not (scale_is_scalar and zero_point_is_scalar):
+                axis = _onnx_int_attribute(node, "axis", 1)
+                axis = axis if axis >= 0 else len(lineage.shape) + axis
+                if axis < 0 or axis >= len(lineage.shape):
+                    return _OnnxWeightLineage(
+                        initializer_index=lineage.initializer_index,
+                        shape=lineage.shape,
+                        data_type=lineage.data_type,
+                        transforms=lineage.transforms,
+                        unresolved_reason=lineage.unresolved_reason or "invalid_dequantize_axis",
+                        quantization=lineage.quantization,
+                    )
             output_shape = lineage.shape
-            transform = _OnnxWeightTransform("DequantizeLinear", (axis,))
+            transform = _OnnxWeightTransform("DequantizeLinear", () if axis is None else (axis,))
             output_data_type = _onnx_int_attribute(node, "output_dtype", 0) or int(constants[scale_name].data_type)
             if output_data_type not in floating_types:
                 return _OnnxWeightLineage(

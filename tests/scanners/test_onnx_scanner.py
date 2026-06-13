@@ -1404,11 +1404,13 @@ def create_qdq_weight_model(
     malicious: bool = False,
     malformed_scale: bool = False,
     full_shape_parameters: bool = False,
+    reshape_after_dequantization: bool = False,
 ) -> Path:
     weights = np.zeros((100, 10), dtype=np.int8)
     if malicious:
         weights[50:55, 3] = 100
-    quantized_weight = onnx.numpy_helper.from_array(weights, name="W")
+    serialized_weights = weights.reshape((-1,)) if reshape_after_dequantization else weights
+    quantized_weight = onnx.numpy_helper.from_array(serialized_weights, name="W")
     if full_shape_parameters:
         scale_value = np.ones(weights.shape, dtype=np.float32)
         zero_point_value = weights.copy()
@@ -1419,11 +1421,14 @@ def create_qdq_weight_model(
     zero_point = onnx.numpy_helper.from_array(zero_point_value, name="zero_point")
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
-    nodes = [
-        helper.make_node("DequantizeLinear", ["W", "scale", "zero_point"], ["dequantized_weight"]),
-        helper.make_node("MatMul", ["X", "dequantized_weight"], ["Y"]),
-    ]
-    graph = helper.make_graph(nodes, "qdq_weight_graph", [X], [Y], initializer=[quantized_weight, scale, zero_point])
+    dequantized_output = "dequantized_flat" if reshape_after_dequantization else "dequantized_weight"
+    nodes = [helper.make_node("DequantizeLinear", ["W", "scale", "zero_point"], [dequantized_output])]
+    initializers = [quantized_weight, scale, zero_point]
+    if reshape_after_dequantization:
+        initializers.append(onnx.numpy_helper.from_array(np.asarray(weights.shape, dtype=np.int64), name="shape"))
+        nodes.append(helper.make_node("Reshape", [dequantized_output, "shape"], ["dequantized_weight"]))
+    nodes.append(helper.make_node("MatMul", ["X", "dequantized_weight"], ["Y"]))
+    graph = helper.make_graph(nodes, "qdq_weight_graph", [X], [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     if not (malformed_scale or full_shape_parameters):
@@ -1437,7 +1442,7 @@ def create_qdq_weight_model(
         if malicious
         else "clean"
     )
-    path = tmp_path / f"qdq-weight-{suffix}.onnx"
+    path = tmp_path / f"qdq-weight-{suffix}{'-reshape' if reshape_after_dequantization else ''}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -7372,6 +7377,25 @@ class TestWeightDistributionSemantics:
         if malicious:
             assert checks[0].details["affected_neurons"] == [3]
             assert checks[0].details["lineage"] == ["DequantizeLinear"]
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_scalar_qdq_flat_weight_is_analyzed_before_reshape(self, tmp_path: Path, malicious: bool) -> None:
+        model_path = create_qdq_weight_model(
+            tmp_path,
+            malicious=malicious,
+            reshape_after_dequantization=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["eligible"][0]["lineage"] == ["DequantizeLinear", "Reshape"]
+        assert semantics["eligible"][0]["quantization_axis"] is None
 
     @pytest.mark.parametrize("weight_on_left", [False, True])
     @pytest.mark.parametrize("malicious", [False, True])
