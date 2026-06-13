@@ -2774,6 +2774,27 @@ def test_pytorch_zip_discovery_scans_referenced_storage_blob_when_it_is_a_pickle
     )
 
 
+def test_pytorch_zip_discovery_scans_size_mismatched_storage_blob_on_hidden_pickle_path(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_size_mismatched_storage_payload.pt"
+    hidden_payload = b"S'" + (b"A" * 5000) + b"'\n" + b"cposix\nsystem\n(S'echo hidden'\ntR."
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", hidden_payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["pickle_files"] == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_scans_referenced_storage_blob_with_truncated_frame(
     tmp_path: Path,
 ) -> None:
@@ -9588,7 +9609,7 @@ def test_pytorch_zip_scanner_preserves_legacy_pickle_rule_codes_for_embedded_mem
 
 
 def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path: Path) -> None:
-    payload = _pytorch_storage_persistent_id_payload("0")
+    payload = _pytorch_storage_persistent_id_payload("0", size_opcode=b"K\x02")
     model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id.pt", with_pickle=False, prefix="archive")
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("archive/data.pkl", payload)
@@ -9857,7 +9878,7 @@ def test_pytorch_zip_scanner_does_not_trust_noncanonical_protocol0_storage_persi
 
 
 def test_pytorch_zip_scanner_trusts_storage_persistent_ids_with_utf8_byte_key(tmp_path: Path) -> None:
-    payload = _pytorch_storage_persistent_id_payload(b"0")
+    payload = _pytorch_storage_persistent_id_payload(b"0", size_opcode=b"K\x02")
     model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_bytes.pt", with_pickle=False)
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("version", "3")
@@ -9950,7 +9971,7 @@ def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_unrelate
 
 
 def test_pytorch_zip_scanner_scopes_storage_persistent_id_trust_by_prefix(tmp_path: Path) -> None:
-    payload = _pytorch_storage_persistent_id_payload("0")
+    payload = _pytorch_storage_persistent_id_payload("0", size_opcode=b"K\x02")
     model_path = tmp_path / "mixed_storage_persistent_id.pt"
     with zipfile.ZipFile(model_path, "w") as zipf:
         zipf.writestr("good/version", "3")

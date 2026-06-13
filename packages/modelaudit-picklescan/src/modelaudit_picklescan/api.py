@@ -383,6 +383,13 @@ class _PytorchZipDataPickleTrust:
     canonical_tensor_rebuild_invocations: frozenset[tuple[int, int]]
 
 
+@dataclass(frozen=True)
+class _PytorchZipStorageEntries:
+    trusted_entry_ids: set[int]
+    storage_probe_entry_ids: set[int]
+    trusted_data_pkl_by_name: dict[str, _PytorchZipDataPickleTrust]
+
+
 _ABSTRACT_MARK = object()
 _ABSTRACT_UNKNOWN = object()
 
@@ -886,7 +893,7 @@ def _discover_pytorch_zip_pickle_entries(
         if _is_data_pickle_member(lowered) or lowered.endswith(_PICKLE_MEMBER_SUFFIXES):
             add_entry(entry)
 
-    trusted_storage_entry_ids, trusted_data_pkl_by_name, storage_notices = _validated_pytorch_storage_entry_ids(
+    storage_entries, storage_notices = _validated_pytorch_storage_entry_ids(
         archive,
         entries,
         source=source,
@@ -905,12 +912,21 @@ def _discover_pytorch_zip_pickle_entries(
     for candidate_index, entry in enumerate(candidates):
         _check_pytorch_zip_deadline(deadline)
         try:
-            if id(entry) in trusted_storage_entry_ids:
+            entry_id = id(entry)
+            if entry_id in storage_entries.trusted_entry_ids:
                 looks_like_pickle = _trusted_storage_zip_entry_looks_like_pickle(
                     archive,
                     entry,
                     probe_bytes_remaining,
                     deadline,
+                )
+            elif entry_id in storage_entries.storage_probe_entry_ids:
+                looks_like_pickle = _trusted_storage_zip_entry_looks_like_pickle(
+                    archive,
+                    entry,
+                    probe_bytes_remaining,
+                    deadline,
+                    max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
                 )
             else:
                 looks_like_pickle = _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining, deadline)
@@ -930,7 +946,7 @@ def _discover_pytorch_zip_pickle_entries(
         except Exception as error:
             notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
 
-    return pickle_entries, tuple(notices), trusted_data_pkl_by_name
+    return pickle_entries, tuple(notices), storage_entries.trusted_data_pkl_by_name
 
 
 def _validated_pytorch_storage_entry_ids(
@@ -940,7 +956,7 @@ def _validated_pytorch_storage_entry_ids(
     source: str,
     options: ScanOptions,
     deadline: float,
-) -> tuple[set[int], dict[str, _PytorchZipDataPickleTrust], tuple[Notice, ...]]:
+) -> tuple[_PytorchZipStorageEntries, tuple[Notice, ...]]:
     members = [
         (entry.filename, entry)
         for entry in entries
@@ -951,6 +967,7 @@ def _validated_pytorch_storage_entry_ids(
         entries_by_name.setdefault(name, []).append(entry)
 
     trusted_entry_ids: set[int] = set()
+    storage_probe_entry_ids: set[int] = set()
     trusted_data_pkl_by_name: dict[str, _PytorchZipDataPickleTrust] = {}
     notices: list[Notice] = []
     storage_reference_bytes_read = 0
@@ -1088,17 +1105,31 @@ def _validated_pytorch_storage_entry_ids(
                     },
                 )
             )
-        if trusted_storage_keys and not missing_storage_keys and reference_parse.all_persistent_ids_are_pytorch_storage:
+        validated_storage_keys = trusted_storage_keys - storage_size_mismatch_keys
+        exact_trusted_storage_keys = (
+            validated_storage_keys if reference_parse.all_persistent_ids_are_pytorch_storage else set()
+        )
+        storage_probe_keys = trusted_storage_keys - exact_trusted_storage_keys
+        if exact_trusted_storage_keys and not missing_storage_keys:
             trusted_data_pkl_by_name[data_pkl_name] = _PytorchZipDataPickleTrust(
-                storage_keys=trusted_storage_keys,
+                storage_keys=exact_trusted_storage_keys,
                 canonical_tensor_rebuild_invocations=frozenset(
                     reference_parse.canonical_tensor_rebuild_invocations if not storage_size_mismatch_keys else set()
                 ),
             )
-        for storage_key in trusted_storage_keys:
+        for storage_key in exact_trusted_storage_keys:
             trusted_entry_ids.add(id(storage_entries_by_key[storage_key]))
+        for storage_key in storage_probe_keys:
+            storage_probe_entry_ids.add(id(storage_entries_by_key[storage_key]))
 
-    return trusted_entry_ids, trusted_data_pkl_by_name, tuple(notices)
+    return (
+        _PytorchZipStorageEntries(
+            trusted_entry_ids=trusted_entry_ids,
+            storage_probe_entry_ids=storage_probe_entry_ids,
+            trusted_data_pkl_by_name=trusted_data_pkl_by_name,
+        ),
+        tuple(notices),
+    )
 
 
 def _pytorch_storage_size_mismatches(
@@ -1123,17 +1154,21 @@ def _trusted_pytorch_data_pkl_from_storage_member_sizes(
         return None
     if not reference_parse.referenced_keys <= storage_member_sizes.keys():
         return None
-    storage_size_mismatch = any(
-        not isinstance(storage_member_sizes[key], int)
-        or isinstance(storage_member_sizes[key], bool)
-        or _pytorch_storage_size_mismatches(
+    validated_storage_keys = {
+        key
+        for key in reference_parse.referenced_keys
+        if isinstance(storage_member_sizes[key], int)
+        and not isinstance(storage_member_sizes[key], bool)
+        and not _pytorch_storage_size_mismatches(
             int(storage_member_sizes[key]),
             reference_parse.storage_refs_by_key.get(key),
         )
-        for key in reference_parse.referenced_keys
-    )
+    }
+    if not validated_storage_keys:
+        return None
+    storage_size_mismatch = validated_storage_keys != reference_parse.referenced_keys
     return _PytorchZipDataPickleTrust(
-        storage_keys=set(reference_parse.referenced_keys),
+        storage_keys=validated_storage_keys,
         canonical_tensor_rebuild_invocations=frozenset(
             reference_parse.canonical_tensor_rebuild_invocations if not storage_size_mismatch else set()
         ),
@@ -1207,6 +1242,8 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     entry: zipfile.ZipInfo,
     probe_bytes_remaining: list[int],
     deadline: float,
+    *,
+    max_probe_bytes: int = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
 ) -> bool:
     prefix = _read_zip_entry_probe(
         archive,
@@ -1227,7 +1264,7 @@ def _trusted_storage_zip_entry_looks_like_pickle(
         sample = _read_zip_entry_probe(
             archive,
             entry,
-            _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
+            max_probe_bytes,
             probe_bytes_remaining,
             deadline,
         )
@@ -1499,10 +1536,10 @@ def _quoted_protocol0_field_value(field: str) -> str | None:
     return None if "\\" in value else value
 
 
-def _storage_key_from_protocol0_persid_text(
+def _storage_ref_from_protocol0_persid_text(
     pid_text: Any,
     trusted_storage_keys: set[str] | None = None,
-) -> str | None:
+) -> _PytorchStorageRef | None:
     text = _coerce_pickle_string_arg(pid_text)
     if text is None:
         return None
@@ -1527,7 +1564,22 @@ def _storage_key_from_protocol0_persid_text(
     storage_size = fields[4]
     if not storage_size.isascii() or not storage_size.isdecimal():
         return None
-    return storage_key
+    return _PytorchStorageRef(
+        storage_key,
+        module,
+        name,
+        _quoted_protocol0_field_value(fields[3]) or "",
+        int(storage_size),
+        _PYTORCH_STORAGE_ITEM_SIZES.get(name),
+    )
+
+
+def _storage_key_from_protocol0_persid_text(
+    pid_text: Any,
+    trusted_storage_keys: set[str] | None = None,
+) -> str | None:
+    storage_ref = _storage_ref_from_protocol0_persid_text(pid_text, trusted_storage_keys)
+    return storage_ref.key if storage_ref is not None else None
 
 
 def _protocol0_persid_text_from_preview(preview: Any) -> str | None:
@@ -2037,9 +2089,13 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     all_persistent_ids_are_pytorch_storage = False
                     stack.append(None)
             elif opcode_name == "PERSID":
-                storage_key = _storage_key_from_protocol0_persid_text(arg)
-                if storage_key is not None:
-                    referenced_keys.add(storage_key)
+                storage_ref = _storage_ref_from_protocol0_persid_text(arg)
+                if storage_ref is not None:
+                    referenced_keys.add(storage_ref.key)
+                    existing_ref = storage_refs_by_key.get(storage_ref.key)
+                    if existing_ref is not None and existing_ref != storage_ref:
+                        all_persistent_ids_are_pytorch_storage = False
+                    storage_refs_by_key[storage_ref.key] = storage_ref
                 else:
                     all_persistent_ids_are_pytorch_storage = False
                 invalidate_tensor_rebuild_proof()
