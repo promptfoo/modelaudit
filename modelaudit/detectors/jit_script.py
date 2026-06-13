@@ -286,12 +286,22 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_START_PATTERN = re.compile(
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
-_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = (
-    rb"(?:[A-Za-z_]\w*(?:(?:\s*\[[^\]\n#]+\])|(?:\s*\.\s*[A-Za-z_]\w*))*"
-    rb"(?:\s*:[^=\n#]+)?|"
-    rb"[\(\[][A-Za-z_][^=\n#]*[\)\]])"
-)
 _EMBEDDED_PYTHON_ASSIGNMENT_OPERATOR_PATTERN = rb"(?://=|<<=|>>=|\*\*=|[-+*/%@&|^]=|=)"
+_EMBEDDED_PYTHON_ASSIGNMENT_VALUE_LINE_PATTERN = (
+    rb"(?=[^\x00-\x08\x0b-\x1f\x7f]{0,"
+    + str(_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES).encode("ascii")
+    + rb"}(?:\r?\n|$))"
+)
+_EMBEDDED_PYTHON_ASSIGNMENT_VALUE_START_PATTERN = (
+    rb"(?=[ \t]*(?:[A-Za-z0-9_\"'({\[\-+~.]|\\\r?\n))" + _EMBEDDED_PYTHON_ASSIGNMENT_VALUE_LINE_PATTERN
+)
+_EMBEDDED_PYTHON_CONTEXT_EXPR_BYTES_PATTERN = rb"[^\]\r\n#\x00-\x08\x0b-\x1f\x7f]+"
+_EMBEDDED_PYTHON_CONTEXT_ANNOTATION_PATTERN = rb"[^=\r\n#\x00-\x08\x0b-\x1f\x7f]+"
+_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = (
+    rb"(?:[A-Za-z_]\w*(?:(?:\s*\[" + _EMBEDDED_PYTHON_CONTEXT_EXPR_BYTES_PATTERN + rb"\])|(?:\s*\.\s*[A-Za-z_]\w*))*"
+    rb"(?:\s*:" + _EMBEDDED_PYTHON_CONTEXT_ANNOTATION_PATTERN + rb")?|"
+    rb"[\(\[][A-Za-z_][^=\r\n#\x00-\x08\x0b-\x1f\x7f]*[\)\]])"
+)
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}\x00]+|class\s+\w+[^}\x00]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
@@ -301,6 +311,7 @@ _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     + _EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN
     + rb"\s*"
     + _EMBEDDED_PYTHON_ASSIGNMENT_OPERATOR_PATTERN
+    + _EMBEDDED_PYTHON_ASSIGNMENT_VALUE_START_PATTERN
     + rb"|(?<![A-Za-z0-9_'\".])(?:async\s+)?for\s+[^:\n]+:"
     rb"|(?<![A-Za-z0-9_'\".])match\s+[^:\n]+:"
     rb"|(?<![A-Za-z0-9_'\".])\(\s*lambda\b"
@@ -315,6 +326,7 @@ _UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN = re.compile(
     + _EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN
     + rb"\s*"
     + _EMBEDDED_PYTHON_ASSIGNMENT_OPERATOR_PATTERN
+    + _EMBEDDED_PYTHON_ASSIGNMENT_VALUE_START_PATTERN
     + rb"|(?:async\s+)?for\s+[^:\n]+:|match\s+[^:\n]+:|\(\s*lambda\b|next\s*\()"
 )
 _EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(

@@ -111,6 +111,30 @@ def _decode_huggingface_revision(raw_component: str) -> str:
     return decoded
 
 
+def _extract_huggingface_revision_query(raw_query: str) -> str | None:
+    """Return an optional revision query value without trusting decoded query parsing."""
+    if not raw_query:
+        return None
+
+    revisions: list[str] = []
+    for raw_pair in raw_query.split("&"):
+        if not raw_pair:
+            continue
+        raw_key, separator, raw_value = raw_pair.partition("=")
+        key = _decode_huggingface_url_component(raw_key, "query parameter")
+        if key != "revision":
+            continue
+        if not separator or not raw_value:
+            raise ValueError("Invalid HuggingFace revision query")
+        revisions.append(_decode_huggingface_revision(raw_value))
+
+    if not revisions:
+        return None
+    if len(set(revisions)) != 1:
+        raise ValueError("Ambiguous HuggingFace revision query")
+    return revisions[0]
+
+
 def _split_huggingface_repo_path(raw_path: str) -> tuple[str, str, list[str]]:
     stripped = raw_path.strip("/")
     if not stripped:
@@ -248,17 +272,27 @@ def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
 
 def parse_huggingface_url(url: str) -> tuple[str, str]:
     """Parse a HuggingFace model URL into namespace and repository name."""
+    namespace, repo_name, _revision = parse_huggingface_url_with_revision(url)
+    return namespace, repo_name
+
+
+def parse_huggingface_url_with_revision(url: str) -> tuple[str, str, str | None]:
+    """Parse a HuggingFace model URL into namespace, repository name, and optional revision."""
+    _validate_huggingface_url_input(url)
     if url.startswith("hf://"):
-        parsed = urlparse(url)
-        raw_repo_path = parsed.netloc + parsed.path
         try:
+            parsed = urlparse(url)
+            raw_repo_path = parsed.netloc
+            if parsed.path:
+                raw_repo_path = f"{raw_repo_path}{parsed.path}"
             namespace, repo_name, raw_parts = _split_huggingface_repo_path(raw_repo_path)
+            revision = _extract_huggingface_revision_query(parsed.query)
         except ValueError as exc:
             raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}") from exc
         if len(raw_parts) == 1:
-            return namespace, ""
+            return namespace, "", revision
         if len(raw_parts) == 2:
-            return namespace, repo_name
+            return namespace, repo_name, revision
         raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}")
 
     parsed = urlparse(url)
@@ -270,8 +304,10 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
     except ValueError as exc:
         raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}") from exc
     if len(raw_parts) == 1:
-        return namespace, ""
-    return namespace, repo_name
+        return namespace, "", _extract_huggingface_revision_query(parsed.query)
+    if len(raw_parts) == 2:
+        return namespace, repo_name, _extract_huggingface_revision_query(parsed.query)
+    raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}")
 
 
 def is_huggingface_cache_path(path: str | Path) -> bool:

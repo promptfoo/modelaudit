@@ -12,28 +12,17 @@ _RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 
 def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str, Any]:
     if operation == "list_repo_files":
-        from huggingface_hub import HfApi
+        from modelaudit.utils.sources.huggingface import _list_huggingface_repo_files_at_revision
 
-        repo_info_kwargs: dict[str, Any] = {
-            "timeout": operation_kwargs.get("request_timeout"),
-            "files_metadata": False,
-        }
-        requested_revision = operation_kwargs.get("requested_revision")
-        if requested_revision is not None:
-            repo_info_kwargs["revision"] = requested_revision
-        repo_info = HfApi().repo_info(operation_kwargs["repo_id"], **repo_info_kwargs)
-        siblings = getattr(repo_info, "siblings", None)
-        files: list[str] | None = None
-        if siblings is not None:
-            files = []
-            for sibling in siblings:
-                if isinstance(sibling, dict):
-                    file_name = sibling.get("rfilename") or sibling.get("path")
-                else:
-                    file_name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
-                if isinstance(file_name, str) and file_name:
-                    files.append(file_name)
-        return {"value": {"files": files, "revision": getattr(repo_info, "sha", None)}}
+        requested_revision = operation_kwargs.get("revision")
+        if requested_revision is None:
+            requested_revision = operation_kwargs.get("requested_revision")
+        files, revision = _list_huggingface_repo_files_at_revision(
+            operation_kwargs["repo_id"],
+            requested_revision=requested_revision,
+            timeout_seconds=operation_kwargs.get("request_timeout", 30),
+        )
+        return {"value": {"files": files, "revision": revision}}
     if operation == "snapshot_download":
         from huggingface_hub import snapshot_download
 
@@ -49,13 +38,12 @@ def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str
         request_timeout = operation_kwargs.get("request_timeout")
         if request_timeout is not None:
             model_info_kwargs["timeout"] = request_timeout
-        requested_revision = operation_kwargs.get("requested_revision")
+        requested_revision = operation_kwargs.get("revision")
+        if requested_revision is None:
+            requested_revision = operation_kwargs.get("requested_revision")
         if requested_revision is not None:
             model_info_kwargs["revision"] = requested_revision
-        model_info = HfApi().model_info(
-            operation_kwargs["repo_id"],
-            **model_info_kwargs,
-        )
+        model_info = HfApi().model_info(operation_kwargs["repo_id"], **model_info_kwargs)
         total_size = sum(
             file_info.size
             for file_info in (getattr(model_info, "siblings", None) or ())
@@ -70,17 +58,25 @@ def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str
         api = HfApi()
         resolved_revision = operation_kwargs.get("resolved_revision")
         if resolved_revision is None:
-            path_info_repo_kwargs: dict[str, Any] = {"files_metadata": False}
+            path_repo_info_kwargs: dict[str, Any] = {"files_metadata": False}
+            if operation_kwargs.get("request_timeout") is not None:
+                path_repo_info_kwargs["timeout"] = operation_kwargs["request_timeout"]
             requested_revision = operation_kwargs.get("requested_revision")
             if requested_revision is not None:
-                path_info_repo_kwargs["revision"] = requested_revision
-            repo_info = api.repo_info(operation_kwargs["repo_id"], **path_info_repo_kwargs)
+                path_repo_info_kwargs["revision"] = requested_revision
+            repo_info = api.repo_info(operation_kwargs["repo_id"], **path_repo_info_kwargs)
             resolved_revision = getattr(repo_info, "sha", None)
-        path_info = api.get_paths_info(
-            operation_kwargs["repo_id"],
-            operation_kwargs["filenames"],
-            revision=resolved_revision,
-        )
+        filenames = operation_kwargs["filenames"]
+        path_info = []
+        batch_size = 512
+        for start in range(0, len(filenames), batch_size):
+            path_info.extend(
+                api.get_paths_info(
+                    operation_kwargs["repo_id"],
+                    filenames[start : start + batch_size],
+                    revision=resolved_revision,
+                )
+            )
         return {
             "value": {
                 "revision": resolved_revision,

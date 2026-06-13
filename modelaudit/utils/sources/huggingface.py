@@ -1,8 +1,11 @@
 """Utilities for handling HuggingFace model downloads."""
 
+import hashlib
 import json
 import logging
+import ntpath
 import os
+import posixpath
 import re
 import signal
 import struct
@@ -10,15 +13,18 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from collections.abc import Callable, Collection, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import cache
 from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast, overload
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
+from ..file.detection import detect_file_format_for_skip_filter
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
     extract_model_id_from_path,
@@ -27,6 +33,7 @@ from .huggingface_paths import (
     is_huggingface_url,
     parse_huggingface_file_url,
     parse_huggingface_url,
+    parse_huggingface_url_with_revision,
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
@@ -39,11 +46,15 @@ _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
-_MAX_HF_STREAMING_UNFILTERED_FILES = 128
 _HF_SAFETENSORS_STRICT_RANGE_REDIRECTS = 5
 _HF_SAFETENSORS_RANGE_ATTEMPTS = 3
+_HF_SAFETENSORS_OVERLAP_PROBE_BYTES = 64 * 1024
+_HF_SAFETENSORS_OVERLAP_TAIL_PROBE_BYTES = 128 * 1024
 _MAX_HF_SAFETENSORS_INDEX_BYTES = 32 * 1024 * 1024
 _MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_HF_SAFETENSORS_INDEX_TENSORS = 250_000
+_MAX_HF_SAFETENSORS_INDEX_JSON_TOKENS = (2 * _MAX_HF_SAFETENSORS_INDEX_TENSORS) + 4096
+_MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS = 20
 _HF_SAFETENSORS_REMOTE_OVERLAP_REASON = "remote_safetensors_overlap_coverage_incomplete"
 _HF_SAFETENSORS_OVERLAP_SIGNATURES: tuple[tuple[str, bytes], ...] = (
     ("zip", b"PK\x03\x04"),
@@ -55,10 +66,26 @@ _HF_SAFETENSORS_OVERLAP_SIGNATURES: tuple[tuple[str, bytes], ...] = (
     ("compressed", b"\x1f\x8b"),
     ("torch7", b"T7\x00\x00"),
 )
-_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS: frozenset[str] = frozenset({"compressed", "keras_h5", "torch7", "zip"})
+_MAX_HF_STREAMING_ONNX_EXTERNAL_DATA_FILES = 256
+_MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES = 128
+_MAX_HF_REPOSITORY_INVENTORY_FILES = 8192
+_MAX_HF_REPOSITORY_INVENTORY_PAGES = 128
+_MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES = 10 * 1024 * 1024
+_MAX_HF_REPOSITORY_PATH_CHARS = 4096
+_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES = 64 * 1024
+_HF_PATH_INFO_BATCH_SIZE = 512
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
+_HF_SAFETENSORS_SHARD_PATTERN = re.compile(
+    r"(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors",
+    re.IGNORECASE,
+)
+_HF_SAFETENSORS_SHARD_SHAPE_PATTERN = re.compile(
+    r".+-\d+-of-\d+\.safetensors",
+    re.IGNORECASE,
+)
+_HF_REPO_BOOKKEEPING_FILENAMES = frozenset({".gitattributes"})
 
 __all__ = [
     "download_file_from_hf",
@@ -71,6 +98,9 @@ __all__ = [
     "is_huggingface_url",
     "parse_huggingface_file_url",
     "parse_huggingface_url",
+    "parse_huggingface_url_with_revision",
+    "plan_huggingface_model_download",
+    "plan_huggingface_streaming_download",
     "redact_huggingface_url_for_display",
     "redact_huggingface_urls_in_text",
 ]
@@ -120,6 +150,50 @@ class _HuggingFaceProbeBudget:
         self.file_sizes[filename] = file_size
 
 
+class _SparseRangeReader:
+    """Seekable bounded view over known remote ranges without allocating gaps."""
+
+    def __init__(self, size: int, ranges: Collection[tuple[int, bytes]]) -> None:
+        self._size = size
+        self._ranges = tuple(ranges)
+        self._position = 0
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            position = offset
+        elif whence == os.SEEK_CUR:
+            position = self._position + offset
+        elif whence == os.SEEK_END:
+            position = self._size + offset
+        else:
+            raise ValueError(f"invalid seek mode: {whence}")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        if self._position >= self._size:
+            return b""
+        read_size = self._size - self._position if size < 0 else min(size, self._size - self._position)
+        start = self._position
+        end = start + read_size
+        output = bytearray(read_size)
+        for range_start, range_bytes in self._ranges:
+            range_end = range_start + len(range_bytes)
+            overlap_start = max(start, range_start)
+            overlap_end = min(end, range_end)
+            if overlap_start < overlap_end:
+                output[overlap_start - start : overlap_end - start] = range_bytes[
+                    overlap_start - range_start : overlap_end - range_start
+                ]
+        self._position = end
+        return bytes(output)
+
+
 @dataclass(frozen=True)
 class _HuggingFaceStrictRangeRead:
     data: bytes
@@ -133,22 +207,28 @@ class _HuggingFaceRangeBudgetExceeded(ValueError):
     """Raised when a bounded range read would exceed the caller's byte budget."""
 
 
+class _HuggingFaceStrictRangeError(RuntimeError):
+    """Preserve bytes consumed before a strict range read failed."""
+
+    def __init__(self, error: BaseException, bytes_transferred: int) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.bytes_transferred = bytes_transferred
+
+
 def _remote_safetensors_source_path(repo_id: str, revision: str, filename: str) -> str:
     return f"hf://{repo_id}@{revision}/{filename}"
 
 
-def _requested_huggingface_revision(url: str) -> str | None:
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return None
-    query = parse_qs(parsed.query, keep_blank_values=False)
-    raw_values = query.get("revision") or query.get("rev")
-    if not raw_values:
-        return None
-    if len(raw_values) != 1 or not _is_huggingface_commit_sha(raw_values[0]):
-        raise ValueError("Hugging Face revision query must be a full immutable commit SHA")
-    return raw_values[0]
+def _replace_remote_temp_path(value: Any, temp_path: str, source_path: str) -> Any:
+    """Rewrite source-local temporary paths before records leave remote scanning."""
+    if isinstance(value, str):
+        return value.replace(temp_path, source_path)
+    if isinstance(value, list):
+        return [_replace_remote_temp_path(item, temp_path, source_path) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_remote_temp_path(item, temp_path, source_path) for key, item in value.items()}
+    return value
 
 
 def _is_trusted_huggingface_range_host(hostname: str | None) -> bool:
@@ -169,6 +249,12 @@ def _validate_huggingface_range_url(url: str) -> None:
         raise ValueError("Hugging Face range redirect used an untrusted scheme")
     if parsed.username or parsed.password:
         raise ValueError("Hugging Face range redirect used userinfo credentials")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Hugging Face range redirect used an invalid port") from exc
+    if port not in {None, 443}:
+        raise ValueError("Hugging Face range redirect used an untrusted port")
     if not _is_trusted_huggingface_range_host(parsed.hostname):
         raise ValueError("Hugging Face range redirect used an untrusted final host")
 
@@ -183,28 +269,61 @@ def _range_response_validator(headers: Any) -> str:
         if normalized.lower().startswith("w/"):
             raise ValueError("Hugging Face range response used a weak object validator")
         validator_value = normalized.strip('"')
+        if not validator_value:
+            raise ValueError("Hugging Face range response used an empty object validator")
         validator_parts.append(f"{key.lower()}={validator_value}")
     if not validator_parts:
         raise ValueError("Hugging Face range response omitted a stable object validator")
     return ";".join(validator_parts)
 
 
-def _parse_strict_content_range(response: Any, expected_size: int | None, max_bytes: int) -> tuple[int, int]:
+def _parse_strict_content_range(
+    response: Any,
+    expected_size: int | None,
+    max_bytes: int,
+    start_offset: int,
+) -> tuple[int, int]:
     content_range = response.headers.get("Content-Range", "")
-    match = re.fullmatch(r"bytes 0-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
     if match is None:
         raise ValueError("Hugging Face range response omitted a valid Content-Range")
-    end_offset, total_size = (int(value) for value in match.groups())
+    reported_start, end_offset, total_size = (int(value) for value in match.groups())
+    if reported_start != start_offset:
+        raise ValueError("Hugging Face range response returned an unexpected start offset")
     if expected_size is not None and total_size != expected_size:
         raise ValueError("Hugging Face range response size changed during header scan")
-    expected_bytes = min(total_size, max_bytes)
-    if end_offset + 1 != expected_bytes:
+    expected_bytes = min(max(total_size - start_offset, 0), max_bytes)
+    if end_offset - start_offset + 1 != expected_bytes:
         raise ValueError("Hugging Face range response returned an unexpected byte range")
     return expected_bytes, total_size
 
 
+def _interrupt_huggingface_range_response(response: Any) -> None:
+    """Interrupt a blocking Requests body read at the hard acquisition deadline."""
+    import socket
+
+    raw_response = getattr(response, "raw", None)
+    connection = getattr(raw_response, "_connection", None)
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        response_fp = getattr(getattr(raw_response, "_fp", None), "fp", None)
+        sock = getattr(getattr(response_fp, "raw", None), "_sock", None)
+    if sock is not None:
+        with suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        with suppress(OSError):
+            sock.close()
+    if raw_response is not None:
+        with suppress(Exception):
+            raw_response.close()
+    with suppress(Exception):
+        response.close()
+
+
 def _is_retryable_huggingface_range_error(error: BaseException) -> bool:
     """Return whether a remote range failure is likely transport-side, not evidence-side."""
+    if isinstance(error, _HuggingFaceStrictRangeError):
+        return _is_retryable_huggingface_range_error(error.error)
     try:
         import requests
     except Exception:
@@ -235,9 +354,10 @@ def _read_huggingface_strict_range(
     *,
     expected_size: int | None,
     deadline: float | None,
+    start_offset: int = 0,
 ) -> _HuggingFaceStrictRangeRead:
     """Read a trusted prefix range and reject ambiguous range or object identity semantics."""
-    if max_bytes <= 0:
+    if max_bytes <= 0 or start_offset < 0:
         raise ValueError("Hugging Face range read size must be positive")
 
     import requests
@@ -250,12 +370,13 @@ def _read_huggingface_strict_range(
     headers = build_hf_headers(
         token=None,
         headers={
-            "Range": f"bytes=0-{max_bytes - 1}",
+            "Range": f"bytes={start_offset}-{start_offset + max_bytes - 1}",
             "Accept-Encoding": "identity",
         },
     )
     current_headers = dict(headers)
-    original_host = urlparse(current_url).hostname
+    original_url = urlparse(current_url)
+    original_origin = (original_url.scheme, original_url.hostname, original_url.port or 443)
 
     response = None
     for _redirect_count in range(_HF_SAFETENSORS_STRICT_RANGE_REDIRECTS + 1):
@@ -274,12 +395,14 @@ def _read_huggingface_strict_range(
                 raise ValueError("Hugging Face range redirect omitted a Location header")
             next_url = urljoin(current_url, location)
             _validate_huggingface_range_url(next_url)
-            next_host = urlparse(next_url).hostname
-            if next_host != original_host:
-                current_headers.pop("authorization", None)
-                current_headers.pop("Authorization", None)
-                current_headers.pop("cookie", None)
-                current_headers.pop("Cookie", None)
+            parsed_next_url = urlparse(next_url)
+            next_origin = (parsed_next_url.scheme, parsed_next_url.hostname, parsed_next_url.port or 443)
+            if next_origin != original_origin:
+                current_headers = {
+                    key: value
+                    for key, value in current_headers.items()
+                    if key.lower() not in {"authorization", "cookie"}
+                }
             current_url = next_url
             continue
         break
@@ -294,7 +417,7 @@ def _read_huggingface_strict_range(
         content_encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
         if content_encoding not in {"", "identity"}:
             raise ValueError("Hugging Face range response used encoded content")
-        expected_bytes, total_size = _parse_strict_content_range(response, expected_size, max_bytes)
+        expected_bytes, total_size = _parse_strict_content_range(response, expected_size, max_bytes, start_offset)
         content_length = response.headers.get("Content-Length")
         if content_length is not None:
             try:
@@ -307,18 +430,36 @@ def _read_huggingface_strict_range(
 
         chunks: list[bytes] = []
         total = 0
-        chunk_size = min(1024 * 1024, max(1, expected_bytes))
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            request_deadline.check_deadline(repo_id)
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > expected_bytes:
-                raise ValueError("Hugging Face range response body exceeded declared range")
-            chunks.append(chunk)
-        data = b"".join(chunks)
-        if len(data) != expected_bytes:
-            raise ValueError("Hugging Face range response ended before declared range")
+        chunk_size = min(64 * 1024, max(1, expected_bytes))
+        deadline_timer = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            import threading
+
+            deadline_timer = threading.Timer(remaining, _interrupt_huggingface_range_response, args=(response,))
+            deadline_timer.daemon = True
+            deadline_timer.start()
+        try:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > expected_bytes:
+                    raise ValueError("Hugging Face range response body exceeded declared range")
+                chunks.append(chunk)
+                request_deadline.check_deadline(repo_id)
+                if total == expected_bytes:
+                    break
+            data = b"".join(chunks)
+            if len(data) != expected_bytes:
+                raise ValueError("Hugging Face range response ended before declared range")
+        except Exception as exc:
+            raise _HuggingFaceStrictRangeError(exc, total) from exc
+        finally:
+            if deadline_timer is not None:
+                deadline_timer.cancel()
         return _HuggingFaceStrictRangeRead(
             data=data,
             total_size=total_size,
@@ -393,19 +534,12 @@ def _remote_safetensors_overlap_scanner_ids(
     return [scanner_id for scanner_id in matched_scanner_ids if scanner_id in active]
 
 
-def _remote_safetensors_payload_overlap_gap_scanner_ids(
-    *,
-    header_len: int,
-    declared_size: int,
-    active_scanner_ids: Collection[str] | None,
-) -> list[str]:
-    if header_len <= 0 or header_len > declared_size - 8 or declared_size <= 8 + header_len:
-        return []
+def _active_safetensors_overlap_scanner_ids(active_scanner_ids: Collection[str] | None) -> set[str]:
+    overlap_ids = set(_hf_safetensors_route_scanner_ids()) - {"safetensors"}
     if active_scanner_ids is None:
-        return sorted(_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS)
-
+        return overlap_ids
     active = {str(scanner_id).lower() for scanner_id in active_scanner_ids}
-    return sorted(_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS.intersection(active))
+    return overlap_ids.intersection(active)
 
 
 def _mark_remote_safetensors_overlap_incomplete(
@@ -413,6 +547,7 @@ def _mark_remote_safetensors_overlap_incomplete(
     *,
     source_path: str,
     overlap_scanner_ids: list[str],
+    payload_bytes_downloaded: int,
 ) -> None:
     from ...core_results import mark_operational_scan_error
     from ...scanner_results import mark_inconclusive_scan_result
@@ -428,7 +563,7 @@ def _mark_remote_safetensors_overlap_incomplete(
             "remote_overlap_scanner_ids": overlap_scanner_ids,
             "analysis_incomplete": True,
             "scan_outcome_reason": _HF_SAFETENSORS_REMOTE_OVERLAP_REASON,
-            "tensor_payload_bytes_downloaded": 0,
+            "tensor_payload_bytes_downloaded": payload_bytes_downloaded,
         },
     )
     mark_inconclusive_scan_result(result, _HF_SAFETENSORS_REMOTE_OVERLAP_REASON)
@@ -449,6 +584,7 @@ def _scan_remote_huggingface_safetensors_header(
     active_scanner_ids: Collection[str] | None = None,
 ) -> Any:
     """Inspect one remote SafeTensors header without downloading tensor payload bytes."""
+    from ...scanners.base import FORMAT_VALIDATION_CONFIG_KEY
     from ...scanners.safetensors_scanner import (
         _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY,
         _REMOTE_HEADER_INTEGRITY_CONFIG_KEY,
@@ -463,6 +599,10 @@ def _scan_remote_huggingface_safetensors_header(
     total_bytes_transferred = 0
     for attempt in range(_HF_SAFETENSORS_RANGE_ATTEMPTS):
         attempt_bytes_transferred = 0
+        payload_probe = b""
+        tail_probe = b""
+        tail_probe_start = declared_size
+        sparse_overlap_probes: list[tuple[int, bytes]] = []
         temp_path: str | None = None
         try:
             if max_transferred_bytes is not None and total_bytes_transferred + 8 > max_transferred_bytes:
@@ -483,16 +623,8 @@ def _scan_remote_huggingface_safetensors_header(
             header_payload = first_range.data
             final_url = first_range.final_url
             validator = first_range.validator
-            overlap_scanner_ids = sorted(
-                {
-                    *_remote_safetensors_overlap_scanner_ids(first_range.data, active_scanner_ids),
-                    *_remote_safetensors_payload_overlap_gap_scanner_ids(
-                        header_len=header_len,
-                        declared_size=declared_size,
-                        active_scanner_ids=active_scanner_ids,
-                    ),
-                }
-            )
+            active_overlap_scanner_ids = _active_safetensors_overlap_scanner_ids(active_scanner_ids)
+            overlap_scanner_ids = _remote_safetensors_overlap_scanner_ids(first_range.data, active_overlap_scanner_ids)
             if 0 < header_len <= max_header_bytes and header_len <= declared_size - 8:
                 projected_bytes = total_bytes_transferred + attempt_bytes_transferred + 8 + header_len
                 if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
@@ -506,6 +638,8 @@ def _scan_remote_huggingface_safetensors_header(
                     deadline=deadline,
                 )
                 attempt_bytes_transferred += header_range.bytes_transferred
+                if header_range.data[:8] != first_range.data:
+                    raise ValueError("Hugging Face SafeTensors header prefix changed between range reads")
                 if header_range.validator != first_range.validator:
                     raise ValueError("Hugging Face SafeTensors object validator changed during header scan")
                 if header_range.total_size != first_range.total_size:
@@ -513,6 +647,120 @@ def _scan_remote_huggingface_safetensors_header(
                 header_payload = header_range.data
                 final_url = header_range.final_url
                 validator = header_range.validator
+
+                payload_size = declared_size - (8 + header_len)
+                if payload_size > 0 and active_overlap_scanner_ids:
+                    payload_probe_size = min(payload_size, _HF_SAFETENSORS_OVERLAP_PROBE_BYTES)
+                    projected_bytes = total_bytes_transferred + attempt_bytes_transferred + payload_probe_size
+                    if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
+                        raise _HuggingFaceRangeBudgetExceeded(
+                            "remote SafeTensors overlap probe exceeds max-size budget"
+                        )
+                    payload_range = _read_huggingface_strict_range(
+                        repo_id,
+                        filename,
+                        revision,
+                        payload_probe_size,
+                        expected_size=declared_size,
+                        deadline=deadline,
+                        start_offset=8 + header_len,
+                    )
+                    attempt_bytes_transferred += payload_range.bytes_transferred
+                    if payload_range.validator != first_range.validator:
+                        raise ValueError("Hugging Face SafeTensors object validator changed during overlap probe")
+                    payload_probe = payload_range.data
+                    overlap_scanner_ids = sorted(
+                        set(overlap_scanner_ids).union(
+                            _remote_safetensors_overlap_scanner_ids(
+                                payload_probe,
+                                active_overlap_scanner_ids,
+                            )
+                        )
+                    )
+                    if payload_probe.startswith(b"\x89HDF\r\n\x1a\n") and "keras_h5" in active_overlap_scanner_ids:
+                        overlap_scanner_ids = sorted({*overlap_scanner_ids, "keras_h5"})
+
+                    if "keras_h5" in active_overlap_scanner_ids:
+                        from ..file.hdf5 import (
+                            HDF5_SUPERBLOCK_PROBE_BYTES,
+                            has_plausible_hdf5_superblock,
+                            hdf5_signature_offsets,
+                        )
+
+                        covered_prefix_end = 8 + header_len + len(payload_probe)
+                        covered_prefix = header_payload + payload_probe
+                        for signature_offset in hdf5_signature_offsets(
+                            declared_size,
+                            max_signature_scan_bytes=None,
+                        ):
+                            probe_size = min(HDF5_SUPERBLOCK_PROBE_BYTES, declared_size - signature_offset)
+                            if signature_offset + probe_size <= covered_prefix_end:
+                                if has_plausible_hdf5_superblock(
+                                    covered_prefix[signature_offset : signature_offset + probe_size],
+                                    signature_offset,
+                                    declared_size,
+                                ):
+                                    overlap_scanner_ids = sorted({*overlap_scanner_ids, "keras_h5"})
+                                    break
+                                continue
+                            projected_bytes = total_bytes_transferred + attempt_bytes_transferred + probe_size
+                            if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
+                                raise _HuggingFaceRangeBudgetExceeded(
+                                    "remote SafeTensors HDF5 overlap probes exceed max-size budget"
+                                )
+                            hdf5_range = _read_huggingface_strict_range(
+                                repo_id,
+                                filename,
+                                revision,
+                                probe_size,
+                                expected_size=declared_size,
+                                deadline=deadline,
+                                start_offset=signature_offset,
+                            )
+                            attempt_bytes_transferred += hdf5_range.bytes_transferred
+                            if hdf5_range.validator != first_range.validator:
+                                raise ValueError(
+                                    "Hugging Face SafeTensors object validator changed during HDF5 overlap probe"
+                                )
+                            sparse_overlap_probes.append((signature_offset, hdf5_range.data))
+                            if has_plausible_hdf5_superblock(
+                                hdf5_range.data,
+                                signature_offset,
+                                declared_size,
+                            ):
+                                overlap_scanner_ids = sorted({*overlap_scanner_ids, "keras_h5"})
+                                break
+
+                    zip_overlap_scanner_ids = active_overlap_scanner_ids.intersection(
+                        _hf_route_scanner_ids_for_formats(frozenset({"zip"}))
+                    )
+                    payload_probe_end = 8 + header_len + len(payload_probe)
+                    if zip_overlap_scanner_ids and declared_size > payload_probe_end:
+                        tail_probe_size = min(
+                            declared_size - payload_probe_end,
+                            _HF_SAFETENSORS_OVERLAP_TAIL_PROBE_BYTES,
+                        )
+                        tail_probe_start = declared_size - tail_probe_size
+                        projected_bytes = total_bytes_transferred + attempt_bytes_transferred + tail_probe_size
+                        if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
+                            raise _HuggingFaceRangeBudgetExceeded(
+                                "remote SafeTensors overlap tail probe exceeds max-size budget"
+                            )
+                        tail_range = _read_huggingface_strict_range(
+                            repo_id,
+                            filename,
+                            revision,
+                            tail_probe_size,
+                            expected_size=declared_size,
+                            deadline=deadline,
+                            start_offset=tail_probe_start,
+                        )
+                        attempt_bytes_transferred += tail_range.bytes_transferred
+                        if tail_range.validator != first_range.validator:
+                            raise ValueError(
+                                "Hugging Face SafeTensors object validator changed during overlap tail probe"
+                            )
+                        tail_probe = tail_range.data
 
             bytes_transferred = total_bytes_transferred + attempt_bytes_transferred
             suffix = ".safetensors" if not Path(filename).suffix else Path(filename).suffix
@@ -523,7 +771,25 @@ def _scan_remote_huggingface_safetensors_header(
             ) as temp_file:
                 temp_path = temp_file.name
                 temp_file.write(header_payload)
-                temp_file.truncate(declared_size)
+                temp_file.write(payload_probe)
+
+            if active_overlap_scanner_ids:
+                import zipfile
+
+                sparse_ranges = [
+                    (0, header_payload),
+                    (len(header_payload), payload_probe),
+                    (tail_probe_start, tail_probe),
+                    *sparse_overlap_probes,
+                ]
+                if zipfile.is_zipfile(_SparseRangeReader(declared_size, sparse_ranges)):
+                    overlap_scanner_ids = sorted(
+                        set(overlap_scanner_ids).union(
+                            active_overlap_scanner_ids.intersection(
+                                _hf_route_scanner_ids_for_formats(frozenset({"zip"}))
+                            )
+                        )
+                    )
 
             integrity_details: dict[str, Any] = {
                 "hf_repo_id": repo_id,
@@ -537,10 +803,21 @@ def _scan_remote_huggingface_safetensors_header(
                 "remote_final_host": urlparse(final_url).hostname,
                 "range_semantics": "strict_206_content_range",
                 "range_attempts": attempt + 1,
+                "tensor_payload_bytes_downloaded": (
+                    len(payload_probe)
+                    + len(tail_probe)
+                    + sum(len(probe_bytes) for _, probe_bytes in sparse_overlap_probes)
+                ),
             }
             remote_scanner_config = dict(caller_scanner_config)
             remote_scanner_config.update(
                 {
+                    FORMAT_VALIDATION_CONFIG_KEY: {
+                        "path": os.path.abspath(temp_path),
+                        "file_type_valid": True,
+                        "header_format": "safetensors",
+                        "extension_format": "safetensors",
+                    },
                     _REMOTE_HEADER_ONLY_CONFIG_KEY: True,
                     _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY: bytes_transferred,
                     _REMOTE_HEADER_INTEGRITY_CONFIG_KEY: integrity_details,
@@ -551,8 +828,10 @@ def _scan_remote_huggingface_safetensors_header(
             )
             result = scanner.scan(temp_path)
             for record in [*result.checks, *result.issues]:
-                if getattr(record, "location", None) == temp_path:
-                    cast(Any, record).location = source_path
+                record_value = cast(Any, record)
+                if getattr(record_value, "location", None) == temp_path:
+                    record_value.location = source_path
+                record_value.details = _replace_remote_temp_path(record_value.details, temp_path, source_path)
             result.metadata.update(integrity_details)
             result.metadata.update(
                 {
@@ -562,22 +841,38 @@ def _scan_remote_huggingface_safetensors_header(
                     "remote_header_only": True,
                     "analysis_scope": "safetensors_header_and_metadata",
                     "content_hash_unavailable_reason": "remote_safetensors_header_only",
-                    "tensor_payload_bytes_downloaded": 0,
+                    "tensor_payload_bytes_downloaded": integrity_details["tensor_payload_bytes_downloaded"],
                 }
             )
             if shard_details is not None:
                 from ...scanners.base import IssueSeverity
 
-                result.metadata["remote_shard_family"] = dict(shard_details)
+                evaluated_shard_details = dict(shard_details)
+                expected_tensor_digest = evaluated_shard_details.get("index_tensor_names_digest")
+                actual_tensor_digest = result.metadata.get("tensor_names_digest")
+                if (
+                    evaluated_shard_details.get("index_referenced_by_manifest")
+                    and isinstance(expected_tensor_digest, str)
+                    and expected_tensor_digest != actual_tensor_digest
+                ):
+                    evaluated_shard_details.update(
+                        {
+                            "complete": False,
+                            "index_complete": False,
+                            "index_incomplete_reason": "index_tensor_assignment_mismatch",
+                            "message": "Remote SafeTensors index tensor assignments do not match the shard header.",
+                        }
+                    )
+                result.metadata["remote_shard_family"] = evaluated_shard_details
                 result.add_check(
                     name="Hugging Face SafeTensors Shard Coverage",
-                    passed=bool(shard_details.get("complete")),
-                    message=str(shard_details.get("message", "Remote SafeTensors shard coverage evaluated")),
-                    severity=None if shard_details.get("complete") else IssueSeverity.INFO,
+                    passed=bool(evaluated_shard_details.get("complete")),
+                    message=str(evaluated_shard_details.get("message", "Remote SafeTensors shard coverage evaluated")),
+                    severity=None if evaluated_shard_details.get("complete") else IssueSeverity.INFO,
                     location=source_path,
-                    details=shard_details,
+                    details=evaluated_shard_details,
                 )
-                if not shard_details.get("complete"):
+                if not evaluated_shard_details.get("complete"):
                     from ...scanner_results import mark_inconclusive_scan_result
 
                     mark_inconclusive_scan_result(result, "remote_safetensors_shard_coverage_incomplete")
@@ -588,10 +883,13 @@ def _scan_remote_huggingface_safetensors_header(
                     result,
                     source_path=source_path,
                     overlap_scanner_ids=overlap_scanner_ids,
+                    payload_bytes_downloaded=int(integrity_details["tensor_payload_bytes_downloaded"]),
                 )
             result.bytes_scanned = bytes_transferred
             return result
         except Exception as exc:
+            if isinstance(exc, _HuggingFaceStrictRangeError):
+                attempt_bytes_transferred += exc.bytes_transferred
             total_bytes_transferred += attempt_bytes_transferred
             if not _is_retryable_huggingface_range_error(exc) or attempt + 1 >= _HF_SAFETENSORS_RANGE_ATTEMPTS:
                 reason = (
@@ -608,7 +906,11 @@ def _scan_remote_huggingface_safetensors_header(
                     reason=reason,
                     error=exc,
                 )
-            time.sleep(0.25 * (attempt + 1))
+            retry_delay = 0.25 * (attempt + 1)
+            if deadline is not None:
+                retry_delay = min(retry_delay, max(0.0, deadline - time.monotonic()))
+            if retry_delay > 0:
+                time.sleep(retry_delay)
         finally:
             if temp_path is not None:
                 with suppress(OSError):
@@ -621,7 +923,7 @@ def _remote_safetensors_filename_shard_details_by_file(
     model_files: list[str], repo_files: list[str]
 ) -> dict[str, dict[str, Any]]:
     """Return per-shard filename coverage details derived from the immutable repository listing."""
-    from modelaudit.utils.file.handlers import ShardedModelDetector
+    from modelaudit.utils.file.handlers import ShardedModelDetector, _summarize_missing_shard_indices
 
     grouped: dict[tuple[str, str, int], dict[str, Any]] = {}
     selected = set(model_files)
@@ -648,12 +950,16 @@ def _remote_safetensors_filename_shard_details_by_file(
     details_by_file: dict[str, dict[str, Any]] = {}
     for (_parent, pattern, expected_total), entry in grouped.items():
         by_index = cast(dict[int, list[str]], entry["by_index"])
-        missing_indices = [index for index in range(1, expected_total + 1) if index not in by_index]
+        missing_indices, missing_count, missing_truncated = _summarize_missing_shard_indices(
+            set(by_index), expected_total
+        )
         duplicate_indices = {index: names for index, names in by_index.items() if len(names) > 1}
         present_filenames = [name for names in by_index.values() for name in names]
         unselected = sorted(name for name in present_filenames if name not in selected)
+        filename_pattern_authoritative = all(1 <= index <= expected_total for index in by_index)
         complete = (
-            not missing_indices
+            filename_pattern_authoritative
+            and missing_count == 0
             and not duplicate_indices
             and not unselected
             and len(present_filenames) == expected_total
@@ -666,13 +972,14 @@ def _remote_safetensors_filename_shard_details_by_file(
         group_details: dict[str, Any] = {
             "complete": complete,
             "filename_pattern_complete": complete,
+            "filename_pattern_authoritative": filename_pattern_authoritative,
             "message": message,
             "pattern": pattern,
             "expected_total_shards": expected_total,
             "present_total_shards": len(present_filenames),
-            "missing_shard_count": len(missing_indices),
+            "missing_shard_count": missing_count,
             "missing_shard_indices": missing_indices[:20],
-            "missing_shard_indices_truncated": len(missing_indices) > 20,
+            "missing_shard_indices_truncated": missing_truncated or missing_count > 20,
             "duplicate_shard_count": len(duplicate_indices),
             "duplicate_shard_indices": sorted(duplicate_indices)[:20],
             "unselected_shard_count": len(unselected),
@@ -697,8 +1004,16 @@ def _remote_index_parent_prefix(index_filename: str) -> str:
 def _normalize_safetensors_index_shard_path(index_filename: str, shard_name: object) -> tuple[str | None, str | None]:
     if not isinstance(shard_name, str) or not shard_name:
         return None, "non-string or empty shard reference"
-    if "\\" in shard_name:
-        return None, "backslash in shard reference"
+    if "\x00" in shard_name or "\\" in shard_name:
+        return None, "invalid character in shard reference"
+    if re.match(r"^[A-Za-z]:", shard_name):
+        return None, "Windows-absolute shard reference"
+    if (
+        shard_name.startswith("/")
+        or "//" in shard_name
+        or any(part in {"", ".", ".."} for part in shard_name.split("/"))
+    ):
+        return None, "unsafe shard reference path"
     shard_path = PurePosixPath(shard_name)
     if shard_path.is_absolute() or any(part in {"", ".", ".."} for part in shard_path.parts):
         return None, "unsafe shard reference path"
@@ -706,15 +1021,26 @@ def _normalize_safetensors_index_shard_path(index_filename: str, shard_name: obj
     return f"{parent_prefix}{shard_path.as_posix()}" if parent_prefix else shard_path.as_posix(), None
 
 
-def _loads_json_without_duplicate_keys(raw: bytes) -> tuple[Any | None, list[str], str | None]:
+def _loads_json_without_duplicate_keys(raw: bytes) -> tuple[Any | None, list[str], int, str | None]:
+    from ...scanners.safetensors_scanner import _validate_json_structural_token_limit
+
     duplicate_keys: list[str] = []
+    duplicate_key_count = 0
+
+    try:
+        _validate_json_structural_token_limit(raw, _MAX_HF_SAFETENSORS_INDEX_JSON_TOKENS, "SafeTensors index")
+    except ValueError as exc:
+        return None, [], 0, str(exc)
 
     def object_pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        nonlocal duplicate_key_count
         obj: dict[str, Any] = {}
         seen: set[str] = set()
         for key, value in pairs:
             if key in seen:
-                duplicate_keys.append(key)
+                duplicate_key_count += 1
+                if key not in duplicate_keys and len(duplicate_keys) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
+                    duplicate_keys.append(key)
             seen.add(key)
             obj[key] = value
         return obj
@@ -722,12 +1048,12 @@ def _loads_json_without_duplicate_keys(raw: bytes) -> tuple[Any | None, list[str
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        return None, [], f"invalid UTF-8: {exc}"
+        return None, [], 0, f"invalid UTF-8: {exc}"
     try:
         parsed = json.loads(text, object_pairs_hook=object_pairs_hook)
     except json.JSONDecodeError as exc:
-        return None, [], f"invalid JSON: {exc}"
-    return parsed, sorted(set(duplicate_keys)), None
+        return None, [], duplicate_key_count, f"invalid JSON: {exc}"
+    return parsed, sorted(duplicate_keys), duplicate_key_count, None
 
 
 def _index_failure_details(
@@ -753,6 +1079,59 @@ def _index_failure_details(
     return details
 
 
+def _tensor_name_digest(tensor_names: Collection[str], *, deadline: float | None = None) -> str:
+    """Return an order-independent digest without retaining an unbounded name list."""
+    digest = hashlib.sha256()
+    sorted_names = sorted(tensor_names)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("SafeTensors index reconciliation timed out")
+    for index, name in enumerate(sorted_names):
+        if index % 1024 == 0 and deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("SafeTensors index reconciliation timed out")
+        encoded = name.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("SafeTensors index reconciliation timed out")
+    return digest.hexdigest()
+
+
+def _merge_remote_index_details(
+    existing: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge manifest evidence conservatively so a later manifest cannot erase failure."""
+    if existing is None:
+        merged = dict(incoming)
+        merged["index_manifest_count"] = 1
+        merged["index_manifests"] = [incoming.get("index_manifest")]
+        return merged
+
+    existing_complete = bool(existing.get("index_complete"))
+    incoming_complete = bool(incoming.get("index_complete"))
+    conflicting_tensors = (
+        existing_complete
+        and incoming_complete
+        and existing.get("index_tensor_names_digest") != incoming.get("index_tensor_names_digest")
+    )
+    merged = dict(incoming if not incoming_complete else existing)
+    manifests = [
+        manifest
+        for manifest in [*existing.get("index_manifests", []), incoming.get("index_manifest")]
+        if isinstance(manifest, str)
+    ]
+    merged["index_manifest_count"] = int(existing.get("index_manifest_count", 1)) + 1
+    merged["index_manifests"] = list(dict.fromkeys(manifests))[:_MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS]
+    merged["index_manifests_truncated"] = len(set(manifests)) > _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS
+    merged["index_complete"] = existing_complete and incoming_complete and not conflicting_tensors
+    merged["complete"] = merged["index_complete"]
+    if conflicting_tensors:
+        merged["index_incomplete_reason"] = "conflicting_index_tensor_assignments"
+    if not merged["index_complete"]:
+        merged["message"] = "Remote SafeTensors index coverage is incomplete."
+    return merged
+
+
 def _remote_safetensors_index_details_by_file(
     repo_id: str,
     model_files: list[str],
@@ -766,15 +1145,22 @@ def _remote_safetensors_index_details_by_file(
     """Return per-shard details from bounded SafeTensors index manifests."""
     selected_files = set(model_files)
     repo_file_set = set(repo_files)
-    selected_safetensors = {
-        filename for filename in selected_files if PurePosixPath(filename).suffix.lower() == ".safetensors"
-    }
+    selected_safetensors = set(model_files)
     if not selected_safetensors:
         return {}, 0
 
     details_by_file: dict[str, dict[str, Any]] = {}
+
+    def attach_details(filename: str, details: dict[str, Any]) -> None:
+        details_by_file[filename] = _merge_remote_index_details(details_by_file.get(filename), details)
+
     total_index_bytes = 0
     for index_filename in sorted(filename for filename in repo_files if _is_safetensors_index_file(filename)):
+        if deadline is not None and time.monotonic() >= deadline:
+            failure = _index_failure_details(index_filename, "index_reconciliation_timed_out")
+            for filename in selected_safetensors:
+                attach_details(filename, failure)
+            break
         parent_prefix = _remote_index_parent_prefix(index_filename)
         selected_under_index = sorted(
             filename for filename in selected_safetensors if not parent_prefix or filename.startswith(parent_prefix)
@@ -786,24 +1172,24 @@ def _remote_safetensors_index_details_by_file(
         if index_size is None:
             failure = _index_failure_details(index_filename, "missing_index_size")
             for filename in selected_under_index:
-                details_by_file[filename] = dict(failure)
+                attach_details(filename, failure)
             continue
         if index_size > _MAX_HF_SAFETENSORS_INDEX_BYTES:
             failure = _index_failure_details(index_filename, "index_exceeds_limit", index_size=index_size)
             for filename in selected_under_index:
-                details_by_file[filename] = dict(failure)
+                attach_details(filename, failure)
             continue
         if total_index_bytes + index_size > _MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES:
             failure = _index_failure_details(
                 index_filename, "aggregate_index_bytes_exceed_limit", index_size=index_size
             )
             for filename in selected_under_index:
-                details_by_file[filename] = dict(failure)
+                attach_details(filename, failure)
             continue
         if max_transferred_bytes is not None and total_index_bytes + index_size > max_transferred_bytes:
             failure = _index_failure_details(index_filename, "index_exceeds_max_size_budget", index_size=index_size)
             for filename in selected_under_index:
-                details_by_file[filename] = dict(failure)
+                attach_details(filename, failure)
             continue
 
         index_bytes_transferred = 0
@@ -818,7 +1204,9 @@ def _remote_safetensors_index_details_by_file(
             )
             index_bytes_transferred = index_range.bytes_transferred
             total_index_bytes += index_range.bytes_transferred
-            parsed, duplicate_keys, parse_error = _loads_json_without_duplicate_keys(index_range.data)
+            parsed, duplicate_keys, duplicate_key_count, parse_error = _loads_json_without_duplicate_keys(
+                index_range.data
+            )
             if parse_error is not None:
                 raise ValueError(parse_error)
             if not isinstance(parsed, dict):
@@ -829,7 +1217,12 @@ def _remote_safetensors_index_details_by_file(
                 raise ValueError("SafeTensors index metadata is not a JSON object")
             if not isinstance(weight_map, dict):
                 raise ValueError("SafeTensors index weight_map is not a JSON object")
+            if len(weight_map) > _MAX_HF_SAFETENSORS_INDEX_TENSORS:
+                raise ValueError("SafeTensors index weight_map exceeds tensor entry limit")
         except Exception as exc:
+            if isinstance(exc, _HuggingFaceStrictRangeError):
+                index_bytes_transferred += exc.bytes_transferred
+                total_index_bytes += exc.bytes_transferred
             failure = _index_failure_details(
                 index_filename,
                 "index_read_or_parse_failed",
@@ -838,12 +1231,16 @@ def _remote_safetensors_index_details_by_file(
                 error=exc,
             )
             for filename in selected_under_index:
-                details_by_file[filename] = dict(failure)
+                attach_details(filename, failure)
             continue
 
         referenced_by_file: dict[str, list[str]] = {}
         invalid_entries: list[str] = []
-        for tensor_name, shard_name in weight_map.items():
+        reconciliation_timed_out = False
+        for entry_index, (tensor_name, shard_name) in enumerate(weight_map.items()):
+            if entry_index % 1024 == 0 and deadline is not None and time.monotonic() >= deadline:
+                reconciliation_timed_out = True
+                break
             if not isinstance(tensor_name, str) or not tensor_name:
                 invalid_entries.append("<invalid tensor key>")
                 continue
@@ -853,11 +1250,21 @@ def _remote_safetensors_index_details_by_file(
                 continue
             referenced_by_file.setdefault(normalized_path, []).append(tensor_name)
 
+        if reconciliation_timed_out:
+            failure = _index_failure_details(
+                index_filename,
+                "index_reconciliation_timed_out",
+                bytes_transferred=index_range.bytes_transferred,
+                index_size=index_size,
+            )
+            for filename in selected_under_index:
+                attach_details(filename, failure)
+            continue
+
         referenced_files = set(referenced_by_file)
         missing_files = sorted(referenced_files - repo_file_set)
         unselected_files = sorted((referenced_files & repo_file_set) - selected_files)
         selected_referenced = sorted(referenced_files & selected_files)
-
         metadata_total_size = metadata.get("total_size") if isinstance(metadata, dict) else None
         invalid_total_size = False
         if metadata_total_size is not None:
@@ -875,6 +1282,33 @@ def _remote_safetensors_index_details_by_file(
                         known_capacity += max(0, file_size - 8)
                 if known_capacity > 0 and metadata_total_size > known_capacity:
                     invalid_total_size = True
+
+        try:
+            tensor_digests_by_file = {
+                filename: _tensor_name_digest(tensors, deadline=deadline)
+                for filename, tensors in referenced_by_file.items()
+            }
+        except TimeoutError:
+            failure = _index_failure_details(
+                index_filename,
+                "index_reconciliation_timed_out",
+                bytes_transferred=index_range.bytes_transferred,
+                index_size=index_size,
+            )
+            for filename in selected_under_index:
+                attach_details(filename, failure)
+            continue
+
+        if deadline is not None and time.monotonic() >= deadline:
+            failure = _index_failure_details(
+                index_filename,
+                "index_reconciliation_timed_out",
+                bytes_transferred=index_range.bytes_transferred,
+                index_size=index_size,
+            )
+            for filename in selected_under_index:
+                attach_details(filename, failure)
+            continue
 
         index_complete = (
             not duplicate_keys
@@ -903,13 +1337,20 @@ def _remote_safetensors_index_details_by_file(
             "index_invalid_entry_count": len(invalid_entries),
             "index_invalid_entries": invalid_entries[:20],
             "index_invalid_entries_truncated": len(invalid_entries) > 20,
-            "index_duplicate_json_key_count": len(duplicate_keys),
+            "index_duplicate_json_key_count": duplicate_key_count,
             "index_duplicate_json_keys": duplicate_keys[:20],
-            "index_duplicate_json_keys_truncated": len(duplicate_keys) > 20,
+            "index_duplicate_json_keys_truncated": duplicate_key_count > len(duplicate_keys),
             "index_metadata_total_size": metadata_total_size,
-            "index_metadata_total_size_valid": not invalid_total_size,
+            "index_metadata_total_size_plausible": not invalid_total_size,
+            "index_metadata_total_size_verified": None if metadata_total_size is None else False,
+            "index_relationships_complete": index_complete,
             "message": (
-                "SafeTensors index relationships are complete for this shard."
+                (
+                    "SafeTensors index file and tensor relationships are complete for this shard; "
+                    "metadata.total_size was not independently verified."
+                )
+                if index_complete and metadata_total_size is not None
+                else "SafeTensors index file and tensor relationships are complete for this shard."
                 if index_complete
                 else "Remote SafeTensors index coverage is incomplete."
             ),
@@ -926,7 +1367,8 @@ def _remote_safetensors_index_details_by_file(
             details["index_tensor_count_for_shard"] = len(tensors)
             details["index_tensor_names_for_shard"] = tensors[:20]
             details["index_tensor_names_for_shard_truncated"] = len(tensors) > 20
-            details_by_file[filename] = details
+            details["index_tensor_names_digest"] = tensor_digests_by_file.get(filename, _tensor_name_digest(()))
+            attach_details(filename, details)
 
     return details_by_file, total_index_bytes
 
@@ -949,10 +1391,11 @@ def _combine_remote_safetensors_shard_details(
         combined = dict(filename_detail)
         combined.update(index_detail)
         filename_complete = bool(filename_detail.get("complete"))
+        filename_pattern_authoritative = bool(filename_detail.get("filename_pattern_authoritative", True))
         index_complete = bool(index_detail.get("complete"))
         combined["filename_pattern_complete"] = filename_complete
         combined["index_complete"] = index_complete
-        combined["complete"] = filename_complete and index_complete
+        combined["complete"] = index_complete and (filename_complete or not filename_pattern_authoritative)
         combined["message"] = (
             "Remote SafeTensors shard filename and index coverage are complete."
             if combined["complete"]
@@ -984,6 +1427,27 @@ def _remote_safetensors_shard_details_by_file(
         max_transferred_bytes=max_transferred_bytes,
     )
     return _combine_remote_safetensors_shard_details(filename_details, index_details), index_bytes
+
+
+@dataclass
+class _HuggingFaceStreamingSelection:
+    filenames: list[str]
+    content_route_formats: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class HuggingFaceDownloadPlan:
+    namespace: str
+    repo_name: str
+    repo_id: str
+    deadline: float | None
+    size_limit: int | None
+    repo_files: list[str]
+    repo_revision: str
+    selected_files: list[str]
+    selected_sizes: dict[str, int]
+    download_revision: str
+    content_route_formats: dict[str, str] = field(default_factory=dict)
 
 
 def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_bytes: int) -> int | None:
@@ -1027,6 +1491,14 @@ def _huggingface_sample_is_prefix(
     if file_size is not None:
         return file_size > len(probe)
     return len(probe) >= fallback_limit
+
+
+def _format_huggingface_exception_label(exc: Exception) -> str:
+    """Return a compact, redacted exception label that preserves HTTP status."""
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status_code, int):
+        return f"{type(exc).__name__}: HTTP {status_code}"
+    return type(exc).__name__
 
 
 def _get_model_extensions() -> set[str]:
@@ -1098,7 +1570,7 @@ def _read_huggingface_prefix(
     except Exception as exc:
         raise ValueError(
             "Hugging Face selective filtering incomplete: unable to inspect skipped file "
-            f"{repo_id}/{filename} ({type(exc).__name__})"
+            f"{repo_id}/{filename} ({_format_huggingface_exception_label(exc)})"
         ) from exc
 
 
@@ -1114,6 +1586,321 @@ def _read_huggingface_probe(
     if len(prefix) >= max_bytes:
         return prefix[:max_bytes]
     return _read_huggingface_prefix(repo_id, filename, revision, budget, max_bytes)
+
+
+def _read_huggingface_tail(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+    max_bytes: int,
+) -> bytes:
+    """Read a bounded remote tail when the earlier prefix proved the file size."""
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None or max_bytes <= 0:
+        return b""
+    if file_size <= len(prefix):
+        return prefix[-max_bytes:]
+
+    read_size = min(file_size, max_bytes)
+    start_offset = file_size - read_size
+    if start_offset == 0:
+        return _read_huggingface_probe(repo_id, filename, revision, budget, prefix, read_size)[-read_size:]
+
+    budget.reserve(repo_id, read_size)
+    try:
+        import re
+
+        import requests
+        from huggingface_hub import hf_hub_url
+        from huggingface_hub.utils import build_hf_headers
+
+        file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+        headers = build_hf_headers(
+            token=None,
+            headers={
+                "Range": f"bytes={start_offset}-{file_size - 1}",
+                "Accept-Encoding": "identity",
+            },
+        )
+        with requests.get(
+            file_url,
+            headers=headers,
+            stream=True,
+            timeout=budget.request_timeout(repo_id),
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=read_size):
+                budget.check_deadline(repo_id)
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= read_size:
+                    break
+            tail = b"".join(chunks)[:read_size]
+            content_range = getattr(response, "headers", {}).get("Content-Range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+            if getattr(response, "status_code", None) != 206 or match is None:
+                raise ValueError("tail Hugging Face response omitted a valid Content-Range")
+            reported_start, reported_end, reported_size = (int(value) for value in match.groups())
+            if (
+                reported_start != start_offset
+                or reported_end != file_size - 1
+                or reported_size != file_size
+                or len(tail) != read_size
+            ):
+                raise ValueError("tail Hugging Face response reported an inconsistent Content-Range")
+        return tail
+    except Exception as exc:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: unable to inspect skipped file "
+            f"{repo_id}/{filename} ({type(exc).__name__})"
+        ) from exc
+
+
+def _read_huggingface_range(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+    start_offset: int,
+    max_bytes: int,
+) -> bytes:
+    """Read a bounded remote byte range, reusing the cached prefix when possible."""
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None or max_bytes <= 0 or start_offset < 0 or start_offset >= file_size:
+        return b""
+
+    read_size = min(max_bytes, file_size - start_offset)
+    end_offset = start_offset + read_size
+    if end_offset <= len(prefix):
+        return prefix[start_offset:end_offset]
+
+    chunks: list[bytes] = []
+    remote_start = start_offset
+    if start_offset < len(prefix):
+        chunks.append(prefix[start_offset:])
+        remote_start = len(prefix)
+
+    remote_size = read_size - sum(len(chunk) for chunk in chunks)
+    if remote_size <= 0:
+        return b"".join(chunks)[:read_size]
+
+    remote_end = remote_start + remote_size - 1
+    budget.reserve(repo_id, remote_size)
+    try:
+        import re
+
+        import requests
+        from huggingface_hub import hf_hub_url
+        from huggingface_hub.utils import build_hf_headers
+
+        file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+        headers = build_hf_headers(
+            token=None,
+            headers={
+                "Range": f"bytes={remote_start}-{remote_end}",
+                "Accept-Encoding": "identity",
+            },
+        )
+        with requests.get(
+            file_url,
+            headers=headers,
+            stream=True,
+            timeout=budget.request_timeout(repo_id),
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            remote_chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=remote_size):
+                budget.check_deadline(repo_id)
+                if not chunk:
+                    continue
+                remote_chunks.append(chunk)
+                total += len(chunk)
+                if total >= remote_size:
+                    break
+            remote_payload = b"".join(remote_chunks)[:remote_size]
+            content_range = getattr(response, "headers", {}).get("Content-Range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+            if getattr(response, "status_code", None) != 206 or match is None:
+                raise ValueError("range Hugging Face response omitted a valid Content-Range")
+            reported_start, reported_end, reported_size = (int(value) for value in match.groups())
+            if (
+                reported_start != remote_start
+                or reported_end != remote_end
+                or reported_size != file_size
+                or len(remote_payload) != remote_size
+            ):
+                raise ValueError("range Hugging Face response reported an inconsistent Content-Range")
+            chunks.append(remote_payload)
+        return b"".join(chunks)[:read_size]
+    except Exception as exc:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: unable to inspect skipped file "
+            f"{repo_id}/{filename} ({type(exc).__name__})"
+        ) from exc
+
+
+def _detect_huggingface_png_media_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a PNG media route by walking chunk framing with sparse range reads."""
+    from modelaudit.utils.file.detection import (
+        _PNG_SIGNATURE,
+        MEDIA_ROUTE_READ_BYTES,
+        MEDIA_ROUTE_TAIL_READ_BYTES,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        VALID_MEDIA_ROUTING_FORMAT,
+        _detect_complete_media_route_from_trailing,
+        _find_png_end_with_reader,
+    )
+
+    if not prefix.startswith(_PNG_SIGNATURE):
+        return None
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    tail: bytes | None = None
+    tail_start = file_size
+    range_windows: list[tuple[int, bytes]] = []
+
+    def read_at(offset: int, size: int) -> bytes:
+        nonlocal tail, tail_start
+        end_offset = offset + size
+        if end_offset <= len(prefix):
+            return prefix[offset:end_offset]
+        if tail is None:
+            tail = _read_huggingface_tail(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                MEDIA_ROUTE_TAIL_READ_BYTES,
+            )
+            tail_start = file_size - len(tail)
+        if tail_start <= offset and end_offset <= tail_start + len(tail):
+            return tail[offset - tail_start : end_offset - tail_start]
+        if offset < len(prefix) and len(prefix) >= tail_start and end_offset <= tail_start + len(tail):
+            prefix_part = prefix[offset : min(end_offset, len(prefix))]
+            tail_part_start = max(len(prefix), tail_start)
+            tail_part = tail[tail_part_start - tail_start : end_offset - tail_start]
+            return prefix_part + tail_part
+        for window_start, window in range_windows:
+            if window_start <= offset and end_offset <= window_start + len(window):
+                return window[offset - window_start : end_offset - window_start]
+        window_size = min(MEDIA_ROUTE_TAIL_READ_BYTES, file_size - offset)
+        window = _read_huggingface_range(repo_id, filename, revision, budget, prefix, offset, window_size)
+        range_windows.append((offset, window))
+        return window[:size]
+
+    try:
+        media_end = _find_png_end_with_reader(
+            file_size,
+            read_at,
+        )
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    try:
+        trailing = read_at(media_end, read_size)
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
+def _detect_huggingface_jpeg_media_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a JPEG media route by walking marker structure with sparse range reads."""
+    from modelaudit.utils.file.detection import (
+        MEDIA_ROUTE_READ_BYTES,
+        MEDIA_ROUTE_TAIL_READ_BYTES,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        VALID_MEDIA_ROUTING_FORMAT,
+        _detect_complete_media_route_from_trailing,
+        _find_jpeg_end_with_reader,
+    )
+
+    if not prefix.startswith(b"\xff\xd8"):
+        return None
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    tail: bytes | None = None
+    tail_start = file_size
+    range_windows: list[tuple[int, bytes]] = []
+
+    def read_at(offset: int, size: int) -> bytes:
+        nonlocal tail, tail_start
+        end_offset = offset + size
+        if end_offset <= len(prefix):
+            return prefix[offset:end_offset]
+        if tail is None:
+            tail = _read_huggingface_tail(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                MEDIA_ROUTE_TAIL_READ_BYTES,
+            )
+            tail_start = file_size - len(tail)
+        if tail_start <= offset and end_offset <= tail_start + len(tail):
+            return tail[offset - tail_start : end_offset - tail_start]
+        if offset < len(prefix) and len(prefix) >= tail_start and end_offset <= tail_start + len(tail):
+            prefix_part = prefix[offset : min(end_offset, len(prefix))]
+            tail_part_start = max(len(prefix), tail_start)
+            tail_part = tail[tail_part_start - tail_start : end_offset - tail_start]
+            return prefix_part + tail_part
+        for window_start, window in range_windows:
+            if window_start <= offset and end_offset <= window_start + len(window):
+                return window[offset - window_start : end_offset - window_start]
+        window_size = min(MEDIA_ROUTE_TAIL_READ_BYTES, file_size - offset)
+        window = _read_huggingface_range(repo_id, filename, revision, budget, prefix, offset, window_size)
+        range_windows.append((offset, window))
+        return window[:size]
+
+    try:
+        media_end = _find_jpeg_end_with_reader(file_size, read_at)
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    try:
+        trailing = read_at(media_end, read_size)
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
 
 
 def _looks_like_safetensors_prefix(
@@ -1266,7 +2053,7 @@ def _detect_huggingface_xgboost_ubjson_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
-    if Path(filename).suffix:
+    if Path(filename).suffix and not _has_hf_safetensors_shard_shape(filename):
         return None
 
     from modelaudit.utils.file.detection import (
@@ -1387,15 +2174,36 @@ def _probe_huggingface_executorch_prefix(prefix: bytes, *, sample_is_prefix: boo
     )
 
 
-def _is_complete_huggingface_text_or_json(probe: bytes, *, sample_is_prefix: bool) -> bool:
+def _is_complete_huggingface_text_or_json(
+    filename: str,
+    probe: bytes,
+    *,
+    sample_is_prefix: bool,
+    preserve_protobuf_model_candidates: bool = False,
+) -> bool:
     """Return whether a complete bounded probe is owned by benign text or JSON."""
     if sample_is_prefix:
         return False
 
-    from modelaudit.utils.file.detection import _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+        _has_bounded_protobuf_model_text_candidate_signal_bytes,
+        _is_complete_bounded_ascii_printable_text_content_owner_bytes,
+        _is_complete_bounded_printable_text_content_owner_bytes,
+    )
 
-    if not probe.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
+    remote_path = Path(filename)
+    if (
+        preserve_protobuf_model_candidates
+        and remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        and _has_bounded_protobuf_model_text_candidate_signal_bytes(probe)
+        and not _is_complete_bounded_ascii_printable_text_content_owner_bytes(remote_path, len(probe), probe)
+    ):
+        return False
+
+    if _is_complete_bounded_printable_text_content_owner_bytes(remote_path, len(probe), probe):
         return True
+
     normalized = probe.lstrip()
     if normalized.startswith(b"\xef\xbb\xbf"):
         normalized = normalized[3:].lstrip()
@@ -1407,6 +2215,181 @@ def _is_complete_huggingface_text_or_json(probe: bytes, *, sample_is_prefix: boo
         return False
 
 
+def _starts_with_non_ascii_length_delimited_proto_prefix(probe: bytes) -> bool:
+    """Return whether a text-like prefix starts with a non-ASCII length-delimited proto field."""
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES,
+        _read_length_delimited_proto_value,
+        _read_proto_varint,
+    )
+
+    tag_result = _read_proto_varint(probe, 0)
+    if tag_result is None:
+        return False
+    tag, value_offset = tag_result
+    if tag >> 3 == 0 or tag & 0x07 != 2:
+        return False
+    bounds = _read_length_delimited_proto_value(probe, value_offset)
+    if bounds is None:
+        return False
+    length, value_start, value_end, actual_value_end = bounds
+    if length <= 0 or actual_value_end > len(probe):
+        return False
+    return bool(probe[value_start:value_end].translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES))
+
+
+def _is_huggingface_text_owner_prefix(
+    filename: str,
+    probe: bytes,
+    *,
+    preserve_protobuf_model_candidates: bool = False,
+) -> bool:
+    """Return whether an already-read remote prefix has ordinary text-owner structure."""
+    if not probe:
+        return False
+
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+        _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS,
+        _has_content_route_text_owner_structure,
+        _is_complete_bounded_ascii_printable_text_content_owner_bytes,
+        is_declared_text_content_filename,
+    )
+
+    remote_path = Path(filename)
+    if remote_path.suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and not is_declared_text_content_filename(
+        filename
+    ):
+        return False
+    if (
+        preserve_protobuf_model_candidates
+        and _starts_with_non_ascii_length_delimited_proto_prefix(probe)
+        and not _is_complete_bounded_ascii_printable_text_content_owner_bytes(remote_path, len(probe), probe)
+    ):
+        return False
+    try:
+        text = probe.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return _has_content_route_text_owner_structure(text) and all(
+        char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text
+    )
+
+
+def _is_printable_non_ascii_huggingface_text_prefix(probe: bytes) -> bool:
+    """Return whether a prefix is printable UTF-8 text with non-ASCII bytes."""
+    if not probe:
+        return False
+    return any(byte >= 0x80 for byte in probe) and not any(
+        (byte < 0x20 and byte not in {0x09, 0x0A, 0x0C, 0x0D}) or byte == 0x7F for byte in probe
+    )
+
+
+def _detect_huggingface_text_owner_embedded_binary_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a bounded route for binary/model bytes embedded after a text-owned prefix."""
+    known_size = budget.file_sizes.get(filename)
+    if known_size is None or known_size <= len(prefix):
+        return None
+
+    from modelaudit.utils.file.detection import (
+        FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        _has_bounded_protobuf_model_text_candidate_signal_bytes,
+        _looks_like_proto0_or_1_pickle,
+        _probe_flax_msgpack_checkpoint_stream,
+        detect_format_from_magic_bytes,
+    )
+
+    def detect_sample_route(sample: bytes) -> str | None:
+        if not sample:
+            return None
+        flax_state = _probe_flax_msgpack_checkpoint_stream(
+            BytesIO(sample),
+            len(sample),
+            sample_is_prefix=True,
+            incomplete_prefix_is_inconclusive=True,
+        )
+        if flax_state is True:
+            return "flax_msgpack"
+        if _starts_with_non_ascii_length_delimited_proto_prefix(
+            sample
+        ) or _has_bounded_protobuf_model_text_candidate_signal_bytes(sample):
+            return PROTOBUF_MODEL_CANDIDATE_FORMAT
+        if _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True):
+            return "pickle"
+        detected_format = detect_format_from_magic_bytes(
+            sample[:4],
+            sample[:8],
+            sample[:16],
+            max(len(sample), 1),
+            None,
+            pickle_probe_sample=sample,
+            pickle_probe_is_prefix=True,
+        )
+        return None if detected_format == "unknown" else detected_format
+
+    sample_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+    post_prefix = _read_huggingface_range(repo_id, filename, revision, budget, prefix, len(prefix), sample_size)
+    post_prefix_route = detect_sample_route(post_prefix)
+    if post_prefix_route is not None:
+        return post_prefix_route
+
+    tail_start = max(0, known_size - min(known_size, sample_size))
+    if tail_start <= len(prefix) + len(post_prefix):
+        return None
+    tail = _read_huggingface_tail(repo_id, filename, revision, budget, prefix, sample_size)
+    return detect_sample_route(tail)
+
+
+def _is_complete_huggingface_text_owner_or_json_probe(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    raw_probe: bytes,
+    max_probe_size: int,
+    *,
+    preserve_protobuf_model_candidates: bool = False,
+) -> bool:
+    """Return whether a bounded remote probe proves text or JSON ownership."""
+    probe = raw_probe[:max_probe_size]
+    if _is_complete_huggingface_text_or_json(
+        filename,
+        probe,
+        sample_is_prefix=_huggingface_sample_is_prefix(budget, filename, probe, max_probe_size),
+        preserve_protobuf_model_candidates=preserve_protobuf_model_candidates,
+    ):
+        return True
+
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+        is_declared_text_content_filename,
+    )
+
+    if Path(
+        filename
+    ).suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and not is_declared_text_content_filename(filename):
+        return False
+    known_size = budget.file_sizes.get(filename)
+    if known_size is not None and known_size > _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES:
+        return False
+    if known_size is None or known_size > len(probe):
+        return False
+
+    return _is_huggingface_text_owner_prefix(
+        filename,
+        probe,
+        preserve_protobuf_model_candidates=preserve_protobuf_model_candidates,
+    )
+
+
 def _detect_huggingface_protobuf_model_route(
     repo_id: str,
     filename: str,
@@ -1416,6 +2399,7 @@ def _detect_huggingface_protobuf_model_route(
 ) -> str | None:
     """Return a bounded TensorFlow, CoreML, ONNX, or unresolved protobuf model route."""
     from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
         _COREML_PROTO_SIGNATURE_READ_BYTES,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
@@ -1425,6 +2409,8 @@ def _detect_huggingface_protobuf_model_route(
         _looks_like_onnx_model_proto_stream,
     )
 
+    if Path(filename).suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and prefix.startswith(b":"):
+        return None
     if not _could_start_coreml_model_proto(prefix):
         return None
 
@@ -1432,7 +2418,15 @@ def _detect_huggingface_protobuf_model_route(
     raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
     sample_is_prefix = len(raw_probe) > max_probe_size
     probe = raw_probe[:max_probe_size]
-    if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        raw_probe,
+        max_probe_size,
+        preserve_protobuf_model_candidates=True,
+    ):
         return None
 
     coreml_status = _looks_like_coreml_model_proto_prefix(probe, sample_is_prefix=sample_is_prefix)
@@ -1450,6 +2444,12 @@ def _detect_huggingface_protobuf_model_route(
         return "tf_metagraph"
     if tensorflow_route in {"oversized_candidate", "inconclusive"}:
         return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    if Path(
+        filename
+    ).suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES and _starts_with_non_ascii_length_delimited_proto_prefix(
+        prefix
+    ):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
     if sample_is_prefix or coreml_status is None or onnx_status is None:
         return PROTOBUF_MODEL_CANDIDATE_FORMAT
     return None
@@ -1461,14 +2461,22 @@ def _detect_huggingface_flax_msgpack_route(
     revision: str,
     budget: _HuggingFaceProbeBudget,
     prefix: bytes,
+    *,
+    require_confirmed: bool = False,
 ) -> str | None:
     """Return a bounded Flax MessagePack route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
         FLAX_MSGPACK_STRUCTURE_READ_BYTES,
         _probe_flax_msgpack_checkpoint_stream,
+        is_declared_text_content_filename,
     )
 
-    if Path(filename).suffix.lower() in {".py", ".pyw"}:
+    remote_path = Path(filename)
+    suffix = remote_path.suffix.lower()
+    text_owner_filename = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(filename)
+    if suffix in {".py", ".pyw"}:
         return None
 
     initial_probe_state = _probe_flax_msgpack_checkpoint_stream(
@@ -1484,14 +2492,43 @@ def _detect_huggingface_flax_msgpack_route(
     )
     if initial_probe_state is True:
         return "flax_msgpack"
-    if initial_probe_state is False or len(prefix) < _HF_CONTENT_SNIFF_BYTES:
+    if len(prefix) < _HF_CONTENT_SNIFF_BYTES:
+        return None
+    if initial_probe_state is False and not text_owner_filename:
+        return None
+    if initial_probe_state is False and _is_huggingface_text_owner_prefix(filename, prefix):
+        known_size = budget.file_sizes.get(filename)
+        if known_size is not None and known_size <= _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES:
+            raw_text_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, known_size)
+            if len(raw_text_probe) >= known_size and _is_complete_huggingface_text_or_json(
+                filename,
+                raw_text_probe[:known_size],
+                sample_is_prefix=False,
+            ):
+                return None
+        return _detect_huggingface_text_owner_embedded_binary_route(repo_id, filename, revision, budget, prefix)
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        prefix,
+        _HF_CONTENT_SNIFF_BYTES,
+    ):
         return None
 
     max_probe_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
     raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
     sample_is_prefix = len(raw_probe) > max_probe_size
     probe = raw_probe[:max_probe_size]
-    if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        raw_probe,
+        max_probe_size,
+    ):
         return None
     probe_state = _probe_flax_msgpack_checkpoint_stream(
         BytesIO(probe),
@@ -1499,7 +2536,14 @@ def _detect_huggingface_flax_msgpack_route(
         sample_is_prefix=sample_is_prefix,
         incomplete_prefix_is_inconclusive=True,
     )
-    if probe_state is not False:
+    if (
+        probe_state is False
+        and not require_confirmed
+        and text_owner_filename
+        and _is_printable_non_ascii_huggingface_text_prefix(probe)
+    ):
+        return "flax_msgpack"
+    if probe_state is True or (probe_state is not False and not require_confirmed):
         return "flax_msgpack"
     return None
 
@@ -1517,10 +2561,18 @@ def _detect_huggingface_content_route_format(
         return None
 
     from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+        _MEDIA_ROUTING_SUFFIXES,
         _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS,
+        MEDIA_ROUTE_TAIL_READ_BYTES,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         PROTO0_1_MAX_PROBE_BYTES,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        VALID_MEDIA_ROUTING_FORMAT,
         _allows_renamed_binary_content_route,
+        _could_start_bounded_media_route,
         _could_start_proto0_or_1_pickle,
+        _detect_bounded_media_route_from_edges,
         _is_cntk_signature,
         _is_content_routed_lightgbm_signature,
         _looks_like_proto0_or_1_pickle,
@@ -1533,6 +2585,17 @@ def _detect_huggingface_content_route_format(
         return llamafile_route
 
     if _looks_like_safetensors_prefix(repo_id, filename, revision, budget, prefix):
+        if remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+            flax_route = _detect_huggingface_flax_msgpack_route(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                require_confirmed=True,
+            )
+            if flax_route is not None:
+                return flax_route
         return "safetensors"
     if _looks_like_uncompressed_tar_header(prefix):
         return "tar"
@@ -1556,6 +2619,27 @@ def _detect_huggingface_content_route_format(
     mxnet_route = _detect_huggingface_mxnet_symbol_route(repo_id, filename, revision, budget, prefix)
     if mxnet_route is not None:
         return mxnet_route
+
+    if remote_path.suffix.lower() in _MEDIA_ROUTING_SUFFIXES:
+        media_route = _detect_huggingface_png_media_route(repo_id, filename, revision, budget, prefix)
+        if media_route is None:
+            media_route = _detect_huggingface_jpeg_media_route(repo_id, filename, revision, budget, prefix)
+        if media_route is None:
+            media_tail = _read_huggingface_tail(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                MEDIA_ROUTE_TAIL_READ_BYTES,
+            )
+            media_route = _detect_bounded_media_route_from_edges(remote_path, prefix, media_tail)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return None
+        if media_route is not None:
+            return media_route
+        if _could_start_bounded_media_route(remote_path, prefix):
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
     if _could_start_proto0_or_1_pickle(prefix):
         pickle_probe = _read_huggingface_probe(
@@ -1629,6 +2713,30 @@ def _detect_huggingface_content_route_format(
     if detected_format != "unknown":
         return detected_format
 
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        prefix,
+        _HF_CONTENT_SNIFF_BYTES,
+        preserve_protobuf_model_candidates=True,
+    ):
+        return None
+    if _is_huggingface_text_owner_prefix(
+        filename,
+        prefix,
+        preserve_protobuf_model_candidates=True,
+    ):
+        return _detect_huggingface_text_owner_embedded_binary_route(repo_id, filename, revision, budget, prefix)
+
+    if (
+        remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        and not prefix.startswith(b":")
+        and _starts_with_non_ascii_length_delimited_proto_prefix(prefix)
+    ):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
+
     protobuf_route = _detect_huggingface_protobuf_model_route(repo_id, filename, revision, budget, prefix)
     if protobuf_route is not None:
         return protobuf_route
@@ -1642,12 +2750,21 @@ def _select_huggingface_model_files(
     revision: str,
     model_extensions: Collection[str],
     *,
+    allow_content_probes: bool = True,
+    allow_inaccessible_probe_errors: bool = False,
+    inaccessible_probe_files: list[str] | None = None,
     deadline: float | None = None,
 ) -> list[str]:
     """Select extension-matching files plus bounded content-routed renamed model files."""
     model_files = list(
         dict.fromkeys(filename for filename in repo_files if _is_scannable_hf_file(filename, model_extensions))
     )
+    if not allow_content_probes:
+        candidate_files = _metadata_only_hf_content_probe_candidates(repo_files, model_files)
+        if candidate_files:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
+        return model_files
+
     selected_files = set(model_files)
     inspected_files = 0
     probe_budget = _HuggingFaceProbeBudget(
@@ -1658,13 +2775,28 @@ def _select_huggingface_model_files(
     for filename in repo_files:
         if filename in selected_files:
             continue
+        if _is_huggingface_repo_bookkeeping_file(filename):
+            continue
         if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
             raise ValueError(
                 "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
                 f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_FILES} files)"
             )
         inspected_files += 1
-        detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
+        try:
+            detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
+        except Exception as exc:
+            if allow_inaccessible_probe_errors and _is_huggingface_gated_or_auth_error(exc):
+                logger.debug(
+                    "Skipping inaccessible gated Hugging Face content probe for %s/%s: %s",
+                    repo_id,
+                    filename,
+                    redact_huggingface_urls_in_text(str(exc)),
+                )
+                if inaccessible_probe_files is not None and filename not in inaccessible_probe_files:
+                    inaccessible_probe_files.append(filename)
+                continue
+            raise
         if detected_format is None:
             continue
         model_files.append(filename)
@@ -1673,9 +2805,98 @@ def _select_huggingface_model_files(
     return model_files
 
 
+def _metadata_only_hf_content_probe_candidates(repo_files: list[str], selected_files: Collection[str]) -> list[str]:
+    """Return unselected repo files whose inclusion cannot be proven without content probes."""
+    selected_file_set = set(selected_files)
+    return list(
+        dict.fromkeys(
+            filename
+            for filename in repo_files
+            if filename not in selected_file_set and not _is_huggingface_repo_bookkeeping_file(filename)
+        )
+    )
+
+
+def _raise_metadata_only_hf_selection_incomplete(repo_id: str, candidate_files: Collection[str]) -> None:
+    """Fail closed when metadata-only dry-runs cannot prove content-routed selection."""
+    candidates = list(candidate_files)
+    preview = ", ".join(candidates[:3])
+    if len(candidates) > 3:
+        preview = f"{preview}, ..."
+    candidate_label = "file" if len(candidates) == 1 else "files"
+    raise ValueError(
+        "Hugging Face metadata-only dry-run selection incomplete: "
+        f"dry-run refuses for {repo_id} because it cannot prove selection without content probes; "
+        f"{len(candidates)} unselected non-bookkeeping repository {candidate_label} would require "
+        f"artifact content probing: {preview}"
+    )
+
+
 def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
     """Escape repository filenames before passing them to the Hub glob filter."""
     return [escape_glob(filename) for filename in filenames]
+
+
+def _remote_companion_path_key(filename: str) -> str:
+    return unicodedata.normalize("NFC", filename).casefold()
+
+
+def _openvino_bin_companion_name(filename: str, repo_files: Collection[str] | None = None) -> str | None:
+    """Return the exact same-stem OpenVINO weights filename for a repo XML path."""
+    remote_path = PurePosixPath(filename)
+    if remote_path.suffix.lower() != ".xml":
+        return None
+    expected_companion = remote_path.with_suffix(".bin").as_posix()
+    if repo_files is None or expected_companion in repo_files:
+        return expected_companion
+
+    expected_key = _remote_companion_path_key(expected_companion)
+    candidates = [repo_file for repo_file in repo_files if _remote_companion_path_key(repo_file) == expected_key]
+    if len(candidates) == 1:
+        return candidates[0]
+    return expected_companion
+
+
+def _include_huggingface_openvino_companions(
+    repo_id: str,
+    repo_files: list[str],
+    revision: str,
+    model_files: list[str],
+    *,
+    allow_content_probes: bool = True,
+    include_openvino_companions: bool = True,
+    deadline: float | None = None,
+) -> list[str]:
+    """Include exact OpenVINO XML/BIN companions before size checks and downloads."""
+    if not include_openvino_companions:
+        return model_files
+
+    from modelaudit.utils.file.detection import XML_MODEL_INCONCLUSIVE_FORMAT
+
+    repo_file_set = set(repo_files)
+    selected_files = set(model_files)
+    expanded_files = list(model_files)
+    probe_budget = _HuggingFaceProbeBudget(
+        remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
+        deadline=deadline,
+    )
+
+    for filename in model_files:
+        companion = _openvino_bin_companion_name(filename, repo_files)
+        if companion is None or companion not in repo_file_set or companion in selected_files:
+            continue
+
+        if not allow_content_probes:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, [companion])
+
+        detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
+        if detected_format not in {"openvino", XML_MODEL_INCONCLUSIVE_FORMAT}:
+            continue
+
+        expanded_files.append(companion)
+        selected_files.add(companion)
+
+    return expanded_files
 
 
 def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
@@ -1696,10 +2917,47 @@ def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
     return files
 
 
+def _validate_huggingface_repo_filename(repo_id: str, filename: str) -> str:
+    """Return a safe POSIX repository filename or fail closed."""
+    if len(filename) > _MAX_HF_REPOSITORY_PATH_CHARS:
+        raise ValueError(
+            "Hugging Face repository inventory incomplete: repository filename exceeds "
+            f"the bounded path length ({_MAX_HF_REPOSITORY_PATH_CHARS}) for {repo_id}"
+        )
+    if not filename or filename.startswith("/") or "\x00" in filename or "\\" in filename:
+        raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in filename):
+        raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
+
+    parts = filename.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
+    return filename
+
+
+def _normalize_huggingface_repo_files(repo_id: str, filenames: Collection[str]) -> list[str]:
+    """Validate, deduplicate, bound, and deterministically order repository filenames."""
+    normalized: set[str] = set()
+    for filename in filenames:
+        safe_filename = _validate_huggingface_repo_filename(repo_id, filename)
+        normalized.add(safe_filename)
+        if len(normalized) > _MAX_HF_REPOSITORY_INVENTORY_FILES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: repository file count exceeds "
+                f"the bounded inventory limit ({_MAX_HF_REPOSITORY_INVENTORY_FILES}) for {repo_id}"
+            )
+    return sorted(normalized)
+
+
 def _is_scannable_hf_file(filename: str, extensions: Collection[str]) -> bool:
     """Return whether a listed Hugging Face file has a supported suffix."""
     filename_lower = filename.lower()
     return any(filename_lower.endswith(ext.lower()) for ext in extensions if ext)
+
+
+def _is_huggingface_repo_bookkeeping_file(filename: str) -> bool:
+    """Return whether a Hub repo entry is fixed metadata, not model payload."""
+    return PurePosixPath(filename).name.lower() in _HF_REPO_BOOKKEEPING_FILENAMES
 
 
 def _raise_no_scannable_hf_files(repo_id: str) -> None:
@@ -1792,6 +3050,101 @@ def _get_hf_content_route_scanner_ids() -> set[str]:
     return scanner_ids
 
 
+@cache
+def _hf_safetensors_route_scanner_ids() -> frozenset[str]:
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    return scanner_ids_for_detected_format("safetensors")
+
+
+@cache
+def _hf_route_scanner_ids_for_formats(format_names: frozenset[str]) -> frozenset[str]:
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    scanner_ids: set[str] = set()
+    for format_name in format_names:
+        scanner_ids.update(scanner_ids_for_detected_format(format_name))
+    return frozenset(scanner_ids)
+
+
+def _hf_safetensors_shard_excluded_by_selection(
+    filename: str,
+    selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
+    *,
+    complete_safetensors_shard_files: Collection[str] | None = None,
+) -> bool:
+    """Return whether no selected scanner can claim a declared SafeTensors shard."""
+    if _parse_hf_safetensors_shard(filename) is None:
+        return False
+    if complete_safetensors_shard_files is not None and filename not in complete_safetensors_shard_files:
+        return False
+
+    # SafeTensors content routes intentionally include overlap-capable scanners
+    # such as pickle and compressed, not only the SafeTensors scanner itself.
+    safetensors_route_scanner_ids = _hf_safetensors_route_scanner_ids()
+    if selected_route_scanner_ids is not None:
+        selected_safetensors_routes = selected_route_scanner_ids.intersection(safetensors_route_scanner_ids)
+        return not selected_safetensors_routes
+    if selected_route_formats is None:
+        return False
+
+    selected_format_route_scanner_ids = _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+    return not selected_format_route_scanner_ids.intersection(safetensors_route_scanner_ids)
+
+
+def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
+    match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(filename)
+    if match is None:
+        return None
+    index = int(match.group("index"))
+    total = int(match.group("total"))
+    if index < 1 or total < 2 or index > total:
+        return None
+    return match.group("stem"), index, total
+
+
+def _has_hf_safetensors_shard_shape(filename: str) -> bool:
+    return _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename) is not None
+
+
+def _complete_hf_safetensors_shard_files(repo_files: Collection[str]) -> frozenset[str]:
+    """Return canonical SafeTensors shards whose directory-scoped family is complete."""
+    families: dict[tuple[str, int], dict[int, set[str]]] = {}
+    for filename in repo_files:
+        parsed = _parse_hf_safetensors_shard(filename)
+        if parsed is None:
+            continue
+        stem, index, total = parsed
+        families.setdefault((stem, total), {}).setdefault(index, set()).add(filename)
+
+    complete_files: set[str] = set()
+    for (_stem, total), indexed_files in families.items():
+        if len(indexed_files) != total:
+            continue
+        if any(index not in indexed_files or len(indexed_files[index]) != 1 for index in range(1, total + 1)):
+            continue
+        for filenames in indexed_files.values():
+            complete_files.update(filenames)
+    return frozenset(complete_files)
+
+
+def _hf_detected_format_excluded_by_selected_route_formats(
+    detected_format: str,
+    selected_route_formats: set[str],
+) -> bool:
+    """Return whether inferred route formats cannot claim a detected route."""
+    normalized_detected_format = str(detected_format).lower()
+    if normalized_detected_format in selected_route_formats:
+        return False
+
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    selected_route_scanner_ids = _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+    detected_route_scanner_ids = scanner_ids_for_detected_format(normalized_detected_format)
+    return not selected_route_scanner_ids.intersection(detected_route_scanner_ids)
+
+
 def _get_selected_hf_content_route_formats(
     scannable_extensions: Collection[str] | None,
     scannable_filenames: Collection[str] | None,
@@ -1803,14 +3156,40 @@ def _get_selected_hf_content_route_formats(
     from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP, get_scanner_registry_metadata
 
     content_route_formats = _get_hf_content_route_formats()
-    selected_extensions = (
+    selected_extensions: set[str] = (
         set() if scannable_extensions is None else {str(extension).lower() for extension in scannable_extensions}
     )
     selected_filenames = (
         set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
     )
+    for filename in selected_filenames:
+        suffix = PurePosixPath(filename).suffix.lower()
+        if suffix:
+            selected_extensions.add(suffix)
+
+    scanner_metadata = get_scanner_registry_metadata()
+    extension_claimants: dict[str, set[str]] = {extension: set() for extension in selected_extensions if extension}
+    for scanner_id, scanner_info in scanner_metadata.items():
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            for extension in scanner_info.get(key, []):
+                extension_text = str(extension).lower()
+                if extension_text in extension_claimants and extension_text not in remote_excluded_extensions:
+                    extension_claimants[extension_text].add(scanner_id)
+
+    selected_extensions = {
+        extension
+        for extension in selected_extensions
+        if extension in EXTENSION_FORMAT_MAP
+        or (
+            len(extension_claimants.get(extension, set())) == 1
+            and bool(extension_claimants.get(extension, set()).intersection(content_route_formats))
+        )
+    }
     selected_formats: set[str] = set()
-    for scanner_id, scanner_info in get_scanner_registry_metadata().items():
+    for scanner_id, scanner_info in scanner_metadata.items():
         remote_excluded_extensions = {
             str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
         }
@@ -1840,6 +3219,37 @@ def _get_selected_hf_content_route_formats(
     return selected_formats
 
 
+def _streamable_hf_content_probe_candidates(
+    repo_files: list[str],
+    selected_files: Collection[str],
+    selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
+    exact_openvino_companion_candidates: Collection[str],
+) -> list[str]:
+    """Return streaming files that the renamed-file sniff loop would inspect."""
+    processed_files = set(selected_files)
+    exact_openvino_companion_candidate_set = set(exact_openvino_companion_candidates)
+    complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
+    candidates: list[str] = []
+    for file_name in repo_files:
+        if file_name in processed_files:
+            continue
+        processed_files.add(file_name)
+        if _is_huggingface_repo_bookkeeping_file(file_name):
+            continue
+        if file_name in exact_openvino_companion_candidate_set:
+            continue
+        if _hf_safetensors_shard_excluded_by_selection(
+            file_name,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            complete_safetensors_shard_files=complete_safetensors_shard_files,
+        ):
+            continue
+        candidates.append(file_name)
+    return candidates
+
+
 def _select_streamable_hf_files(
     repo_id: str,
     repo_files: list[str],
@@ -1848,9 +3258,11 @@ def _select_streamable_hf_files(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     *,
+    allow_content_probes: bool = True,
     include_all_files: bool = False,
+    include_all_files_unbounded_extra_limit: int | None = None,
     deadline: float | None = None,
-) -> list[str]:
+) -> _HuggingFaceStreamingSelection:
     """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
     selected_route_formats: set[str] | None = None
     selected_route_scanner_ids: set[str] | None = None
@@ -1858,26 +3270,14 @@ def _select_streamable_hf_files(
         selected_route_scanner_ids = {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}.intersection(
             _get_hf_content_route_scanner_ids()
         )
-    elif scannable_filenames:
-        from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP
-
-        authoritative_extensions = (
-            set()
-            if scannable_extensions is None
-            else {
-                str(extension).lower()
-                for extension in scannable_extensions
-                if str(extension).lower() in EXTENSION_FORMAT_MAP
-            }
-        )
-        selected_route_formats = _get_selected_hf_content_route_formats(authoritative_extensions, None)
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
-    sniff_renamed_files = not include_all_files and (
+    sniff_renamed_files_would_be_active = not include_all_files and (
         bool(selected_route_scanner_ids)
         if selected_route_scanner_ids is not None
         else selected_route_formats is None or bool(selected_route_formats)
     )
+    sniff_renamed_files = allow_content_probes and sniff_renamed_files_would_be_active
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
         filenames = (
@@ -1891,8 +3291,9 @@ def _select_streamable_hf_files(
             set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
         )
     model_files: list[str] = []
+    content_route_formats: dict[str, str] = {}
     extensionless_count = 0
-    unfiltered_count = 0
+    include_all_extra_count = 0
     seen_files: set[str] = set()
 
     for file_name in repo_files:
@@ -1910,14 +3311,19 @@ def _select_streamable_hf_files(
             model_files.append(file_name)
             continue
 
+        if _is_huggingface_repo_bookkeeping_file(file_name):
+            continue
+
         if include_all_files:
-            unfiltered_count += 1
-            if unfiltered_count > _MAX_HF_STREAMING_UNFILTERED_FILES:
-                raise Exception(
-                    f"Refusing to stream-download unfiltered files from {repo_id}: "
-                    f"repository listing exceeds the bounded unfiltered candidate limit "
-                    f"({_MAX_HF_STREAMING_UNFILTERED_FILES}); streaming coverage is incomplete"
-                )
+            if include_all_files_unbounded_extra_limit is not None:
+                include_all_extra_count += 1
+                if include_all_extra_count > include_all_files_unbounded_extra_limit:
+                    raise ValueError(
+                        "Refusing to stream-download all files from "
+                        f"{repo_id}: include_all_files=True without max_size selected more than "
+                        f"{include_all_files_unbounded_extra_limit} otherwise-unrecognized file(s); "
+                        "set max_size to bound aggregate transfer size"
+                    )
             model_files.append(file_name)
             continue
 
@@ -1931,16 +3337,41 @@ def _select_streamable_hf_files(
                 )
             model_files.append(file_name)
 
+    exact_openvino_companion_candidates = (
+        {
+            companion
+            for selected_file in model_files
+            if (companion := _openvino_bin_companion_name(selected_file, repo_files)) is not None
+        }
+        if selected_route_scanner_ids == {"openvino"}
+        else set()
+    )
+
+    if not allow_content_probes and sniff_renamed_files_would_be_active:
+        candidate_files = _streamable_hf_content_probe_candidates(
+            repo_files,
+            model_files,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            exact_openvino_companion_candidates,
+        )
+        if candidate_files:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
+
     if sniff_renamed_files:
         inspected_files = 0
         probe_budget = _HuggingFaceProbeBudget(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
             deadline=deadline,
         )
-        selected_files = set(model_files)
-        for file_name in repo_files:
-            if file_name in selected_files:
-                continue
+        unskippable_detected_safetensors_shards: list[str] = []
+        for file_name in _streamable_hf_content_probe_candidates(
+            repo_files,
+            model_files,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            exact_openvino_companion_candidates,
+        ):
             if _is_safetensors_index_file(file_name):
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
@@ -1956,16 +3387,125 @@ def _select_streamable_hf_files(
                 from ...scanner_selection import scanner_ids_for_detected_format
 
                 if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
+                    if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                        unskippable_detected_safetensors_shards.append(file_name)
                     continue
-            elif selected_route_formats is not None and detected_format not in selected_route_formats:
+            elif selected_route_formats is not None and _hf_detected_format_excluded_by_selected_route_formats(
+                detected_format,
+                selected_route_formats,
+            ):
+                if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                    unskippable_detected_safetensors_shards.append(file_name)
                 continue
             model_files.append(file_name)
-            selected_files.add(file_name)
+            content_route_formats[file_name] = detected_format
+        if unskippable_detected_safetensors_shards:
+            preview = ", ".join(unskippable_detected_safetensors_shards[:3])
+            if len(unskippable_detected_safetensors_shards) > 3:
+                preview = f"{preview}, ..."
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: detected SafeTensors shard candidates "
+                f"that do not form a complete canonical shard family for {repo_id}: {preview}; "
+                "streaming coverage is incomplete"
+            )
 
     if not model_files:
         _raise_no_scannable_hf_files(repo_id)
 
-    return model_files
+    return _HuggingFaceStreamingSelection(model_files, content_route_formats)
+
+
+def _is_hf_streaming_onnx_candidate(filename: str, *, content_route_format: str | None = None) -> bool:
+    """Return whether a selected remote file should be checked for ONNX sidecars."""
+    return PurePosixPath(filename).suffix.lower() == ".onnx" or content_route_format == "onnx"
+
+
+def _resolve_hf_onnx_external_data_path(onnx_filename: str, location: str) -> str | None:
+    """Resolve a declared ONNX external_data location to a safe repo-relative path."""
+    if (
+        not location
+        or "\x00" in location
+        or "\\" in location
+        or location.startswith("/")
+        or ntpath.isabs(location.replace("/", "\\"))
+    ):
+        return None
+
+    normalized_location = posixpath.normpath(location)
+    if normalized_location in {"", "."} or normalized_location == ".." or normalized_location.startswith("../"):
+        return None
+
+    onnx_parent = PurePosixPath(onnx_filename).parent
+    candidate = onnx_parent / PurePosixPath(normalized_location)
+    parent_parts = () if str(onnx_parent) == "." else onnx_parent.parts
+    if candidate.parts[: len(parent_parts)] != parent_parts:
+        return None
+    return candidate.as_posix()
+
+
+def _discover_hf_onnx_external_data_files(
+    onnx_path: Path,
+    onnx_filename: str,
+    repo_files: set[str],
+) -> list[str]:
+    """Return safe declared ONNX external_data companions present in the repo listing."""
+    try:
+        import onnx
+
+        from ...scanners.onnx_scanner import _iter_model_external_data_tensor_groups
+    except Exception:
+        return []
+
+    try:
+        model = onnx.load(str(onnx_path), load_external_data=False)
+    except Exception:
+        return []
+
+    companions: list[str] = []
+    seen: set[str] = set()
+    for tensors in _iter_model_external_data_tensor_groups(model):
+        for tensor in tensors:
+            if tensor.data_location != onnx.TensorProto.EXTERNAL:
+                continue
+            info = {entry.key: entry.value for entry in tensor.external_data}
+            location = info.get("location")
+            if not isinstance(location, str):
+                continue
+            companion = _resolve_hf_onnx_external_data_path(onnx_filename, location)
+            if companion is None or companion == onnx_filename or companion not in repo_files or companion in seen:
+                continue
+            seen.add(companion)
+            companions.append(companion)
+            if len(companions) > _MAX_HF_STREAMING_ONNX_EXTERNAL_DATA_FILES:
+                raise ValueError(
+                    "Hugging Face ONNX external_data coverage incomplete: "
+                    f"{onnx_filename} declares more than "
+                    f"{_MAX_HF_STREAMING_ONNX_EXTERNAL_DATA_FILES} external data files"
+                )
+    return companions
+
+
+def _get_hf_onnx_external_data_sizes(
+    repo_id: str,
+    filenames: list[str],
+    *,
+    revision: str,
+    deadline: float | None,
+) -> dict[str, int]:
+    """Return exact sizes for ONNX sidecars, failing closed on missing metadata."""
+    sizes, _revision = _get_huggingface_path_sizes(
+        repo_id,
+        filenames,
+        resolved_revision=revision,
+        deadline=deadline,
+    )
+    exact_sizes: dict[str, int] = {}
+    for filename in filenames:
+        size = sizes.get(filename)
+        if size is None:
+            raise ValueError(f"Cannot download {repo_id}: unknown size for ONNX external_data file {filename}")
+        exact_sizes[filename] = size
+    return exact_sizes
 
 
 def _get_hf_cache_root() -> Path:
@@ -2020,6 +3560,17 @@ def _is_within_directory(base_dir: Path, target: Path) -> bool:
     return target_path.is_relative_to(base_path)
 
 
+def _is_huggingface_cache_blob_target(downloaded_path: Path, target: Path) -> bool:
+    """Return True when target is a Hub cache blob for the snapshot path."""
+    target_path = target.resolve()
+    current_path = downloaded_path.resolve()
+    for candidate in [current_path, *current_path.parents]:
+        if candidate.parent.name == "snapshots":
+            blob_dir = candidate.parent.parent / "blobs"
+            return _is_within_directory(blob_dir, target_path)
+    return False
+
+
 def _build_huggingface_download_path(cache_dir: Path, namespace: str, repo_name: str) -> Path:
     """Build and containment-check the local HuggingFace download path."""
     cache_root = (cache_dir / "huggingface").resolve()
@@ -2038,16 +3589,15 @@ def _list_repo_files_with_timeout(
     *,
     requested_revision: str | None = None,
     deadline: float | None = None,
+    revision: str | None = None,
 ) -> tuple[list[str] | None, str | None, str | None]:
     """Return repository files, their immutable revision, or a failure reason."""
+    effective_revision = revision if revision is not None else requested_revision
     if deadline is not None:
+        operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": timeout_seconds}
+        if effective_revision is not None:
+            operation_kwargs["revision"] = effective_revision
         try:
-            operation_kwargs: dict[str, Any] = {
-                "repo_id": repo_id,
-                "request_timeout": timeout_seconds,
-            }
-            if requested_revision is not None:
-                operation_kwargs["requested_revision"] = requested_revision
             worker_result = _run_huggingface_worker_with_deadline(
                 "list_repo_files",
                 operation_kwargs,
@@ -2064,32 +3614,25 @@ def _list_repo_files_with_timeout(
             return None, None, "repository listing unavailable"
         if not isinstance(raw_files, list) or not all(isinstance(file_name, str) for file_name in raw_files):
             return None, None, "repository listing returned invalid filenames"
-        worker_files = cast(list[str], raw_files)
-        revision = value.get("revision")
-        if not _is_huggingface_commit_sha(revision):
-            return worker_files, None, "repository listing did not include an immutable commit SHA"
-        assert isinstance(revision, str)
-        return worker_files, revision, None
-
-    from huggingface_hub import HfApi
+        worker_revision = value.get("revision")
+        if not _is_huggingface_commit_sha(worker_revision):
+            return None, None, "repository listing did not include an immutable commit SHA"
+        assert isinstance(worker_revision, str)
+        try:
+            worker_files = _normalize_huggingface_repo_files(repo_id, cast(list[str], raw_files))
+        except ValueError as exc:
+            return None, None, str(exc)
+        return worker_files, worker_revision, None
 
     try:
-        repo_info_kwargs: dict[str, Any] = {"timeout": timeout_seconds, "files_metadata": False}
-        if requested_revision is not None:
-            repo_info_kwargs["revision"] = requested_revision
-        repo_info = HfApi().repo_info(repo_id, **repo_info_kwargs)
+        files, resolved_revision = _list_huggingface_repo_files_at_revision(
+            repo_id,
+            requested_revision=effective_revision,
+            timeout_seconds=timeout_seconds,
+        )
     except Exception as exc:
         return None, None, str(exc)
-
-    files = _extract_huggingface_repo_files(repo_info)
-    if files is None:
-        return None, None, "repository listing unavailable"
-
-    revision = getattr(repo_info, "sha", None)
-    if not _is_huggingface_commit_sha(revision):
-        return files, None, "repository listing did not include an immutable commit SHA"
-
-    return files, revision, None
+    return files, resolved_revision, None
 
 
 def _run_huggingface_worker_with_deadline(
@@ -2195,19 +3738,195 @@ def _terminate_huggingface_download_process(process: subprocess.Popen[str]) -> N
         process.communicate()
 
 
-def _list_huggingface_repo_files_at_revision(repo_id: str, timeout_seconds: float = 30) -> tuple[list[str], str]:
+def _extract_huggingface_tree_page_files(repo_id: str, page_items: object) -> list[str]:
+    """Extract file paths from one Hugging Face tree API page."""
+    if not isinstance(page_items, list):
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree page for {repo_id}")
+
+    files: list[str] = []
+    for item in page_items:
+        if not isinstance(item, dict):
+            raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree item for {repo_id}")
+        item_type = item.get("type")
+        if item_type not in {"file", "directory"}:
+            raise ValueError(f"Hugging Face repository inventory incomplete: unknown tree item type for {repo_id}")
+        path = item.get("path")
+        if not isinstance(path, str):
+            raise ValueError(f"Hugging Face repository inventory incomplete: invalid repository filename for {repo_id}")
+        safe_path = _validate_huggingface_repo_filename(repo_id, path)
+        if item_type == "directory":
+            continue
+        files.append(safe_path)
+    return files
+
+
+def _read_bounded_huggingface_tree_response(response: Any, repo_id: str) -> object:
+    """Read and decode one bounded Hugging Face tree API page."""
+    headers = getattr(response, "headers", {})
+    content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
+    if content_length is not None:
+        try:
+            response_size = int(content_length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Hugging Face repository inventory incomplete: invalid tree page size for {repo_id}"
+            ) from exc
+        if response_size < 0 or response_size > _MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: tree page response exceeds "
+                f"the bounded response limit ({_MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES} bytes) for {repo_id}"
+            )
+
+    payload = bytearray()
+    iter_bytes = getattr(response, "iter_bytes", None)
+    iter_content = getattr(response, "iter_content", None)
+    if callable(iter_bytes):
+        chunks = iter_bytes(chunk_size=_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES)
+    elif callable(iter_content):
+        chunks = iter_content(chunk_size=_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES)
+    else:
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree page response for {repo_id}")
+    for chunk in chunks:
+        if not chunk:
+            continue
+        payload.extend(chunk)
+        if len(payload) > _MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: tree page response exceeds "
+                f"the bounded response limit ({_MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES} bytes) for {repo_id}"
+            )
+
+    try:
+        return json.loads(bytes(payload))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree page JSON for {repo_id}") from exc
+
+
+def _canonical_huggingface_tree_page_url(url: str) -> str:
+    """Normalize tree page URLs enough to detect equivalent pagination loops."""
+    parts = urlsplit(url)
+    query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)), doseq=True)
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, query, ""))
+
+
+def _validate_huggingface_tree_next_url(repo_id: str, current_url: str, next_url: str) -> str:
+    """Return a safe same-origin tree pagination URL or fail closed."""
+    if next_url.strip() != next_url or any(ord(char) < 32 or ord(char) == 127 for char in next_url):
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid pagination link for {repo_id}")
+
+    try:
+        current_parts = urlsplit(current_url)
+        next_parts = urlsplit(next_url)
+        _ = (current_parts.port, next_parts.port)
+    except ValueError as exc:
+        raise ValueError(
+            f"Hugging Face repository inventory incomplete: invalid pagination link for {repo_id}"
+        ) from exc
+
+    if (
+        not next_parts.scheme
+        or not next_parts.netloc
+        or next_parts.username is not None
+        or next_parts.password is not None
+    ):
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid pagination link for {repo_id}")
+
+    if (
+        next_parts.scheme.lower() != current_parts.scheme.lower()
+        or next_parts.netloc.lower() != current_parts.netloc.lower()
+    ):
+        raise ValueError(f"Hugging Face repository inventory incomplete: pagination link changed origin for {repo_id}")
+
+    return next_url
+
+
+def _list_huggingface_repo_files_paginated(
+    repo_id: str,
+    revision: str,
+    timeout_seconds: float = 30,
+) -> list[str]:
+    """Return a complete bounded repository file inventory at an immutable revision."""
+    from huggingface_hub import HfApi
+    from huggingface_hub.utils import build_hf_headers, get_session
+
+    api = HfApi()
+    next_url: str | None = f"{api.endpoint}/api/models/{repo_id}/tree/{quote(revision, safe='')}"
+    params: dict[str, bool] | None = {"recursive": True, "expand": False}
+    headers = build_hf_headers(token=None)
+    session = get_session()
+    seen_page_urls: set[str] = set()
+    files: set[str] = set()
+    page_count = 0
+
+    while next_url is not None:
+        canonical_next_url = _canonical_huggingface_tree_page_url(next_url)
+        if canonical_next_url in seen_page_urls:
+            raise ValueError(f"Hugging Face repository inventory incomplete: pagination cursor repeated for {repo_id}")
+        seen_page_urls.add(canonical_next_url)
+        page_count += 1
+        if page_count > _MAX_HF_REPOSITORY_INVENTORY_PAGES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: repository tree page count exceeds "
+                f"the bounded pagination limit ({_MAX_HF_REPOSITORY_INVENTORY_PAGES}) for {repo_id}"
+            )
+
+        stream_response = getattr(session, "stream", None)
+        if callable(stream_response):
+            response_context = stream_response(
+                "GET",
+                next_url,
+                headers=headers,
+                params=params,
+                timeout=timeout_seconds,
+            )
+        else:
+            response_context = cast(Any, session).get(
+                next_url, headers=headers, params=params, timeout=timeout_seconds, stream=True
+            )
+        with response_context as response:
+            response.raise_for_status()
+            page_items = _read_bounded_huggingface_tree_response(response, repo_id)
+
+        for filename in _extract_huggingface_tree_page_files(repo_id, page_items):
+            files.add(_validate_huggingface_repo_filename(repo_id, filename))
+            if len(files) > _MAX_HF_REPOSITORY_INVENTORY_FILES:
+                raise ValueError(
+                    "Hugging Face repository inventory incomplete: repository file count exceeds "
+                    f"the bounded inventory limit ({_MAX_HF_REPOSITORY_INVENTORY_FILES}) for {repo_id}"
+                )
+
+        links = getattr(response, "links", {})
+        next_link = links.get("next") if isinstance(links, dict) else None
+        next_candidate = next_link.get("url") if isinstance(next_link, dict) else None
+        next_url = (
+            _validate_huggingface_tree_next_url(repo_id, next_url, next_candidate)
+            if isinstance(next_candidate, str) and next_candidate
+            else None
+        )
+        params = None
+
+    return sorted(files)
+
+
+def _list_huggingface_repo_files_at_revision(
+    repo_id: str,
+    *,
+    requested_revision: str | None = None,
+    timeout_seconds: float = 30,
+) -> tuple[list[str], str]:
     """Return repository filenames and the revision that produced the listing."""
     from huggingface_hub import HfApi
 
-    repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
+    repo_info_kwargs: dict[str, Any] = {"timeout": timeout_seconds, "files_metadata": False}
+    if requested_revision is not None:
+        repo_info_kwargs["revision"] = requested_revision
+    repo_info = HfApi().repo_info(repo_id, **repo_info_kwargs)
     raw_revision = getattr(repo_info, "sha", None)
     if not _is_huggingface_commit_sha(raw_revision):
-        raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+        raise Exception("repository listing did not include an immutable commit SHA")
     assert isinstance(raw_revision, str)
 
-    files = _extract_huggingface_repo_files(repo_info)
-    if files is None:
-        raise Exception(f"Cannot enforce max-size for {repo_id}: repository listing unavailable")
+    files = _list_huggingface_repo_files_paginated(repo_id, raw_revision, timeout_seconds=timeout_seconds)
     return files, raw_revision
 
 
@@ -2250,9 +3969,14 @@ def _get_huggingface_path_sizes(
             if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                 continue
             raw_size = item.get("size")
-            worker_sizes[item["path"]] = (
-                raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
-            )
+            size = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+            path = item["path"]
+            previous_size = worker_sizes.get(path)
+            if path in worker_sizes and previous_size != size:
+                raise Exception(
+                    f"Cannot enforce max-size for {repo_id}: inconsistent size metadata for selected file {path}"
+                )
+            worker_sizes[path] = size
         return worker_sizes, raw_revision
 
     from huggingface_hub import HfApi
@@ -2269,16 +3993,28 @@ def _get_huggingface_path_sizes(
         assert isinstance(raw_revision, str)
         resolved_revision = raw_revision
     assert resolved_revision is not None
-    path_info = api.get_paths_info(repo_id, filenames, revision=resolved_revision)
+    path_info = []
+    for start in range(0, len(filenames), _HF_PATH_INFO_BATCH_SIZE):
+        path_info.extend(
+            api.get_paths_info(
+                repo_id,
+                filenames[start : start + _HF_PATH_INFO_BATCH_SIZE],
+                revision=resolved_revision,
+            )
+        )
     sizes: dict[str, int | None] = {}
     for item in path_info:
         path = getattr(item, "path", None)
         if not isinstance(path, str):
             continue
         raw_size = getattr(item, "size", None)
-        sizes[path] = (
-            raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
-        )
+        size = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+        previous_size = sizes.get(path)
+        if path in sizes and previous_size != size:
+            raise Exception(
+                f"Cannot enforce max-size for {repo_id}: inconsistent size metadata for selected file {path}"
+            )
+        sizes[path] = size
     return sizes, resolved_revision
 
 
@@ -2333,7 +4069,24 @@ def _verify_huggingface_selection_within_max_size(
 
     total_size = initial_size
     for filename in dict.fromkeys(filenames):
+        _validate_huggingface_repo_filename(repo_id, filename)
         file_path = downloaded_path / filename
+        parent_path = file_path.parent.resolve()
+        if not _is_within_directory(downloaded_path, parent_path):
+            raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file path escaped: {filename}")
+        if file_path.is_symlink():
+            try:
+                symlink_target = file_path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(
+                    f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}"
+                ) from exc
+            if not _is_within_directory(downloaded_path, symlink_target) and not _is_huggingface_cache_blob_target(
+                downloaded_path, symlink_target
+            ):
+                raise ValueError(
+                    f"Cannot verify max-size for {repo_id}: downloaded selected file symlink target escaped: {filename}"
+                )
         if not file_path.is_file():
             raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}")
         try:
@@ -2351,11 +4104,272 @@ def _verify_huggingface_selection_within_max_size(
     return total_size
 
 
-def get_model_info(url: str) -> dict:
+def _get_downloaded_huggingface_file_size(repo_id: str, file_path: Path, filename: str) -> int:
+    """Return a downloaded file's exact size or fail closed with remote filename context."""
+    if not file_path.is_file():
+        raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}")
+    try:
+        return file_path.stat().st_size
+    except OSError as exc:
+        raise ValueError(
+            f"Cannot verify max-size for {repo_id}: downloaded selected file unreadable: {filename}"
+        ) from exc
+
+
+def _should_cleanup_hf_streaming_context_file(
+    cache_dir: Path | None,
+    download_path: Path | None,
+    file_path: Path,
+) -> bool:
+    """Return whether a context-only sidecar is in ModelAudit's disposable HF staging tree."""
+    if cache_dir is None or download_path is None:
+        return False
+    try:
+        resolved_cache_dir = cache_dir.resolve()
+    except OSError:
+        return False
+    if not resolved_cache_dir.name.startswith("modelaudit_hf_"):
+        return False
+    return _is_within_directory(download_path, file_path)
+
+
+def _huggingface_metadata_size(item: Any) -> int | None:
+    """Extract a non-negative Hub-disclosed size from sibling/tree metadata."""
+    if isinstance(item, dict):
+        raw_size = item.get("size")
+        raw_lfs = item.get("lfs")
+    else:
+        raw_size = getattr(item, "size", None)
+        raw_lfs = getattr(item, "lfs", None)
+
+    if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0:
+        return raw_size
+
+    raw_lfs_size = raw_lfs.get("size") if isinstance(raw_lfs, dict) else getattr(raw_lfs, "size", None)
+    if isinstance(raw_lfs_size, int) and not isinstance(raw_lfs_size, bool) and raw_lfs_size >= 0:
+        return raw_lfs_size
+
+    return None
+
+
+def _extract_huggingface_repo_file_sizes(repo_info: Any) -> dict[str, int]:
+    """Return recursive file sizes disclosed by Hugging Face repo metadata."""
+    siblings = getattr(repo_info, "siblings", None) or ()
+    sizes: dict[str, int] = {}
+    for sibling in siblings:
+        if isinstance(sibling, dict):
+            file_name = sibling.get("rfilename") or sibling.get("path")
+        else:
+            file_name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+        if not isinstance(file_name, str) or not file_name:
+            continue
+        file_size = _huggingface_metadata_size(sibling)
+        if file_size is not None:
+            sizes[file_name] = file_size
+    return sizes
+
+
+def _is_huggingface_gated_or_auth_error(error: BaseException) -> bool:
+    """Return whether a Hub metadata error means selected bytes are inaccessible."""
+    markers = (
+        "gated",
+        "unauthorized",
+        "authorization",
+        "forbidden",
+        "restricted",
+        "401",
+        "403",
+    )
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        error_type = type(current).__name__.lower()
+        error_text = str(current).lower()
+        if any(marker in error_type or marker in error_text for marker in markers):
+            return True
+        response = getattr(current, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code in {401, 403}:
+            return True
+        cause = current.__cause__
+        if cause is not None:
+            pending.append(cause)
+        context = current.__context__
+        if context is not None:
+            pending.append(context)
+    return False
+
+
+def _is_huggingface_gated_repo(repo_info: Any) -> bool:
+    gated = getattr(repo_info, "gated", None)
+    return bool(gated and gated not in {False, "false", "False", "none", "None"})
+
+
+def _build_huggingface_model_info(
+    repo_id: str,
+    repo_info: Any,
+    repo_files: list[str],
+    repo_revision: str,
+    *,
+    deadline: float | None = None,
+    streaming_selection: bool = False,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    allow_content_probes: bool = True,
+    include_all_files: bool = False,
+) -> dict[str, Any]:
+    """Build selected recursive inventory metadata using the downloader's selection policy."""
+    inaccessible_probe_files: list[str] = []
+    allow_inaccessible_probe_errors = _is_huggingface_gated_repo(repo_info)
+    if streaming_selection:
+        selection = _select_streamable_hf_files(
+            repo_id,
+            repo_files,
+            repo_revision,
+            scannable_extensions,
+            scannable_filenames,
+            scannable_scanner_ids,
+            allow_content_probes=allow_content_probes,
+            include_all_files=include_all_files,
+            deadline=deadline,
+        )
+        model_files = selection.filenames
+        include_openvino_companions = scannable_scanner_ids is None or "openvino" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        model_files = _include_huggingface_openvino_companions(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_files,
+            allow_content_probes=allow_content_probes,
+            include_openvino_companions=include_openvino_companions,
+            deadline=deadline,
+        )
+    else:
+        model_extensions = _get_model_extensions()
+        model_files = _select_huggingface_model_files(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_extensions,
+            allow_content_probes=allow_content_probes,
+            allow_inaccessible_probe_errors=allow_inaccessible_probe_errors,
+            inaccessible_probe_files=inaccessible_probe_files if allow_inaccessible_probe_errors else None,
+            deadline=deadline,
+        )
+    inventory_files = list(dict.fromkeys([*model_files, *inaccessible_probe_files]))
+    inaccessible_probe_file_set = set(inaccessible_probe_files)
+    repo_metadata_sizes = _extract_huggingface_repo_file_sizes(repo_info)
+    repo_is_gated = _is_huggingface_gated_repo(repo_info)
+
+    path_size_error: str | None = None
+    path_size_gated = False
+    try:
+        selected_sizes, size_revision = _get_huggingface_path_sizes(
+            repo_id,
+            inventory_files,
+            resolved_revision=repo_revision,
+            deadline=deadline,
+        )
+    except Exception as exc:
+        selected_sizes = {}
+        size_revision = repo_revision
+        path_size_gated = _is_huggingface_gated_or_auth_error(exc) or repo_is_gated
+        path_size_error = redact_huggingface_urls_in_text(str(exc))
+
+    files: list[dict[str, Any]] = []
+    accessible_bytes = 0
+    inaccessible_gated_bytes = 0
+    inaccessible_gated_count = 0
+    unknown_size_count = 0
+    unknown_size_files: list[str] = []
+    inaccessible_gated_files: list[str] = []
+
+    for filename in inventory_files:
+        path_size = selected_sizes.get(filename)
+        size = path_size if isinstance(path_size, int) and not isinstance(path_size, bool) else None
+        inaccessible_gated = filename in inaccessible_probe_file_set
+        gated_missing_path_size = repo_is_gated and (filename not in selected_sizes or path_size is None)
+        if size is None and (path_size_gated or inaccessible_gated or gated_missing_path_size):
+            metadata_size = repo_metadata_sizes.get(filename)
+            if metadata_size is not None:
+                size = metadata_size
+            inaccessible_gated = True
+
+        file_info: dict[str, Any] = {"name": filename, "size": size}
+        if inaccessible_gated:
+            inaccessible_gated_count += 1
+            inaccessible_gated_bytes += size or 0
+            inaccessible_gated_files.append(filename)
+            file_info["access"] = "gated"
+            if size is None:
+                unknown_size_count += 1
+                unknown_size_files.append(filename)
+        elif size is None:
+            unknown_size_count += 1
+            unknown_size_files.append(filename)
+            file_info["access"] = "unknown"
+        else:
+            accessible_bytes += size
+            file_info["access"] = "available"
+        files.append(file_info)
+
+    total_size = accessible_bytes + inaccessible_gated_bytes
+    inventory_status = "complete"
+    if inaccessible_gated_count:
+        inventory_status = "gated_inaccessible"
+    elif unknown_size_count:
+        inventory_status = "partial_unknown_size"
+
+    return {
+        "repo_id": repo_id,
+        "revision": size_revision,
+        "total_size": total_size,
+        "accessible_size": accessible_bytes,
+        "inaccessible_gated_bytes": inaccessible_gated_bytes,
+        "inaccessible_gated_file_count": inaccessible_gated_count,
+        "inaccessible_gated_files": inaccessible_gated_files[:20],
+        "unknown_size_count": unknown_size_count,
+        "unknown_size_files": unknown_size_files[:20],
+        "file_count": len(inventory_files),
+        "repo_file_count": len(repo_files),
+        "files": files,
+        "inventory_status": inventory_status,
+        "inventory_error": path_size_error,
+        "gated": repo_is_gated,
+        "model_id": getattr(repo_info, "modelId", repo_id),
+        "author": getattr(repo_info, "author", ""),
+    }
+
+
+def get_model_info(
+    url: str,
+    *,
+    timeout_seconds: float | None = None,
+    streaming_selection: bool = False,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    allow_content_probes: bool = True,
+    include_all_files: bool = False,
+) -> dict[str, Any]:
     """Get information about a HuggingFace model without downloading it.
 
     Args:
         url: HuggingFace model URL
+        timeout_seconds: Optional end-to-end preview deadline in seconds
+        streaming_selection: Match streaming acquisition selection instead of snapshot selection
+        scannable_extensions: Optional remote prefilter extensions from scanner selection policy
+        scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
+        scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
+        allow_content_probes: Allow bounded artifact range reads for renamed-format routing
+        include_all_files: Include otherwise-unrecognized files under streaming selection bounds
 
     Returns:
         Dictionary with model information including size
@@ -2368,57 +4382,53 @@ def get_model_info(url: str) -> dict:
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
-    requested_revision = _requested_huggingface_revision(url)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     api = HfApi()
     try:
-        # Get model info for metadata
-        model_info_kwargs: dict[str, Any] = {}
+        repo_info_kwargs: dict[str, Any] = {"files_metadata": True}
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            repo_info_kwargs["timeout"] = min(30.0, remaining)
         if requested_revision is not None:
-            model_info_kwargs["revision"] = requested_revision
-        model_info = api.model_info(repo_id, **model_info_kwargs)
+            repo_info_kwargs["revision"] = requested_revision
+        model_info = api.repo_info(repo_id, **repo_info_kwargs)
+        repo_files = _extract_huggingface_repo_files(model_info)
+        if repo_files is None:
+            raise Exception("repository listing unavailable")
+        repo_revision = getattr(model_info, "sha", None)
+        if not _is_huggingface_commit_sha(repo_revision):
+            raise Exception("repository listing did not include an immutable commit SHA")
+        assert isinstance(repo_revision, str)
 
-        # Use list_repo_tree to get accurate file sizes
-        # (model_info.siblings often returns None for size)
-        total_size = 0
-        files = []
-        try:
-            repo_tree_kwargs: dict[str, Any] = {"recursive": False}
-            if requested_revision is not None:
-                repo_tree_kwargs["revision"] = requested_revision
-            repo_files = api.list_repo_tree(repo_id, **repo_tree_kwargs)
-            for item in repo_files:
-                # Skip metadata files
-                if hasattr(item, "path") and item.path not in [".gitattributes", "README.md"]:
-                    file_size = getattr(item, "size", 0) or 0
-                    total_size += file_size
-                    files.append({"name": item.path, "size": file_size})
-        except Exception as e:
-            # If list_repo_tree fails, return 0 (will show as "Unknown size" in CLI)
-            logger.debug(f"list_repo_tree failed for {repo_id}, falling back to unknown size: {e}")
-            total_size = 0
-            # Still try to get file count from siblings
-            siblings = model_info.siblings or []
-            for sibling in siblings:
-                if sibling.rfilename not in [".gitattributes", "README.md"]:
-                    files.append({"name": sibling.rfilename, "size": 0})
-
-        return {
-            "repo_id": repo_id,
-            "total_size": total_size,
-            "file_count": len(files),
-            "files": files,
-            "model_id": getattr(model_info, "modelId", repo_id),
-            "author": getattr(model_info, "author", ""),
-        }
+        return _build_huggingface_model_info(
+            repo_id,
+            model_info,
+            repo_files,
+            repo_revision,
+            deadline=deadline,
+            streaming_selection=streaming_selection,
+            scannable_extensions=scannable_extensions,
+            scannable_filenames=scannable_filenames,
+            scannable_scanner_ids=scannable_scanner_ids,
+            allow_content_probes=allow_content_probes,
+            include_all_files=include_all_files,
+        )
     except Exception as e:
         raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 
 
-def get_model_size(repo_id: str, timeout_seconds: float | None = None, *, revision: str | None = None) -> int | None:
+def get_model_size(
+    repo_id: str,
+    timeout_seconds: float | None = None,
+    *,
+    revision: str | None = None,
+) -> int | None:
     """Get the total size of a HuggingFace model repository.
 
     Args:
@@ -2457,22 +4467,21 @@ def _get_model_size_with_deadline(
     repo_id: str,
     deadline: float | None,
     *,
-    requested_revision: str | None = None,
+    revision: str | None = None,
 ) -> int | None:
     """Return model size without allowing the optional lookup to outlive acquisition."""
     if deadline is None:
-        return get_model_size(repo_id, revision=requested_revision)
+        return get_model_size(repo_id, revision=revision)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
     try:
+        operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": min(30.0, remaining)}
+        if revision is not None:
+            operation_kwargs["revision"] = revision
         worker_result = _run_huggingface_worker_with_deadline(
             "get_model_size",
-            {
-                "repo_id": repo_id,
-                "request_timeout": min(30.0, remaining),
-                "requested_revision": requested_revision,
-            },
+            operation_kwargs,
             deadline,
             repo_id,
         )
@@ -2491,6 +4500,7 @@ def download_model(
     max_size: int | None = None,
     *,
     timeout_seconds: float | None = None,
+    repository_file_inventory: list[str] | None = None,
 ) -> Path:
     """Download a model from HuggingFace.
 
@@ -2500,6 +4510,7 @@ def download_model(
         show_progress: Whether to show download progress
         max_size: Optional maximum total selected download size in bytes
         timeout_seconds: Optional end-to-end acquisition deadline in seconds
+        repository_file_inventory: Optional list filled with repository member names from metadata
 
     Returns:
         Path to the downloaded model directory
@@ -2516,18 +4527,13 @@ def download_model(
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
-    requested_revision = _requested_huggingface_revision(url)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     # Disk space check and path setup
-    model_size = _get_model_size_with_deadline(
-        repo_id,
-        deadline,
-        requested_revision=requested_revision,
-    )
+    model_size = _get_model_size_with_deadline(repo_id, deadline, revision=requested_revision)
     download_path = None  # Will be set only if cache_dir is provided
     disk_check_path = None
     download_path_preexisting = False
@@ -2554,8 +4560,6 @@ def download_model(
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
-        size_limit = _normalize_download_size_limit(max_size)
-
         # Enable/disable progress bars based on parameter
         if not show_progress:
             disable_progress_bars()
@@ -2564,47 +4568,12 @@ def download_model(
             # Force progress bar to show even in non-TTY environments
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files in the repository to identify model files
-        listing_timeout = 30.0
-        if deadline is not None:
-            listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
-            if listing_timeout <= 0:
-                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-        listing_kwargs: dict[str, Any] = {"deadline": deadline}
-        if requested_revision is not None:
-            listing_kwargs["requested_revision"] = requested_revision
-        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
-            repo_id,
-            listing_timeout,
-            **listing_kwargs,
-        )
-        if repo_files is None:
-            raise ValueError(
-                "Hugging Face selective filtering incomplete: "
-                f"failed listing files in repository {repo_id}: {repo_listing_error}"
-            )
-        if repo_revision is None:
-            raise ValueError(
-                "Hugging Face selective filtering incomplete: "
-                f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
-            )
-        if requested_revision is not None and repo_revision != requested_revision:
-            raise ValueError(
-                "Hugging Face selective filtering incomplete: "
-                f"resolved revision {repo_revision} did not match requested immutable revision {requested_revision}"
-            )
-
-        # Find model files in the repository (using centralized model extensions)
-        model_extensions = _get_model_extensions()
-        model_files = _select_huggingface_model_files(
-            repo_id,
-            repo_files,
-            repo_revision,
-            model_extensions,
-            deadline=deadline,
-        )
-        if deadline is not None and time.monotonic() >= deadline:
-            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+        plan = plan_huggingface_model_download(url, max_size, deadline=deadline)
+        deadline = plan.deadline
+        size_limit = plan.size_limit
+        model_files = plan.selected_files
+        if repository_file_inventory is not None:
+            repository_file_inventory[:] = plan.repo_files
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -2614,7 +4583,7 @@ def download_model(
             "repo_id": repo_id,
             "tqdm_class": None,  # Use default tqdm
         }
-        download_kwargs["revision"] = repo_revision
+        download_kwargs["revision"] = plan.download_revision
 
         if cache_dir is not None:
             # User provided cache directory - use local_dir for direct placement
@@ -2624,18 +4593,7 @@ def download_model(
             # This is safer as it doesn't risk deleting user's global cache
             pass
 
-        # If we found specific model files, download them
-        if model_files:
-            _revision, _ = _ensure_huggingface_selection_within_max_size(
-                repo_id,
-                model_files,
-                size_limit,
-                resolved_revision=repo_revision,
-                deadline=deadline,
-            )
-            download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
-        else:
-            _raise_no_scannable_hf_files(repo_id)
+        download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
 
         local_path = _run_huggingface_download_with_deadline(
             "snapshot_download",
@@ -2677,6 +4635,184 @@ def download_model(
         ) from e
 
 
+def plan_huggingface_model_download(
+    url: str,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    deadline: float | None = None,
+    allow_content_probes: bool = True,
+) -> HuggingFaceDownloadPlan:
+    """Plan the bounded Hugging Face files a standard acquisition would download."""
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
+    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+    size_limit = _normalize_download_size_limit(max_size)
+    if deadline is None and timeout_seconds is not None:
+        deadline = time.monotonic() + timeout_seconds
+
+    listing_timeout = 30.0
+    if deadline is not None:
+        listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+        if listing_timeout <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+        repo_id,
+        listing_timeout,
+        deadline=deadline,
+        revision=requested_revision,
+    )
+    if repo_files is None:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: "
+            f"failed listing files in repository {repo_id}: {repo_listing_error}"
+        )
+    if repo_revision is None:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: "
+            f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+        )
+
+    model_files = _select_huggingface_model_files(
+        repo_id,
+        repo_files,
+        repo_revision,
+        _get_model_extensions(),
+        allow_content_probes=allow_content_probes,
+        deadline=deadline,
+    )
+    model_files = _include_huggingface_openvino_companions(
+        repo_id,
+        repo_files,
+        repo_revision,
+        model_files,
+        allow_content_probes=allow_content_probes,
+        deadline=deadline,
+    )
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    if not model_files:
+        _raise_no_scannable_hf_files(repo_id)
+    revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
+        repo_id,
+        model_files,
+        size_limit,
+        resolved_revision=repo_revision,
+        deadline=deadline,
+    )
+    return HuggingFaceDownloadPlan(
+        namespace=namespace,
+        repo_name=repo_name,
+        repo_id=repo_id,
+        deadline=deadline,
+        size_limit=size_limit,
+        repo_files=repo_files,
+        repo_revision=repo_revision,
+        selected_files=model_files,
+        selected_sizes=selected_sizes,
+        download_revision=revision or repo_revision,
+    )
+
+
+def plan_huggingface_streaming_download(
+    url: str,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    allow_content_probes: bool = True,
+    include_all_files: bool = False,
+    _stream_safetensors_headers: bool = False,
+) -> HuggingFaceDownloadPlan:
+    """Plan the bounded Hugging Face files a streaming acquisition would download."""
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
+    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+    size_limit = _normalize_download_size_limit(max_size)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
+    listing_timeout = 30.0
+    if deadline is not None:
+        listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+        if listing_timeout <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+        repo_id,
+        listing_timeout,
+        deadline=deadline,
+        revision=requested_revision,
+    )
+    if repo_files is None:
+        if repo_listing_error and repo_listing_error.startswith("timed out after"):
+            raise Exception(f"Timeout listing files in repository {repo_id}")
+        raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+    if repo_revision is None:
+        raise Exception(
+            f"Failed listing files in repository {repo_id}: "
+            f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+        )
+
+    selection = _select_streamable_hf_files(
+        repo_id,
+        repo_files,
+        repo_revision,
+        scannable_extensions,
+        scannable_filenames,
+        scannable_scanner_ids,
+        allow_content_probes=allow_content_probes,
+        include_all_files=include_all_files,
+        include_all_files_unbounded_extra_limit=(
+            _MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES if include_all_files and size_limit is None else None
+        ),
+        deadline=deadline,
+    )
+    model_files = selection.filenames
+    openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
+        str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+    }
+    model_files = _include_huggingface_openvino_companions(
+        repo_id,
+        repo_files,
+        repo_revision,
+        model_files,
+        allow_content_probes=allow_content_probes,
+        include_openvino_companions=openvino_companion_suppression_enabled,
+        deadline=deadline,
+    )
+    size_preflight_files = model_files
+    if _stream_safetensors_headers:
+        safetensors_selection_enabled = scannable_scanner_ids is None or "safetensors" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        if safetensors_selection_enabled:
+            size_preflight_files = [
+                filename
+                for filename in model_files
+                if PurePosixPath(filename).suffix.lower() != ".safetensors"
+                and selection.content_route_formats.get(filename) != "safetensors"
+            ]
+    revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
+        repo_id,
+        size_preflight_files,
+        size_limit,
+        resolved_revision=repo_revision,
+        deadline=deadline,
+    )
+    return HuggingFaceDownloadPlan(
+        namespace=namespace,
+        repo_name=repo_name,
+        repo_id=repo_id,
+        deadline=deadline,
+        size_limit=size_limit,
+        repo_files=repo_files,
+        repo_revision=repo_revision,
+        selected_files=model_files,
+        selected_sizes=selected_sizes,
+        download_revision=revision or repo_revision,
+        content_route_formats=selection.content_route_formats,
+    )
+
+
 @overload
 def download_model_streaming(
     url: str,
@@ -2689,9 +4825,11 @@ def download_model_streaming(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
+    repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
     _include_scan_results: Literal[False] = False,
-) -> Iterator[tuple[Path, bool]]: ...
+) -> Iterator[tuple[Path, bool]]:
+    pass
 
 
 @overload
@@ -2706,9 +4844,11 @@ def download_model_streaming(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
+    repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
     _include_scan_results: Literal[True],
-) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]: ...
+) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]:
+    pass
 
 
 def download_model_streaming(
@@ -2722,6 +4862,7 @@ def download_model_streaming(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
+    repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
     _include_scan_results: bool = False,
 ) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]:
@@ -2740,6 +4881,7 @@ def download_model_streaming(
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
+        repository_file_inventory: Optional list filled with repository member names from metadata
         scanner_config: Optional scanner configuration to preserve in remote native scans
         _include_scan_results: Internal opt-in for precomputed trusted source-native scan results
 
@@ -2760,19 +4902,13 @@ def download_model_streaming(
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
-    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
-    requested_revision = _requested_huggingface_revision(url)
 
     try:
         # List all files in the repository
         import os
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
-
-        size_limit = _normalize_download_size_limit(max_size)
-        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
         # Configure progress display
         if not show_progress:
@@ -2781,49 +4917,39 @@ def download_model_streaming(
             enable_progress_bars()
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files with timeout without leaking a blocking worker thread.
-        listing_timeout = 30.0
-        if deadline is not None:
-            listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
-            if listing_timeout <= 0:
-                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
-            repo_id,
-            listing_timeout,
-            requested_revision=requested_revision,
-            deadline=deadline,
-        )
-        if repo_files is None:
-            if repo_listing_error and repo_listing_error.startswith("timed out after"):
-                raise Exception(f"Timeout listing files in repository {repo_id}")
-            raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
-        if repo_revision is None:
-            raise Exception(
-                f"Failed listing files in repository {repo_id}: "
-                f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
-            )
-        if requested_revision is not None and repo_revision != requested_revision:
-            raise Exception(
-                f"Failed listing files in repository {repo_id}: resolved revision {repo_revision} "
-                f"did not match requested immutable revision {requested_revision}"
-            )
-
-        model_files = _select_streamable_hf_files(
-            repo_id,
-            repo_files,
-            repo_revision,
-            scannable_extensions,
-            scannable_filenames,
-            scannable_scanner_ids,
+        plan = plan_huggingface_streaming_download(
+            url,
+            max_size,
+            timeout_seconds=timeout_seconds,
+            scannable_extensions=scannable_extensions,
+            scannable_filenames=scannable_filenames,
+            scannable_scanner_ids=scannable_scanner_ids,
             include_all_files=include_all_files,
-            deadline=deadline,
+            _stream_safetensors_headers=_include_scan_results,
         )
+        namespace = plan.namespace
+        repo_name = plan.repo_name
+        repo_id = plan.repo_id
+        deadline = plan.deadline
+        size_limit = plan.size_limit
+        repo_files = plan.repo_files
+        repo_revision = plan.repo_revision
+        model_files = plan.selected_files
+        selection = _HuggingFaceStreamingSelection(model_files, dict(plan.content_route_formats))
+        if repository_file_inventory is not None:
+            repository_file_inventory[:] = repo_files
+
         safetensors_header_streaming_allowed = _include_scan_results and (
             scannable_scanner_ids is None
             or "safetensors" in {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}
         )
         safetensors_header_files = (
-            {filename for filename in model_files if PurePosixPath(filename).suffix.lower() == ".safetensors"}
+            {
+                filename
+                for filename in model_files
+                if PurePosixPath(filename).suffix.lower() == ".safetensors"
+                or selection.content_route_formats.get(filename) == "safetensors"
+            }
             if safetensors_header_streaming_allowed
             else set()
         )
@@ -2841,14 +4967,13 @@ def download_model_streaming(
             if safetensors_header_files
             else set()
         )
-        selected_sizes: dict[str, int] = {}
+        selected_sizes: dict[str, int] = dict(plan.selected_sizes)
         path_sizes: dict[str, int | None] = {}
-        if size_limit is not None or safetensors_header_files:
+        if _include_scan_results and (size_limit is not None or safetensors_header_files):
             size_lookup_files = sorted(set(model_files).union(safetensors_index_files))
             path_sizes, metadata_revision = _get_huggingface_path_sizes(
                 repo_id,
                 size_lookup_files,
-                requested_revision=requested_revision,
                 resolved_revision=repo_revision,
                 deadline=deadline,
             )
@@ -2864,16 +4989,24 @@ def download_model_streaming(
                 if file_size is None:
                     raise Exception(f"Cannot stream {repo_id}: unknown size for selected file {filename}")
                 selected_sizes[filename] = file_size
-        download_revision = repo_revision
+        download_revision = plan.download_revision if not _include_scan_results else repo_revision
         shard_details_by_file, remote_index_bytes_transferred = _remote_safetensors_shard_details_by_file(
             repo_id,
-            model_files,
+            sorted(safetensors_header_files),
             repo_files,
             repo_revision,
             path_sizes,
             deadline=deadline,
             max_transferred_bytes=size_limit,
         )
+        openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        repo_file_set = set(repo_files)
+        selected_file_set = set(model_files)
+        onnx_external_data_enabled = scannable_scanner_ids is None or "onnx" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
 
         # Setup cache directory
         download_path = None
@@ -2881,59 +5014,80 @@ def download_model_streaming(
             download_path = _build_huggingface_download_path(cache_dir, namespace, repo_name)
             download_path.mkdir(parents=True, exist_ok=True)
 
-        # Download each file one at a time
-        total_files = len(model_files)
+        openvino_companion_by_xml = (
+            {
+                filename: companion
+                for filename in model_files
+                if (companion := _openvino_bin_companion_name(filename, model_files)) in selected_file_set
+            }
+            if openvino_companion_suppression_enabled
+            else {}
+        )
+        openvino_xml_by_companion = {companion: xml for xml, companion in openvino_companion_by_xml.items()}
+
+        # Download each file one at a time. OpenVINO XML/BIN pairs are staged
+        # together, then only the XML is yielded so the scanner owns the logical
+        # model and the weights sidecar is not routed as standalone PyTorch.
         downloaded_total_size = remote_index_bytes_transferred
-        for idx, filename in enumerate(model_files):
-            is_last = idx == total_files - 1
+        prefetched_selected_paths: dict[str, Path] = {}
+        downloaded_selected_paths: dict[str, Path] = {}
+        downloaded_context_paths: dict[str, Path] = {}
+        context_cleanup_paths: set[Path] = set()
+        accounted_selected_filenames: set[str] = set()
+        consumed_filenames: set[str] = set()
 
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+        def emit_file(path: Path, cleanup_paths: list[Path], is_last: bool) -> Iterator[tuple[Path, bool]]:
+            try:
+                yield (path, is_last)
+            finally:
+                for external_path in cleanup_paths:
+                    with suppress(OSError):
+                        external_path.unlink()
 
-            if filename in safetensors_header_files:
-                declared_size = selected_sizes[filename]
-                if size_limit is not None and downloaded_total_size + 8 > size_limit:
-                    raise ValueError(
-                        f"Cannot stream {repo_id}: remote SafeTensors header preflight for {filename} "
-                        f"would exceed max size {size_limit} bytes"
-                    )
-                scan_result = _scan_remote_huggingface_safetensors_header(
-                    repo_id,
-                    filename,
-                    download_revision,
-                    declared_size=declared_size,
-                    deadline=deadline,
-                    shard_details=shard_details_by_file.get(filename),
-                    max_transferred_bytes=(size_limit - downloaded_total_size if size_limit is not None else None),
-                    scanner_config=scanner_config,
-                    active_scanner_ids=scannable_scanner_ids,
+        def has_future_yield(current_index: int) -> bool:
+            for future_filename in model_files[current_index + 1 :]:
+                if future_filename in consumed_filenames:
+                    continue
+                if future_filename in openvino_xml_by_companion:
+                    continue
+                return True
+            return False
+
+        def scan_remote_safetensors(filename: str) -> Any:
+            nonlocal downloaded_total_size
+            declared_size = selected_sizes[filename]
+            if size_limit is not None and downloaded_total_size + 8 > size_limit:
+                raise ValueError(
+                    f"Cannot stream {repo_id}: remote SafeTensors header preflight for {filename} "
+                    f"would exceed max size {size_limit} bytes"
                 )
-                transferred = scan_result.metadata.get("remote_bytes_transferred", scan_result.bytes_scanned)
-                transferred_bytes = (
-                    transferred
-                    if isinstance(transferred, int) and not isinstance(transferred, bool) and transferred >= 0
-                    else scan_result.bytes_scanned
+            scan_result = _scan_remote_huggingface_safetensors_header(
+                repo_id,
+                filename,
+                download_revision,
+                declared_size=declared_size,
+                deadline=deadline,
+                shard_details=shard_details_by_file.get(filename),
+                max_transferred_bytes=(size_limit - downloaded_total_size if size_limit is not None else None),
+                scanner_config=scanner_config,
+                active_scanner_ids=scannable_scanner_ids,
+            )
+            transferred = scan_result.metadata.get("remote_bytes_transferred", scan_result.bytes_scanned)
+            transferred_bytes = (
+                transferred
+                if isinstance(transferred, int) and not isinstance(transferred, bool) and transferred >= 0
+                else scan_result.bytes_scanned
+            )
+            if size_limit is not None and downloaded_total_size + transferred_bytes > size_limit:
+                raise ValueError(
+                    f"Cannot stream {repo_id}: remote SafeTensors header bytes plus prior downloads "
+                    f"would total {downloaded_total_size + transferred_bytes} bytes, "
+                    f"exceeding max size {size_limit} bytes"
                 )
-                if size_limit is not None and downloaded_total_size + transferred_bytes > size_limit:
-                    raise ValueError(
-                        f"Cannot stream {repo_id}: remote SafeTensors header bytes plus prior downloads "
-                        f"would total {downloaded_total_size + transferred_bytes} bytes, "
-                        f"exceeding max size {size_limit} bytes"
-                    )
-                downloaded_total_size += transferred_bytes
-                yield (Path(filename), is_last, scan_result)
-                continue
+            downloaded_total_size += transferred_bytes
+            return scan_result
 
-            if size_limit is not None:
-                advertised_size = selected_sizes[filename]
-                projected_total = downloaded_total_size + advertised_size
-                if projected_total > size_limit:
-                    raise ValueError(
-                        f"Cannot download {repo_id}: downloaded bytes plus selected file {filename} "
-                        f"would total {projected_total} bytes, exceeding max size {size_limit} bytes"
-                    )
-
-            # Download single file
+        def download_stream_file(filename: str) -> Path:
             download_kwargs: dict[str, Any] = {
                 "repo_id": repo_id,
                 "filename": filename,
@@ -2959,19 +5113,195 @@ def download_model_streaming(
                     repo_id,
                     direct_download=hf_hub_download,
                 )
+            return Path(local_path)
+
+        def download_selected_file(filename: str) -> Path:
+            nonlocal downloaded_total_size
+            downloaded_file = downloaded_selected_paths.get(filename)
+            if downloaded_file is not None and downloaded_file.is_file():
+                return downloaded_file
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
-            downloaded_file = Path(local_path)
-            downloaded_total_size = _verify_huggingface_selection_within_max_size(
-                repo_id,
-                downloaded_file.parent,
-                [downloaded_file.name],
-                size_limit,
-                initial_size=downloaded_total_size,
-            )
-            yield (downloaded_file, is_last)
+            already_accounted = filename in accounted_selected_filenames
+            if size_limit is not None and not already_accounted:
+                advertised_size = selected_sizes[filename]
+                projected_total = downloaded_total_size + advertised_size
+                if projected_total > size_limit:
+                    raise ValueError(
+                        f"Cannot download {repo_id}: downloaded bytes plus selected file {filename} "
+                        f"would total {projected_total} bytes, exceeding max size {size_limit} bytes"
+                    )
+
+            # Download single file
+            downloaded_file = prefetched_selected_paths.pop(filename, None)
+            if downloaded_file is None or not downloaded_file.is_file():
+                downloaded_file = download_stream_file(filename)
+            if size_limit is not None and not already_accounted:
+                downloaded_file_size = _get_downloaded_huggingface_file_size(repo_id, downloaded_file, filename)
+                downloaded_total_size += downloaded_file_size
+                accounted_selected_filenames.add(filename)
+                if downloaded_total_size > size_limit:
+                    raise ValueError(
+                        f"Cannot download {repo_id}: downloaded selected Hugging Face files total "
+                        f"{downloaded_total_size} bytes exceeds max size {size_limit} bytes"
+                    )
+            downloaded_selected_paths[filename] = downloaded_file
+            return downloaded_file
+
+        def prepare_stream_yield(filename: str) -> tuple[Path, list[Path]]:
+            nonlocal downloaded_total_size
+            downloaded_file = download_selected_file(filename)
+
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+
+            onnx_external_data_cleanup_paths: list[Path] = []
+            content_route_format = selection.content_route_formats.get(filename)
+            if (
+                onnx_external_data_enabled
+                and content_route_format is None
+                and PurePosixPath(filename).suffix.lower() != ".onnx"
+            ):
+                try:
+                    detected_format = detect_file_format_for_skip_filter(str(downloaded_file))
+                except Exception:
+                    logger.debug(
+                        "Unable to sniff selected Hugging Face file %s for ONNX sidecars", filename, exc_info=True
+                    )
+                else:
+                    if detected_format == "onnx":
+                        content_route_format = detected_format
+                        selection.content_route_formats[filename] = detected_format
+            if onnx_external_data_enabled and _is_hf_streaming_onnx_candidate(
+                filename,
+                content_route_format=content_route_format,
+            ):
+                external_data_files = _discover_hf_onnx_external_data_files(
+                    downloaded_file,
+                    filename,
+                    repo_file_set,
+                )
+                if external_data_files:
+                    external_context_files = [
+                        external_filename
+                        for external_filename in external_data_files
+                        if external_filename not in selected_file_set
+                        and not (
+                            (downloaded_context_path := downloaded_context_paths.get(external_filename)) is not None
+                            and downloaded_context_path.is_file()
+                        )
+                    ]
+                    external_data_sizes: dict[str, int] = {}
+                    if size_limit is not None and external_context_files:
+                        external_data_sizes = _get_hf_onnx_external_data_sizes(
+                            repo_id,
+                            external_context_files,
+                            revision=download_revision,
+                            deadline=deadline,
+                        )
+                    for external_filename in external_data_files:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+                        if external_filename in selected_file_set:
+                            downloaded_selected_path = downloaded_selected_paths.get(external_filename)
+                            if downloaded_selected_path is not None and downloaded_selected_path.is_file():
+                                continue
+                            external_path = prefetched_selected_paths.get(external_filename)
+                            if external_path is None or not external_path.is_file():
+                                external_path = download_stream_file(external_filename)
+                                if downloaded_selected_path is None:
+                                    prefetched_selected_paths[external_filename] = external_path
+                            if downloaded_selected_path is not None:
+                                downloaded_selected_paths[external_filename] = external_path
+                                if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
+                                    onnx_external_data_cleanup_paths.append(external_path)
+                                continue
+                            if size_limit is not None and external_filename not in accounted_selected_filenames:
+                                external_file_size = _get_downloaded_huggingface_file_size(
+                                    repo_id,
+                                    external_path,
+                                    external_filename,
+                                )
+                                projected_total = downloaded_total_size + external_file_size
+                                if projected_total > size_limit:
+                                    raise ValueError(
+                                        f"Cannot download {repo_id}: downloaded bytes plus selected ONNX "
+                                        f"external_data file {external_filename} would total {projected_total} "
+                                        f"bytes, exceeding max size {size_limit} bytes"
+                                    )
+                                downloaded_total_size = projected_total
+                                accounted_selected_filenames.add(external_filename)
+                            continue
+                        external_path = downloaded_context_paths.get(external_filename)
+                        if external_path is not None and external_path.is_file():
+                            continue
+                        if size_limit is not None:
+                            advertised_size = external_data_sizes[external_filename]
+                            projected_total = downloaded_total_size + advertised_size
+                            if projected_total > size_limit:
+                                raise ValueError(
+                                    f"Cannot download {repo_id}: downloaded bytes plus ONNX external_data file "
+                                    f"{external_filename} would total {projected_total} bytes, exceeding max size "
+                                    f"{size_limit} bytes"
+                                )
+                        external_path = download_stream_file(external_filename)
+                        if size_limit is not None:
+                            external_file_size = _get_downloaded_huggingface_file_size(
+                                repo_id,
+                                external_path,
+                                external_filename,
+                            )
+                            projected_total = downloaded_total_size + external_file_size
+                            if projected_total > size_limit:
+                                raise ValueError(
+                                    f"Cannot download {repo_id}: downloaded bytes plus ONNX external_data file "
+                                    f"{external_filename} would total {projected_total} bytes, exceeding max size "
+                                    f"{size_limit} bytes"
+                                )
+                            downloaded_total_size = projected_total
+                        downloaded_context_paths[external_filename] = external_path
+                        if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
+                            context_cleanup_paths.add(external_path)
+
+            return downloaded_file, onnx_external_data_cleanup_paths
+
+        try:
+            for idx, filename in enumerate(model_files):
+                if filename in consumed_filenames:
+                    continue
+
+                if filename in safetensors_header_files:
+                    scan_result = scan_remote_safetensors(filename)
+                    yield (Path(filename), not has_future_yield(idx), scan_result)
+                    continue
+
+                if filename in openvino_xml_by_companion:
+                    # Wait for the XML so we can prove it is an OpenVINO model
+                    # before suppressing standalone analysis of the same-stem .bin.
+                    continue
+
+                downloaded_file, cleanup_paths = prepare_stream_yield(filename)
+                companion = openvino_companion_by_xml.get(filename)
+                if companion is not None:
+                    from modelaudit.scanners.openvino_scanner import OpenVinoScanner
+
+                    if OpenVinoScanner.can_handle(str(downloaded_file)):
+                        download_selected_file(companion)
+                        consumed_filenames.add(companion)
+                    else:
+                        companion_path, companion_cleanup_paths = prepare_stream_yield(companion)
+                        consumed_filenames.add(companion)
+                        yield from emit_file(downloaded_file, cleanup_paths, False)
+                        yield from emit_file(companion_path, companion_cleanup_paths, not has_future_yield(idx))
+                        continue
+
+                yield from emit_file(downloaded_file, cleanup_paths, not has_future_yield(idx))
+        finally:
+            for external_path in context_cleanup_paths:
+                with suppress(OSError):
+                    external_path.unlink()
 
     except Exception as e:
         raise Exception(
@@ -2979,13 +5309,22 @@ def download_model_streaming(
         ) from e
 
 
-def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int | None = None) -> Path:
+def download_file_from_hf(
+    url: str,
+    cache_dir: Path | None = None,
+    max_size: int | None = None,
+    *,
+    repository_file_inventory: list[str] | None = None,
+    timeout_seconds: float | None = None,
+) -> Path:
     """Download a single file from HuggingFace using direct file URL.
 
     Args:
         url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
         cache_dir: Optional cache directory for downloads
         max_size: Optional maximum file size to download; 0 disables the limit
+        repository_file_inventory: Optional list filled with repository member names from metadata
+        timeout_seconds: Optional end-to-end acquisition deadline in seconds
 
     Returns:
         Path to the downloaded file
@@ -2999,7 +5338,7 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
     display_url = redact_huggingface_url_for_display(url)
 
     try:
-        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub import hf_hub_download
     except ImportError as e:
         raise ImportError(
             "huggingface-hub package is required for HuggingFace URL support. "
@@ -3012,31 +5351,77 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
 
         size_limit = max_size or None
         download_revision = branch
-        if size_limit is not None:
-            api = HfApi()
-            repo_info = api.repo_info(repo_id, revision=branch)
-            pinned_revision = getattr(repo_info, "sha", None)
-            if not _is_huggingface_commit_sha(pinned_revision):
-                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
-            assert isinstance(pinned_revision, str)
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+        repo_files: list[str] | None = None
+        repo_revision: str | None = None
+        repo_listing_error: str | None = None
+        if repository_file_inventory is not None:
+            listing_timeout = 30.0
+            if deadline is not None:
+                listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+                if listing_timeout <= 0:
+                    raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+                repo_id,
+                listing_timeout,
+                revision=branch,
+                deadline=deadline,
+            )
+            inventory_revision: str | None = None
+            if _is_huggingface_commit_sha(repo_revision):
+                assert isinstance(repo_revision, str)
+                inventory_revision = repo_revision
+            elif _is_huggingface_commit_sha(branch):
+                inventory_revision = branch
+            if repository_file_inventory is not None and repo_files is not None and inventory_revision is not None:
+                repository_file_inventory[:] = repo_files
+                download_revision = inventory_revision
 
-            path_info = api.get_paths_info(repo_id, filename, revision=pinned_revision)
-            file_metadata = path_info[0] if path_info else None
-            file_size = getattr(file_metadata, "size", None)
+        if size_limit is not None:
+            if repository_file_inventory is not None and not _is_huggingface_commit_sha(repo_revision):
+                error_suffix = f": {repo_listing_error}" if repo_listing_error else ""
+                raise ValueError(
+                    f"Unable to determine immutable revision for {display_url}; refusing capped download{error_suffix}"
+                )
+            pinned_revision = repo_revision if repository_file_inventory is not None else None
+
+            try:
+                path_sizes, resolved_revision = _get_huggingface_path_sizes(
+                    repo_id,
+                    [filename],
+                    requested_revision=branch,
+                    resolved_revision=pinned_revision,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                if "repository revision unavailable" in str(exc):
+                    raise ValueError(
+                        f"Unable to determine immutable revision for {display_url}; refusing capped download"
+                    ) from exc
+                raise
+            if not _is_huggingface_commit_sha(resolved_revision):
+                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+            file_size = path_sizes.get(filename)
             if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
                 raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
             if file_size > size_limit:
                 raise ValueError(
                     f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
                 )
-            download_revision = pinned_revision
+            download_revision = resolved_revision
 
-        # Use hf_hub_download for single file downloads
-        local_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            revision=download_revision,
-            cache_dir=str(cache_dir) if cache_dir else None,
+        download_kwargs: dict[str, Any] = {
+            "repo_id": repo_id,
+            "filename": filename,
+            "revision": download_revision,
+            "cache_dir": str(cache_dir) if cache_dir else None,
+        }
+        local_path = _run_huggingface_download_with_deadline(
+            "hf_hub_download",
+            download_kwargs,
+            deadline,
+            repo_id,
+            direct_download=hf_hub_download,
         )
         downloaded_path = Path(local_path)
         if size_limit is not None:

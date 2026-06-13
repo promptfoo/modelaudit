@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import html
 import json
 import os
 import re
 import struct
 from collections.abc import Iterator
 from typing import Any, ClassVar
+from urllib.parse import unquote, urlparse
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
@@ -49,6 +54,10 @@ SAFETENSORS_READ_INCONCLUSIVE_REASON = "safetensors_read_failed"
 _REMOTE_HEADER_ONLY_CONFIG_KEY = "_safetensors_header_only_remote"
 _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY = "_safetensors_remote_header_bytes_scanned"
 _REMOTE_HEADER_INTEGRITY_CONFIG_KEY = "_safetensors_remote_header_integrity"
+_MAX_SAFETENSORS_TENSORS = 4096
+_MAX_REPORTED_TENSOR_NAMES = 1024
+_MAX_REPORTED_TENSOR_FINDINGS = 20
+_MAX_SAFETENSORS_JSON_TOKENS = 100_000
 
 _HTML_METADATA_PATTERNS = (
     r"javascript:",
@@ -181,6 +190,30 @@ _HTML_EVENT_NAMES = frozenset(
         "wheel",
     }
 )
+
+
+def _validate_json_structural_token_limit(raw: bytes, max_tokens: int, label: str) -> None:
+    """Reject container-heavy JSON before the decoder materializes attacker-controlled graphs."""
+    token_count = 0
+    in_string = False
+    escaped = False
+    for byte in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                in_string = False
+            continue
+        if byte == ord('"'):
+            in_string = True
+        elif byte in {ord("{"), ord("["), ord(",")}:
+            token_count += 1
+            if token_count > max_tokens:
+                raise ValueError(f"{label} exceeds JSON object/value limit")
+
+
 _CODE_METADATA_PATTERNS = (
     r"eval\s*\(",
     r"exec\s*\(",
@@ -210,6 +243,368 @@ _CREDENTIAL_METADATA_PATTERNS = (
     r"xox[boaprs]-[0-9]{12}-[0-9]{12}-[0-9a-zA-Z]{24}",
     r"ghp_[a-zA-Z0-9]{36}",
 )
+_GENERIC_URL_METADATA_PATTERN = r"https?://"
+_ENCODED_URL_DELIMITER_METADATA_PATTERN = "encoded-url-delimiter"
+_BACKSLASH_URL_DELIMITER_METADATA_PATTERN = "backslash-url-delimiter"
+_WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN = "wrapped-opaque-token"
+_LICENSE_METADATA_KEYS = frozenset({"license"})
+_LICENSE_DOCUMENT_MARKERS = (
+    "license agreement",
+    "terms and conditions",
+    "permission is hereby granted",
+    "grant of license",
+    "apache license",
+    "mit license",
+    "gnu general public license",
+    "creative commons",
+    "bsd license",
+    "mozilla public license",
+)
+_LICENSE_DOCUMENT_MIN_CHARS = 500
+_LICENSE_DOCUMENT_MAX_CHARS = 128 * 1024
+_LICENSE_DOCUMENT_MAX_LINE_CHARS = 2000
+_LICENSE_DOCUMENT_LINE_MARKERS = (
+    "agreement",
+    "arbitration",
+    "copyright",
+    "derivative",
+    "distribute",
+    "entity",
+    "grant",
+    "law",
+    "liability",
+    "license",
+    "licensor",
+    "may",
+    "must",
+    "output",
+    "patent",
+    "permission",
+    "reproduce",
+    "restriction",
+    "shall",
+    "terms",
+    "trademark",
+    "use",
+)
+_LICENSE_DOCUMENT_BASE64_WORD_TOKENS = frozenset(
+    {
+        *_LICENSE_DOCUMENT_LINE_MARKERS,
+        "a",
+        "additional",
+        "apache",
+        "applicable",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "charge",
+        "com",
+        "conditions",
+        "contributor",
+        "defined",
+        "definitions",
+        "distribution",
+        "display",
+        "dmca",
+        "document",
+        "each",
+        "exclusive",
+        "free",
+        "github",
+        "grants",
+        "hereby",
+        "http",
+        "https",
+        "i",
+        "irrevocable",
+        "january",
+        "legal",
+        "licence",
+        "licenses",
+        "licensing",
+        "lightricks",
+        "mean",
+        "model",
+        "not",
+        "notice",
+        "of",
+        "ordinary",
+        "or",
+        "perform",
+        "policies",
+        "policy",
+        "prepare",
+        "publicly",
+        "reference",
+        "royalty",
+        "royalty-free",
+        "sections",
+        "source",
+        "spdx",
+        "subject",
+        "sublicense",
+        "the",
+        "this",
+        "to",
+        "through",
+        "under",
+        "version",
+        "video",
+        "whereas",
+        "work",
+        "works",
+        "worldwide",
+    }
+)
+_DUPLICATE_JSON_KEY_DETAIL_LIMIT = 20
+_URL_METADATA_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_LICENSE_REFERENCE_HOST_SUFFIXES = (
+    "apache.org",
+    "creativecommons.org",
+    "github.com",
+    "gnu.org",
+    "ltx.io",
+    "mozilla.org",
+    "opensource.org",
+    "spdx.org",
+)
+_LICENSE_REFERENCE_PATH_COMPONENTS = frozenset(
+    {
+        "copying",
+        "legal",
+        "legalcode",
+        "licence",
+        "license",
+        "licenses",
+        "licensing",
+        "notice",
+        "policies",
+        "policy",
+        "terms",
+    }
+)
+_LICENSE_REFERENCE_FILE_MARKERS = (
+    "copying",
+    "legalcode",
+    "licence",
+    "license",
+    "licensing",
+    "notice",
+    "policy",
+    "terms",
+)
+_SUSPICIOUS_LICENSE_URL_PATH_COMPONENTS = frozenset({"download", "raw", "releases"})
+_SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES = (
+    ".bat",
+    ".bin",
+    ".bz2",
+    ".cjs",
+    ".cmd",
+    ".ckpt",
+    ".com",
+    ".dll",
+    ".dylib",
+    ".exe",
+    ".gguf",
+    ".gz",
+    ".h5",
+    ".jar",
+    ".js",
+    ".joblib",
+    ".jsx",
+    ".keras",
+    ".mjs",
+    ".model",
+    ".msgpack",
+    ".npy",
+    ".npz",
+    ".onnx",
+    ".php",
+    ".pickle",
+    ".pkl",
+    ".pl",
+    ".ps1",
+    ".pt",
+    ".pth",
+    ".py",
+    ".rar",
+    ".rb",
+    ".safetensors",
+    ".safetensors.index.json",
+    ".sh",
+    ".so",
+    ".tar",
+    ".tar.bz2",
+    ".tar.gz",
+    ".tgz",
+    ".ts",
+    ".tsx",
+    ".xz",
+    ".whl",
+    ".zip",
+)
+_OPAQUE_LICENSE_TOKEN_MIN_CHARS = 128
+_OPAQUE_LICENSE_TOKEN_PATTERN = re.compile(rf"\b[A-Za-z0-9+/=_-]{{{_OPAQUE_LICENSE_TOKEN_MIN_CHARS},}}\b")
+_BASE64_LICENSE_WRAP_LINE_MIN_CHARS = 4
+_BASE64_LICENSE_WRAP_TOKEN_MIN_CHARS = 4
+_BASE64_LICENSE_WRAP_MIN_DECODE_CHARS = 24
+_BASE64_LICENSE_WRAP_MAX_LINES = 128
+_BASE64_LICENSE_WRAP_MAX_CHARS = 8192
+_BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
+_BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
+_BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS = 4
+_BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO = 0.15
+_BASE64_LICENSE_WRAP_ANNOTATED_OPAQUE_MIN_CHARS = 64
+_BASE64_LICENSE_WRAP_TRAILING_DOCUMENTARY_TOKENS = frozenset({"and", "or"})
+_BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
+_BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9+/_-])(?:"
+    rf"[A-Za-z0-9+/_-]{{{_BASE64_LICENSE_WRAP_TOKEN_MIN_CHARS},}}"
+    r"|[A-Za-z0-9+/_-]{3}="
+    r"|[A-Za-z0-9+/_-]{2}=="
+    r")(?![A-Za-z0-9+/_-])"
+)
+_BASE64_LICENSE_WRAP_SHORT_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{1,3}(?![A-Za-z0-9+/_-])")
+_BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
+    r"^(?:[#>;]|//|--|\*)\s*(?:continued|continuation|wrapped|base64|license(?:\s+terms?)?)?\s*$",
+    re.IGNORECASE,
+)
+_SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback")
+_BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
+    "#!",
+    "chmod +x",
+    "curl ",
+    "eval(",
+    "exec(",
+    "http://",
+    "https://",
+    "import ",
+    "os.system",
+    "rm -rf",
+    "subprocess",
+    "wget ",
+)
+_URL_PATH_NORMALIZATION_PASSES = 4
+_URL_DELIMITER_ENTITY_DECODE_PASSES = 4
+_PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
+_HTML_ENTITY_REFERENCE_SOURCE = r"&(?:#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[A-Za-z][A-Za-z0-9]{1,31};)"
+_RESIDUAL_NESTED_HTML_ENTITY_REFERENCE_SOURCE = (
+    r"&(?:amp;)*(?:#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[A-Za-z][A-Za-z0-9]{1,31};)"
+)
+_RESIDUAL_NESTED_ENTITY_H = r"&(?:amp;)*(?:#0*(?:72|104);?|#[xX]0*(?:48|68);?)"
+_RESIDUAL_NESTED_ENTITY_T = r"&(?:amp;)*(?:#0*(?:84|116);?|#[xX]0*(?:54|74);?)"
+_RESIDUAL_NESTED_ENTITY_P = r"&(?:amp;)*(?:#0*(?:80|112);?|#[xX]0*(?:50|70);?)"
+_RESIDUAL_NESTED_ENTITY_S = r"&(?:amp;)*(?:#0*(?:83|115);?|#[xX]0*(?:53|73);?)"
+_RESIDUAL_NESTED_ENTITY_SCHEME_LETTERS = (
+    rf"(?:h|{_RESIDUAL_NESTED_ENTITY_H})",
+    rf"(?:t|{_RESIDUAL_NESTED_ENTITY_T})",
+    rf"(?:t|{_RESIDUAL_NESTED_ENTITY_T})",
+    rf"(?:p|{_RESIDUAL_NESTED_ENTITY_P})",
+    rf"(?:s|{_RESIDUAL_NESTED_ENTITY_S})?",
+)
+_HTML_ENTITY_REFERENCE_PATTERN = re.compile(_HTML_ENTITY_REFERENCE_SOURCE)
+_RESIDUAL_ENTITY_URL_DELIMITER_PATTERN = re.compile(
+    rf"{''.join(_RESIDUAL_NESTED_ENTITY_SCHEME_LETTERS)}(?:{_RESIDUAL_NESTED_HTML_ENTITY_REFERENCE_SOURCE}|:)"
+    rf"(?:{_RESIDUAL_NESTED_HTML_ENTITY_REFERENCE_SOURCE}|/|\\)"
+    rf"(?:{_RESIDUAL_NESTED_HTML_ENTITY_REFERENCE_SOURCE}|/|\\)",
+    re.IGNORECASE,
+)
+_ENCODED_URL_SCHEME_LETTERS = (
+    r"(?:h|%(?:25)*(?:48|68))",
+    r"(?:t|%(?:25)*(?:54|74))",
+    r"(?:t|%(?:25)*(?:54|74))",
+    r"(?:p|%(?:25)*(?:50|70))",
+    r"(?:s|%(?:25)*(?:53|73))?",
+)
+_ENCODED_URL_DELIMITER_PATTERN = re.compile(
+    rf"(?P<scheme>{''.join(_ENCODED_URL_SCHEME_LETTERS)})(?P<colon>%(?:25)*3a|:)"
+    r"(?P<slash1>%(?:25)*(?:2f|5c)|/|\\)(?P<slash2>%(?:25)*(?:2f|5c)|/|\\)",
+    re.IGNORECASE,
+)
+_RAW_BACKSLASH_URL_DELIMITER_PATTERN = re.compile(r"https?:(?:\\\\|/\\|\\/|\\(?![\\/])|/(?!/))", re.IGNORECASE)
+
+
+def _url_path_has_unsafe_decoded_char(path: str) -> bool:
+    return any(
+        char == "\\" or char == ";" or ord(char) < 0x20 or char.isspace() or ord(char) == 0x7F for char in path
+    ) or any(segment in {".", ".."} for segment in path.split("/"))
+
+
+def _html_unescape_with_entity_mask(value: str, entity_mask: bytearray) -> tuple[str, bytearray, bool]:
+    decoded_parts: list[str] = []
+    decoded_entity_mask = bytearray()
+    cursor = 0
+    changed = False
+
+    for match in _HTML_ENTITY_REFERENCE_PATTERN.finditer(value):
+        start, end = match.span()
+        decoded_parts.append(value[cursor:start])
+        decoded_entity_mask.extend(entity_mask[cursor:start])
+
+        raw_entity = match.group(0)
+        decoded_entity = html.unescape(raw_entity)
+        if decoded_entity != raw_entity:
+            decoded_parts.append(decoded_entity)
+            decoded_entity_mask.extend(b"\x01" * len(decoded_entity))
+            changed = True
+        else:
+            decoded_parts.append(raw_entity)
+            decoded_entity_mask.extend(entity_mask[start:end])
+
+        cursor = end
+
+    decoded_parts.append(value[cursor:])
+    decoded_entity_mask.extend(entity_mask[cursor:])
+    return "".join(decoded_parts), decoded_entity_mask, changed
+
+
+def _encoded_url_delimiter_match_has_encoded_component(
+    value: str,
+    match: re.Match[str],
+    *,
+    entity_mask: bytearray | None = None,
+) -> bool:
+    for group_name in ("scheme", "colon", "slash1", "slash2"):
+        start, end = match.span(group_name)
+        if "%" in value[start:end]:
+            return True
+        if entity_mask is not None and any(entity_mask[start:end]):
+            return True
+    return False
+
+
+def _value_has_encoded_url_delimiter(value: str) -> bool:
+    if any(
+        _encoded_url_delimiter_match_has_encoded_component(value, match)
+        for match in _ENCODED_URL_DELIMITER_PATTERN.finditer(value)
+    ):
+        return True
+    if "&" not in value:
+        return False
+
+    decoded_value = value
+    entity_mask = bytearray(len(value))
+    for _ in range(_URL_DELIMITER_ENTITY_DECODE_PASSES):
+        decoded_value, entity_mask, changed = _html_unescape_with_entity_mask(decoded_value, entity_mask)
+        if not changed:
+            return False
+        if any(
+            _encoded_url_delimiter_match_has_encoded_component(decoded_value, match, entity_mask=entity_mask)
+            for match in _ENCODED_URL_DELIMITER_PATTERN.finditer(decoded_value)
+        ):
+            return True
+    return any(
+        _HTML_ENTITY_REFERENCE_PATTERN.search(match.group(0)) is not None
+        for match in _RESIDUAL_ENTITY_URL_DELIMITER_PATTERN.finditer(decoded_value)
+    )
+
+
+def _value_has_raw_backslash_url_delimiter(value: str) -> bool:
+    return _RAW_BACKSLASH_URL_DELIMITER_PATTERN.search(value) is not None
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -257,18 +652,6 @@ class SafeTensorsScanner(BaseScanner):
         ]
         if not validation_result.checks and not validation_result.issues:
             self._path_validation_result = None
-
-    @staticmethod
-    def _json_duplicate_key_hook(duplicate_keys: list[str]) -> Any:
-        def hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-            parsed: dict[str, Any] = {}
-            for key, value in pairs:
-                if key in parsed:
-                    duplicate_keys.append(key)
-                parsed[key] = value
-            return parsed
-
-        return hook
 
     @classmethod
     def _finish_read_failure(cls, result: ScanResult, path: str, error: OSError) -> ScanResult:
@@ -382,10 +765,523 @@ class SafeTensorsScanner(BaseScanner):
         return first_matches, total_matches
 
     @classmethod
+    def _load_json_header(cls, header_bytes: bytes) -> tuple[Any, list[str]]:
+        """Parse a SafeTensors header while tracking duplicate object keys."""
+        duplicate_keys: list[str] = []
+        _validate_json_structural_token_limit(
+            header_bytes,
+            _MAX_SAFETENSORS_JSON_TOKENS,
+            "SafeTensors header",
+        )
+
+        def track_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            parsed: dict[str, Any] = {}
+            seen: set[str] = set()
+            for key, value in pairs:
+                if key in seen and len(duplicate_keys) < _DUPLICATE_JSON_KEY_DETAIL_LIMIT:
+                    duplicate_keys.append(key)
+                seen.add(key)
+                parsed[key] = value
+            return parsed
+
+        return json.loads(header_bytes.decode("utf-8"), object_pairs_hook=track_duplicate_keys), duplicate_keys
+
+    @classmethod
+    def _looks_like_ordinary_license_document(cls, value: str) -> bool:
+        lower_value = value.lower()
+        if len(value) < _LICENSE_DOCUMENT_MIN_CHARS:
+            return False
+        return (
+            "license" in lower_value
+            and any(marker in lower_value for marker in _LICENSE_DOCUMENT_MARKERS)
+            and cls._license_document_body_is_bounded_and_coherent(value)
+        )
+
+    @staticmethod
+    def _license_document_line_looks_documentary(line: str) -> bool:
+        return any(marker in line for marker in _LICENSE_DOCUMENT_LINE_MARKERS)
+
+    @staticmethod
+    def _license_document_line_looks_opaque(line: str) -> bool:
+        return _OPAQUE_LICENSE_TOKEN_PATTERN.search(line) is not None
+
+    @staticmethod
+    def _license_document_line_is_wrapped_base64_fragment(line: str) -> bool:
+        stripped = line.strip()
+        return (
+            len(stripped) >= _BASE64_LICENSE_WRAP_LINE_MIN_CHARS
+            and not any(char.isspace() for char in stripped)
+            and _BASE64_LICENSE_WRAP_LINE_PATTERN.fullmatch(stripped) is not None
+            and not SafeTensorsScanner._license_document_token_looks_documentary(stripped)
+        )
+
+    @staticmethod
+    def _license_document_annotation_looks_documentary(text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return True
+        lower_text = stripped.lower()
+        return (
+            lower_text.startswith(("#", ">", ";", "//", "--", "*"))
+            or SafeTensorsScanner._license_document_line_looks_documentary(lower_text)
+            or _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN.fullmatch(stripped) is not None
+        )
+
+    @staticmethod
+    def _license_document_line_base64_fragments(line: str) -> tuple[list[str], bool]:
+        stripped = line.strip()
+        if SafeTensorsScanner._license_document_line_is_wrapped_base64_fragment(stripped):
+            return [stripped], False
+
+        nonspace_len = sum(1 for char in stripped if not char.isspace())
+        if nonspace_len == 0:
+            return [], False
+
+        fragments: list[str] = []
+        has_documentary_annotation = False
+        token_matches = list(_BASE64_LICENSE_WRAP_TOKEN_PATTERN.finditer(stripped))
+        for match in token_matches:
+            token = match.group(0)
+            if SafeTensorsScanner._license_document_span_is_inside_url(stripped, match.start(), match.end()):
+                continue
+            before = stripped[: match.start()]
+            after = stripped[match.end() :]
+            token_decodes = SafeTensorsScanner._base64_candidate_decodes(token)
+            if (
+                len(token) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO
+                and not token_decodes
+                and SafeTensorsScanner._license_document_token_looks_documentary(token)
+            ):
+                continue
+            annotations = [annotation for annotation in (before, after) if annotation.strip()]
+            if not all(
+                SafeTensorsScanner._license_document_annotation_looks_documentary(annotation)
+                for annotation in annotations
+            ):
+                continue
+            has_documentary_annotation = has_documentary_annotation or bool(annotations)
+            if not token_decodes and SafeTensorsScanner._license_document_token_looks_documentary(token):
+                continue
+            fragments.append(token)
+        return fragments, has_documentary_annotation
+
+    @staticmethod
+    def _license_document_span_is_inside_url(line: str, start: int, end: int) -> bool:
+        return any(match.start() <= start and end <= match.end() for match in _URL_METADATA_PATTERN.finditer(line))
+
+    @staticmethod
+    def _license_document_line_short_base64_fragments(line: str) -> list[str]:
+        stripped = line.strip()
+        if SafeTensorsScanner._license_document_line_is_wrapped_base64_fragment(stripped):
+            return []
+
+        token_matches = list(_BASE64_LICENSE_WRAP_SHORT_TOKEN_PATTERN.finditer(stripped))
+        fragments: list[str] = []
+        documentary_fragments: list[str] = []
+        for match in token_matches:
+            token = match.group(0)
+            if SafeTensorsScanner._license_document_span_is_inside_url(stripped, match.start(), match.end()):
+                continue
+            before = stripped[: match.start()]
+            after = stripped[match.end() :]
+            annotations = [annotation for annotation in (before, after) if annotation.strip()]
+            if not all(
+                SafeTensorsScanner._license_document_annotation_looks_documentary(annotation)
+                for annotation in annotations
+            ):
+                continue
+            if SafeTensorsScanner._license_document_token_looks_documentary(token):
+                documentary_fragments.append(token)
+                continue
+            fragments.append(token)
+        if fragments:
+            return fragments
+        if documentary_fragments:
+            if (
+                len(documentary_fragments) > 1
+                and documentary_fragments[-1].strip("=").lower() in _BASE64_LICENSE_WRAP_TRAILING_DOCUMENTARY_TOKENS
+            ):
+                return [documentary_fragments[-2]]
+            return [documentary_fragments[-1]]
+        return fragments
+
+    @staticmethod
+    def _license_document_token_looks_documentary(token: str) -> bool:
+        normalized = token.strip("=").lower()
+        if not normalized:
+            return True
+        if normalized.isdecimal():
+            return True
+        return normalized in _LICENSE_DOCUMENT_BASE64_WORD_TOKENS
+
+    @staticmethod
+    def _license_document_line_is_bounded_documentary_separator(line: str) -> bool:
+        if len(line) > _LICENSE_DOCUMENT_MAX_LINE_CHARS:
+            return False
+        return SafeTensorsScanner._license_document_line_looks_documentary(line.lower())
+
+    @staticmethod
+    def _license_document_line_is_wrapped_base64_separator(line: str) -> bool:
+        return len(line) <= _LICENSE_DOCUMENT_MAX_LINE_CHARS and (
+            _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN.fullmatch(line) is not None
+            or SafeTensorsScanner._license_document_line_is_bounded_documentary_separator(line)
+        )
+
+    @staticmethod
+    def _decoded_license_blob_has_active_pattern(decoded_text: str) -> bool:
+        return any(marker in decoded_text for marker in _BASE64_LICENSE_DECODED_ACTIVE_MARKERS) or any(
+            re.search(pattern, decoded_text, re.IGNORECASE) for pattern in _CODE_METADATA_PATTERNS
+        )
+
+    @staticmethod
+    def _base64_candidate_decodes(
+        candidate: str,
+        *,
+        require_active_pattern: bool = False,
+        fail_on_invalid_padding: bool = True,
+    ) -> bool:
+        if len(candidate) < _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS:
+            return False
+        if len(candidate) > _BASE64_LICENSE_WRAP_MAX_CHARS:
+            return True
+
+        normalized = candidate.replace("-", "+").replace("_", "/")
+        if "=" in normalized.rstrip("="):
+            return True
+        if len(normalized) % 4 == 1:
+            return fail_on_invalid_padding
+        padding = "=" * ((4 - len(normalized) % 4) % 4)
+        padded = f"{normalized}{padding}"
+        estimated_decoded_bytes = (len(padded) // 4) * 3
+        if estimated_decoded_bytes > _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES:
+            return True
+        try:
+            decoded = base64.b64decode(padded, validate=True)
+        except binascii.Error:
+            return False
+        if require_active_pattern or len(candidate) < _OPAQUE_LICENSE_TOKEN_MIN_CHARS:
+            decoded_text = decoded.decode("utf-8", errors="ignore").lower()
+            return SafeTensorsScanner._decoded_license_blob_has_active_pattern(decoded_text)
+        return len(decoded) >= (_OPAQUE_LICENSE_TOKEN_MIN_CHARS * 3) // 4
+
+    @classmethod
+    def _license_document_has_wrapped_opaque_token(cls, lines: list[str]) -> bool:
+        chunks: list[str] = []
+        total_chars = 0
+        total_lines = 0
+        separator_lines = 0
+        has_short_fragments = False
+        has_non_documentary_short_fragment = False
+        has_low_ratio_documentary_annotations = False
+        high_ratio_documentary_fragment_chars = 0
+        high_ratio_documentary_fragment_lines = 0
+
+        def requires_active_pattern() -> bool:
+            has_annotated_wrapped_payload = (
+                high_ratio_documentary_fragment_lines >= 2
+                and high_ratio_documentary_fragment_chars >= _OPAQUE_LICENSE_TOKEN_MIN_CHARS
+            )
+            return has_short_fragments or (has_low_ratio_documentary_annotations and not has_annotated_wrapped_payload)
+
+        def flush() -> bool:
+            return total_chars >= _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS and cls._base64_candidate_decodes(
+                "".join(chunks),
+                require_active_pattern=requires_active_pattern(),
+                fail_on_invalid_padding=not requires_active_pattern() or has_non_documentary_short_fragment,
+            )
+
+        def reset() -> None:
+            nonlocal chunks, total_chars, total_lines, separator_lines, has_short_fragments
+            nonlocal has_non_documentary_short_fragment, has_low_ratio_documentary_annotations
+            nonlocal high_ratio_documentary_fragment_chars, high_ratio_documentary_fragment_lines
+            chunks = []
+            total_chars = 0
+            total_lines = 0
+            separator_lines = 0
+            has_short_fragments = False
+            has_non_documentary_short_fragment = False
+            has_low_ratio_documentary_annotations = False
+            high_ratio_documentary_fragment_chars = 0
+            high_ratio_documentary_fragment_lines = 0
+
+        for line in [*lines, ""]:
+            fragments, line_has_documentary_annotation = cls._license_document_line_base64_fragments(line)
+            short_fragments = False
+            if not fragments:
+                fragments = cls._license_document_line_short_base64_fragments(line)
+                short_fragments = bool(fragments)
+            if fragments:
+                current_line_has_annotated_opaque_fragment = line_has_documentary_annotation and any(
+                    len(fragment) >= _BASE64_LICENSE_WRAP_ANNOTATED_OPAQUE_MIN_CHARS for fragment in fragments
+                )
+                if chunks and current_line_has_annotated_opaque_fragment and requires_active_pattern():
+                    if flush():
+                        return True
+                    reset()
+                current_line_decodes_active = not short_fragments and cls._base64_candidate_decodes(
+                    "".join(fragments),
+                    require_active_pattern=True,
+                    fail_on_invalid_padding=False,
+                )
+                starts_distinct_payload = not line_has_documentary_annotation or current_line_decodes_active
+                if chunks and not short_fragments and starts_distinct_payload and requires_active_pattern():
+                    if flush():
+                        return True
+                    reset()
+                total_lines += 1
+                separator_lines = 0
+                has_short_fragments = has_short_fragments or short_fragments
+                fragment_chars = sum(len(fragment) for fragment in fragments)
+                nonspace_chars = sum(1 for char in line if not char.isspace())
+                if line_has_documentary_annotation and nonspace_chars > 0:
+                    if any(len(fragment) >= _BASE64_LICENSE_WRAP_ANNOTATED_OPAQUE_MIN_CHARS for fragment in fragments):
+                        high_ratio_documentary_fragment_chars += fragment_chars
+                        high_ratio_documentary_fragment_lines += 1
+                    elif fragment_chars / nonspace_chars < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO:
+                        has_low_ratio_documentary_annotations = True
+                    elif any(len(fragment) >= _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS for fragment in fragments):
+                        high_ratio_documentary_fragment_chars += fragment_chars
+                        high_ratio_documentary_fragment_lines += 1
+                    else:
+                        has_low_ratio_documentary_annotations = True
+                if short_fragments:
+                    has_non_documentary_short_fragment = has_non_documentary_short_fragment or any(
+                        not cls._license_document_token_looks_documentary(fragment) for fragment in fragments
+                    )
+                total_chars += fragment_chars
+                if total_lines > _BASE64_LICENSE_WRAP_MAX_LINES or total_chars > _BASE64_LICENSE_WRAP_MAX_CHARS:
+                    if flush():
+                        return True
+                    reset()
+                    continue
+                chunks.extend(fragments)
+                continue
+
+            if chunks and cls._license_document_line_is_wrapped_base64_separator(line):
+                total_lines += 1
+                separator_lines += 1
+                if total_lines > _BASE64_LICENSE_WRAP_MAX_LINES:
+                    if flush() or (chunks and not requires_active_pattern()):
+                        return True
+                    reset()
+                    continue
+                if separator_lines > _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES:
+                    if flush():
+                        return True
+                    if requires_active_pattern():
+                        continue
+                    if total_chars >= _BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS:
+                        return True
+                    reset()
+                    continue
+                continue
+
+            if flush():
+                return True
+            reset()
+
+        return False
+
+    @classmethod
+    def _metadata_value_has_wrapped_opaque_token(cls, value: str) -> bool:
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        return len(lines) > 1 and cls._license_document_has_wrapped_opaque_token(lines)
+
+    @classmethod
+    def _license_document_body_is_bounded_and_coherent(cls, value: str) -> bool:
+        if len(value) > _LICENSE_DOCUMENT_MAX_CHARS:
+            return False
+
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        if not lines or any(len(line) > _LICENSE_DOCUMENT_MAX_LINE_CHARS for line in lines):
+            return False
+        if any(cls._license_document_line_looks_opaque(line) for line in lines):
+            return False
+        if cls._license_document_has_wrapped_opaque_token(lines):
+            return False
+
+        documentary_lines = sum(cls._license_document_line_looks_documentary(line.lower()) for line in lines)
+        return documentary_lines / len(lines) > 0.5
+
+    @staticmethod
+    def _url_host_matches_suffix(hostname: str, suffix: str) -> bool:
+        return hostname == suffix or hostname.endswith(f".{suffix}")
+
+    @staticmethod
+    def _normalize_url_path(path: str) -> tuple[str, bool]:
+        normalized = path
+        for _ in range(_URL_PATH_NORMALIZATION_PASSES):
+            decoded = unquote(normalized)
+            if decoded == normalized:
+                normalized_path = normalized.lower()
+                return normalized_path, not normalized_path.isascii() or _url_path_has_unsafe_decoded_char(
+                    normalized_path
+                )
+            normalized = decoded
+        normalized_path = normalized.lower()
+        return (
+            normalized_path,
+            not normalized_path.isascii()
+            or _url_path_has_unsafe_decoded_char(normalized_path)
+            or _PERCENT_ENCODED_BYTE_PATTERN.search(normalized_path) is not None,
+        )
+
+    @classmethod
+    def _url_path_segments(cls, path: str) -> tuple[list[str], bool]:
+        normalized_path, has_residual_encoding = cls._normalize_url_path(path)
+        return [segment for segment in normalized_path.strip("/").split("/") if segment], has_residual_encoding
+
+    @classmethod
+    def _url_path_has_suspicious_target(cls, path: str) -> bool:
+        segments, has_residual_encoding = cls._url_path_segments(path)
+        if has_residual_encoding:
+            return True
+        return (
+            any(segment in _SUSPICIOUS_LICENSE_URL_PATH_COMPONENTS for segment in segments)
+            or any(marker in segment for segment in segments for marker in _SUSPICIOUS_LICENSE_URL_MARKERS)
+            or any(segment.endswith(suffix) for segment in segments for suffix in _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES)
+        )
+
+    @classmethod
+    def _url_path_has_embedded_url(cls, path: str) -> bool:
+        normalized_path, has_residual_encoding = cls._normalize_url_path(path)
+        if has_residual_encoding:
+            return True
+        return "://" in normalized_path or "http:/" in normalized_path or "https:/" in normalized_path
+
+    @classmethod
+    def _url_path_looks_like_license_reference(cls, hostname: str, path: str) -> bool:
+        segments, has_residual_encoding = cls._url_path_segments(path)
+        if has_residual_encoding:
+            return False
+
+        if cls._url_host_matches_suffix(hostname, "github.com") and len(segments) == 2:
+            return True
+
+        if any(segment in _LICENSE_REFERENCE_PATH_COMPONENTS for segment in segments):
+            return True
+
+        return any(
+            segment in _LICENSE_REFERENCE_FILE_MARKERS
+            or any(segment.startswith(f"{marker}.") for marker in _LICENSE_REFERENCE_FILE_MARKERS)
+            for segment in segments
+        )
+
+    @classmethod
+    def _url_looks_like_license_reference(cls, raw_url: str) -> bool:
+        cleaned_url = raw_url.rstrip(").,;:]}")
+        try:
+            parsed = urlparse(cleaned_url)
+            port = parsed.port
+            hostname = parsed.hostname.lower() if parsed.hostname else ""
+        except ValueError:
+            return False
+        if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+            return False
+        if port is not None and not 0 <= port <= 65535:
+            return False
+        if parsed.netloc.rsplit("@", maxsplit=1)[-1].endswith(":"):
+            return False
+        if parsed.username or parsed.password:
+            return False
+        if not parsed.netloc.isascii() or not parsed.path.isascii():
+            return False
+        if parsed.params or parsed.query or parsed.fragment:
+            return False
+
+        lowered_url = cleaned_url.lower()
+        if any(marker in lowered_url for marker in _SUSPICIOUS_LICENSE_URL_MARKERS):
+            return False
+        if cls._url_path_has_embedded_url(parsed.path):
+            return False
+        if cls._url_path_has_suspicious_target(parsed.path):
+            return False
+
+        return any(cls._url_host_matches_suffix(hostname, suffix) for suffix in _LICENSE_REFERENCE_HOST_SUFFIXES) and (
+            cls._url_path_looks_like_license_reference(hostname, parsed.path)
+        )
+
+    @classmethod
+    def _license_document_urls_are_documentary(cls, value: str) -> bool:
+        if _value_has_encoded_url_delimiter(value) or _value_has_raw_backslash_url_delimiter(value):
+            return False
+        urls = _URL_METADATA_PATTERN.findall(value)
+        return all(cls._url_looks_like_license_reference(url) for url in urls)
+
+    @classmethod
+    def _looks_like_ordinary_license_reference_value(cls, value: str) -> bool:
+        stripped = value.strip()
+        if not stripped or any(char.isspace() for char in stripped):
+            return False
+        urls = _URL_METADATA_PATTERN.findall(stripped)
+        if len(urls) != 1:
+            return False
+        return urls[0].rstrip(").,;:]}") == stripped.rstrip(").,;:]}") and cls._url_looks_like_license_reference(
+            urls[0]
+        )
+
+    @classmethod
+    def _metadata_value_has_active_risk(cls, value: str) -> bool:
+        lower_value = value.lower()
+        if any(marker in lower_value for marker in ("import ", "#!/")):
+            return True
+        if cls._find_html_tag_matches(value)[1] or cls._find_html_event_handler_matches(value)[1]:
+            return True
+
+        active_pattern_groups = (
+            _HTML_METADATA_PATTERNS,
+            _CODE_METADATA_PATTERNS,
+            _PATH_TRAVERSAL_METADATA_PATTERNS,
+            _CREDENTIAL_METADATA_PATTERNS,
+        )
+        if any(
+            re.search(pattern, value, re.IGNORECASE)
+            for pattern_group in active_pattern_groups
+            for pattern in pattern_group
+        ):
+            return True
+
+        return any(
+            pattern != _GENERIC_URL_METADATA_PATTERN and re.search(pattern, value, re.IGNORECASE)
+            for pattern in SUSPICIOUS_METADATA_PATTERNS
+        )
+
+    @staticmethod
+    def _add_metadata_pattern_check(result: ScanResult, path: str, key: str, pattern: str) -> None:
+        result.add_check(
+            name="Metadata Pattern Check",
+            passed=False,
+            message=f"Suspicious metadata value for {key}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={"key": key, "pattern": pattern},
+            why="Metadata matched known suspicious pattern",
+        )
+
+    @classmethod
+    def _is_ordinary_license_metadata_value(
+        cls,
+        key: str,
+        value: str,
+        *,
+        metadata_is_valid: bool,
+    ) -> bool:
+        if not metadata_is_valid:
+            return False
+        if key.strip().lower() not in _LICENSE_METADATA_KEYS:
+            return False
+        if cls._metadata_value_has_active_risk(value):
+            return False
+        return (
+            cls._looks_like_ordinary_license_document(value) and cls._license_document_urls_are_documentary(value)
+        ) or cls._looks_like_ordinary_license_reference_value(value)
+
+    @classmethod
     def _summarize_custom_metadata(cls, custom_metadata: Any) -> dict[str, Any]:
         """Return a privacy-safe structural and security summary for custom metadata."""
         summary = cls._summarize_custom_metadata_structure(custom_metadata)
         flags: set[str] = set()
+        metadata_is_valid = summary["custom_metadata_valid"] is True
         serialized = json.dumps(custom_metadata, ensure_ascii=False)
         _, html_tag_match_count = cls._find_html_tag_matches(serialized)
         _, event_handler_match_count = cls._find_html_event_handler_matches(serialized)
@@ -402,12 +1298,26 @@ class SafeTensorsScanner(BaseScanner):
         if any(re.search(pattern, serialized, re.IGNORECASE) for pattern in _CREDENTIAL_METADATA_PATTERNS):
             flags.add("credential_exposure")
 
-        for _, value in cls._iter_custom_metadata_strings(custom_metadata):
-            if len(value) > 1000:
+        for key, value in cls._iter_custom_metadata_strings(custom_metadata):
+            is_ordinary_license = cls._is_ordinary_license_metadata_value(
+                key,
+                value,
+                metadata_is_valid=metadata_is_valid,
+            )
+            if len(value) > 1000 and not is_ordinary_license:
                 flags.add("unusually_long_value")
             if any(marker in value.lower() for marker in ("import ", "#!/")):
                 flags.add("code_like_value")
-            if any(re.search(pattern, value) for pattern in SUSPICIOUS_METADATA_PATTERNS):
+            if (
+                any(
+                    (pattern != _GENERIC_URL_METADATA_PATTERN or not is_ordinary_license)
+                    and re.search(pattern, value, re.IGNORECASE)
+                    for pattern in SUSPICIOUS_METADATA_PATTERNS
+                )
+                or _value_has_encoded_url_delimiter(value)
+                or _value_has_raw_backslash_url_delimiter(value)
+                or cls._metadata_value_has_wrapped_opaque_token(value)
+            ):
                 flags.add("suspicious_pattern")
 
         summary["custom_metadata_security_flags"] = sorted(flags)
@@ -447,14 +1357,25 @@ class SafeTensorsScanner(BaseScanner):
             self._suppress_remote_stub_file_type_validation()
             if self._path_validation_result is None:
                 self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
-            self._path_validation_result.metadata["file_size"] = self.get_file_size(path)
+            remote_integrity = self.config.get(_REMOTE_HEADER_INTEGRITY_CONFIG_KEY)
+            remote_declared_size = (
+                remote_integrity.get("remote_declared_size") if isinstance(remote_integrity, dict) else None
+            )
+            file_size = (
+                remote_declared_size
+                if isinstance(remote_declared_size, int)
+                and not isinstance(remote_declared_size, bool)
+                and remote_declared_size >= 0
+                else self.get_file_size(path)
+            )
+            self._path_validation_result.metadata["file_size"] = file_size
         else:
             size_check = self._check_size_limit(path)
             if size_check:
                 return size_check
+            file_size = self.get_file_size(path)
 
         result = self._create_result()
-        file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
         structural_validation_failed = False
 
@@ -602,11 +1523,7 @@ class SafeTensorsScanner(BaseScanner):
                     )
 
                 try:
-                    duplicate_keys: list[str] = []
-                    header = json.loads(
-                        header_bytes.decode("utf-8"),
-                        object_pairs_hook=self._json_duplicate_key_hook(duplicate_keys),
-                    )
+                    header, duplicate_keys = self._load_json_header(header_bytes)
                 except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as e:
                     result.add_check(
                         name="SafeTensors JSON Parse",
@@ -623,19 +1540,20 @@ class SafeTensorsScanner(BaseScanner):
 
                 if duplicate_keys:
                     result.add_check(
-                        name="SafeTensors Duplicate Header Key Validation",
+                        name="SafeTensors Duplicate Key Detection",
                         passed=False,
                         message="SafeTensors header contains duplicate JSON keys",
                         severity=IssueSeverity.INFO,
                         location=path,
                         details={
-                            "duplicate_keys": duplicate_keys[:20],
+                            "duplicate_keys": duplicate_keys,
                             "duplicate_key_count": len(duplicate_keys),
-                            "duplicate_keys_truncated": len(duplicate_keys) > 20,
                         },
                     )
-                    self._mark_inconclusive(result, SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON)
-                    structural_validation_failed = True
+                    self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
+                    result.bytes_scanned = scanned_bytes_for_result()
+                    result.finish(success=False)
+                    return result
 
                 if "__metadata__" in header:
                     custom_metadata_summary = self._summarize_custom_metadata_structure(header["__metadata__"])
@@ -664,9 +1582,39 @@ class SafeTensorsScanner(BaseScanner):
                         self._mark_inconclusive(result, SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON)
                         structural_validation_failed = True
 
-                tensor_names = [k for k in header if k != "__metadata__"]
-                result.metadata["tensor_count"] = len(tensor_names)
+                tensor_count = max(len(header) - (1 if "__metadata__" in header else 0), 0)
+                tensor_names: list[str] = []
+                for name in header:
+                    if name != "__metadata__" and len(tensor_names) < _MAX_REPORTED_TENSOR_NAMES:
+                        tensor_names.append(name)
+                result.metadata["tensor_count"] = tensor_count
                 result.metadata["tensors"] = tensor_names
+                result.metadata["tensor_count_reported"] = len(tensor_names)
+                result.metadata["tensor_metadata_truncated"] = tensor_count > len(tensor_names)
+                result.metadata["max_reported_tensors"] = _MAX_REPORTED_TENSOR_NAMES
+                if tensor_count > _MAX_SAFETENSORS_TENSORS:
+                    result.add_check(
+                        name="SafeTensors Tensor Cardinality Limit",
+                        passed=False,
+                        message="SafeTensors header exceeds the bounded tensor validation limit",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "tensor_count": tensor_count,
+                            "max_tensors": _MAX_SAFETENSORS_TENSORS,
+                            "analysis_incomplete": True,
+                        },
+                    )
+                    self._mark_inconclusive(result, SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON)
+                    result.bytes_scanned = scanned_bytes_for_result()
+                    result.finish(success=False)
+                    return result
+                tensor_name_digest = hashlib.sha256()
+                for name in sorted(name for name in header if name != "__metadata__"):
+                    encoded_name = name.encode("utf-8")
+                    tensor_name_digest.update(len(encoded_name).to_bytes(8, "little"))
+                    tensor_name_digest.update(encoded_name)
+                result.metadata["tensor_names_digest"] = tensor_name_digest.hexdigest()
 
                 # Enhanced SafeTensors metadata injection detection
                 custom_metadata_security_flags = self._detect_metadata_injection_attacks(
@@ -677,18 +1625,43 @@ class SafeTensorsScanner(BaseScanner):
                 )
 
                 # Validate tensor offsets and sizes
-                tensor_entries: list[tuple[str, Any]] = [(k, v) for k, v in header.items() if k != "__metadata__"]
-
                 data_size = file_size - (8 + header_len)
                 offsets = []
-                for name, info in tensor_entries:
+                tensor_validation_counts: dict[str, dict[str, int]] = {}
+
+                def add_tensor_check(
+                    *,
+                    name: str,
+                    passed: bool,
+                    message: str,
+                    severity: IssueSeverity | None = None,
+                    details: dict[str, Any],
+                ) -> None:
+                    counts = tensor_validation_counts.setdefault(name, {"passed": 0, "failed": 0, "reported": 0})
+                    outcome = "passed" if passed else "failed"
+                    counts[outcome] += 1
+                    report_limit = 1 if passed else _MAX_REPORTED_TENSOR_FINDINGS
+                    if counts["reported"] >= report_limit:
+                        return
+                    counts["reported"] += 1
+                    result.add_check(
+                        name=name,
+                        passed=passed,
+                        message=message,
+                        severity=severity,
+                        location=path,
+                        details=details,
+                    )
+
+                for name, info in header.items():
+                    if name == "__metadata__":
+                        continue
                     if not isinstance(info, dict):
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Entry Type Validation",
                             passed=False,
                             message=f"Invalid tensor entry for {name}",
                             severity=IssueSeverity.INFO,
-                            location=path,
                             details={"tensor": name, "actual_type": type(info).__name__, "expected_type": "dict"},
                         )
                         self._mark_inconclusive(result, SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON)
@@ -700,12 +1673,11 @@ class SafeTensorsScanner(BaseScanner):
                     shape = info.get("shape", [])
 
                     if not isinstance(raw_offsets, list) or len(raw_offsets) != 2:
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Offset Structure Validation",
                             passed=False,
                             message=f"Invalid data_offsets structure for {name}",
                             severity=IssueSeverity.INFO,
-                            location=path,
                             details={
                                 "tensor": name,
                                 "actual_type": type(raw_offsets).__name__,
@@ -725,12 +1697,11 @@ class SafeTensorsScanner(BaseScanner):
                         or not isinstance(end, int)
                         or isinstance(end, bool)
                     ):
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Offset Type Validation",
                             passed=False,
                             message=f"Invalid data_offsets for {name}",
                             severity=IssueSeverity.INFO,
-                            location=path,
                             details={
                                 "tensor": name,
                                 "begin_type": type(begin).__name__,
@@ -748,12 +1719,11 @@ class SafeTensorsScanner(BaseScanner):
                         or end > _MAX_PLATFORM_USIZE
                         or end > data_size
                     ):
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Offset Validation",
                             passed=False,
                             message=f"Tensor {name} offsets out of bounds",
                             severity=IssueSeverity.CRITICAL,
-                            location=path,
                             details={
                                 "tensor": name,
                                 "begin": begin,
@@ -764,11 +1734,10 @@ class SafeTensorsScanner(BaseScanner):
                         )
                         continue
                     else:
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Offset Validation",
                             passed=True,
                             message=f"Tensor {name} offsets are valid",
-                            location=path,
                             details={"tensor": name, "begin": begin, "end": end},
                         )
 
@@ -776,12 +1745,11 @@ class SafeTensorsScanner(BaseScanner):
 
                     # Validate dtype/shape size
                     if not isinstance(dtype, str) or dtype not in _DTYPE_BITS:
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Dtype Validation",
                             passed=False,
                             message=f"Invalid dtype for tensor {name}",
                             severity=IssueSeverity.INFO,
-                            location=path,
                             details={
                                 "tensor": name,
                                 "dtype": dtype,
@@ -793,12 +1761,11 @@ class SafeTensorsScanner(BaseScanner):
                         continue
 
                     if not self._is_valid_shape(shape):
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Shape Validation",
                             passed=False,
                             message=f"Invalid shape for tensor {name}",
                             severity=IssueSeverity.INFO,
-                            location=path,
                             details={
                                 "tensor": name,
                                 "shape": shape,
@@ -811,12 +1778,11 @@ class SafeTensorsScanner(BaseScanner):
 
                     expected_size = self._expected_size(dtype, shape)
                     if expected_size is None:
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Size Computation Check",
                             passed=False,
                             message=f"Unable to compute expected size for tensor {name}",
                             severity=IssueSeverity.INFO,
-                            location=path,
                             details={
                                 "tensor": name,
                                 "dtype": dtype,
@@ -828,12 +1794,11 @@ class SafeTensorsScanner(BaseScanner):
                         continue
 
                     if expected_size != end - begin:
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Size Consistency Check",
                             passed=False,
                             message=f"Size mismatch for tensor {name}",
                             severity=IssueSeverity.CRITICAL,
-                            location=path,
                             details={
                                 "tensor": name,
                                 "expected_size": expected_size,
@@ -841,16 +1806,17 @@ class SafeTensorsScanner(BaseScanner):
                             },
                         )
                     else:
-                        result.add_check(
+                        add_tensor_check(
                             name="Tensor Size Consistency Check",
                             passed=True,
                             message=f"Tensor {name} size matches dtype/shape",
-                            location=path,
                             details={
                                 "tensor": name,
                                 "size": expected_size,
                             },
                         )
+
+                result.metadata["tensor_validation_record_counts"] = tensor_validation_counts
 
                 # Check offset continuity
                 offsets.sort()
@@ -896,8 +1862,14 @@ class SafeTensorsScanner(BaseScanner):
 
                 # Check metadata
                 metadata = header.get("__metadata__", {})
+                metadata_is_valid = result.metadata.get("custom_metadata_valid") is True
                 for key, value in self._iter_custom_metadata_strings(metadata):
-                    if len(value) > 1000:
+                    is_ordinary_license = self._is_ordinary_license_metadata_value(
+                        key,
+                        value,
+                        metadata_is_valid=metadata_is_valid,
+                    )
+                    if len(value) > 1000 and not is_ordinary_license:
                         custom_metadata_security_flags.add("unusually_long_value")
                         result.add_check(
                             name="Metadata Length Check",
@@ -933,19 +1905,30 @@ class SafeTensorsScanner(BaseScanner):
                         )
 
                     # Check for regex-based suspicious patterns (independent of above check)
+                    suspicious_pattern: str | None = None
                     for pattern in SUSPICIOUS_METADATA_PATTERNS:
-                        if re.search(pattern, value):
-                            custom_metadata_security_flags.add("suspicious_pattern")
-                            result.add_check(
-                                name="Metadata Pattern Check",
-                                passed=False,
-                                message=f"Suspicious metadata value for {key}",
-                                severity=IssueSeverity.INFO,
-                                location=path,
-                                details={"key": key, "pattern": pattern},
-                                why="Metadata matched known suspicious pattern",
-                            )
+                        if pattern == _GENERIC_URL_METADATA_PATTERN and is_ordinary_license:
+                            continue
+                        if re.search(pattern, value, re.IGNORECASE):
+                            suspicious_pattern = pattern
                             break
+                    if suspicious_pattern is None and _value_has_encoded_url_delimiter(value):
+                        suspicious_pattern = _ENCODED_URL_DELIMITER_METADATA_PATTERN
+                    if suspicious_pattern is None and _value_has_raw_backslash_url_delimiter(value):
+                        suspicious_pattern = _BACKSLASH_URL_DELIMITER_METADATA_PATTERN
+                    has_wrapped_opaque_token = self._metadata_value_has_wrapped_opaque_token(value)
+                    if suspicious_pattern is None and has_wrapped_opaque_token:
+                        suspicious_pattern = _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN
+                    if suspicious_pattern is not None:
+                        custom_metadata_security_flags.add("suspicious_pattern")
+                        self._add_metadata_pattern_check(result, path, key, suspicious_pattern)
+                        if has_wrapped_opaque_token and suspicious_pattern != _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN:
+                            self._add_metadata_pattern_check(
+                                result,
+                                path,
+                                key,
+                                _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN,
+                            )
 
                 if "__metadata__" in header:
                     result.metadata["custom_metadata_security_flags"] = sorted(custom_metadata_security_flags)
@@ -1022,22 +2005,26 @@ class SafeTensorsScanner(BaseScanner):
 
         # Check tensor names for injection attempts
         tensor_names = [k for k in header if k != "__metadata__"]
+        suspicious_tensor_name_count = 0
         for tensor_name in tensor_names:
             if self._is_suspicious_tensor_name(tensor_name):
-                result.add_check(
-                    name="SafeTensors Tensor Name Injection Check",
-                    passed=False,
-                    message=f"Suspicious tensor name detected: {tensor_name}",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={
-                        "tensor_name": tensor_name,
-                        "attack_type": "tensor_name_injection",
-                        "reason": "Contains path traversal or dangerous characters",
-                    },
-                )
+                suspicious_tensor_name_count += 1
+                if suspicious_tensor_name_count <= _MAX_REPORTED_TENSOR_FINDINGS:
+                    result.add_check(
+                        name="SafeTensors Tensor Name Injection Check",
+                        passed=False,
+                        message=f"Suspicious tensor name detected: {tensor_name}",
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={
+                            "tensor_name": tensor_name,
+                            "attack_type": "tensor_name_injection",
+                            "reason": "Contains path traversal or dangerous characters",
+                        },
+                    )
 
         # Check tensor metadata for injection
+        unexpected_tensor_metadata_count = 0
         for tensor_name, tensor_info in header.items():
             if tensor_name == "__metadata__":
                 continue
@@ -1048,18 +2035,34 @@ class SafeTensorsScanner(BaseScanner):
                 unexpected_keys = set(tensor_info.keys()) - expected_keys
 
                 if unexpected_keys:
-                    result.add_check(
-                        name="SafeTensors Tensor Metadata Injection Check",
-                        passed=False,
-                        message=f"Tensor {tensor_name} contains unexpected metadata keys: {list(unexpected_keys)}",
-                        severity=IssueSeverity.INFO,
-                        location=path,
-                        details={
-                            "tensor_name": tensor_name,
-                            "unexpected_keys": list(unexpected_keys),
-                            "attack_type": "tensor_metadata_injection",
-                        },
-                    )
+                    unexpected_tensor_metadata_count += 1
+                    if unexpected_tensor_metadata_count <= _MAX_REPORTED_TENSOR_FINDINGS:
+                        reported_unexpected_keys = sorted(unexpected_keys)[:_MAX_REPORTED_TENSOR_FINDINGS]
+                        result.add_check(
+                            name="SafeTensors Tensor Metadata Injection Check",
+                            passed=False,
+                            message=(
+                                f"Tensor {tensor_name} contains unexpected metadata keys: {reported_unexpected_keys}"
+                            ),
+                            severity=IssueSeverity.INFO,
+                            location=path,
+                            details={
+                                "tensor_name": tensor_name,
+                                "unexpected_key_count": len(unexpected_keys),
+                                "unexpected_keys": reported_unexpected_keys,
+                                "unexpected_keys_truncated": len(unexpected_keys) > len(reported_unexpected_keys),
+                                "attack_type": "tensor_metadata_injection",
+                            },
+                        )
+
+        result.metadata["tensor_name_injection_count"] = suspicious_tensor_name_count
+        result.metadata["tensor_name_injection_findings_truncated"] = (
+            suspicious_tensor_name_count > _MAX_REPORTED_TENSOR_FINDINGS
+        )
+        result.metadata["tensor_metadata_injection_count"] = unexpected_tensor_metadata_count
+        result.metadata["tensor_metadata_injection_findings_truncated"] = (
+            unexpected_tensor_metadata_count > _MAX_REPORTED_TENSOR_FINDINGS
+        )
 
         return security_flags
 
@@ -1222,7 +2225,11 @@ class SafeTensorsScanner(BaseScanner):
                 if len(header_bytes) != header_len:
                     metadata["extraction_error"] = "Truncated SafeTensors header"
                     return metadata
-                header = json.loads(header_bytes)
+                header, duplicate_keys = self._load_json_header(header_bytes)
+                if duplicate_keys:
+                    metadata["extraction_error"] = "Duplicate SafeTensors header keys"
+                    metadata["duplicate_header_keys"] = duplicate_keys
+                    return metadata
 
                 # Extract tensor info
                 tensors: dict[str, dict[str, Any]] = {}
