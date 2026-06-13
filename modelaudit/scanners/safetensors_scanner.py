@@ -57,6 +57,7 @@ _REMOTE_HEADER_INTEGRITY_CONFIG_KEY = "_safetensors_remote_header_integrity"
 _MAX_SAFETENSORS_TENSORS = 4096
 _MAX_REPORTED_TENSOR_NAMES = 1024
 _MAX_REPORTED_TENSOR_FINDINGS = 20
+_MAX_REPORTED_METADATA_FINDINGS = 20
 _MAX_SAFETENSORS_JSON_TOKENS = 100_000
 
 _HTML_METADATA_PATTERNS = (
@@ -1383,6 +1384,8 @@ class SafeTensorsScanner(BaseScanner):
                 else file_size
             )
 
+        result.bytes_scanned = scanned_bytes_for_result()
+
         try:
             self.current_file_path = path
             with open(path, "rb") as f:
@@ -1398,7 +1401,6 @@ class SafeTensorsScanner(BaseScanner):
                         details={"bytes_read": len(header_len_bytes), "required": 8},
                     )
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
-                    result.bytes_scanned = scanned_bytes_for_result()
                     result.finish(success=False)
                     return result
 
@@ -1415,7 +1417,6 @@ class SafeTensorsScanner(BaseScanner):
                         details={"header_len": header_len, "max_allowed": file_size - 8},
                     )
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
-                    result.bytes_scanned = scanned_bytes_for_result()
                     result.finish(success=False)
                     return result
                 else:
@@ -1444,7 +1445,6 @@ class SafeTensorsScanner(BaseScanner):
                     )
                     result.metadata["analysis_incomplete"] = True
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON)
-                    result.bytes_scanned = scanned_bytes_for_result()
                     result.finish(success=False)
                     return result
 
@@ -1521,7 +1521,6 @@ class SafeTensorsScanner(BaseScanner):
                         },
                     )
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
-                    result.bytes_scanned = scanned_bytes_for_result()
                     result.finish(success=False)
                     return result
 
@@ -1562,6 +1561,17 @@ class SafeTensorsScanner(BaseScanner):
                 result.metadata["tensor_count_reported"] = len(tensor_names)
                 result.metadata["tensor_metadata_truncated"] = tensor_count > len(tensor_names)
                 result.metadata["max_reported_tensors"] = _MAX_REPORTED_TENSOR_NAMES
+
+                custom_metadata_security_flags = self._detect_metadata_injection_attacks(
+                    header=header,
+                    result=result,
+                    path=path,
+                    analyze_metadata_content=True,
+                    analyze_tensor_entries=tensor_count <= _MAX_SAFETENSORS_TENSORS,
+                )
+                if "__metadata__" in header:
+                    result.metadata["custom_metadata_security_flags"] = sorted(custom_metadata_security_flags)
+
                 if tensor_count > _MAX_SAFETENSORS_TENSORS:
                     result.add_check(
                         name="SafeTensors Tensor Cardinality Limit",
@@ -1576,7 +1586,6 @@ class SafeTensorsScanner(BaseScanner):
                         },
                     )
                     self._mark_inconclusive(result, SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON)
-                    result.bytes_scanned = scanned_bytes_for_result()
                     result.finish(success=False)
                     return result
                 tensor_name_digest = hashlib.sha256()
@@ -1585,14 +1594,6 @@ class SafeTensorsScanner(BaseScanner):
                     tensor_name_digest.update(len(encoded_name).to_bytes(8, "little"))
                     tensor_name_digest.update(encoded_name)
                 result.metadata["tensor_names_digest"] = tensor_name_digest.hexdigest()
-
-                # Enhanced SafeTensors metadata injection detection
-                custom_metadata_security_flags = self._detect_metadata_injection_attacks(
-                    header=header,
-                    result=result,
-                    path=path,
-                    analyze_metadata_content=True,
-                )
 
                 # Validate tensor offsets and sizes
                 data_size = file_size - (8 + header_len)
@@ -1830,84 +1831,6 @@ class SafeTensorsScanner(BaseScanner):
                     self._mark_inconclusive(result, SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON)
                     structural_validation_failed = True
 
-                # Check metadata
-                metadata = header.get("__metadata__", {})
-                metadata_is_valid = result.metadata.get("custom_metadata_valid") is True
-                for key, value in self._iter_custom_metadata_strings(metadata):
-                    is_ordinary_license = self._is_ordinary_license_metadata_value(
-                        key,
-                        value,
-                        metadata_is_valid=metadata_is_valid,
-                    )
-                    if len(value) > 1000 and not is_ordinary_license:
-                        custom_metadata_security_flags.add("unusually_long_value")
-                        result.add_check(
-                            name="Metadata Length Check",
-                            passed=False,
-                            message=f"Metadata value for {key} is very long",
-                            severity=IssueSeverity.INFO,
-                            location=path,
-                            details={"key": key, "length": len(value), "threshold": 1000},
-                            why=(
-                                "Metadata fields over 1000 characters are unusual in model files. Long strings "
-                                "in metadata could contain encoded payloads, scripts, or data exfiltration "
-                                "attempts."
-                            ),
-                        )
-
-                    lower_val = value.lower()
-
-                    # Check for simple code-like patterns
-                    if any(s in lower_val for s in ["import ", "#!/"]):
-                        custom_metadata_security_flags.add("code_like_value")
-                        result.add_check(
-                            name="Metadata Code Pattern Check",
-                            passed=False,
-                            message=f"Suspicious metadata value for {key}",
-                            severity=IssueSeverity.INFO,
-                            location=path,
-                            details={"key": key, "pattern": "code-like"},
-                            why=(
-                                "Metadata containing code-like patterns (import statements, shebangs, escape "
-                                "sequences) is atypical for model files and may indicate embedded scripts or "
-                                "injection attempts."
-                            ),
-                        )
-
-                    # Check for regex-based suspicious patterns (independent of above check)
-                    suspicious_pattern: str | None = None
-                    for pattern in SUSPICIOUS_METADATA_PATTERNS:
-                        if pattern == _GENERIC_URL_METADATA_PATTERN and is_ordinary_license:
-                            continue
-                        if re.search(pattern, value, re.IGNORECASE):
-                            suspicious_pattern = pattern
-                            break
-                    if suspicious_pattern is None and _value_has_encoded_url_delimiter(value):
-                        suspicious_pattern = _ENCODED_URL_DELIMITER_METADATA_PATTERN
-                    if suspicious_pattern is None and _value_has_raw_backslash_url_delimiter(value):
-                        suspicious_pattern = _BACKSLASH_URL_DELIMITER_METADATA_PATTERN
-                    has_wrapped_opaque_token = self._metadata_value_has_wrapped_opaque_token(value)
-                    if suspicious_pattern is None and has_wrapped_opaque_token:
-                        suspicious_pattern = _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN
-                    if suspicious_pattern is not None:
-                        custom_metadata_security_flags.add("suspicious_pattern")
-                        self._add_metadata_pattern_check(result, path, key, suspicious_pattern)
-                        if has_wrapped_opaque_token and suspicious_pattern != _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN:
-                            self._add_metadata_pattern_check(
-                                result,
-                                path,
-                                key,
-                                _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN,
-                            )
-
-                if "__metadata__" in header:
-                    result.metadata["custom_metadata_security_flags"] = sorted(custom_metadata_security_flags)
-
-                # Bytes scanned = file size for local scans. Remote header-only scans
-                # report transferred header bytes while retaining the declared file size
-                # in metadata.
-                result.bytes_scanned = scanned_bytes_for_result()
-
         except OSError as e:
             return self._finish_read_failure(result, path, e)
         except Exception as e:
@@ -1954,6 +1877,7 @@ class SafeTensorsScanner(BaseScanner):
         result: ScanResult,
         path: str,
         analyze_metadata_content: bool = True,
+        analyze_tensor_entries: bool = True,
     ) -> set[str]:
         """Detect metadata injection attacks in SafeTensors files"""
         security_flags: set[str] = set()
@@ -1964,6 +1888,9 @@ class SafeTensorsScanner(BaseScanner):
         if "__metadata__" in header and analyze_metadata_content:
             # Analyze the metadata for injection patterns
             security_flags.update(self._analyze_metadata_content(metadata, result, path))
+
+        if not analyze_tensor_entries:
+            return security_flags
 
         # Check tensor names for injection attempts
         tensor_names = [k for k in header if k != "__metadata__"]
@@ -2127,6 +2054,113 @@ class SafeTensorsScanner(BaseScanner):
                         "total_matches": total_matches,
                     },
                 )
+
+        metadata_is_valid = result.metadata.get("custom_metadata_valid") is True
+        finding_counts = {
+            "length": {"count": 0, "reported_values": 0, "reported_checks": 0},
+            "code_pattern": {"count": 0, "reported_values": 0, "reported_checks": 0},
+            "pattern": {"count": 0, "reported_values": 0, "reported_checks": 0},
+        }
+
+        def should_report(category: str) -> bool:
+            counts = finding_counts[category]
+            counts["count"] += 1
+            if counts["reported_checks"] >= _MAX_REPORTED_METADATA_FINDINGS:
+                return False
+            counts["reported_values"] += 1
+            counts["reported_checks"] += 1
+            return True
+
+        def reserve_extra_report(category: str) -> bool:
+            counts = finding_counts[category]
+            if counts["reported_checks"] >= _MAX_REPORTED_METADATA_FINDINGS:
+                return False
+            counts["reported_checks"] += 1
+            return True
+
+        for key, value in self._iter_custom_metadata_strings(metadata):
+            is_ordinary_license = self._is_ordinary_license_metadata_value(
+                key,
+                value,
+                metadata_is_valid=metadata_is_valid,
+            )
+            if len(value) > 1000 and not is_ordinary_license:
+                security_flags.add("unusually_long_value")
+                if should_report("length"):
+                    result.add_check(
+                        name="Metadata Length Check",
+                        passed=False,
+                        message=f"Metadata value for {key} is very long",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={"key": key, "length": len(value), "threshold": 1000},
+                        why=(
+                            "Metadata fields over 1000 characters are unusual in model files. Long strings "
+                            "in metadata could contain encoded payloads, scripts, or data exfiltration attempts."
+                        ),
+                    )
+
+            lower_val = value.lower()
+            if any(token in lower_val for token in ["import ", "#!/"]):
+                security_flags.add("code_like_value")
+                if should_report("code_pattern"):
+                    result.add_check(
+                        name="Metadata Code Pattern Check",
+                        passed=False,
+                        message=f"Suspicious metadata value for {key}",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={"key": key, "pattern": "code-like"},
+                        why=(
+                            "Metadata containing code-like patterns (import statements, shebangs, escape sequences) "
+                            "is atypical for model files and may indicate embedded scripts or injection attempts."
+                        ),
+                    )
+
+            suspicious_pattern: str | None = None
+            for pattern in SUSPICIOUS_METADATA_PATTERNS:
+                if pattern == _GENERIC_URL_METADATA_PATTERN and is_ordinary_license:
+                    continue
+                if re.search(pattern, value, re.IGNORECASE):
+                    suspicious_pattern = pattern
+                    break
+            if suspicious_pattern is None and _value_has_encoded_url_delimiter(value):
+                suspicious_pattern = _ENCODED_URL_DELIMITER_METADATA_PATTERN
+            if suspicious_pattern is None and _value_has_raw_backslash_url_delimiter(value):
+                suspicious_pattern = _BACKSLASH_URL_DELIMITER_METADATA_PATTERN
+            has_wrapped_opaque_token = self._metadata_value_has_wrapped_opaque_token(value)
+            if suspicious_pattern is None and has_wrapped_opaque_token:
+                suspicious_pattern = _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN
+            if suspicious_pattern is not None:
+                security_flags.add("suspicious_pattern")
+                if should_report("pattern"):
+                    self._add_metadata_pattern_check(result, path, key, suspicious_pattern)
+                    if (
+                        has_wrapped_opaque_token
+                        and suspicious_pattern != _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN
+                        and reserve_extra_report("pattern")
+                    ):
+                        self._add_metadata_pattern_check(
+                            result,
+                            path,
+                            key,
+                            _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN,
+                        )
+
+        check_names = {
+            "length": "Metadata Length Check",
+            "code_pattern": "Metadata Code Pattern Check",
+            "pattern": "Metadata Pattern Check",
+        }
+        result.metadata["custom_metadata_security_record_counts"] = {
+            check_names[category]: {"failed": counts["count"], "reported": counts["reported_checks"]}
+            for category, counts in finding_counts.items()
+        }
+        for category, counts in finding_counts.items():
+            result.metadata[f"custom_metadata_{category}_finding_count"] = counts["count"]
+            result.metadata[f"custom_metadata_{category}_findings_truncated"] = (
+                counts["reported_values"] < counts["count"]
+            )
 
         return security_flags
 

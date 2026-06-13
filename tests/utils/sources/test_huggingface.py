@@ -3350,6 +3350,7 @@ class TestModelDownloadStreaming:
         def header_scan(*_args: object, **_kwargs: object) -> Any:
             result = _fake_remote_safetensors_scan(filename, len(frame))
             result.bytes_scanned = 8
+            result.metadata["remote_bytes_transferred"] = 8
             return result
 
         with (
@@ -8955,6 +8956,143 @@ class TestModelDownloadStreaming:
         assert "remote_safetensors_header_range_failed" in scan_result.metadata["scan_outcome_reasons"]
         assert mock_requests_get.call_count == 1
         mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
+    @patch("requests.get")
+    @pytest.mark.parametrize(
+        ("budget_adjustment", "expected_bytes", "expected_request_count", "expected_reason"),
+        [
+            (0, None, 2, "safetensors_header_validation_failed"),
+            (-1, 8, 1, "remote_safetensors_header_max_size_exceeded"),
+        ],
+        ids=["exact-budget", "one-byte-under"],
+    )
+    def test_download_model_streaming_charges_malformed_header_bytes(
+        self,
+        mock_requests_get: MagicMock,
+        _mock_hf_hub_url: MagicMock,
+        _mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        budget_adjustment: int,
+        expected_bytes: int | None,
+        expected_request_count: int,
+        expected_reason: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Malformed remote headers still consume their exact transferred-byte budget."""
+        filename = "malformed.safetensors"
+        header = b'{"tensor":'
+        frame = struct.pack("<Q", len(header)) + header
+        full_transfer_bytes = len(frame) + 8
+        max_size = full_transfer_bytes + budget_adjustment
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: len(frame)}, _HF_TEST_REVISION),
+        )
+
+        def range_response(url: str, *, headers: dict[str, str], **_kwargs: object) -> _FakeRangeResponse:
+            start_text, end_text = headers["Range"].removeprefix("bytes=").split("-", 1)
+            start, end = int(start_text), min(int(end_text), len(frame) - 1)
+            return _strict_range_response(frame[start : end + 1], len(frame), start_offset=start, url=url)
+
+        _mock_build_headers.side_effect = lambda *, token=None, headers=None: headers or {}
+        mock_requests_get.side_effect = range_response
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=max_size,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
+            )
+        )
+
+        _path, _is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        charged_bytes = full_transfer_bytes if expected_bytes is None else expected_bytes
+        assert scan_result.success is False
+        assert scan_result.metadata["remote_bytes_transferred"] == charged_bytes
+        assert expected_reason in scan_result.metadata["scan_outcome_reasons"]
+        assert mock_requests_get.call_count == expected_request_count
+        mock_hf_hub_download.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "reported_remote_bytes",
+        [16, None, True, -1],
+        ids=["valid", "missing", "boolean", "negative"],
+    )
+    def test_download_model_streaming_charges_failed_header_metadata_across_files(
+        self,
+        reported_remote_bytes: object,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A zero-byte failed result cannot reset the shared budget before the next file."""
+        filenames = ["first.safetensors", "second.safetensors"]
+        max_size = 16
+        remaining_budgets: list[int | None] = []
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: (filenames, _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (dict.fromkeys(filenames, 128), _HF_TEST_REVISION),
+        )
+
+        def failed_scan(
+            _repo_id: str,
+            filename: str,
+            _revision: str,
+            *,
+            max_transferred_bytes: int | None,
+            **_kwargs: object,
+        ) -> Any:
+            remaining_budgets.append(max_transferred_bytes)
+            result = _fake_remote_safetensors_scan(filename, 128)
+            result.bytes_scanned = 3 if filename == filenames[0] else 0
+            if filename == filenames[0]:
+                if reported_remote_bytes is None:
+                    result.metadata.pop("remote_bytes_transferred")
+                else:
+                    result.metadata["remote_bytes_transferred"] = reported_remote_bytes
+            else:
+                result.metadata["remote_bytes_transferred"] = 0
+            result.finish(success=False)
+            return result
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._scan_remote_huggingface_safetensors_header",
+                side_effect=failed_scan,
+            ),
+            patch("huggingface_hub.hf_hub_download") as mock_download,
+        ):
+            stream = download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=max_size,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
+            )
+            if reported_remote_bytes == 16 and not isinstance(reported_remote_bytes, bool):
+                results = cast(list[tuple[Path, bool, Any]], list(stream))
+            else:
+                with pytest.raises(Exception, match="invalid byte accounting"):
+                    list(stream)
+                results = []
+
+        if results:
+            assert len(results) == 2
+            assert remaining_budgets == [16, 0]
+            assert results[0][2].bytes_scanned == 3
+        else:
+            assert remaining_budgets == [16]
+        mock_download.assert_not_called()
 
     @patch("huggingface_hub.hf_hub_download")
     @patch("huggingface_hub.utils.build_hf_headers", return_value={})

@@ -274,6 +274,99 @@ def test_tensor_cardinality_limit_bounds_result_amplification(tmp_path: Path) ->
     assert len(result.checks) < 20
 
 
+def test_tensor_cardinality_limit_still_reports_custom_metadata_attacks(tmp_path: Path) -> None:
+    """Padding tensors cannot suppress bounded custom-metadata security checks."""
+    file_path = tmp_path / "many-tensors-malicious-metadata.safetensors"
+    header = {f"tensor_{index}": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]} for index in range(4097)}
+    header["__metadata__"] = {
+        "html": "<script>alert(1)</script>",
+        "code": "eval(payload)",
+        "credential": "api_key=SECRET_METADATA_TOKEN",
+        "url": "https://evil.example/payload",
+    }
+    write_raw_safetensors(file_path, header, b"")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["tensor_count"] == 4097
+    assert {
+        "xss_html_injection",
+        "code_injection",
+        "credential_exposure",
+        "suspicious_pattern",
+    }.issubset(result.metadata["custom_metadata_security_flags"])
+    assert {
+        "SafeTensors XSS/HTML Injection Detection",
+        "SafeTensors Code Injection Detection",
+        "SafeTensors Embedded Credentials Detection",
+        "Metadata Pattern Check",
+    }.issubset({check.name for check in result.checks if check.status == CheckStatus.FAILED})
+    assert "tensor_name_injection_count" not in result.metadata
+    assert any(
+        check.name == "SafeTensors Tensor Cardinality Limit" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_tensor_cardinality_limit_keeps_benign_custom_metadata_clean(tmp_path: Path) -> None:
+    """Benign metadata remains clean when tensor validation stops at the cap."""
+    file_path = tmp_path / "many-tensors-benign-metadata.safetensors"
+    header = {f"tensor_{index}": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]} for index in range(4097)}
+    header["__metadata__"] = {"description": "ordinary model training notes"}
+    write_raw_safetensors(file_path, header, b"")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert any(
+        check.name == "SafeTensors Tensor Cardinality Limit" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not [
+        check
+        for check in result.checks
+        if check.name
+        in {
+            "SafeTensors XSS/HTML Injection Detection",
+            "SafeTensors Code Injection Detection",
+            "SafeTensors Embedded Credentials Detection",
+            "Metadata Pattern Check",
+        }
+        and check.status == CheckStatus.FAILED
+    ]
+
+
+def test_custom_metadata_value_findings_are_bounded_and_counted(tmp_path: Path) -> None:
+    """Per-value metadata findings count all matches without amplifying output."""
+    file_path = tmp_path / "many-metadata-findings.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]},
+            "__metadata__": {f"entry_{index}": "import os" for index in range(2000)},
+        },
+        b"",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    code_checks = [check for check in result.checks if check.name == "Metadata Code Pattern Check"]
+    assert len(code_checks) == 20
+    assert result.metadata["custom_metadata_code_pattern_finding_count"] == 2000
+    assert result.metadata["custom_metadata_code_pattern_findings_truncated"] is True
+    assert result.metadata["custom_metadata_security_record_counts"]["Metadata Code Pattern Check"] == {
+        "failed": 2000,
+        "reported": 20,
+    }
+    assert len([issue for issue in result.issues if issue.why and "code-like patterns" in issue.why]) == 20
+    assert all(
+        len([check for check in result.checks if check.name == check_name]) <= 20
+        for check_name in ("Metadata Length Check", "Metadata Code Pattern Check", "Metadata Pattern Check")
+    )
+
+
 def test_tensor_validation_records_are_bounded_at_cardinality_limit(tmp_path: Path) -> None:
     file_path = tmp_path / "bounded-tensor-findings.safetensors"
     header = {

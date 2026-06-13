@@ -5294,6 +5294,14 @@ def download_model_streaming(
                 active_scanner_ids=scannable_scanner_ids,
             )
             transferred_bytes = scan_result.bytes_scanned
+            remote_bytes_transferred = scan_result.metadata.get("remote_bytes_transferred")
+            if (
+                not isinstance(remote_bytes_transferred, int)
+                or isinstance(remote_bytes_transferred, bool)
+                or remote_bytes_transferred < 0
+            ):
+                raise ValueError("Remote SafeTensors scan returned invalid byte accounting")
+            transferred_bytes = max(transferred_bytes, remote_bytes_transferred)
             if size_limit is not None and downloaded_total_size + transferred_bytes > size_limit:
                 raise ValueError(
                     f"Cannot stream {repo_id}: remote SafeTensors header bytes plus prior downloads "
