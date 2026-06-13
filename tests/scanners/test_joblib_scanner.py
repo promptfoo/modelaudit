@@ -1,6 +1,8 @@
 import bz2
 import gzip
+import hashlib
 import lzma
+import pickle
 import zlib
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +29,46 @@ def test_joblib_scanner_basic(tmp_path: Path) -> None:
 
     assert result.success is True
     assert result.bytes_scanned > 0
+
+
+def test_compressed_joblib_keeps_outer_hash_and_namespaces_decompressed_hash(tmp_path: Path) -> None:
+    inner_payload = pickle.dumps({"safe": True})
+    outer_payload = zlib.compress(inner_payload)
+    path = tmp_path / "compressed.joblib"
+    path.write_bytes(outer_payload)
+
+    result = JoblibScanner().scan(str(path))
+
+    assert result.metadata["file_hashes"] == {"sha256": hashlib.sha256(outer_payload).hexdigest()}
+    member_hashes = result.metadata["member_file_hashes"]
+    assert isinstance(member_hashes, dict)
+    records = [
+        record
+        for record in member_hashes.values()
+        if isinstance(record, dict) and record.get("path_segments") == ["decompressed.pkl"]
+    ]
+    assert len(records) == 1
+    assert records[0]["file_hashes"] == {"sha256": hashlib.sha256(inner_payload).hexdigest()}
+
+
+def test_compressed_numpy_joblib_hashes_original_decompressed_payload(tmp_path: Path) -> None:
+    path = tmp_path / "numpy.joblib"
+    joblib.dump({"a": np.arange(5)}, path, compress=3)
+    outer_payload = path.read_bytes()
+    decompressed_payload = JoblibScanner()._safe_decompress(outer_payload)
+
+    result = JoblibScanner().scan(str(path))
+
+    member_hashes = result.metadata["member_file_hashes"]
+    assert isinstance(member_hashes, dict)
+    records = [
+        record
+        for record in member_hashes.values()
+        if isinstance(record, dict) and record.get("path_segments") == ["decompressed.pkl"]
+    ]
+    assert len(records) == 1
+    assert records[0]["file_size"] == len(decompressed_payload)
+    assert records[0]["file_hashes"] == {"sha256": hashlib.sha256(decompressed_payload).hexdigest()}
 
 
 def test_joblib_metadata_extraction_ignores_deserialization_opt_in(

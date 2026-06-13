@@ -1,18 +1,31 @@
+import importlib.abc
 import io
+import sys
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from importlib.machinery import ModuleSpec
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import numpy as np
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
+from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.numpy_scanner import NUMPY_HEADER_MAX_SIZE, NumPyScanner, _read_numpy_array_header
+from modelaudit.scanners.numpy_scanner import (
+    NUMPY_HEADER_MAX_SIZE,
+    NumPyScanner,
+    _numpy_object_reconstruction_reference_is_trusted,
+    _read_numpy_array_header,
+)
+
+_MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD = b"cnumpy._core.multiarray\n_reconstruct\n(NtR."
 
 
 def test_numpy_scanner_valid(tmp_path):
@@ -290,6 +303,19 @@ class _SSLPayload:
 
 def _failed_checks(result: ScanResult) -> list[Check]:
     return [c for c in result.checks if c.status.value == "failed"]
+
+
+def _replace_npy_data_payload(path: Path, payload: bytes) -> None:
+    with path.open("rb") as handle:
+        version = np.lib.format.read_magic(handle)
+        if version == (1, 0):
+            np.lib.format.read_array_header_1_0(handle)
+        elif version == (2, 0):
+            np.lib.format.read_array_header_2_0(handle)
+        else:
+            np.lib.format.read_array_header_1_0(handle)
+        payload_start = handle.tell()
+    path.write_bytes(path.read_bytes()[:payload_start] + payload)
 
 
 def _assert_no_trailing_pickle_parse_noise(result: ScanResult) -> None:
@@ -595,7 +621,7 @@ def test_object_dtype_numpy_recurses_into_pickle_exec(tmp_path: Path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is True
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
@@ -613,7 +639,7 @@ def test_object_dtype_numpy_recurses_into_pickle_ssl(tmp_path: Path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is True
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
@@ -691,6 +717,196 @@ def test_benign_object_dtype_numpy_no_nested_critical(tmp_path: Path) -> None:
     assert not any(i.severity == IssueSeverity.CRITICAL for i in result.issues if "CVE-2019-6446" not in i.message)
 
 
+def test_object_dtype_numpy_preserves_untrusted_reconstruction_origin_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import modelaudit_picklescan.api as picklescan_api
+
+    untrusted_references = {
+        "numpy._core.multiarray._reconstruct",
+        "numpy.core.multiarray._reconstruct",
+        "numpy.dtype",
+        "numpy.ndarray",
+    }
+    original_picklescan_trust = picklescan_api.import_only_reference_is_proven_trusted
+    original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
+
+    def trust_reference(module: str, name: str) -> bool:
+        if f"{module}.{name}" in untrusted_references:
+            return False
+        return original_picklescan_trust(module, name)
+
+    def requires_origin_review(module: str, name: str) -> bool:
+        if f"{module}.{name}" in untrusted_references:
+            return True
+        return original_requires_origin_review(module, name)
+
+    monkeypatch.setattr(picklescan_api, "import_only_reference_is_proven_trusted", trust_reference)
+    monkeypatch.setattr(picklescan_api, "import_only_module_requires_origin_review", requires_origin_review)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda module, name: False if f"{module}.{name}" in untrusted_references else trust_reference(module, name),
+    )
+
+    arr = np.array([{"k": "v"}, [1, 2, 3]], dtype=object)
+    path = tmp_path / "untrusted_reconstruction.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        item.rule_code == "NON_ALLOWLISTED_GLOBAL" and item.details.get("import_reference") in untrusted_references
+        for item in result.issues
+    )
+
+
+def test_object_dtype_numpy_malformed_reconstruct_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "malformed_reconstruct.npy"
+    np.save(path, np.array([None], dtype=object), allow_pickle=True)
+    _replace_npy_data_payload(path, _MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD)
+
+    result = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "numpy._core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+
+
+def test_numpy_object_reconstruction_trust_fails_closed_without_picklescan_owner_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.import_only_reference_is_proven_trusted", lambda *_: False)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._picklescan_loaded_site_package_reference_owner_matches",
+        None,
+    )
+
+    assert _numpy_object_reconstruction_reference_is_trusted("numpy", "dtype") is False
+
+
+def test_numpy_object_reconstruction_trust_does_not_import_unloaded_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_module = "numpy.core.multiarray"
+    target_name = "_reconstruct"
+    target_reference = f"{target_module}.{target_name}"
+    import_marker = tmp_path / "import-hook-fired"
+    path = tmp_path / "shadowed_numpy_reconstruct.npy"
+    np.save(path, np.array([{"k": "v"}], dtype=object), allow_pickle=True)
+
+    class RecordingImportHook(importlib.abc.MetaPathFinder):
+        def find_spec(
+            self,
+            fullname: str,
+            path: Sequence[str] | None,
+            target: ModuleType | None = None,
+        ) -> ModuleSpec | None:
+            del path, target
+            if fullname == target_module:
+                import_marker.write_text("imported", encoding="utf-8")
+                raise AssertionError("trust fallback must not import after origin proof fails")
+            return None
+
+    def trust_reference(_module: str, _name: str) -> bool:
+        return False
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        del self, payload_size
+        result = ScanResult(scanner_name="pickle")
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="untrusted NumPy reconstruction",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": target_reference,
+                "module": target_module,
+                "name": target_name,
+                "position": file_obj.tell(),
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.finish(success=False)
+        return result
+
+    monkeypatch.delitem(sys.modules, target_module, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [RecordingImportHook(), *sys.meta_path])
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.import_only_reference_is_proven_trusted", trust_reference)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        lambda _payload: True,
+    )
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+
+    result = NumPyScanner().scan(str(path))
+
+    assert import_marker.exists() is False
+    assert result.success is False
+    assert any(
+        check.rule_code == "NON_ALLOWLISTED_GLOBAL" and check.details.get("import_reference") == target_reference
+        for check in result.checks
+    )
+
+
+def test_numpy_object_reconstruction_trust_uses_loaded_numpy_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "loaded_numpy_dtype.npy"
+    np.save(path, np.array([{"k": "v"}], dtype=object), allow_pickle=True)
+
+    def trust_reference(_module: str, _name: str) -> bool:
+        raise RuntimeError("forced primary trust failure")
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        del self, payload_size
+        result = ScanResult(scanner_name="pickle")
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="trusted loaded dtype",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy.dtype",
+                "module": "numpy",
+                "name": "dtype",
+                "position": file_obj.tell(),
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.finish(success=False)
+        return result
+
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.import_only_reference_is_proven_trusted", trust_reference)
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["embedded_pickle_scan_success"] is False
+    assert not result.has_warnings
+    assert not any(check.rule_code == "NON_ALLOWLISTED_GLOBAL" for check in result.checks)
+    assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+
+
 def test_numpy_object_dtype_benign_exit0(tmp_path: Path) -> None:
     arr = np.array([{"k": "v"}, [1, 2, 3]], dtype=object)
     path = tmp_path / "benign_object.npy"
@@ -703,6 +919,282 @@ def test_numpy_object_dtype_benign_exit0(tmp_path: Path) -> None:
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_numpy_object_dtype_benign_direct_scan_success_after_reconstruction_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arr = np.array([{"k": "v"}, [1, 2, 3]], dtype=object)
+    path = tmp_path / "benign_object_direct.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        result = ScanResult(scanner_name="pickle")
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="validated reconstruct",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy._core.multiarray._reconstruct",
+                "module": "numpy._core.multiarray",
+                "name": "_reconstruct",
+                "position": file_obj.tell(),
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.finish(success=False)
+        return result
+
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        lambda _payload: True,
+    )
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["embedded_pickle_scan_success"] is False
+    assert not result.has_warnings
+    assert not result.has_errors
+    assert not any(check.rule_code == "NON_ALLOWLISTED_GLOBAL" for check in result.checks)
+    assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+    serialized_result = result.to_dict(include_private_metadata=True)
+    private_metadata = serialized_result.get("_private_metadata", {})
+    assert isinstance(private_metadata, dict)
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in private_metadata
+    assert should_cache_scan_result(serialized_result) is True
+
+
+def test_numpy_object_dtype_direct_scan_preserves_retained_embedded_failure_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arr = np.array([{"k": "v"}], dtype=object)
+    path = tmp_path / "malicious_object_direct.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        result = ScanResult(scanner_name="pickle")
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="validated reconstruct",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy._core.multiarray._reconstruct",
+                "module": "numpy._core.multiarray",
+                "name": "_reconstruct",
+                "position": file_obj.tell(),
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="dangerous reduce",
+            severity=IssueSeverity.CRITICAL,
+            location=context_path,
+            details={
+                "associated_global": "builtins.exec",
+                "module": "builtins",
+                "name": "exec",
+                "position": file_obj.tell() + 1,
+            },
+            rule_code="S209",
+        )
+        result.finish(success=False)
+        return result
+
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        lambda _payload: True,
+    )
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["embedded_pickle_scan_success"] is False
+    assert result.has_errors is True
+    assert not any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "numpy._core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_numpy_object_dtype_cleanup_keeps_untrusted_numpy_reconstruction_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = ScanResult("numpy")
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="untrusted dtype",
+        severity=IssueSeverity.WARNING,
+        details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 209},
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+
+    def trust_reconstruction_origin(module: str, name: str) -> bool:
+        return (module, name) != ("numpy", "dtype")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner.import_only_reference_is_proven_trusted",
+        trust_reconstruction_origin,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._picklescan_loaded_site_package_reference_owner_matches",
+        None,
+    )
+
+    NumPyScanner._remove_validated_numpy_object_reconstruction_findings(
+        result,
+        safe_numpy_reconstruct_payload=True,
+    )
+
+    assert [check.details.get("position") for check in result.checks] == [209]
+    assert [issue.details.get("position") for issue in result.issues] == [209]
+
+
+def test_numpy_object_dtype_cleanup_filters_matching_private_failed_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def add_validated_dtype_check(scan_result: ScanResult) -> None:
+        scan_result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="validated dtype",
+            severity=IssueSeverity.WARNING,
+            details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 209},
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+
+    benign_result = ScanResult("numpy")
+    add_validated_dtype_check(benign_result)
+    benign_result.checks[0].severity = IssueSeverity.INFO
+    benign_result.issues[0].severity = IssueSeverity.INFO
+
+    result = ScanResult("numpy")
+    add_validated_dtype_check(result)
+    result.add_check(
+        name="Dangerous Embedded Code",
+        passed=False,
+        message="dangerous global",
+        severity=IssueSeverity.CRITICAL,
+        details={"import_reference": "builtins.exec", "module": "builtins", "name": "exec", "position": 212},
+        rule_code="S101",
+    )
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+
+    NumPyScanner._remove_validated_numpy_object_reconstruction_findings(
+        benign_result,
+        safe_numpy_reconstruct_payload=True,
+    )
+    NumPyScanner._remove_validated_numpy_object_reconstruction_findings(
+        result,
+        safe_numpy_reconstruct_payload=True,
+    )
+
+    assert benign_result.checks == []
+    assert benign_result.issues == []
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in benign_result._private_metadata
+    assert [(check.name, check.rule_code) for check in result.checks] == [("Dangerous Embedded Code", "S101")]
+    assert [(issue.message, issue.rule_code) for issue in result.issues] == [("dangerous global", "S101")]
+    assert result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] == [
+        {"name": "Dangerous Embedded Code", "rule_code": "S101", "severity": "critical"}
+    ]
+
+
+def test_numpy_object_dtype_direct_scan_preserves_info_downgraded_embedded_private_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arr = np.array([{"k": "v"}], dtype=object)
+    path = tmp_path / "info_downgraded_private.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        result = ScanResult(scanner_name="pickle")
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="validated reconstruct",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy._core.multiarray._reconstruct",
+                "module": "numpy._core.multiarray",
+                "name": "_reconstruct",
+                "position": file_obj.tell(),
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.add_check(
+            name="Dangerous Embedded Code",
+            passed=False,
+            message="dangerous global",
+            severity=IssueSeverity.CRITICAL,
+            location=context_path,
+            details={"import_reference": "builtins.exec", "module": "builtins", "name": "exec", "position": 212},
+            rule_code="S101",
+        )
+        result.checks[-1].severity = IssueSeverity.INFO
+        result.issues[-1].severity = IssueSeverity.INFO
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        lambda _payload: True,
+    )
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is True
+    assert not result.has_warnings
+    assert result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] == [
+        {"name": "Dangerous Embedded Code", "rule_code": "S101", "severity": "critical"}
+    ]
+    assert not should_cache_scan_result(result.to_dict(include_private_metadata=True))
+
+
 def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
     arr = np.array([_ExecPayload()], dtype=object)
     path = tmp_path / "malicious_object.npy"
@@ -712,6 +1204,11 @@ def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
 
     assert determine_exit_code(result) == 1
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    direct_result = NumPyScanner().scan(str(path))
+
+    assert direct_result.success is False
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct_result.issues)
 
 
 def test_numpy_object_dtype_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
@@ -979,6 +1476,59 @@ def test_object_dtype_numpy_trailing_bytes_malicious_exit1(tmp_path: Path) -> No
     assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert determine_exit_code(result) == 1
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_object_dtype_numpy_trailing_stream_keeps_unproven_reconstruct_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arr = np.array([{"k": "v"}], dtype=object)
+    path = tmp_path / "safe_first_stream_unsafe_reconstruct_tail.npy"
+    np.save(path, arr, allow_pickle=True)
+    path.write_bytes(path.read_bytes() + b"TAIL")
+
+    def payload_has_safe_reconstruct_proof(payload: bytes) -> bool:
+        return not payload.endswith(b"TAIL")
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        result = ScanResult(scanner_name="pickle")
+        result.metadata["first_pickle_end_pos"] = file_obj.tell() + 1
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="unproven trailing reconstruct",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy._core.multiarray._reconstruct",
+                "module": "numpy._core.multiarray",
+                "name": "_reconstruct",
+                "position": file_obj.tell() + 2,
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.finish(success=False)
+        return result
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        payload_has_safe_reconstruct_proof,
+    )
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "numpy._core.multiarray._reconstruct"
+        for issue in result.issues
+    )
 
 
 def test_corrupted_npz_fails_safely(tmp_path: Path) -> None:

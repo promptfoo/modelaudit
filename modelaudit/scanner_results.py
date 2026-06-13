@@ -17,6 +17,9 @@ SCAN_OUTCOME_METADATA_KEY: Final[str] = "scan_outcome"
 SCAN_OUTCOME_REASONS_METADATA_KEY: Final[str] = "scan_outcome_reasons"
 SCAN_OUTCOME_MESSAGE_METADATA_KEY: Final[str] = "scan_outcome_message"
 SCANNER_DEPENDENCY_IDS_METADATA_KEY: Final[str] = "scanner_dependency_ids"
+VALIDATED_FORMAT_METADATA_KEY: Final[str] = "validated_format"
+ACTIONABLE_FAILED_CHECKS_METADATA_KEY: Final[str] = "actionable_failed_checks"
+SUPPRESSED_FAILED_CHECKS_METADATA_KEY: Final[str] = "suppressed_failed_checks"
 OPERATIONAL_ERROR_METADATA_KEY: Final[str] = "operational_error"
 RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON: Final[str] = "raw_detector_analysis_incomplete"
 RAW_DETECTOR_FAILURES_METADATA_KEY: Final[str] = "raw_detector_analysis_failures"
@@ -30,12 +33,15 @@ MEMBER_FILE_HASHES_OMITTED_METADATA_KEY: Final[str] = "member_file_hashes_omitte
 FILE_HASHES_COMPLETE_METADATA_KEY: Final[str] = "file_hashes_complete"
 FILE_HASHES_BYTES_HASHED_METADATA_KEY: Final[str] = "file_hashes_bytes_hashed"
 MAX_MEMBER_FILE_HASH_RECORDS: Final[int] = 4096
+MAX_MEMBER_FILE_HASH_PATH_BYTES: Final[int] = 2 * 1024 * 1024
 _MEMBER_FILE_HASH_OCCURRENCES_PRIVATE_KEY: Final[str] = "member_file_hash_occurrences"
 _MEMBER_FILE_HASH_STORED_COUNT_PRIVATE_KEY: Final[str] = "member_file_hashes_stored_count"
+_MEMBER_FILE_HASH_PATH_BYTES_PRIVATE_KEY: Final[str] = "member_file_hash_path_bytes"
 _MEMBER_FILE_HASH_PRIVATE_METADATA_KEYS: Final[frozenset[str]] = frozenset(
     {
         _MEMBER_FILE_HASH_OCCURRENCES_PRIVATE_KEY,
         _MEMBER_FILE_HASH_STORED_COUNT_PRIVATE_KEY,
+        _MEMBER_FILE_HASH_PATH_BYTES_PRIVATE_KEY,
     }
 )
 _PARENT_INTEGRITY_METADATA_KEYS: Final[frozenset[str]] = frozenset(
@@ -47,13 +53,6 @@ _PARENT_INTEGRITY_METADATA_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 _HASH_FIELD_NAMES: Final[frozenset[str]] = frozenset({"md5", "sha1", "sha256", "sha512"})
-_MEMBER_FILE_HASH_SUMMARY_METADATA_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        MEMBER_FILE_HASHES_TOTAL_METADATA_KEY,
-        MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY,
-        MEMBER_FILE_HASHES_OMITTED_METADATA_KEY,
-    }
-)
 
 
 def _deep_mutable_copy(value: Any) -> Any:
@@ -76,10 +75,12 @@ def _member_file_hashes_from_metadata(metadata: Mapping[str, Any], scanner_name:
         for algorithm, value in raw_hashes.items()
         if algorithm in _HASH_FIELD_NAMES and isinstance(value, str) and value
     }
-    if not hashes:
+    sha256_prefix = raw_hashes.get("sha256_prefix")
+    if not hashes and not (isinstance(sha256_prefix, str) and sha256_prefix):
         return None
 
     hash_complete = metadata.get(FILE_HASHES_COMPLETE_METADATA_KEY)
+    is_partial = hash_complete is False or (not hashes and isinstance(sha256_prefix, str) and bool(sha256_prefix))
     bytes_hashed = metadata.get(FILE_HASHES_BYTES_HASHED_METADATA_KEY)
     record: dict[str, Any] = {}
     if scanner_name:
@@ -91,9 +92,11 @@ def _member_file_hashes_from_metadata(metadata: Mapping[str, Any], scanner_name:
     if isinstance(bytes_hashed, int):
         record["bytes_hashed"] = bytes_hashed
 
-    if hash_complete is False:
+    if is_partial:
         record["hash_complete"] = False
         record["hash_status"] = "partial"
+        if isinstance(sha256_prefix, str) and sha256_prefix:
+            record["sha256_prefix"] = sha256_prefix
     else:
         record["file_hashes"] = _deep_mutable_copy(hashes)
         if hash_complete is True:
@@ -104,6 +107,10 @@ def _member_file_hashes_from_metadata(metadata: Mapping[str, Any], scanner_name:
 
 def _member_path_segments_key(path_segments: list[str]) -> str:
     return json.dumps(path_segments, separators=(",", ":"), sort_keys=True)
+
+
+def _member_path_segments_size(path_segments: list[str]) -> int:
+    return len(_member_path_segments_key(path_segments).encode("utf-8", errors="surrogatepass"))
 
 
 def _member_file_hash_identity_key(path_segments: list[str], occurrence: int) -> str:
@@ -138,17 +145,6 @@ def _member_occurrence_from_record(record: Mapping[str, Any]) -> int:
     if isinstance(occurrence, int) and occurrence > 0 and not isinstance(occurrence, bool):
         return occurrence
     return 1
-
-
-def _iter_child_member_file_hash_records(metadata: Mapping[str, Any]) -> list[tuple[list[str], Mapping[str, Any]]]:
-    raw_member_hashes = metadata.get(MEMBER_FILE_HASHES_METADATA_KEY)
-    if not isinstance(raw_member_hashes, Mapping):
-        return []
-    records: list[tuple[list[str], Mapping[str, Any]]] = []
-    for member_path, record in raw_member_hashes.items():
-        if isinstance(member_path, str) and member_path and isinstance(record, Mapping):
-            records.append((_member_path_segments_from_record(member_path, record), record))
-    return records
 
 
 def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str, Any]) -> bool:
@@ -274,6 +270,31 @@ def scan_result_has_inconclusive_outcome(scan_result: "ScanResult") -> bool:
     return scan_result.metadata.get(SCAN_OUTCOME_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME
 
 
+def _record_field(record: Any, field: str) -> Any:
+    if isinstance(record, Mapping):
+        return record.get(field)
+    return getattr(record, field, None)
+
+
+def _normalized_record_value(value: Any) -> str | None:
+    raw_value = getattr(value, "value", value)
+    if not isinstance(raw_value, str):
+        return None
+    return raw_value.lower().split(".", 1)[-1]
+
+
+def _record_is_failed_security_check(record: Any) -> bool:
+    return _normalized_record_value(_record_field(record, "status")) == "failed" and _normalized_record_value(
+        _record_field(record, "severity")
+    ) in {"warning", "critical"}
+
+
+def _scan_result_has_security_findings(scan_result: "ScanResult") -> bool:
+    if scan_result.has_errors or scan_result.has_warnings:
+        return True
+    return any(_record_is_failed_security_check(check) for check in scan_result.checks)
+
+
 def mark_inconclusive_scan_result(scan_result: "ScanResult", reason: str) -> None:
     """Mark a scan result as inconclusive while preserving existing reasons."""
     scan_result.metadata["analysis_incomplete"] = True
@@ -298,6 +319,8 @@ def normalize_unclassified_scan_failure(scan_result: "ScanResult") -> None:
     if bool(scan_result.metadata.get(OPERATIONAL_ERROR_METADATA_KEY)):
         return
     if scan_result_has_inconclusive_outcome(scan_result):
+        return
+    if _scan_result_has_security_findings(scan_result):
         return
     mark_inconclusive_scan_result(scan_result, UNCLASSIFIED_SCAN_FAILURE_REASON)
 
@@ -418,6 +441,24 @@ class ScanResult:
         self._metadata_restored_critical: bool = False
         self._merged_children_success: bool = True
 
+    def _record_private_failed_check(
+        self,
+        metadata_key: str,
+        *,
+        name: str,
+        rule_code: str,
+        severity: IssueSeverity,
+    ) -> None:
+        failed_checks = self._private_metadata.setdefault(metadata_key, [])
+        if isinstance(failed_checks, list):
+            failed_checks.append(
+                {
+                    "name": name,
+                    "rule_code": rule_code,
+                    "severity": severity.value,
+                }
+            )
+
     def add_check(
         self,
         name: str,
@@ -452,8 +493,24 @@ class ScanResult:
 
         config = get_config()
 
+        raw_failed_severity = severity or IssueSeverity.WARNING
+        if rule_code and not passed and raw_failed_severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+            self._record_private_failed_check(
+                ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+                name=name,
+                rule_code=rule_code,
+                severity=raw_failed_severity,
+            )
+
         # Check if rule is suppressed
         if rule_code and config.is_suppressed(rule_code, location):
+            if not passed:
+                self._record_private_failed_check(
+                    SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
+                    name=name,
+                    rule_code=rule_code,
+                    severity=raw_failed_severity,
+                )
             # Messages can include matched secrets or attacker-controlled model content.
             logger.debug("Suppressed security finding")
             return
@@ -616,13 +673,15 @@ class ScanResult:
         """Backward-compatible wrapper for raw-detector check reconciliation."""
         self.reconcile_raw_detector_checks()
 
-    def _ensure_member_file_hash_state(self) -> tuple[dict[str, int], int]:
+    def _ensure_member_file_hash_state(self) -> tuple[dict[str, int], int, int]:
         occurrences = self._private_metadata.get(_MEMBER_FILE_HASH_OCCURRENCES_PRIVATE_KEY)
         stored_count = self._private_metadata.get(_MEMBER_FILE_HASH_STORED_COUNT_PRIVATE_KEY)
-        if isinstance(occurrences, dict) and isinstance(stored_count, int):
-            return occurrences, stored_count
+        stored_path_bytes = self._private_metadata.get(_MEMBER_FILE_HASH_PATH_BYTES_PRIVATE_KEY)
+        if isinstance(occurrences, dict) and isinstance(stored_count, int) and isinstance(stored_path_bytes, int):
+            return occurrences, stored_count, stored_path_bytes
 
         occurrences = {}
+        stored_path_bytes = 0
         raw_member_hashes = self.metadata.get(MEMBER_FILE_HASHES_METADATA_KEY)
         if isinstance(raw_member_hashes, Mapping):
             for member_key, record in raw_member_hashes.items():
@@ -631,13 +690,15 @@ class ScanResult:
                 path_segments = _member_path_segments_from_record(member_key, record)
                 path_key = _member_path_segments_key(path_segments)
                 occurrences[path_key] = max(occurrences.get(path_key, 0), _member_occurrence_from_record(record))
+                stored_path_bytes += _member_path_segments_size(path_segments)
             stored_count = len(raw_member_hashes)
         else:
             stored_count = 0
 
         self._private_metadata[_MEMBER_FILE_HASH_OCCURRENCES_PRIVATE_KEY] = occurrences
         self._private_metadata[_MEMBER_FILE_HASH_STORED_COUNT_PRIVATE_KEY] = stored_count
-        return occurrences, stored_count
+        self._private_metadata[_MEMBER_FILE_HASH_PATH_BYTES_PRIVATE_KEY] = stored_path_bytes
+        return occurrences, stored_count, stored_path_bytes
 
     def _record_member_file_hash_omission(self, omitted_count: int = 1) -> None:
         if omitted_count <= 0:
@@ -654,7 +715,7 @@ class ScanResult:
             member_hashes = {}
             self.metadata[MEMBER_FILE_HASHES_METADATA_KEY] = member_hashes
 
-        occurrences, stored_count = self._ensure_member_file_hash_state()
+        occurrences, stored_count, stored_path_bytes = self._ensure_member_file_hash_state()
 
         existing_total = self.metadata.get(MEMBER_FILE_HASHES_TOTAL_METADATA_KEY)
         self.metadata[MEMBER_FILE_HASHES_TOTAL_METADATA_KEY] = (
@@ -666,6 +727,10 @@ class ScanResult:
             return
 
         normalized_segments = [str(segment) for segment in path_segments]
+        path_size = _member_path_segments_size(normalized_segments)
+        if stored_path_bytes + path_size > MAX_MEMBER_FILE_HASH_PATH_BYTES:
+            self._record_member_file_hash_omission()
+            return
         path_key = _member_path_segments_key(normalized_segments)
         occurrence = occurrences.get(path_key, 0) + 1
         occurrences[path_key] = occurrence
@@ -676,6 +741,7 @@ class ScanResult:
         stored_record["occurrence"] = occurrence
         member_hashes[_member_file_hash_identity_key(normalized_segments, occurrence)] = stored_record
         self._private_metadata[_MEMBER_FILE_HASH_STORED_COUNT_PRIVATE_KEY] = stored_count + 1
+        self._private_metadata[_MEMBER_FILE_HASH_PATH_BYTES_PRIVATE_KEY] = stored_path_bytes + path_size
 
     def _absorb_member_file_hash_summary(self, metadata: Mapping[str, Any]) -> None:
         omitted = metadata.get(MEMBER_FILE_HASHES_OMITTED_METADATA_KEY)
@@ -686,7 +752,12 @@ class ScanResult:
             ) + omitted
             self._record_member_file_hash_omission(omitted)
 
-    def _merge_member_file_hash_records(self, records: Mapping[str, Any]) -> None:
+    def _merge_member_file_hash_records(
+        self,
+        records: Mapping[str, Any],
+        prefix_segments: list[str] | None = None,
+    ) -> None:
+        prefix = prefix_segments or []
         sortable_records: list[tuple[str, int, str, list[str], Mapping[str, Any]]] = []
         for member_key, record in records.items():
             if not isinstance(member_key, str) or not isinstance(record, Mapping):
@@ -702,31 +773,25 @@ class ScanResult:
                 )
             )
         for _, _, _, path_segments, record in sorted(sortable_records):
-            self._add_member_file_hash_record(path_segments, record)
+            self._add_member_file_hash_record([*prefix, *path_segments], record)
 
-    def merge_member_result(self, other: "ScanResult", member_path: str) -> None:
+    def merge_member_result(self, other: "ScanResult", member_path: str, *member_path_segments: str) -> None:
         """Merge an archive-member scan without letting member hashes become parent hashes."""
+        path_segments = [member_path, *member_path_segments]
         parent_identity = {
             key: _deep_mutable_copy(self.metadata[key])
             for key in _PARENT_INTEGRITY_METADATA_KEYS
             if key in self.metadata
         }
         child_integrity_record = _member_file_hashes_from_metadata(other.metadata, other.scanner_name)
-        child_member_hashes = _iter_child_member_file_hash_records(other.metadata)
 
         missing = object()
         other_member_hashes = other.metadata.pop(MEMBER_FILE_HASHES_METADATA_KEY, missing)
-        other_summary_values = {
-            key: other.metadata.pop(key, missing) for key in _MEMBER_FILE_HASH_SUMMARY_METADATA_KEYS
-        }
         try:
             self.merge(other)
         finally:
             if other_member_hashes is not missing:
                 other.metadata[MEMBER_FILE_HASHES_METADATA_KEY] = other_member_hashes
-            for key, value in other_summary_values.items():
-                if value is not missing:
-                    other.metadata[key] = value
 
         for key in _PARENT_INTEGRITY_METADATA_KEYS:
             if key in parent_identity:
@@ -735,11 +800,9 @@ class ScanResult:
                 self.metadata.pop(key, None)
 
         if child_integrity_record is not None:
-            self._add_member_file_hash_record([member_path], child_integrity_record)
-        for child_segments, record in child_member_hashes:
-            self._add_member_file_hash_record([member_path, *child_segments], record)
-        summary_metadata = {key: value for key, value in other_summary_values.items() if value is not missing}
-        self._absorb_member_file_hash_summary(summary_metadata)
+            self._add_member_file_hash_record(path_segments, child_integrity_record)
+        if isinstance(other_member_hashes, Mapping):
+            self._merge_member_file_hash_records(other_member_hashes, path_segments)
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""

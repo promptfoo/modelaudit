@@ -15,6 +15,10 @@ from typing import Any, ClassVar
 from .. import core
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file._compression import is_zlib_header
+from ..utils.file.detection import (
+    _is_malformed_sentencepiece_model_proto_candidate_file,
+    is_sentencepiece_model_proto_file,
+)
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import member_scan_incomplete
@@ -181,7 +185,44 @@ class CompressedScanner(BaseScanner):
             wrapper_path.name[: -len(wrapper_path.suffix)] if wrapper_path.suffix else wrapper_path.name
         )
         inferred_suffix = Path(stem_without_wrapper).suffix
-        return inferred_suffix or ".bin"
+        if inferred_suffix:
+            return inferred_suffix
+        if stem_without_wrapper.lower() in {"tokenizer", "spiece", "sentencepiece"}:
+            return ""
+        return ".bin"
+
+    @staticmethod
+    def _uses_tokenizer_extensionless_inner(path: str) -> bool:
+        wrapper_path = Path(path)
+        if not wrapper_path.suffix or not CompressedScanner._has_declared_wrapper_extension(path):
+            return False
+        stem_without_wrapper = wrapper_path.name[: -len(wrapper_path.suffix)]
+        return not Path(stem_without_wrapper).suffix and stem_without_wrapper.lower() in {
+            "tokenizer",
+            "spiece",
+            "sentencepiece",
+        }
+
+    @staticmethod
+    def _is_sentencepiece_candidate(path: str) -> bool:
+        return is_sentencepiece_model_proto_file(path) or _is_malformed_sentencepiece_model_proto_candidate_file(path)
+
+    @staticmethod
+    def _replace_temp_suffix(path: str, suffix: str) -> str:
+        fd, replacement_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        os.unlink(replacement_path)
+        os.replace(path, replacement_path)
+        return replacement_path
+
+    @classmethod
+    def _route_tokenizer_extensionless_or_bin(cls, wrapper_path: str, temp_paths: list[str]) -> list[str]:
+        if not cls._uses_tokenizer_extensionless_inner(wrapper_path):
+            return temp_paths
+        return [
+            temp_path if cls._is_sentencepiece_candidate(temp_path) else cls._replace_temp_suffix(temp_path, ".bin")
+            for temp_path in temp_paths
+        ]
 
     @staticmethod
     def _derive_inner_display_name(path: str) -> str:
@@ -916,6 +957,9 @@ class CompressedScanner(BaseScanner):
         decompressed_bytes = 0
         try:
             temp_path, member_temp_paths, decompressed_bytes = self._decompress_to_tempfiles(path, expected_codec)
+            routed_temp_paths = self._route_tokenizer_extensionless_or_bin(path, [temp_path, *member_temp_paths])
+            temp_path = routed_temp_paths[0]
+            member_temp_paths = routed_temp_paths[1:]
             temp_paths = [temp_path, *member_temp_paths]
             result.metadata["decompressed_bytes"] = decompressed_bytes
             result.metadata["compressed_member_count"] = len(member_temp_paths)

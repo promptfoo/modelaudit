@@ -31,10 +31,6 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
-from ..scanner_results import (
-    FILE_HASHES_BYTES_HASHED_METADATA_KEY,
-    FILE_HASHES_COMPLETE_METADATA_KEY,
-)
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded, _read_zip_member_prefix
 from ..utils.file.hdf5 import (
     HDF5_SIGNATURE_SCAN_MAX_BYTES,
@@ -788,31 +784,20 @@ class KerasZipScanner(BaseScanner):
         if has_embedded_weights_limit:
             self._suppress_expected_embedded_weights_limit_noise(nested_result)
         self._redact_recursive_archive_scan_result(nested_result)
-        parent_integrity_metadata = {
-            key: deepcopy(result.metadata[key])
-            for key in (
-                "file_hashes",
-                "file_size",
-                FILE_HASHES_COMPLETE_METADATA_KEY,
-                FILE_HASHES_BYTES_HASHED_METADATA_KEY,
-            )
-            if key in result.metadata
-        }
+        preserved_metadata = deepcopy(result.metadata)
+        for key in (
+            "member_file_hashes",
+            "member_file_hashes_total",
+            "member_file_hashes_truncated",
+            "member_file_hashes_omitted",
+            "contents",
+        ):
+            preserved_metadata.pop(key, None)
         nested_contents = nested_result.metadata.get("contents")
         result.merge(nested_result)
-        for key in (
-            "file_hashes",
-            "file_size",
-            FILE_HASHES_COMPLETE_METADATA_KEY,
-            FILE_HASHES_BYTES_HASHED_METADATA_KEY,
-        ):
-            if key in parent_integrity_metadata:
-                result.metadata[key] = deepcopy(parent_integrity_metadata[key])
-            else:
-                result.metadata.pop(key, None)
+        result.metadata.update(preserved_metadata)
         if nested_contents is not None:
             result.metadata["contents"] = nested_contents
-        result.success = result.success and nested_result.success
 
     def _merge_recursive_archive_scan_after_primary_failure(
         self,
@@ -3549,7 +3534,8 @@ class KerasZipScanner(BaseScanner):
                     )
                     result.merge_member_result(
                         prefix_result,
-                        f"{display_weights_entry}:embedded-weights-prefix-{segment_index}.pkl",
+                        display_weights_entry,
+                        f"embedded-weights-prefix-{segment_index}.pkl",
                     )
                     continue
                 pickle_scan_was_selection_skipped = (
@@ -3583,7 +3569,8 @@ class KerasZipScanner(BaseScanner):
                 )
                 result.merge_member_result(
                     pickle_result,
-                    f"{display_weights_entry}:embedded-weights-prefix-{segment_index}.pkl",
+                    display_weights_entry,
+                    f"embedded-weights-prefix-{segment_index}.pkl",
                 )
 
     def _scan_embedded_weights_full_payload_security(

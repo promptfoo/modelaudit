@@ -235,7 +235,7 @@ def test_paddle_suspicious_pdmodel_aggregate_exit_code_is_security_finding(tmp_p
         result = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
     warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is False
     assert determine_exit_code(result) == 1
     assert warning_issues
@@ -326,7 +326,7 @@ def test_paddle_suspicious_pdiparams_aggregate_exit_code_is_security_finding(tmp
         result = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
     warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is False
     assert determine_exit_code(result) == 1
     assert warning_issues

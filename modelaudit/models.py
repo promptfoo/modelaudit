@@ -39,30 +39,199 @@ def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
     return getattr(metadata, "scan_outcome", None) == outcome
 
 
-def _file_metadata_has_scan_outcome(file_metadata: Any, outcome: str) -> bool:
-    """Return True when any file metadata entry reports a scan outcome."""
+def _metadata_value(metadata: Any, key: str) -> Any:
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        return metadata.get(key)
+
+    getter = getattr(metadata, "get", None)
+    if callable(getter):
+        try:
+            return getter(key)
+        except Exception:
+            return None
+
+    return getattr(metadata, key, None)
+
+
+_COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS = frozenset({"recognized_format_scanner_unavailable"})
+_COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES = ("_routing_incomplete",)
+_RUNTIME_VERSION_SKIP_DETAILS = {
+    "runtime_version_known": False,
+    "runtime_cve_applicability": "unknown",
+    "runtime_cve_version_gate": "local_environment_only",
+}
+
+
+def _metadata_has_coverage_only_operational_error(metadata: Any) -> bool:
+    """Return True when operational_error marks fail-closed coverage, not a scanner failure."""
+    if _metadata_value(metadata, "operational_error") is not True:
+        return False
+    reason = _metadata_value(metadata, "operational_error_reason")
+    return isinstance(reason, str) and (
+        reason in _COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS or reason.endswith(_COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES)
+    )
+
+
+def _metadata_has_incomplete_coverage(metadata: Any, *, allow_bare_analysis_incomplete: bool = True) -> bool:
+    """Return True when metadata identifies incomplete scan coverage."""
+    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
+        return True
+    if allow_bare_analysis_incomplete and _metadata_value(metadata, "analysis_incomplete") is True:
+        return True
+    reason = _metadata_value(metadata, "scan_outcome_reason")
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = _metadata_value(metadata, "scan_outcome_reasons")
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(reason) for reason in reasons)
+
+    return False
+
+
+def _metadata_has_scan_outcome_or_reason_marker(metadata: Any) -> bool:
+    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
+        return True
+    reason = _metadata_value(metadata, "scan_outcome_reason")
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = _metadata_value(metadata, "scan_outcome_reasons")
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(reason) for reason in reasons)
+
+    return False
+
+
+def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
+    """Return True when record details explicitly identify incomplete coverage."""
+    if _metadata_has_scan_outcome_or_reason_marker(metadata):
+        return True
+    return _metadata_value(metadata, "analysis_incomplete") is True
+
+
+def _details_have_incomplete_coverage(
+    details: Any,
+    *,
+    allow_bare_analysis_incomplete: bool = True,
+    _depth: int = 0,
+) -> bool:
+    """Return True when details or consolidated detail findings identify incomplete coverage."""
+    if allow_bare_analysis_incomplete:
+        if _metadata_has_explicit_incomplete_coverage_marker(details):
+            return True
+    elif _metadata_has_scan_outcome_or_reason_marker(details):
+        return True
+    if _depth >= 4:
+        return False
+
+    findings = _metadata_value(details, "findings")
+    if isinstance(findings, dict):
+        return _details_have_incomplete_coverage(
+            findings,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+            _depth=_depth + 1,
+        )
+    if isinstance(findings, (list, tuple, set, frozenset)):
+        for finding in findings:
+            if _details_have_incomplete_coverage(
+                finding,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+                _depth=_depth + 1,
+            ):
+                return True
+            nested_details = _metadata_value(finding, "details")
+            if nested_details is not finding and _details_have_incomplete_coverage(
+                nested_details,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+                _depth=_depth + 1,
+            ):
+                return True
+
+    return False
+
+
+def _record_is_clean_runtime_version_skip(record: Any) -> bool:
+    details = _metadata_value(record, "details")
+    status = _metadata_value(record, "status")
+    status_value = getattr(status, "value", status)
+    if not (
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
+        and _metadata_value(details, "analysis_incomplete") is True
+        and not _metadata_has_scan_outcome_or_reason_marker(details)
+    ):
+        return False
+
+    return all(_metadata_value(details, key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
+
+
+def _file_metadata_has_incomplete_coverage(file_metadata: Any) -> bool:
+    """Return True when any file metadata entry reports incomplete scan coverage."""
     if not isinstance(file_metadata, dict):
         return False
-    return any(_metadata_has_scan_outcome(metadata, outcome) for metadata in file_metadata.values())
+    return any(_metadata_has_incomplete_coverage(metadata) for metadata in file_metadata.values())
 
 
-def _issues_have_security_findings(issues: list[Any]) -> bool:
+def _records_have_incomplete_coverage(
+    records: Any,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    """Return True when any issue/check details identify incomplete scan coverage."""
+    if not isinstance(records, list):
+        return False
+    for record in records:
+        if _record_has_incomplete_coverage(
+            record,
+            allow_skipped_check_exemption=allow_skipped_check_exemption,
+        ):
+            return True
+    return False
+
+
+def _record_has_incomplete_coverage(
+    record: Any,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    if allow_skipped_check_exemption and _record_is_clean_runtime_version_skip(record):
+        return False
+    return _details_have_incomplete_coverage(_metadata_value(record, "details"))
+
+
+def _normalized_enum_value(value: Any) -> str | None:
+    raw_value = getattr(value, "value", value)
+    if not isinstance(raw_value, str):
+        return None
+    return raw_value.lower().split(".", 1)[-1]
+
+
+def _record_has_security_severity(record: Any) -> bool:
+    severity = _metadata_value(record, "severity")
+    return _normalized_enum_value(severity) in {
+        IssueSeverity.WARNING.value,
+        IssueSeverity.CRITICAL.value,
+    }
+
+
+def _issues_have_security_findings(records: list[Any]) -> bool:
     """Return True when incoming issue records contain WARNING/CRITICAL findings."""
-    for issue in issues:
-        severity = issue.get("severity") if isinstance(issue, dict) else getattr(issue, "severity", None)
-        if isinstance(severity, IssueSeverity):
-            if severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL):
-                return True
-            continue
-        if isinstance(severity, str):
-            severity_name = severity.lower()
-            if severity_name.startswith("issueseverity."):
-                severity_name = severity_name.split(".", 1)[1]
-            if severity_name in {
-                IssueSeverity.WARNING.value,
-                IssueSeverity.CRITICAL.value,
-            }:
-                return True
+    return any(_record_has_security_severity(record) for record in records)
+
+
+def _checks_have_failed_security_findings(checks: list[Any]) -> bool:
+    for check in checks:
+        if _normalized_enum_value(_metadata_value(check, "status")) == CheckStatus.FAILED.value and (
+            _record_has_security_severity(check)
+        ):
+            return True
     return False
 
 
@@ -287,11 +456,16 @@ class FileHashesModel(BaseModel):
     md5: str | None = Field(None, description="MD5 hash", pattern=r"^[a-fA-F0-9]{32}$")
     sha1: str | None = Field(None, description="SHA1 hash", pattern=r"^[a-fA-F0-9]{40}$")
     sha256: str | None = Field(None, description="SHA256 hash", pattern=r"^[a-fA-F0-9]{64}$")
+    sha256_prefix: str | None = Field(
+        None,
+        description="SHA256 hash for a bounded prefix only; not a complete file hash",
+        pattern=r"^[a-fA-F0-9]{64}$",
+    )
     sha512: str | None = Field(None, description="SHA512 hash", pattern=r"^[a-fA-F0-9]{128}$")
 
     def has_any_hash(self) -> bool:
         """Check if any hash is present"""
-        return any([self.md5, self.sha1, self.sha256, self.sha512])
+        return any([self.md5, self.sha1, self.sha256, self.sha256_prefix, self.sha512])
 
     def get_strongest_hash(self) -> tuple[str, str] | None:
         """Get the strongest available hash as (algorithm, hash) tuple"""
@@ -316,6 +490,11 @@ class MemberFileIntegrityModel(BaseModel, DictCompatMixin):
     bytes_hashed: int | None = Field(None, description="Bytes covered by the member hash", ge=0)
     hash_complete: bool | None = Field(None, description="Whether the member hash covered the full payload")
     hash_status: str | None = Field(None, description="Hash coverage status")
+    sha256_prefix: str | None = Field(
+        None,
+        description="SHA256 hash for a bounded member prefix only",
+        pattern=r"^[a-fA-F0-9]{64}$",
+    )
     scanner_name: str | None = Field(None, description="Scanner that produced the member hash")
     logical_path: str | None = Field(None, description="Original logical path when duplicate keys are disambiguated")
     path_segments: list[str] = Field(default_factory=list, description="Raw nested archive path segments")
@@ -493,18 +672,28 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             self.scanner_selection = incoming_scanner_selection
 
         incoming_issues = results_dict.get("issues", [])
+        incoming_checks = results_dict.get("checks", [])
         incoming_has_security_findings = (
             _issues_have_security_findings(incoming_issues) if isinstance(incoming_issues, list) else False
         )
-        incoming_has_inconclusive_outcome = _metadata_has_scan_outcome(
-            results_dict.get("metadata"), INCONCLUSIVE_SCAN_OUTCOME
-        ) or _file_metadata_has_scan_outcome(results_dict.get("file_metadata"), INCONCLUSIVE_SCAN_OUTCOME)
+        incoming_has_incomplete_coverage = _metadata_has_incomplete_coverage(results_dict.get("metadata")) or any(
+            (
+                _file_metadata_has_incomplete_coverage(results_dict.get("file_metadata")),
+                _records_have_incomplete_coverage(incoming_issues),
+                _records_have_incomplete_coverage(incoming_checks, allow_skipped_check_exemption=True),
+            )
+        )
 
-        # Update success status for operational/inconclusive scan failures.
+        # Update success status for operational/incomplete scan failures.
         # Security findings should drive exit code 1 without becoming an
-        # operationally unsuccessful scan by themselves.
-        incoming_unsuccessful = results_dict.get("success", True) is False or incoming_has_inconclusive_outcome
-        if results_dict.get("has_errors", False) or (incoming_unsuccessful and not incoming_has_security_findings):
+        # operationally unsuccessful scan by themselves, but incomplete
+        # coverage is always an unsuccessful aggregate security coverage result.
+        incoming_unsuccessful = results_dict.get("success", True) is False
+        if (
+            results_dict.get("has_errors", False)
+            or incoming_has_incomplete_coverage
+            or (incoming_unsuccessful and not incoming_has_security_findings)
+        ):
             self.success = False
 
         # Convert and extend issues
@@ -570,11 +759,26 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         self.files_scanned += 1  # Each ScanResult represents one file scan
 
         metadata = scan_result.metadata or {}
-        if bool(metadata.get("operational_error")):
+        if bool(metadata.get("operational_error")) and not _metadata_has_coverage_only_operational_error(metadata):
             self.has_errors = True
 
-        # Update success status - only set to False for operational errors
-        if bool(metadata.get("operational_error")) or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        # Update success status for operational errors or incomplete coverage.
+        issues_have_incomplete_coverage = _records_have_incomplete_coverage(scan_result.issues)
+        checks_have_incomplete_coverage = _records_have_incomplete_coverage(
+            scan_result.checks,
+            allow_skipped_check_exemption=True,
+        )
+        if (
+            bool(metadata.get("operational_error"))
+            or _metadata_has_incomplete_coverage(metadata)
+            or issues_have_incomplete_coverage
+            or checks_have_incomplete_coverage
+            or (
+                scan_result.success is False
+                and _checks_have_failed_security_findings(scan_result.checks)
+                and not scan_result.has_errors
+            )
+        ):
             self.success = False
 
         if metadata:

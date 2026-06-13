@@ -35,6 +35,10 @@ def _sbom_property_value(value: object) -> str:
     return str(value)
 
 
+def _serialize_member_file_hashes(value: object) -> str:
+    return json.dumps(redact_source_value(value), sort_keys=True, separators=(",", ":"))
+
+
 def _append_member_file_hash_summary_properties(props: list[Property], metadata: FileMetadataModel) -> None:
     summary_values = {
         "modelaudit:member_file_hashes_total": metadata.member_file_hashes_total,
@@ -662,13 +666,11 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
         props.append(
             Property(
                 name="modelaudit:member_file_hashes",
-                value=json.dumps(
+                value=_serialize_member_file_hashes(
                     {
                         member_path: record.model_dump(mode="json", exclude_none=True)
                         for member_path, record in metadata.member_file_hashes.items()
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
+                    }
                 ),
             )
         )
@@ -841,7 +843,7 @@ def _component_for_file(
             props.append(
                 Property(
                     name="modelaudit:member_file_hashes",
-                    value=json.dumps(member_file_hashes, sort_keys=True, separators=(",", ":")),
+                    value=_serialize_member_file_hashes(member_file_hashes),
                 )
             )
         _append_member_file_hash_summary_properties_from_dict(props, metadata)

@@ -81,6 +81,16 @@ def _create_run(
     # Create artifacts from scanned files
     artifacts = _create_artifacts(audit_result)
     exit_code = determine_exit_code(audit_result)
+    has_operational_errors = results_have_operational_error(audit_result)
+    has_incomplete_coverage = results_have_inconclusive_outcome(audit_result)
+    is_dry_run = bool(getattr(audit_result, "dry_run", False))
+    process_completed = not has_operational_errors
+    security_coverage_complete = (
+        process_completed
+        and not has_incomplete_coverage
+        and audit_result.success is not False
+        and (is_dry_run or audit_result.files_scanned > 0)
+    )
 
     run = {
         "tool": {
@@ -99,7 +109,7 @@ def _create_run(
         },
         "invocations": [
             {
-                "executionSuccessful": exit_code != 2,
+                "executionSuccessful": security_coverage_complete,
                 "commandLine": f"modelaudit {' '.join(safe_scan_paths)}",
                 "arguments": safe_scan_paths,
                 "workingDirectory": {"uri": Path.cwd().as_uri()},
@@ -121,6 +131,10 @@ def _create_run(
                     "bytesScanned": audit_result.bytes_scanned,
                     "duration": audit_result.duration,
                     "scanners": audit_result.scanner_names,
+                    "processCompleted": process_completed,
+                    "securityCoverageComplete": security_coverage_complete,
+                    "incompleteCoverage": has_incomplete_coverage,
+                    "operationalErrors": has_operational_errors,
                 },
             }
         ],
@@ -152,6 +166,8 @@ def _exit_code_description(audit_result: ModelAuditResultModel, exit_code: int) 
     if exit_code == 0:
         return "No security issues found"
     if exit_code == 1:
+        if results_have_inconclusive_outcome(audit_result):
+            return "Security issues detected; scan coverage incomplete"
         return "Security issues detected"
     if results_have_operational_error(audit_result):
         return "Errors occurred during scanning"
@@ -256,11 +272,19 @@ def _create_results(
         # Add fingerprints for deduplication
         import hashlib
 
-        fingerprint_message = _redact_text_for_sarif(issue.message)
+        fingerprint = ""
         fingerprint_location = _redact_path_for_sarif(issue.location or "")
-        fingerprint = hashlib.sha256(
-            f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
-        ).hexdigest()[:16]
+        if issue.details:
+            evidence_fingerprint = _redact_text_for_sarif(str(issue.details.get("evidence_fingerprint", "")))
+            if evidence_fingerprint:
+                fingerprint = hashlib.sha256(
+                    "\x1f".join((evidence_fingerprint, fingerprint_location, str(issue.severity))).encode()
+                ).hexdigest()[:16]
+        if not fingerprint:
+            fingerprint_message = _redact_text_for_sarif(issue.message)
+            fingerprint = hashlib.sha256(
+                f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
+            ).hexdigest()[:16]
         result["partialFingerprints"]["primaryLocationLineHash"] = fingerprint  # type: ignore[index]
 
         # Add properties with additional details

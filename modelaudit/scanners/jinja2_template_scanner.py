@@ -29,6 +29,7 @@ import re
 import warnings
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, ClassVar, cast
 
 try:
@@ -40,6 +41,11 @@ except ImportError:
     HAS_RESOURCE_LIMITS = False
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
+from modelaudit.scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from modelaudit.utils.file.detection import (
+    huggingface_tokenizer_json_has_jax_route_evidence,
+    huggingface_tokenizer_json_has_template_route_evidence,
+)
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
@@ -77,6 +83,7 @@ _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
 _JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 _JINJA_TEMPLATE_INDICATOR_BYTES = tuple(indicator.encode("utf-8") for indicator in _JINJA_TEMPLATE_INDICATORS)
 _TEMPLATE_FIELD_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY = "_jinja_skip_jax_json_overlap"
 _DETECTION_MESSAGE_LABELS = {
     "critical_injection": "critical injection",
     "object_traversal": "object hierarchy access",
@@ -381,6 +388,11 @@ class DetectionResult:
         self.explanation = explanation
 
 
+@dataclass(frozen=True)
+class _ExecutableTemplateSpan:
+    text: str
+
+
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
     return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
@@ -454,6 +466,9 @@ class Jinja2TemplateScanner(BaseScanner):
         if ext in [".jinja", ".j2", ".template"]:
             return True
 
+        if huggingface_tokenizer_json_has_template_route_evidence(path):
+            return True
+
         # JSON files containing templates
         if ext == ".json" and any(
             pattern in filename
@@ -464,6 +479,8 @@ class Jinja2TemplateScanner(BaseScanner):
                 "generation_config.json",
             ]
         ):
+            if filename == "tokenizer.json":
+                return huggingface_tokenizer_json_has_template_route_evidence(path)
             return True
 
         # YAML files in ML contexts
@@ -545,10 +562,13 @@ class Jinja2TemplateScanner(BaseScanner):
                     location=path,
                     details={"file_type": context.file_type},
                 )
+                self._scan_jax_json_overlap(path, result)
                 result.finish(success=True)
                 return result
 
-            return self._scan_extracted_templates(path, templates, context, result=result, file_size=file_size)
+            result = self._scan_extracted_templates(path, templates, context, result=result, file_size=file_size)
+            self._scan_jax_json_overlap(path, result)
+            return result
 
         except Exception as e:
             import traceback
@@ -755,6 +775,45 @@ class Jinja2TemplateScanner(BaseScanner):
             return
 
         result.finish(success=True)
+
+    def _merge_filename_owned_result(self, result: ScanResult, owner_result: ScanResult) -> None:
+        """Merge an owner scan without dropping existing incomplete-coverage reasons."""
+        existing_reasons = list(result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY, []))
+        owner_reasons = list(owner_result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY, []))
+        result.merge(owner_result)
+        if existing_reasons or owner_reasons:
+            result.metadata[_INCONCLUSIVE_REASONS_METADATA_KEY] = list(
+                dict.fromkeys([*owner_reasons, *existing_reasons])
+            )
+
+    def _scan_jax_json_overlap(self, path: str, result: ScanResult) -> None:
+        """Preserve JAX analysis for Jinja-owned tokenizer JSON files."""
+        if self.config.get(JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY) is True:
+            return
+        if Path(path).name.lower() not in {
+            "tokenizer",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "tokenizer.txt",
+            "tokenizer.bin",
+        } or not huggingface_tokenizer_json_has_jax_route_evidence(path):
+            return
+
+        from .jax_checkpoint_scanner import JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY, JaxCheckpointScanner
+
+        scanner_selection = policy_from_config(self.config)
+        if scanner_selection.allows("jax_checkpoint"):
+            jax_config = dict(self.config)
+            jax_config[JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY] = True
+            self._merge_filename_owned_result(result, JaxCheckpointScanner(config=jax_config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jax_checkpoint",
+                scanner_selection,
+                context="overlapping JAX JSON analysis",
+            )
 
     def _determine_context(self, path: str) -> MLContext:
         """Determine ML context and file type"""
@@ -1386,10 +1445,17 @@ class Jinja2TemplateScanner(BaseScanner):
         if not template_content or len(template_content.strip()) < 3:
             return detections, analysis_failures
 
-        # Check each pattern category
+        executable_spans = self._executable_template_spans(template_content)
+
+        # Check each pattern category only inside executable Jinja spans. Literal
+        # template data can contain model instructions or documentation prose.
         for category, compiled_patterns in self._compiled_patterns.items():
             for compiled_pattern, original_pattern in compiled_patterns:
-                matches = compiled_pattern.finditer(template_content)
+                matches = (
+                    match
+                    for executable_span in executable_spans
+                    for match in compiled_pattern.finditer(executable_span.text)
+                )
 
                 for match in matches:
                     # Skip if this is a common ML pattern and we're configured to ignore them
@@ -1425,6 +1491,150 @@ class Jinja2TemplateScanner(BaseScanner):
                 )
 
         return detections, analysis_failures
+
+    @staticmethod
+    def _executable_template_spans(template_content: str) -> list[_ExecutableTemplateSpan]:
+        if HAS_JINJA2_SANDBOX:
+            lexer_spans = Jinja2TemplateScanner._jinja_lexer_executable_template_spans(template_content)
+            if lexer_spans is not None:
+                return lexer_spans
+        return Jinja2TemplateScanner._delimiter_executable_template_spans(template_content)
+
+    @staticmethod
+    def _jinja_lexer_executable_template_spans(template_content: str) -> list[_ExecutableTemplateSpan] | None:
+        spans: list[_ExecutableTemplateSpan] = []
+        active_start: int | None = None
+        cursor = 0
+
+        try:
+            tokens = jinja2.Environment().lex(template_content)
+            for _lineno, token_type, token_value in tokens:
+                token_start = cursor
+                token_end = token_start + len(token_value)
+                if template_content[token_start:token_end] != token_value:
+                    return None
+
+                if token_type in {"variable_begin", "block_begin"}:
+                    active_start = token_start
+                if active_start is not None and token_type in {"variable_end", "block_end"}:
+                    spans.append(_ExecutableTemplateSpan(template_content[active_start:token_end]))
+                    active_start = None
+
+                cursor = token_end
+        except Exception:
+            return None
+
+        if active_start is not None:
+            spans.append(_ExecutableTemplateSpan(template_content[active_start:cursor]))
+        return spans
+
+    @staticmethod
+    def _delimiter_executable_template_spans(template_content: str) -> list[_ExecutableTemplateSpan]:
+        spans: list[_ExecutableTemplateSpan] = []
+        cursor = 0
+        while cursor < len(template_content):
+            marker_start, marker = Jinja2TemplateScanner._next_jinja_marker(template_content, cursor)
+            if marker_start is None or marker is None:
+                break
+
+            if marker == "{#":
+                cursor = Jinja2TemplateScanner._find_jinja_tag_end(
+                    template_content,
+                    marker_start,
+                    "#}",
+                    quote_aware=False,
+                )
+                continue
+
+            if marker == "{{":
+                span_end = Jinja2TemplateScanner._find_jinja_tag_end(template_content, marker_start, "}}")
+                spans.append(_ExecutableTemplateSpan(template_content[marker_start:span_end]))
+                cursor = max(span_end, marker_start + len(marker))
+                continue
+
+            span_end = Jinja2TemplateScanner._find_jinja_tag_end(template_content, marker_start, "%}")
+            span_text = template_content[marker_start:span_end]
+            tag_name = Jinja2TemplateScanner._jinja_block_tag_name(span_text)
+            if tag_name == "raw":
+                cursor = Jinja2TemplateScanner._find_jinja_raw_end(template_content, span_end)
+                continue
+
+            spans.append(_ExecutableTemplateSpan(span_text))
+            cursor = max(span_end, marker_start + len(marker))
+
+        return spans
+
+    @staticmethod
+    def _next_jinja_marker(template_content: str, cursor: int) -> tuple[int | None, str | None]:
+        next_marker_start: int | None = None
+        next_marker: str | None = None
+        for marker in ("{{", "{%", "{#"):
+            marker_start = template_content.find(marker, cursor)
+            if marker_start != -1 and (next_marker_start is None or marker_start < next_marker_start):
+                next_marker_start = marker_start
+                next_marker = marker
+        return next_marker_start, next_marker
+
+    @staticmethod
+    def _find_jinja_tag_end(
+        template_content: str,
+        marker_start: int,
+        end_token: str,
+        *,
+        quote_aware: bool = True,
+    ) -> int:
+        cursor = marker_start + 2
+        quote: str | None = None
+        escaped = False
+        while cursor < len(template_content):
+            character = template_content[cursor]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                cursor += 1
+                continue
+
+            if quote_aware and character in {"'", '"'}:
+                quote = character
+                cursor += 1
+                continue
+
+            if template_content.startswith(end_token, cursor):
+                return cursor + len(end_token)
+            cursor += 1
+
+        return len(template_content)
+
+    @staticmethod
+    def _jinja_block_tag_name(span_text: str) -> str:
+        if not span_text.startswith("{%"):
+            return ""
+        if span_text.endswith("%}"):
+            span_text = span_text[:-2]
+        inner = span_text[2:].strip(" \t\r\n-+")
+        return inner.split(None, 1)[0].lower() if inner else ""
+
+    @staticmethod
+    def _find_jinja_raw_end(template_content: str, cursor: int) -> int:
+        while cursor < len(template_content):
+            block_start = template_content.find("{%", cursor)
+            if block_start == -1:
+                return len(template_content)
+            block_end = Jinja2TemplateScanner._find_jinja_tag_end(
+                template_content,
+                block_start,
+                "%}",
+                quote_aware=False,
+            )
+            block_text = template_content[block_start:block_end]
+            if Jinja2TemplateScanner._jinja_block_tag_name(block_text) == "endraw":
+                return block_end
+            cursor = block_start + 2
+        return len(template_content)
 
     def _is_common_ml_pattern(self, match_text: str, context: MLContext) -> bool:
         """Check if match is a common, benign ML pattern"""
@@ -1644,10 +1854,11 @@ class Jinja2TemplateScanner(BaseScanner):
         ) or self._template_ast_has_static_repeated_sequence_budget_risk(parsed)
 
     def _template_has_static_sandbox_risk(self, template_content: str) -> bool:
-        return bool(
-            re.search(r"\.\s*__\w+__", template_content)
-            or re.search(r"\|\s*attr\s*\(\s*['\"]__\w+__", template_content)
-            or re.search(r"\[\s*['\"]__\w+__['\"]\s*\]", template_content)
+        return any(
+            re.search(r"\.\s*__\w+__", executable_span.text)
+            or re.search(r"\|\s*attr\s*\(\s*['\"]__\w+__", executable_span.text)
+            or re.search(r"\[\s*['\"]__\w+__['\"]\s*\]", executable_span.text)
+            for executable_span in self._executable_template_spans(template_content)
         )
 
     def _template_has_static_sandbox_probe_risk(self, template_content: str) -> bool:

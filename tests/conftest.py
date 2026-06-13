@@ -98,12 +98,12 @@ def pytest_runtest_setup(item):
             "test_picklescan_adapter.py",
             "test_nested_budget_limits.py",
             "test_basic.py",  # ScanResult private-metadata merge regressions
-            "test_models.py",  # Pydantic and ScanResult merge model regressions
             "test_joblib_scanner.py",
             "test_scanner_registry.py",  # Scanner registry routing and metadata tests
             "test_scanner_selection.py",  # Scanner selection policy and routing tests
             "test_lazy_loading.py",  # Lazy scanner descriptor/catalog tests
             "test_graceful_degradation.py",  # Scanner dependency degradation tests
+            "test_onnx_dependency_handling.py",  # ONNX optional dependency capability outcomes
             "test_joblib_scanner_codecs.py",  # Joblib raw/compressed pickle fallback regression tests
             "test_base_scanner.py",
             "test_core.py",
@@ -121,6 +121,8 @@ def pytest_runtest_setup(item):
             "test_secure_hasher.py",  # Aggregate hash computation tests
             "test_advanced_file_handler.py",  # Large-file fail-closed handler regressions
             "test_huggingface_extensions.py",  # HuggingFace MODEL_EXTENSIONS tests
+            "test_huggingface_inconclusive_coverage.py",  # Pinned HF incomplete-coverage regression
+            "test_huggingface_symlinks.py",  # HuggingFace cache symlink routing tests
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
             "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions
             "test_manifest_scanner.py",  # Manifest scanner tests
@@ -188,6 +190,7 @@ def pytest_runtest_setup(item):
             "test_models.py",  # aggregate result model and exit-code propagation tests
             "test_file_filter.py",  # Directory file prefilter tests
             "test_huggingface.py",  # HuggingFace provenance and cache path tests
+            "test_huggingface_fp_regression_harness.py",  # opt-in HuggingFace false-positive harness tests
             "test_pytorch_hub.py",  # PyTorch Hub artifact URL and download budget regression tests
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "test_jfrog.py",  # JFrog utility tests

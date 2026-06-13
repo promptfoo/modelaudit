@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import re
 import tarfile
 import tempfile
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar, cast
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.file.detection import is_declared_text_content_filename
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
@@ -243,6 +245,7 @@ class TarScanner(BaseScanner):
         member: tarfile.TarInfo,
         *,
         suffix: str,
+        basename: str | None = None,
     ) -> tuple[str, int]:
         """Stream a TAR member to disk while enforcing the configured size limit."""
         max_entry_size = self._get_max_entry_size()
@@ -256,22 +259,37 @@ class TarScanner(BaseScanner):
 
         total_size = 0
         tmp_path: str | None = None
+        tmp_dir: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp_path = tmp.name
+
+            def copy_member_to(tmp_file: BinaryIO) -> int:
+                copied_size = 0
                 while True:
                     chunk = fileobj.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
                     if not chunk:
                         break
-                    total_size += len(chunk)
-                    if total_size > max_entry_size:
+                    copied_size += len(chunk)
+                    if copied_size > max_entry_size:
                         raise _TarEntryExtractionIncomplete(
                             f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes"
                         )
-                    tmp.write(chunk)
+                    tmp_file.write(chunk)
+                return copied_size
+
+            if basename is None:
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as named_tmp:
+                    tmp_path = named_tmp.name
+                    total_size = copy_member_to(cast(BinaryIO, named_tmp))
+            else:
+                tmp_dir = tempfile.mkdtemp(prefix="modelaudit_tar_")
+                tmp_path = os.path.join(tmp_dir, basename)
+                with open(tmp_path, "wb") as tmp_file:
+                    total_size = copy_member_to(tmp_file)
         except Exception:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            if tmp_dir and os.path.isdir(tmp_dir):
+                os.rmdir(tmp_dir)
             raise
         finally:
             fileobj.close()
@@ -624,6 +642,8 @@ class TarScanner(BaseScanner):
                 try:
                     # Check for compound extensions like .tar.gz
                     name_lower = name.lower()
+                    member_basename = os.path.basename(name.replace("\\", "/"))
+                    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", member_basename) or "member"
                     is_tar_extension = any(name_lower.endswith(ext) for ext in self.supported_extensions)
                     if is_tar_extension:
                         # Extract the full extension for the temp file
@@ -634,10 +654,16 @@ class TarScanner(BaseScanner):
                         else:
                             suffix = ".tar"  # fallback
                     else:
-                        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name))
                         suffix = f"_{safe_name}"
 
-                    tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=suffix)
+                    basename = safe_name if is_declared_text_content_filename(member_basename) else None
+                    tmp_path, total_size = self._extract_member_to_tempfile(
+                        tar,
+                        member,
+                        suffix=suffix,
+                        basename=basename,
+                    )
+                    tmp_dir = os.path.dirname(tmp_path) if basename is not None else None
                     try:
                         if is_tar_extension and tarfile.is_tarfile(tmp_path):
                             nested_config = dict(self.config)
@@ -691,6 +717,9 @@ class TarScanner(BaseScanner):
                         contents.append(asset_entry)
                     finally:
                         os.unlink(tmp_path)
+                        if tmp_dir is not None:
+                            with contextlib.suppress(OSError):
+                                os.rmdir(tmp_dir)
                 except _TarEntryExtractionIncomplete as exc:
                     scan_complete = False
                     mark_archive_scan_incomplete(result, "tar_entry_extraction_incomplete")
