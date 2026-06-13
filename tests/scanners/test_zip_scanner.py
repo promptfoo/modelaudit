@@ -158,6 +158,26 @@ def _assert_inconclusive_zip_scan_not_cached(
         reset_cache_manager()
 
 
+def _assert_inconclusive_pickle_member(result: ScanResult, archive_path: Path, member_name: str) -> None:
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+    routing_checks = [check for check in result.checks if check.name == "Pickle Routing"]
+    assert len(routing_checks) == 1
+    check = routing_checks[0]
+    assert check.status == CheckStatus.FAILED
+    assert check.severity == IssueSeverity.INFO
+    assert check.message == "Pickle routing was inconclusive because the bounded structural probe reached its limit"
+    assert check.location == f"{archive_path}:{member_name}"
+    assert check.details.get("format") == "pickle_routing_inconclusive"
+    assert check.details.get("zip_entry") == member_name
+    assert not any(issue.rule_code == "S201" for issue in result.issues)
+
+
 def _build_malicious_tf_metagraph() -> bytes:
     if not _has_tf_protos():
         pytest.skip("TensorFlow protobuf stubs unavailable")
@@ -10874,7 +10894,10 @@ class TestZipScanner:
         )
         assert not any(issue.rule_code in {"S901", "S902"} for issue in result.issues)
 
-    @pytest.mark.parametrize("member_name", ["LICENSE", "LICENSE.markdown", "NOTICE.markdown"])
+    @pytest.mark.parametrize(
+        "member_name",
+        ["LICENSE", "LICENSE.markdown", "NOTICE.markdown", r"docs\LICENSE"],
+    )
     def test_scan_zip_uses_logical_legal_member_name_for_network_classification(
         self,
         tmp_path: Path,
@@ -10900,6 +10923,15 @@ class TestZipScanner:
         ]
         assert license_network_issues
         assert all(issue.severity == IssueSeverity.INFO for issue in license_network_issues)
+        expected_type = (
+            "license" if member_name.replace("\\", "/").rsplit("/", 1)[-1].startswith("LICENSE") else "notice"
+        )
+        assert any(
+            check.name == "File Type Identification"
+            and check.details.get("file_type") == expected_type
+            and check.details.get("zip_entry") == member_name
+            for check in result.checks
+        )
 
     @pytest.mark.parametrize(
         ("member_name", "content", "expected_rule"),
@@ -10932,7 +10964,7 @@ class TestZipScanner:
             for check in result.checks
         )
 
-    @pytest.mark.parametrize("member_name", ["LICENSE.env", "NOTICE.env"])
+    @pytest.mark.parametrize("member_name", ["LICENSE.env", "NOTICE.env", r"docs\LICENSE.env"])
     def test_scan_zip_routes_legal_stem_env_members_as_env_and_detects_aws_credentials(
         self,
         tmp_path: Path,
@@ -11088,6 +11120,29 @@ class TestZipScanner:
         assert any(
             check.name == "Pickle Routing" and check.details.get("zip_entry") == "LICENSE" for check in result.checks
         )
+
+    def test_scan_zip_fails_closed_for_backslash_legal_member_with_embedded_pickle(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "backslash_legal_member.zip"
+        member_name = r"docs\LICENSE"
+        payload = b"MIT License\nCopyright Example\n" + b"cposix\nsystem\n(S'id'\ntR."
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(member_name, payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        _assert_inconclusive_pickle_member(result, archive_path, member_name)
+
+    def test_scan_zip_fails_closed_for_oversized_legal_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "oversized_legal_member.zip"
+        prefix = b"NOTICE\nCopyright (c) Example\n"
+        malicious_tail = b"cposix\nsystem\n(S'id'\ntR."
+        payload = prefix + (b"A" * (file_detection._LEGAL_TEXT_ROUTE_MAX_BYTES + 1 - len(prefix))) + malicious_tail
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("NOTICE", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        _assert_inconclusive_pickle_member(result, archive_path, "NOTICE")
 
     @pytest.mark.parametrize(
         "padding_size",

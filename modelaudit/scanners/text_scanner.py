@@ -33,28 +33,6 @@ DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
 DEFAULT_TEXT_CONTENT_SECURITY_MAX_FINDINGS = 1024
 DETECTOR_FINDING_LIMIT_TYPE = "detector_finding_limit"
 FSTRING_MIDDLE_TOKEN_TYPE = getattr(token, "FSTRING_MIDDLE", None)
-DOCUMENTATION_TEXT_FILENAMES = frozenset(
-    {
-        "license",
-        "license.md",
-        "license.rst",
-        "license.txt",
-        "model_card",
-        "model_card.md",
-        "model_card.rst",
-        "model_card.txt",
-        "modelcard.md",
-        "notice",
-        "notice.md",
-        "notice.rst",
-        "notice.txt",
-        "readme",
-        "readme.md",
-        "readme.markdown",
-        "readme.rst",
-        "readme.txt",
-    }
-)
 PASSIVE_NETWORK_FINDING_TYPES = frozenset(
     {
         "cloud_storage_url",
@@ -819,7 +797,7 @@ class TextScanner(BaseScanner):
     def _routed_filename(self, path: str) -> str:
         logical_name = self.config.get(LOGICAL_SCAN_PATH_CONFIG_KEY)
         if isinstance(logical_name, str) and logical_name:
-            return os.path.basename(logical_name).lower()
+            return os.path.basename(logical_name.replace("\\", "/")).lower()
         return os.path.basename(path).lower()
 
     @classmethod
@@ -885,8 +863,7 @@ class TextScanner(BaseScanner):
     def _is_documentation_sidecar(cls, path: str) -> bool:
         filename = os.path.basename(path).lower()
         return (
-            filename in DOCUMENTATION_TEXT_FILENAMES
-            or cls._is_readme_documentation_filename(filename)
+            cls._is_readme_documentation_filename(filename)
             or cls._is_model_card_documentation_filename(filename)
             or cls._is_legal_documentation_filename(filename)
         )
@@ -3611,7 +3588,7 @@ class TextScanner(BaseScanner):
                     details={"file_type": file_type},
                     rule_code=None,  # Passing check
                 )
-            elif filename in DOCUMENTATION_TEXT_FILENAMES:
+            elif self._is_documentation_sidecar(filename):
                 result.add_check(
                     name="File Type Identification",
                     passed=True,

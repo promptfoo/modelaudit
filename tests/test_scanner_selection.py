@@ -30,8 +30,9 @@ from modelaudit.scanner_selection import (
     selected_scanner_filenames,
 )
 from modelaudit.scanners.archive_dispatch import scan_nested_file
-from modelaudit.scanners.base import CheckStatus
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.utils.file.detection import (
+    _LEGAL_TEXT_ROUTE_MAX_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -65,6 +66,10 @@ def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
     )
 
 
+def _over_budget_legal_payload(leading: bytes, trailing: bytes = b"") -> bytes:
+    return leading + (b"A" * (_LEGAL_TEXT_ROUTE_MAX_BYTES + 1 - len(leading))) + trailing
+
+
 def _build_malicious_skops_schema() -> bytes:
     return (
         b'{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval", '
@@ -78,6 +83,27 @@ def _has_pickle_execution_finding(result: Any) -> bool:
         if issue.rule_code == "S201" or "os.system" in issue_text or "eval" in issue_text:
             return True
     return False
+
+
+def _assert_incomplete_pickle_routing(result: Any, path: Path) -> None:
+    assert result.success is False
+    assert result.scanner_name == "unknown"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["scan_outcome_reasons"] == ["pickle_routing_incomplete"]
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+    routing_checks = [check for check in result.checks if check.name == "Pickle Routing"]
+    assert len(routing_checks) == 1
+    check = routing_checks[0]
+    assert check.status == CheckStatus.FAILED
+    assert check.severity == IssueSeverity.INFO
+    assert check.message == "Pickle routing was inconclusive because the bounded structural probe reached its limit"
+    assert check.location == str(path)
+    assert check.details == {
+        "format": PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        "path": str(path),
+    }
 
 
 def _write_basic_openvino_xml(path: Path) -> Path:
@@ -652,10 +678,29 @@ def test_scan_file_fails_closed_for_binary_pickle_embedded_in_license_text(tmp_p
 
     result = scan_file(str(path), config={"cache_enabled": False})
 
-    assert result.scanner_name == "unknown"
+    _assert_incomplete_pickle_routing(result, path)
+
+
+@pytest.mark.parametrize(
+    "leading_pickle",
+    [
+        pytest.param(_build_malicious_pickle(), id="binary"),
+        pytest.param(b"cposix\nsystem\n(S'id'\ntR.", id="protocol0"),
+    ],
+)
+def test_scan_file_routes_proven_leading_pickle_before_oversized_legal_fallback(
+    tmp_path: Path,
+    leading_pickle: bytes,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(_over_budget_legal_payload(leading_pickle))
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
     assert result.success is False
-    assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
-    assert any(check.name == "Pickle Routing" for check in result.checks)
+    assert _has_pickle_execution_finding(result)
+    assert any(issue.rule_code == "S201" for issue in result.issues)
 
 
 def test_scan_file_fails_closed_for_long_embedded_protocol0_license_text_and_does_not_cache(
@@ -686,6 +731,56 @@ def test_scan_file_fails_closed_for_long_embedded_protocol0_license_text_and_doe
             assert result.scanner_names == []
             assert any(check.name == "Pickle Routing" for check in result.checks)
             assert result.file_metadata[str(path)]["scan_outcome"] == "inconclusive"
+
+        stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+        assert stats["cache_hits"] == 0
+        assert stats["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_fails_closed_for_over_budget_legal_sidecar_and_does_not_cache(tmp_path: Path) -> None:
+    path = tmp_path / "NOTICE"
+    prefix = b"NOTICE\nCopyright (c) Example\n"
+    malicious_tail = b"cposix\nsystem\n(S'id'\ntR."
+    path.write_bytes(_over_budget_legal_payload(prefix, malicious_tail))
+    cache_dir = tmp_path / "cache"
+
+    direct = scan_file(str(path), config={"cache_enabled": False})
+    _assert_incomplete_pickle_routing(direct, path)
+    assert not any(issue.rule_code == "S201" for issue in direct.issues)
+
+    reset_cache_manager()
+    try:
+        for _ in range(2):
+            result = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert result.success is False
+            assert determine_exit_code(result) == 2
+            assert result.scanner_names == []
+            metadata = result.file_metadata[str(path)]
+            assert metadata["analysis_incomplete"] is True
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["scan_outcome_reasons"] == ["pickle_routing_incomplete"]
+            assert metadata["operational_error"] is True
+            assert metadata["operational_error_reason"] == "pickle_routing_incomplete"
+            routing_checks = [check for check in result.checks if check.name == "Pickle Routing"]
+            assert len(routing_checks) == 1
+            assert routing_checks[0].status == CheckStatus.FAILED
+            assert routing_checks[0].severity == IssueSeverity.INFO
+            assert (
+                routing_checks[0].message
+                == "Pickle routing was inconclusive because the bounded structural probe reached its limit"
+            )
+            assert routing_checks[0].details == {
+                "format": PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+                "path": str(path),
+            }
+            assert not any(issue.rule_code == "S201" for issue in result.issues)
 
         stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
         assert stats["cache_hits"] == 0

@@ -5264,7 +5264,7 @@ def _classify_extended_initial_line_pickle_security_signal(
 
 def _logical_basename_for_route(path: Path, logical_name: str | None = None) -> str:
     if logical_name:
-        return PurePosixPath(logical_name).name.lower()
+        return PurePosixPath(logical_name.replace("\\", "/")).name.lower()
     return path.name.lower()
 
 
@@ -5870,8 +5870,18 @@ def _detect_legal_text_sidecar_route(
     *,
     logical_name: str | None = None,
 ) -> str | None:
-    if size <= 0 or size > _LEGAL_TEXT_ROUTE_MAX_BYTES or not _is_legal_text_sidecar_name(path, logical_name):
+    if size <= 0 or not _is_legal_text_sidecar_name(path, logical_name):
         return None
+    if size > _LEGAL_TEXT_ROUTE_MAX_BYTES:
+        try:
+            with path.open("rb") as handle:
+                payload = handle.read(PROTO0_1_MAX_PROBE_BYTES)
+        except OSError:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        if len(payload) != PROTO0_1_MAX_PROBE_BYTES:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        leading_route = _classify_pickle_security_payload(payload)
+        return "pickle" if leading_route == "pickle" else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     try:
         with path.open("rb") as handle:
             payload = handle.read(_LEGAL_TEXT_ROUTE_MAX_BYTES + 1)

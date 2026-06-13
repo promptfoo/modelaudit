@@ -3574,6 +3574,32 @@ def test_detect_file_format_accepts_legal_text_at_exact_route_size_limit(tmp_pat
     assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
+@pytest.mark.parametrize(
+    "leading_pickle",
+    [
+        pytest.param(pickle.dumps(_FiletypeDangerousPayload(), protocol=4), id="binary"),
+        pytest.param(b"cposix\nsystem\n(S'id'\ntR.", id="protocol0"),
+    ],
+)
+def test_detect_file_format_routes_proven_leading_pickle_before_oversized_legal_fallback(
+    tmp_path: Path,
+    leading_pickle: bytes,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(leading_pickle + (b"A" * (file_detection._LEGAL_TEXT_ROUTE_MAX_BYTES + 1 - len(leading_pickle))))
+
+    assert detect_file_format(str(path)) == "pickle"
+    assert detect_file_format_from_magic(str(path)) == "pickle"
+    assert detect_file_format_for_skip_filter(str(path)) == "pickle"
+
+
+def test_oversized_nonlegal_name_does_not_trigger_legal_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE.pkl"
+    path.write_bytes(b"A" * (file_detection._LEGAL_TEXT_ROUTE_MAX_BYTES + 1))
+
+    assert file_detection._detect_legal_text_sidecar_route(path, path.stat().st_size) is None
+
+
 def test_detect_file_format_keeps_global_shaped_non_pickle_prose_on_text_route(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     path.write_bytes(
@@ -3831,14 +3857,17 @@ def test_detect_file_format_preserves_polyglot_and_oversized_legal_name_controls
         archive.writestr("payload.pkl", b'cposix\nsystem\n(S"echo pwned"\ntR.')
 
     oversized_notice = tmp_path / "NOTICE"
+    prefix = b"NOTICE\nCopyright (c) Example\n"
+    malicious_tail = b"cposix\nsystem\n(S'id'\ntR."
     oversized_notice.write_bytes(
-        b"NOTICE\nCopyright (c) Example\n" + (b"A" * (file_detection._LEGAL_TEXT_ROUTE_MAX_BYTES + 1))
+        prefix + (b"A" * (file_detection._LEGAL_TEXT_ROUTE_MAX_BYTES - len(prefix))) + malicious_tail
     )
 
     assert detect_file_format(str(zip_named_license)) == "zip"
     assert detect_file_format_from_magic(str(zip_named_license)) == "zip"
-    assert detect_file_format(str(oversized_notice)) != "text"
-    assert detect_file_format_from_magic(str(oversized_notice)) != "text"
+    assert detect_file_format(str(oversized_notice)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(oversized_notice)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(oversized_notice)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_detect_file_format_accepts_forward_compatible_binary_pickle_protocol(tmp_path: Path) -> None:
