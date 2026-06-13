@@ -5305,12 +5305,14 @@ class TestCVE202427318NestedPathTraversal:
             ("sparse", "indices", "default_indices"),
         ],
     )
+    @pytest.mark.parametrize("file_backed", [False, True], ids=["in-memory", "file-backed"])
     def test_function_default_tensor_attribute_traversal_detected(
         self,
         tmp_path: Path,
         attribute_kind: str,
         external_tensor: str,
         tensor_name: str,
+        file_backed: bool,
     ) -> None:
         model_path = create_onnx_model_with_function_default_external_tensor_attribute(
             tmp_path,
@@ -5320,9 +5322,13 @@ class TestCVE202427318NestedPathTraversal:
             missing_external=True,
         )
 
-        result = OnnxScanner().scan(str(model_path))
+        config = {"onnx_raw_detector_max_bytes": 1} if file_backed else None
+        result = OnnxScanner(config=config).scan(str(model_path))
 
         assert result.success is False
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == (
+            "file_backed_structure" if file_backed else "in_memory_model_proto"
+        )
         cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
         assert len(cve_checks) > 0
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
@@ -6838,6 +6844,12 @@ def _proto_bytes(field_number: int, payload: bytes) -> bytes:
     return _proto_key(field_number, 2) + _encode_proto_varint(len(payload)) + payload
 
 
+def _write_onnx_payload(tmp_path: Path, filename: str, payload: bytes) -> Path:
+    path = tmp_path / filename
+    path.write_bytes(payload)
+    return path
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -6920,9 +6932,7 @@ def _nested_graph_payload(depth: int) -> bytes:
 def _write_deeply_nested_onnx(tmp_path: Path) -> Path:
     graph_payload = _nested_graph_payload(140)
     model_payload = _proto_varint(1, 8) + _proto_bytes(7, graph_payload)
-    path = tmp_path / "deep.onnx"
-    path.write_bytes(model_payload)
-    return path
+    return _write_onnx_payload(tmp_path, "deep.onnx", model_payload)
 
 
 def _write_tensor_rank_bomb_onnx(tmp_path: Path) -> Path:
@@ -6930,27 +6940,21 @@ def _write_tensor_rank_bomb_onnx(tmp_path: Path) -> Path:
     tensor = dims + _proto_varint(2, int(TensorProto.FLOAT)) + _proto_bytes(8, b"W")
     graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"rank-bomb")
     model = _proto_varint(1, 8) + _proto_bytes(7, graph)
-    path = tmp_path / "rank-bomb.onnx"
-    path.write_bytes(model)
-    return path
+    return _write_onnx_payload(tmp_path, "rank-bomb.onnx", model)
 
 
 def _write_duplicate_graph_onnx(tmp_path: Path) -> Path:
     malicious_graph = _proto_bytes(1, _proto_bytes(4, b"PythonOp")) + _proto_bytes(2, b"malicious")
     benign_graph = _proto_bytes(1, _proto_bytes(4, b"Relu")) + _proto_bytes(2, b"benign")
     model = _proto_varint(1, 8) + _proto_bytes(7, malicious_graph) + _proto_bytes(7, benign_graph)
-    path = tmp_path / "duplicate-graph.onnx"
-    path.write_bytes(model)
-    return path
+    return _write_onnx_payload(tmp_path, "duplicate-graph.onnx", model)
 
 
 def _write_many_node_attributes_onnx(tmp_path: Path) -> Path:
     attributes = b"".join(_proto_bytes(5, _proto_bytes(1, b"a")) for _ in range(4097))
     graph = _proto_bytes(1, _proto_bytes(4, b"Relu") + attributes) + _proto_bytes(2, b"attr-bomb")
     model = _proto_varint(1, 8) + _proto_bytes(7, graph)
-    path = tmp_path / "attribute-bomb.onnx"
-    path.write_bytes(model)
-    return path
+    return _write_onnx_payload(tmp_path, "attribute-bomb.onnx", model)
 
 
 def _write_many_external_data_entries_onnx(tmp_path: Path) -> Path:
@@ -6958,9 +6962,7 @@ def _write_many_external_data_entries_onnx(tmp_path: Path) -> Path:
     tensor = _proto_varint(2, int(TensorProto.FLOAT)) + _proto_bytes(8, b"W") + entries
     graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"external-data-bomb")
     model = _proto_varint(1, 8) + _proto_bytes(7, graph)
-    path = tmp_path / "external-data-bomb.onnx"
-    path.write_bytes(model)
-    return path
+    return _write_onnx_payload(tmp_path, "external-data-bomb.onnx", model)
 
 
 def _write_many_string_data_entries_onnx(tmp_path: Path) -> Path:
@@ -6968,9 +6970,7 @@ def _write_many_string_data_entries_onnx(tmp_path: Path) -> Path:
     tensor = _proto_varint(2, int(TensorProto.STRING)) + _proto_bytes(8, b"S") + string_data
     graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"string-data-bomb")
     model = _proto_varint(1, 8) + _proto_bytes(7, graph)
-    path = tmp_path / "string-data-bomb.onnx"
-    path.write_bytes(model)
-    return path
+    return _write_onnx_payload(tmp_path, "string-data-bomb.onnx", model)
 
 
 def _write_large_string_data_payload_onnx(tmp_path: Path, *, payload_size: int = 1_000_001) -> Path:
@@ -6990,15 +6990,11 @@ def _write_packed_float_tensor_payload_onnx(tmp_path: Path, *, count: int = 1_00
     )
     graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"packed-float")
     model = _proto_varint(1, 8) + _proto_bytes(7, graph)
-    path = tmp_path / "packed-float.onnx"
-    path.write_bytes(model)
-    return path
+    return _write_onnx_payload(tmp_path, "packed-float.onnx", model)
 
 
 def _write_invalid_field_zero_onnx(tmp_path: Path) -> Path:
-    path = tmp_path / "field-zero.onnx"
-    path.write_bytes(_proto_varint(1, 8) + b"\x00")
-    return path
+    return _write_onnx_payload(tmp_path, "field-zero.onnx", _proto_varint(1, 8) + b"\x00")
 
 
 def _write_out_of_range_field_onnx(tmp_path: Path) -> Path:
@@ -7008,15 +7004,11 @@ def _write_out_of_range_field_onnx(tmp_path: Path) -> Path:
 
 
 def _write_invalid_wire_type_onnx(tmp_path: Path) -> Path:
-    path = tmp_path / "invalid-wire-type.onnx"
-    path.write_bytes(_proto_varint(1, 8) + _proto_key(7, 6))
-    return path
+    return _write_onnx_payload(tmp_path, "invalid-wire-type.onnx", _proto_varint(1, 8) + _proto_key(7, 6))
 
 
 def _write_terminal_varint_onnx(tmp_path: Path) -> Path:
-    path = tmp_path / "terminal-varint.onnx"
-    path.write_bytes(_proto_varint(1, 8) + b"\x80")
-    return path
+    return _write_onnx_payload(tmp_path, "terminal-varint.onnx", _proto_varint(1, 8) + b"\x80")
 
 
 def _write_packed_int_parse_work_bomb_onnx(tmp_path: Path) -> Path:
@@ -7055,9 +7047,7 @@ def _write_function_value_info_bomb_onnx(tmp_path: Path, *, count: int = 3) -> P
         + _proto_bytes(7, graph)
         + _proto_bytes(25, function)
     )
-    path = tmp_path / "function-value-info-bomb.onnx"
-    path.write_bytes(model)
-    return path
+    return _write_onnx_payload(tmp_path, "function-value-info-bomb.onnx", model)
 
 
 def _write_function_schema_near_match_onnx(tmp_path: Path) -> Path:
@@ -7070,21 +7060,17 @@ def _write_function_schema_near_match_onnx(tmp_path: Path) -> Path:
         + _proto_varint(14, int(TensorProto.EXTERNAL))
     )
     metadata = _proto_bytes(1, b"owner") + _proto_bytes(2, b"modelaudit")
-    function = _proto_bytes(1, b"Fn") + _proto_bytes(14, metadata) + _proto_bytes(15, tensor)
+    function = _proto_bytes(1, b"Fn") + _proto_bytes(14, metadata) + _proto_bytes(15, tensor) + _proto_bytes(16, tensor)
     graph = _proto_bytes(2, b"graph")
     model = _proto_varint(1, 8) + _proto_bytes(7, graph) + _proto_bytes(25, function)
-    path = tmp_path / "function-schema-near-match.onnx"
-    path.write_bytes(model)
-    return path
+    return _write_onnx_payload(tmp_path, "function-schema-near-match.onnx", model)
 
 
 def _write_training_binding_bomb_onnx(tmp_path: Path, *, count: int = 3) -> Path:
     binding = _proto_bytes(1, b"old") + _proto_bytes(2, b"new")
     training_info = _proto_bytes(1, _proto_bytes(2, b"init")) + b"".join(_proto_bytes(3, binding) for _ in range(count))
     model = _proto_varint(1, 8) + _proto_bytes(7, _proto_bytes(2, b"graph")) + _proto_bytes(20, training_info)
-    path = tmp_path / "training-binding-bomb.onnx"
-    path.write_bytes(model)
-    return path
+    return _write_onnx_payload(tmp_path, "training-binding-bomb.onnx", model)
 
 
 def _write_aggregate_object_bomb_onnx(tmp_path: Path) -> Path:
@@ -7126,9 +7112,7 @@ def _write_empty_repeated_models(tmp_path: Path, *, kind: str, count: int = 4) -
         )
     else:  # pragma: no cover - test helper contract
         raise ValueError(f"unknown empty ONNX fixture kind: {kind}")
-    path = tmp_path / f"empty-{kind}.onnx"
-    path.write_bytes(payload)
-    return path
+    return _write_onnx_payload(tmp_path, f"empty-{kind}.onnx", payload)
 
 
 def _write_wire_semantics_onnx(
@@ -7472,7 +7456,7 @@ class TestLargeOnnxFileBackedInspection:
         ]
 
         assert fields_by_number[14].name == "metadata_props"
-        assert 15 not in fields_by_number
+        assert {15, 16}.isdisjoint(fields_by_number)
         assert native.functions[0].metadata_props[0].key == "owner"
         assert native.functions[0].metadata_props[0].value == "modelaudit"
         assert native_tensors == lite_tensors == []
@@ -7769,18 +7753,7 @@ class TestLargeOnnxFileBackedInspection:
 
         result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
 
-        parse_checks = self._checks(result, "ONNX Structure Parse Coverage")
-        assert result.success is False
-        assert result.has_errors is False
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert any(
-            check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.INFO
-            and check.details["coverage_gap"] == "protobuf_parse_step_limit_exceeded"
-            and check.details["safety_budget_exhausted"] is True
-            for check in parse_checks
-        )
-        assert not self._checks(result, "ONNX Model Parsing")
+        self._assert_safety_budget_result(result, "protobuf_parse_step_limit_exceeded")
 
         cache_dir = tmp_path / "parse-work-cache"
         reset_cache_manager()

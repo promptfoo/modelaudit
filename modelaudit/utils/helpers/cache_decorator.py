@@ -186,11 +186,13 @@ def should_defer_hash_for_file_backed_onnx(
 ) -> bool:
     """Avoid whole-file hashes when ONNX uses bounded file-backed inspection."""
     try:
+        from ...scanner_selection import allows_protobuf_model_candidate_analyzer, policy_from_config
         from ...scanners.onnx_scanner import OnnxScanner, resolve_onnx_raw_detector_max_bytes
         from ..file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT, detect_file_format_for_skip_filter
 
         size = os.path.getsize(file_path) if file_size is None else file_size
         max_bytes = resolve_onnx_raw_detector_max_bytes(config)
+        scanner_selection = policy_from_config(config)
     except Exception:
         return False
     if size <= max_bytes:
@@ -198,10 +200,12 @@ def should_defer_hash_for_file_backed_onnx(
     try:
         detected_format = detect_file_format_for_skip_filter(file_path)
     except Exception:
-        return OnnxScanner.can_handle(file_path)
-    if detected_format in {"onnx", PROTOBUF_MODEL_CANDIDATE_FORMAT}:
-        return True
-    return detected_format == "unknown" and OnnxScanner.can_handle(file_path)
+        return scanner_selection.allows("onnx") and OnnxScanner.can_handle(file_path)
+    if detected_format == "onnx":
+        return scanner_selection.allows("onnx")
+    if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+        return allows_protobuf_model_candidate_analyzer(scanner_selection, "onnx")
+    return detected_format == "unknown" and scanner_selection.allows("onnx") and OnnxScanner.can_handle(file_path)
 
 
 def should_bypass_cache_for_zip_entry_preflight(file_path: str, config: dict[str, Any]) -> bool:

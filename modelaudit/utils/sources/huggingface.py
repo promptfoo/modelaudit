@@ -2186,12 +2186,8 @@ def _discover_hf_onnx_external_data_files(
 
     companions: list[str] = []
     seen: set[str] = set()
-    for tensors in _iter_model_external_data_tensor_groups(model):
-        if interrupt_check is not None:
-            interrupt_check()
+    for tensors in _iter_model_external_data_tensor_groups(model, interrupt_check):
         for tensor in tensors:
-            if interrupt_check is not None:
-                interrupt_check()
             if tensor.data_location != onnx.TensorProto.EXTERNAL:
                 continue
             info: dict[str, str] = {}

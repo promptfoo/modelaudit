@@ -670,67 +670,108 @@ def _is_explicit_custom_operator(
     )
 
 
-def _iter_graph_and_subgraphs(graph: Any) -> Any:
+def _check_onnx_traversal_interrupted(interrupt_check: Callable[[], None] | None) -> None:
+    if interrupt_check is not None:
+        interrupt_check()
+
+
+def _iter_graph_and_subgraphs(
+    graph: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield an ONNX graph and every graph nested below node attributes."""
+    _check_onnx_traversal_interrupted(interrupt_check)
     yield graph
     for node in getattr(graph, "node", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         for attribute in getattr(node, "attribute", []):
+            _check_onnx_traversal_interrupted(interrupt_check)
             for subgraph in _iter_attribute_graphs(attribute):
-                yield from _iter_graph_and_subgraphs(subgraph)
+                yield from _iter_graph_and_subgraphs(subgraph, interrupt_check)
 
 
-def _iter_model_initializer_graphs(model: Any) -> Any:
+def _iter_model_initializer_graphs(
+    model: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield every ONNX graph that can carry tensor initializers."""
-    yield from _iter_graph_and_subgraphs(model.graph)
+    yield from _iter_graph_and_subgraphs(model.graph, interrupt_check)
     for function in getattr(model, "functions", []):
-        yield from _iter_graph_and_subgraphs(function)
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield from _iter_graph_and_subgraphs(function, interrupt_check)
         for attribute in getattr(function, "attribute_proto", []):
+            _check_onnx_traversal_interrupted(interrupt_check)
             for subgraph in _iter_attribute_graphs(attribute):
-                yield from _iter_graph_and_subgraphs(subgraph)
+                yield from _iter_graph_and_subgraphs(subgraph, interrupt_check)
     for training_info in getattr(model, "training_info", []):
-        yield from _iter_graph_and_subgraphs(training_info.initialization)
-        yield from _iter_graph_and_subgraphs(training_info.algorithm)
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield from _iter_graph_and_subgraphs(training_info.initialization, interrupt_check)
+        yield from _iter_graph_and_subgraphs(training_info.algorithm, interrupt_check)
 
 
-def _iter_attribute_external_data_tensors(attribute: Any) -> Any:
+def _iter_attribute_external_data_tensors(
+    attribute: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield tensor values declared by an ONNX attribute."""
-    yield from getattr(attribute, "tensors", [])
+    for tensor in getattr(attribute, "tensors", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield tensor
     for sparse_tensor in getattr(attribute, "sparse_tensors", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         yield sparse_tensor.values
         yield sparse_tensor.indices
     try:
         if attribute.HasField("t"):
+            _check_onnx_traversal_interrupted(interrupt_check)
             yield attribute.t
         if attribute.HasField("sparse_tensor"):
+            _check_onnx_traversal_interrupted(interrupt_check)
             yield attribute.sparse_tensor.values
             yield attribute.sparse_tensor.indices
     except (ValueError, AttributeError):  # pragma: no cover - proto edge case
         pass
 
 
-def _iter_graph_external_data_tensors(graph: Any) -> Any:
+def _iter_graph_external_data_tensors(
+    graph: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield graph-owned tensors that can carry external_data references."""
-    yield from getattr(graph, "initializer", [])
+    for tensor in getattr(graph, "initializer", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield tensor
     for sparse_tensor in getattr(graph, "sparse_initializer", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         yield sparse_tensor.values
         yield sparse_tensor.indices
     for node in getattr(graph, "node", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         for attribute in getattr(node, "attribute", []):
-            yield from _iter_attribute_external_data_tensors(attribute)
+            _check_onnx_traversal_interrupted(interrupt_check)
+            yield from _iter_attribute_external_data_tensors(attribute, interrupt_check)
 
 
-def _iter_model_external_data_tensor_groups(model: Any) -> Any:
+def _iter_model_external_data_tensor_groups(
+    model: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield model tensor groups that can declare external_data."""
-    for graph in _iter_model_initializer_graphs(model):
-        yield _iter_graph_external_data_tensors(graph)
+    for graph in _iter_model_initializer_graphs(model, interrupt_check):
+        yield _iter_graph_external_data_tensors(graph, interrupt_check)
     for function in getattr(model, "functions", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         for attribute in getattr(function, "attribute_proto", []):
-            yield _iter_attribute_external_data_tensors(attribute)
+            _check_onnx_traversal_interrupted(interrupt_check)
+            yield _iter_attribute_external_data_tensors(attribute, interrupt_check)
 
 
-def _model_has_external_data(model: Any) -> bool:
+def _model_has_external_data(
+    model: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> bool:
     """Return True when an ONNX model declares tensors stored in external_data."""
-    for tensors in _iter_model_external_data_tensor_groups(model):
+    for tensors in _iter_model_external_data_tensor_groups(model, interrupt_check):
         for tensor in tensors:
             if int(getattr(tensor, "data_location", 0)) == 1:
                 return True
@@ -2807,9 +2848,6 @@ class _OnnxOmittedBytes:
     def __len__(self) -> int:
         return self._length
 
-    def __bool__(self) -> bool:
-        return self._length > 0
-
 
 class _OnnxLengthOnlySequence:
     """Sequence facade used when only a tensor-data count and byte total are needed."""
@@ -4135,9 +4173,6 @@ class OnnxScanner(BaseScanner):
             format_validation.get("routed_format") == PROTOBUF_MODEL_CANDIDATE_FORMAT
         )
 
-    def _resolve_onnx_raw_detector_max_bytes(self) -> int:
-        return resolve_onnx_raw_detector_max_bytes(self.config)
-
     def _read_onnx_raw_detector_input(self, path: str, file_size: int, max_bytes: int) -> bytes | None:
         if file_size > max_bytes:
             return None
@@ -4235,7 +4270,7 @@ class OnnxScanner(BaseScanner):
             return result
         file_size = source_stat.st_size
         result.metadata["file_size"] = file_size
-        raw_detector_max_bytes = self._resolve_onnx_raw_detector_max_bytes()
+        raw_detector_max_bytes = resolve_onnx_raw_detector_max_bytes(self.config)
 
         # Add file integrity check for compliance
         self._add_onnx_file_integrity_check(
@@ -4462,11 +4497,11 @@ class OnnxScanner(BaseScanner):
                         "checker_available": True,
                         "file_backed_structure": True,
                         "parse_mode": "file_backed_structure",
-                        "external_data_present": _model_has_external_data(model),
+                        "external_data_present": _model_has_external_data(model, self.check_interrupted),
                         "reason": "file_backed_structure_not_full_model_proto",
                     },
                 )
-            elif _model_has_external_data(model):
+            elif _model_has_external_data(model, self.check_interrupted):
                 _mark_onnx_schema_incomplete(
                     result,
                     path,
@@ -4618,7 +4653,6 @@ class OnnxScanner(BaseScanner):
         )
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
-        custom_domains = set()
         local_function_identifiers = _model_local_function_identifiers(model)
         custom_domain_findings: dict[str, _CustomOperatorAggregate] = {}
         explicit_custom_operator_findings: dict[tuple[str, str, str], _CustomOperatorAggregate] = {}
@@ -4648,14 +4682,13 @@ class OnnxScanner(BaseScanner):
                 is_explicit_custom_operator = _is_explicit_custom_operator(node, local_function_identifiers)
                 if is_external_custom_operator or is_explicit_custom_operator:
                     custom_operators_found += 1
+                    retained_group_count = len(custom_domain_findings) + len(explicit_custom_operator_findings)
                     if is_external_custom_operator:
                         domain = str(node.domain or "")
                         finding = custom_domain_findings.get(domain)
-                        retained_group_count = len(custom_domain_findings) + len(explicit_custom_operator_findings)
                         if finding is None and retained_group_count < _ONNX_RESULT_MAX_DISTINCT_GROUPS:
                             finding = _CustomOperatorAggregate()
                             custom_domain_findings[domain] = finding
-                            custom_domains.add(domain)
                         if finding is None:
                             omitted_custom_groups += 1
                         else:
@@ -4663,7 +4696,6 @@ class OnnxScanner(BaseScanner):
                     else:
                         identifier = _operator_identifier(node)
                         finding = explicit_custom_operator_findings.get(identifier)
-                        retained_group_count = len(custom_domain_findings) + len(explicit_custom_operator_findings)
                         if finding is None and retained_group_count < _ONNX_RESULT_MAX_DISTINCT_GROUPS:
                             finding = _CustomOperatorAggregate()
                             explicit_custom_operator_findings[identifier] = finding
@@ -4790,8 +4822,8 @@ class OnnxScanner(BaseScanner):
                 details={"nodes_checked": nodes_checked},
             )
 
-        if custom_domains:
-            result.metadata["custom_domains"] = sorted(custom_domains)
+        if custom_domain_findings:
+            result.metadata["custom_domains"] = sorted(custom_domain_findings)
         _mark_onnx_result_reporting_incomplete(
             result,
             path,
@@ -4836,10 +4868,8 @@ class OnnxScanner(BaseScanner):
                 groups[location] = aggregate
             aggregate.add(tensor_name)
 
-        for tensors in _iter_model_external_data_tensor_groups(model):
+        for tensors in _iter_model_external_data_tensor_groups(model, self.check_interrupted):
             for tensor in tensors:
-                self.check_interrupted()
-
                 if tensor.data_location != onnx.TensorProto.EXTERNAL:
                     continue
                 info = {entry.key: entry.value for entry in tensor.external_data}
@@ -4877,8 +4907,6 @@ class OnnxScanner(BaseScanner):
                 elif escapes_model_dir:
                     # Track for per-file CVE-2025-51480 (write direction) reporting
                     aggregate_location(traversal_files, location, tensor.name)
-                    if location not in traversal_files:
-                        continue
                 elif not external_path.exists():
                     aggregate_location(missing_files, location, tensor.name)
                 else:

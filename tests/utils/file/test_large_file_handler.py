@@ -14,6 +14,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.scan_results_cache import _source_resolution_context
+from modelaudit.core import scan_file
 from modelaudit.scanners import keras_h5_scanner, safetensors_scanner
 from modelaudit.scanners.base import ScanResult
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
@@ -23,6 +24,7 @@ from modelaudit.utils.file import handlers as advanced_handlers
 from modelaudit.utils.file import large_file_handler
 from modelaudit.utils.helpers.cache_decorator import should_bypass_cache_for_zip_entry_preflight
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
+from tests.helpers import create_mock_onnx
 
 
 class DummyScanner:
@@ -117,21 +119,14 @@ def test_large_handler_cache_bypasses_oversized_safetensors_hashing(
         reset_cache_manager()
 
 
+@pytest.mark.parametrize("scan_func", [large_file_handler.scan_large_file, advanced_handlers.scan_advanced_large_file])
 def test_large_handler_cache_bypasses_file_backed_onnx(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    scan_func: Callable[..., ScanResult],
 ) -> None:
-    onnx = pytest.importorskip("onnx")
-    from onnx import TensorProto, helper
-
-    model_path = tmp_path / "model.onnx"
-    graph = helper.make_graph(
-        [helper.make_node("Relu", ["input"], ["output"])],
-        "graph",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
-    )
-    onnx.save(helper.make_model(graph), str(model_path))
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "model.onnx")
     scanner = OnnxScanner(
         config={
             "cache_enabled": True,
@@ -144,9 +139,35 @@ def test_large_handler_cache_bypasses_file_backed_onnx(
         lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must bypass the large-file cache"),
     )
 
-    result = large_file_handler.scan_large_file(str(model_path), scanner)
+    result = scan_func(str(model_path), scanner)
 
     assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+
+
+def test_extreme_onnx_route_uses_file_backed_scan_without_cache_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "extreme.onnx")
+    monkeypatch.setattr(advanced_handlers, "EXTREME_MODEL_THRESHOLD", 1)
+    monkeypatch.setattr(advanced_handlers, "LARGE_MODEL_THRESHOLD_200GB", model_path.stat().st_size + 1)
+    monkeypatch.setattr(
+        "modelaudit.cache.get_cache_manager",
+        lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must bypass the advanced-file cache"),
+    )
+
+    result = scan_file(
+        str(model_path),
+        config={
+            "cache_enabled": True,
+            "cache_dir": str(tmp_path / "cache"),
+            "onnx_raw_detector_max_bytes": 1,
+        },
+    )
+
+    assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+    assert result.metadata.get("operational_error_reason") != "unsupported_bounded_large_file_analysis"
 
 
 @pytest.mark.parametrize(

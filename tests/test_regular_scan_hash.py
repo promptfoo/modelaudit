@@ -894,17 +894,47 @@ class TestHashGenerationEdgeCases:
         self,
         tmp_path: Path,
     ) -> None:
+        from modelaudit.utils.file.detection import (
+            PROTOBUF_MODEL_CANDIDATE_FORMAT,
+            detect_file_format_for_skip_filter,
+        )
         from modelaudit.utils.helpers.cache_decorator import should_defer_hash_for_file_backed_onnx
 
         renamed_model = tmp_path / "renamed"
+        ambiguous_model = tmp_path / "ambiguous.conf"
         foreign_zip = tmp_path / "foreign.onnx"
         _write_regular_scan_onnx_model(renamed_model)
+        _write_regular_scan_onnx_model(ambiguous_model)
+        ambiguous_model.write_bytes((b"\x12\x01a" * 4097) + ambiguous_model.read_bytes())
         with zipfile.ZipFile(foreign_zip, "w") as archive:
             archive.writestr("payload.txt", "not ONNX")
         config = {"onnx_raw_detector_max_bytes": 1}
 
         assert should_defer_hash_for_file_backed_onnx(str(renamed_model), config)
         assert not should_defer_hash_for_file_backed_onnx(str(foreign_zip), config)
+        assert detect_file_format_for_skip_filter(str(ambiguous_model)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        assert should_defer_hash_for_file_backed_onnx(
+            str(ambiguous_model),
+            {**config, "scanners": ["protobuf_model_candidate"]},
+        )
+        assert not should_defer_hash_for_file_backed_onnx(
+            str(ambiguous_model),
+            {**config, "scanners": ["metadata"]},
+        )
+        assert not should_defer_hash_for_file_backed_onnx(
+            str(renamed_model),
+            {**config, "scanners": ["metadata"]},
+        )
+
+        metadata_result = scan_model_directory_or_file(
+            str(ambiguous_model),
+            cache_enabled=False,
+            scanners=["metadata"],
+            skip_file_types=False,
+            onnx_raw_detector_max_bytes=1,
+        )
+        expected_hash = compute_aggregate_hash([hashlib.sha256(ambiguous_model.read_bytes()).hexdigest()])
+        assert metadata_result.content_hash == expected_hash
 
     def test_single_file_backed_onnx_bypasses_aggregate_and_cache_hashes(
         self,

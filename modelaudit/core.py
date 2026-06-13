@@ -1270,10 +1270,19 @@ def _is_streamed_onnx_external_data_hash_candidate(path: Path) -> bool:
         return False
 
 
-def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path] | None:
+def _streamed_onnx_external_data_hash_paths(
+    path: Path,
+    *,
+    deadline: float | None = None,
+) -> list[Path] | None:
     """Return safe ONNX sidecars, or ``None`` when discovery cannot complete."""
     if not _is_streamed_onnx_external_data_hash_candidate(path):
         return []
+
+    def check_discovery_interrupted() -> None:
+        check_interrupted()
+        if deadline is not None and time.time() > deadline:
+            raise TimeoutError("ONNX external_data discovery exceeded the scan deadline")
 
     try:
         import onnx
@@ -1296,9 +1305,11 @@ def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path] | None:
         model, _ = _load_onnx_structure_file_backed(
             str(model_path),
             source_stat.st_size,
-            check_interrupted,
+            check_discovery_interrupted,
             expected_stat=source_stat,
         )
+    except TimeoutError:
+        raise
     except _OnnxStructureParseError:
         return None
     except Exception:
@@ -1313,17 +1324,15 @@ def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path] | None:
 
     external_paths: list[Path] = []
     seen_external_paths: set[Path] = set()
-    for tensors in _iter_model_external_data_tensor_groups(model):
-        check_interrupted()
+    for tensors in _iter_model_external_data_tensor_groups(model, check_discovery_interrupted):
         for tensor in tensors:
-            check_interrupted()
             if getattr(tensor, "data_location", None) != onnx.TensorProto.EXTERNAL:
                 continue
             if not getattr(tensor, "external_data", ()):
                 continue
             info: dict[str, str] = {}
             for entry in tensor.external_data:
-                check_interrupted()
+                check_discovery_interrupted()
                 info[entry.key] = entry.value
             location = info.get("location")
             if (
@@ -4490,7 +4499,8 @@ def scan_model_directory_or_file(
                         representative_external_sources: list[str] = []
                         representative_external_bytes = 0
                         discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(
-                            Path(representative_file)
+                            Path(representative_file),
+                            deadline=start_time + timeout,
                         )
                         if discovered_external_data_paths is None:
                             aggregate_hash_complete = False
@@ -7530,6 +7540,10 @@ def scan_model_streaming(
                     str(scan_path),
                     scan_config,
                 )
+                defer_hash_for_file_backed_onnx = should_defer_hash_for_file_backed_onnx(
+                    str(scan_path),
+                    scan_config,
+                )
                 if defer_hash_for_pytorch_read_limit:
                     scan_config = dict(scan_config)
                     scan_config["cache_enabled"] = False
@@ -7551,7 +7565,10 @@ def scan_model_streaming(
                     str(scan_path),
                     scan_config,
                 ):
-                    discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(scan_path)
+                    discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(
+                        scan_path,
+                        deadline=start_time + timeout,
+                    )
                     if discovered_external_data_paths is None:
                         aggregate_hash_complete = False
                     for onnx_external_data_path in discovered_external_data_paths or ():
@@ -7595,14 +7612,18 @@ def scan_model_streaming(
                             if max_total_size > 0 and top_level_hashed_bytes + external_data_size > max_total_size:
                                 aggregate_hash_complete = False
                                 continue
-                        external_data_hash = append_streamed_file_hash(
-                            onnx_external_data_path,
-                            scan_config,
-                            progress_label=onnx_external_data_path.name,
-                            skip_if_stream_source_seen=True,
-                            skip_if_stream_target_seen=True,
-                        )
-                        if external_data_hash is not None and external_data_target_key is not None:
+                        external_data_hash = None
+                        if not defer_hash_for_file_backed_onnx:
+                            external_data_hash = append_streamed_file_hash(
+                                onnx_external_data_path,
+                                scan_config,
+                                progress_label=onnx_external_data_path.name,
+                                skip_if_stream_source_seen=True,
+                                skip_if_stream_target_seen=True,
+                            )
+                        if external_data_target_key is not None and (
+                            defer_hash_for_file_backed_onnx or external_data_hash is not None
+                        ):
                             consumed_onnx_external_data_aliases[external_data_key] = external_data_target_key
 
                 # Scan the file

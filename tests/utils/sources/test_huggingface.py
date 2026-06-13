@@ -355,7 +355,7 @@ def test_hf_onnx_sidecar_discovery_reports_bounded_parse_failure(
         )
 
 
-def test_hf_onnx_sidecar_discovery_checks_deadline_during_external_data_enumeration(
+def test_hf_onnx_sidecar_discovery_checks_deadline_during_no_tensor_graph_traversal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -365,12 +365,13 @@ def test_hf_onnx_sidecar_discovery_checks_deadline_during_external_data_enumerat
     onnx_path = tmp_path / "model.onnx"
     onnx_path.write_bytes(_make_external_onnx_payload(tmp_path))
     parsed_model = onnx.load_model_from_string(onnx_path.read_bytes())
+    parsed_model.graph.ClearField("initializer")
     callback_invocations = 0
 
     def check_deadline() -> None:
         nonlocal callback_invocations
         callback_invocations += 1
-        if callback_invocations == 3:
+        if callback_invocations == 2:
             raise TimeoutError("enumeration deadline reached")
 
     def load_without_invoking_callback(
@@ -393,7 +394,7 @@ def test_hf_onnx_sidecar_discovery_checks_deadline_during_external_data_enumerat
             {"model.onnx", "model.onnx_data"},
             check_deadline,
         )
-    assert callback_invocations == 3
+    assert callback_invocations == 2
 
 
 TEST_COMMIT_SHA = "a" * 40
