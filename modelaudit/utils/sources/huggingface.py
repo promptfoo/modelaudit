@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 import unicodedata
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cache
@@ -1606,6 +1606,7 @@ def _validate_remote_safetensors_indexes(
     probe_budget: _HuggingFaceProbeBudget,
     *,
     allow_index_expansion: bool = True,
+    allow_content_probes: bool = True,
 ) -> list[str]:
     """Validate and expand selected SafeTensors shard inventories when enabled."""
     from modelaudit.utils.file.handlers import (
@@ -1627,23 +1628,26 @@ def _validate_remote_safetensors_indexes(
     selected_safetensors_ancestor_dirs = {
         ancestor.as_posix() for path in selected_safetensors_paths for ancestor in path.parents
     }
+    selected_family_keys = set(_remote_safetensors_family_files(selected_files, SAFETENSORS_SHARD_PATTERN))
     repo_family_files = _remote_safetensors_family_files(repo_files, SAFETENSORS_SHARD_PATTERN)
     relevant_index_files: list[str] = []
+    strongly_relevant_index_files: set[str] = set()
     for index_file in repo_files:
         if PurePosixPath(index_file).name != SAFETENSORS_INDEX_NAME:
             continue
         index_parent = PurePosixPath(index_file).parent
-        if (
-            index_file in selected_files
-            or index_parent in selected_safetensors_parents
-            or index_parent.as_posix() in selected_safetensors_ancestor_dirs
-        ):
+        strongly_relevant = index_file in selected_files or index_parent in selected_safetensors_parents
+        if strongly_relevant or index_parent.as_posix() in selected_safetensors_ancestor_dirs:
             relevant_index_files.append(index_file)
+            if strongly_relevant:
+                strongly_relevant_index_files.add(index_file)
     if len(relevant_index_files) > _HF_SAFETENSORS_INDEX_MAX_FILES:
         raise ValueError(
             "Hugging Face selective filtering incomplete: SafeTensors index inspection limit exceeded "
             f"for {repo_id} ({_HF_SAFETENSORS_INDEX_MAX_FILES} files)"
         )
+    if relevant_index_files and not allow_content_probes:
+        _raise_metadata_only_hf_selection_incomplete(repo_id, relevant_index_files)
 
     for index_file in relevant_index_files:
         probe_budget.check_deadline(repo_id)
@@ -1715,6 +1719,9 @@ def _validate_remote_safetensors_indexes(
                 )
             target_indices.add(shard_index)
             target_families.setdefault((target_path.parent.as_posix(), shard_total), set()).add(target_file)
+
+        if index_file not in strongly_relevant_index_files and selected_family_keys.isdisjoint(target_families):
+            continue
 
         if not index_selected:
             updated_model_files.append(index_file)
@@ -2352,6 +2359,7 @@ def _select_streamable_hf_files(
         model_files,
         probe_budget,
         allow_index_expansion=allow_safetensors_index_expansion,
+        allow_content_probes=allow_content_probes,
     )
     return _HuggingFaceStreamingSelection(model_files, content_route_formats)
 
@@ -3481,8 +3489,11 @@ def download_model(
     display_url = redact_huggingface_url_for_display(url)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
-    # Disk space check and path setup
-    model_size = _get_model_size_with_deadline(repo_id, deadline, revision=requested_revision)
+    # Disk space path setup. Selection-aware size evidence is collected after planning.
+    selection_is_filtered = scannable_extensions is not None or scannable_scanner_ids is not None
+    model_size = (
+        None if selection_is_filtered else _get_model_size_with_deadline(repo_id, deadline, revision=requested_revision)
+    )
     download_path = None  # Will be set only if cache_dir is provided
     disk_check_path = None
     download_path_preexisting = False
@@ -3497,11 +3508,6 @@ def download_model(
     else:
         disk_check_path = _get_hf_cache_root()
         disk_check_path.mkdir(parents=True, exist_ok=True)
-
-    if model_size and disk_check_path is not None:
-        has_space, message = check_disk_space(disk_check_path, model_size)
-        if not has_space:
-            raise Exception(f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}")
 
     try:
         # Configure progress display based on environment
@@ -3529,6 +3535,31 @@ def download_model(
         model_files = plan.selected_files
         if repository_file_inventory is not None:
             repository_file_inventory[:] = plan.repo_files
+
+        if selection_is_filtered:
+            selected_size_evidence: Mapping[str, int | None] = plan.selected_sizes
+            if any(filename not in selected_size_evidence for filename in model_files):
+                try:
+                    selected_size_evidence, _size_revision = _get_huggingface_path_sizes(
+                        repo_id,
+                        model_files,
+                        resolved_revision=plan.repo_revision,
+                        deadline=deadline,
+                    )
+                except Exception:
+                    selected_size_evidence = {}
+            selected_model_sizes = [
+                size
+                for filename in model_files
+                if isinstance((size := selected_size_evidence.get(filename)), int) and not isinstance(size, bool)
+            ]
+            if selected_model_sizes and len(selected_model_sizes) == len(model_files):
+                model_size = sum(selected_model_sizes, start=0)
+
+        if model_size and disk_check_path is not None:
+            has_space, message = check_disk_space(disk_check_path, model_size)
+            if not has_space:
+                raise Exception(f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}")
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)

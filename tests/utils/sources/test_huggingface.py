@@ -3674,6 +3674,51 @@ class TestModelDownloadStreaming:
 
         mock_requests_get.assert_not_called()
 
+    def test_remote_safetensors_validation_ignores_unrelated_ancestor_index(self) -> None:
+        """A root model index must not expand or reject a selected nested adapter family."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "model-00000-of-00001.safetensors",
+            "adapter/model-00000-of-00001.safetensors",
+        ]
+        selected_files = ["adapter/model-00000-of-00001.safetensors"]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps({"weight_map": {"root_tensor": "model-00000-of-00001.safetensors"}}).encode()
+
+        with patch("requests.get", return_value=_FakeRangeResponse(payload)):
+            result = _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                selected_files,
+                budget,
+            )
+
+        assert result == selected_files
+
+    def test_remote_safetensors_validation_metadata_only_refuses_index_reads(self) -> None:
+        """Metadata-only planning must not range-read SafeTensors index content."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "model-00000-of-00001.safetensors",
+        ]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        with (
+            patch("requests.get") as mock_requests_get,
+            pytest.raises(ValueError, match="metadata-only dry-run selection incomplete"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                repo_files,
+                budget,
+                allow_content_probes=False,
+            )
+
+        mock_requests_get.assert_not_called()
+
     def test_remote_safetensors_index_validation_checks_deadline_during_large_inventory(self) -> None:
         """Attacker-sized target loops must honor the shared acquisition deadline."""
         target_count = 256
@@ -7554,10 +7599,19 @@ class TestModelSizeAndDiskSpace:
 
     @patch("modelaudit.utils.sources.huggingface.get_model_size")
     @patch("modelaudit.utils.sources.huggingface.check_disk_space")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["model.bin"], _HF_TEST_REVISION, None),
+    )
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_insufficient_disk_space(
-        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
-    ):
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_check_disk_space: MagicMock,
+        mock_get_model_size: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test download fails gracefully when disk space is insufficient (with custom cache)."""
         # Mock model size
         mock_get_model_size.return_value = 10 * 1024 * 1024 * 1024  # 10 GB
@@ -7647,6 +7701,42 @@ class TestModelSizeAndDiskSpace:
 
         assert hf_cache_root.exists()
         mock_check_disk_space.assert_called_once_with(hf_cache_root, 1024 * 1024)
+
+    def test_download_model_filtered_selection_checks_only_selected_disk_size(self, tmp_path: Path) -> None:
+        """Scanner-filtered downloads must not require space for unrelated repository artifacts."""
+        repo_files = ["model.onnx", "model-00000-of-00001.safetensors"]
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "model.onnx").write_bytes(b"onnx")
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.onnx": 100}, _HF_TEST_REVISION),
+            ) as mock_get_sizes,
+            patch("modelaudit.utils.sources.huggingface._get_model_size_with_deadline") as mock_repo_size,
+            patch(
+                "modelaudit.utils.sources.huggingface.check_disk_space",
+                return_value=(True, "sufficient selected space"),
+            ) as mock_check_disk_space,
+            patch("huggingface_hub.snapshot_download", return_value=str(download_path)),
+        ):
+            result = download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "cache",
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert result == download_path
+        mock_repo_size.assert_not_called()
+        assert mock_get_sizes.call_args.args[1] == ["model.onnx"]
+        mock_check_disk_space.assert_called_once_with(tmp_path / "cache" / "huggingface" / "test" / "model", 100)
 
 
 class TestGetModelInfo:

@@ -484,7 +484,9 @@ class TestShardedModelDetector:
         result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, scanners=["safetensors"])
 
         assert shard_info is not None
-        assert shard_info["shards"] == [str(shard) for shard in shards]
+        assert [os.path.normcase(os.path.normpath(path)) for path in shard_info["shards"]] == [
+            os.path.normcase(os.path.normpath(str(shard))) for shard in shards
+        ]
         assert "missing_shard_count" not in shard_info
         assert "out_of_scope_shard_count" not in shard_info
         assert result.success is True

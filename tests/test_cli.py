@@ -5727,6 +5727,34 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_fails_closed() -> N
     mock_scan_local.assert_not_called()
 
 
+def test_scan_huggingface_streaming_dry_run_refuses_safetensors_index_content_read() -> None:
+    """Metadata-only streaming previews must not range-read selected SafeTensors indexes."""
+    repo_files = ["model.safetensors.index.json", "model-00000-of-00001.safetensors"]
+    with (
+        patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(repo_files, _HF_TEST_REVISION, None),
+        ),
+        patch("requests.get") as mock_requests_get,
+        patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
+        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
+        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--dry-run", "--stream", "--format", "json", "hf://test/model"],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2
+    assert "metadata-only dry-run selection incomplete" in result.output
+    assert "model.safetensors.index.json" in result.output
+    mock_requests_get.assert_not_called()
+    mock_get_model_info.assert_not_called()
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+
+
 @patch(
     "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
     return_value=(["notes.txt"], _HF_TEST_REVISION, None),
@@ -6196,6 +6224,8 @@ def test_scan_huggingface_standard_dry_run_bounds_metadata_to_plan_deadline() ->
                 "7",
                 "--format",
                 "json",
+                "--scanners",
+                "onnx",
                 "hf://test/model",
             ],
             catch_exceptions=False,
@@ -6208,9 +6238,13 @@ def test_scan_huggingface_standard_dry_run_bounds_metadata_to_plan_deadline() ->
     mock_plan_download.assert_called_once()
     assert mock_plan_download.call_args.kwargs["timeout_seconds"] == 7
     assert mock_plan_download.call_args.kwargs["allow_content_probes"] is False
+    assert ".onnx" in mock_plan_download.call_args.kwargs["scannable_extensions"]
+    assert set(mock_plan_download.call_args.kwargs["scannable_scanner_ids"]) == {"onnx"}
     metadata_timeout = mock_get_model_info.call_args.kwargs["timeout_seconds"]
     assert 0 < metadata_timeout <= 7
     assert mock_get_model_info.call_args.kwargs["allow_content_probes"] is False
+    assert ".onnx" in mock_get_model_info.call_args.kwargs["scannable_extensions"]
+    assert set(mock_get_model_info.call_args.kwargs["scannable_scanner_ids"]) == {"onnx"}
     mock_streaming_plan.assert_not_called()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()

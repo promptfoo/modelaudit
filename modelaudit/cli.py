@@ -327,6 +327,8 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
             runtime.max_download_bytes,
             timeout_seconds=runtime.timeout,
             allow_content_probes=False,
+            scannable_extensions=runtime.scannable_extensions,
+            scannable_scanner_ids=runtime.scannable_scanner_ids,
         )
 
     preview_timeout = _remaining_huggingface_plan_timeout_seconds(plan)
@@ -335,10 +337,10 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
         model_info_kwargs["timeout_seconds"] = preview_timeout
     if runtime.scan_and_delete:
         model_info_kwargs["streaming_selection"] = True
-        model_info_kwargs["scannable_extensions"] = runtime.scannable_extensions
         model_info_kwargs["scannable_filenames"] = runtime.scannable_filenames
-        model_info_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
         model_info_kwargs["include_all_files"] = runtime.hf_stream_include_all_files
+    model_info_kwargs["scannable_extensions"] = runtime.scannable_extensions
+    model_info_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
     model_info = get_model_info(path, **model_info_kwargs)
     total_size = model_info.get("total_size")
     preserved_metadata = {
