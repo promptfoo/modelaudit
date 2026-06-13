@@ -16464,6 +16464,36 @@ def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) 
     assert result.success is True
 
 
+def test_selected_safetensors_overlap_single_shard_preserves_missing_family_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambiguous selected shard must retain advanced-handler missing-peer coverage."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00002.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+
+    monkeypatch.setattr(
+        "modelaudit.core.detect_file_format",
+        lambda _path: file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+    )
+    monkeypatch.setattr(
+        "modelaudit.core.detect_file_format_from_magic",
+        lambda _path: file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+    )
+
+    result = scan_model_directory_or_file(
+        str(shard),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+    assert any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+
+
 def test_directory_child_probe_stops_at_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     def bounded_iterdir(self: Path) -> Iterator[Path]:
         for index in range(core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT):

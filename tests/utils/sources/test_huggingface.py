@@ -866,6 +866,121 @@ class TestModelDownload:
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.onnx"]
         mock_requests_get.assert_not_called()
 
+    def test_download_model_filtered_cache_removes_stale_unselected_files(self, tmp_path: Path) -> None:
+        """A filtered persistent snapshot must not expose files from an earlier broader download."""
+        cache_dir = tmp_path / "cache"
+        download_path = cache_dir / "huggingface" / "test" / "model"
+        download_path.mkdir(parents=True)
+        stale = download_path / "stale.safetensors"
+        stale.write_bytes(b"stale")
+
+        def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
+            local_path = Path(local_dir)
+            assert not stale.exists()
+            (local_path / "model.onnx").write_bytes(b"onnx")
+            return str(local_path)
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes", return_value=({}, _HF_TEST_REVISION)
+            ),
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect),
+        ):
+            result = download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert result == download_path
+        assert not stale.exists()
+        assert (download_path / "model.onnx").is_file()
+
+    def test_download_model_filtered_onnx_includes_external_data(self, tmp_path: Path) -> None:
+        """A filtered standard ONNX snapshot must materialize declared external-data companions."""
+        repo_files = ["model.onnx", "weights/model.onnx_data"]
+        snapshot_calls: list[list[str]] = []
+
+        def snapshot_side_effect(*, local_dir: str, allow_patterns: list[str], **_kwargs: object) -> str:
+            snapshot_calls.append(allow_patterns)
+            local_path = Path(local_dir)
+            for filename in allow_patterns:
+                path = local_path / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"onnx" if filename == "model.onnx" else b"weights")
+            return str(local_path)
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes", return_value=({}, _HF_TEST_REVISION)
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._discover_hf_onnx_external_data_files",
+                return_value=["weights/model.onnx_data"],
+            ),
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect),
+        ):
+            result = download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "cache",
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert snapshot_calls == [["model.onnx"], ["model.onnx", "weights/model.onnx_data"]]
+        assert (result / "weights" / "model.onnx_data").read_bytes() == b"weights"
+
+    def test_download_model_pickle_selection_probes_safetensors_suffix(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Explicit pickle selection must content-route renamed payloads despite a SafeTensors suffix."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        mock_snapshot_download = MagicMock(return_value=str(download_path))
+
+        def snapshot_side_effect(**kwargs: object) -> str:
+            allow_patterns = cast(list[str], kwargs["allow_patterns"])
+            for filename in allow_patterns:
+                (download_path / filename).write_bytes(b"payload")
+            return str(download_path)
+
+        mock_snapshot_download.side_effect = snapshot_side_effect
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["payload.safetensors"], _HF_TEST_REVISION, None),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                return_value="pickle",
+            ) as mock_detect_content,
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes", return_value=({}, _HF_TEST_REVISION)
+            ),
+            patch("huggingface_hub.snapshot_download", mock_snapshot_download),
+        ):
+            result = download_model(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".pkl", ".pickle"},
+                scannable_scanner_ids={"pickle"},
+            )
+
+        assert result == download_path
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["payload.safetensors"]
+        mock_detect_content.assert_called_once()
+
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(["model.bin"], _HF_TEST_REVISION, None),

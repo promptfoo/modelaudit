@@ -6,6 +6,7 @@ import ntpath
 import os
 import posixpath
 import re
+import shutil
 import signal
 import struct
 import subprocess
@@ -1454,13 +1455,22 @@ def _select_huggingface_model_files(
     allow_inaccessible_probe_errors: bool = False,
     inaccessible_probe_files: list[str] | None = None,
     allow_safetensors_index_expansion: bool = True,
+    scannable_scanner_ids: Collection[str] | None = None,
     deadline: float | None = None,
 ) -> list[str]:
     """Select extension-matching files plus bounded content-routed renamed model files."""
     model_files = list(
         dict.fromkeys(filename for filename in repo_files if _is_scannable_hf_file(filename, model_extensions))
     )
+    selected_route_scanner_ids = (
+        {str(scanner_id).lower() for scanner_id in scannable_scanner_ids} if scannable_scanner_ids is not None else None
+    )
     if not allow_content_probes:
+        selected_safetensors_indexes = [
+            filename for filename in model_files if PurePosixPath(filename).name == "model.safetensors.index.json"
+        ]
+        if allow_safetensors_index_expansion and selected_safetensors_indexes:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, selected_safetensors_indexes)
         candidate_files = _metadata_only_hf_content_probe_candidates(repo_files, model_files)
         if candidate_files:
             _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
@@ -1478,8 +1488,12 @@ def _select_huggingface_model_files(
             continue
         if _is_huggingface_repo_bookkeeping_file(filename):
             continue
-        if not allow_safetensors_index_expansion and (
-            PurePosixPath(filename).name == "model.safetensors.index.json" or filename.endswith(".safetensors")
+        if not allow_safetensors_index_expansion and PurePosixPath(filename).name == "model.safetensors.index.json":
+            continue
+        if (
+            not allow_safetensors_index_expansion
+            and filename.endswith(".safetensors")
+            and (selected_route_scanner_ids is None or "pickle" not in selected_route_scanner_ids)
         ):
             continue
         if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
@@ -1504,6 +1518,11 @@ def _select_huggingface_model_files(
             raise
         if detected_format is None:
             continue
+        if selected_route_scanner_ids is not None:
+            from ...scanner_selection import scanner_ids_for_detected_format
+
+            if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
+                continue
         model_files.append(filename)
         selected_files.add(filename)
 
@@ -3218,6 +3237,7 @@ def _build_huggingface_model_info(
                 scannable_extensions,
                 scannable_scanner_ids,
             ),
+            scannable_scanner_ids=scannable_scanner_ids,
             deadline=deadline,
         )
     inventory_files = list(dict.fromkeys([*model_files, *inaccessible_probe_files]))
@@ -3561,6 +3581,14 @@ def download_model(
             if not has_space:
                 raise Exception(f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}")
 
+        if selection_is_filtered and download_path is not None and download_path_preexisting:
+            if download_path.is_symlink():
+                download_path.unlink()
+            else:
+                shutil.rmtree(download_path)
+            download_path.mkdir(parents=True, exist_ok=True)
+            download_path_preexisting = False
+
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
         # - When cache_dir is None: Use HF's default caching mechanism (avoid interfering)
@@ -3591,6 +3619,42 @@ def download_model(
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
+        onnx_external_data_enabled = scannable_scanner_ids is None or "onnx" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        external_data_files: list[str] = []
+        if onnx_external_data_enabled:
+            repo_file_set = set(plan.repo_files)
+            for filename in model_files:
+                if PurePosixPath(filename).suffix.lower() != ".onnx":
+                    continue
+                external_data_files.extend(
+                    _discover_hf_onnx_external_data_files(
+                        downloaded_path / filename,
+                        filename,
+                        repo_file_set,
+                    )
+                )
+        external_data_files = list(dict.fromkeys(external_data_files))
+        if external_data_files:
+            model_files = list(dict.fromkeys([*model_files, *external_data_files]))
+            if size_limit is not None:
+                _ensure_huggingface_selection_within_max_size(
+                    repo_id,
+                    model_files,
+                    size_limit,
+                    resolved_revision=plan.repo_revision,
+                    deadline=deadline,
+                )
+            download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
+            local_path = _run_huggingface_download_with_deadline(
+                "snapshot_download",
+                download_kwargs,
+                deadline,
+                repo_id,
+                direct_download=snapshot_download,
+            )
+            downloaded_path = Path(local_path)
         _verify_huggingface_selection_within_max_size(repo_id, downloaded_path, model_files, size_limit)
         downloaded_files = {
             path.relative_to(downloaded_path).as_posix() for path in downloaded_path.rglob("*") if path.is_file()
@@ -3613,8 +3677,6 @@ def download_model(
             and download_path.exists()
             and _is_within_directory(cache_dir / "huggingface", download_path)
         ):
-            import shutil
-
             shutil.rmtree(download_path)
         raise Exception(
             f"Failed to download model from {display_url}: {redact_huggingface_urls_in_text(str(e))}"
@@ -3675,6 +3737,7 @@ def plan_huggingface_model_download(
             scannable_extensions,
             scannable_scanner_ids,
         ),
+        scannable_scanner_ids=scannable_scanner_ids,
         deadline=deadline,
     )
     model_files = _include_huggingface_openvino_companions(

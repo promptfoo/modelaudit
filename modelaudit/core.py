@@ -6582,7 +6582,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         return sr
     if (
         header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    ) and not (use_extreme_handler and len(allowed_shard_targets or {}) > 1):
+    ) and not use_extreme_handler:
         selected_safetensors_result = _scan_selected_safetensors_overlap(
             path,
             config,
@@ -6640,7 +6640,6 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         file_type_valid = True
     elif (
         use_extreme_handler
-        and len(allowed_shard_targets or {}) > 1
         and (header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT)
         and "safetensors" in safetensors_overlap_scanner_ids
         and scanner_selection.active

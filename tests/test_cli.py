@@ -5755,6 +5755,34 @@ def test_scan_huggingface_streaming_dry_run_refuses_safetensors_index_content_re
     mock_scan_streaming.assert_not_called()
 
 
+def test_scan_huggingface_standard_dry_run_refuses_safetensors_index_content_read() -> None:
+    """Metadata-only standard previews must validate selected SafeTensors indexes before succeeding."""
+    repo_files = ["model.safetensors.index.json", "model-00000-of-00001.safetensors"]
+    with (
+        patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(repo_files, _HF_TEST_REVISION, None),
+        ),
+        patch("requests.get") as mock_requests_get,
+        patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--dry-run", "--format", "json", "hf://test/model"],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2
+    assert "metadata-only dry-run selection incomplete" in result.output
+    assert "model.safetensors.index.json" in result.output
+    mock_requests_get.assert_not_called()
+    mock_get_model_info.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan_local.assert_not_called()
+
+
 @patch(
     "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
     return_value=(["notes.txt"], _HF_TEST_REVISION, None),
