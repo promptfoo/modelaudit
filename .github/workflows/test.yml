@@ -536,6 +536,9 @@ jobs:
     # Prove workflow changes on their PR, but avoid adding five expensive jobs
     # to ordinary Python PRs. Main always receives the sharded coverage gate.
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.workflows == 'true'
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     # Branch coverage is CPU-bound on the hosted runner. Keep every test
     # instrumented, but distribute stable node-ID shards across runners.
@@ -593,6 +596,7 @@ jobs:
           name: python-coverage-${{ matrix.shard }}
           files: ./coverage.xml
           fail_ci_if_error: true
+          use_oidc: true
           verbose: true
 
   test-numpy-compatibility:
