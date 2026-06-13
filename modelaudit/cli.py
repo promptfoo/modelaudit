@@ -2123,6 +2123,18 @@ def style_text(text: str, **kwargs: Any) -> str:
     return text
 
 
+def _configure_unicode_safe_cli_streams() -> None:
+    """Keep decorative CLI text from crashing legacy redirected encodings."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="backslashreplace")
+        except (OSError, TypeError, ValueError):
+            continue
+
+
 def _escape_terminal_text(value: Any) -> str:
     """Render control characters visibly before writing model-controlled text to terminals."""
     text = "" if value is None else str(value)
@@ -6223,6 +6235,7 @@ def debug(output_json: bool, verbose: bool) -> None:
 
 
 def main() -> None:
+    _configure_unicode_safe_cli_streams()
     if sys.version_info < (3, 10):  # noqa: UP036 — intentional safety net for bypassed requires-python
         click.echo(
             click.style(
