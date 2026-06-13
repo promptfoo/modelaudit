@@ -727,17 +727,33 @@ def _write_rebindable_trusted_torch_utils_package(site_packages: Path) -> None:
     )
 
 
-def _write_source_dependent_trusted_torch_utils_package(site_packages: Path) -> None:
+def _write_source_dependent_trusted_torch_utils_package(
+    site_packages: Path,
+    *,
+    default_callback: bool = False,
+) -> None:
     package_dir = site_packages / "torch"
     package_dir.mkdir(parents=True, exist_ok=True)
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    rebuild_lines = (
+        [
+            "def _rebuild_tensor_v2(tensor, callback=None):",
+            "    if callback:",
+            "        return callback(tensor)",
+            "    return _restore_device_fake_mode(tensor)",
+        ]
+        if default_callback
+        else [
+            "def _rebuild_tensor_v2(tensor):",
+            "    return _restore_device_fake_mode(tensor)",
+        ]
+    )
     (package_dir / "_utils.py").write_text(
         "\n".join(
             [
                 "def _restore_device_fake_mode(tensor):",
                 "    return tensor",
-                "def _rebuild_tensor_v2(tensor):",
-                "    return _restore_device_fake_mode(tensor)",
+                *rebuild_lines,
                 "",
             ]
         ),
@@ -748,17 +764,20 @@ def _write_source_dependent_trusted_torch_utils_package(site_packages: Path) -> 
 def _scan_source_dependent_torch_rebuild_tensor_v2(
     tmp_path: Path,
     *,
+    payload_value: bytes = b"metadata",
     rebound_name: str = "",
     marker_text: str = "",
+    rebound_builtin: str = "",
+    default_marker_text: str = "",
 ) -> dict[str, Any]:
     payload_path = tmp_path / "poststartup-torch-rebuild-tensor-v2.pkl"
-    payload_path.write_bytes(_metadata_reduce_payload("torch._utils", "_rebuild_tensor_v2") + b".")
+    payload_path.write_bytes(_metadata_reduce_payload("torch._utils", "_rebuild_tensor_v2", payload_value) + b".")
     marker = tmp_path / f"{payload_path.stem}.marker"
     site_packages = tmp_path / "trusted-site-packages"
-    _write_source_dependent_trusted_torch_utils_package(site_packages)
+    _write_source_dependent_trusted_torch_utils_package(site_packages, default_callback=bool(default_marker_text))
 
     script = (
-        "import json, pickle, sys\n"
+        "import builtins, json, pickle, sys\n"
         "from pathlib import Path\n"
         "from modelaudit_picklescan import scan_file\n"
         "import torch._utils as torch_utils\n"
@@ -766,7 +785,12 @@ def _scan_source_dependent_torch_rebuild_tensor_v2(
         "rebound_name = sys.argv[2]\n"
         "marker = Path(sys.argv[3])\n"
         "marker_text = sys.argv[4]\n"
-        "if rebound_name:\n"
+        "rebound_builtin = sys.argv[5]\n"
+        "default_marker_text = sys.argv[6]\n"
+        "if rebound_name and rebound_builtin:\n"
+        "    torch_utils.marker = marker\n"
+        "    setattr(torch_utils, rebound_name, getattr(builtins, rebound_builtin))\n"
+        "elif rebound_name:\n"
         "    namespace = {'__name__': 'torch._utils', 'marker': marker, 'marker_text': marker_text}\n"
         "    source = (\n"
         "        f'def {rebound_name}(arg):\\n'\n"
@@ -775,9 +799,15 @@ def _scan_source_dependent_torch_rebuild_tensor_v2(
         "    )\n"
         "    exec(compile(source, str(Path(torch_utils.__file__)), 'exec'), namespace)\n"
         "    setattr(torch_utils, rebound_name, namespace[rebound_name])\n"
+        "if default_marker_text:\n"
+        "    class EvilDefault:\n"
+        "        def __bool__(self):\n"
+        "            marker.write_text(default_marker_text, encoding='utf-8')\n"
+        "            return False\n"
+        "    torch_utils._rebuild_tensor_v2.__defaults__ = (EvilDefault(),)\n"
         "report = scan_file(payload_path)\n"
         "marker_before_unpickle = marker.exists()\n"
-        "if rebound_name:\n"
+        "if rebound_name or default_marker_text:\n"
         "    pickle.loads(payload_path.read_bytes())\n"
         "print(json.dumps({\n"
         "    'status': report.status.value,\n"
@@ -795,7 +825,17 @@ def _scan_source_dependent_torch_rebuild_tensor_v2(
     )
 
     completed = subprocess.run(
-        [sys.executable, "-c", script, str(payload_path), rebound_name, str(marker), marker_text],
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(payload_path),
+            rebound_name,
+            str(marker),
+            marker_text,
+            rebound_builtin,
+            default_marker_text,
+        ],
         check=False,
         env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
         capture_output=True,
@@ -8332,6 +8372,23 @@ def test_scan_file_warns_when_late_loaded_framework_reconstruction_function_is_r
     )
 
 
+def test_scan_file_warns_when_late_loaded_framework_reconstruction_default_is_rebound(
+    tmp_path: Path,
+) -> None:
+    output = _scan_source_dependent_torch_rebuild_tensor_v2(
+        tmp_path,
+        default_marker_text="forged-default",
+    )
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "torch._utils._rebuild_tensor_v2"
+        for finding in output["findings"]
+    )
+
+
 def test_scan_file_warns_when_late_loaded_framework_reconstruction_helper_is_rebound(
     tmp_path: Path,
 ) -> None:
@@ -8339,6 +8396,25 @@ def test_scan_file_warns_when_late_loaded_framework_reconstruction_helper_is_reb
         tmp_path,
         rebound_name="_restore_device_fake_mode",
         marker_text="forged-helper",
+    )
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "torch._utils._rebuild_tensor_v2"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_late_loaded_framework_reconstruction_helper_is_rebound_to_builtin(
+    tmp_path: Path,
+) -> None:
+    output = _scan_source_dependent_torch_rebuild_tensor_v2(
+        tmp_path,
+        payload_value=b"marker.write_text('eval-helper', encoding='utf-8')",
+        rebound_name="_restore_device_fake_mode",
+        rebound_builtin="eval",
     )
     assert output["marker_before_unpickle"] is False
     assert output["marker_after_unpickle"] is True
