@@ -229,6 +229,10 @@ _WEIGHT_COMPUTING_LINEAGE_OPERATORS: frozenset[str] = frozenset(
         *_RECURRENT_WEIGHT_OPERATORS,
     }
 )
+_METADATA_ONLY_LINEAGE_OPERATORS: frozenset[str] = frozenset({"Shape", "Size"})
+_PRIMARY_DATA_LINEAGE_OPERATORS: frozenset[str] = frozenset(
+    {"Compress", "CumSum", "Expand", "Pad", "Resize", "Slice", "Split", "Tile", "TopK"}
+)
 
 
 def _check_onnx() -> bool:
@@ -1646,6 +1650,19 @@ def _build_onnx_weight_analysis_plan(
             current_data_type = int(onnx.TensorProto.FLOAT)
             scale_data_type: int | None = None
             has_dynamic_quantize_scale = False
+
+            def semantically_live_consumers(value_names: Iterable[str]) -> list[Any]:
+                return [
+                    consumer
+                    for value_name in value_names
+                    for consumer in consumers_by_value.get(value_name, [])
+                    if not (
+                        getattr(consumer, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                        and consumer.op_type in _METADATA_ONLY_LINEAGE_OPERATORS
+                    )
+                    and any(str(output_name) in live_values for output_name in consumer.output if output_name)
+                ]
+
             while queue:
                 value_name, depth = queue.pop(0)
                 if not value_name or value_name in visited_values:
@@ -1659,7 +1676,7 @@ def _build_onnx_weight_analysis_plan(
                     if any(str(output_name) in live_values for output_name in consumer.output if output_name)
                 ]
                 if value_name in graph_output_names:
-                    if live_consumers or not graph_outputs_are_authoritative:
+                    if semantically_live_consumers((value_name,)) or not graph_outputs_are_authoritative:
                         return None, "unresolved_quantized_weight_scale"
                     reached_terminal = True
                     continue
@@ -1695,7 +1712,12 @@ def _build_onnx_weight_analysis_plan(
                             return None, "unresolved_quantized_weight_scale"
                         # A dynamic activation scale plus a static scale completes the
                         # canonical integer dequantization path before the typed bias.
-                        if scale_data_type is not None and has_dynamic_quantize_scale and scale_names:
+                        if (
+                            scale_data_type is not None
+                            and has_dynamic_quantize_scale
+                            and scale_names
+                            and not semantically_live_consumers(next_values)
+                        ):
                             reached_terminal = True
                             continue
                     elif consumer.op_type == "Cast":
@@ -2402,7 +2424,11 @@ def _build_onnx_weight_analysis_plan(
                 is_non_data_standard_input = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and ((node.op_type == "Clip" and input_index > 0) or (node.op_type == "Where" and input_index == 0))
+                    and (
+                        (node.op_type == "Clip" and input_index > 0)
+                        or (node.op_type == "Where" and input_index == 0)
+                        or (node.op_type in _PRIMARY_DATA_LINEAGE_OPERATORS and input_index > 0)
+                    )
                 )
                 if not is_array_feature_selector and not is_non_data_standard_input:
                     merge_lineages(
@@ -2703,30 +2729,21 @@ def _build_onnx_weight_analysis_plan(
                     transform_counts[initializer_index] += 1
                     output_lineages[initializer_index] = transformed_lineage(lineage, node, constants)
             elif all_input_lineages and function is None and not subgraph_results:
+                registered_standard_operator = (
+                    is_registered_standard_operator and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                )
                 same_type_elementwise = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
+                    registered_standard_operator and node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
                 )
                 same_type_unary_elementwise = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    registered_standard_operator
                     and node.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
                     and len(input_names) == 1
                 )
-                clip_operator = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type == "Clip"
-                )
-                pow_operator = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type == "Pow"
-                )
+                clip_operator = registered_standard_operator and node.op_type == "Clip"
+                pow_operator = registered_standard_operator and node.op_type == "Pow"
                 prelu_data_is_activation = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    registered_standard_operator
                     and node.op_type == "PRelu"
                     and bool(input_names)
                     and (
@@ -2741,24 +2758,19 @@ def _build_onnx_weight_analysis_plan(
                     )
                 )
                 weight_computing_lineage = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type in _WEIGHT_COMPUTING_LINEAGE_OPERATORS
+                    registered_standard_operator and node.op_type in _WEIGHT_COMPUTING_LINEAGE_OPERATORS
                 )
-                concat_output_shapes = (
-                    {known_value_shapes.get(str(output_name)) for output_name in node.output if output_name}
-                    if node.op_type == "Concat"
-                    else set()
-                )
-                concat_output_shape = (
-                    next(iter(concat_output_shapes))
-                    if len(concat_output_shapes) == 1 and None not in concat_output_shapes
+                declared_output_shapes = {
+                    known_value_shapes.get(str(output_name)) for output_name in node.output if output_name
+                }
+                declared_output_shape = (
+                    next(iter(declared_output_shapes))
+                    if len(declared_output_shapes) == 1 and None not in declared_output_shapes
                     else None
                 )
-                concat_lineage = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type == "Concat"
+                unmodeled_standard_operator_lineage = (
+                    registered_standard_operator
+                    and node.op_type not in _METADATA_ONLY_LINEAGE_OPERATORS
                     and not (
                         same_type_elementwise
                         or same_type_unary_elementwise
@@ -2780,7 +2792,7 @@ def _build_onnx_weight_analysis_plan(
                     or prelu_data_is_activation
                     or weight_computing_lineage
                     or unknown_operator_lineage
-                    or concat_lineage
+                    or unmodeled_standard_operator_lineage
                 )
                 if propagates_lineage:
                     elementwise_output_shape = (
@@ -2788,8 +2800,8 @@ def _build_onnx_weight_analysis_plan(
                         if same_type_elementwise or same_type_unary_elementwise or pow_operator
                         else known_value_shapes.get(input_names[0])
                         if clip_operator and input_names
-                        else concat_output_shape
-                        if concat_lineage
+                        else declared_output_shape
+                        if unmodeled_standard_operator_lineage
                         else None
                     )
                     carries_dynamic_activation = bool(terminal_weight_lineages) and has_dynamic_input
@@ -2809,17 +2821,15 @@ def _build_onnx_weight_analysis_plan(
                                 unresolved_reason = (
                                     "dynamic_input_lineage" if has_dynamic_input else "unsupported_lineage_operator"
                                 )
-                        output_lineages[initializer_index] = _OnnxWeightLineage(
-                            initializer_index=initializer_index,
+                        output_lineages[initializer_index] = replace(
+                            lineage,
                             shape=elementwise_output_shape,
                             data_type=(
                                 lineage.data_type
                                 if same_type_elementwise or same_type_unary_elementwise or clip_operator
                                 else None
                             ),
-                            transforms=lineage.transforms,
                             unresolved_reason=unresolved_reason,
-                            quantization=lineage.quantization,
                         )
 
             output_lineages = bounded_lineages(output_lineages)
