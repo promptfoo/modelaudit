@@ -480,6 +480,27 @@ class FileHashesModel(BaseModel):
         return None
 
 
+class MemberFileIntegrityModel(BaseModel, DictCompatMixin):
+    """Integrity metadata for a nested archive/member payload."""
+
+    model_config = ConfigDict(validate_assignment=True, extra="allow")
+
+    file_hashes: FileHashesModel | None = Field(None, description="Complete member hashes")
+    file_size: int | None = Field(None, description="Member size in bytes", ge=0)
+    bytes_hashed: int | None = Field(None, description="Bytes covered by the member hash", ge=0)
+    hash_complete: bool | None = Field(None, description="Whether the member hash covered the full payload")
+    hash_status: str | None = Field(None, description="Hash coverage status")
+    sha256_prefix: str | None = Field(
+        None,
+        description="SHA256 hash for a bounded member prefix only",
+        pattern=r"^[a-fA-F0-9]{64}$",
+    )
+    scanner_name: str | None = Field(None, description="Scanner that produced the member hash")
+    logical_path: str | None = Field(None, description="Original logical path when duplicate keys are disambiguated")
+    path_segments: list[str] = Field(default_factory=list, description="Raw nested archive path segments")
+    occurrence: int | None = Field(None, description="Occurrence number for duplicate logical member paths", ge=1)
+
+
 class FileMetadataModel(BaseModel, DictCompatMixin):
     """Enhanced model for individual file metadata with structured validation"""
 
@@ -491,6 +512,20 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
     # Basic file information
     file_size: int | None = Field(None, description="File size in bytes", ge=0)
     file_hashes: FileHashesModel | None = Field(None, description="File hashes with validation")
+    member_file_hashes: dict[str, MemberFileIntegrityModel] = Field(
+        default_factory=dict,
+        description="Nested member integrity metadata keyed by a collision-free structured member identity",
+    )
+    member_file_hashes_total: int | None = Field(None, description="Total nested member hash records observed", ge=0)
+    member_file_hashes_truncated: bool | None = Field(
+        None,
+        description="Whether nested member hash records were omitted after the retention bound",
+    )
+    member_file_hashes_omitted: int | None = Field(
+        None,
+        description="Number of nested member hash records omitted after the retention bound",
+        ge=0,
+    )
 
     # Pickle-specific metadata
     max_stack_depth: int | None = Field(None, description="Maximum stack depth for pickle files", ge=0)
