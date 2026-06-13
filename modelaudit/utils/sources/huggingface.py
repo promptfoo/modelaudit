@@ -50,22 +50,13 @@ _HF_SAFETENSORS_STRICT_RANGE_REDIRECTS = 5
 _HF_SAFETENSORS_RANGE_ATTEMPTS = 3
 _HF_SAFETENSORS_OVERLAP_PROBE_BYTES = 64 * 1024
 _HF_SAFETENSORS_OVERLAP_TAIL_PROBE_BYTES = 128 * 1024
+_HF_SAFETENSORS_TORCH7_PROBE_BYTES = 4 * 1024
 _MAX_HF_SAFETENSORS_INDEX_BYTES = 32 * 1024 * 1024
 _MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES = 64 * 1024 * 1024
 _MAX_HF_SAFETENSORS_INDEX_TENSORS = 250_000
 _MAX_HF_SAFETENSORS_INDEX_JSON_TOKENS = (2 * _MAX_HF_SAFETENSORS_INDEX_TENSORS) + 4096
 _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS = 20
 _HF_SAFETENSORS_REMOTE_OVERLAP_REASON = "remote_safetensors_overlap_coverage_incomplete"
-_HF_SAFETENSORS_OVERLAP_SIGNATURES: tuple[tuple[str, bytes], ...] = (
-    ("zip", b"PK\x03\x04"),
-    ("zip", b"PK\x01\x02"),
-    ("zip", b"PK\x05\x06"),
-    ("zip", b"PK\x06\x06"),
-    ("zip", b"PK\x06\x07"),
-    ("zip", b"PK\x07\x08"),
-    ("compressed", b"\x1f\x8b"),
-    ("torch7", b"T7\x00\x00"),
-)
 _MAX_HF_STREAMING_ONNX_EXTERNAL_DATA_FILES = 256
 _MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES = 128
 _MAX_HF_REPOSITORY_INVENTORY_FILES = 8192
@@ -520,18 +511,50 @@ def _remote_safetensors_failure_result(
     return result
 
 
-def _remote_safetensors_overlap_scanner_ids(
+def _remote_safetensors_gzip_overlap_state(prefix: bytes, *, sample_is_prefix: bool) -> bool | None:
+    """Classify a bounded gzip candidate without accepting magic alone."""
+    if len(prefix) < 4 or prefix[:3] != b"\x1f\x8b\x08" or prefix[3] & 0xE0:
+        return False
+
+    import zlib
+
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        decompressed = decompressor.decompress(prefix, _HF_SAFETENSORS_OVERLAP_PROBE_BYTES + 1)
+    except zlib.error:
+        return False
+    if decompressor.eof or decompressor.unconsumed_tail or len(decompressed) > _HF_SAFETENSORS_OVERLAP_PROBE_BYTES:
+        return True
+    return None if sample_is_prefix else False
+
+
+def _remote_safetensors_structural_overlap_scanner_ids(
     prefix: bytes,
-    active_scanner_ids: Collection[str] | None,
+    active_scanner_ids: Collection[str],
+    *,
+    file_size: int,
+    include_pickle: bool,
 ) -> list[str]:
-    matched_scanner_ids = sorted(
-        {scanner_id for scanner_id, signature in _HF_SAFETENSORS_OVERLAP_SIGNATURES if prefix.startswith(signature)}
-    )
-    if active_scanner_ids is None:
-        return matched_scanner_ids
+    from ..file.detection import classify_safetensors_pickle_overlap_sample, find_structural_torch7_offset
 
     active = {str(scanner_id).lower() for scanner_id in active_scanner_ids}
-    return [scanner_id for scanner_id in matched_scanner_ids if scanner_id in active]
+    matched: set[str] = set()
+    if (
+        "compressed" in active
+        and _remote_safetensors_gzip_overlap_state(
+            prefix,
+            sample_is_prefix=len(prefix) < file_size,
+        )
+        is not False
+    ):
+        matched.add("compressed")
+    if "torch7" in active and find_structural_torch7_offset(prefix[:_HF_SAFETENSORS_TORCH7_PROBE_BYTES]) == 0:
+        matched.add("torch7")
+    if include_pickle and "pickle" in active:
+        pickle_state = classify_safetensors_pickle_overlap_sample(prefix, file_size=file_size)
+        if pickle_state is not False:
+            matched.add("pickle")
+    return sorted(matched)
 
 
 def _active_safetensors_overlap_scanner_ids(active_scanner_ids: Collection[str] | None) -> set[str]:
@@ -624,7 +647,7 @@ def _scan_remote_huggingface_safetensors_header(
             final_url = first_range.final_url
             validator = first_range.validator
             active_overlap_scanner_ids = _active_safetensors_overlap_scanner_ids(active_scanner_ids)
-            overlap_scanner_ids = _remote_safetensors_overlap_scanner_ids(first_range.data, active_overlap_scanner_ids)
+            overlap_scanner_ids: list[str] = []
             if 0 < header_len <= max_header_bytes and header_len <= declared_size - 8:
                 projected_bytes = total_bytes_transferred + attempt_bytes_transferred + 8 + header_len
                 if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
@@ -669,14 +692,6 @@ def _scan_remote_huggingface_safetensors_header(
                     if payload_range.validator != first_range.validator:
                         raise ValueError("Hugging Face SafeTensors object validator changed during overlap probe")
                     payload_probe = payload_range.data
-                    overlap_scanner_ids = sorted(
-                        set(overlap_scanner_ids).union(
-                            _remote_safetensors_overlap_scanner_ids(
-                                payload_probe,
-                                active_overlap_scanner_ids,
-                            )
-                        )
-                    )
                     if payload_probe.startswith(b"\x89HDF\r\n\x1a\n") and "keras_h5" in active_overlap_scanner_ids:
                         overlap_scanner_ids = sorted({*overlap_scanner_ids, "keras_h5"})
 
@@ -761,6 +776,24 @@ def _scan_remote_huggingface_safetensors_header(
                                 "Hugging Face SafeTensors object validator changed during overlap tail probe"
                             )
                         tail_probe = tail_range.data
+
+                if active_overlap_scanner_ids:
+                    frame_probe = header_payload + payload_probe
+                    structural_overlap_scanner_ids = _remote_safetensors_structural_overlap_scanner_ids(
+                        frame_probe,
+                        active_overlap_scanner_ids,
+                        file_size=declared_size,
+                        include_pickle=True,
+                    )
+                    payload_overlap_scanner_ids = _remote_safetensors_structural_overlap_scanner_ids(
+                        payload_probe,
+                        active_overlap_scanner_ids,
+                        file_size=max(0, declared_size - len(header_payload)),
+                        include_pickle=False,
+                    )
+                    overlap_scanner_ids = sorted(
+                        {*overlap_scanner_ids, *structural_overlap_scanner_ids, *payload_overlap_scanner_ids}
+                    )
 
             bytes_transferred = total_bytes_transferred + attempt_bytes_transferred
             suffix = ".safetensors" if not Path(filename).suffix else Path(filename).suffix

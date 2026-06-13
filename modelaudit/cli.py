@@ -320,6 +320,7 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
             scannable_scanner_ids=runtime.scannable_scanner_ids,
             allow_content_probes=False,
             include_all_files=runtime.hf_stream_include_all_files,
+            _stream_safetensors_headers=True,
         )
     else:
         plan = plan_huggingface_model_download(

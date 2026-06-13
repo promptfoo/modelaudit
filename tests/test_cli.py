@@ -4620,6 +4620,7 @@ def test_scan_huggingface_streaming_dry_run_uses_metadata_preview_without_downlo
     assert "Access: 1 selected file size(s) unavailable" in result.output
     mock_plan_streaming.assert_called_once()
     assert mock_plan_streaming.call_args.kwargs["allow_content_probes"] is False
+    assert mock_plan_streaming.call_args.kwargs["_stream_safetensors_headers"] is True
     mock_get_model_info.assert_called_once()
     assert mock_get_model_info.call_args.args == ("hf://test/model",)
     preview_kwargs = mock_get_model_info.call_args.kwargs
