@@ -18,6 +18,7 @@ import modelaudit_picklescan.api as picklescan_api
 import pytest
 from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches
 
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, INCONCLUSIVE_SCAN_OUTCOME, Issue
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
@@ -862,6 +863,42 @@ def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["pickle_report_status"] == "inconclusive"
     assert result.metadata["pickle_verdict"] == "suspicious"
+
+
+def test_validated_joblib_wrapper_cleanup_preserves_ambiguous_no_position_dtype_occurrences(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+        lambda _module, _name: True,
+    )
+    result = ScanResult("joblib")
+    result.metadata["analysis_incomplete"] = True
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    result.metadata["scan_outcome_message"] = "Scan analysis incomplete."
+    result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    result.metadata["pickle_report_status"] = "inconclusive"
+    result.metadata["pickle_verdict"] = "suspicious"
+    for message in ("validated dtype", "ambiguous dtype"):
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.WARNING,
+            details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype"},
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+    assert len(result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]) == 2
+
+    JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, {"numpy.dtype": frozenset({1})})
+
+    assert [check.message for check in result.checks] == ["ambiguous dtype"]
+    assert [issue.message for issue in result.issues] == ["ambiguous dtype"]
+    assert len(result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]) == 1
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["pickle_report_status"] == "inconclusive"
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
 
 
 def test_validated_joblib_wrapper_cleanup_preserves_untrusted_dtype_origin(
