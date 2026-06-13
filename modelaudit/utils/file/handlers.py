@@ -131,6 +131,31 @@ def _descriptor_path_for_open_file(file_fd: int) -> str | None:
     return None
 
 
+def _rebase_pinned_shard_result(result: "ScanResult", pinned_path: str, report_path: str) -> None:
+    """Replace transient descriptor paths in scanner-owned result fields."""
+
+    def rebase(value: Any, depth: int = 0) -> Any:
+        if depth > 8:
+            return value
+        if isinstance(value, str):
+            return value.replace(pinned_path, report_path)
+        if isinstance(value, dict):
+            return {key: rebase(item, depth + 1) for key, item in value.items()}
+        if isinstance(value, list):
+            return [rebase(item, depth + 1) for item in value]
+        if isinstance(value, tuple):
+            return tuple(rebase(item, depth + 1) for item in value)
+        return value
+
+    for records in (result.issues, result.checks):
+        for record in records:
+            if isinstance(record.location, str):
+                record.location = rebase(record.location)
+            record.message = rebase(record.message)
+            record.details = rebase(record.details)
+    result.metadata = rebase(result.metadata)
+
+
 @contextmanager
 def _pinned_windows_shard_scan_path(
     resolved_path: str,
@@ -490,25 +515,6 @@ def _summarize_missing_shard_indices(
     return missing_indices, missing_count, missing_count > len(missing_indices)
 
 
-def _is_complete_single_safetensors_shard_info(shard_info: dict[str, Any]) -> bool:
-    """Return whether shard metadata describes one complete SafeTensors shard."""
-    if (
-        shard_info.get("pattern") != SAFETENSORS_SHARD_PATTERN
-        or shard_info.get("expected_total_shards") != 1
-        or shard_info.get("total_shards") != 1
-    ):
-        return False
-    incomplete_count_keys = (
-        "missing_shard_count",
-        "unreadable_shard_count",
-        "out_of_scope_shard_count",
-        "unvalidated_shard_count",
-        "duplicate_shard_count",
-        "unexpected_shard_count",
-    )
-    return not any(shard_info.get(key, 0) for key in incomplete_count_keys)
-
-
 def _is_single_safetensors_shard_path(path: str | os.PathLike[str]) -> bool:
     """Return whether a path names the only member of a SafeTensors shard family."""
     shard_match = ShardedModelDetector.match_safetensors_shard_filename(Path(path).name)
@@ -745,20 +751,38 @@ class ShardedModelDetector:
         pattern: str,
         expected_total: int | None,
         current_file: Path,
+        index_search_root: Path,
     ) -> _SafetensorsShardIndexInventory | None:
         """Load a governing SafeTensors index inventory or captured validation error."""
         if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
             return None
 
-        for index_dir in (dir_path, *dir_path.parents):
+        try:
+            absolute_dir = Path(os.path.abspath(dir_path)).resolve(strict=True)
+            resolved_search_root = index_search_root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        normalized_search_root = _normalized_absolute_path(resolved_search_root)
+        try:
+            if os.path.commonpath([_normalized_absolute_path(absolute_dir), normalized_search_root]) != (
+                normalized_search_root
+            ):
+                return None
+        except ValueError:
+            return None
+
+        index_dir = absolute_dir
+        while True:
             index_path = index_dir / SAFETENSORS_INDEX_NAME
-            if not (index_path.exists() or index_path.is_symlink()):
-                continue
-            inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, None)
-            if inventory.error is not None:
-                return inventory
-            if cls._safetensors_inventory_governs_file(inventory, current_file, pattern, expected_total):
-                return inventory
+            if index_path.exists() or index_path.is_symlink():
+                inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, None)
+                if inventory.error is not None:
+                    return inventory
+                if cls._safetensors_inventory_governs_file(inventory, current_file, pattern, expected_total):
+                    return inventory
+            if _normalized_absolute_path(index_dir) == normalized_search_root:
+                break
+            index_dir = index_dir.parent
         return None
 
     @classmethod
@@ -768,6 +792,7 @@ class ShardedModelDetector:
         *,
         allowed_paths: list[str] | None = None,
         allowed_targets: ValidatedShardTargets | None = None,
+        index_search_root: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any] | None:
         """
         Detect if a file is part of a sharded model.
@@ -780,6 +805,9 @@ class ShardedModelDetector:
         """
         file_name = Path(file_path).name
         dir_path = Path(file_path).parent
+        effective_index_search_root = (
+            Path(index_search_root) if index_search_root is not None else Path(os.path.abspath(dir_path))
+        )
         requested_path = str(Path(file_path).absolute())
         normalized_allowed_targets = (
             {
@@ -825,6 +853,7 @@ class ShardedModelDetector:
                     pattern,
                     requested_expected_total,
                     Path(file_path),
+                    effective_index_search_root,
                 )
                 if index_inventory is not None:
                     shard_info["safetensors_index_path"] = str(index_inventory.index_path)
@@ -1718,11 +1747,14 @@ class ParallelShardHandler:
                 isinstance(self.scanner_config, dict)
                 and self.scanner_config.get(_SHARD_ALREADY_PINNED_CONFIG_KEY) is True
             )
-            if validated_target is None or already_pinned:
+            if validated_target is None:
                 result: ScanResult = scanner.scan(scan_path)
+            elif already_pinned:
+                result = scanner.scan(shard_path)
             else:
                 with _pinned_shard_scan_path(scan_path, validated_target) as pinned_scan:
                     result = scanner.scan(pinned_scan.path)
+                    _rebase_pinned_shard_result(result, pinned_scan.path, shard_path)
         except _ShardPinUnavailableError as error:
             result = ScanResult(scanner_name=getattr(scanner, "name", "shard_scanner"))
             _mark_inconclusive_scan_outcome(result, "shard_pin_unavailable")
@@ -1785,6 +1817,7 @@ class AdvancedFileHandler:
         timeout: int = 7200,  # 2 hours for large models
         allowed_shard_paths: list[str] | None = None,
         allowed_shard_targets: ValidatedShardTargets | None = None,
+        index_search_root: str | os.PathLike[str] | None = None,
     ):
         """
         Initialize advanced file handler.
@@ -1807,6 +1840,7 @@ class AdvancedFileHandler:
         self.uses_prevalidated_shard_info = isinstance(prevalidated_shard_info, dict)
         self.allowed_shard_paths = allowed_shard_paths
         self.allowed_shard_targets = allowed_shard_targets
+        self.index_search_root = index_search_root
         self.shard_boundary_error = _grouped_shard_boundary_error(
             file_path,
             allowed_shard_paths,
@@ -1824,15 +1858,11 @@ class AdvancedFileHandler:
                     file_path,
                     allowed_paths=allowed_shard_paths,
                     allowed_targets=allowed_shard_targets,
+                    index_search_root=index_search_root,
                 )
             )
         )
-        self.shard_info = (
-            None
-            if self.detected_shard_info is not None
-            and _is_complete_single_safetensors_shard_info(self.detected_shard_info)
-            else self.detected_shard_info
-        )
+        self.shard_info = self.detected_shard_info
 
         # Get file/model size
         if self.shard_boundary_error is not None:
@@ -1875,6 +1905,7 @@ class AdvancedFileHandler:
                 self.file_path,
                 allowed_paths=self.allowed_shard_paths,
                 allowed_targets=self.allowed_shard_targets,
+                index_search_root=self.index_search_root,
             )
             if current_shard_info != self.detected_shard_info:
                 return _preserve_findings_with_shard_boundary_failure(
@@ -2191,6 +2222,7 @@ def should_use_advanced_handler(
     *,
     allowed_shard_paths: list[str] | None = None,
     allowed_shard_targets: ValidatedShardTargets | None = None,
+    index_search_root: str | os.PathLike[str] | None = None,
 ) -> bool:
     """
     Check if file should use advanced file handler.
@@ -2210,6 +2242,7 @@ def should_use_advanced_handler(
         file_path,
         allowed_paths=allowed_shard_paths,
         allowed_targets=allowed_shard_targets,
+        index_search_root=index_search_root,
     ):
         return True
 
@@ -2228,6 +2261,7 @@ def scan_advanced_large_file(
     timeout: int = 7200,
     allowed_shard_paths: list[str] | None = None,
     allowed_shard_targets: ValidatedShardTargets | None = None,
+    index_search_root: str | os.PathLike[str] | None = None,
 ) -> "ScanResult":
     """
     Scan a large file with advanced handler.
@@ -2261,6 +2295,7 @@ def scan_advanced_large_file(
             file_path,
             allowed_paths=allowed_shard_paths,
             allowed_targets=allowed_shard_targets,
+            index_search_root=index_search_root,
         )
     )
     if shard_info is not None and not _supports_reliable_shard_cache_identity():
@@ -2272,6 +2307,7 @@ def scan_advanced_large_file(
             timeout,
             allowed_shard_paths=allowed_shard_paths,
             allowed_shard_targets=allowed_shard_targets,
+            index_search_root=index_search_root,
         )
 
     # If caching is disabled, proceed with direct scan
@@ -2283,6 +2319,7 @@ def scan_advanced_large_file(
             timeout,
             allowed_shard_paths=allowed_shard_paths,
             allowed_shard_targets=allowed_shard_targets,
+            index_search_root=index_search_root,
         )
     if should_bypass_cache_for_zip_entry_preflight(file_path, config):
         logger.debug(f"Bypassing advanced-file cache for bounded ZIP entry preflight: {file_path}")
@@ -2293,6 +2330,7 @@ def scan_advanced_large_file(
             timeout,
             allowed_shard_paths=allowed_shard_paths,
             allowed_shard_targets=allowed_shard_targets,
+            index_search_root=index_search_root,
         )
     if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
         logger.debug(f"Bypassing advanced-file cache because HDF5 analysis is unavailable: {file_path}")
@@ -2303,6 +2341,7 @@ def scan_advanced_large_file(
             timeout,
             allowed_shard_paths=allowed_shard_paths,
             allowed_shard_targets=allowed_shard_targets,
+            index_search_root=index_search_root,
         )
 
     # Use cache manager for advanced large file scans
@@ -2331,6 +2370,7 @@ def scan_advanced_large_file(
                     timeout,
                     allowed_shard_paths=allowed_shard_paths,
                     allowed_shard_targets=allowed_shard_targets,
+                    index_search_root=index_search_root,
                 )
             if shard_family_fingerprint is not None:
                 version_config["advanced_shard_family_cache_fingerprint"] = shard_family_fingerprint
@@ -2346,6 +2386,7 @@ def scan_advanced_large_file(
                     timeout,
                     allowed_shard_paths=allowed_shard_paths,
                     allowed_shard_targets=allowed_shard_targets,
+                    index_search_root=index_search_root,
                 )
             version_config["advanced_shard_model_config_cache_fingerprint"] = model_config_fingerprint
         if allowed_shard_paths is not None:
@@ -2353,6 +2394,8 @@ def scan_advanced_large_file(
             version_config["advanced_allowed_shard_paths"] = sorted(
                 {str(Path(path).resolve()) for path in allowed_shard_paths}
             )
+        if index_search_root is not None:
+            version_config["advanced_shard_index_search_root"] = _normalized_absolute_path(index_search_root)
         version_context = add_optional_dependency_availability_to_version_context(
             build_cache_version_context(version_config)
         )
@@ -2366,11 +2409,13 @@ def scan_advanced_large_file(
                 timeout,
                 allowed_shard_paths=allowed_shard_paths,
                 allowed_shard_targets=allowed_shard_targets,
+                index_search_root=index_search_root,
             )
             current_shard_info = ShardedModelDetector.detect_shards(
                 file_path,
                 allowed_paths=allowed_shard_paths,
                 allowed_targets=allowed_shard_targets,
+                index_search_root=index_search_root,
             )
             if current_shard_info != shard_info:
                 result = _preserve_findings_with_shard_boundary_failure(
@@ -2408,6 +2453,7 @@ def scan_advanced_large_file(
             file_path,
             allowed_paths=allowed_shard_paths,
             allowed_targets=allowed_shard_targets,
+            index_search_root=index_search_root,
         )
         if post_scan_shard_info != shard_info:
             return _preserve_findings_with_shard_boundary_failure(
@@ -2441,6 +2487,7 @@ def scan_advanced_large_file(
             timeout,
             allowed_shard_paths=allowed_shard_paths,
             allowed_shard_targets=allowed_shard_targets,
+            index_search_root=index_search_root,
         )
 
 
@@ -2451,6 +2498,7 @@ def _scan_advanced_large_file_internal(
     timeout: int = 7200,
     allowed_shard_paths: list[str] | None = None,
     allowed_shard_targets: ValidatedShardTargets | None = None,
+    index_search_root: str | os.PathLike[str] | None = None,
 ) -> "ScanResult":
     """
     Internal implementation of advanced large file scanning (cache-agnostic).
@@ -2471,5 +2519,6 @@ def _scan_advanced_large_file_internal(
         timeout,
         allowed_shard_paths=allowed_shard_paths,
         allowed_shard_targets=allowed_shard_targets,
+        index_search_root=index_search_root,
     )
     return handler.scan()

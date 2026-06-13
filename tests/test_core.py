@@ -3056,6 +3056,67 @@ def test_directory_scan_groups_hf_cache_sharded_symlinks(
 
 
 @pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_groups_indexed_hf_shards_across_nested_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trusted snapshot index may group nested aliases that share the same blobs root."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+
+    shard_links: list[Path] = []
+    blob_paths: list[Path] = []
+    for nested_dir, shard_index in (("a", 0), ("b", 1)):
+        blob_path = blobs_dir / f"blob-{shard_index}"
+        blob_path.write_bytes(f"hf-shard-{shard_index}".encode())
+        shard_link = snapshot / nested_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_link.parent.mkdir()
+        shard_link.symlink_to(Path("../../../blobs") / blob_path.name)
+        shard_links.append(shard_link)
+        blob_paths.append(blob_path.resolve())
+    (snapshot / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    f"tensor_{index}": shard.relative_to(snapshot).as_posix() for index, shard in enumerate(shard_links)
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    shard_calls: list[str] = []
+    shard_configs: list[dict[str, Any]] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        if path.endswith(".safetensors"):
+            shard_calls.append(path)
+            shard_configs.append(dict(config or {}))
+            return _mock_sharded_scan_result(sum(blob.stat().st_size for blob in blob_paths))
+        result = ScanResult(scanner_name="manifest")
+        result.bytes_scanned = Path(path).stat().st_size
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    fingerprint = normalize_material_scan_config(shard_configs[0])[
+        core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY
+    ]
+    assert len(shard_calls) == 1
+    assert {member["path"] for member in fingerprint["members"]} == {str(blob) for blob in blob_paths}
+    assert result.success is True
+    assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
 def test_directory_scan_does_not_reresolve_trusted_hf_alias(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3587,12 +3648,14 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
         *,
         allowed_shard_paths: list[str] | None = None,
         allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+        index_search_root: str | os.PathLike[str] | None = None,
     ) -> ScanResult:
         assert path == str(shard)
         assert progress_callback is None
         assert timeout == 7200
         captured_allowed_paths.append(allowed_shard_paths)
         captured_allowed_targets.append(allowed_shard_targets)
+        assert index_search_root == str(tmp_path)
         assert core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY not in scanner.config
         result = ScanResult(scanner_name=scanner.name)
         result.bytes_scanned = shard.stat().st_size
@@ -3604,9 +3667,11 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
         *,
         allowed_shard_paths: list[str] | None = None,
         allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+        index_search_root: str | os.PathLike[str] | None = None,
     ) -> bool:
         captured_selection_allowed_paths.append(allowed_shard_paths)
         captured_allowed_targets.append(allowed_shard_targets)
+        assert index_search_root == str(tmp_path)
         return path == str(shard)
 
     monkeypatch.setattr(core_module, "should_use_advanced_handler", fake_should_use_advanced_handler)
@@ -3618,6 +3683,7 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
         str(shard),
         config={
             "cache_scan_results": False,
+            core_module.REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(tmp_path),
             core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
                 "members": [
                     {
@@ -4047,6 +4113,7 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
         *,
         allowed_shard_paths: list[str] | None = None,
         allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+        index_search_root: str | os.PathLike[str] | None = None,
     ) -> ScanResult:
         assert path == str(shard)
         assert scanner.name == "dummy_preferred"
@@ -4054,6 +4121,7 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
         assert timeout == 7200
         captured_allowed_paths.append(allowed_shard_paths)
         captured_allowed_targets.append(allowed_shard_targets)
+        assert index_search_root == str(tmp_path)
         assert core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY not in scanner.config
         result = ScanResult(scanner_name=scanner.name)
         result.bytes_scanned = shard.stat().st_size
@@ -4065,9 +4133,11 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
         *,
         allowed_shard_paths: list[str] | None = None,
         allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+        index_search_root: str | os.PathLike[str] | None = None,
     ) -> bool:
         captured_selection_allowed_paths.append(allowed_shard_paths)
         captured_allowed_targets.append(allowed_shard_targets)
+        assert index_search_root == str(tmp_path)
         return path == str(shard)
 
     monkeypatch.setattr(core_module, "should_use_advanced_handler", fake_should_use_advanced_handler)
@@ -4084,6 +4154,7 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
         str(shard),
         config={
             "cache_scan_results": False,
+            core_module.REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(tmp_path),
             core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
                 "members": [
                     {
@@ -9670,12 +9741,14 @@ def test_scan_file_disables_advanced_cache_for_unavailable_keras_fallback(
         *,
         allowed_shard_paths: list[str] | None = None,
         allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+        index_search_root: str | os.PathLike[str] | None = None,
     ) -> ScanResult:
         assert path == str(disguised_keras)
         assert progress_callback is None
         assert timeout == 7200
         assert allowed_shard_paths is None
         assert allowed_shard_targets is None
+        assert index_search_root is None
         assert scanner.config["cache_enabled"] is False
         return scanner.scan(path)
 
@@ -9686,9 +9759,11 @@ def test_scan_file_disables_advanced_cache_for_unavailable_keras_fallback(
         *,
         allowed_shard_paths: list[str] | None = None,
         allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+        index_search_root: str | os.PathLike[str] | None = None,
     ) -> bool:
         assert allowed_shard_paths is None
         assert allowed_shard_targets is None
+        assert index_search_root is None
         return True
 
     monkeypatch.setattr(core_module, "should_use_advanced_handler", always_use_advanced_handler)
@@ -16492,6 +16567,44 @@ def test_selected_safetensors_overlap_single_shard_preserves_missing_family_cove
     assert determine_exit_code(result) == 2
     assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
     assert any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+
+
+def test_size_only_advanced_handler_does_not_bypass_inconclusive_pickle_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-sharded large-file route must retain fail-closed pickle ownership."""
+    ambiguous = tmp_path / "ambiguous.pkl"
+    ambiguous.write_bytes(b"not enough bounded evidence")
+
+    monkeypatch.setattr("modelaudit.core.should_use_advanced_handler", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        "modelaudit.core.ShardedModelDetector.detect_shards",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "modelaudit.core.detect_file_format",
+        lambda _path: file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+    )
+    monkeypatch.setattr(
+        "modelaudit.core.detect_file_format_from_magic",
+        lambda _path: file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+    )
+
+    direct = scan_file(
+        str(ambiguous),
+        config={"cache_enabled": False, "scanners": ["text"]},
+    )
+    aggregate = scan_model_directory_or_file(
+        str(ambiguous),
+        cache_enabled=False,
+        scanners=["text"],
+    )
+
+    assert direct.success is False
+    assert direct.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+    assert "pickle_routing_incomplete" in direct.metadata["scan_outcome_reasons"]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_directory_child_probe_stops_at_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

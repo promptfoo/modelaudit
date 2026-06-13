@@ -858,6 +858,7 @@ class TestModelDownload:
 
         result = download_model(
             "https://huggingface.co/test/model",
+            cache_dir=tmp_path / "cache",
             scannable_extensions={".onnx"},
             scannable_scanner_ids={"onnx"},
         )
@@ -866,17 +867,150 @@ class TestModelDownload:
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.onnx"]
         mock_requests_get.assert_not_called()
 
-    def test_download_model_filtered_cache_removes_stale_unselected_files(self, tmp_path: Path) -> None:
+    def test_download_model_filtered_cache_isolates_stale_unselected_files(self, tmp_path: Path) -> None:
         """A filtered persistent snapshot must not expose files from an earlier broader download."""
         cache_dir = tmp_path / "cache"
-        download_path = cache_dir / "huggingface" / "test" / "model"
-        download_path.mkdir(parents=True)
-        stale = download_path / "stale.safetensors"
+        broad_download_path = cache_dir / "huggingface" / "test" / "model"
+        broad_download_path.mkdir(parents=True)
+        stale = broad_download_path / "stale.safetensors"
         stale.write_bytes(b"stale")
 
         def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
             local_path = Path(local_dir)
-            assert not stale.exists()
+            assert local_path != broad_download_path
+            assert not (local_path / stale.name).exists()
+            (local_path / "model.onnx").write_bytes(b"onnx")
+            return str(local_path)
+
+        def disk_space_side_effect(path: Path, required_size: int) -> tuple[bool, str]:
+            assert path != broad_download_path
+            assert required_size == 4
+            return True, ""
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.onnx": 4}, _HF_TEST_REVISION),
+            ),
+            patch("modelaudit.utils.sources.huggingface.check_disk_space", side_effect=disk_space_side_effect),
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect),
+        ):
+            result = download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert result != broad_download_path
+        assert stale.exists()
+        assert (result / "model.onnx").is_file()
+        assert {path.name for path in result.iterdir()} == {"model.onnx"}
+
+    def test_download_model_filtered_cache_preserves_symlink_target_on_failure(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A filtered failure must not delete a pre-existing repository-cache symlink target."""
+        del requires_symlinks
+        cache_dir = tmp_path / "cache"
+        cache_root = cache_dir / "huggingface"
+        repository_path = cache_root / "test" / "model"
+        repository_path.parent.mkdir(parents=True)
+        legacy_target = tmp_path / "outside-legacy-cache"
+        legacy_target.mkdir()
+        repository_path.symlink_to(legacy_target, target_is_directory=True)
+        sentinel = legacy_target / "other-model.bin"
+        sentinel.write_bytes(b"keep")
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({}, _HF_TEST_REVISION),
+            ),
+            patch("huggingface_hub.snapshot_download", side_effect=RuntimeError("download failed")),
+            pytest.raises(Exception, match="download failed"),
+        ):
+            download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert repository_path.is_symlink()
+        assert sentinel.read_bytes() == b"keep"
+
+    def test_download_model_filtered_default_cache_uses_selection_directory(self, tmp_path: Path) -> None:
+        """Default-cache filtering must not expose stale files from a broader snapshot."""
+        cache_root = tmp_path / "hf-cache" / "hub"
+        stale_snapshot = cache_root / "models--test--model" / "snapshots" / _HF_TEST_REVISION
+        stale_snapshot.mkdir(parents=True)
+        stale = stale_snapshot / "stale.pkl"
+        stale.write_bytes(b"stale")
+
+        def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
+            local_path = Path(local_dir)
+            assert local_path != stale_snapshot
+            (local_path / "model.onnx").write_bytes(b"onnx")
+            return str(local_path)
+
+        with (
+            patch("modelaudit.utils.sources.huggingface._get_hf_cache_root", return_value=cache_root),
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.onnx": 4}, _HF_TEST_REVISION),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface.check_disk_space",
+                return_value=(True, "sufficient selected space"),
+            ) as mock_check_disk_space,
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect) as mock_snapshot_download,
+        ):
+            result = download_model(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+            other_policy_result = download_model(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"safetensors"},
+            )
+
+        assert result.parent == cache_root / ".modelaudit-selections" / "test" / "model"
+        assert other_policy_result.parent == result.parent
+        assert other_policy_result != result
+        assert [item.kwargs["local_dir"] for item in mock_snapshot_download.call_args_list] == [
+            str(result),
+            str(other_policy_result),
+        ]
+        assert {path.name for path in result.iterdir()} == {"model.onnx"}
+        assert {path.name for path in other_policy_result.iterdir()} == {"model.onnx"}
+        assert stale.read_bytes() == b"stale"
+        assert [call.args[1] for call in mock_check_disk_space.call_args_list] == [4, 4]
+
+    def test_download_model_filtered_rejects_stale_selection_files(self, tmp_path: Path) -> None:
+        """A reused filtered directory must fail closed if it contains an unselected file."""
+
+        def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
+            local_path = Path(local_dir)
             (local_path / "model.onnx").write_bytes(b"onnx")
             return str(local_path)
 
@@ -887,20 +1021,32 @@ class TestModelDownload:
             ),
             patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
             patch(
-                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes", return_value=({}, _HF_TEST_REVISION)
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.onnx": 4}, _HF_TEST_REVISION),
             ),
-            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect),
+            patch(
+                "modelaudit.utils.sources.huggingface.check_disk_space",
+                return_value=(True, "sufficient selected space"),
+            ) as mock_check_disk_space,
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect) as mock_snapshot_download,
         ):
             result = download_model(
                 "https://huggingface.co/test/model",
-                cache_dir=cache_dir,
+                cache_dir=tmp_path / "cache",
                 scannable_extensions={".onnx"},
                 scannable_scanner_ids={"onnx"},
             )
+            (result / "stale.pkl").write_bytes(b"stale")
+            with pytest.raises(Exception, match=r"snapshot included 1 unselected file\(s\)"):
+                download_model(
+                    "https://huggingface.co/test/model",
+                    cache_dir=tmp_path / "cache",
+                    scannable_extensions={".onnx"},
+                    scannable_scanner_ids={"onnx"},
+                )
 
-        assert result == download_path
-        assert not stale.exists()
-        assert (download_path / "model.onnx").is_file()
+        assert all(call.kwargs["force_download"] is True for call in mock_snapshot_download.call_args_list)
+        assert [call.args[1] for call in mock_check_disk_space.call_args_list] == [4, 4]
 
     def test_download_model_filtered_onnx_includes_external_data(self, tmp_path: Path) -> None:
         """A filtered standard ONNX snapshot must materialize declared external-data companions."""
@@ -941,6 +1087,104 @@ class TestModelDownload:
         assert snapshot_calls == [["model.onnx"], ["model.onnx", "weights/model.onnx_data"]]
         assert (result / "weights" / "model.onnx_data").read_bytes() == b"weights"
 
+    def test_download_model_filtered_content_routed_onnx_includes_external_data(self, tmp_path: Path) -> None:
+        """A renamed ONNX model must retain its declared external-data companions."""
+        repo_files = ["renamed.bin", "weights/model.onnx_data"]
+        snapshot_calls: list[list[str]] = []
+
+        def remote_route_side_effect(_repo_id: str, filename: str, *_args: object, **_kwargs: object) -> str | None:
+            return "onnx" if filename == "renamed.bin" else None
+
+        def snapshot_side_effect(*, local_dir: str, allow_patterns: list[str], **_kwargs: object) -> str:
+            snapshot_calls.append(allow_patterns)
+            local_path = Path(local_dir)
+            for filename in allow_patterns:
+                path = local_path / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"onnx" if filename == "renamed.bin" else b"weights")
+            return str(local_path)
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                side_effect=remote_route_side_effect,
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface.detect_file_format_for_skip_filter",
+                return_value="onnx",
+            ) as mock_detect_local,
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes", return_value=({}, _HF_TEST_REVISION)
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._discover_hf_onnx_external_data_files",
+                return_value=["weights/model.onnx_data"],
+            ),
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect),
+        ):
+            result = download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "cache",
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert snapshot_calls == [["renamed.bin"], ["renamed.bin", "weights/model.onnx_data"]]
+        mock_detect_local.assert_called_once_with(str(result / "renamed.bin"))
+        assert (result / "weights" / "model.onnx_data").read_bytes() == b"weights"
+
+    def test_download_model_filtered_onnx_preflights_external_data_disk_space(self, tmp_path: Path) -> None:
+        """Declared ONNX sidecars must pass disk preflight before the second snapshot."""
+        repo_files = ["model.onnx", "weights/model.onnx_data"]
+
+        def size_side_effect(
+            _repo_id: str,
+            filenames: list[str],
+            **_kwargs: object,
+        ) -> tuple[dict[str, int], str]:
+            sizes = {"model.onnx": 10, "weights/model.onnx_data": 1_000}
+            return {filename: sizes[filename] for filename in filenames}, _HF_TEST_REVISION
+
+        def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
+            local_path = Path(local_dir)
+            (local_path / "model.onnx").write_bytes(b"onnx")
+            return str(local_path)
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                side_effect=size_side_effect,
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._discover_hf_onnx_external_data_files",
+                return_value=["weights/model.onnx_data"],
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface.check_disk_space",
+                side_effect=[(True, "enough for graph"), (False, "sidecar does not fit")],
+            ) as mock_check_disk_space,
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect) as mock_snapshot_download,
+            pytest.raises(Exception, match="sidecar does not fit"),
+        ):
+            download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "cache",
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert [call.args[1] for call in mock_check_disk_space.call_args_list] == [10, 1_000]
+        mock_snapshot_download.assert_called_once()
+
     def test_download_model_pickle_selection_probes_safetensors_suffix(
         self,
         tmp_path: Path,
@@ -973,6 +1217,7 @@ class TestModelDownload:
         ):
             result = download_model(
                 "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "cache",
                 scannable_extensions={".pkl", ".pickle"},
                 scannable_scanner_ids={"pickle"},
             )
@@ -7851,7 +8096,12 @@ class TestModelSizeAndDiskSpace:
         assert result == download_path
         mock_repo_size.assert_not_called()
         assert mock_get_sizes.call_args.args[1] == ["model.onnx"]
-        mock_check_disk_space.assert_called_once_with(tmp_path / "cache" / "huggingface" / "test" / "model", 100)
+        mock_check_disk_space.assert_called_once()
+        disk_check_path, required_size = mock_check_disk_space.call_args.args
+        assert required_size == 100
+        assert Path(disk_check_path).parent == (
+            tmp_path / "cache" / "huggingface" / ".modelaudit-selections" / "test" / "model"
+        )
 
 
 class TestGetModelInfo:

@@ -132,7 +132,6 @@ from modelaudit.utils.file.handlers import (
     ShardedModelDetector,
     ValidatedShardTargets,
     _count_expected_shard_indices,
-    _is_complete_single_safetensors_shard_info,
     _is_single_safetensors_shard_path,
     _pinned_shard_scan_path,
     _preserve_findings_with_shard_boundary_failure,
@@ -552,16 +551,6 @@ _TRUSTED_STREAM_SHARD_PARENT_PREFIXES = (
     "modelaudit_stream_",
 )
 _TRUSTED_STREAM_SHARD_ROOT_TOKEN = object()
-
-
-@dataclass(frozen=True)
-class _UnexpectedValidatedShardFamily:
-    """Validated streamed shards that cannot describe one expected family."""
-
-    location: str
-    sources: tuple[str, ...]
-    unexpected_sources: tuple[str, ...]
-    expected_total: int
 
 
 @dataclass(frozen=True)
@@ -1622,13 +1611,23 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
     return complete_sources
 
 
-def _unexpected_validated_shard_families(
+def _record_unexpected_validated_shard_families(
+    results: ModelAuditResultModel,
     validated_targets: ValidatedShardTargets,
-) -> list[_UnexpectedValidatedShardFamily]:
-    """Return trusted shard families with indices or multiplicities outside one expected base."""
-    grouped_targets = _group_validated_shard_family_targets(validated_targets)
+) -> bool:
+    """Persist explicit incomplete outcomes for invalid validated shard families."""
+    from .models import FileMetadataModel
 
-    unexpected_families: list[_UnexpectedValidatedShardFamily] = []
+    grouped_targets = _group_validated_shard_family_targets(validated_targets)
+    existing_locations = {
+        os.path.normcase(os.path.normpath(os.path.abspath(check.location)))
+        for check in results.checks
+        if check.name == "Sharded Model Coverage Check"
+        and isinstance(check.location, str)
+        and isinstance(check.details, dict)
+        and check.details.get("scan_outcome_reason") == "unexpected_model_shards"
+    }
+    recorded = False
     seen_locations: set[str] = set()
     for (pattern, expected_total, _family_scope), targets_by_index in grouped_targets.items():
         expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(
@@ -1653,54 +1652,22 @@ def _unexpected_validated_shard_families(
         if normalized_location in seen_locations:
             continue
         seen_locations.add(normalized_location)
-        unexpected_families.append(
-            _UnexpectedValidatedShardFamily(
-                location=location,
-                sources=sources,
-                unexpected_sources=unexpected_sources,
-                expected_total=expected_total,
-            )
-        )
-    return unexpected_families
-
-
-def _record_unexpected_validated_shard_families(
-    results: ModelAuditResultModel,
-    unexpected_families: list[_UnexpectedValidatedShardFamily],
-) -> bool:
-    """Persist explicit incomplete outcomes for invalid validated shard families."""
-    if not unexpected_families:
-        return False
-
-    from .models import FileMetadataModel
-
-    existing_locations = {
-        os.path.normcase(os.path.normpath(os.path.abspath(check.location)))
-        for check in results.checks
-        if check.name == "Sharded Model Coverage Check"
-        and isinstance(check.location, str)
-        and isinstance(check.details, dict)
-        and check.details.get("scan_outcome_reason") == "unexpected_model_shards"
-    }
-    recorded = False
-    for family in unexpected_families:
-        normalized_location = os.path.normcase(os.path.normpath(os.path.abspath(family.location)))
         if normalized_location not in existing_locations:
             results.checks.append(
                 Check(
                     name="Sharded Model Coverage Check",
                     status=CheckStatus.FAILED,
                     message=(
-                        f"Found {len(family.unexpected_sources)} model shard(s) outside the expected family inventory; "
+                        f"Found {len(unexpected_sources)} model shard(s) outside the expected family inventory; "
                         "scan coverage is incomplete."
                     ),
                     severity=IssueSeverity.INFO,
-                    location=family.location,
+                    location=location,
                     details={
-                        "expected_total_shards": family.expected_total,
-                        "present_total_shards": len(family.sources),
-                        "unexpected_shard_count": len(family.unexpected_sources),
-                        "unexpected_shards": list(family.unexpected_sources),
+                        "expected_total_shards": expected_total,
+                        "present_total_shards": len(sources),
+                        "unexpected_shard_count": len(unexpected_sources),
+                        "unexpected_shards": list(unexpected_sources),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "unexpected_model_shards",
@@ -1709,7 +1676,7 @@ def _record_unexpected_validated_shard_families(
             )
             existing_locations.add(normalized_location)
             recorded = True
-        for source_path in family.sources:
+        for source_path in sources:
             metadata = (
                 results.file_metadata[source_path].model_dump(mode="python")
                 if source_path in results.file_metadata
@@ -1928,7 +1895,7 @@ def _reconcile_cross_directory_shard_coverage(
     """Remove missing-shard outcomes, clearing errors only with explicit ownership proof."""
     recorded_unexpected = _record_unexpected_validated_shard_families(
         results,
-        _unexpected_validated_shard_families(validated_targets),
+        validated_targets,
     )
     complete_sources = _complete_validated_shard_family_sources(validated_targets)
     if not complete_sources:
@@ -2119,6 +2086,12 @@ def _validated_shard_targets_from_config(config: dict[str, Any]) -> ValidatedSha
     return targets or None
 
 
+def _shard_index_search_root_from_config(config: dict[str, Any]) -> str | None:
+    """Return the explicit repository boundary for ancestor shard-index lookup."""
+    root = config.get(REPOSITORY_SCAN_ROOT_CONFIG_KEY)
+    return root if isinstance(root, str) and root.strip() else None
+
+
 def _grouped_shard_boundary_error(
     path: str,
     allowed_paths: list[str],
@@ -2201,11 +2174,13 @@ def _grouped_shard_boundary_error(
     return None
 
 
-def _allowed_hf_shard_alias_paths(shard_path: str, base_dir: Path, hf_cache_root: Path) -> list[str]:
-    """Return shard siblings resolving inside the scan root or the same HF cache blobs directory."""
+def _allowed_hf_shard_alias_paths(base_dir: Path, hf_cache_root: Path) -> list[str]:
+    """Return snapshot shards resolving inside the scan root or its trusted blobs directory."""
     allowed_paths: list[str] = []
     blobs_root = _trusted_hf_blobs_root(hf_cache_root)
-    for candidate_path in Path(shard_path).parent.glob("*"):
+    for candidate_path in base_dir.rglob("*.safetensors"):
+        if ShardedModelDetector.match_safetensors_shard_filename(candidate_path.name) is None:
+            continue
         with suppress(OSError, RuntimeError):
             resolved_candidate = candidate_path.resolve(strict=True)
             resolved_candidate_path = str(resolved_candidate)
@@ -3785,6 +3760,7 @@ def scan_model_directory_or_file(
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
             shard_family_targets: dict[_ShardFamilyKey, ValidatedShardTargets] = {}
             complete_hf_shard_families: set[_ShardFamilyKey] = set()
+            trusted_hf_shard_paths: list[str] | None = None
             dvc_directory_output_owners: list[tuple[Path, str]] = []
             pending_dvc_output_limit_checks: list[tuple[str, DvcResolution]] = []
             directory_coverage_gaps: dict[tuple[str, str], set[str]] = {}
@@ -4218,14 +4194,15 @@ def scan_model_directory_or_file(
                                 and hf_cache_root is not None
                                 and _path_has_part(Path(target_str), "snapshots")
                             )
-                            allowed_hf_shard_paths = (
-                                _allowed_hf_shard_alias_paths(target_str, base_dir, hf_cache_root)
-                                if shard_is_in_hf_snapshot and hf_cache_root is not None
-                                else None
-                            )
+                            allowed_hf_shard_paths = None
+                            if shard_is_in_hf_snapshot and hf_cache_root is not None:
+                                if trusted_hf_shard_paths is None:
+                                    trusted_hf_shard_paths = _allowed_hf_shard_alias_paths(base_dir, hf_cache_root)
+                                allowed_hf_shard_paths = trusted_hf_shard_paths
                             shard_info = ShardedModelDetector.detect_shards(
                                 target_str,
                                 allowed_paths=allowed_hf_shard_paths,
+                                index_search_root=base_dir,
                             )
                             if shard_info is not None and not shard_info.get("safetensors_index_error"):
                                 governing_index = shard_info.get("safetensors_index_path")
@@ -4247,11 +4224,6 @@ def scan_model_directory_or_file(
                                 if shard_info is None:
                                     family_paths.add(target_str)
                                 else:
-                                    if _is_complete_single_safetensors_shard_info(shard_info):
-                                        shard_family_representatives.pop(shard_family_key, None)
-                                        shard_family_paths.pop(shard_family_key, None)
-                                        files_to_scan.append(target_str)
-                                        continue
                                     validated_targets: ValidatedShardTargets = {}
                                     detected_targets = shard_info.get("shard_targets")
                                     expected_total_shards = shard_info.get("expected_total_shards")
@@ -6258,6 +6230,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     allowed_shard_paths = _allowed_shard_paths_from_config(config)
     allowed_shard_targets = _validated_shard_targets_from_config(config)
+    index_search_root = _shard_index_search_root_from_config(config)
     if allowed_shard_paths is not None:
         boundary_error = _grouped_shard_boundary_error(path, allowed_shard_paths, allowed_shard_targets)
         if boundary_error is not None:
@@ -6353,6 +6326,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         path,
         allowed_shard_paths=allowed_shard_paths,
         allowed_shard_targets=allowed_shard_targets,
+        index_search_root=index_search_root,
     )
 
     # Check file size limit only if NOT using extreme handler
@@ -6531,6 +6505,21 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
 
+    pickle_routing_inconclusive = (
+        header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    )
+    pickle_overlap_uses_shard_handler = (
+        pickle_routing_inconclusive
+        and use_extreme_handler
+        and ShardedModelDetector.detect_shards(
+            path,
+            allowed_paths=allowed_shard_paths,
+            allowed_targets=allowed_shard_targets,
+            index_search_root=index_search_root,
+        )
+        is not None
+    )
+
     # Validate file type consistency as a security check
     if header_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_llamafile_routing_result(path, config)
@@ -6580,9 +6569,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
-    if (
-        header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    ) and not use_extreme_handler:
+    if pickle_routing_inconclusive and not pickle_overlap_uses_shard_handler:
         selected_safetensors_result = _scan_selected_safetensors_overlap(
             path,
             config,
@@ -6639,8 +6626,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         # user-block prefix that resembles another format.
         file_type_valid = True
     elif (
-        use_extreme_handler
-        and (header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT)
+        pickle_overlap_uses_shard_handler
         and "safetensors" in safetensors_overlap_scanner_ids
         and scanner_selection.active
         and scanner_selection.allows("safetensors")
@@ -6782,6 +6768,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     timeout * 2,
                     allowed_shard_paths=allowed_shard_paths,
                     allowed_shard_targets=allowed_shard_targets,
+                    index_search_root=index_search_root,
                 )  # Double timeout for extreme files
             elif use_large_handler:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
@@ -6854,6 +6841,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         timeout * 2,
                         allowed_shard_paths=allowed_shard_paths,
                         allowed_shard_targets=allowed_shard_targets,
+                        index_search_root=index_search_root,
                     )  # Double timeout for extreme files
                 elif use_large_handler:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
@@ -7442,6 +7430,8 @@ def scan_model_streaming(
         )
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
+    configured_index_search_root = _shard_index_search_root_from_config(scan_kwargs)
+    stream_index_search_root = configured_index_search_root or (str(base_dir) if base_dir is not None else None)
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
     scanner_selection_skip_extensions = (
@@ -7670,7 +7660,12 @@ def scan_model_streaming(
                 }
                 is_single_safetensors_stream = _is_single_safetensors_shard_path(source_path)
                 single_source_shard_info = (
-                    ShardedModelDetector.detect_shards(str(source_path)) if is_single_safetensors_stream else None
+                    ShardedModelDetector.detect_shards(
+                        str(source_path),
+                        index_search_root=stream_index_search_root,
+                    )
+                    if is_single_safetensors_stream
+                    else None
                 )
                 scan_repository_inventory_context = streaming_repository_inventory_context()
                 if scan_repository_inventory_context.files:
@@ -7814,7 +7809,10 @@ def scan_model_streaming(
                     config=scan_config,
                 )
                 if is_single_safetensors_stream and single_source_shard_info is not None:
-                    post_scan_single_shard_info = ShardedModelDetector.detect_shards(str(source_path))
+                    post_scan_single_shard_info = ShardedModelDetector.detect_shards(
+                        str(source_path),
+                        index_search_root=stream_index_search_root,
+                    )
                     if post_scan_single_shard_info != single_source_shard_info:
                         scan_result = _preserve_findings_with_shard_boundary_failure(
                             scan_result,
@@ -8032,7 +8030,7 @@ def scan_model_streaming(
 
         _record_unexpected_validated_shard_families(
             results,
-            _unexpected_validated_shard_families(single_safetensors_family_targets),
+            single_safetensors_family_targets,
         )
         _reconcile_cross_directory_shard_coverage(
             results,

@@ -23,6 +23,7 @@ import pytest
 
 from modelaudit.core import (
     _complete_validated_shard_family_sources,
+    _make_trusted_stream_shard_root,
     _reconcile_cross_directory_shard_coverage,
     _snapshot_validated_shard_target,
     detect_file_format,
@@ -1795,6 +1796,35 @@ def test_stream_staging_family_groups_are_scoped_to_nested_logical_parent() -> N
     family_groups = [next(iter(snapshot.values())).get("family_group") for snapshot in snapshots]
     assert all(isinstance(family_group, str) for family_group in family_groups)
     assert family_groups[0] != family_groups[1]
+
+
+def test_stream_staging_complete_nested_families_do_not_collide(tmp_path: Path) -> None:
+    """Complete same-named families in separate logical directories remain independent."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    staging_root = tmp_path / "stream-root"
+    staging_root.mkdir(mode=0o700)
+    shards: list[Path] = []
+    for model_id in ("base", "adapter"):
+        logical_dir = staging_root / "remote" / model_id
+        logical_dir.mkdir(parents=True)
+        for shard_index in (1, 2):
+            shard_path = logical_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shards.append(shard_path)
+
+    result = scan_model_streaming(
+        file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+        timeout=30,
+        delete_after_scan=False,
+        shard_family_group="trusted-stream:remote-repo",
+        _trusted_shard_family_root=_make_trusted_stream_shard_root(str(staging_root)),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not any(check.details.get("scan_outcome_reason") == "unexpected_model_shards" for check in result.checks)
 
 
 def test_stream_staging_family_group_rejects_nested_prefix_lookalike(tmp_path: Path) -> None:

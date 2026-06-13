@@ -248,6 +248,81 @@ class TestShardedModelDetector:
         assert "unexpected_shard_count" not in shard_info
         assert result.success is True
 
+    def test_direct_nested_shard_does_not_follow_ancestor_index(self, tmp_path: Path) -> None:
+        """A direct file scan cannot use an ancestor index to expand into a sibling subtree."""
+        selected = tmp_path / "selected" / "model-00000-of-00002.safetensors"
+        sibling = tmp_path / "outside" / "model-00001-of-00002.safetensors"
+        selected.parent.mkdir()
+        sibling.parent.mkdir()
+        selected.write_bytes(b"selected")
+        sibling.write_bytes(b"outside")
+        _write_safetensors_index(
+            tmp_path,
+            [selected.relative_to(tmp_path).as_posix(), sibling.relative_to(tmp_path).as_posix()],
+        )
+        scanned_payloads: list[bytes] = []
+
+        class RecordingScanner(CompletingShardScanner):
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_payloads.append(Path(shard_path).read_bytes())
+                return super().scan(shard_path)
+
+        shard_info = ShardedModelDetector.detect_shards(str(selected))
+        result = AdvancedFileHandler(str(selected), RecordingScanner()).scan()
+
+        assert shard_info is not None
+        assert "safetensors_index_path" not in shard_info
+        assert shard_info["shards"] == [str(selected)]
+        assert scanned_payloads == [b"selected"]
+        assert result.success is False
+        assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_explicit_index_root_does_not_follow_symlinked_directory_escape(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A directory symlink cannot move authoritative index lookup outside the trusted root."""
+        del requires_symlinks
+        scan_root = tmp_path / "scan-root"
+        outside = tmp_path / "outside"
+        first = outside / "a" / "model-00000-of-00002.safetensors"
+        second = outside / "b" / "model-00001-of-00002.safetensors"
+        scan_root.mkdir()
+        first.parent.mkdir(parents=True)
+        second.parent.mkdir(parents=True)
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        _write_safetensors_index(
+            outside,
+            [first.relative_to(outside).as_posix(), second.relative_to(outside).as_posix()],
+        )
+        linked_root = scan_root / "linked"
+        linked_root.symlink_to(outside, target_is_directory=True)
+        selected = linked_root / first.relative_to(outside)
+        scanned_payloads: list[bytes] = []
+
+        class RecordingScanner(CompletingShardScanner):
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_payloads.append(Path(shard_path).read_bytes())
+                return super().scan(shard_path)
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(selected),
+            index_search_root=scan_root,
+        )
+        result = AdvancedFileHandler(
+            str(selected),
+            RecordingScanner(),
+            index_search_root=scan_root,
+        ).scan()
+
+        assert shard_info is not None
+        assert "safetensors_index_path" not in shard_info
+        assert scanned_payloads == [b"first"]
+        assert result.success is False
+        assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
+
     @pytest.mark.parametrize(
         ("indices", "expected_base"),
         [
@@ -269,8 +344,15 @@ class TestShardedModelDetector:
             (tmp_path / shard).write_bytes(shard.encode())
         _write_safetensors_index(tmp_path, shard_files)
 
-        shard_info = ShardedModelDetector.detect_shards(str(tmp_path / shard_files[0]))
-        result = AdvancedFileHandler(str(tmp_path / shard_files[0]), CompletingShardScanner()).scan()
+        shard_info = ShardedModelDetector.detect_shards(
+            str(tmp_path / shard_files[0]),
+            index_search_root=tmp_path,
+        )
+        result = AdvancedFileHandler(
+            str(tmp_path / shard_files[0]),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
 
         assert shard_info is not None
         assert shard_info["safetensors_index_path"] == str(tmp_path / "model.safetensors.index.json")
@@ -339,8 +421,12 @@ class TestShardedModelDetector:
             ],
         )
 
-        shard_info = ShardedModelDetector.detect_shards(str(indexed_present))
-        result = AdvancedFileHandler(str(indexed_present), CompletingShardScanner()).scan()
+        shard_info = ShardedModelDetector.detect_shards(str(indexed_present), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(indexed_present),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
 
         assert shard_info is not None
         assert shard_info["shard_index_base"] == "zero"
@@ -404,8 +490,12 @@ class TestShardedModelDetector:
         shard_zero.write_bytes(b"zero")
         (tmp_path / "model.safetensors.index.json").write_text(index_payload, encoding="utf-8")
 
-        shard_info = ShardedModelDetector.detect_shards(str(shard_zero))
-        result = AdvancedFileHandler(str(shard_zero), CompletingShardScanner()).scan()
+        shard_info = ShardedModelDetector.detect_shards(str(shard_zero), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(shard_zero),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
 
         assert shard_info is not None
         assert shard_info["safetensors_index_error"]
@@ -480,7 +570,7 @@ class TestShardedModelDetector:
             shard.write_bytes(struct.pack("<Q", len(header)) + header)
         _write_safetensors_index(tmp_path, [shard.relative_to(tmp_path).as_posix() for shard in shards])
 
-        shard_info = ShardedModelDetector.detect_shards(str(shards[0]))
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]), index_search_root=tmp_path)
         result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, scanners=["safetensors"])
 
         assert shard_info is not None
@@ -512,8 +602,12 @@ class TestShardedModelDetector:
             [first.relative_to(model_root).as_posix(), second.relative_to(model_root).as_posix()],
         )
 
-        shard_info = ShardedModelDetector.detect_shards(str(first))
-        result = AdvancedFileHandler(str(first), CompletingShardScanner()).scan()
+        shard_info = ShardedModelDetector.detect_shards(str(first), index_search_root=model_root)
+        result = AdvancedFileHandler(
+            str(first),
+            CompletingShardScanner(),
+            index_search_root=model_root,
+        ).scan()
 
         assert shard_info is not None
         assert [os.path.normcase(os.path.normpath(path)) for path in shard_info["out_of_scope_shards"]] == [
@@ -537,31 +631,29 @@ class TestShardedModelDetector:
                 _write_safetensors_index(tmp_path, [family_b.relative_to(tmp_path).as_posix()])
                 return super().scan(shard_path)
 
-        result = AdvancedFileHandler(str(family_a), IndexSwappingScanner()).scan()
+        result = AdvancedFileHandler(
+            str(family_a),
+            IndexSwappingScanner(),
+            index_search_root=tmp_path,
+        ).scan()
 
         assert json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]["tensor_0"].startswith("b/")
         assert result.success is False
         assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
 
     @pytest.mark.parametrize("cache_enabled", [False, True], ids=["no-cache", "cache"])
-    def test_complete_single_safetensors_header_scan_is_platform_independent_when_pin_unavailable(
+    def test_complete_single_safetensors_header_scan_uses_stable_path(
         self,
         tmp_path: Path,
         cache_enabled: bool,
     ) -> None:
-        """A complete one-shard SafeTensors family should scan as one file without descriptor pinning."""
+        """A complete one-shard SafeTensors family should scan through the pinned shard path."""
         header = b'{"__metadata__":{"format":"pt"},"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
         shard = tmp_path / "model-00000-of-00001.safetensors"
         shard.write_bytes(struct.pack("<Q", len(header)) + header + b"\0")
         _write_safetensors_index(tmp_path, [shard.name])
 
-        with (
-            patch("modelaudit.core.should_use_large_file_handler", return_value=True),
-            patch(
-                "modelaudit.utils.file.handlers._pinned_shard_scan_path",
-                side_effect=AssertionError("single SafeTensors shard should not require descriptor pinning"),
-            ),
-        ):
+        with patch("modelaudit.core.should_use_large_file_handler", return_value=True):
             result = scan_model_directory_or_file(
                 str(tmp_path),
                 cache_enabled=cache_enabled,
@@ -573,6 +665,41 @@ class TestShardedModelDetector:
         assert determine_exit_code(result) == 0
         assert "safetensors" in result.scanner_names
         assert not any(check.details.get("scan_outcome_reason") == "shard_pin_unavailable" for check in result.checks)
+
+    def test_complete_single_safetensors_alias_aba_scans_validated_target(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A transient alias swap cannot replace the validated one-shard scan input."""
+        del requires_symlinks
+        malicious_header = b'{"__metadata__":{"api_key":"SECRET_METADATA_TOKEN"}}'
+        safe_header = b'{"__metadata__":{"format":"pt"}}'
+        malicious = tmp_path / "malicious.safetensors"
+        safe = tmp_path / "safe.safetensors"
+        malicious.write_bytes(struct.pack("<Q", len(malicious_header)) + malicious_header)
+        safe.write_bytes(struct.pack("<Q", len(safe_header)) + safe_header)
+        alias = tmp_path / "model-00000-of-00001.safetensors"
+        alias.symlink_to(malicious.name)
+        _write_safetensors_index(tmp_path, [alias.name])
+
+        class AliasSwappingScanner(HeaderHashShardScanner):
+            def scan(self, shard_path: str) -> ScanResult:
+                alias.unlink()
+                alias.symlink_to(safe.name)
+                try:
+                    return super().scan(shard_path)
+                finally:
+                    alias.unlink()
+                    alias.symlink_to(malicious.name)
+
+        result = AdvancedFileHandler(str(alias), AliasSwappingScanner()).scan()
+
+        header_check = next(check for check in result.checks if check.name == "SafeTensors Header Pin")
+        assert alias.resolve() == malicious
+        assert header_check.location == str(alias)
+        assert header_check.details["header_sha256"] == hashlib.sha256(malicious_header).hexdigest()
+        assert result.success is True
 
     @pytest.mark.parametrize(
         "index_payload",
@@ -2048,6 +2175,50 @@ class TestAdvancedFileHandler:
         assert restricted.bytes_scanned == shard_one.stat().st_size
         assert expanded.bytes_scanned == shard_one.stat().st_size + shard_two.stat().st_size
 
+    def test_cached_advanced_scan_keys_index_search_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Equivalent shard inventories with different trusted roots must not share cache entries."""
+        model_root = tmp_path / "model"
+        shards = [
+            model_root / "a" / "model-00000-of-00002.safetensors",
+            model_root / "b" / "model-00001-of-00002.safetensors",
+        ]
+        for shard in shards:
+            shard.parent.mkdir(parents=True)
+            shard.write_bytes(shard.name.encode())
+        _write_safetensors_index(model_root, [shard.relative_to(model_root).as_posix() for shard in shards])
+        scanned_payloads: list[bytes] = []
+
+        class CachedRecordingScanner(CompletingShardScanner):
+            def __init__(self, config: dict[str, Any]) -> None:
+                self.config = config
+
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_payloads.append(Path(shard_path).read_bytes())
+                return super().scan(shard_path)
+
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._supports_reliable_shard_cache_identity",
+            lambda: True,
+        )
+        scanner = CachedRecordingScanner({"cache_enabled": True, "cache_dir": str(tmp_path / "cache")})
+
+        reset_cache_manager()
+        try:
+            scan_advanced_large_file(str(shards[0]), scanner, index_search_root=model_root)
+            first_scan_count = len(scanned_payloads)
+            scan_advanced_large_file(str(shards[0]), scanner, index_search_root=model_root)
+            assert len(scanned_payloads) == first_scan_count
+            scan_advanced_large_file(str(shards[0]), scanner, index_search_root=tmp_path)
+        finally:
+            reset_cache_manager()
+
+        assert first_scan_count == 2
+        assert len(scanned_payloads) == 4
+
     def test_cached_advanced_scan_keys_direct_shard_family_content(
         self,
         tmp_path: Path,
@@ -2089,8 +2260,9 @@ class TestAdvancedFileHandler:
             *,
             allowed_paths: list[str] | None = None,
             allowed_targets: ValidatedShardTargets | None = None,
+            index_search_root: str | os.PathLike[str] | None = None,
         ) -> dict[str, Any]:
-            del cls, file_path, allowed_paths, allowed_targets
+            del cls, file_path, allowed_paths, allowed_targets, index_search_root
             return {
                 "pattern": r"checkpoint_(\d+)\.pt",
                 "current_file": str(shard_one),

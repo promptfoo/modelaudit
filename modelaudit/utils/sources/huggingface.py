@@ -1,5 +1,6 @@
 """Utilities for handling HuggingFace model downloads."""
 
+import hashlib
 import json
 import logging
 import ntpath
@@ -23,6 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
+from .._path_hardening import _ensure_secure_directory
 from ..file.detection import detect_file_format_for_skip_filter
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
@@ -1458,7 +1460,7 @@ def _select_huggingface_model_files(
     scannable_scanner_ids: Collection[str] | None = None,
     deadline: float | None = None,
 ) -> list[str]:
-    """Select extension-matching files plus bounded content-routed renamed model files."""
+    """Select extension matches, bounded content routes, and validated SafeTensors index families."""
     model_files = list(
         dict.fromkeys(filename for filename in repo_files if _is_scannable_hf_file(filename, model_extensions))
     )
@@ -2551,6 +2553,49 @@ def _build_huggingface_download_path(cache_dir: Path, namespace: str, repo_name:
     return resolved_download_path
 
 
+def _build_huggingface_filtered_download_path(
+    cache_root: Path,
+    namespace: str,
+    repo_name: str,
+    repo_id: str,
+    revision: str,
+    filenames: Collection[str],
+    scannable_extensions: Collection[str] | None,
+    scannable_scanner_ids: Collection[str] | None,
+) -> Path:
+    """Return a non-symlink selection-specific directory under a trusted cache root."""
+    resolved_cache_root = cache_root.resolve()
+    selection_key = hashlib.sha256(
+        json.dumps(
+            {
+                "schema": "modelaudit-hf-selection-v1",
+                "repo": repo_id,
+                "revision": revision,
+                "filenames": sorted(set(filenames)),
+                "extensions": (
+                    None
+                    if scannable_extensions is None
+                    else sorted(str(value).lower() for value in scannable_extensions)
+                ),
+                "scanners": (
+                    None
+                    if scannable_scanner_ids is None
+                    else sorted(str(value).lower() for value in scannable_scanner_ids)
+                ),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    selection_path = resolved_cache_root / ".modelaudit-selections" / namespace
+    if repo_name:
+        selection_path = selection_path / repo_name
+    selection_path = selection_path / selection_key
+    if not _is_within_directory(resolved_cache_root, selection_path) or not _ensure_secure_directory(selection_path):
+        raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
+    return selection_path
+
+
 def _list_repo_files_with_timeout(
     repo_id: str,
     timeout_seconds: float = 30,
@@ -3518,15 +3563,14 @@ def download_model(
     disk_check_path = None
     download_path_preexisting = False
 
-    if cache_dir is not None:
+    if cache_dir is not None and not selection_is_filtered:
         # Create a structured, containment-checked cache directory.
         download_path = _build_huggingface_download_path(cache_dir, namespace, repo_name)
         download_path_preexisting = download_path.exists()
         download_path.mkdir(parents=True, exist_ok=True)
         disk_check_path = download_path
-
     else:
-        disk_check_path = _get_hf_cache_root()
+        disk_check_path = cache_dir / "huggingface" if cache_dir is not None else _get_hf_cache_root()
         disk_check_path.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -3557,6 +3601,23 @@ def download_model(
             repository_file_inventory[:] = plan.repo_files
 
         if selection_is_filtered:
+            filtered_cache_root = cache_dir / "huggingface" if cache_dir is not None else _get_hf_cache_root()
+            download_path = _build_huggingface_filtered_download_path(
+                filtered_cache_root,
+                namespace,
+                repo_name,
+                repo_id,
+                plan.download_revision,
+                model_files,
+                scannable_extensions,
+                scannable_scanner_ids,
+            )
+            # Selection directories are immutable-revision namespaces. Never
+            # delete them on failure: another concurrent scan may own the same selection.
+            download_path_preexisting = True
+            disk_check_path = download_path
+
+        if selection_is_filtered:
             selected_size_evidence: Mapping[str, int | None] = plan.selected_sizes
             if any(filename not in selected_size_evidence for filename in model_files):
                 try:
@@ -3568,26 +3629,18 @@ def download_model(
                     )
                 except Exception:
                     selected_size_evidence = {}
-            selected_model_sizes = [
-                size
+            selected_model_sizes = {
+                filename: size
                 for filename in model_files
                 if isinstance((size := selected_size_evidence.get(filename)), int) and not isinstance(size, bool)
-            ]
+            }
             if selected_model_sizes and len(selected_model_sizes) == len(model_files):
-                model_size = sum(selected_model_sizes, start=0)
+                model_size = sum(selected_model_sizes.values(), start=0)
 
         if model_size and disk_check_path is not None:
             has_space, message = check_disk_space(disk_check_path, model_size)
             if not has_space:
                 raise Exception(f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}")
-
-        if selection_is_filtered and download_path is not None and download_path_preexisting:
-            if download_path.is_symlink():
-                download_path.unlink()
-            else:
-                shutil.rmtree(download_path)
-            download_path.mkdir(parents=True, exist_ok=True)
-            download_path_preexisting = False
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -3598,9 +3651,12 @@ def download_model(
             "tqdm_class": None,  # Use default tqdm
         }
         download_kwargs["revision"] = plan.download_revision
+        if selection_is_filtered:
+            # A filtered view must not trust prior local-dir metadata or bytes.
+            download_kwargs["force_download"] = True
 
-        if cache_dir is not None:
-            # User provided cache directory - use local_dir for direct placement
+        if download_path is not None:
+            # Custom and filtered downloads use an isolated local directory.
             download_kwargs["local_dir"] = str(download_path)
         else:
             # No cache directory provided - let HF use its default cache
@@ -3626,11 +3682,22 @@ def download_model(
         if onnx_external_data_enabled:
             repo_file_set = set(plan.repo_files)
             for filename in model_files:
-                if PurePosixPath(filename).suffix.lower() != ".onnx":
+                selected_path = downloaded_path / filename
+                is_onnx_candidate = PurePosixPath(filename).suffix.lower() == ".onnx"
+                if not is_onnx_candidate:
+                    try:
+                        is_onnx_candidate = detect_file_format_for_skip_filter(str(selected_path)) == "onnx"
+                    except Exception:
+                        logger.debug(
+                            "Unable to sniff selected Hugging Face file %s for ONNX sidecars",
+                            filename,
+                            exc_info=True,
+                        )
+                if not is_onnx_candidate:
                     continue
                 external_data_files.extend(
                     _discover_hf_onnx_external_data_files(
-                        downloaded_path / filename,
+                        selected_path,
                         filename,
                         repo_file_set,
                     )
@@ -3638,14 +3705,38 @@ def download_model(
         external_data_files = list(dict.fromkeys(external_data_files))
         if external_data_files:
             model_files = list(dict.fromkeys([*model_files, *external_data_files]))
+            external_size_evidence: Mapping[str, int | None]
             if size_limit is not None:
-                _ensure_huggingface_selection_within_max_size(
+                _revision, expanded_size_evidence = _ensure_huggingface_selection_within_max_size(
                     repo_id,
                     model_files,
                     size_limit,
                     resolved_revision=plan.repo_revision,
                     deadline=deadline,
                 )
+                external_size_evidence = expanded_size_evidence
+            else:
+                try:
+                    external_size_evidence, _size_revision = _get_huggingface_path_sizes(
+                        repo_id,
+                        external_data_files,
+                        resolved_revision=plan.repo_revision,
+                        deadline=deadline,
+                    )
+                except Exception:
+                    external_size_evidence = {}
+            external_sizes = {
+                filename: size
+                for filename in external_data_files
+                if isinstance((size := external_size_evidence.get(filename)), int) and not isinstance(size, bool)
+            }
+            if disk_check_path is not None and len(external_sizes) == len(external_data_files):
+                external_data_size = sum(external_sizes.values(), start=0)
+                has_space, message = check_disk_space(disk_check_path, external_data_size)
+                if not has_space:
+                    raise Exception(
+                        f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}"
+                    )
             download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
             local_path = _run_huggingface_download_with_deadline(
                 "snapshot_download",
@@ -3665,6 +3756,18 @@ def download_model(
                 "Hugging Face selective filtering incomplete: "
                 f"snapshot missing {len(missing_model_files)} selected file(s) for {repo_id}"
             )
+        if selection_is_filtered:
+            downloaded_selection_files = {
+                filename
+                for filename in downloaded_files
+                if PurePosixPath(filename).parts[:2] != (".cache", "huggingface")
+            }
+            unexpected_model_files = downloaded_selection_files.difference(model_files)
+            if unexpected_model_files:
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: "
+                    f"snapshot included {len(unexpected_model_files)} unselected file(s) for {repo_id}"
+                )
 
         return Path(local_path)
     except Exception as e:

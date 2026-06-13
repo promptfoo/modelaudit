@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - reconstruct bounded wrapped SafeTensors license base64 tails and fail closed on residual URL encodings before suppressing metadata URL and length findings
 - validate Basic Auth credentials only in bounded authorization-header context with decodable username/password tokens
 - propagate file-level inconclusive and incomplete-coverage metadata into aggregate success, strict JSON, exit-code, and cache semantics
-- preserve declared ONNX external data sidecars during Hugging Face streaming scans
+- preserve declared ONNX external data sidecars during standard filtered and streaming Hugging Face scans
 - inspect large Keras HDF5 models through file-backed metadata traversal instead of rejecting them at the generic whole-file read cap; aggregate `content_hash` is omitted for these large file-backed HDF5 scans
 - paginate and bound large Hugging Face repository inventories before streaming so unfiltered scans preserve complete coverage
 - dispatch logical model directories through their owning scanners, preserving bounded complete SavedModel asset probes before supplemental child-file coverage
