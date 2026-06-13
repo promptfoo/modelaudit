@@ -179,6 +179,27 @@ def _assert_inconclusive_pickle_member(result: ScanResult, archive_path: Path, m
     assert not any(issue.rule_code == "S201" for issue in result.issues)
 
 
+def _writestr_preserving_member_name(
+    archive: zipfile.ZipFile,
+    member_name: str,
+    data: str | bytes,
+) -> None:
+    info = zipfile.ZipInfo("placeholder")
+    info.filename = member_name
+    info.orig_filename = member_name
+    archive.writestr(info, data)
+
+
+def _malicious_lightgbm_legal_payload() -> bytes:
+    return (
+        b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        b"feature_names=f0 f1 f2\nfeature_infos=[0:1] [0:1] [0:1]\ntree_sizes=12\n"
+        b"Tree=0\nnum_leaves=2\nsplit_feature=0\nsplit_gain=1.0\nthreshold=0.5\n"
+        b"decision_type=<=\nleft_child=-1\nright_child=-2\nleaf_value=0.1 0.2\n"
+        b"license=MIT License\nmetadata=os.system('id')\n"
+    )
+
+
 def _build_malicious_tf_metagraph() -> bytes:
     if not _has_tf_protos():
         pytest.skip("TensorFlow protobuf stubs unavailable")
@@ -7662,6 +7683,18 @@ class TestZipScanner:
         """Set up test fixtures"""
         self.scanner = ZipScanner()
 
+    def test_logical_archive_entry_name_preserves_windows_separator_spelling(self) -> None:
+        info = zipfile.ZipInfo("docs/LICENSE")
+        info.orig_filename = r"docs\LICENSE"
+
+        assert ZipScanner._logical_archive_entry_name(info) == r"docs\LICENSE"
+
+    def test_logical_archive_entry_name_does_not_restore_sanitized_nul_suffix(self) -> None:
+        info = zipfile.ZipInfo("LICENSE")
+        info.orig_filename = "LICENSE\0payload.pkl"
+
+        assert ZipScanner._logical_archive_entry_name(info) == "LICENSE"
+
     def test_can_handle_zip_files(self):
         """Test that the scanner correctly identifies ZIP files"""
         # Create a temporary zip file
@@ -10906,7 +10939,8 @@ class TestZipScanner:
     ) -> None:
         archive_path = tmp_path / "legal_text_member_with_url.zip"
         with zipfile.ZipFile(archive_path, "w") as z:
-            z.writestr(
+            _writestr_preserving_member_name(
+                z,
                 member_name,
                 "MIT License\n\n"
                 "Copyright (c) 2026 Example\n"
@@ -10932,6 +10966,9 @@ class TestZipScanner:
             and check.details.get("file_type") == expected_type
             and check.details.get("zip_entry") == member_name
             for check in result.checks
+        )
+        assert any(
+            content.get("path") == f"{archive_path}:{member_name}" for content in result.metadata.get("contents", [])
         )
 
     @pytest.mark.parametrize(
@@ -10973,7 +11010,11 @@ class TestZipScanner:
     ) -> None:
         archive_path = tmp_path / "legal_stem_env.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
-            archive.writestr(member_name, "AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n")
+            _writestr_preserving_member_name(
+                archive,
+                member_name,
+                "AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n",
+            )
 
         result = self.scanner.scan(str(archive_path))
 
@@ -11127,7 +11168,7 @@ class TestZipScanner:
         member_name = r"docs\LICENSE"
         payload = b"MIT License\nCopyright Example\n" + b"cposix\nsystem\n(S'id'\ntR."
         with zipfile.ZipFile(archive_path, "w") as archive:
-            archive.writestr(member_name, payload)
+            _writestr_preserving_member_name(archive, member_name, payload)
 
         result = self.scanner.scan(str(archive_path))
 
@@ -11233,6 +11274,49 @@ class TestZipScanner:
         assert result.success is False
         assert any(
             issue.rule_code == "S201" and issue.details.get("zip_entry") == member_name for issue in result.issues
+        )
+
+    def test_scan_zip_reports_import_only_global_in_backslash_license_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "import_only_global.zip"
+        member_name = r"docs\LICENSE"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            _writestr_preserving_member_name(
+                archive,
+                member_name,
+                b"(cmystery_module\nthing\nS'MIT License'\nl.",
+            )
+
+        result = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert core.determine_exit_code(result) == 1
+        assert any(
+            issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and issue.location == f"{archive_path}:{member_name}"
+            and issue.details.get("zip_entry") == member_name
+            and issue.details.get("import_reference") == "mystery_module.thing"
+            for issue in result.issues
+        )
+
+    def test_scan_zip_routes_lightgbm_in_backslash_license_member_before_text(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "lightgbm_license.zip"
+        member_name = r"docs\LICENSE"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            _writestr_preserving_member_name(
+                archive,
+                member_name,
+                _malicious_lightgbm_legal_payload(),
+            )
+
+        result = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert core.determine_exit_code(result) == 1
+        assert any(
+            check.name == "Command Indicator Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.location == f"{archive_path}:{member_name}"
+            and check.details.get("zip_entry") == member_name
+            for check in result.checks
         )
 
     def test_scan_zip_keeps_webbrowser_pickle_named_notice_on_pickle_route(self, tmp_path: Path) -> None:
@@ -11421,7 +11505,11 @@ class TestZipScanner:
     def test_scan_zip_backslash_readme_member_detects_basic_auth_header(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "backslash_headers.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
-            archive.writestr("docs\\README", "Authorization: Basic YmFja3NsYXNoOnBhc3M=\n")
+            _writestr_preserving_member_name(
+                archive,
+                "docs\\README",
+                "Authorization: Basic YmFja3NsYXNoOnBhc3M=\n",
+            )
 
         result = core.scan_file(
             str(archive_path),

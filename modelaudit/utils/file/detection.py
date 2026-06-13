@@ -5759,12 +5759,13 @@ def _legal_text_pickle_prefix_route(
         trailing_opcode = _PICKLE_OPCODE_BY_BYTE.get(trailing[0])
         if trailing_opcode is not None and trailing_opcode.name in _BINARY_PICKLE_SECURITY_OPCODES:
             return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    has_complete_global_reference = bool(global_arguments) and not trailing
     has_suspicious_global = any(_is_suspicious_pickle_global(module, name) for module, name in global_arguments)
     has_invocation = bool(opcodes & _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES.difference({"GLOBAL"}))
     has_non_global_nontrivial_opcode = any(
         opcode != "STOP" and opcode != "GLOBAL" and opcode not in PROTO0_1_TRIVIAL_LEADING_OPCODES for opcode in opcodes
     )
-    if has_invocation or has_suspicious_global or has_non_global_nontrivial_opcode:
+    if has_invocation or has_complete_global_reference or has_suspicious_global or has_non_global_nontrivial_opcode:
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if embedded else "pickle"
     return None
 
@@ -9512,6 +9513,55 @@ def detect_format_from_magic_bytes(
     return "unknown"
 
 
+def _detect_content_routed_signature_model(
+    file_path: Path,
+    file_size: int,
+    prefix: bytes,
+) -> str | None:
+    """Return a model owner proven by a bounded CNTK or LightGBM signature."""
+    probe_size = min(file_size, max(_CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
+    if len(prefix) < probe_size:
+        prefix = read_magic_bytes(str(file_path), probe_size)
+    if file_path.suffix.lower() != ".model" and _is_cntk_signature(prefix[:_CNTK_SIGNATURE_READ_BYTES]):
+        return "cntk"
+    if _is_content_routed_lightgbm_signature(prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
+        return "lightgbm"
+    return None
+
+
+def _resolve_legal_text_sidecar_route(
+    file_path: Path,
+    file_size: int,
+    prefix: bytes,
+    *,
+    logical_name: str | None,
+) -> str | None:
+    """Let proven structured models override only a validated text fallback."""
+    legal_text_route = _detect_legal_text_sidecar_route(file_path, file_size, logical_name=logical_name)
+    if legal_text_route != "text":
+        return legal_text_route
+
+    torch7_probe_size = min(file_size, _TORCH7_SIGNATURE_READ_BYTES)
+    torch7_prefix = prefix[:torch7_probe_size]
+    if len(torch7_prefix) < torch7_probe_size:
+        torch7_prefix = read_magic_bytes(str(file_path), torch7_probe_size)
+    if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(torch7_prefix):
+        return "torch7"
+
+    signature_model = _detect_content_routed_signature_model(file_path, file_size, prefix)
+    if signature_model is not None:
+        return signature_model
+    if _is_confirmed_content_routed_jax_json_checkpoint(file_path):
+        return "jax_checkpoint"
+    if not file_path.suffix:
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(str(file_path), min(file_size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
+    return "text"
+
+
 def detect_file_format_from_magic(path: str, *, logical_name: str | None = None) -> str:
     """Detect file format solely from magic bytes."""
     file_path = Path(path)
@@ -9577,7 +9627,12 @@ def detect_file_format_from_magic(path: str, *, logical_name: str | None = None)
             if xml_format != "unknown":
                 return xml_format
 
-            legal_text_route = _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name)
+            legal_text_route = _resolve_legal_text_sidecar_route(
+                file_path,
+                size,
+                header,
+                logical_name=logical_name,
+            )
             if legal_text_route is not None:
                 return legal_text_route
             if format_result == "pickle":
@@ -9602,17 +9657,9 @@ def detect_file_format_from_magic(path: str, *, logical_name: str | None = None)
             if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(torch7_prefix):
                 return "torch7"
 
-            # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
-            # Use bounded signature markers for deterministic identification after serialized formats.
-            f.seek(0)
-            cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
-            if file_path.suffix.lower() != ".model" and _is_cntk_signature(cntk_prefix):
-                return "cntk"
-
-            f.seek(0)
-            lightgbm_prefix = f.read(_LIGHTGBM_SIGNATURE_READ_BYTES)
-            if _is_content_routed_lightgbm_signature(lightgbm_prefix):
-                return "lightgbm"
+            signature_model = _detect_content_routed_signature_model(file_path, size, header)
+            if signature_model is not None:
+                return signature_model
 
             if not file_path.suffix:
                 f.seek(0)
@@ -9761,7 +9808,12 @@ def detect_file_format_for_skip_filter(path: str, *, logical_name: str | None = 
         if xml_format != "unknown":
             return xml_format
 
-        legal_text_route = _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name)
+        legal_text_route = _resolve_legal_text_sidecar_route(
+            file_path,
+            size,
+            prefix,
+            logical_name=logical_name,
+        )
         if legal_text_route is not None:
             return legal_text_route
         if format_result == "pickle":
@@ -9788,17 +9840,9 @@ def detect_file_format_for_skip_filter(path: str, *, logical_name: str | None = 
         if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(prefix):
             return "torch7"
 
-        cntk_probe_size = min(size, _CNTK_SIGNATURE_READ_BYTES)
-        if len(prefix) < cntk_probe_size:
-            prefix += f.read(cntk_probe_size - len(prefix))
-        if file_path.suffix.lower() != ".model" and _is_cntk_signature(prefix[:cntk_probe_size]):
-            return "cntk"
-
-        lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
-        if len(prefix) < lightgbm_probe_size:
-            prefix += f.read(lightgbm_probe_size - len(prefix))
-        if _is_content_routed_lightgbm_signature(prefix[:lightgbm_probe_size]):
-            return "lightgbm"
+        signature_model = _detect_content_routed_signature_model(file_path, size, prefix)
+        if signature_model is not None:
+            return signature_model
 
         if not file_path.suffix:
             xgboost_probe_size = min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES)
@@ -9839,6 +9883,7 @@ def detect_file_format_for_skip_filter(path: str, *, logical_name: str | None = 
         file_path, size
     ):
         return PROTOBUF_MODEL_CANDIDATE_FORMAT
+
     return "unknown"
 
 
@@ -9931,7 +9976,12 @@ def detect_file_format(path: str, *, logical_name: str | None = None) -> str:
         xml_format = _detect_bounded_xml_model_file_format(file_path, size, header)
         if xml_format != "unknown":
             return xml_format
-        legal_text_route = _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name)
+        legal_text_route = _resolve_legal_text_sidecar_route(
+            file_path,
+            size,
+            header,
+            logical_name=logical_name,
+        )
         if legal_text_route is not None:
             return legal_text_route
         media_route = _detect_bounded_media_route(file_path, size)
@@ -10065,11 +10115,9 @@ def detect_file_format(path: str, *, logical_name: str | None = None) -> str:
     if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(torch7_prefix):
         return "torch7"
 
-    signature_prefix = read_magic_bytes(path, max(_CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
-    if ext != ".model" and _is_cntk_signature(signature_prefix[:_CNTK_SIGNATURE_READ_BYTES]):
-        return "cntk"
-    if _is_content_routed_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
-        return "lightgbm"
+    signature_model = _detect_content_routed_signature_model(file_path, size, header)
+    if signature_model is not None:
+        return signature_model
 
     if ext == "":
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(
@@ -10077,8 +10125,9 @@ def detect_file_format(path: str, *, logical_name: str | None = None) -> str:
         )
         if xgboost_route is not None:
             return xgboost_route
-        if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
-            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+    if ext == "" and _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+        return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)

@@ -67,6 +67,16 @@ def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
     )
 
 
+def _malicious_lightgbm_legal_payload() -> bytes:
+    return (
+        b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        b"feature_names=f0 f1 f2\nfeature_infos=[0:1] [0:1] [0:1]\ntree_sizes=12\n"
+        b"Tree=0\nnum_leaves=2\nsplit_feature=0\nsplit_gain=1.0\nthreshold=0.5\n"
+        b"decision_type=<=\nleft_child=-1\nright_child=-2\nleaf_value=0.1 0.2\n"
+        b"license=MIT License\nmetadata=os.system('id')\n"
+    )
+
+
 def _over_budget_legal_payload(leading: bytes, trailing: bytes = b"") -> bytes:
     return leading + (b"A" * (_LEGAL_TEXT_ROUTE_MAX_BYTES + 1 - len(leading))) + trailing
 
@@ -671,6 +681,47 @@ def test_scan_file_keeps_malicious_pickle_named_license_on_pickle_route(tmp_path
 
     assert result.scanner_name == "pickle"
     assert _has_pickle_execution_finding(result)
+
+
+def test_scan_file_reports_import_only_global_in_protocol0_license(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"(cmystery_module\nthing\nS'MIT License'\nl.")
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.scanner_names == ["pickle"]
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL" and issue.details.get("import_reference") == "mystery_module.thing"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_keeps_allowlisted_import_only_global_on_pickle_route(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"(cbuiltins\nset\nS'MIT License'\nl.")
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.scanner_names == ["pickle"]
+    assert determine_exit_code(result) == 0
+    assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+
+
+def test_scan_file_routes_malicious_lightgbm_named_license_before_text(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(_malicious_lightgbm_legal_payload())
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.scanner_names == ["lightgbm"]
+    assert determine_exit_code(result) == 1
+    assert any(
+        check.name == "Command Indicator Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
 
 
 def test_scan_file_fails_closed_for_binary_pickle_embedded_in_license_text(tmp_path: Path) -> None:

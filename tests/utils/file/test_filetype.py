@@ -70,6 +70,30 @@ def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
     )
 
 
+def _lightgbm_text_payload(*extra_lines: str) -> bytes:
+    lines = [
+        "tree",
+        "version=v4",
+        "num_class=1",
+        "num_tree_per_iteration=1",
+        "max_feature_idx=2",
+        "feature_names=f0 f1 f2",
+        "feature_infos=[0:1] [0:1] [0:1]",
+        "tree_sizes=12",
+        "Tree=0",
+        "num_leaves=2",
+        "split_feature=0",
+        "split_gain=1.0",
+        "threshold=0.5",
+        "decision_type=<=",
+        "left_child=-1",
+        "right_child=-2",
+        "leaf_value=0.1 0.2",
+        *extra_lines,
+    ]
+    return ("\n".join(lines) + "\n").encode()
+
+
 def _ubjson_key(key: bytes) -> bytes:
     return b"U" + bytes([len(key)]) + key
 
@@ -3642,6 +3666,26 @@ def test_detect_file_format_keeps_global_shaped_non_pickle_prose_on_text_route(t
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"(cmystery_module\nthing\nS'MIT License'\nl.", id="GLOBAL-nonallowlisted"),
+        pytest.param(b"(VMIT License\nimystery_module\nthing\n.", id="INST-nonallowlisted"),
+        pytest.param(b"(cbuiltins\nset\nS'MIT License'\nl.", id="GLOBAL-allowlisted"),
+    ],
+)
+def test_complete_protocol0_import_named_license_retains_pickle_ownership(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == "pickle"
+    assert detect_file_format_from_magic(str(path)) == "pickle"
+    assert detect_file_format_for_skip_filter(str(path)) == "pickle"
+
+
+@pytest.mark.parametrize(
     "continuation",
     [
         pytest.param(b"0MIT License\n", id="POP"),
@@ -3761,6 +3805,70 @@ def test_structured_xml_model_named_license_precedes_legal_text_fallback(
     assert detect_file_format(str(path)) == expected_format
     assert detect_file_format_from_magic(str(path)) == expected_format
     assert detect_file_format_for_skip_filter(str(path)) == expected_format
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_format"),
+    [
+        pytest.param(
+            _lightgbm_text_payload("license=MIT License", "metadata=os.system('id')"),
+            "lightgbm",
+            id="lightgbm",
+        ),
+        pytest.param(
+            b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab "
+            b"CompositeFunction primitive_functions MIT License",
+            "cntk",
+            id="cntk",
+        ),
+        pytest.param(
+            b"{"
+            + _ubjson_key(b"learner")
+            + b"{"
+            + _ubjson_key(b"learner_model_param")
+            + b"{}"
+            + b"}"
+            + _ubjson_key(b"version")
+            + b"[]"
+            + _ubjson_key(b"license")
+            + _ubjson_string(b"MIT License")
+            + b"}",
+            "xgboost",
+            id="xgboost",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "framework": "jax",
+                    "orbax_version": "0.1.0",
+                    "license": "MIT License",
+                }
+            ).encode(),
+            "jax_checkpoint",
+            id="jax-json",
+        ),
+    ],
+)
+def test_structured_model_named_license_precedes_legal_text_fallback(
+    tmp_path: Path,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(path)) == expected_format
+
+
+def test_lightgbm_shaped_legal_prose_without_native_framing_remains_text(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"MIT License\nCopyright Example\n" + _lightgbm_text_payload())
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
 def test_legal_named_pickle_with_post_stop_persid_fails_closed(tmp_path: Path) -> None:

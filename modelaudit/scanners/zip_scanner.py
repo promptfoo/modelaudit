@@ -276,6 +276,14 @@ class ZipScanner(BaseScanner):
         return name.replace("\\", "/").rsplit("/", 1)[-1]
 
     @staticmethod
+    def _logical_archive_entry_name(info: zipfile.ZipInfo) -> str:
+        """Preserve raw separator spelling without restoring sanitized name content."""
+        raw_name = info.orig_filename
+        if raw_name and raw_name.replace("\\", "/") == info.filename:
+            return raw_name
+        return info.filename
+
+    @staticmethod
     def _safe_preserved_temp_basename(name: str) -> str:
         if len(name) <= _ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH:
             return name
@@ -1619,7 +1627,7 @@ class ZipScanner(BaseScanner):
         result: ScanResult,
     ) -> tuple[bool, bool]:
         """Validate ZIP entry metadata that does not require full extraction."""
-        name = info.filename
+        name = self._logical_archive_entry_name(info)
         if not name:
             return False, True
 
@@ -1905,7 +1913,7 @@ class ZipScanner(BaseScanner):
             # Scan each file in the archive
             extracted_uncompressed_size = 0
             for info in extractable_entries:
-                name = info.filename
+                name = self._logical_archive_entry_name(info)
 
                 # Check compression ratio for zip bomb detection
                 if info.compress_size > 0:
