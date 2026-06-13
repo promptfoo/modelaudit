@@ -1,5 +1,7 @@
 """Tests for streaming scan-and-delete functionality."""
 
+import hashlib
+import json
 import logging
 import os
 import pickle
@@ -30,13 +32,15 @@ from modelaudit.core import (
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.models import FileMetadataModel, LicenseInfoModel, create_initial_audit_result
 from modelaudit.scanners import safetensors_scanner
-from modelaudit.scanners.base import CheckStatus, Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
-from tests.helpers import create_malicious_pickle
+from modelaudit.utils.sources.huggingface import download_model_streaming
+from tests.helpers import create_malicious_pickle, create_mock_pytorch_zip
 
 
 @pytest.fixture
@@ -64,6 +68,42 @@ def create_mock_scan_result(bytes_scanned: int = 1024, with_critical_issue: bool
     return result
 
 
+def create_external_onnx_payload(tmp_path: Path, external_path: str = "model.onnx_data") -> bytes:
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+    from onnx.onnx_ml_pb2 import StringStringEntryProto
+
+    tensor = helper.make_tensor("W", TensorProto.FLOAT, [1], vals=[1.0])
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    entry = StringStringEntryProto()
+    entry.key = "location"
+    entry.value = external_path
+    tensor.external_data.append(entry)
+    graph = helper.make_graph(
+        [helper.make_node("Relu", ["input"], ["output"], name="relu")],
+        "streaming_external_data_graph",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
+        initializer=[tensor],
+    )
+    model_path = tmp_path / "fixture.onnx"
+    onnx.save(helper.make_model(graph), str(model_path))
+    return model_path.read_bytes()
+
+
+def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
+    schema_issues = [
+        issue
+        for issue in result.issues
+        if issue.details.get("schema_validation_reason") == "onnx_schema_validation_failed"
+        and issue.details.get("checker_available") is True
+        and issue.details.get("external_data_present") is True
+    ]
+    assert len(schema_issues) == 1
+    assert result.issues == schema_issues
+    assert determine_exit_code(result) == 2
+
+
 def write_hf_download_metadata(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -81,6 +121,20 @@ def write_hf_cachedir_tag(path: Path) -> None:
         "#\thttps://bford.info/cachedir/\n",
         encoding="utf-8",
     )
+
+
+def write_large_valid_userblock_keras_hdf5(path: Path) -> int:
+    h5py = pytest.importorskip("h5py")
+    userblock_size = 16 * 1024 * 1024
+    assert userblock_size > HDF5_SIGNATURE_SCAN_MAX_BYTES
+    with h5py.File(path, "w", userblock_size=userblock_size) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]}},
+        )
+        h5_file.attrs["keras_version"] = "3.13.2"
+    with path.open("ab") as handle:
+        handle.truncate(DEFAULT_MAX_FILE_READ_SIZE + 4096)
+    return userblock_size
 
 
 def create_mock_location_scan_result(
@@ -261,7 +315,7 @@ def test_scan_model_directory_or_file_partial_streaming_security_finding_returns
 
     metadata = result.file_metadata[stream_url].model_dump()
     assert metadata["scan_outcome"] == "inconclusive"
-    assert result.success is True
+    assert result.success is False
     assert determine_exit_code(result) == 1
 
 
@@ -620,6 +674,509 @@ def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
         assert result.has_errors is False
         assert result.content_hash is not None
         assert len(result.content_hash) == 64  # SHA256 hex string
+
+
+@patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], "a" * 40, None),
+)
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_model_streaming_hf_onnx_external_data_sidecar_matches_local_directory(
+    mock_hf_hub_download: Any,
+    _mock_list_repo_files: Any,
+    _mock_get_extensions: Any,
+    _mock_detect_content: Any,
+    tmp_path: Path,
+) -> None:
+    """HF streaming should preserve declared ONNX sidecars for the parent scan."""
+    payload = create_external_onnx_payload(tmp_path)
+    sidecar_bytes = struct.pack("f", 1.0)
+
+    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+        assert local_dir is not None
+        path = Path(local_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
+        return str(path)
+
+    mock_hf_hub_download.side_effect = download_side_effect
+    generator = download_model_streaming(
+        "https://huggingface.co/test/model",
+        cache_dir=tmp_path / "cache",
+        scannable_extensions={".onnx"},
+        scannable_scanner_ids={"onnx"},
+    )
+
+    result = scan_model_streaming(
+        generator,
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "passed"
+    ]
+    assert failed_external == []
+    assert passed_external
+    assert_only_onnx_external_schema_validation_skipped(result)
+    assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+        "onnx/model.onnx",
+        "onnx/model.onnx_data",
+    ]
+
+
+@patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["onnx/model-a.onnx", "onnx/model-b.onnx", "onnx/shared.onnx_data"], "a" * 40, None),
+)
+@patch("modelaudit.utils.sources.huggingface._get_huggingface_path_sizes")
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_model_streaming_hf_shared_onnx_external_data_counts_bytes_once(
+    mock_hf_hub_download: Any,
+    mock_get_path_sizes: Any,
+    _mock_list_repo_files: Any,
+    _mock_get_extensions: Any,
+    _mock_detect_content: Any,
+    tmp_path: Path,
+) -> None:
+    """A shared context-only ONNX sidecar should count once toward streaming totals."""
+    model_a_payload = create_external_onnx_payload(tmp_path, external_path="shared.onnx_data")
+    model_b_payload = create_external_onnx_payload(tmp_path, external_path="shared.onnx_data")
+    sidecar_payload = struct.pack("f", 1.0)
+    remote_payloads = {
+        "onnx/model-a.onnx": model_a_payload,
+        "onnx/model-b.onnx": model_b_payload,
+        "onnx/shared.onnx_data": sidecar_payload,
+    }
+    remote_sizes = {filename: len(payload) for filename, payload in remote_payloads.items()}
+    unique_bytes = sum(remote_sizes.values())
+    expected_hash = compute_aggregate_hash(
+        [
+            hashlib.sha256(model_a_payload).hexdigest(),
+            hashlib.sha256(sidecar_payload).hexdigest(),
+            hashlib.sha256(model_b_payload).hexdigest(),
+        ]
+    )
+
+    def get_path_sizes(
+        _repo_id: str,
+        filenames: list[str],
+        **_kwargs: object,
+    ) -> tuple[dict[str, int | None], str]:
+        return {filename: remote_sizes[filename] for filename in filenames}, "a" * 40
+
+    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+        assert local_dir is not None
+        path = Path(local_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(remote_payloads[filename])
+        return str(path)
+
+    mock_get_path_sizes.side_effect = get_path_sizes
+    mock_hf_hub_download.side_effect = download_side_effect
+    generator = download_model_streaming(
+        "https://huggingface.co/test/model",
+        cache_dir=tmp_path / "cache",
+        max_size=unique_bytes,
+        scannable_extensions={".onnx"},
+        scannable_scanner_ids={"onnx"},
+    )
+
+    result = scan_model_streaming(
+        generator,
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        max_total_size=unique_bytes,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert result.bytes_scanned == unique_bytes
+    assert result.content_hash == expected_hash
+    assert not any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+    assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+        "onnx/model-a.onnx",
+        "onnx/shared.onnx_data",
+        "onnx/model-b.onnx",
+    ]
+
+
+@patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["onnx/model.onnx"], "a" * 40, None),
+)
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_model_streaming_hf_onnx_missing_external_data_still_warns(
+    mock_hf_hub_download: Any,
+    _mock_list_repo_files: Any,
+    _mock_get_extensions: Any,
+    _mock_detect_content: Any,
+    tmp_path: Path,
+) -> None:
+    """Missing declared sidecars should remain visible instead of being suppressed."""
+    payload = create_external_onnx_payload(tmp_path)
+
+    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+        assert filename == "onnx/model.onnx"
+        assert local_dir is not None
+        path = Path(local_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return str(path)
+
+    mock_hf_hub_download.side_effect = download_side_effect
+    generator = download_model_streaming(
+        "https://huggingface.co/test/model",
+        cache_dir=tmp_path / "cache",
+        scannable_extensions={".onnx"},
+        scannable_scanner_ids={"onnx"},
+    )
+
+    result = scan_model_streaming(
+        generator,
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    missing_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    assert len(missing_external) == 1
+    assert missing_external[0].details["file"] == "model.onnx_data"
+    assert determine_exit_code(result) == 1
+    assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == ["onnx/model.onnx"]
+
+
+@patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["onnx/model.onnx", "secret.bin"], "a" * 40, None),
+)
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_model_streaming_hf_onnx_escaping_external_data_remains_cve(
+    mock_hf_hub_download: Any,
+    _mock_list_repo_files: Any,
+    _mock_get_extensions: Any,
+    _mock_detect_content: Any,
+    tmp_path: Path,
+) -> None:
+    """Escaping sidecars must not be downloaded and made to look safe."""
+    payload = create_external_onnx_payload(tmp_path, external_path="../secret.bin")
+
+    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+        assert filename == "onnx/model.onnx"
+        assert local_dir is not None
+        path = Path(local_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return str(path)
+
+    mock_hf_hub_download.side_effect = download_side_effect
+    generator = download_model_streaming(
+        "https://huggingface.co/test/model",
+        cache_dir=tmp_path / "cache",
+        scannable_extensions={".onnx"},
+        scannable_scanner_ids={"onnx"},
+    )
+
+    result = scan_model_streaming(
+        generator,
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert any("CVE-2022-25882" in check.name for check in result.checks)
+    assert all(
+        not (
+            check.name == "External Data Reference Check"
+            and check.status.value == "failed"
+            and check.details.get("file") == "../secret.bin"
+        )
+        for check in result.checks
+    )
+    assert determine_exit_code(result) == 1
+    assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == ["onnx/model.onnx"]
+
+
+def test_scan_model_directory_hf_cache_onnx_external_data_uses_snapshot_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Local scans over HF cache snapshots should resolve ONNX sidecars beside the snapshot alias."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_directory_or_file(
+        str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    assert failed_external == []
+    assert len(passed_external) == 1
+    assert_only_onnx_external_schema_validation_skipped(result)
+
+
+def test_scan_model_directory_hf_cache_onnx_external_data_accepts_symlinked_cache_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Configured HF cache roots reached through symlinks should still trust snapshot aliases."""
+    real_hub = tmp_path / "real-hub"
+    link_hub = tmp_path / "link-hub"
+    real_hub.mkdir()
+    link_hub.symlink_to(real_hub, target_is_directory=True)
+    monkeypatch.setenv("HF_HUB_CACHE", str(link_hub))
+
+    cache_root = link_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_directory_or_file(
+        str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    symlink_traversal_checks = [
+        check for check in result.checks if check.name == "CVE-2026-34447: External Data Symlink Traversal"
+    ]
+
+    assert failed_external == []
+    assert len(passed_external) == 1
+    assert symlink_traversal_checks == []
+    assert_only_onnx_external_schema_validation_skipped(result)
+
+
+def test_scan_model_directory_hf_cache_content_routed_onnx_external_data_accepts_symlinked_cache_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Extensionless ONNX aliases under symlinked HF cache roots should keep snapshot sidecar context."""
+    real_hub = tmp_path / "real-hub"
+    link_hub = tmp_path / "link-hub"
+    real_hub.mkdir()
+    link_hub.symlink_to(real_hub, target_is_directory=True)
+    monkeypatch.setenv("HF_HUB_CACHE", str(link_hub))
+
+    cache_root = link_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / "renamed").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_directory_or_file(
+        str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    symlink_traversal_checks = [
+        check for check in result.checks if check.name == "CVE-2026-34447: External Data Symlink Traversal"
+    ]
+
+    assert failed_external == []
+    assert len(passed_external) == 1
+    assert symlink_traversal_checks == []
+    assert_only_onnx_external_schema_validation_skipped(result)
+
+
+def test_scan_model_directory_hf_cache_onnx_external_data_rejects_nested_cache_lookalike(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Nested models--* directories under a configured hub root must not become trusted cache roots."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    fake_cache_root = cache_hub / "scratch" / "models--test--model"
+    blobs_dir = fake_cache_root / "blobs"
+    snapshot_dir = fake_cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_directory_or_file(
+        str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    traversal_issues = [issue for issue in result.issues if "path traversal" in issue.message.lower()]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+
+    assert traversal_issues
+    assert passed_external == []
+    assert determine_exit_code(result) == 1
+
+
+def test_scan_model_directory_hf_cache_onnx_external_data_keeps_snapshot_alias_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Shared ONNX blobs must scan once per snapshot alias when sidecar aliases differ."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    blobs_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    valid_sidecar_blob = blobs_dir / "sidecar-valid"
+    short_sidecar_blob = blobs_dir / "sidecar-short"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    valid_sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    short_sidecar_blob.write_bytes(b"\x00")
+
+    valid_snapshot = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    missing_snapshot = cache_root / "snapshots" / ("b" * 40) / "onnx"
+    short_snapshot = cache_root / "snapshots" / ("c" * 40) / "onnx"
+    for snapshot_dir in (valid_snapshot, missing_snapshot, short_snapshot):
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (valid_snapshot / "model.onnx_data").symlink_to(os.path.relpath(valid_sidecar_blob, valid_snapshot))
+    (short_snapshot / "model.onnx_data").symlink_to(os.path.relpath(short_sidecar_blob, short_snapshot))
+
+    result = scan_model_directory_or_file(
+        str(cache_root / "snapshots"),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    failed_sizes = [
+        check
+        for check in result.checks
+        if check.name == "External Data Size Validation" and check.status.value == "failed"
+    ]
+    assert len(passed_external) == 2
+    assert len(failed_external) == 1
+    assert failed_external[0].location == str(missing_snapshot / "model.onnx_data")
+    assert len(failed_sizes) == 1
+    assert failed_sizes[0].details["actual_size"] == 1
+    assert determine_exit_code(result) == 1
 
 
 @pytest.mark.parametrize("delete_after_scan", [False, True])
@@ -1459,6 +2016,77 @@ def test_scan_model_streaming_preserves_openvino_companion_when_bin_arrives_firs
     assert not any(check.rule_code == "S901" for check in result.checks)
 
 
+def test_scan_model_streaming_preserves_executable_openvino_bin_sidecar_route(tmp_path: Path) -> None:
+    """Executable same-stem .bin content must not be consumed only by OpenVINO XML scanning."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    create_mock_pytorch_zip(bin_path, malicious=True)
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, False), (xml_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        skip_file_types=True,
+    )
+
+    assert determine_exit_code(result) == 1
+    assert result.files_scanned == 2
+    assert "openvino" in result.scanner_names
+    assert "pytorch_zip" in result.scanner_names
+    assert not xml_path.exists()
+    assert not bin_path.exists()
+    assert result.file_metadata[str(xml_path)]["bin_size"] > 0
+    assert any(
+        issue.location and str(bin_path) in issue.location and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_executable_openvino_sidecar_counts_once_for_max_total_size(tmp_path: Path) -> None:
+    """Independently routed OpenVINO .bin sidecars must not be double-counted by XML accounting."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    create_mock_pytorch_zip(bin_path, malicious=False)
+    max_total_size = xml_path.stat().st_size + bin_path.stat().st_size
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, False), (xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        skip_file_types=True,
+        max_total_size=max_total_size,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.success is True
+    assert result.files_scanned == 2
+    assert "openvino" in result.scanner_names
+    assert "pytorch_zip" in result.scanner_names
+    assert result.bytes_scanned <= max_total_size
+    assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
+    assert not any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+
+
+def test_scan_model_streaming_keeps_benign_openvino_sidecar_accounting(tmp_path: Path) -> None:
+    """Benign OpenVINO weights remain accounted without standalone .bin scanner routing."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(xml_path), compute_sha256_hash(bin_path)])
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, False), (xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        skip_file_types=True,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.scanner_names == ["openvino"]
+    assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
+    assert result.bytes_scanned == xml_path.stat().st_size + bin_path.stat().st_size
+    assert result.content_hash == expected_hash
+
+
 def test_scan_model_streaming_preserves_path_sensitive_openvino_companions_with_duplicate_basenames(
     tmp_path: Path,
 ) -> None:
@@ -1554,6 +2182,157 @@ def test_scan_model_streaming_openvino_prefetched_companion_changes_content_hash
     assert first_result.content_hash is not None
     assert second_result.content_hash is not None
     assert first_result.content_hash != second_result.content_hash
+
+
+def test_scan_model_streaming_onnx_external_data_contributes_content_hash(tmp_path: Path) -> None:
+    """A staged ONNX external_data sidecar must remain part of the streaming aggregate hash."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(struct.pack("f", 1.0))
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert_only_onnx_external_schema_validation_skipped(result)
+    assert result.content_hash == expected_hash
+
+    sidecar_path.write_bytes(struct.pack("f", 2.0))
+    changed_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+    changed_result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert_only_onnx_external_schema_validation_skipped(changed_result)
+    assert changed_result.content_hash == changed_hash
+    assert changed_result.content_hash != result.content_hash
+
+
+def test_scan_model_streaming_onnx_external_data_refetch_does_not_duplicate_content_hash(
+    tmp_path: Path,
+) -> None:
+    """A selected sidecar later re-fetched as ONNX context should stay one aggregate member."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    model_payload = create_external_onnx_payload(tmp_path)
+    sidecar_payload = struct.pack("f", 1.0)
+
+    model_path.write_bytes(model_payload)
+    sidecar_path.write_bytes(sidecar_payload)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(sidecar_path), compute_sha256_hash(model_path)])
+    model_path.unlink()
+    sidecar_path.unlink()
+
+    def refetched_sidecar_generator() -> Iterator[tuple[Path, bool]]:
+        sidecar_path.write_bytes(sidecar_payload)
+        yield sidecar_path, False
+        model_path.write_bytes(model_payload)
+        sidecar_path.write_bytes(sidecar_payload)
+        yield model_path, True
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=1)
+        result = scan_model_streaming(
+            file_generator=refetched_sidecar_generator(),
+            timeout=30,
+            delete_after_scan=True,
+            cache_enabled=False,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+
+    assert result.content_hash == expected_hash
+    assert result.bytes_scanned == 2
+    assert mock_scan.call_args_list[0].args[0] == str(sidecar_path)
+    assert mock_scan.call_args_list[1].args[0] == str(model_path)
+
+
+def test_scan_model_streaming_onnx_external_data_counts_toward_max_total_size(tmp_path: Path) -> None:
+    """Staged ONNX external_data sidecars must count against total streaming caps."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    sidecar_size = 64
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(b"\x00" * sidecar_size)
+    max_total_size = model_path.stat().st_size + sidecar_size - 1
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        max_total_size=max_total_size,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.bytes_scanned > max_total_size
+    assert result.bytes_scanned >= model_path.stat().st_size + sidecar_size
+    assert result.content_hash is None
+    assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+
+
+def test_scan_model_streaming_onnx_external_data_over_total_cap_skips_sidecar_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized ONNX external_data context must not be read for aggregate hashing."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    sidecar_size = 64
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(b"\x00" * sidecar_size)
+    max_total_size = model_path.stat().st_size + sidecar_size - 1
+    hashed_paths: list[Path] = []
+
+    def track_hash(path: Path) -> str:
+        hashed_paths.append(path)
+        if path == sidecar_path:
+            pytest.fail("streaming ONNX external_data sidecar must not be hashed past max_total_size")
+        return "a" * 64
+
+    monkeypatch.setattr("modelaudit.utils.helpers.file_hash.compute_sha256_hash", track_hash)
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        max_total_size=max_total_size,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert model_path in hashed_paths
+    assert sidecar_path not in hashed_paths
+    assert result.bytes_scanned > max_total_size
+    assert result.content_hash is None
+    assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "External Data Reference Check"
+        and check.status.value == "failed"
+        and check.details.get("file") == "model.onnx_data"
+        for check in result.checks
+    )
 
 
 def test_scan_model_streaming_hashes_reused_path_file_instances(tmp_path: Path) -> None:
@@ -2473,6 +3252,225 @@ def test_scan_model_streaming_hf_cache_symlink_reports_snapshot_path(
     assert check_locations["Layout Inspection"] == f"{model_link}:tensor"
 
 
+def test_scan_model_streaming_hf_cache_onnx_external_data_uses_snapshot_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Streaming scans over trusted HF cache aliases should keep ONNX sidecar context."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    model_link = snapshot_dir / "model.onnx"
+    sidecar_link = snapshot_dir / "model.onnx_data"
+    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(snapshot_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    symlink_traversal_checks = [
+        check for check in result.checks if check.name == "CVE-2026-34447: External Data Symlink Traversal"
+    ]
+
+    assert failed_external == []
+    assert len(passed_external) == 1
+    assert symlink_traversal_checks == []
+    assert_only_onnx_external_schema_validation_skipped(result)
+
+
+def test_scan_model_streaming_hf_cache_onnx_external_data_dedupes_yielded_alias_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """A yielded HF sidecar alias should count once when also used as ONNX context."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    model_link = snapshot_dir / "model.onnx"
+    sidecar_link = snapshot_dir / "model.onnx_data"
+    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    yielded_paths = {path for path, _is_last in iterate_files_streaming(snapshot_dir)}
+    assert yielded_paths == {model_link, sidecar_link}
+
+    unique_bytes = model_blob.stat().st_size + sidecar_blob.stat().st_size
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_link), compute_sha256_hash(sidecar_link)])
+
+    def scan_file_side_effect(path: str, config: dict[str, Any]) -> ScanResult:
+        return create_mock_scan_result(bytes_scanned=Path(path).stat().st_size)
+
+    with patch("modelaudit.core.scan_file", side_effect=scan_file_side_effect):
+        result = scan_model_streaming(
+            file_generator=iterate_files_streaming(snapshot_dir),
+            timeout=30,
+            delete_after_scan=False,
+            scan_root=str(snapshot_dir),
+            cache_enabled=False,
+            max_total_size=unique_bytes,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+
+    assert result.bytes_scanned == unique_bytes
+    assert result.content_hash == expected_hash
+    assert not any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+    assert determine_exit_code(result) == 0
+
+
+def test_scan_model_streaming_scans_consumed_scannable_onnx_external_data_alias(tmp_path: Path) -> None:
+    """A consumed ONNX sidecar alias must still dispatch to an enabled scanner."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "payload.bin"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path, external_path=sidecar_path.name))
+    create_malicious_pickle(sidecar_path)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+    duplicate_sidecar_hash = compute_aggregate_hash(
+        [compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path), compute_sha256_hash(sidecar_path)]
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, False), (sidecar_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx", "pickle"],
+    )
+
+    pickle_issues = [
+        issue
+        for issue in result.issues
+        if issue.location == str(sidecar_path) and issue.severity == IssueSeverity.CRITICAL
+    ]
+    assert any("system" in issue.message.lower() for issue in pickle_issues)
+    assert result.content_hash == expected_hash
+    assert result.content_hash != duplicate_sidecar_hash
+
+
+def test_scan_model_streaming_hf_cache_context_only_onnx_external_data_contributes_hash_and_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Trusted HF snapshot sidecar aliases should be hashed even when yielded only as context."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    model_link = snapshot_dir / "model.onnx"
+    sidecar_link = snapshot_dir / "model.onnx_data"
+    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_link), compute_sha256_hash(sidecar_link)])
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_link, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert_only_onnx_external_schema_validation_skipped(result)
+    assert result.files_scanned == 1
+    assert result.content_hash == expected_hash
+    assert result.bytes_scanned >= model_blob.stat().st_size + sidecar_blob.stat().st_size
+
+
+def test_scan_model_streaming_hf_cache_onnx_external_data_rejects_nested_cache_lookalike(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Nested models--* lookalikes must not gain trusted HF cache alias handling."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    fake_cache_root = cache_hub / "scratch" / "models--test--model"
+    blobs_dir = fake_cache_root / "blobs"
+    snapshot_dir = fake_cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(snapshot_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    traversal_issues = [issue for issue in result.issues if "path traversal" in issue.message.lower()]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+
+    assert traversal_issues
+    assert passed_external == []
+    assert determine_exit_code(result) == 1
+
+
 def test_scan_model_streaming_with_deletion(temp_test_files: list[Path]) -> None:
     """Test that files are deleted after scanning in streaming mode."""
 
@@ -2648,7 +3646,7 @@ def test_scan_model_streaming_informational_failed_scan_does_not_set_operational
         )
 
     assert result.files_scanned == 2
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is False
     assert determine_exit_code(result) == 1
 
@@ -2753,6 +3751,36 @@ def test_scan_model_streaming_oversized_renamed_safetensors_fails_before_hashing
     assert determine_exit_code(result) == 2
     assert "safetensors" in result.scanner_names
     assert any(check.name == "Header Size Limit" for check in result.checks)
+
+
+def test_scan_model_streaming_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "large-userblock-model.h5"
+    userblock_size = write_large_valid_userblock_keras_hdf5(payload)
+    assert find_hdf5_signature_offset(str(payload)) == userblock_size
+
+    monkeypatch.setattr(
+        "modelaudit.utils.helpers.file_hash.compute_sha256_hash",
+        lambda _path: pytest.fail("streaming large file-backed HDF5 artifact must not be whole-file hashed"),
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    metadata = result.file_metadata[str(payload)]
+    assert result.files_scanned == 1
+    assert result.content_hash is None
+    assert "keras_h5" in result.scanner_names
+    assert metadata["file_backed_scan"] is True
+    assert metadata["file_hashes"] is None
+    assert "hdf5_userblock_zip_probe_incomplete" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 2
 
 
 def test_scan_model_streaming_does_not_hash_files_over_max_file_size(

@@ -12,6 +12,7 @@ import faulthandler
 import functools
 import importlib
 import io
+import json
 import logging
 import marshal
 import os
@@ -139,6 +140,139 @@ def _short_binunicode(data: bytes) -> bytes:
 
 def _global(module: bytes, name: bytes) -> bytes:
     return b"c" + module + b"\n" + name + b"\n"
+
+
+_HF_TRAINING_ARGS_METADATA_REFERENCES = frozenset(
+    {
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("torch", "bfloat16"),
+        ("torch", "device"),
+        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+        ("transformers.training_args", "TrainingArguments"),
+    }
+)
+_HF_TRAINING_ARGS_REDUCE_REFERENCES = frozenset(
+    {
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("torch", "device"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+    }
+)
+
+
+def _pytorch_storage_persistent_id_payload(
+    key: str,
+    *,
+    storage_module: str = "torch",
+    storage_name: str = "FloatStorage",
+    size_opcode: bytes = b"K\x01",
+) -> bytes:
+    key_bytes = key.encode("ascii")
+    return (
+        b"\x80\x04("
+        + _short_binunicode(b"storage")
+        + _short_binunicode(storage_module.encode("ascii"))
+        + _short_binunicode(storage_name.encode("ascii"))
+        + b"\x93"
+        + _short_binunicode(key_bytes)
+        + _short_binunicode(b"cpu")
+        + size_opcode
+        + b"tQ."
+    )
+
+
+def _pytorch_storage_protocol0_persistent_id_payload(
+    key: str,
+    *,
+    storage_qualname: str = "torch.FloatStorage",
+    size: int = 1,
+) -> bytes:
+    return f"(dp0\nVx\np1\nP('storage', <class '{storage_qualname}'>, '{key}', 'cpu', {size})\ns.".encode("ascii")
+
+
+def _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload(key: str) -> bytes:
+    payload = _pytorch_storage_protocol0_persistent_id_payload(key)
+    assert payload.endswith(b".")
+    return payload[:-1] + b"Parbitrary-storage-key\n0."
+
+
+def _pytorch_storage_persistent_id_payload_with_extra_field(key: str) -> bytes:
+    payload = _pytorch_storage_persistent_id_payload(key)
+    assert payload.endswith(b"tQ.")
+    return payload[:-3] + _short_binunicode(b"evil") + b"tQ."
+
+
+def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
+    return (
+        b"\x80\x04("
+        + b"C\x07storage\x94"
+        + b"C\x0bFakeStorage\x94"
+        + _short_binunicode(key.encode("ascii"))
+        + _short_binunicode(b"cpu")
+        + b"K\x01tQ."
+    )
+
+
+def _large_proto0_system_payload() -> bytes:
+    return b"cposix\nsystem\n(S'" + (b"A" * 10_000) + b"'\ntR."
+
+
+def _protocol_less_framed_malicious_storage_payload() -> bytes:
+    return b"cposix\nsystem\n(S'echo hidden'\ntR" + b"\x95" + (100).to_bytes(8, "little") + b"abc"
+
+
+def _frame_first_large_malicious_eval_pickle_payload() -> bytes:
+    benign_prefix = b"N0" * 2100
+    dangerous_suffix = b"cbuiltins\neval\n(S'print(1)'\ntR."
+    body = benign_prefix + dangerous_suffix
+    payload = b"\x95" + len(body).to_bytes(8, "little") + body
+    assert payload[0] == 0x95
+    assert int.from_bytes(payload[1:9], "little") > 4 * 1024
+    assert payload.find(b"cbuiltins\neval\n") > 4 * 1024
+    assert payload.rfind(b".") > 4 * 1024
+    return payload
+
+
+def _frame_first_raw_storage_bytes() -> bytes:
+    return b"\x95" + (10_000).to_bytes(8, "little") + (b"\x00" * 4096)
+
+
+def _large_length_prefixed_malicious_payload() -> bytes:
+    declared_payload = b"A" * 10_000
+    return (
+        b"\x80\x04B"
+        + len(declared_payload).to_bytes(4, "little")
+        + declared_payload
+        + pickle.dumps(MaliciousPayload(), protocol=4)
+    )
+
+
+def _pickleish_tensor_storage_bytes() -> bytes:
+    # Minimal prefix from pinned PiD raw tensor storage that looks like a pickle FRAME crossing STOP.
+    return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
+
+
+def _binary_magic_tensor_storage_bytes() -> bytes:
+    return b"\x80\x04\x00" + (b"\x00" * 128)
+
+
+def _writestr_preserving_member_name(archive: zipfile.ZipFile, member_name: str, data: bytes) -> None:
+    info = zipfile.ZipInfo("placeholder")
+    info.filename = member_name
+    archive.writestr(info, data)
 
 
 def _binunicode(data: bytes) -> bytes:
@@ -307,6 +441,445 @@ def _dangerous_getattr_findings(report: PickleReport) -> tuple[Finding, ...]:
 
 def _binunicode8(data: bytes) -> bytes:
     return b"\x8d" + len(data).to_bytes(8, "little") + data
+
+
+def _reference_global(module: str, name: str) -> bytes:
+    return _global(module.encode("ascii"), name.encode("ascii"))
+
+
+def _metadata_reduce_payload(module: str, name: str, value: bytes = b"metadata") -> bytes:
+    return _reference_global(module, name) + _binunicode(value) + b"\x85R"
+
+
+def _metadata_newobj_build_payload(module: str, name: str) -> bytes:
+    return _reference_global(module, name) + b")\x81}b"
+
+
+def _metadata_build_payload(module: str, name: str) -> bytes:
+    return _reference_global(module, name) + b"}b"
+
+
+def _metadata_memoized_newobj_build_then_reduce_payload(module: str, name: str) -> bytes:
+    return _reference_global(module, name) + b"q\x00)\x81}b0h\x00)R"
+
+
+def _hf_training_args_metadata_payload() -> bytes:
+    items = [
+        _metadata_newobj_build_payload("transformers.training_args", "TrainingArguments"),
+        _metadata_reduce_payload("transformers.trainer_utils", "IntervalStrategy", b"steps"),
+        _metadata_reduce_payload("transformers.trainer_utils", "SchedulerType", b"linear"),
+        _metadata_reduce_payload("transformers.trainer_utils", "SaveStrategy", b"steps"),
+        _metadata_newobj_build_payload("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        _metadata_reduce_payload("transformers.training_args", "OptimizerNames", b"adamw_torch"),
+        _metadata_reduce_payload("transformers.trainer_utils", "HubStrategy", b"every_save"),
+        _metadata_newobj_build_payload("accelerate.state", "PartialState"),
+        _metadata_reduce_payload("torch", "device", b"cpu"),
+        _metadata_reduce_payload("accelerate.utils.dataclasses", "DistributedType", b"NO"),
+        _metadata_newobj_build_payload("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        _metadata_newobj_build_payload("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        _reference_global("torch", "bfloat16"),
+        _metadata_newobj_build_payload("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+    ]
+    return b"\x80\x02](" + b"".join(items) + b"e."
+
+
+def _hf_training_args_import_only_metadata_payload() -> bytes:
+    return (
+        b"\x80\x02]("
+        + b"".join(_reference_global(module, name) for module, name in sorted(_HF_TRAINING_ARGS_METADATA_REFERENCES))
+        + b"e."
+    )
+
+
+_SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD = (
+    b"\x80\x02cnumpy._core.multiarray\n_reconstruct\nq\x00cnumpy\nndarray\nq\x01K\x00\x85q\x02"
+    b"c_codecs\nencode\nq\x03X\x01\x00\x00\x00bq\x04X\x06\x00\x00\x00latin1q\x05\x86q\x06"
+    b"Rq\x07\x87q\x08Rq\t(K\x01K\x03\x85q\ncnumpy\ndtype\nq\x0bX\x02\x00\x00\x00u4q\x0c"
+    b"\x89\x88\x87q\rRq\x0e(K\x03X\x01\x00\x00\x00<q\x0fNNNJ\xff\xff\xff\xffJ\xff\xff\xff\xff"
+    b"K\x00tq\x10b\x89h\x03X\x0c\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00"
+    b"q\x11h\x05\x86q\x12Rq\x13tq\x14b."
+)
+_MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD = b"cnumpy._core.multiarray\n_reconstruct\n(NtR."
+
+
+def _force_framework_metadata_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
+        lambda _module_name: "unresolved",
+    )
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._resolve_module_source", lambda _module_name: None)
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+
+
+_SHADOW_FRAMEWORK_MODULE = "transformers.training_args"
+_SHADOW_FRAMEWORK_NAME = "TrainingArguments"
+
+
+def _stack_global_reference_payload(protocol: int) -> bytes:
+    return (
+        bytes((0x80, protocol))
+        + _short_binunicode(_SHADOW_FRAMEWORK_MODULE.encode("ascii"))
+        + b"\x94"
+        + _short_binunicode(_SHADOW_FRAMEWORK_NAME.encode("ascii"))
+        + b"\x94\x93"
+    )
+
+
+def _shadow_newobj_build_payload(protocol: int = 4) -> bytes:
+    return _stack_global_reference_payload(protocol) + b")\x81}b."
+
+
+def _shadow_memo_alias_payload() -> bytes:
+    return _stack_global_reference_payload(4) + b"\x94" + b"0" + b"h\x02)\x81}b."
+
+
+def _shadow_newobj_ex_payload() -> bytes:
+    return _stack_global_reference_payload(4) + b")}\x92}b."
+
+
+def _shadow_slot_state_build_payload() -> bytes:
+    return (
+        _stack_global_reference_payload(4)
+        + b")\x81N}"
+        + _short_binunicode(b"payload")
+        + _short_binunicode(b"owned")
+        + b"s\x86b."
+    )
+
+
+def _bytes_literal_payload(payload: bytes) -> bytes:
+    return b"\x80\x04B" + len(payload).to_bytes(4, "little") + payload + b"."
+
+
+def _extension_reconstruction_payload(opcode: bytes, encoded_code: bytes) -> bytes:
+    return b"\x80\x04" + opcode + encoded_code + b")\x81}b."
+
+
+def _shadow_framework_divergence_cases() -> tuple[object, ...]:
+    nested = _shadow_newobj_build_payload(4)
+    return (
+        pytest.param("protocol4_stack_global", _shadow_newobj_build_payload(4), "single", None, id="protocol4"),
+        pytest.param("protocol5_stack_global", _shadow_newobj_build_payload(5), "single", None, id="protocol5"),
+        pytest.param("memo_alias", _shadow_memo_alias_payload(), "single", None, id="memo-alias"),
+        pytest.param("newobj_ex", _shadow_newobj_ex_payload(), "single", None, id="newobj-ex"),
+        pytest.param("slot_state_build", _shadow_slot_state_build_payload(), "single", None, id="slot-state-build"),
+        pytest.param("nested_stream", _bytes_literal_payload(nested), "nested", None, id="nested"),
+        pytest.param("concatenated_stream", b"\x80\x04N." + nested, "concatenated", None, id="concatenated"),
+        pytest.param("ext1_control", _extension_reconstruction_payload(b"\x82", b"\x01"), "single", 1, id="ext1"),
+        pytest.param(
+            "ext2_control",
+            _extension_reconstruction_payload(b"\x83", (256).to_bytes(2, "little")),
+            "single",
+            256,
+            id="ext2",
+        ),
+        pytest.param(
+            "ext4_control",
+            _extension_reconstruction_payload(b"\x84", (70_000).to_bytes(4, "little")),
+            "single",
+            70_000,
+            id="ext4",
+        ),
+    )
+
+
+def _write_shadow_transformers_package(package_root: Path, marker: Path) -> None:
+    package_dir = package_root / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                f"_MARKER = Path({str(marker)!r})",
+                "class TrainingArguments:",
+                "    __slots__ = ('payload',)",
+                "    def __new__(cls, *args, **kwargs):",
+                "        return object.__new__(cls)",
+                "    def __setstate__(self, state):",
+                "        _MARKER.write_text('setstate', encoding='utf-8')",
+                "    def __setattr__(self, name, value):",
+                "        _MARKER.write_text(f'setattr:{name}', encoding='utf-8')",
+                "        object.__setattr__(self, name, value)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_init_inert_setstate_transformers_package(site_packages: Path, marker: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                f"MARKER = {str(marker)!r}",
+                "class TrainingArguments:",
+                "    def __new__(cls, *args, **kwargs):",
+                "        return object.__new__(cls)",
+                "    def __setstate__(self, state):",
+                "        with open(MARKER, 'w', encoding='utf-8') as handle:",
+                "            handle.write('setstate')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_import_side_effect_transformers_package(site_packages: Path, marker: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                f"MARKER = {str(marker)!r}",
+                "with open(MARKER, 'w', encoding='utf-8') as handle:",
+                "    handle.write('import')",
+                "class OptimizerNames:",
+                "    pass",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_rebindable_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "class TrainingArguments:",
+                "    def __new__(cls):",
+                "        return object.__new__(cls)",
+                "",
+                "class OptimizerNames:",
+                "    def __new__(cls, value=''):",
+                "        return object.__new__(cls)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_init_heavy_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "HELPER = object()",
+                "class TrainingArguments:",
+                "    def __new__(cls):",
+                "        return object.__new__(cls)",
+                "    def __init__(self):",
+                "        self.helper = HELPER",
+                "    def __setstate__(self, state):",
+                "        self.__dict__.update(state)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_enum_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "trainer_utils.py").write_text(
+        "\n".join(
+            [
+                "from enum import Enum",
+                "class IntervalStrategy(str, Enum):",
+                "    STEPS = 'steps'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_rebindable_trusted_torch_utils_package(site_packages: Path) -> None:
+    package_dir = site_packages / "torch"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "_utils.py").write_text(
+        "\n".join(
+            [
+                "def _rebuild_tensor(arg):",
+                "    return None",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_cross_module_rebind_target_package(site_packages: Path) -> None:
+    (site_packages / "trusted_target.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "def rebound_optimizer(path):",
+                "    Path(path).write_text('cross-module', encoding='utf-8')",
+                "    return None",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_runtime_mutable_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "def OptimizerNames(value, callback=None):",
+                "    if callback is not None:",
+                "        return callback(value)",
+                "    return None",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_same_module_rebind_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "def OptimizerNames(value=''):",
+                "    return None",
+                "def rebound_optimizer(path):",
+                "    Path(path).write_text('same-module', encoding='utf-8')",
+                "    return None",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_non_inert_trusted_transformers_package(site_packages: Path, marker: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                f"_INIT_MARKER = Path({str(marker)!r})",
+                "_INIT_MARKER.write_text('imported', encoding='utf-8')",
+                "def OptimizerNames(value=''):",
+                "    return None",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_sitecustomize_trusting_site_packages(customize_dir: Path, site_packages: Path) -> None:
+    customize_dir.mkdir(parents=True, exist_ok=True)
+    (customize_dir / "sitecustomize.py").write_text(
+        "\n".join(
+            [
+                "import sysconfig",
+                f"_TRUSTED_SITE_PACKAGES = {str(site_packages)!r}",
+                "_ORIGINAL_GET_PATH = sysconfig.get_path",
+                "def _patched_get_path(name, scheme=None, vars=None, expand=True):",
+                "    if name in {'purelib', 'platlib'}:",
+                "        return _TRUSTED_SITE_PACKAGES",
+                "    if scheme is None and vars is None and expand is True:",
+                "        return _ORIGINAL_GET_PATH(name)",
+                "    return _ORIGINAL_GET_PATH(name, scheme=scheme, vars=vars, expand=expand)",
+                "sysconfig.get_path = _patched_get_path",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _preimport_rebound_subprocess_env(tmp_path: Path, site_packages: Path) -> dict[str, str]:
+    customize_dir = tmp_path / "sitecustomize"
+    _write_sitecustomize_trusting_site_packages(customize_dir, site_packages)
+    package_src = Path(__file__).resolve().parents[1] / "src"
+    pythonpath = os.pathsep.join(
+        entry
+        for entry in (
+            str(customize_dir),
+            str(site_packages),
+            str(package_src),
+            os.environ.get("PYTHONPATH", ""),
+        )
+        if entry
+    )
+    return {**os.environ, "PYTHONPATH": pythonpath}
+
+
+def _assert_shadow_framework_unpickle_executes(
+    payload_path: Path,
+    tmp_path: Path,
+    *,
+    mode: str,
+    extension_code: int | None,
+) -> None:
+    marker = tmp_path / f"{payload_path.stem}.marker"
+    package_root = tmp_path / f"{payload_path.stem}.shadow"
+    _write_shadow_transformers_package(package_root, marker)
+    code_arg = "none" if extension_code is None else str(extension_code)
+    script = (
+        "import copyreg, io, pickle, sys\n"
+        "from pathlib import Path\n"
+        "payload = Path(sys.argv[1]).read_bytes()\n"
+        "mode = sys.argv[2]\n"
+        "code_arg = sys.argv[3]\n"
+        "if code_arg != 'none':\n"
+        "    copyreg.add_extension('transformers.training_args', 'TrainingArguments', int(code_arg))\n"
+        "if mode == 'nested':\n"
+        "    pickle.loads(pickle.loads(payload))\n"
+        "elif mode == 'concatenated':\n"
+        "    stream = io.BytesIO(payload)\n"
+        "    while stream.tell() < len(payload):\n"
+        "        pickle.load(stream)\n"
+        "else:\n"
+        "    pickle.loads(payload)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), mode, code_arg],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(package_root)},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert marker.exists()
+
+
+def _import_reference_pairs(report: PickleReport) -> set[tuple[str, str]]:
+    references = cast(tuple[collections.abc.Mapping[str, object], ...], report.metadata.get("import_references", ()))
+    return {(str(reference.get("module", "")), str(reference.get("name", ""))) for reference in references}
 
 
 def _concrete_pathlib_class_name() -> str:
@@ -2060,7 +2633,6 @@ def test_scan_bytes_flags_canonical_pytorch_storage_persistent_ids() -> None:
     report = scan_bytes(payload, source="pytorch-storage.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
         for finding in report.findings
@@ -2092,7 +2664,6 @@ def test_scan_bytes_marks_global_pytorch_storage_persistent_id_import_reference(
     report = scan_bytes(payload, source="global-pytorch-storage.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
     import_references = cast(tuple[dict[str, object], ...], report.metadata.get("import_references", ()))
     assert any(
         reference.get("import_reference") == "torch.FloatStorage"
@@ -2101,6 +2672,136 @@ def test_scan_bytes_marks_global_pytorch_storage_persistent_id_import_reference(
     )
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
     assert report.notices == ()
+
+
+def test_scan_bytes_marks_only_pytorch_storage_global_used_by_persistent_id() -> None:
+    payload = (
+        b"\x80\x04("
+        + _short_binunicode(b"storage")
+        + _short_binunicode(b"torch")
+        + _short_binunicode(b"FloatStorage")
+        + b"\x93"
+        + _short_binunicode(b"k")
+        + _short_binunicode(b"cpu")
+        + b"K\x01tQ0"
+        + _short_binunicode(b"torch")
+        + _short_binunicode(b"IntStorage")
+        + b"\x93."
+    )
+
+    report = scan_bytes(payload, source="mixed-pytorch-storage-globals.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    import_references = cast(tuple[dict[str, object], ...], report.metadata.get("import_references", ()))
+    storage_references = [
+        reference
+        for reference in import_references
+        if reference.get("module") == "torch" and str(reference.get("name", "")).endswith("Storage")
+    ]
+    assert [reference.get("name") for reference in storage_references] == ["FloatStorage", "IntStorage"]
+    assert [
+        reference.get("name")
+        for reference in storage_references
+        if reference.get("pytorch_storage_persistent_id") is True
+    ] == ["FloatStorage"]
+    assert "pytorch_storage_persistent_id" not in package_api._canonical_pytorch_storage_import_reference(
+        {
+            "module": "torch",
+            "name": "IntStorage",
+            "position": 999,
+            "pytorch_storage_persistent_id": True,
+        },
+        proven_canonical_storage_ids=True,
+        storage_global_positions={10},
+    )
+
+
+def test_scan_bytes_does_not_warn_for_library_pytorch_storage_persistent_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = (
+        b"\x80\x02("
+        + _binunicode(b"storage")
+        + _global(b"torch", b"FloatStorage")
+        + _binunicode(b"k")
+        + _binunicode(b"cpu")
+        + b"K\x01tQ."
+    )
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(payload, source="library-pytorch-storage.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert not any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch.FloatStorage"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_for_shadowed_pytorch_storage_persistent_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-torch-storage-marker"
+    torch_dir = tmp_path / "torch"
+    torch_dir.mkdir()
+    (torch_dir / "__init__.py").write_text(
+        f"open({str(marker)!r}, 'w').write('imported')\nclass FloatStorage:\n    pass\n",
+        encoding="utf-8",
+    )
+    payload = (
+        b"\x80\x02("
+        + _binunicode(b"storage")
+        + _global(b"torch", b"FloatStorage")
+        + _binunicode(b"k")
+        + _binunicode(b"cpu")
+        + b"K\x01tQ."
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(payload, source="shadowed-pytorch-storage.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert marker.exists() is False
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch.FloatStorage"
+        for finding in report.findings
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "\n".join(
+                [
+                    "import pickle",
+                    "try:",
+                    f"    pickle.loads({payload!r})",
+                    "except Exception:",
+                    "    pass",
+                    "",
+                ]
+            ),
+        ],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "imported"
 
 
 def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() -> None:
@@ -2117,7 +2818,27 @@ def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() 
             + terminator
         )
 
-    storage_names = [f"Synthetic{index}Storage" for index in range(33)]
+    storage_names = [
+        "BFloat16Storage",
+        "BoolStorage",
+        "ByteStorage",
+        "CharStorage",
+        "ComplexDoubleStorage",
+        "ComplexFloatStorage",
+        "DoubleStorage",
+        "FloatStorage",
+        "HalfStorage",
+        "IntStorage",
+        "LongStorage",
+        "QInt32Storage",
+        "QInt8Storage",
+        "QUInt8Storage",
+        "QUInt4x2Storage",
+        "QUInt2x4Storage",
+        "ShortStorage",
+        "UntypedStorage",
+    ]
+    storage_names = [storage_names[index % len(storage_names)] for index in range(33)]
     payload = b"\x80\x04" + b"".join(
         storage_persistent_id(name, str(index), b"." if index == len(storage_names) - 1 else b"0")
         for index, name in enumerate(storage_names)
@@ -2126,7 +2847,6 @@ def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() 
     report = scan_bytes(payload, source="many-pytorch-storage-persistent-ids.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH_LIMIT" for finding in report.findings)
     storage_references = [
         reference
@@ -2137,13 +2857,66 @@ def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() 
     assert all(reference.get("pytorch_storage_persistent_id") is True for reference in storage_references)
 
 
+def test_scan_bytes_marks_only_matched_pytorch_storage_persistent_id_import_reference() -> None:
+    payload = _pytorch_storage_persistent_id_payload("0")
+    first_storage_position = payload.index(b"\x93")
+    payload = payload[:-1] + b"0" + _short_binunicode(b"torch") + _short_binunicode(b"FloatStorage") + b"\x93."
+    extra_storage_position = payload.rindex(b"\x93")
+
+    report = scan_bytes(payload, source="mixed-pytorch-storage-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    storage_references = [
+        reference
+        for reference in report.metadata["import_references"]
+        if reference.get("import_reference") == "torch.FloatStorage"
+    ]
+    assert len(storage_references) == 2
+    storage_flags_by_position = {
+        reference.get("position"): reference.get("pytorch_storage_persistent_id") for reference in storage_references
+    }
+    flagged_positions = [
+        reference.get("position")
+        for reference in storage_references
+        if reference.get("pytorch_storage_persistent_id") is True
+    ]
+    assert flagged_positions == [first_storage_position]
+    assert storage_flags_by_position[first_storage_position] is True
+    assert storage_flags_by_position.get(extra_storage_position) is not True
+
+
+def test_scan_bytes_does_not_mark_synthetic_torch_storage_name_as_storage_persistent_id() -> None:
+    payload = _pytorch_storage_persistent_id_payload("0", storage_name="SyntheticStorage")
+
+    report = scan_bytes(payload, source="synthetic-storage-name.pkl", enrich_call_graph=False)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    persistent_id_findings = [finding for finding in report.findings if finding.rule_code == "PERSISTENT_ID"]
+    assert persistent_id_findings
+    assert not any(finding.details.get("pytorch_storage_persistent_id") is True for finding in persistent_id_findings)
+    assert any(
+        finding.rule_code in {"DANGEROUS_CALL_GRAPH", "NON_ALLOWLISTED_GLOBAL"}
+        and (
+            finding.details.get("import_reference") == "torch.SyntheticStorage"
+            or (finding.details.get("module"), finding.details.get("name")) == ("torch", "SyntheticStorage")
+        )
+        for finding in report.findings
+    )
+    assert any(
+        reference.get("import_reference") == "torch.SyntheticStorage"
+        and reference.get("pytorch_storage_persistent_id") is not True
+        for reference in report.metadata["import_references"]
+    )
+
+
 def test_scan_bytes_flags_noncanonical_pytorch_storage_persistent_ids() -> None:
     payload = b"\x80\x04(\x8c\x07storage\x94\x8c\x12torch.FloatStorage\x94\x8c\x04evil\x94\x8c\x03cpu\x94K\x01tQ."
 
     report = scan_bytes(payload, source="noncanonical-pytorch-storage.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
         for finding in report.findings
@@ -2173,7 +2946,6 @@ def test_scan_bytes_flags_pytorch_storage_persistent_ids_with_bool_size() -> Non
     report = scan_bytes(payload, source="bool-sized-pytorch-storage.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
         for finding in report.findings
@@ -2190,7 +2962,6 @@ def test_scan_bytes_flags_pytorch_storage_persistent_ids_with_extra_fields() -> 
     report = scan_bytes(payload, source="extra-field-pytorch-storage.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
         for finding in report.findings
@@ -2539,17 +3310,421 @@ def test_scan_file_detects_hidden_pytorch_zip_pickle_member_with_data_pickle(tmp
 def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-        archive.writestr("archive/data/0", b"\x00" * 1024)
+        archive.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
         archive.writestr("archive/notes", b"cat is a category label, not a GLOBAL opcode stream")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_does_not_route_binary_magic_storage_blob_without_opcode(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", _binary_magic_tensor_storage_bytes())
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_does_not_route_frame_first_storage_blob_without_opcode(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", _frame_first_raw_storage_bytes())
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_routes_protocol0_storage_blob_as_raw_storage(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_protocol0_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_trusts_protocol0_storage_persid_in_data_pkl(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_protocol0_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 8)
 
     report = scan_file(archive_path)
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_keeps_arbitrary_protocol0_persid_warning_in_data_pkl(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    payload = b"Parbitrary-storage-key\n0" + _pytorch_storage_protocol0_persistent_id_payload("0")
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 8)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert any(
+        finding.rule_code == "PERSISTENT_ID"
+        and finding.details.get("opcode") == "PERSID"
+        and finding.details.get("persistent_id_preview") == 'str:"arbitrary-storage-key"'
+        for finding in report.findings
+    )
+    assert not any(
+        finding.rule_code == "PERSISTENT_ID"
+        and finding.details.get("persistent_id_preview")
+        == "str:\"('storage', <class 'torch.FloatStorage'>, '0', 'cpu', 1)\""
+        for finding in report.findings
+    )
+
+
+def test_scan_file_keeps_storage_first_mixed_protocol0_persid_warning_in_data_pkl(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    payload = _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload("0")
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 8)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert any(
+        finding.rule_code == "PERSISTENT_ID"
+        and finding.details.get("opcode") == "PERSID"
+        and finding.details.get("persistent_id_preview")
+        == "str:\"('storage', <class 'torch.FloatStorage'>, '0', 'cpu', 1)\""
+        for finding in report.findings
+    )
+
+
+def test_scan_file_keeps_noncanonical_protocol0_storage_persid_warning_in_data_pkl(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "archive/data.pkl",
+            _pytorch_storage_protocol0_persistent_id_payload("0", storage_qualname="torch.FakeStorage"),
+        )
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 8)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID"
+        and finding.details.get("opcode") == "PERSID"
+        and "torch.FakeStorage" in str(finding.details.get("persistent_id_preview"))
+        for finding in report.findings
+    )
+
+
+def test_scan_file_routes_torch_storage_untyped_storage_blob_as_raw_storage(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "archive/data.pkl",
+            _pytorch_storage_persistent_id_payload(
+                "0",
+                storage_module="torch.storage",
+                storage_name="UntypedStorage",
+            ),
+        )
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"cposix\nsystem\n(S'echo hidden'\ntR.",
+        _large_proto0_system_payload(),
+        pickle.dumps(MaliciousPayload(), protocol=4),
+        pickle.dumps({"pad": b"A" * 10_000, "payload": MaliciousPayload()}, protocol=4),
+        _large_length_prefixed_malicious_payload(),
+    ],
+)
+def test_scan_file_scans_referenced_storage_blob_when_it_is_a_pickle(payload: bytes, tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", payload)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_scans_referenced_storage_blob_with_truncated_frame(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", _protocol_less_framed_malicious_storage_payload())
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_scans_referenced_storage_blob_with_frame_first_large_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", _frame_first_large_malicious_eval_pickle_payload())
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        and finding.details.get("import_reference") == "builtins.eval"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("storage_member", [r"archive\data\0", "/archive/data/0"])
+def test_scan_file_scans_noncanonical_referenced_storage_aliases(
+    storage_member: str,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        _writestr_preserving_member_name(archive, storage_member, b"cposix\nsystem\n(S'echo hidden'\ntR.")
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    reported_storage_member = storage_member
+    if reported_storage_member not in report.metadata["pickle_files"]:
+        reported_storage_member = storage_member.replace("\\", "/")
+    assert reported_storage_member in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:{reported_storage_member}" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_keeps_unreferenced_storage_lookalike_on_hidden_pickle_path(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 1024)
+        archive.writestr("archive/data/999", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/999"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/999" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("data_pkl_payload", "include_version", "expected_notice_code"),
+    [
+        (_pytorch_storage_persistent_id_payload("1"), True, "pytorch_zip_storage_reference_missing_members"),
+        (_fake_byte_storage_persistent_id_payload("0"), True, None),
+        (_pytorch_storage_persistent_id_payload("0", storage_name="FakeStorage"), True, None),
+        (_pytorch_storage_protocol0_persistent_id_payload("0", storage_qualname="torch.FakeStorage"), True, None),
+        (_pytorch_storage_persistent_id_payload("0", size_opcode=b"\x88"), True, None),
+        (_pytorch_storage_persistent_id_payload_with_extra_field("0"), True, None),
+        (_pytorch_storage_persistent_id_payload("0")[:-1], True, "pytorch_zip_storage_reference_validation_failed"),
+        (_pytorch_storage_persistent_id_payload("0"), False, None),
+    ],
+)
+def test_scan_file_keeps_untrusted_storage_lookalikes_on_hidden_pickle_path(
+    data_pkl_payload: bytes,
+    include_version: bool,
+    expected_notice_code: str | None,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl_payload)
+        if include_version:
+            archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/data/0" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+    if expected_notice_code is not None:
+        assert any(notice.code == expected_notice_code for notice in report.notices)
+
+
+def test_scan_file_marks_storage_reference_opcode_budget_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(package_api, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    archive_path = tmp_path / "model.pt"
+    data_pkl_payload = b"\x80\x04" + (b"N" * 8) + _pytorch_storage_persistent_id_payload("0")[2:]
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"cposix\nsystem\n(S'echo hidden'\ntR.")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/data/0" in report.metadata["pickle_files"]
+    assert any(notice.code == "pytorch_zip_storage_reference_validation_failed" for notice in report.notices)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_storage_reference_total_budget_keeps_blob_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES",
+        len(_pytorch_storage_persistent_id_payload("0")) + 1,
+    )
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for index in range(2):
+            prefix = f"archive{index}/"
+            archive.writestr(f"{prefix}data.pkl", _pytorch_storage_persistent_id_payload("0"))
+            archive.writestr(f"{prefix}version", "3\n")
+            archive.writestr(f"{prefix}byteorder", "little")
+            archive.writestr(f"{prefix}data/0", b"cposix\nsystem\n(S'echo hidden'\ntR.")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert "archive1/data/0" in report.metadata["pickle_files"]
+    assert any(notice.code == "pytorch_zip_storage_reference_validation_failed" for notice in report.notices)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive1/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_storage_reference_opcode_budget_is_aggregate(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for index in range(2):
+            prefix = f"archive{index}/"
+            archive.writestr(f"{prefix}data.pkl", _pytorch_storage_persistent_id_payload("0"))
+            archive.writestr(f"{prefix}version", "3\n")
+            archive.writestr(f"{prefix}byteorder", "little")
+            archive.writestr(f"{prefix}data/0", b"cposix\nsystem\n(S'echo hidden'\ntR.")
+
+    report = scan_file(archive_path, options=ScanOptions(max_opcodes=13))
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert "archive1/data/0" in report.metadata["pickle_files"]
+    assert any(notice.code == "pytorch_zip_storage_reference_validation_failed" for notice in report.notices)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive1/data/0" in finding.location
+        for finding in report.findings
+    )
 
 
 def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp_path: Path) -> None:
@@ -4787,7 +5962,7 @@ def test_scan_bytes_detects_operator_setitem_constructed_object_protocol() -> No
     try:
         report = scan_bytes(payload, source="operator-setitem-constructed-object.pkl")
 
-        assert report.status == ScanStatus.COMPLETE
+        assert report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE}
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert _PROTOCOL_MUTATION_EVENTS == []
         assert any(
@@ -6749,7 +7924,7 @@ def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pyt
         ("torch._utils", "_rebuild_tensor_v2"),
     ],
 )
-def test_scan_bytes_keeps_unresolved_framework_reconstruction_global_clean(
+def test_scan_bytes_warns_on_unresolved_framework_reconstruction_global(
     module: str,
     name: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -6762,32 +7937,1596 @@ def test_scan_bytes_keeps_unresolved_framework_reconstruction_global_clean(
     report = scan_bytes(f"c{module}\n{name}\n.".encode(), source="unresolved-framework-global.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
 
 
-def test_scan_bytes_keeps_invoked_unresolved_framework_reconstruction_global_clean(
+def test_scan_bytes_warns_on_invoked_unresolved_framework_reconstruction_global(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
-        lambda _module_name: "unresolved",
-    )
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._resolve_module_source", lambda _module_name: None)
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
-        lambda _module_name: None,
-    )
+    _force_framework_metadata_unresolved(monkeypatch)
 
     report = scan_bytes(
         b"ctorch._utils\n_rebuild_tensor_v2\n)R.",
         source="invoked-unresolved-framework-global.pkl",
     )
 
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+        for finding in report.findings
+    )
+    assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
+
+
+def test_scan_bytes_warns_on_unresolved_hf_training_args_framework_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(
+            _hf_training_args_metadata_payload(),
+            source="hf-training-args-framework-metadata.pkl",
+        )
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
+        for finding in report.findings
+    )
+    assert _import_reference_pairs(report) >= _HF_TRAINING_ARGS_METADATA_REFERENCES
+    assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
+
+
+def test_scan_bytes_warns_on_unresolved_import_only_hf_training_args_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(
+            _hf_training_args_import_only_metadata_payload(),
+            source="hf-training-args-import-only-framework-metadata.pkl",
+        )
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _import_reference_pairs(report) >= _HF_TRAINING_ARGS_METADATA_REFERENCES
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_suppresses_import_only_hf_training_args_metadata_with_trusted_origin_and_inert_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) in _HF_TRAINING_ARGS_METADATA_REFERENCES,
+    )
+    trusted_modules = {module for module, _name in _HF_TRAINING_ARGS_METADATA_REFERENCES}
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.module_initialization_is_proven_inert",
+        lambda module: module in trusted_modules,
+    )
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(
+            _hf_training_args_import_only_metadata_payload(),
+            source="trusted-hf-training-args-import-only-framework-metadata.pkl",
+        )
+    finally:
+        _clear_source_sensitive_caches()
+
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
-    assert all(notice.code != "call_graph_source_unavailable" for notice in report.notices)
+    assert _import_reference_pairs(report) >= _HF_TRAINING_ARGS_METADATA_REFERENCES
+    assert not any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    ("case_name", "payload", "mode", "extension_code"),
+    _shadow_framework_divergence_cases(),
+)
+def test_scan_file_warns_on_unresolved_framework_scan_load_divergence(
+    case_name: str,
+    payload: bytes,
+    mode: str,
+    extension_code: int | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_path = tmp_path / f"{case_name}.pkl"
+    payload_path.write_bytes(payload)
+    _force_framework_metadata_unresolved(monkeypatch)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_file(payload_path)
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert not (report.status == ScanStatus.COMPLETE and report.verdict == SafetyVerdict.CLEAN)
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    _assert_shadow_framework_unpickle_executes(
+        payload_path,
+        tmp_path,
+        mode=mode,
+        extension_code=extension_code,
+    )
+
+
+def test_scan_file_warns_when_trusted_framework_reference_is_rebound_before_scanner_import(tmp_path: Path) -> None:
+    payload_path = tmp_path / "preimport-rebound-training-args.pkl"
+    payload_path.write_bytes(_shadow_newobj_build_payload())
+    marker = tmp_path / "preimport-rebound.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "class ReboundTrainingArguments:\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setstate__(self, state):\n"
+        "        marker.write_text('setstate', encoding='utf-8')\n"
+        "ReboundTrainingArguments.__module__ = 'transformers.training_args'\n"
+        "ReboundTrainingArguments.__qualname__ = 'TrainingArguments'\n"
+        "training_args.TrainingArguments = ReboundTrainingArguments\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'severity': finding.severity.value,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert not (output["status"] == ScanStatus.COMPLETE.value and output["verdict"] == SafetyVerdict.CLEAN.value)
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_framework_metadata_rebound_to_buildable_instance_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-rebound-instance-optimizer.pkl"
+    payload_path.write_bytes(_metadata_build_payload("transformers.training_args", "OptimizerNames") + b".")
+    marker = tmp_path / "preimport-rebound-instance.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "class ReboundOptimizerInstance:\n"
+        "    def __setstate__(self, state):\n"
+        "        marker.write_text('instance-setstate', encoding='utf-8')\n"
+        "ReboundOptimizerInstance.__module__ = 'transformers.training_args'\n"
+        "training_args.OptimizerNames = ReboundOptimizerInstance()\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'severity': finding.severity.value,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert not (output["status"] == ScanStatus.COMPLETE.value and output["verdict"] == SafetyVerdict.CLEAN.value)
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_unloaded_source_backed_metadata_import_is_not_inert(tmp_path: Path) -> None:
+    payload_path = tmp_path / "unloaded-training-args-import-only.pkl"
+    payload_path.write_bytes(_reference_global("transformers.training_args", "OptimizerNames") + b".")
+    marker = tmp_path / "unloaded-training-args-import.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_import_side_effect_transformers_package(site_packages, marker)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'severity': finding.severity.value,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert not (output["status"] == ScanStatus.COMPLETE.value and output["verdict"] == SafetyVerdict.CLEAN.value)
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_source_backed_framework_reference_is_unloaded_before_scan(tmp_path: Path) -> None:
+    payload_path = tmp_path / "unloaded-training-args-setstate.pkl"
+    payload_path.write_bytes(_shadow_newobj_build_payload())
+    marker = tmp_path / "unloaded-training-args.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_init_inert_setstate_transformers_package(site_packages, marker)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'severity': finding.severity.value,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert not (output["status"] == ScanStatus.COMPLETE.value and output["verdict"] == SafetyVerdict.CLEAN.value)
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_trusts_source_backed_framework_reference_imported_after_scanner_startup(tmp_path: Path) -> None:
+    payload_path = tmp_path / "poststartup-training-args.pkl"
+    payload_path.write_bytes(_shadow_newobj_build_payload())
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import transformers.training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "report = scan_file(payload_path)\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["status"] == ScanStatus.COMPLETE.value
+    assert output["verdict"] == SafetyVerdict.CLEAN.value
+    assert not any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_trusts_import_only_non_callable_framework_metadata_loaded_after_startup(tmp_path: Path) -> None:
+    payload_path = tmp_path / "poststartup-import-only-instance.pkl"
+    payload_path.write_bytes(_reference_global("transformers.training_args", "TrainingArguments") + b".")
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import transformers.training_args as training_args\n"
+        "training_args.TrainingArguments = object()\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "report = scan_file(payload_path)\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["status"] == ScanStatus.COMPLETE.value
+    assert output["verdict"] == SafetyVerdict.CLEAN.value
+    assert not any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_late_loaded_framework_metadata_is_rebound_to_instance_before_build(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "poststartup-rebound-instance-build.pkl"
+    payload_path.write_bytes(_metadata_build_payload("transformers.training_args", "TrainingArguments") + b".")
+    marker = tmp_path / "poststartup-rebound-instance-build.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "class ReboundTrainingArguments:\n"
+        "    def __setstate__(self, state):\n"
+        "        marker.write_text('setstate', encoding='utf-8')\n"
+        "ReboundTrainingArguments.__module__ = 'transformers.training_args'\n"
+        "ReboundTrainingArguments.__qualname__ = 'TrainingArguments'\n"
+        "training_args.TrainingArguments = ReboundTrainingArguments()\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_trusts_newobj_build_without_reaching_init(tmp_path: Path) -> None:
+    payload_path = tmp_path / "newobj-build-unused-init.pkl"
+    payload_path.write_bytes(_metadata_newobj_build_payload("transformers.training_args", "TrainingArguments") + b".")
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_init_heavy_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import transformers.training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "report = scan_file(payload_path)\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["status"] == ScanStatus.COMPLETE.value
+    assert output["verdict"] == SafetyVerdict.CLEAN.value
+    assert not any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_memoized_framework_global_is_reduced_after_reconstruction(tmp_path: Path) -> None:
+    payload_path = tmp_path / "memoized-newobj-build-reduce-training-args.pkl"
+    payload_path.write_bytes(
+        _metadata_memoized_newobj_build_then_reduce_payload("transformers.training_args", "TrainingArguments") + b"."
+    )
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_init_heavy_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import transformers.training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "report = scan_file(payload_path)\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "    'training_args_invocations': [\n"
+        "        {\n"
+        "            'opcode': invocation.get('opcode'),\n"
+        "            'global_position': invocation.get('global_position'),\n"
+        "        }\n"
+        "        for invocation in report.metadata.get('callable_invocations', [])\n"
+        "        if invocation.get('module') == 'transformers.training_args'\n"
+        "        and invocation.get('name') == 'TrainingArguments'\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    invocation_opcodes = {invocation["opcode"] for invocation in output["training_args_invocations"]}
+    invocation_positions = {invocation["global_position"] for invocation in output["training_args_invocations"]}
+    assert output["status"] == ScanStatus.COMPLETE.value
+    assert output["verdict"] == SafetyVerdict.SUSPICIOUS.value
+    assert invocation_opcodes >= {"NEWOBJ", "BUILD", "REDUCE"}
+    assert len(invocation_positions) == 1
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_trusts_stdlib_enum_metaclass_reduce(tmp_path: Path) -> None:
+    payload_path = tmp_path / "enum-interval-strategy.pkl"
+    payload_path.write_bytes(
+        _metadata_reduce_payload("transformers.trainer_utils", "IntervalStrategy", b"steps") + b"."
+    )
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_enum_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import transformers.trainer_utils\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "report = scan_file(payload_path)\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["status"] == ScanStatus.COMPLETE.value
+    assert output["verdict"] == SafetyVerdict.CLEAN.value
+    assert not any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.trainer_utils.IntervalStrategy"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_rebound_framework_class_uses_descriptor_new_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-rebound-descriptor-training-args.pkl"
+    payload_path.write_bytes(_shadow_newobj_build_payload())
+    marker = tmp_path / "preimport-rebound-descriptor.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "class DescriptorNew:\n"
+        "    def __get__(self, instance, owner):\n"
+        "        marker.write_text('descriptor-new', encoding='utf-8')\n"
+        "        return lambda cls: object.__new__(cls)\n"
+        "class ReboundTrainingArguments:\n"
+        "    __new__ = DescriptorNew()\n"
+        "ReboundTrainingArguments.__module__ = 'transformers.training_args'\n"
+        "ReboundTrainingArguments.__qualname__ = 'TrainingArguments'\n"
+        "training_args.TrainingArguments = ReboundTrainingArguments\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'severity': finding.severity.value,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert not (output["status"] == ScanStatus.COMPLETE.value and output["verdict"] == SafetyVerdict.CLEAN.value)
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_rebound_framework_class_uses_data_descriptor_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-rebound-data-descriptor-training-args.pkl"
+    payload_path.write_bytes(_shadow_slot_state_build_payload())
+    marker = tmp_path / "preimport-rebound-data-descriptor.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "class PayloadDescriptor:\n"
+        "    def __set__(self, instance, value):\n"
+        "        marker.write_text('descriptor-set', encoding='utf-8')\n"
+        "class ReboundTrainingArguments:\n"
+        "    payload = PayloadDescriptor()\n"
+        "ReboundTrainingArguments.__module__ = 'transformers.training_args'\n"
+        "ReboundTrainingArguments.__qualname__ = 'TrainingArguments'\n"
+        "training_args.TrainingArguments = ReboundTrainingArguments\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_rebound_framework_class_uses_metaclass_call_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-rebound-metaclass-optimizer.pkl"
+    payload_path.write_bytes(_metadata_reduce_payload("transformers.training_args", "OptimizerNames") + b".")
+    marker = tmp_path / "preimport-rebound-metaclass.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "class EvilMeta(type):\n"
+        "    def __call__(cls, *args, **kwargs):\n"
+        "        marker.write_text('metaclass-call', encoding='utf-8')\n"
+        "        return object.__new__(cls)\n"
+        "class ReboundOptimizerNames(metaclass=EvilMeta):\n"
+        "    pass\n"
+        "ReboundOptimizerNames.__module__ = 'transformers.training_args'\n"
+        "ReboundOptimizerNames.__qualname__ = 'OptimizerNames'\n"
+        "training_args.OptimizerNames = ReboundOptimizerNames\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_rebound_framework_function_forges_trusted_filename_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-rebound-forged-function.pkl"
+    payload_path.write_bytes(_metadata_reduce_payload("torch._utils", "_rebuild_tensor") + b".")
+    marker = tmp_path / "preimport-rebound-forged-function.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_torch_utils_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import torch._utils as torch_utils\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "namespace = {'__name__': 'torch._utils', 'marker': marker}\n"
+        "exec(compile(\n"
+        '    "def _rebuild_tensor(arg):\\n"\n'
+        "    \"    marker.write_text('forged-function', encoding='utf-8')\\n\"\n"
+        '    "    return None\\n",\n'
+        "    str(Path(torch_utils.__file__)),\n"
+        "    'exec',\n"
+        "), namespace)\n"
+        "torch_utils._rebuild_tensor = namespace['_rebuild_tensor']\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "torch._utils._rebuild_tensor"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_framework_metadata_rebound_to_cross_module_source_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-rebound-cross-module-optimizer.pkl"
+    marker = tmp_path / "preimport-rebound-cross-module.marker"
+    payload_path.write_bytes(
+        _metadata_reduce_payload("transformers.training_args", "OptimizerNames", str(marker).encode()) + b"."
+    )
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+    _write_cross_module_rebind_target_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import trusted_target\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "training_args.OptimizerNames = trusted_target.rebound_optimizer\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_framework_function_default_mutated_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-mutated-default-optimizer.pkl"
+    marker = tmp_path / "preimport-mutated-default.marker"
+    payload_path.write_bytes(
+        _metadata_reduce_payload("transformers.training_args", "OptimizerNames", str(marker).encode()) + b"."
+    )
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_runtime_mutable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "def evil_callback(path):\n"
+        "    marker.write_text('mutated-default', encoding='utf-8')\n"
+        "    return None\n"
+        "training_args.OptimizerNames.__defaults__ = (evil_callback,)\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_framework_metadata_rebound_to_same_module_source_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-rebound-same-module-optimizer.pkl"
+    marker = tmp_path / "preimport-rebound-same-module.marker"
+    payload_path.write_bytes(
+        _metadata_reduce_payload("transformers.training_args", "OptimizerNames", str(marker).encode()) + b"."
+    )
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_same_module_rebind_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "training_args.OptimizerNames = training_args.rebound_optimizer\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_unloaded_invoked_framework_module_init_is_not_inert(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "unloaded-non-inert-optimizer.pkl"
+    marker = tmp_path / "unloaded-non-inert.marker"
+    payload_path.write_bytes(_metadata_reduce_payload("transformers.training_args", "OptimizerNames") + b".")
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_non_inert_trusted_transformers_package(site_packages, marker)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
+        for finding in output["findings"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("accelerate.state", "EvilState"),
+        ("accelerate.utils.dataclasses", "EvilPlugin"),
+        ("torch", "device.evil"),
+        ("transformers.trainer_utils", "EvilStrategy"),
+        ("transformers.training_args", "EvilArguments"),
+        ("transformers.training_args", "TrainingArguments.__globals__"),
+    ],
+)
+def test_scan_bytes_warns_on_untrusted_hf_framework_metadata_near_match(
+    module: str,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+
+    report = scan_bytes(_reference_global(module, name) + b".", source="hf-training-args-near-match.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert any(
+        finding.rule_code in {"DANGEROUS_GLOBAL", "NON_ALLOWLISTED_GLOBAL"}
+        and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(("module", "name"), sorted(_HF_TRAINING_ARGS_REDUCE_REFERENCES))
+def test_scan_bytes_warns_on_unresolved_selected_hf_framework_metadata_reduce(
+    module: str,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+
+    report = scan_bytes(_metadata_reduce_payload(module, name) + b".", source="hf-training-args-reduce.pkl")
+
+    assert report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE}
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    sorted(_HF_TRAINING_ARGS_METADATA_REFERENCES - _HF_TRAINING_ARGS_REDUCE_REFERENCES - {("torch", "bfloat16")}),
+)
+def test_scan_bytes_warns_on_untrusted_hf_framework_metadata_reduce(
+    module: str,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+
+    report = scan_bytes(_metadata_reduce_payload(module, name) + b".", source="hf-training-args-untrusted-reduce.pkl")
+
+    assert report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE}
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_rule"),
+    [
+        (
+            _reference_global("builtins", "eval") + _binunicode(b"1+1") + b"\x85R.",
+            "DANGEROUS_CALL",
+        ),
+        (b"\x80\x02\x82\x01)R.", "DANGEROUS_CALL"),
+    ],
+)
+def test_scan_bytes_keeps_malicious_reduce_and_extension_controls_detected(
+    payload: bytes,
+    expected_rule: str,
+) -> None:
+    report = scan_bytes(payload, source="hf-training-args-malicious-control.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == expected_rule for finding in report.findings)
+
+
+def test_scan_bytes_suppresses_safe_numpy_ndarray_reconstruct_call_graph_noise() -> None:
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    )
+    report = scan_bytes(
+        payload,
+        source="safe-numpy-ndarray-reconstruct.pkl",
+    )
+
+    assert not any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        for finding in report.findings
+    )
+    assert not any(finding.severity == Severity.CRITICAL for finding in report.findings)
+
+
+def test_scan_bytes_warns_on_malformed_numpy_reconstruct_before_and_after_numpy_import() -> None:
+    pytest.importorskip("numpy")
+    script = f"""
+import json
+import sys
+
+from modelaudit_picklescan import scan_bytes
+
+payload = {_MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD!r}
+before_loaded = any(name == "numpy" or name.startswith("numpy.") for name in sys.modules)
+before = scan_bytes(payload, source="malformed-numpy-reconstruct-before.pkl")
+import numpy  # noqa: F401
+after = scan_bytes(payload, source="malformed-numpy-reconstruct-after.pkl")
+
+def summarize(report):
+    return {{
+        "verdict": report.verdict.value,
+        "findings": [
+            [finding.rule_code, finding.details.get("import_reference")]
+            for finding in report.findings
+        ],
+    }}
+
+print(json.dumps({{"before_loaded": before_loaded, "before": summarize(before), "after": summarize(after)}}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    summary = json.loads(completed.stdout)
+    expected_finding = ["NON_ALLOWLISTED_GLOBAL", "numpy._core.multiarray._reconstruct"]
+
+    assert summary["before_loaded"] is False
+    assert summary["before"]["verdict"] == SafetyVerdict.SUSPICIOUS.value
+    assert expected_finding in summary["before"]["findings"]
+    assert summary["after"]["verdict"] == SafetyVerdict.SUSPICIOUS.value
+    assert expected_finding in summary["after"]["findings"]
+
+
+def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_after_opcode_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(
+        _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD
+    )
+
+    monkeypatch.setattr(package_api, "_SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES", 4)
+
+    assert not package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(
+        _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD
+    )
+
+
+def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_on_unsafe_follow_on_stream() -> None:
+    pytest.importorskip("numpy")
+    safe_payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    )
+    unsafe_follow_on = safe_payload.replace(
+        b"cnumpy\nndarray\n",
+        b"cbuiltins\neval\n",
+    )
+    payload = safe_payload + unsafe_follow_on
+
+    assert not package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
+
+    report = scan_bytes(payload, source="safe-numpy-with-unsafe-follow-on.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.rule_code in {"DANGEROUS_CALL_GRAPH", "DANGEROUS_GLOBAL"}
+        and finding.details.get("import_reference") in {"numpy.core.multiarray._reconstruct", "builtins.eval"}
+        for finding in report.findings
+    )
+
+
+def test_safe_numpy_ndarray_reconstruct_dataflow_preserves_memo_across_follow_on_streams() -> None:
+    pytest.importorskip("numpy")
+    unsafe_follow_on = b"\x80\x02h\x00cbuiltins\neval\nK\x00\x85U\x01b\x87R."
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD + unsafe_follow_on
+
+    assert not package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
+
+    report = scan_bytes(payload, source="safe-numpy-with-memoized-follow-on.pkl")
+
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert any(
+        finding.rule_code in {"DANGEROUS_CALL_GRAPH", "NON_ALLOWLISTED_GLOBAL"}
+        and finding.details.get("import_reference") in {"numpy._core.multiarray._reconstruct", "builtins.eval"}
+        for finding in report.findings
+    )
+
+
+def test_safe_numpy_ndarray_reconstruct_dataflow_accepts_inert_object_array_state() -> None:
+    numpy = pytest.importorskip("numpy")
+    buffer = io.BytesIO()
+    numpy.save(buffer, numpy.array([{"key": "value"}], dtype=object), allow_pickle=True)
+    buffer.seek(0)
+    version = numpy.lib.format.read_magic(buffer)
+    if version == (1, 0):
+        numpy.lib.format.read_array_header_1_0(buffer)
+    elif version == (2, 0):
+        numpy.lib.format.read_array_header_2_0(buffer)
+    payload = buffer.read()
+
+    assert package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
+
+
+def test_safe_numpy_reconstruct_call_graph_suppression_requires_trusted_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = CallGraphFinding(
+        module="numpy.core.multiarray",
+        name="_reconstruct",
+        import_reference="numpy.core.multiarray._reconstruct",
+        sink="builtins.__import__",
+        call_path=("numpy.core.multiarray.__getattr__",),
+        invocation_opcode="REDUCE",
+    )
+    monkeypatch.setattr(
+        package_api,
+        "import_only_reference_is_proven_trusted",
+        lambda _module, _name: False,
+    )
+
+    assert not package_api._call_graph_finding_is_safe_numpy_reconstruction_noise(
+        finding,
+        suppress_safe_numpy_reconstruct=True,
+    )
+
+    monkeypatch.setattr(
+        package_api,
+        "import_only_reference_is_proven_trusted",
+        lambda _module, _name: True,
+    )
+
+    assert package_api._call_graph_finding_is_safe_numpy_reconstruction_noise(
+        finding,
+        suppress_safe_numpy_reconstruct=True,
+    )
+
+
+def test_scan_bytes_keeps_numpy_reconstruct_critical_when_class_argument_is_attacker_controlled() -> None:
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    ).replace(
+        b"cnumpy\nndarray\n",
+        b"cbuiltins\neval\n",
+    )
+
+    report = scan_bytes(payload, source="attacker-controlled-numpy-reconstruct.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    critical_findings = [
+        finding
+        for finding in report.findings
+        if finding.severity == Severity.CRITICAL and finding.rule_code in {"DANGEROUS_CALL_GRAPH", "DANGEROUS_GLOBAL"}
+    ]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        for finding in critical_findings
+    ) or any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") == "builtins.eval"
+        for finding in critical_findings
+    )
+
+
+def test_scan_bytes_warns_when_hf_import_only_metadata_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-training-args-import-marker"
+    package_dir = tmp_path / "transformers"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        f"open({str(marker)!r}, 'w').write('imported')\nclass TrainingArguments:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "transformers.training_args", raising=False)
+    monkeypatch.delitem(sys.modules, "transformers", raising=False)
+    _clear_source_sensitive_caches()
+    payload = _reference_global("transformers.training_args", "TrainingArguments") + b"."
+    try:
+        report = scan_bytes(payload, source="shadowed-hf-training-args-import-only.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert marker.exists() is False
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
+        for finding in report.findings
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "imported"
+
+
+def test_scan_bytes_warns_when_numpy_reconstruct_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-numpy-reconstruct-marker"
+    numpy_dir = tmp_path / "numpy"
+    core_dir = numpy_dir / "core"
+    core_dir.mkdir(parents=True)
+    (numpy_dir / "__init__.py").write_text(
+        "class ndarray:\n    pass\n\ndef dtype(*_args):\n    return object()\n",
+        encoding="utf-8",
+    )
+    (core_dir / "__init__.py").write_text("", encoding="utf-8")
+    (core_dir / "multiarray.py").write_text(
+        "\n".join(
+            [
+                "def __getattr__(name):",
+                "    import os",
+                f"    open({str(marker)!r}, 'w').write(name)",
+                "    def _reconstruct(*_args):",
+                "        return object()",
+                "    return _reconstruct",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for module_name in (
+        "numpy.core.multiarray",
+        "numpy.core",
+        "numpy._core.multiarray",
+        "numpy._core",
+        "numpy",
+    ):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+    _clear_source_sensitive_caches()
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    )
+    try:
+        report = scan_bytes(payload, source="shadowed-numpy-reconstruct.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert marker.exists() is False
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        for finding in report.findings
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "\n".join(
+                [
+                    "import pickle, sys",
+                    f"sys.path.insert(0, {str(tmp_path)!r})",
+                    "try:",
+                    f"    pickle.loads({payload!r})",
+                    "except Exception:",
+                    "    pass",
+                    "",
+                ]
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "_reconstruct"
+
+
+def test_scan_bytes_warns_when_hf_metadata_constructor_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-training-args-marker"
+    package_dir = tmp_path / "transformers"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                f"open({str(marker)!r}, 'w').write('imported')",
+                "class TrainingArguments:",
+                "    def __new__(cls):",
+                "        os.system('echo constructor')",
+                "        return super().__new__(cls)",
+                "    def __setstate__(self, state):",
+                "        os.system('echo state')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(
+            _metadata_newobj_build_payload("transformers.training_args", "TrainingArguments") + b".",
+            source="shadowed-hf-training-args-constructor.pkl",
+        )
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert marker.exists() is False
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) or any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
+        for finding in report.findings
+    )
 
 
 def test_scan_bytes_warns_when_framework_reconstruction_reference_resolves_to_shadow_module(
@@ -8202,11 +10941,53 @@ def test_safe_import_suppression_does_not_cross_invocation_positions() -> None:
         invoked_global_positions=frozenset({100}),
         analyzed_invocation_global_positions=frozenset({0}),
         analyzed_invocation_references=frozenset({reference}),
+        invocation_load_safe_modules=frozenset({reference[0]}),
         trusted_reconstruction_global_positions=frozenset(),
         trusted_reconstruction_references=frozenset(),
     )
 
     assert proven_safe is False
+
+
+def test_source_backed_framework_suppression_requires_contextual_invocation_trust() -> None:
+    reference = ("transformers.training_args", "TrainingArguments")
+    finding = Finding(
+        message="framework metadata invocation",
+        severity=Severity.WARNING,
+        location="mixed-framework-invocations.pkl (pos 42)",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        details={
+            "module": reference[0],
+            "name": reference[1],
+            "import_reference": ".".join(reference),
+            "position": 42,
+            "invoked": True,
+        },
+    )
+
+    assert not package_api._non_allowlisted_import_finding_is_proven_safe(
+        finding,
+        inert_initialization_modules=frozenset(),
+        trusted_import_references=frozenset({reference}),
+        invoked_global_positions=frozenset({42}),
+        analyzed_invocation_global_positions=frozenset({42}),
+        analyzed_invocation_references=frozenset({reference}),
+        invocation_load_safe_modules=frozenset({reference[0]}),
+        trusted_reconstruction_global_positions=frozenset(),
+        trusted_reconstruction_references=frozenset(),
+    )
+    assert package_api._non_allowlisted_import_finding_is_proven_safe(
+        finding,
+        inert_initialization_modules=frozenset(),
+        trusted_import_references=frozenset(),
+        invoked_global_positions=frozenset({42}),
+        analyzed_invocation_global_positions=frozenset({42}),
+        analyzed_invocation_references=frozenset({reference}),
+        invocation_load_safe_modules=frozenset({reference[0]}),
+        trusted_reconstruction_global_positions=frozenset(),
+        trusted_reconstruction_references=frozenset(),
+        trusted_invocation_global_positions=frozenset({42}),
+    )
 
 
 def test_with_call_graph_findings_detects_startup_hook_when_only_import_findings_truncated() -> None:

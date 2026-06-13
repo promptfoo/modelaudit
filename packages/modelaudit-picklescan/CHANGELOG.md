@@ -10,6 +10,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - ignore executable-looking terms inside inert URL string literals while preserving network reducer detections
+- suppress installed source-trusted inert Hugging Face training metadata and safe NumPy ndarray reconstruction noise while keeping default-install, unresolved, rebound, or shadowed framework metadata suspicious
+- skip PyTorch ZIP tensor storage members referenced by `data.pkl` during hidden-pickle discovery while preserving inconclusive outcomes for ambiguous storage evidence
 - avoid critical `getattr` findings for proven Ultralytics `Detect.forward` reconstruction while preserving unsafe traversal controls
 - avoid routing trusted NumPy extension reconstruction exports through module `__getattr__` fallbacks while preserving legacy dotted-`GLOBAL` hook detection
 - preserve nested and aliased callable opcode evidence for downstream scanners

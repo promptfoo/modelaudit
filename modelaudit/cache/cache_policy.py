@@ -5,6 +5,7 @@ from typing import Any
 from modelaudit.scanner_results import (
     ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
+    SCAN_OUTCOME_REASONS_METADATA_KEY,
     SCANNER_DEPENDENCY_IDS_METADATA_KEY,
     SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
 )
@@ -41,6 +42,11 @@ _PRIVATE_EVIDENCE_METADATA_KEYS = (
     ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
 )
+_RUNTIME_VERSION_SKIP_DETAILS = {
+    "runtime_version_known": False,
+    "runtime_cve_applicability": "unknown",
+    "runtime_cve_version_gate": "local_environment_only",
+}
 
 
 def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
@@ -48,12 +54,7 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
     if scan_result.get("success") is False:
         return False
 
-    metadata = scan_result.get("metadata")
-    if isinstance(metadata, dict) and (
-        bool(metadata.get("operational_error"))
-        or bool(metadata.get("analysis_incomplete"))
-        or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-    ):
+    if _metadata_disqualifies_cache(scan_result.get("metadata"), allow_bare_analysis_incomplete=True):
         return False
 
     private_metadata = scan_result.get("_private_metadata")
@@ -69,6 +70,12 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
             if not isinstance(entry, dict):
                 continue
 
+            if _record_disqualifies_cache(
+                entry,
+                allow_skipped_check_exemption=collection_name == "checks",
+            ):
+                return False
+
             message = entry.get("message")
             if isinstance(message, str) and any(
                 indicator in message.lower() for indicator in _OPERATIONAL_ERROR_INDICATORS
@@ -76,6 +83,110 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
                 return False
 
     return True
+
+
+def _record_disqualifies_cache(
+    entry: dict[str, Any],
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    if allow_skipped_check_exemption and _record_is_clean_runtime_version_skip(entry):
+        return False
+    return _metadata_disqualifies_cache(
+        entry.get("details"),
+        allow_bare_analysis_incomplete=True,
+    )
+
+
+def _record_is_clean_runtime_version_skip(record: dict[str, Any]) -> bool:
+    details = record.get("details")
+    if not isinstance(details, dict):
+        return False
+    status = record.get("status")
+    status_value = getattr(status, "value", status)
+    if not (
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
+        and details.get("analysis_incomplete") is True
+        and not _has_incomplete_coverage_outcome_marker(details)
+    ):
+        return False
+
+    return all(details.get(key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
+
+
+def _metadata_disqualifies_cache(metadata: Any, *, allow_bare_analysis_incomplete: bool) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    if (
+        bool(metadata.get("operational_error"))
+        or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        or _has_incomplete_coverage_reasons(
+            metadata,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+        )
+    ):
+        return True
+
+    findings = metadata.get("findings")
+    if isinstance(findings, dict):
+        return _metadata_disqualifies_cache(
+            findings,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+        )
+    if isinstance(findings, (list, tuple, set, frozenset)):
+        return any(
+            _metadata_disqualifies_cache(
+                finding,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+            )
+            for finding in findings
+        )
+
+    details = metadata.get("details")
+    if isinstance(details, dict):
+        return _metadata_disqualifies_cache(
+            details,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+        )
+
+    return False
+
+
+def _has_incomplete_coverage_outcome_marker(metadata: dict[str, Any]) -> bool:
+    if metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        return True
+    reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(item) for item in reasons)
+
+    return False
+
+
+def _has_incomplete_coverage_reasons(
+    metadata: dict[str, Any],
+    *,
+    allow_bare_analysis_incomplete: bool,
+) -> bool:
+    reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str) and reason:
+        return True
+    if allow_bare_analysis_incomplete and metadata.get("analysis_incomplete") is True:
+        return True
+
+    reasons = metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(item) for item in reasons)
+
+    return False
 
 
 def cached_scan_result_dependencies_available(scan_result: dict[str, Any]) -> bool:

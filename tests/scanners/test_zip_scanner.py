@@ -9057,6 +9057,57 @@ class TestZipScanner:
             for check in result.checks
         )
 
+    def test_partial_zip64_streamed_entry_uses_64bit_descriptor_width(self, tmp_path: Path) -> None:
+        class NonSeekableBuffer(io.BytesIO):
+            def seek(self, *_args: Any, **_kwargs: Any) -> int:
+                raise io.UnsupportedOperation("not seekable")
+
+            def seekable(self) -> bool:
+                return False
+
+        archive_buffer = NonSeekableBuffer()
+        with (
+            zipfile.ZipFile(archive_buffer, "w") as archive,
+            archive.open("archive/data/0", "w", force_zip64=True) as member,
+        ):
+            member.write(b"safe")
+
+        archive_bytes = bytearray(archive_buffer.getvalue())
+        local_header = archive_bytes.find(b"PK\x03\x04")
+        assert local_header >= 0
+        filename_size = int.from_bytes(archive_bytes[local_header + 26 : local_header + 28], "little")
+        extra_size = int.from_bytes(archive_bytes[local_header + 28 : local_header + 30], "little")
+        extra_start = local_header + 30 + filename_size
+        assert archive_bytes[extra_start : extra_start + 2] == b"\x01\x00"
+        assert int.from_bytes(archive_bytes[extra_start + 2 : extra_start + 4], "little") == 16
+
+        del archive_bytes[extra_start + 12 : extra_start + 20]
+        archive_bytes[extra_start + 2 : extra_start + 4] = (8).to_bytes(2, "little")
+        archive_bytes[local_header + 18 : local_header + 26] = b"\x00" * 8
+        archive_bytes[local_header + 28 : local_header + 30] = (extra_size - 8).to_bytes(2, "little")
+
+        eocd_index = archive_bytes.rfind(b"PK\x05\x06")
+        assert eocd_index >= 0
+        directory_offset = int.from_bytes(archive_bytes[eocd_index + 16 : eocd_index + 20], "little")
+        archive_bytes[eocd_index + 16 : eocd_index + 20] = (directory_offset - 8).to_bytes(4, "little")
+
+        archive_path = tmp_path / "partial-zip64-streamed.zip"
+        archive_path.write_bytes(archive_bytes)
+
+        assert not ZipScanner.requires_preflight_result(
+            str(archive_path),
+            ZipScanner.DEFAULT_MAX_ENTRIES,
+            ZipScanner.central_directory_size_limit({}),
+        )
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(
+            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
     def test_force_zip64_streamed_entry_rejects_invalid_64bit_descriptor(self, tmp_path: Path) -> None:
         class NonSeekableBuffer(io.BytesIO):
             def seek(self, *_args: Any, **_kwargs: Any) -> int:
@@ -10469,7 +10520,7 @@ class TestZipScanner:
 
         for audit_result in (first_result, second_result):
             metadata = audit_result.file_metadata[str(archive_path)]
-            assert audit_result.success is True
+            assert audit_result.success is False
             assert audit_result.has_errors is False
             assert core.determine_exit_code(audit_result) == 1
             assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -10873,6 +10924,187 @@ class TestZipScanner:
         assert not noisy_pickle_warnings, (
             f"Expected no noisy pickle warning for plain text, got: {[i.message for i in noisy_pickle_warnings]}"
         )
+
+    def test_scan_zip_audio_tokenizer_readme_basic_links_not_basic_auth_secret(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "model_card.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("audio_tokenizer/README.md", "Provide the basic links for the model\n")
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            from modelaudit.scanners.text_scanner import TextScanner
+
+            return TextScanner(config={"check_network_comm": False, "cache_enabled": False}).scan(path)
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["audio_tokenizer/README.md"],
+            }
+        ).scan(str(archive_path))
+
+        assert result.success is True
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert any(
+            check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("zip_entry") == "audio_tokenizer/README.md"
+            for check in result.checks
+        )
+
+    def test_scan_zip_text_member_detects_valid_basic_auth_header(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "headers.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("README.md", "Proxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\n")
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            from modelaudit.scanners.text_scanner import TextScanner
+
+            return TextScanner(config={"check_network_comm": False, "cache_enabled": False}).scan(path)
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["README.md"],
+            }
+        ).scan(str(archive_path))
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == "README.md"
+
+    def test_scan_zip_backslash_readme_member_detects_basic_auth_header(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "backslash_headers.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("docs\\README", "Authorization: Basic YmFja3NsYXNoOnBhc3M=\n")
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        zip_entry = failed_secret_checks[0].details.get("zip_entry")
+        assert isinstance(zip_entry, str)
+        assert zip_entry.replace("\\", "/") == "docs/README"
+
+    def test_scan_zip_long_preserved_readme_member_cleans_tempdir(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "long_readme.zip"
+        temp_root = tmp_path / "temp-root"
+        temp_root.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        long_readme_name = "readme." + ("a" * 300) + ".md"
+
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(long_readme_name, "Authorization: Basic bG9uZy1yZWFkbWU6cGFzcw==\n")
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == long_readme_name
+        assert list(temp_root.iterdir()) == []
+
+    def test_scan_nested_zip_text_member_detects_valid_basic_auth_header(self, tmp_path: Path) -> None:
+        inner_payload = io.BytesIO()
+        with zipfile.ZipFile(inner_payload, "w") as inner_archive:
+            inner_archive.writestr("README.md", "Authorization: Basic dXNlcjpwYXNz\n")
+
+        archive_path = tmp_path / "nested_headers.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested/inner.zip", inner_payload.getvalue())
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == "nested/inner.zip:README.md"
+
+    def test_scan_nested_zip_env_member_detects_basic_auth_server_header(self, tmp_path: Path) -> None:
+        inner_payload = io.BytesIO()
+        with zipfile.ZipFile(inner_payload, "w") as inner_archive:
+            inner_archive.writestr(".env", "HTTP_AUTHORIZATION=Basic bmVzdGVkLWVudjpwYXNz\n")
+
+        archive_path = tmp_path / "nested_env.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested/inner.zip", inner_payload.getvalue())
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == "nested/inner.zip:.env"
 
     def test_scan_zip_with_proto0_pickle_with_single_comment_token_bypass_regression(self, tmp_path: Path) -> None:
         """Single comment-token prefix must not suppress proto0 payload detection."""

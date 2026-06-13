@@ -2,6 +2,7 @@
 
 import gzip
 import importlib
+import json
 import os
 import pickle
 import signal
@@ -20,6 +21,7 @@ from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.scanner_selection import (
     resolve_scanner_selection_policy,
     scanner_ids_for_detected_format,
@@ -27,8 +29,12 @@ from modelaudit.scanner_selection import (
     selected_scanner_filenames,
 )
 from modelaudit.utils.file.detection import (
+    _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES,
+    _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES,
+    FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     MEDIA_ROUTE_TAIL_READ_BYTES,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     detect_file_format_for_skip_filter,
 )
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
@@ -36,6 +42,8 @@ from modelaudit.utils.sources.huggingface import (
     _HF_CONTENT_SNIFF_BYTES,
     _HF_CONTENT_SNIFF_MAX_FILES,
     _build_huggingface_model_info,
+    _detect_huggingface_content_route_format,
+    _detect_huggingface_flax_msgpack_route,
     _extract_huggingface_repo_files,
     _get_huggingface_path_sizes,
     _HuggingFaceProbeBudget,
@@ -66,6 +74,27 @@ from tests.helpers.file_creators import malicious_pickle_bytes, valid_jpeg_bytes
 _HF_TEST_REVISION = "a" * 40
 
 
+def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
+    tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+    tokens.extend(f"[unused{index}]" for index in range(2048))
+    tokens.extend(f"token_{index}" for index in range(2048))
+    payload = ("\n".join(tokens) + "\n").encode("utf-8")
+    assert len(payload) > min_bytes
+    return payload
+
+
+def _bpe_merges_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
+    lines = ["#version: 0.2"]
+    total_bytes = len(lines[0]) + 1
+    index = 0
+    while total_bytes <= min_bytes:
+        line = f"token_{index % 8192} token_{(index * 17) % 8192}"
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 class _FakeRangeResponse:
     def __init__(
         self,
@@ -91,6 +120,46 @@ class _FakeRangeResponse:
         yield self.payload[:chunk_size]
 
 
+def _large_remote_documentation_payload(label: str) -> bytes:
+    line = f"{label} line-oriented documentation with tokenizer notes and multilingual text café.\n".encode()
+    payload = f"# {label}\n".encode() + line * ((_CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES // len(line)) + 128)
+    assert len(payload) > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    assert len(payload) < _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+    return payload
+
+
+class _FakeTreeResponse:
+    def __init__(
+        self,
+        payload: object,
+        links: dict[str, dict[str, str]] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.payload = payload
+        self.raw_payload = json.dumps(payload).encode("utf-8")
+        self.links = links or {}
+        self.headers = headers if headers is not None else {"Content-Length": str(len(self.raw_payload))}
+
+    def __enter__(self) -> "_FakeTreeResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> object:
+        return self.payload
+
+    def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+        for start in range(0, len(self.raw_payload), chunk_size):
+            yield self.raw_payload[start : start + chunk_size]
+
+    def iter_bytes(self, chunk_size: int) -> Iterator[bytes]:
+        yield from self.iter_content(chunk_size)
+
+
 def _fake_content_range_response(payload: bytes, start: int, end: int) -> _FakeRangeResponse:
     return _FakeRangeResponse(
         payload[start : end + 1],
@@ -105,7 +174,9 @@ def _fake_range_responder(payload: bytes) -> Callable[[str], _FakeRangeResponse]
         range_header = headers.get("Range", "")
         if range_header.startswith("bytes="):
             start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
-            return _fake_content_range_response(payload, int(start_text), int(end_text))
+            start = int(start_text)
+            end = min(int(end_text), len(payload) - 1)
+            return _fake_content_range_response(payload, start, end)
         return _FakeRangeResponse(payload)
 
     return get_response
@@ -166,6 +237,14 @@ def _make_large_valid_jpeg_payload() -> bytes:
     return app0_header + scan_header + entropy + b"\xff\xd9"
 
 
+def _make_printable_utf8_messagepack_candidate() -> bytes:
+    return (b'""' + ("é" * 17).encode("utf-8")) * 4097
+
+
+def _make_line_broken_printable_utf8_messagepack_candidate() -> bytes:
+    return (b'""' + ("é" * 17).encode("utf-8") + b"\n") * 4097
+
+
 def _ubjson_key(key: bytes) -> bytes:
     return b"U" + bytes([len(key)]) + key
 
@@ -202,6 +281,29 @@ def _make_coreml_payload(tmp_path: Path) -> bytes:
 def _make_onnx_payload(tmp_path: Path) -> bytes:
     pytest.importorskip("onnx")
     return create_mock_onnx(tmp_path / "fixture.onnx", op_type="PythonOp").read_bytes()
+
+
+def _make_external_onnx_payload(tmp_path: Path, external_path: str = "model.onnx_data") -> bytes:
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+    from onnx.onnx_ml_pb2 import StringStringEntryProto
+
+    tensor = helper.make_tensor("W", TensorProto.FLOAT, [1], vals=[1.0])
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    entry = StringStringEntryProto()
+    entry.key = "location"
+    entry.value = external_path
+    tensor.external_data.append(entry)
+    graph = helper.make_graph(
+        [helper.make_node("Relu", ["input"], ["output"], name="relu")],
+        "external_data_graph",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
+        initializer=[tensor],
+    )
+    model_path = tmp_path / "fixture.onnx"
+    onnx.save(helper.make_model(graph), str(model_path))
+    return model_path.read_bytes()
 
 
 TEST_COMMIT_SHA = "a" * 40
@@ -612,13 +714,19 @@ class TestModelDownload:
 
         mock_snapshot_download.assert_not_called()
 
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_list_repo_files_timeout_uses_hfapi_timeout(self, mock_repo_info: MagicMock) -> None:
+    def test_list_repo_files_timeout_uses_hfapi_timeout(
+        self,
+        mock_repo_info: MagicMock,
+        mock_paginated_listing: MagicMock,
+    ) -> None:
         """Timeout helper should use the request-layer timeout instead of background threads."""
         mock_repo_info.return_value = SimpleNamespace(
             sha=_HF_TEST_REVISION,
             siblings=[SimpleNamespace(rfilename="config.json")],
         )
+        mock_paginated_listing.return_value = ["config.json"]
 
         repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
 
@@ -626,14 +734,21 @@ class TestModelDownload:
         assert revision == _HF_TEST_REVISION
         assert error is None
         mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+        mock_paginated_listing.assert_called_once_with("test/model", _HF_TEST_REVISION, timeout_seconds=7)
 
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_list_repo_files_timeout_passes_requested_revision(self, mock_repo_info: MagicMock) -> None:
+    def test_list_repo_files_timeout_passes_requested_revision(
+        self,
+        mock_repo_info: MagicMock,
+        mock_paginated_listing: MagicMock,
+    ) -> None:
         """Requested repository revisions should reach direct HfApi listing calls."""
         mock_repo_info.return_value = SimpleNamespace(
             sha=_HF_TEST_REVISION,
             siblings=[SimpleNamespace(rfilename="config.json")],
         )
+        mock_paginated_listing.return_value = ["config.json"]
 
         repo_files, revision, error = _list_repo_files_with_timeout(
             "test/model",
@@ -650,6 +765,7 @@ class TestModelDownload:
             files_metadata=False,
             revision="refs/pr/1",
         )
+        mock_paginated_listing.assert_called_once_with("test/model", _HF_TEST_REVISION, timeout_seconds=7)
 
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
     def test_list_repo_files_deadline_uses_terminable_worker(self, mock_run_worker: MagicMock) -> None:
@@ -672,6 +788,25 @@ class TestModelDownload:
             {"repo_id": "test/model", "request_timeout": 7},
             123.0,
             "test/model",
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_at_revision")
+    def test_download_worker_serializes_repository_listing(self, mock_list_at_revision: MagicMock) -> None:
+        """The deadline worker should return only serializable listing evidence."""
+        mock_list_at_revision.return_value = (["config.json", "model.bin"], _HF_TEST_REVISION)
+
+        result = _run_huggingface_worker_operation(
+            "list_repo_files",
+            {"repo_id": "test/model", "request_timeout": 7},
+        )
+
+        assert result == {
+            "value": {"files": ["config.json", "model.bin"], "revision": _HF_TEST_REVISION},
+        }
+        mock_list_at_revision.assert_called_once_with(
+            "test/model",
+            requested_revision=None,
+            timeout_seconds=7,
         )
 
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
@@ -698,31 +833,377 @@ class TestModelDownload:
             "test/model",
         )
 
+    @patch("huggingface_hub.utils.get_session")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_download_worker_serializes_repository_listing(self, mock_repo_info: MagicMock) -> None:
-        """The deadline worker should return only serializable listing evidence."""
-        mock_repo_info.return_value = SimpleNamespace(
-            sha=_HF_TEST_REVISION,
-            siblings=[SimpleNamespace(rfilename="model.bin"), {"path": "config.json"}],
+    def test_list_repo_files_uses_paginated_tree_inventory(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+    ) -> None:
+        """Large repository inventory should consume every tree page once and deduplicate names."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_session = mock_get_session.return_value
+        mock_session.stream.side_effect = [
+            _FakeTreeResponse(
+                [
+                    {"type": "file", "path": "z-model.bin"},
+                    {"type": "directory", "path": "nested"},
+                ],
+                links={"next": {"url": "https://huggingface.co/api/models/test/model/tree/page-2"}},
+            ),
+            _FakeTreeResponse(
+                [
+                    {"type": "file", "path": "a-config.json"},
+                    {"type": "file", "path": "z-model.bin"},
+                ],
+            ),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files == ["a-config.json", "z-model.bin"]
+        assert revision == _HF_TEST_REVISION
+        assert error is None
+        mock_get_session.assert_called_once_with()
+        assert mock_session.stream.call_count == 2
+        assert mock_session.stream.call_args_list[0].args[:2] == ("GET", ANY)
+        assert mock_session.stream.call_args_list[0].kwargs["params"] == {"recursive": True, "expand": False}
+        assert mock_session.stream.call_args_list[1].args[:2] == (
+            "GET",
+            "https://huggingface.co/api/models/test/model/tree/page-2",
+        )
+        assert mock_session.stream.call_args_list[1].kwargs["params"] is None
+
+    @pytest.mark.parametrize(
+        ("next_url", "expected_error"),
+        [
+            ("https://attacker.example/api/models/test/model/tree/page-2", "pagination link changed origin"),
+            ("http://huggingface.co/api/models/test/model/tree/page-2", "pagination link changed origin"),
+            ("https://user:pass@huggingface.co/api/models/test/model/tree/page-2", "invalid pagination link"),
+            ("https://huggingface.co:bad/api/models/test/model/tree/page-2", "invalid pagination link"),
+            ("/api/models/test/model/tree/page-2", "invalid pagination link"),
+        ],
+    )
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_unsafe_pagination_links_before_following(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        next_url: str,
+        expected_error: str,
+    ) -> None:
+        """Unsafe next links must fail closed before auth headers can reach another origin."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_session = mock_get_session.return_value
+        mock_session.stream.side_effect = [
+            _FakeTreeResponse(
+                [{"type": "file", "path": "first.bin"}],
+                links={"next": {"url": next_url}},
+            ),
+            AssertionError("unsafe pagination link should not be followed"),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert expected_error in error
+        assert mock_session.stream.call_count == 1
+        requested_urls = [stream_call.args[1] for stream_call in mock_session.stream.call_args_list]
+        assert next_url not in requested_urls
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "../escape.bin",
+            "/abs.bin",
+            "nested/../../escape.bin",
+            "nested//model.bin",
+            r"nested\escape.bin",
+            "bad\x00name.bin",
+        ],
+    )
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_unsafe_paginated_names(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        filename: str,
+    ) -> None:
+        """Repository tree names must not escape local placement or verification roots."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse([{"type": "file", "path": filename}])
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "unsafe repository filename" in error
+
+    @pytest.mark.parametrize(
+        "tree_item",
+        [
+            {"path": "malicious.pkl"},
+            {"type": None, "path": "malicious.pkl"},
+            {"type": "lfs", "path": "malicious.pkl"},
+        ],
+    )
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_unknown_paginated_tree_item_types(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        tree_item: dict[str, object],
+    ) -> None:
+        """Unknown tree item types must not create a partial benign inventory."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [
+                {"type": "file", "path": "benign.bin"},
+                tree_item,
+            ]
         )
 
-        result = _run_huggingface_worker_operation(
-            "list_repo_files",
-            {"repo_id": "test/model", "request_timeout": 7},
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "unknown tree item type" in error
+
+    @pytest.mark.parametrize(
+        "tree_item",
+        [
+            {"type": "file"},
+            {"type": "file", "path": None},
+            {"type": "file", "path": 123},
+        ],
+    )
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_malformed_paginated_file_entries(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        tree_item: dict[str, object],
+    ) -> None:
+        """Malformed file entries must fail closed before the inventory is accepted."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [
+                {"type": "file", "path": "benign.bin"},
+                tree_item,
+            ]
         )
 
-        assert result == {
-            "value": {"files": ["model.bin", "config.json"], "revision": _HF_TEST_REVISION},
-        }
-        mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
 
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "invalid repository filename" in error
+
+    @patch("huggingface_hub.utils.get_session")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_download_worker_passes_requested_revision_to_listing(self, mock_repo_info: MagicMock) -> None:
+    def test_list_repo_files_rejects_repeated_pagination_cursor(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+    ) -> None:
+        """A repeated next page URL must fail closed instead of looping or double-counting."""
+        repeated_url = "https://huggingface.co/api/models/test/model/tree/repeated"
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_session = mock_get_session.return_value
+        mock_session.stream.side_effect = [
+            _FakeTreeResponse([{"type": "file", "path": "first.bin"}], links={"next": {"url": repeated_url}}),
+            _FakeTreeResponse([{"type": "file", "path": "second.bin"}], links={"next": {"url": repeated_url}}),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "pagination cursor repeated" in error
+        assert mock_session.stream.call_count == 2
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_truncated_paginated_inventory(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+    ) -> None:
+        """A later page failure must not produce a partial successful inventory."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.side_effect = [
+            _FakeTreeResponse(
+                [{"type": "file", "path": "first.bin"}],
+                links={"next": {"url": "https://huggingface.co/api/models/test/model/tree/page-2"}},
+            ),
+            RuntimeError("page 2 failed"),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "page 2 failed" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_excessive_paginated_inventory(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repository inventory remains explicitly bounded even when pagination succeeds."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_INVENTORY_FILES", 2)
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [
+                {"type": "file", "path": "one.bin"},
+                {"type": "file", "path": "two.bin"},
+                {"type": "file", "path": "three.bin"},
+            ]
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "bounded inventory limit" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_excessive_tree_page_response_bytes(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Tree pages must be byte-bounded before JSON decoding."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES", 16)
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [{"type": "file", "path": "model.bin"}],
+            headers={"Content-Length": "17"},
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "bounded response limit" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_overlong_paginated_names(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Accepted tree paths must be length-bounded before local path or glob use."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_PATH_CHARS", 8)
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [{"type": "file", "path": "very-long-model.bin"}]
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "bounded path length" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_excessive_page_count(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pagination must fail closed when page count exceeds the explicit cap."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_INVENTORY_PAGES", 1)
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [{"type": "file", "path": "first.bin"}],
+            links={"next": {"url": "https://huggingface.co/api/models/test/model/tree/page-2"}},
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "bounded pagination limit" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_canonicalizes_repeated_pagination_cursor(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+    ) -> None:
+        """Semantically repeated next URLs must not evade loop detection by query ordering."""
+        first_url = "https://huggingface.co/api/models/test/model/tree/page?cursor=abc&expand=false"
+        repeated_url = "https://huggingface.co/api/models/test/model/tree/page?expand=false&cursor=abc"
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_session = mock_get_session.return_value
+        mock_session.stream.side_effect = [
+            _FakeTreeResponse([{"type": "file", "path": "first.bin"}], links={"next": {"url": first_url}}),
+            _FakeTreeResponse([{"type": "file", "path": "second.bin"}], links={"next": {"url": repeated_url}}),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "pagination cursor repeated" in error
+        assert mock_session.stream.call_count == 2
+
+    @patch("huggingface_hub.utils.build_hf_headers")
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_uses_configured_session_and_auth_headers(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        mock_build_headers: MagicMock,
+    ) -> None:
+        """Private or gated inventories should use Hub-configured auth headers and transport."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_build_headers.return_value = {"authorization": "Bearer configured-token"}
+        mock_session = mock_get_session.return_value
+        mock_session.stream.return_value = _FakeTreeResponse([{"type": "file", "path": "model.bin"}])
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files == ["model.bin"]
+        assert revision == _HF_TEST_REVISION
+        assert error is None
+        mock_build_headers.assert_called_once_with(token=None)
+        mock_get_session.assert_called_once_with()
+        assert mock_session.stream.call_args.args[0] == "GET"
+        assert mock_session.stream.call_args.kwargs["headers"] == {"authorization": "Bearer configured-token"}
+
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_at_revision")
+    def test_download_worker_passes_requested_revision_to_listing(self, mock_list_at_revision: MagicMock) -> None:
         """Worker listing operations should not silently fall back to default branch."""
-        mock_repo_info.return_value = SimpleNamespace(
-            sha=_HF_TEST_REVISION,
-            siblings=[SimpleNamespace(rfilename="model.bin")],
-        )
+        mock_list_at_revision.return_value = (["model.bin"], _HF_TEST_REVISION)
 
         result = _run_huggingface_worker_operation(
             "list_repo_files",
@@ -732,11 +1213,10 @@ class TestModelDownload:
         assert result == {
             "value": {"files": ["model.bin"], "revision": _HF_TEST_REVISION},
         }
-        mock_repo_info.assert_called_once_with(
+        mock_list_at_revision.assert_called_once_with(
             "test/model",
-            timeout=7,
-            files_metadata=False,
-            revision="refs/pr/1",
+            requested_revision="refs/pr/1",
+            timeout_seconds=7,
         )
 
     @patch("huggingface_hub.HfApi.model_info")
@@ -769,7 +1249,7 @@ class TestModelDownload:
 
         repo_files, pinned_revision, error = _list_repo_files_with_timeout("test/model")
 
-        assert repo_files == ["model.bin"]
+        assert repo_files is None
         assert pinned_revision is None
         assert error == "repository listing did not include an immutable commit SHA"
 
@@ -1918,6 +2398,45 @@ class TestModelDownload:
             "test/model",
         )
 
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    def test_huggingface_path_sizes_reject_conflicting_duplicate_metadata(
+        self,
+        mock_get_paths_info: MagicMock,
+    ) -> None:
+        """Conflicting duplicate size evidence must not weaken aggregate download caps."""
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="model.bin", size=1500),
+            SimpleNamespace(path="model.bin", size=1),
+        ]
+
+        with pytest.raises(Exception, match=r"inconsistent size metadata for selected file model\.bin"):
+            _get_huggingface_path_sizes("test/model", ["model.bin"], resolved_revision=_HF_TEST_REVISION)
+
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    def test_huggingface_path_sizes_batches_large_selections(
+        self,
+        mock_get_paths_info: MagicMock,
+    ) -> None:
+        """Selected-file metadata should stay under the Hub path-info batch limit."""
+        filenames = [f"shard-{idx:04d}.bin" for idx in range(513)]
+        mock_get_paths_info.side_effect = [
+            [SimpleNamespace(path=filename, size=1) for filename in filenames[:512]],
+            [SimpleNamespace(path=filenames[512], size=1)],
+        ]
+
+        sizes, revision = _get_huggingface_path_sizes(
+            "test/model",
+            filenames,
+            resolved_revision=_HF_TEST_REVISION,
+        )
+
+        assert sizes == dict.fromkeys(filenames, 1)
+        assert revision == _HF_TEST_REVISION
+        assert mock_get_paths_info.call_args_list == [
+            call("test/model", filenames[:512], revision=_HF_TEST_REVISION),
+            call("test/model", filenames[512:], revision=_HF_TEST_REVISION),
+        ]
+
     @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("requests.get")
     def test_huggingface_prefix_rechecks_deadline_between_chunks(
@@ -2083,19 +2602,35 @@ class TestModelDownload:
         assert deadline > time.monotonic()
         assert repo_id == "test/model"
 
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_list_repo_files_at_revision_returns_matching_sha(self, mock_repo_info: MagicMock) -> None:
+    def test_list_repo_files_at_revision_returns_matching_sha(
+        self,
+        mock_repo_info: MagicMock,
+        mock_paginated_listing: MagicMock,
+    ) -> None:
         """Capped downloads should keep the listing and transfer on one immutable revision."""
         mock_repo_info.return_value = SimpleNamespace(
             sha=TEST_COMMIT_SHA,
             siblings=[SimpleNamespace(rfilename="pytorch_model.bin")],
         )
+        mock_paginated_listing.return_value = ["pytorch_model.bin"]
 
-        repo_files, revision = _list_huggingface_repo_files_at_revision("test/model", timeout_seconds=7)
+        repo_files, revision = _list_huggingface_repo_files_at_revision(
+            "test/model",
+            requested_revision=TEST_COMMIT_SHA,
+            timeout_seconds=7,
+        )
 
         assert repo_files == ["pytorch_model.bin"]
         assert revision == TEST_COMMIT_SHA
-        mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+        mock_repo_info.assert_called_once_with(
+            "test/model",
+            timeout=7,
+            files_metadata=False,
+            revision=TEST_COMMIT_SHA,
+        )
+        mock_paginated_listing.assert_called_once_with("test/model", TEST_COMMIT_SHA, timeout_seconds=7)
 
     @patch("huggingface_hub.HfApi.repo_info")
     def test_list_repo_files_at_revision_rejects_mutable_revision(self, mock_repo_info: MagicMock) -> None:
@@ -2105,7 +2640,7 @@ class TestModelDownload:
             siblings=[SimpleNamespace(rfilename="pytorch_model.bin")],
         )
 
-        with pytest.raises(Exception, match="repository revision unavailable"):
+        with pytest.raises(Exception, match="immutable commit SHA"):
             _list_huggingface_repo_files_at_revision("test/model")
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
@@ -2323,6 +2858,38 @@ class TestModelDownload:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_allows_hf_cache_blob_symlink(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Capped default-cache snapshots should allow normal Hub blob symlinks."""
+        repo_cache = tmp_path / "hf-cache" / "hub" / "models--test--model"
+        download_path = repo_cache / "snapshots" / _HF_TEST_REVISION
+        blob_path = repo_cache / "blobs" / "abc123"
+        download_path.mkdir(parents=True)
+        blob_path.parent.mkdir(parents=True)
+        blob_path.write_bytes(b"weights")
+        (download_path / "pytorch_model.bin").symlink_to(Path("..") / ".." / "blobs" / blob_path.name)
+        mock_snapshot_download.return_value = str(download_path)
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=7)]
+
+        download_model("https://huggingface.co/test/model", max_size=1000)
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
+        assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
     def test_download_model_max_size_rejects_underreported_snapshot(
         self,
         mock_snapshot_download: MagicMock,
@@ -2340,6 +2907,34 @@ class TestModelDownload:
 
         with pytest.raises(Exception, match="downloaded selected Hugging Face files total 9 bytes exceeds max size 4"):
             download_model("https://huggingface.co/test/model", max_size=4)
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_rejects_symlink_escape_after_transfer(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Capped downloads should not accept arbitrary selected-file symlink escapes."""
+        download_path = tmp_path / "download"
+        escaped_target = tmp_path / "outside.bin"
+        download_path.mkdir()
+        escaped_target.write_bytes(b"weights")
+        (download_path / "pytorch_model.bin").symlink_to(escaped_target)
+        mock_snapshot_download.return_value = str(download_path)
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=7)]
+
+        with pytest.raises(Exception, match="downloaded selected file symlink target escaped: pytorch_model\\.bin"):
+            download_model("https://huggingface.co/test/model", max_size=1000)
 
     @patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
@@ -2932,6 +3527,822 @@ class TestModelDownloadStreaming:
             "document.bin",
         ]
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "onnx/model.onnx_data", "README.md"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_preserves_onnx_external_data_before_parent_yield(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Referenced ONNX sidecars should be present while the parent ONNX is yielded."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.side_effect = [
+            [SimpleNamespace(path="onnx/model.onnx", size=len(payload))],
+            [SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes))],
+        ]
+
+        generator = download_model_streaming(
+            "https://huggingface.co/test/model",
+            cache_dir=tmp_path / "modelaudit_hf_fixture",
+            max_size=len(payload) + len(sidecar_bytes),
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+        model_path, is_last = next(generator)
+        sidecar_path = model_path.with_name("model.onnx_data")
+
+        assert is_last is True
+        assert model_path.name == "model.onnx"
+        assert sidecar_path.read_bytes() == sidecar_bytes
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/model.onnx",
+            "onnx/model.onnx_data",
+        ]
+        assert mock_get_paths_info.call_args_list == [
+            call("test/model", ["onnx/model.onnx"], revision=_HF_TEST_REVISION),
+            call("test/model", ["onnx/model.onnx_data"], revision=_HF_TEST_REVISION),
+        ]
+
+        with pytest.raises(StopIteration):
+            next(generator)
+        assert not sidecar_path.exists()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            ["onnx/a.onnx", "onnx/b.onnx", "onnx/shared.onnx_data"],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_counts_shared_onnx_external_data_once(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A shared context-only ONNX sidecar should be downloaded and budgeted once."""
+        payload = _make_external_onnx_payload(tmp_path, external_path="shared.onnx_data")
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(sidecar_bytes if filename == "onnx/shared.onnx_data" else payload)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.side_effect = [
+            [
+                SimpleNamespace(path="onnx/a.onnx", size=len(payload)),
+                SimpleNamespace(path="onnx/b.onnx", size=len(payload)),
+            ],
+            [SimpleNamespace(path="onnx/shared.onnx_data", size=len(sidecar_bytes))],
+        ]
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "modelaudit_hf_fixture",
+                max_size=(len(payload) * 2) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+        )
+
+        assert [path.name for path, _is_last in results] == ["a.onnx", "b.onnx"]
+        assert [is_last for _path, is_last in results] == [False, True]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/a.onnx",
+            "onnx/shared.onnx_data",
+            "onnx/b.onnx",
+        ]
+        assert mock_get_paths_info.call_args_list == [
+            call("test/model", ["onnx/a.onnx", "onnx/b.onnx"], revision=_HF_TEST_REVISION),
+            call("test/model", ["onnx/shared.onnx_data"], revision=_HF_TEST_REVISION),
+        ]
+        assert not (tmp_path / "modelaudit_hf_fixture" / "test" / "model" / "onnx" / "shared.onnx_data").exists()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/renamed", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_preserves_content_routed_renamed_onnx_external_data(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Content-routed renamed ONNX files should receive declared sidecars."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def detect_side_effect(_repo_id: str, filename: str, _revision: str, _budget: object) -> str | None:
+            return "onnx" if filename == "onnx/renamed" else None
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/renamed" else sidecar_bytes)
+            return str(path)
+
+        mock_detect_content.side_effect = detect_side_effect
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        generator = download_model_streaming(
+            "https://huggingface.co/test/model",
+            cache_dir=tmp_path / "cache",
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+        model_path, is_last = next(generator)
+        sidecar_path = model_path.parent / "model.onnx_data"
+
+        assert is_last is True
+        assert model_path.name == "renamed"
+        assert sidecar_path.read_bytes() == sidecar_bytes
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/renamed",
+            "onnx/model.onnx_data",
+        ]
+        assert [call.args[1] for call in mock_detect_content.call_args_list] == [
+            "onnx/renamed",
+            "onnx/model.onnx_data",
+        ]
+
+        with pytest.raises(StopIteration):
+            next(generator)
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_default_extensionless_onnx_stages_external_data_before_parent_scan(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Default extensionless ONNX selections should stage declared sidecars before parent scans."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        generator = download_model_streaming(
+            "https://huggingface.co/test/model",
+            cache_dir=tmp_path / "cache",
+        )
+        staged_before_parent_scan = False
+
+        def assert_sidecar_staged_generator() -> Iterator[tuple[Path, bool]]:
+            nonlocal staged_before_parent_scan
+            for path, is_last in generator:
+                if path.name == "model":
+                    staged_before_parent_scan = (path.parent / "model.onnx_data").is_file()
+                yield path, is_last
+
+        result = scan_model_streaming(
+            assert_sidecar_staged_generator(),
+            timeout=30,
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+
+        assert staged_before_parent_scan
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/model",
+            "onnx/model.onnx_data",
+        ]
+        assert any(
+            check.name == "External Data Reference Check"
+            and check.status.value == "passed"
+            and check.details.get("file") == "model.onnx_data"
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "External Data Reference Check"
+            and check.status.value == "failed"
+            and check.details.get("file") == "model.onnx_data"
+            for check in result.checks
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.bin", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_include_all_sniffs_renamed_onnx_before_sidecar_staging(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Include-all renamed ONNX files should stage declared sidecars before parent scans."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model.bin" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        generator = download_model_streaming(
+            "https://huggingface.co/test/model",
+            cache_dir=tmp_path / "cache",
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+            include_all_files=True,
+        )
+        staged_before_parent_scan = False
+
+        def assert_sidecar_staged_generator() -> Iterator[tuple[Path, bool]]:
+            nonlocal staged_before_parent_scan
+            for path, is_last in generator:
+                if path.name == "model.bin":
+                    staged_before_parent_scan = (path.parent / "model.onnx_data").is_file()
+                yield path, is_last
+
+        result = scan_model_streaming(
+            assert_sidecar_staged_generator(),
+            timeout=30,
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+
+        assert staged_before_parent_scan
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/model.bin",
+            "onnx/model.onnx_data",
+        ]
+        assert any(
+            check.name == "External Data Reference Check"
+            and check.status.value == "passed"
+            and check.details.get("file") == "model.onnx_data"
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "External Data Reference Check"
+            and check.status.value == "failed"
+            and check.details.get("file") == "model.onnx_data"
+            for check in result.checks
+        )
+
+    def test_scan_model_directory_hf_cache_content_routed_renamed_onnx_uses_snapshot_alias(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Extensionless ONNX snapshot aliases should resolve sibling sidecars without trusting unsafe sidecars."""
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--test--model"
+        blobs_dir = cache_root / "blobs"
+        valid_snapshot = cache_root / "snapshots" / ("a" * 40) / "onnx"
+        unsafe_snapshot = cache_root / "snapshots" / ("b" * 40) / "onnx"
+        for snapshot_dir in (valid_snapshot, unsafe_snapshot):
+            snapshot_dir.mkdir(parents=True)
+        blobs_dir.mkdir(parents=True)
+
+        model_blob = blobs_dir / "model-blob"
+        valid_sidecar_blob = blobs_dir / "sidecar-valid"
+        unsafe_sidecar_target = tmp_path / "outside-sidecar"
+        model_blob.write_bytes(_make_external_onnx_payload(tmp_path))
+        valid_sidecar_blob.write_bytes(struct.pack("f", 1.0))
+        unsafe_sidecar_target.write_bytes(struct.pack("f", 1.0))
+
+        for snapshot_dir in (valid_snapshot, unsafe_snapshot):
+            (snapshot_dir / "renamed").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+        (valid_snapshot / "model.onnx_data").symlink_to(os.path.relpath(valid_sidecar_blob, valid_snapshot))
+        (unsafe_snapshot / "model.onnx_data").symlink_to(os.path.relpath(unsafe_sidecar_target, unsafe_snapshot))
+
+        result = scan_model_directory_or_file(
+            str(cache_root / "snapshots"),
+            cache_enabled=False,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+
+        passed_external = [
+            check
+            for check in result.checks
+            if check.name == "External Data Reference Check"
+            and check.status.value == "passed"
+            and check.details.get("file") == "model.onnx_data"
+        ]
+        unsafe_sidecar_checks = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2026-34447: External Data Symlink Traversal"
+            and check.location == str(unsafe_snapshot / "model.onnx_data")
+        ]
+        valid_missing_external = [
+            check
+            for check in result.checks
+            if check.name == "External Data Reference Check"
+            and check.status.value == "failed"
+            and check.location == str(valid_snapshot / "model.onnx_data")
+        ]
+
+        assert len(passed_external) == 1
+        assert passed_external[0].location == str(valid_sidecar_blob)
+        assert unsafe_sidecar_checks
+        assert valid_missing_external == []
+        assert determine_exit_code(result) == 1
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_include_all_counts_selected_onnx_sidecar_once(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Selected sidecars should fit an exact include-all budget and download once."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="onnx/model.onnx", size=len(payload)),
+            SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes)),
+        ]
+
+        cache_dir = tmp_path / "cache"
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                max_size=len(payload) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                include_all_files=True,
+            )
+        )
+
+        download_root = cache_dir / "huggingface" / "test" / "model"
+        assert results == [
+            (download_root / "onnx" / "model.onnx", False),
+            (download_root / "onnx" / "model.onnx_data", True),
+        ]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/model.onnx",
+            "onnx/model.onnx_data",
+        ]
+        mock_get_paths_info.assert_called_once_with(
+            "test/model",
+            ["onnx/model.onnx", "onnx/model.onnx_data"],
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx_data", "onnx/model.onnx"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_include_all_reuses_selected_onnx_sidecar_before_parent(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Previously yielded selected sidecars should not be downloaded or budgeted twice."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes)),
+            SimpleNamespace(path="onnx/model.onnx", size=len(payload)),
+        ]
+
+        cache_dir = tmp_path / "cache"
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                max_size=len(payload) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                include_all_files=True,
+            )
+        )
+
+        download_root = cache_dir / "huggingface" / "test" / "model"
+        assert results == [
+            (download_root / "onnx" / "model.onnx_data", False),
+            (download_root / "onnx" / "model.onnx", True),
+        ]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/model.onnx_data",
+            "onnx/model.onnx",
+        ]
+        mock_get_paths_info.assert_called_once_with(
+            "test/model",
+            ["onnx/model.onnx_data", "onnx/model.onnx"],
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx_data", "onnx/model.onnx"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_include_all_refetches_deleted_selected_onnx_sidecar_before_parent(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A deleted yielded sidecar should be restored as ONNX context without double-budgeting."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes)),
+            SimpleNamespace(path="onnx/model.onnx", size=len(payload)),
+        ]
+
+        generator = download_model_streaming(
+            "https://huggingface.co/test/model",
+            cache_dir=tmp_path / "cache",
+            max_size=len(payload) + len(sidecar_bytes),
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+            include_all_files=True,
+        )
+        sidecar_path, sidecar_is_last = next(generator)
+        sidecar_path.unlink()
+        model_path, model_is_last = next(generator)
+
+        assert sidecar_is_last is False
+        assert model_is_last is True
+        assert model_path.name == "model.onnx"
+        assert (model_path.parent / "model.onnx_data").read_bytes() == sidecar_bytes
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/model.onnx_data",
+            "onnx/model.onnx",
+            "onnx/model.onnx_data",
+        ]
+        mock_get_paths_info.assert_called_once_with(
+            "test/model",
+            ["onnx/model.onnx_data", "onnx/model.onnx"],
+            revision=_HF_TEST_REVISION,
+        )
+        with pytest.raises(StopIteration):
+            next(generator)
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx", ".onnx_data"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            ["onnx/a.onnx", "onnx/b.onnx", "onnx/selected.onnx_data", "onnx/context.bin"],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_prefetched_selected_onnx_sidecar_reserves_budget_for_later_context(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Prefetched selected sidecars should count before later context-only sidecar caps."""
+        selected_sidecar_bytes = b"s" * 64
+        context_sidecar_bytes = b"c" * 4
+        a_payload = _make_external_onnx_payload(tmp_path, external_path="selected.onnx_data")
+        b_payload = _make_external_onnx_payload(tmp_path, external_path="context.bin")
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payloads = {
+                "onnx/a.onnx": a_payload,
+                "onnx/b.onnx": b_payload,
+                "onnx/selected.onnx_data": selected_sidecar_bytes,
+                "onnx/context.bin": context_sidecar_bytes,
+            }
+            path.write_bytes(payloads[filename])
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.side_effect = [
+            [
+                SimpleNamespace(path="onnx/a.onnx", size=len(a_payload)),
+                SimpleNamespace(path="onnx/b.onnx", size=len(b_payload)),
+                SimpleNamespace(path="onnx/selected.onnx_data", size=len(selected_sidecar_bytes)),
+            ],
+            [SimpleNamespace(path="onnx/context.bin", size=len(context_sidecar_bytes))],
+        ]
+
+        with pytest.raises(Exception, match=r"ONNX external_data file onnx/context\.bin"):
+            list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    cache_dir=tmp_path / "cache",
+                    max_size=len(a_payload) + len(b_payload) + len(selected_sidecar_bytes),
+                    scannable_extensions={".onnx", ".onnx_data"},
+                    scannable_scanner_ids={"onnx"},
+                )
+            )
+
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/a.onnx",
+            "onnx/selected.onnx_data",
+            "onnx/b.onnx",
+        ]
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_default_hf_cache_preserves_onnx_external_data_sidecar(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Context sidecars returned from the default HF cache must not be unlinked."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+        hf_cache_snapshot = tmp_path / "hf-cache" / "models--test--model" / "snapshots" / _HF_TEST_REVISION
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is None
+            path = hf_cache_snapshot / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        generator = download_model_streaming(
+            "https://huggingface.co/test/model",
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+        model_path, is_last = next(generator)
+        sidecar_path = model_path.with_name("model.onnx_data")
+
+        assert is_last is True
+        assert sidecar_path.read_bytes() == sidecar_bytes
+        with pytest.raises(StopIteration):
+            next(generator)
+        assert sidecar_path.read_bytes() == sidecar_bytes
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/model.onnx",
+            "onnx/model.onnx_data",
+        ]
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "secret.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_does_not_fetch_escaping_onnx_external_data(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Traversal locations should stay scanner evidence, not downloader context."""
+        payload = _make_external_onnx_payload(tmp_path, external_path="../secret.bin")
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "cache",
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+        )
+
+        assert len(results) == 1
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == ["onnx/model.onnx"]
+        assert not (results[0][0].parents[1] / "secret.bin").exists()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_blocks_oversized_onnx_external_data(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Sidecar bytes must count against the streaming download budget."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_size = 4
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert filename == "onnx/model.onnx"
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.side_effect = [
+            [SimpleNamespace(path="onnx/model.onnx", size=len(payload))],
+            [SimpleNamespace(path="onnx/model.onnx_data", size=sidecar_size)],
+        ]
+
+        with pytest.raises(Exception, match=r"ONNX external_data file onnx/model\.onnx_data"):
+            list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    cache_dir=tmp_path / "cache",
+                    max_size=len(payload) + sidecar_size - 1,
+                    scannable_extensions={".onnx"},
+                    scannable_scanner_ids={"onnx"},
+                )
+            )
+
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == ["onnx/model.onnx"]
+
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_download_model_streaming_real_bge_m3_onnx_external_data_pinned(self, tmp_path: Path) -> None:
+        """Pinned BGE-M3 streaming should resolve the declared model.onnx_data sidecar."""
+        if os.environ.get("MODELAUDIT_RUN_REAL_HF_BGE_M3") != "1":
+            pytest.skip("set MODELAUDIT_RUN_REAL_HF_BGE_M3=1 to run the 2.3GB pinned HF reproduction")
+
+        from huggingface_hub import HfApi
+
+        repo_id = "BAAI/bge-m3"
+        revision = "5617a9f61b028005a4858fdac845db406aefb181"
+        repo_info = HfApi().repo_info(repo_id, revision=revision, files_metadata=False)
+        siblings = getattr(repo_info, "siblings", None)
+        if not isinstance(siblings, list):
+            pytest.fail("BGE-M3 repo listing did not include siblings")
+        repo_files = sorted(str(sibling.rfilename) for sibling in siblings)
+        generator = download_model_streaming(
+            f"https://huggingface.co/{repo_id}",
+            cache_dir=tmp_path / "cache",
+            show_progress=False,
+            max_size=3_000_000_000,
+            timeout_seconds=7200,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, revision, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+        ):
+            result = scan_model_streaming(
+                generator,
+                timeout=7200,
+                delete_after_scan=True,
+                cache_enabled=False,
+                scanners=["onnx"],
+                skip_file_types=False,
+            )
+
+        missing_external = [
+            check
+            for check in result.checks
+            if check.name == "External Data Reference Check"
+            and check.status.value == "failed"
+            and check.details.get("file") == "model.onnx_data"
+        ]
+        resolved_external = [
+            check
+            for check in result.checks
+            if check.name == "External Data Reference Check"
+            and check.status.value == "passed"
+            and check.details.get("file") == "model.onnx_data"
+        ]
+        assert missing_external == []
+        assert resolved_external
+        assert determine_exit_code(result) in {0, 2}
+
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -3006,6 +4417,179 @@ class TestModelDownloadStreaming:
         _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0, revision=None)
         mock_requests_get.assert_not_called()
         mock_hf_hub_download.assert_not_called()
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_complete_multilingual_readme_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote content routing should treat complete bounded UTF-8 README probes as text."""
+        readme_payload = (
+            "# Model Card\n"
+            + ("This multilingual README has こんにちは, café, naïve, résumé, and 😀 examples.\n" * 256)
+        ).encode()
+        mock_requests_get.side_effect = _fake_range_responder(readme_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            "README.md",
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format is None
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "README.md",
+            "README.rst",
+            "README.txt",
+            "README.markdown",
+            "model_card.md",
+            "model_card.rst",
+            "modelcard.txt",
+            "modelcard.markdown",
+        ],
+    )
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_large_complete_documentation_text(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should use the declared text window, not the 2 MiB cap."""
+        documentation_payload = _large_remote_documentation_payload(filename)
+        assert len(documentation_payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        mock_requests_get.side_effect = _fake_range_responder(documentation_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        budget.record_file_size("test/model", filename, len(documentation_payload))
+        budget.prefixes[filename] = documentation_payload[:_HF_CONTENT_SNIFF_BYTES]
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            filename,
+            _HF_TEST_REVISION,
+            budget,
+            documentation_payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format is None
+
+    @pytest.mark.parametrize("filename", ["README.md", "model_card.md", "modelcard.txt"])
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_binary_documentation_checkpoint(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should not suppress MessagePack checkpoint structure."""
+        msgpack = pytest.importorskip("msgpack")
+        hidden_payload = msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+        mock_requests_get.side_effect = _fake_range_responder(hidden_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            filename,
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @pytest.mark.parametrize("filename", ["README.md", "model_card.md"])
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_control_scalar_documentation_fail_closed(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+    ) -> None:
+        """Remote documentation names should not suppress UTF-8 control scalar streams."""
+        payload = b"A\xc2\x80" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 3) + 1)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        budget.record_file_size("test/model", filename, len(payload))
+        budget.prefixes[filename] = payload[:_HF_CONTENT_SNIFF_BYTES]
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            filename,
+            _HF_TEST_REVISION,
+            budget,
+            payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_utf8_scalar_readme_fail_closed(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote low-diversity UTF-8 scalar streams should not claim text ownership."""
+        payload = b"\xc2\xa0" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 2) + 1)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            "README.md",
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_complete_vocabulary_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote Flax routing should treat complete tokenizer vocabularies as text."""
+        vocab_payload = _bert_vocab_payload()
+        mock_requests_get.side_effect = _fake_range_responder(vocab_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "test/model",
+            "vocab.txt",
+            _HF_TEST_REVISION,
+            budget,
+        )
+
+        assert detected_format is None
+        assert budget.file_sizes["vocab.txt"] == len(vocab_payload)
+        assert len(budget.prefixes["vocab.txt"]) == min(len(vocab_payload), _HF_CONTENT_SNIFF_BYTES)
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_large_complete_merges_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote Flax routing should treat complete BPE merge rules as tokenizer text."""
+        merges_payload = _bpe_merges_payload()
+        assert len(merges_payload) > 2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        mock_requests_get.side_effect = _fake_range_responder(merges_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        budget.record_file_size("test/model", "merges.txt", len(merges_payload))
+        budget.prefixes["merges.txt"] = merges_payload[:_HF_CONTENT_SNIFF_BYTES]
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            "merges.txt",
+            _HF_TEST_REVISION,
+            budget,
+            merges_payload[:_HF_CONTENT_SNIFF_BYTES],
+        )
+
+        assert detected_format is None
+        assert budget.file_sizes["merges.txt"] == len(merges_payload)
+        assert len(budget.prefixes["merges.txt"]) == len(merges_payload)
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")
@@ -3116,12 +4700,12 @@ class TestModelDownloadStreaming:
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_include_all_unknown_suffix_overflow_fails_closed(
+    def test_download_model_streaming_include_all_unbounded_large_unknown_suffix_inventory_fails_closed(
         self,
         mock_hf_hub_download: MagicMock,
         _mock_get_extensions: MagicMock,
     ) -> None:
-        """Incomplete unknown-suffix coverage must fail before downloading recognized files."""
+        """Unbounded include-all streaming should not download arbitrary large non-model inventories."""
         repo_files = ["model.bin", *(f"payloads/chunk-{idx:04d}.blob" for idx in range(129))]
 
         with (
@@ -3129,16 +4713,97 @@ class TestModelDownloadStreaming:
                 "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
                 return_value=(repo_files, _HF_TEST_REVISION, None),
             ),
-            pytest.raises(Exception, match="repository listing exceeds the bounded unfiltered candidate limit"),
+            pytest.raises(Exception, match="include_all_files=True without max_size selected more than"),
         ):
-            list(
+            list(download_model_streaming("https://huggingface.co/test/model", include_all_files=True))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_include_all_large_unknown_suffix_inventory_with_max_size_streams_all_candidates(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A max_size cap should bound aggregate include-all transfer without truncating large inventories."""
+        repo_files = ["model.bin", *(f"payloads/chunk-{idx:04d}.blob" for idx in range(129))]
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path=filename, size=len(b"payload")) for filename in repo_files
+        ]
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"payload")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+        ):
+            results = list(
                 download_model_streaming(
                     "https://huggingface.co/test/model",
                     include_all_files=True,
+                    max_size=10 * 1024,
                 )
             )
 
-        mock_hf_hub_download.assert_not_called()
+        assert len(results) == len(repo_files)
+        assert results[0] == (tmp_path / "model.bin", False)
+        assert results[-1] == (tmp_path / "payloads" / "chunk-0128.blob", True)
+        mock_get_paths_info.assert_called_once_with("test/model", repo_files, revision=_HF_TEST_REVISION)
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == repo_files
+
+    @pytest.mark.integration
+    def test_pinned_grok_large_inventory_metadata_streaming_reaches_terminal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The pinned Grok inventory should not fail at the historical 128-candidate cap."""
+        monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+        repo_id = "xai-org/grok-1"
+        revision = "5de83eb225f49624b424f1c8aa74f96983b5885c"
+
+        repo_files, resolved_revision = _list_huggingface_repo_files_at_revision(
+            repo_id,
+            requested_revision=revision,
+            timeout_seconds=30,
+        )
+
+        assert resolved_revision == revision
+        assert len(repo_files) == 773
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(repo_files, resolved_revision, None),
+        ):
+            results = list(
+                download_model_streaming(
+                    "hf://xai-org/grok-1",
+                    cache_dir=tmp_path,
+                    show_progress=False,
+                    max_size=10 * 1024,
+                    timeout_seconds=120,
+                    scannable_extensions={".md"},
+                    scannable_filenames={"readme"},
+                    scannable_scanner_ids={"metadata"},
+                )
+            )
+
+        assert len(results) == 1
+        readme_path, is_last = results[0]
+        assert readme_path.name == "README.md"
+        assert readme_path.stat().st_size <= 10 * 1024
+        assert is_last is True
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -4645,6 +6310,186 @@ class TestModelDownloadStreaming:
         mock_detect_content.assert_called_once_with("test/model", "renamed.jpg", _HF_TEST_REVISION, ANY)
 
     @pytest.mark.parametrize(
+        ("filename", "payload", "scannable_extensions", "scannable_scanner_ids", "expected_files"),
+        [
+            (
+                "weights.txt",
+                b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights.txt"],
+            ),
+            (
+                "weights.conf",
+                b":" + _make_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights.conf"],
+            ),
+            (
+                "weights-colon-newline.conf",
+                b":\n" + _make_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights-colon-newline.conf"],
+            ),
+            (
+                "weights-colon-space.conf",
+                b": a\n" + _make_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights-colon-space.conf"],
+            ),
+            (
+                "weights-key-colon.txt",
+                b"a:\n" + _make_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights-key-colon.txt"],
+            ),
+            (
+                "weights-key-lines.conf",
+                b"key:\n" + _make_line_broken_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights-key-lines.conf"],
+            ),
+            (
+                "candidate.txt",
+                (b"B" + bytes([len(("é" * 60).encode("utf-8") + b" x:12")]) + ("é" * 60).encode("utf-8") + b" x:12")
+                * 4097,
+                {".onnx"},
+                {"onnx"},
+                ["model.onnx", "candidate.txt"],
+            ),
+            (
+                "oversized-candidate.txt",
+                b"\x12\xff\xff\xff\xff\xff" + (b"\x00" * ((1024 * 1024) + 1)),
+                {".onnx"},
+                {"onnx"},
+                ["model.onnx", "oversized-candidate.txt"],
+            ),
+        ],
+        ids=[
+            "flax-msgpack-text-suffix",
+            "flax-msgpack-colon-inline-text-suffix",
+            "flax-msgpack-structure-prefixed-text-suffix",
+            "flax-msgpack-colon-space-text-suffix",
+            "flax-msgpack-key-colon-text-suffix",
+            "flax-msgpack-key-line-broken-text-suffix",
+            "protobuf-candidate-text-suffix",
+            "protobuf-oversized-candidate-text-suffix",
+        ],
+    )
+    @patch("requests.get")
+    def test_select_streamable_text_suffix_retains_binary_routes(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+        payload: bytes,
+        scannable_extensions: set[str],
+        scannable_scanner_ids: set[str],
+        expected_files: list[str],
+    ) -> None:
+        """Text-owner suffix handling must not suppress binary model candidates."""
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        repo_files = [expected_files[0], filename]
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            repo_files,
+            _HF_TEST_REVISION,
+            scannable_extensions=scannable_extensions,
+            scannable_scanner_ids=scannable_scanner_ids,
+        )
+
+        assert selected_files.filenames == expected_files
+
+    @patch("requests.get")
+    def test_select_streamable_text_suffix_safetensors_near_match_preserves_flax_route(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """SafeTensors near-matches must not hide a delayed Flax route for text suffixes."""
+        header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+        disclosed_size = 8 + header_len
+        flax_root = b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        root_offset = _HF_CONTENT_SNIFF_BYTES + 817
+        payload = struct.pack("<Q", header_len) + b"{" + (b"\x00" * (root_offset - 9)) + flax_root
+        assert root_offset + len(flax_root) < FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        payload = payload.ljust(FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1, b"\x00")
+
+        def get_side_effect(_url: str, *, headers: dict[str, str], **_kwargs: object) -> _FakeRangeResponse:
+            range_header = headers["Range"]
+            max_bytes = int(range_header.rsplit("-", 1)[1]) + 1
+            probe = payload[:max_bytes]
+            return _FakeRangeResponse(
+                probe,
+                headers={"Content-Range": f"bytes 0-{len(probe) - 1}/{disclosed_size}"},
+                status_code=206,
+            )
+
+        mock_requests_get.side_effect = get_side_effect
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.conf"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files.filenames == ["known.msgpack", "weights.conf"]
+
+    @patch("requests.get")
+    def test_select_streamable_text_suffix_safetensors_inconclusive_flax_preserves_safetensors(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """A real SafeTensors frame must not be overridden by only inconclusive Flax probing."""
+        tensor = b"\xdb\xff\xff\xff\xff" + (b"x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 16))
+        header = json.dumps(
+            {"tensor": {"dtype": "U8", "shape": [len(tensor)], "data_offsets": [0, len(tensor)]}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload = struct.pack("<Q", len(header)) + header + tensor
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.safetensors", "weights.conf"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".safetensors"},
+            scannable_scanner_ids={"safetensors"},
+        )
+
+        assert selected_files.filenames == ["known.safetensors", "weights.conf"]
+
+    @patch("requests.get")
+    def test_select_streamable_safetensors_suffix_keeps_flax_like_tensor_bytes_as_safetensors(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Only text-suffix SafeTensors near-matches may be promoted to Flax."""
+        tensor = b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        header = json.dumps(
+            {"tensor": {"dtype": "U8", "shape": [len(tensor)], "data_offsets": [0, len(tensor)]}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload = struct.pack("<Q", len(header)) + header + tensor
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.safetensors"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files.filenames == ["known.msgpack"]
+
+    @pytest.mark.parametrize(
         ("hidden_payload", "expected_filenames"),
         [
             (
@@ -4700,6 +6545,179 @@ class TestModelDownloadStreaming:
 
         assert [path.name for path, _is_last in results] == expected_filenames
         assert results[-1][1] is True
+
+    @patch("requests.get")
+    def test_select_streamable_flax_excludes_large_text_owner_merges(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """A complete large tokenizer text file must not be promoted to Flax."""
+        payload = ("#version: 0.2\n" + "e n\n" * 600_000).encode("utf-8")
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files.filenames == ["known.msgpack"]
+
+    @patch("requests.get")
+    def test_select_streamable_text_owner_prefix_preserves_embedded_flax_route(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """A text-looking remote prefix must not skip later bounded binary model bytes."""
+        text_prefix = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")[:_HF_CONTENT_SNIFF_BYTES]
+        payload = text_prefix + b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files.filenames == ["known.msgpack", "weights.txt"]
+
+    @patch("requests.get")
+    def test_select_streamable_text_owner_prefix_preserves_mid_window_flax_route(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """The post-prefix guard must cover the Flax structure window, not only one sniff chunk."""
+        text_prefix = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")[:_HF_CONTENT_SNIFF_BYTES]
+        payload = (
+            text_prefix + (b" " * ((_HF_CONTENT_SNIFF_BYTES * 2) + 100)) + b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        )
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files.filenames == ["known.msgpack", "weights.txt"]
+
+    @patch("requests.get")
+    def test_select_streamable_text_owner_prefix_preserves_embedded_protobuf_route(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Ordinary text prefixes must not hide later protobuf model-candidate bytes."""
+        text_prefix = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")[:_HF_CONTENT_SNIFF_BYTES]
+        proto_value = ("é" * 60).encode("utf-8") + b" x:12"
+        payload = text_prefix + b"B" + bytes([len(proto_value)]) + proto_value
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["model.onnx", "candidate.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+
+        assert selected_files.filenames == ["model.onnx", "candidate.txt"]
+
+    @patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES", 4 * 1024 * 1024)
+    @patch("requests.get")
+    def test_select_streamable_text_owner_uses_known_size_for_complete_probe_budget(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Known-small tokenizer text should not reserve the full text-owner ceiling."""
+        payload = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")
+        requested_ranges: list[tuple[int, int]] = []
+
+        def get_side_effect(_url: str, *, headers: dict[str, str], **_kwargs: object) -> _FakeRangeResponse:
+            range_header = headers["Range"]
+            start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            requested_start = int(start_text)
+            requested_end = int(end_text)
+            requested_ranges.append((requested_start, requested_end))
+            response_end = min(requested_end, len(payload) - 1)
+            return _fake_content_range_response(payload, requested_start, response_end)
+
+        mock_requests_get.side_effect = get_side_effect
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "a.txt", "b.txt", "c.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files.filenames == ["known.msgpack"]
+        assert requested_ranges
+        assert all((end - start + 1) <= FLAX_MSGPACK_STRUCTURE_READ_BYTES for start, end in requested_ranges)
+        assert (0, len(payload) - 1) not in requested_ranges
+
+    @patch("requests.get")
+    def test_select_streamable_protobuf_excludes_non_ascii_bpe_text_owner(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """BPE merge text with non-ASCII tokens must not become a protobuf candidate."""
+        payload = ("#version: 0.2\n" + "Ġ hello\n" * 300_000).encode("utf-8")
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["model.onnx", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+
+        assert selected_files.filenames == ["model.onnx"]
+
+    @patch("requests.get")
+    def test_select_streamable_flax_excludes_non_ascii_bpe_text_owner(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Printable non-ASCII tokenizer text must not be selected as inconclusive Flax."""
+        payload = ("#version: 0.2\n" + "Ġ hello\n" * 300_000).encode("utf-8")
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files.filenames == ["known.msgpack"]
+
+    @patch("requests.get")
+    def test_select_streamable_protobuf_excludes_ascii_varint_text_near_match(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """ASCII text starting with a weak ONNX varint tag must remain text-owned."""
+        payload = (b"(h benign ascii text\n") * 4097
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["model.onnx", "notes.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+
+        assert selected_files.filenames == ["model.onnx"]
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -6037,12 +8055,17 @@ class TestHuggingFaceFileURLs:
             cache_dir=str(cache_dir),
         )
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_preflights_before_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Direct file downloads should allow files exactly at the capped boundary."""
@@ -6063,7 +8086,6 @@ class TestHuggingFaceFileURLs:
         mock_hf_api.return_value.repo_info.assert_called_once_with(
             "test/model",
             revision="main",
-            timeout=30.0,
             files_metadata=False,
         )
         mock_hf_api.return_value.get_paths_info.assert_called_once_with(
@@ -6071,6 +8093,7 @@ class TestHuggingFaceFileURLs:
             ["model.bin"],
             revision=TEST_COMMIT_SHA,
         )
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="model.bin",
@@ -6079,12 +8102,17 @@ class TestHuggingFaceFileURLs:
         )
         assert result == downloaded_file
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        return_value=["pytorch_model.bin", "model.safetensors"],
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_fills_repository_file_inventory(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         downloaded_file = tmp_path / "downloaded_file.bin"
@@ -6110,6 +8138,7 @@ class TestHuggingFaceFileURLs:
 
         assert result == downloaded_file
         assert inventory == ["pytorch_model.bin", "model.safetensors"]
+        mock_paginated_listing.assert_called_once_with("test/model", TEST_COMMIT_SHA, timeout_seconds=30.0)
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="pytorch_model.bin",
@@ -6117,12 +8146,17 @@ class TestHuggingFaceFileURLs:
             cache_dir=None,
         )
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        return_value=["pytorch_model.bin", "model.safetensors"],
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_inventory_pins_uncapped_download_to_listed_revision(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         downloaded_file = tmp_path / "downloaded_file.bin"
@@ -6144,6 +8178,7 @@ class TestHuggingFaceFileURLs:
 
         assert result == downloaded_file
         assert inventory == ["pytorch_model.bin", "model.safetensors"]
+        mock_paginated_listing.assert_called_once_with("test/model", TEST_COMMIT_SHA, timeout_seconds=30.0)
         mock_hf_api.return_value.get_paths_info.assert_not_called()
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
@@ -6180,12 +8215,17 @@ class TestHuggingFaceFileURLs:
             cache_dir=None,
         )
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_rejects_oversized_before_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
     ) -> None:
         """Oversized direct files should not reach hf_hub_download."""
         mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
@@ -6204,8 +8244,13 @@ class TestHuggingFaceFileURLs:
 
         assert "11.0 MB" in str(exc_info.value)
         assert "10.0 MB" in str(exc_info.value)
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     @pytest.mark.parametrize("file_size", [None, -1, "1024", True])
@@ -6213,6 +8258,7 @@ class TestHuggingFaceFileURLs:
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         file_size: object,
     ) -> None:
         """Capped direct files fail closed when HuggingFace metadata has no valid size."""
@@ -6228,14 +8274,20 @@ class TestHuggingFaceFileURLs:
                 max_size=10 * 1024 * 1024,
             )
 
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_rejects_underreported_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Capped direct files should verify the returned cache file before scanning."""
@@ -6254,12 +8306,19 @@ class TestHuggingFaceFileURLs:
                 max_size=4,
             )
 
+        mock_paginated_listing.assert_not_called()
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_rejects_unverifiable_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Capped direct files fail closed if the downloaded cache path cannot be verified."""
@@ -6276,12 +8335,19 @@ class TestHuggingFaceFileURLs:
                 max_size=4,
             )
 
+        mock_paginated_listing.assert_not_called()
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_redacts_metadata_errors(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
     ) -> None:
         """Metadata preflight errors should not expose direct URL credentials."""
         mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
@@ -6302,6 +8368,7 @@ class TestHuggingFaceFileURLs:
         assert "hf_secret" not in error
         assert "token=" not in error
         assert "https://huggingface.co/test/model/resolve/main/model.bin" in error
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
     @patch("huggingface_hub.HfApi")
