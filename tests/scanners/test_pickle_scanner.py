@@ -3500,6 +3500,30 @@ def test_legacy_pytorch_rejects_custom_persid_without_trusting_storage_pid(tmp_p
     assert issues[0].details["opcode"] == "PERSID"
 
 
+def test_legacy_pytorch_rejects_protocol0_tuple_like_storage_persid(tmp_path: Path) -> None:
+    object_stream = b"]P('storage', <class 'torch.ByteStorage'>, '0', 'cpu', 64, None)\na."
+    payload, _pickle_end = _make_legacy_pytorch_container_with_object_stream(b"A" * 64, object_stream)
+    path = tmp_path / "legacy-protocol0-storage.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    _assert_legacy_storage_layout_incomplete(result)
+    layout_check = next(check for check in result.checks if check.rule_code == "S902")
+    issues = _persistent_id_issues(result, opcode="PERSID")
+    serialized_result = result.to_dict(include_private_metadata=True)
+    result.metadata["file_path"] = str(path)
+    aggregate_result = create_initial_audit_result()
+    merge_scan_result(aggregate_result, result)
+
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert layout_check.message == "Legacy PyTorch storage records could not be validated completely"
+    assert len(issues) == 1
+    assert issues[0].rule_code == "S212"
+    assert should_cache_scan_result(serialized_result) is False
+    assert determine_exit_code(aggregate_result) == 1
+
+
 def test_legacy_pytorch_rejects_extra_binpersid_without_trusting_first_storage_pid(tmp_path: Path) -> None:
     canonical_pid = _legacy_pytorch_storage_pid_tuple("0", 64)
     object_stream = b"\x80\x02]" + canonical_pid + b"Qa" + _binunicode(b"external://weights") + b"Qa."
