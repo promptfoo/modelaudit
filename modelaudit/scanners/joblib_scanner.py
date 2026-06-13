@@ -835,8 +835,16 @@ class JoblibScanner(BaseScanner):
                 and finding.details.get("associated_global") == "_codecs.encode"
             )
 
+        removed_private_entries = [
+            entry
+            for check in result.checks
+            if is_validated_dtype_codec_finding(check)
+            for entry in [JoblibScanner._private_actionable_failed_check_entry(check)]
+            if entry is not None
+        ]
         result.issues = [issue for issue in result.issues if not is_validated_dtype_codec_finding(issue)]
         result.checks = [check for check in result.checks if not is_validated_dtype_codec_finding(check)]
+        JoblibScanner._remove_private_actionable_failed_check_entries(result, removed_private_entries)
 
     @staticmethod
     def _numpy_array_wrapper_origin_is_trusted() -> bool:

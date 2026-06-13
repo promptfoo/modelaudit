@@ -18,6 +18,7 @@ import modelaudit_picklescan.api as picklescan_api
 import pytest
 from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches
 
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, INCONCLUSIVE_SCAN_OUTCOME, Issue
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
@@ -940,6 +941,53 @@ def test_validated_joblib_wrapper_cleanup_clears_private_actionable_failed_check
     assert "scan_outcome" not in result.metadata
     assert result.metadata["pickle_report_status"] == "complete"
     assert result.metadata["pickle_verdict"] == "clean"
+
+
+def test_validated_dtype_codec_cleanup_filters_private_actionable_failed_checks() -> None:
+    benign_result = ScanResult("joblib")
+    benign_result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="validated dtype codec",
+        severity=IssueSeverity.WARNING,
+        details={"associated_global": "_codecs.encode"},
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    benign_result.checks[0].severity = IssueSeverity.INFO
+    benign_result.issues[0].severity = IssueSeverity.INFO
+
+    result = ScanResult("joblib")
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="validated dtype codec",
+        severity=IssueSeverity.WARNING,
+        details={"associated_global": "_codecs.encode"},
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    result.checks[0].severity = IssueSeverity.INFO
+    result.issues[0].severity = IssueSeverity.INFO
+    result.add_check(
+        name="Dangerous Embedded Code",
+        passed=False,
+        message="dangerous global",
+        severity=IssueSeverity.CRITICAL,
+        details={"associated_global": "builtins.exec"},
+        rule_code="S101",
+    )
+
+    JoblibScanner._remove_validated_dtype_codec_findings(benign_result)
+    JoblibScanner._remove_validated_dtype_codec_findings(result)
+
+    assert benign_result.checks == []
+    assert benign_result.issues == []
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in benign_result._private_metadata
+    assert should_cache_scan_result(benign_result.to_dict(include_private_metadata=True)) is True
+    assert [(check.name, check.rule_code) for check in result.checks] == [("Dangerous Embedded Code", "S101")]
+    assert [(issue.message, issue.rule_code) for issue in result.issues] == [("dangerous global", "S101")]
+    assert result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] == [
+        {"name": "Dangerous Embedded Code", "rule_code": "S101", "severity": "critical"}
+    ]
 
 
 def test_scan_preserves_unrelated_codec_global_before_validated_dtype_use(tmp_path: Path) -> None:
