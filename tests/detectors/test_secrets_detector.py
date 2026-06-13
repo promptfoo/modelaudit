@@ -1,12 +1,30 @@
 """Tests for embedded secrets detection in ML models."""
 
+import base64
 import json
 import pickle
 
 import pytest
 
-from modelaudit.detectors.secrets import SecretsDetector, detect_secrets_in_file
+from modelaudit.detectors.secrets import (
+    BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS,
+    BASIC_AUTH_TOKEN_MAX_LENGTH,
+    SecretsDetector,
+    detect_secrets_in_file,
+)
 from modelaudit.scanners.pickle_scanner import PickleScanner
+
+
+def _basic_auth_token(credentials: bytes) -> str:
+    return base64.b64encode(credentials).decode("ascii")
+
+
+def _basic_auth_findings(findings: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [finding for finding in findings if finding.get("secret_type") == "Basic Auth Credentials"]
+
+
+def _padded_basic_auth_header_pairs(count: int = 20) -> str:
+    return ", ".join(f'["X-Filler-{index}", "application/json"]' for index in range(count))
 
 
 class TestSecretsDetector:
@@ -101,6 +119,1118 @@ class TestSecretsDetector:
         findings = detector.scan_text(text)
 
         assert any(finding["secret_type"] == "JWT Token" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "context",
+        [
+            "audio_tokenizer/README.md",
+            "tokenizer_config.json",
+            "auth/README.md",
+            "credential_notes.txt",
+        ],
+    )
+    def test_basic_auth_ignores_prose_without_suppressing_other_secrets(self, context: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(
+            "Provide the basic links for the model\naws_access_key_id=AKIAABCDEFGHIJKLMNOP\n",
+            context=context,
+        )
+
+        assert _basic_auth_findings(findings) == []
+        assert any(finding["secret_type"] == "AWS Access Key ID" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Basic links are available for this model.",
+            "Basic authentication is documented here.",
+            "The basic links section lists model files.",
+            "Authorization notes mention Basic links without a header value.",
+        ],
+    )
+    def test_basic_auth_ignores_benign_prose_controls(self, text: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(text, context="audio_tokenizer/README.md")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize(
+        ("text", "token"),
+        [
+            ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: Basic\n dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: Basic\n  dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: Basic \r\n dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: Basic\r\n\tdXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: Basic\r\n\t dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            (f"Authorization: Basic {_basic_auth_token(b'sentence:pass')}.", _basic_auth_token(b"sentence:pass")),
+            (f'BASIC_AUTH="Basic {_basic_auth_token(b"basic-var:pass")}"', _basic_auth_token(b"basic-var:pass")),
+            (f'auth_header = "Basic {_basic_auth_token(b"auth-header:pass")}"', _basic_auth_token(b"auth-header:pass")),
+            (
+                f"Authorization: Basic {_basic_auth_token(b'escaped-crlf:pass')}\\r\\n",
+                _basic_auth_token(b"escaped-crlf:pass"),
+            ),
+            (
+                ("x" * 1000) + f" Authorization: Basic {_basic_auth_token(b'long-line:pass')}",
+                _basic_auth_token(b"long-line:pass"),
+            ),
+            (f"HTTP_AUTHORIZATION=Basic {_basic_auth_token(b'env-user:pass')}", _basic_auth_token(b"env-user:pass")),
+            (
+                f"HTTP_PROXY_AUTHORIZATION=Basic {_basic_auth_token(b'proxy-env:pass')}",
+                _basic_auth_token(b"proxy-env:pass"),
+            ),
+            (
+                f"HTTP_BASIC_AUTH=Basic {_basic_auth_token(b'http-basic:pass')}",
+                _basic_auth_token(b"http-basic:pass"),
+            ),
+            (
+                f"HTTP_AUTH_HEADER=Basic {_basic_auth_token(b'http-auth-header:pass')}",
+                _basic_auth_token(b"http-auth-header:pass"),
+            ),
+            (
+                f"HTTP_AUTHORIZATION_HEADER=Basic {_basic_auth_token(b'http-authorization-header:pass')}",
+                _basic_auth_token(b"http-authorization-header:pass"),
+            ),
+            (
+                f"HTTP_PROXY_AUTH_HEADER=Basic {_basic_auth_token(b'http-proxy-auth-header:pass')}",
+                _basic_auth_token(b"http-proxy-auth-header:pass"),
+            ),
+            (
+                f"proxy_authorization_header: Basic {_basic_auth_token(b'proxy-authorization-header:pass')}",
+                _basic_auth_token(b"proxy-authorization-header:pass"),
+            ),
+            ("Proxy-Authorization:\tBasic\tQWxhZGRpbjpvcGVuIHNlc2FtZQ==", "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
+            ("aUtHoRiZaTiOn: bAsIc dTpw", "dTpw"),
+            ("GET / HTTP/1.1\r\nHost: example.test\r\nAuthorization: Basic YTo/Pz8/\r\n", "YTo/Pz8/"),
+            ('{"Authorization": "Basic YTp+fn5+"}', "YTp+fn5+"),
+            (f"Authorization: Basic {_basic_auth_token(b'api-token:')}", _basic_auth_token(b"api-token:")),
+            (f"Authorization: Basic {_basic_auth_token(b':password')}", _basic_auth_token(b":password")),
+            (f"Authorization:\n  Basic {_basic_auth_token(b'wrapped:pass')}", _basic_auth_token(b"wrapped:pass")),
+            (
+                f"Proxy-Authorization:\r\n\tBasic {_basic_auth_token(b'wrapped-proxy:pass')}",
+                _basic_auth_token(b"wrapped-proxy:pass"),
+            ),
+            (f"Authorization:\n  - Basic {_basic_auth_token(b'listed:pass')}", _basic_auth_token(b"listed:pass")),
+            (
+                f'"Authorization": ["Basic {_basic_auth_token(b"json-list:pass")}"]',
+                _basic_auth_token(b"json-list:pass"),
+            ),
+            (
+                f'"Authorization": ["Bearer placeholder", "Basic {_basic_auth_token(b"json-list-second:pass")}"]',
+                _basic_auth_token(b"json-list-second:pass"),
+            ),
+            (
+                f'"Authorization": [\n  "Basic {_basic_auth_token(b"json-multiline:pass")}"\n]',
+                _basic_auth_token(b"json-multiline:pass"),
+            ),
+            (
+                f"Authorization:\n  - Bearer placeholder\n  - Basic {_basic_auth_token(b'yaml-list-second:pass')}\n",
+                _basic_auth_token(b"yaml-list-second:pass"),
+            ),
+            (f"Authorization: >\n  Basic {_basic_auth_token(b'block:pass')}", _basic_auth_token(b"block:pass")),
+            (f"Authorization: |-\n  Basic {_basic_auth_token(b'chomp:pass')}", _basic_auth_token(b"chomp:pass")),
+            (
+                f"Proxy-Authorization: >+\n  Basic {_basic_auth_token(b'folded:pass')}",
+                _basic_auth_token(b"folded:pass"),
+            ),
+            (
+                f"`Authorization: Basic {_basic_auth_token(b'markdown:pass')}`",
+                _basic_auth_token(b"markdown:pass"),
+            ),
+            (
+                f"<code>Authorization: Basic {_basic_auth_token(b'html:pass')}</code>",
+                _basic_auth_token(b"html:pass"),
+            ),
+            (
+                f"<Authorization>Basic {_basic_auth_token(b'xml-header:pass')}</Authorization>",
+                _basic_auth_token(b"xml-header:pass"),
+            ),
+            (
+                f"<Authorization>\n  Basic {_basic_auth_token(b'xml-header-multiline:pass')}\n</Authorization>",
+                _basic_auth_token(b"xml-header-multiline:pass"),
+            ),
+            (
+                f"<Proxy-Authorization>Basic {_basic_auth_token(b'xml-proxy:pass')}</Proxy-Authorization>",
+                _basic_auth_token(b"xml-proxy:pass"),
+            ),
+            (
+                f"<Proxy-Authorization>\n  Basic "
+                f"{_basic_auth_token(b'xml-proxy-multiline:pass')}\n</Proxy-Authorization>",
+                _basic_auth_token(b"xml-proxy-multiline:pass"),
+            ),
+            (
+                f'headers["Authorization"] = "Basic {_basic_auth_token(b"bracket:pass")}"',
+                _basic_auth_token(b"bracket:pass"),
+            ),
+            (
+                f'http.Header{{"Authorization": []string{{"Basic {_basic_auth_token(b"go-header:pass")}"}}}}',
+                _basic_auth_token(b"go-header:pass"),
+            ),
+            (
+                f'headers["Authorization"] = f"Basic {_basic_auth_token(b"prefixed-fstring:pass")}"',
+                _basic_auth_token(b"prefixed-fstring:pass"),
+            ),
+            (
+                f"headers['Proxy-Authorization'] = b'Basic {_basic_auth_token(b'prefixed-bytes:pass')}'",
+                _basic_auth_token(b"prefixed-bytes:pass"),
+            ),
+            (
+                f"headers['Authorization'] = `Basic {_basic_auth_token(b'js-template-value:pass')}`",
+                _basic_auth_token(b"js-template-value:pass"),
+            ),
+            (
+                f"headers['Proxy-Authorization'] = 'Basic {_basic_auth_token(b'proxy-bracket:pass')}'",
+                _basic_auth_token(b"proxy-bracket:pass"),
+            ),
+            (
+                f'"Authorization" => "Basic {_basic_auth_token(b"hash-rocket:pass")}"',
+                _basic_auth_token(b"hash-rocket:pass"),
+            ),
+            (
+                f'AUTH_HEADER = f"Authorization: Basic {_basic_auth_token(b"py-fstring:pass")}"',
+                _basic_auth_token(b"py-fstring:pass"),
+            ),
+            (
+                f'AUTH_HEADER = b"Authorization: Basic {_basic_auth_token(b"py-bytes:pass")}"',
+                _basic_auth_token(b"py-bytes:pass"),
+            ),
+            (
+                f"AUTH_HEADER = r'Authorization: Basic {_basic_auth_token(b'py-raw:pass')}'",
+                _basic_auth_token(b"py-raw:pass"),
+            ),
+            (
+                f"const auth = `Authorization: Basic {_basic_auth_token(b'js-template:pass')}`;",
+                _basic_auth_token(b"js-template:pass"),
+            ),
+            (
+                f'ENV AUTH_HEADER="Authorization: Basic {_basic_auth_token(b"docker-env:pass")}"',
+                _basic_auth_token(b"docker-env:pass"),
+            ),
+            (
+                f'env:\n- name: AUTH_HEADER\n  value: "Authorization: Basic {_basic_auth_token(b"k8s-env:pass")}"',
+                _basic_auth_token(b"k8s-env:pass"),
+            ),
+            (
+                f"proxy_authorization: Basic {_basic_auth_token(b'raw-alias:pass')}",
+                _basic_auth_token(b"raw-alias:pass"),
+            ),
+            (
+                f"proxyAuthorization: Basic {_basic_auth_token(b'raw-camel:pass')}",
+                _basic_auth_token(b"raw-camel:pass"),
+            ),
+            (
+                f'"proxy_authorization": "Basic {_basic_auth_token(b"json-alias:pass")}"',
+                _basic_auth_token(b"json-alias:pass"),
+            ),
+            (
+                f'payload = {{\\"Authorization\\": \\"Basic {_basic_auth_token(b"escaped-json:pass")}\\"}}',
+                _basic_auth_token(b"escaped-json:pass"),
+            ),
+            (
+                f'headers[\\"Authorization\\"] = \\"Basic {_basic_auth_token(b"escaped-bracket:pass")}\\"',
+                _basic_auth_token(b"escaped-bracket:pass"),
+            ),
+            (
+                f'headers.set("Authorization", "Basic {_basic_auth_token(b"headers-set:pass")}")',
+                _basic_auth_token(b"headers-set:pass"),
+            ),
+            (
+                f'headers.set("Authorization", /* default */ "Basic {_basic_auth_token(b"headers-set-comment:pass")}")',
+                _basic_auth_token(b"headers-set-comment:pass"),
+            ),
+            (
+                f'headers.add("Authorization", "Basic {_basic_auth_token(b"headers-add:pass")}")',
+                _basic_auth_token(b"headers-add:pass"),
+            ),
+            (
+                f'request.headers.add("Authorization", "Basic {_basic_auth_token(b"request-headers-add:pass")}")',
+                _basic_auth_token(b"request-headers-add:pass"),
+            ),
+            (
+                f"request.setRequestHeader('Authorization', 'Basic {_basic_auth_token(b'set-request-header:pass')}')",
+                _basic_auth_token(b"set-request-header:pass"),
+            ),
+            (
+                f'request.setHeader("Authorization", "Basic {_basic_auth_token(b"set-header:pass")}")',
+                _basic_auth_token(b"set-header:pass"),
+            ),
+            (
+                f'headers.append("Proxy-Authorization", "Basic {_basic_auth_token(b"headers-append:pass")}")',
+                _basic_auth_token(b"headers-append:pass"),
+            ),
+            (
+                f'headers["Authorization"].append("Basic {_basic_auth_token(b"property-append:pass")}")',
+                _basic_auth_token(b"property-append:pass"),
+            ),
+            (
+                f'headers.put("Authorization", "Basic {_basic_auth_token(b"headers-put:pass")}")',
+                _basic_auth_token(b"headers-put:pass"),
+            ),
+            (
+                "connection.setRequestProperty("
+                f'"Proxy-Authorization", "Basic {_basic_auth_token(b"request-property:pass")}")',
+                _basic_auth_token(b"request-property:pass"),
+            ),
+            (
+                f'proxy_set_header Authorization "Basic {_basic_auth_token(b"proxy-set-header:pass")}";',
+                _basic_auth_token(b"proxy-set-header:pass"),
+            ),
+            (
+                f'headers.set(\n  "Authorization",\n  "Basic {_basic_auth_token(b"headers-set-multiline:pass")}"\n)',
+                _basic_auth_token(b"headers-set-multiline:pass"),
+            ),
+            (
+                "request.setRequestHeader(\n"
+                "  'Authorization',\n"
+                f"  'Basic {_basic_auth_token(b'set-header-multiline:pass')}'\n"
+                ")",
+                _basic_auth_token(b"set-header-multiline:pass"),
+            ),
+            (
+                "headers.append(\n"
+                '  "Proxy-Authorization",\n'
+                f'  "Basic {_basic_auth_token(b"append-multiline:pass")}"\n'
+                ")",
+                _basic_auth_token(b"append-multiline:pass"),
+            ),
+            (
+                f'new Headers([\n  ["Authorization", "Basic {_basic_auth_token(b"headers-constructor:pass")}"]\n])',
+                _basic_auth_token(b"headers-constructor:pass"),
+            ),
+            (
+                'new Headers([["Accept", "application/json"], '
+                f'["Authorization", "Basic {_basic_auth_token(b"headers-constructor-nonfirst:pass")}"]])',
+                _basic_auth_token(b"headers-constructor-nonfirst:pass"),
+            ),
+            (
+                'new Headers([["Accept", "application/json"], '
+                f'["Proxy-Authorization", "Basic {_basic_auth_token(b"headers-constructor-proxy:pass")}"]])',
+                _basic_auth_token(b"headers-constructor-proxy:pass"),
+            ),
+            (
+                'fetch("/model", { headers: [["Authorization", "Basic '
+                f'{_basic_auth_token(b"fetch-headers:pass")}"]] }})',
+                _basic_auth_token(b"fetch-headers:pass"),
+            ),
+            (
+                f'const init = {{ headers: [["Authorization", "Basic {_basic_auth_token(b"init-headers:pass")}"]] }}',
+                _basic_auth_token(b"init-headers:pass"),
+            ),
+            (
+                f'fetch("/model", {{ headers: [{{ name: "Authorization", value: "Basic '
+                f'{_basic_auth_token(b"object-list:pass")}" }}] }})',
+                _basic_auth_token(b"object-list:pass"),
+            ),
+            (
+                f'fetch("/model", {{ headers: [{{ value: "Basic {_basic_auth_token(b"object-list-reordered:pass")}", '
+                'name: "Authorization" }] })',
+                _basic_auth_token(b"object-list-reordered:pass"),
+            ),
+            (
+                "headers:\n"
+                "  - name: Proxy-Authorization\n"
+                f"    value: Basic {_basic_auth_token(b'yaml-object-list:pass')}\n",
+                _basic_auth_token(b"yaml-object-list:pass"),
+            ),
+            (
+                "headers:\n"
+                f"  - value: Basic {_basic_auth_token(b'yaml-object-reordered:pass')}\n"
+                "    name: Proxy-Authorization\n",
+                _basic_auth_token(b"yaml-object-reordered:pass"),
+            ),
+            (
+                f'{{"headers":[{{"headerName":"proxy_authorization_header","headerValue":"Basic '
+                f'{_basic_auth_token(b"json-header-object:pass")}"}}]}}',
+                _basic_auth_token(b"json-header-object:pass"),
+            ),
+            (
+                f'{{"headers":[{{"headerValue":"Basic {_basic_auth_token(b"json-header-object-reordered:pass")}",'
+                '"headerName":"proxy_authorization_header"}]}}',
+                _basic_auth_token(b"json-header-object-reordered:pass"),
+            ),
+            (
+                f'{{"headers":[{{"value":["Basic {_basic_auth_token(b"json-object-array-first:pass")}"],'
+                '"name":"Authorization"}]}}',
+                _basic_auth_token(b"json-object-array-first:pass"),
+            ),
+            (
+                'headers: [{ value: ["Bearer placeholder", "Basic '
+                f'{_basic_auth_token(b"js-object-array-second:pass")}"], name: "Proxy-Authorization" }}]',
+                _basic_auth_token(b"js-object-array-second:pass"),
+            ),
+            (
+                f'{{"headers":[{{"name":"Authorization","value":["Bearer placeholder","Basic '
+                f'{_basic_auth_token(b"json-object-list-second:pass")}"]}}]}}',
+                _basic_auth_token(b"json-object-list-second:pass"),
+            ),
+            (
+                f'{{"headers":[{{"name":"Authorization","values":["Basic '
+                f'{_basic_auth_token(b"json-object-values:pass")}"]}}]}}',
+                _basic_auth_token(b"json-object-values:pass"),
+            ),
+            (
+                f'{{"headers":[{{"name":"Authorization","headerValues":["Basic '
+                f'{_basic_auth_token(b"json-object-header-values:pass")}"]}}]}}',
+                _basic_auth_token(b"json-object-header-values:pass"),
+            ),
+            (
+                "headers:\n"
+                "  - name: Authorization\n"
+                "    value:\n"
+                "      - Bearer placeholder\n"
+                f"      - Basic {_basic_auth_token(b'yaml-object-list-second:pass')}\n",
+                _basic_auth_token(b"yaml-object-list-second:pass"),
+            ),
+            (
+                "headers:\n"
+                "  - name: Authorization\n"
+                "    values:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-object-values:pass')}\n",
+                _basic_auth_token(b"yaml-object-values:pass"),
+            ),
+            (
+                "headers:\n"
+                "  - name: Authorization\n"
+                "    headerValues:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-object-header-values:pass')}\n",
+                _basic_auth_token(b"yaml-object-header-values:pass"),
+            ),
+            (
+                f"headers=[('Authorization', 'Basic {_basic_auth_token(b'assignment-tuple:pass')}')]",
+                _basic_auth_token(b"assignment-tuple:pass"),
+            ),
+            (
+                'fetch("/model", { headers: [["Accept", "application/json"], '
+                f'["Proxy-Authorization", "Basic {_basic_auth_token(b"fetch-proxy-headers:pass")}"]] }})',
+                _basic_auth_token(b"fetch-proxy-headers:pass"),
+            ),
+            (
+                f"Authorization: Basic {_basic_auth_token(bytes.fromhex('ceb4cebfcebaceb9cebcceae3a70c3a47373'))}",
+                _basic_auth_token(bytes.fromhex("ceb4cebfcebaceb9cebcceae3a70c3a47373")),
+            ),
+        ],
+    )
+    def test_basic_auth_valid_headers_are_detected(self, text: str, token: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(text, context="headers.txt")
+        basic_findings = _basic_auth_findings(findings)
+
+        assert basic_findings
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        serialized = json.dumps(basic_findings, sort_keys=True)
+        assert token not in serialized
+
+    @pytest.mark.parametrize(
+        ("text", "token", "opener"),
+        [
+            (
+                "new Headers(["
+                + _padded_basic_auth_header_pairs()
+                + ', ["Authorization", "Basic '
+                + _basic_auth_token(b"padded-headers-constructor:pass")
+                + '"]])',
+                _basic_auth_token(b"padded-headers-constructor:pass"),
+                "new Headers([",
+            ),
+            (
+                'fetch("/model", { headers: ['
+                + _padded_basic_auth_header_pairs()
+                + ', ["Authorization", "Basic '
+                + _basic_auth_token(b"padded-fetch-headers:pass")
+                + '"]] })',
+                _basic_auth_token(b"padded-fetch-headers:pass"),
+                "headers: [",
+            ),
+        ],
+    )
+    def test_basic_auth_padded_headers_tuple_arrays_are_detected(
+        self,
+        text: str,
+        token: str,
+        opener: str,
+    ) -> None:
+        detector = SecretsDetector()
+
+        assert text.index("Basic ") - text.index(opener) > 256
+        findings = detector.scan_text(text, context="headers.txt")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    def test_basic_auth_source_tuple_headers_container_is_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"source-tuple-headers:pass")
+        text = f'requests.get(url, headers=(("Authorization", "Basic {token}"),))'
+
+        findings = detector.scan_text(text, context="client.py")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize("container_name", ["params", "metadata"])
+    def test_basic_auth_source_tuple_non_headers_container_is_ignored(self, container_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"source-tuple-non-header:pass")
+        text = f'requests.get(url, {container_name}=(("Authorization", "Basic {token}"),))'
+
+        findings = detector.scan_text(text, context="client.py")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_many_yaml_header_value_list_entries_are_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"many-yaml-list:pass")
+        filler = "".join(f"  - Bearer placeholder-{index:03d}-padding-padding\n" for index in range(176))
+        text = f"Authorization:\n{filler}  - Basic {token}\n"
+
+        assert text.index("Basic ") - text.index("Authorization:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    def test_basic_auth_many_yaml_quoted_header_value_list_entries_are_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"many-yaml-quoted-list:pass")
+        filler = "".join(f"  - Bearer placeholder-{index:03d}-padding-padding\n" for index in range(176))
+        text = f'"Authorization":\n{filler}  - Basic {token}\n'
+
+        assert text.index("Basic ") - text.index('"Authorization":') > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    def test_basic_auth_many_yaml_header_object_value_list_entries_are_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"many-yaml-object-list:pass")
+        filler = "".join(f"      - Bearer placeholder-{index:03d}-padding-padding\n" for index in range(176))
+        text = f"headers:\n  - name: Proxy-Authorization\n    value:\n{filler}      - Basic {token}\n"
+
+        assert text.index("Basic ") - text.index("value:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize("value_key", ["value", "headerValue"])
+    @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
+    def test_basic_auth_many_yaml_header_object_list_item_value_key_entries_are_detected(
+        self,
+        value_key: str,
+        header_name: str,
+    ) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(f"many-yaml-list-item-{value_key}:pass".encode())
+        filler = "".join(f"      - Bearer placeholder-{index:03d}-padding-padding\n" for index in range(128))
+        text = f"headers:\n  - {value_key}:\n{filler}      - Basic {token}\n    name: {header_name}\n"
+
+        assert text.index("Basic ") - text.index(f"- {value_key}:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    def test_basic_auth_yaml_header_value_list_context_stops_at_next_key(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"next-key-list:pass")
+        text = f"Authorization:\n  - Bearer placeholder\nmetadata:\n  - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
+    def test_basic_auth_yaml_header_value_list_detects_after_comment_only_lines(self, header_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"yaml-comment-gap:pass")
+        text = f"{header_name}:\n  # generated header list\n  # primary credential\n  - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "\n  - Basic {token}\n",
+            "  documented placeholder\n  - Basic {token}\n",
+            "  - metadata:\n      # comment-only nested line\n      - Basic {token}\n",
+        ],
+    )
+    def test_basic_auth_yaml_header_value_list_ignores_non_direct_gaps(self, body: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"yaml-nondirect-gap:pass")
+        text = "Authorization:\n" + body.format(token=token)
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
+    def test_basic_auth_yaml_header_value_list_detects_after_mapping_sibling(self, header_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"direct-mapping-sibling:pass")
+        text = f"{header_name}:\n  - metadata: placeholder\n  - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
+    def test_basic_auth_yaml_header_value_list_detects_after_block_mapping_sibling(self, header_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"direct-block-mapping-sibling:pass")
+        text = f"{header_name}:\n  - metadata:\n      note: placeholder\n  - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
+    def test_basic_auth_yaml_header_value_list_ignores_nested_metadata(self, header_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"nested-direct-metadata-list:pass")
+        text = f"{header_name}:\n  - metadata:\n      - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_yaml_header_object_value_list_ignores_nested_metadata(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"nested-metadata-list:pass")
+        text = f"headers:\n  - name: Authorization\n    metadata:\n      value:\n        - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_yaml_header_object_value_list_ignores_reordered_nested_metadata(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"nested-metadata-after:pass")
+        text = f"headers:\n  - metadata:\n      value:\n        - Basic {token}\n    name: Authorization\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize("value_key", ["value", "headerValue"])
+    def test_basic_auth_yaml_header_object_list_item_value_key_ignores_nested_metadata_name_before(
+        self,
+        value_key: str,
+    ) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(f"nested-metadata-name-before-{value_key}:pass".encode())
+        filler = "".join(f"          - Bearer placeholder-{index:03d}-padding-padding\n" for index in range(128))
+        text = (
+            f"headers:\n  - name: Authorization\n    metadata:\n      - {value_key}:\n"
+            f"{filler}          - Basic {token}\n"
+        )
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize("value_key", ["value", "headerValue"])
+    def test_basic_auth_yaml_header_object_list_item_value_key_ignores_reordered_nested_metadata(
+        self,
+        value_key: str,
+    ) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(f"nested-metadata-reordered-{value_key}:pass".encode())
+        filler = "".join(f"          - Bearer placeholder-{index:03d}-padding-padding\n" for index in range(128))
+        text = (
+            f"headers:\n  - metadata:\n      - {value_key}:\n"
+            f"{filler}          - Basic {token}\n    name: Authorization\n"
+        )
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Basic dXNlcjpwYXNz",
+            "Authorization Basic dXNlcjpwYXNz",
+            "Authorization: Basic not_base64",
+            "Authorization: Basic bGlua3M=",
+            "Authorization: Basic dXNlci1wYXNz",
+            "Authorization: Basic dXNlcjpwYXNz====",
+            "Authorization: Basic AAAAA",
+            "Authorization: Basic dXNl cjpwYXNz",
+            "Proxy-Authorization: Basic Og==",
+            "X-Authorization: Basic dXNlcjpwYXNz",
+            "Authorization: Basic dXNlcjpwYXNz-extra",
+            "Authorization: Basic%20dXNlcjpwYXNz",
+            "Authorization%3A%20Basic%20dXNlcjpwYXNz",
+            "Authorization: \u0412asic dXNlcjpwYXNz",
+            f"Authorization notes:\n  Basic {_basic_auth_token(b'wrapped:pass')}",
+            f"Authorization: documented value\n  Basic {_basic_auth_token(b'wrapped:pass')}",
+            f"Authorization notes:\n  - Basic {_basic_auth_token(b'listed:pass')}",
+            f"Authorization:\n\n  Basic {_basic_auth_token(b'gap:pass')}",
+            f"Authorization: Basic\r\nX-Trace: {_basic_auth_token(b'not-continuation:pass')}",
+            "Authorization: Basic\n" + ("padding\n" * 300) + _basic_auth_token(b"far-away:pass"),
+            f"<X-Trace>Basic {_basic_auth_token(b'xml-non-header:pass')}</X-Trace>",
+            f"<X-Trace>\n  Basic {_basic_auth_token(b'xml-non-header-multiline:pass')}\n</X-Trace>",
+            f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
+            "https://user:pass@example.test/model.bin",
+            f"https://example.test/?header=Authorization%3A%20Basic%20{_basic_auth_token(b'percent:pass')}",
+            f'("Authorization", "Basic {_basic_auth_token(b"tuple:pass")}")',
+            f'[["Authorization", "Basic {_basic_auth_token(b"array:pass")}"]]',
+            (
+                'const pairs = [["Accept", "application/json"], '
+                f'["Proxy-Authorization", "Basic {_basic_auth_token(b"array-proxy:pass")}"]]'
+            ),
+            (f'metadata: [{{ name: "Authorization", value: "Basic {_basic_auth_token(b"metadata-object:pass")}" }}]'),
+            (
+                "headers:\n"
+                "  - name: Authorization\n"
+                f"    description: Basic {_basic_auth_token(b'description-object:pass')}\n"
+            ),
+            (
+                'headers: [{ name: "Authorization", description: "documented" }, '
+                f'{{ name: "Accept", value: "Basic {_basic_auth_token(b"wrong-object:pass")}" }}]'
+            ),
+            (
+                f'headers: [{{ value: "Basic {_basic_auth_token(b"wrong-object-reordered:pass")}" }}, '
+                '{ name: "Authorization" }]'
+            ),
+            (
+                "headers:\n"
+                f"  - value: Basic {_basic_auth_token(b'wrong-yaml-object-reordered:pass')}\n"
+                "  - name: Authorization\n"
+            ),
+            (
+                f'headers: [{{ value: "Basic {_basic_auth_token(b"nested-metadata-name:pass")}", '
+                'metadata: { name: "Authorization" } }]'
+            ),
+            (
+                f'headers: [{{ value: ["Basic {_basic_auth_token(b"nested-metadata-array-name:pass")}"], '
+                'metadata: { name: "Authorization" } }]'
+            ),
+            (
+                f'headers: [{{ value: ["Basic {_basic_auth_token(b"next-object-array-name:pass")}"] }}, '
+                '{ name: "Authorization" }]'
+            ),
+            (
+                "headers:\n"
+                f"  - value: Basic {_basic_auth_token(b'yaml-nested-metadata-name:pass')}\n"
+                "    metadata:\n"
+                "      name: Authorization\n"
+            ),
+            (f'Authorization: ["Bearer placeholder"]\nNotes: ["Basic {_basic_auth_token(b"closed-list:pass")}"]'),
+            f'notes.append("Authorization notes", "Basic {_basic_auth_token(b"notes:pass")}")',
+            f'cache.add("Authorization", "Basic {_basic_auth_token(b"cache-add:pass")}")',
+            f'cache.set("Authorization", /* default */ "Basic {_basic_auth_token(b"cache-set-comment:pass")}")',
+            f'data.set("Proxy-Authorization", /* default */ "Basic {_basic_auth_token(b"data-set-comment:pass")}")',
+            f'cache["Authorization"].append("Basic {_basic_auth_token(b"cache-property-append:pass")}")',
+            f'data["Proxy-Authorization"].append("Basic {_basic_auth_token(b"data-property-append:pass")}")',
+            f'http.Header{{"X-Trace": []string{{"Basic {_basic_auth_token(b"go-non-header:pass")}"}}}}',
+            f"\u0391uthorization: Basic {_basic_auth_token(b'confusable-alpha:pass')}",
+            f"Authorizati\u043en: Basic {_basic_auth_token(b'confusable-o:pass')}",
+            (
+                f'{{"headers":[{{"values":["Basic {_basic_auth_token(b"json-values-metadata-name:pass")}"],'
+                '"metadata":{"name":"Authorization"}}]}}'
+            ),
+            (
+                f'{{"headers":[{{"headerValues":["Basic {_basic_auth_token(b"json-header-values-meta:pass")}"],'
+                '"metadata":{"name":"Authorization"}}]}}'
+            ),
+            (
+                f'{{"headers":[{{"values":["Basic {_basic_auth_token(b"json-values-next-name:pass")}"]}},'
+                '{"name":"Authorization"}]}'
+            ),
+            (
+                f'{{"headers":[{{"headerValues":["Basic {_basic_auth_token(b"json-header-values-next-name:pass")}"]}},'
+                '{"name":"Authorization"}]}'
+            ),
+            (
+                "headers:\n"
+                "  - values:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-values-metadata-name:pass')}\n"
+                "    metadata:\n"
+                "      name: Authorization\n"
+            ),
+            (
+                "headers:\n"
+                "  - headerValues:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-header-values-metadata-name:pass')}\n"
+                "    metadata:\n"
+                "      name: Authorization\n"
+            ),
+            (
+                "headers:\n"
+                "  - values:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-values-next-name:pass')}\n"
+                "  - name: Authorization\n"
+            ),
+            (
+                "headers:\n"
+                "  - headerValues:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-header-values-next-name:pass')}\n"
+                "  - name: Authorization\n"
+            ),
+        ],
+    )
+    def test_basic_auth_malformed_or_unbounded_values_are_ignored(self, text: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(text, context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_rejects_invalid_tokens_before_context_scan(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        detector = SecretsDetector()
+
+        def fail_context_scan(*_args: object, **_kwargs: object) -> bool:
+            raise AssertionError("invalid Basic token should not run header context checks")
+
+        monkeypatch.setattr(
+            SecretsDetector,
+            "_basic_auth_match_has_header_context",
+            staticmethod(fail_context_scan),
+        )
+
+        findings = detector.scan_text("Notes: Basic AAAAA", context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize(
+        "token_phrase",
+        [
+            "Basic dXNlcjpwYXNz",
+            "auth Basic dXNlcjpwYXNz",
+            "headers Basic dXNlcjpwYXNz",
+        ],
+    )
+    def test_basic_auth_contextless_dense_tokens_skip_broad_context_scans(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        token_phrase: str,
+    ) -> None:
+        detector = SecretsDetector()
+
+        def fail_broad_context_scan(*_args: object, **_kwargs: object) -> bool:
+            raise AssertionError("contextless Basic tokens should not run broad collection context checks")
+
+        for helper_name in (
+            "_basic_auth_match_has_yaml_list_header_context",
+            "_basic_auth_prefix_has_header_value_array_context",
+            "_basic_auth_prefix_has_headers_object_context",
+        ):
+            monkeypatch.setattr(SecretsDetector, helper_name, staticmethod(fail_broad_context_scan))
+
+        findings = detector.scan_text(" ".join([token_phrase] * 1000), context="README.md")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize(
+        "header_name",
+        [
+            "Authorization",
+            "HTTP_AUTHORIZATION",
+            "BASIC_AUTH",
+            "auth_header",
+            "authorization_header",
+            "proxy_authorization",
+            "proxyAuthorization",
+            "HTTP_PROXY_AUTHORIZATION",
+        ],
+    )
+    def test_basic_auth_structured_header_values_are_detected(self, header_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"structured:s3cr3t")
+
+        findings = detector.scan_dict({"headers": {header_name: f"Basic {token}"}})
+
+        assert _basic_auth_findings(findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"Authorization": b"Basic c3RydWN0dXJlZC1ieXRlczpzM2NyM3Q="},
+            {"HTTP_AUTHORIZATION": b"Basic aHR0cC1zdHJ1Y3R1cmVkOnMzY3IzdA=="},
+            {b"Authorization": b"Basic c3RydWN0dXJlZC1ieXRlLWtleTpzM2NyM3Q="},
+            {b"HTTP_AUTHORIZATION": b"Basic aHR0cC1ieXRlLWtleTpzM2NyM3Q="},
+            {"Authorization": ("Basic c3RydWN0dXJlZC10dXBsZTpzM2NyM3Q=",)},
+            {"Authorization": {"value": "Basic c3RydWN0dXJlZC13cmFwcGVkOnMzY3IzdA=="}},
+            {"headers": [{"name": "Authorization", "values": ["Basic cGx1cmFsLXZhbHVlczpzM2NyM3Q="]}]},
+            {"headers": {"proxy_authorization": ["Basic c3RydWN0dXJlZC1saXN0OnMzY3IzdA=="]}},
+        ],
+    )
+    def test_basic_auth_structured_non_scalar_header_values_are_detected(self, data: dict[str, object]) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        assert _basic_auth_findings(findings)
+
+    @pytest.mark.parametrize(
+        ("name_key", "value_key", "header_name"),
+        [
+            ("name", "value", "Authorization"),
+            ("header", "value", "Proxy-Authorization"),
+            ("header_name", "header_value", "authorization"),
+            ("headerName", "headerValue", "proxy_authorization_header"),
+            ("key", "value", "HTTP_PROXY_AUTHORIZATION_HEADER"),
+        ],
+    )
+    def test_basic_auth_structured_header_objects_are_detected(
+        self,
+        name_key: str,
+        value_key: str,
+        header_name: str,
+    ) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"header-object:pass")
+
+        findings = detector.scan_dict({"headers": [{name_key: header_name, value_key: f"Basic {token}"}]})
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"metadata": [{"name": "Authorization", "value": f"Basic {_basic_auth_token(b'object-leak:pass')}"}]},
+            {"headers": [{"name": "Authorization", "description": f"Basic {_basic_auth_token(b'field-leak:pass')}"}]},
+            {"headers": {"Authorization": {"description": f"Basic {_basic_auth_token(b'description-leak:pass')}"}}},
+            {
+                "headers": {
+                    "Authorization": {
+                        "metadata": {"description": f"Basic {_basic_auth_token(b'nested-description-leak:pass')}"}
+                    }
+                }
+            },
+            {
+                "headers": [
+                    {
+                        "values": [f"Basic {_basic_auth_token(b'plural-values-metadata-name:pass')}"],
+                        "metadata": {"name": "Authorization"},
+                    }
+                ]
+            },
+            {
+                "headers": [
+                    {
+                        "headerValues": [f"Basic {_basic_auth_token(b'plural-header-values-metadata-name:pass')}"],
+                        "metadata": {"name": "Authorization"},
+                    }
+                ]
+            },
+            {
+                "headers": [
+                    {"values": [f"Basic {_basic_auth_token(b'plural-values-next-name:pass')}"]},
+                    {"name": "Authorization"},
+                ]
+            },
+            {
+                "headers": [
+                    {"headerValues": [f"Basic {_basic_auth_token(b'plural-header-values-next-name:pass')}"]},
+                    {"name": "Authorization"},
+                ]
+            },
+        ],
+    )
+    def test_basic_auth_structured_header_object_context_does_not_leak(
+        self,
+        data: dict[str, object],
+    ) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"config": [["aws_access_key_id=AKIA1234567890ABCDEF"]]},
+            {"config": [("aws_access_key_id=AKIA1234567890ABCDEF",)]},
+        ],
+    )
+    def test_structured_nested_list_and_tuple_values_detect_ordinary_secrets(
+        self,
+        data: dict[str, object],
+    ) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        assert any(finding.get("secret_type") == "AWS Access Key" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"headers": [["Authorization", f"Basic {_basic_auth_token(b'pair-list:pass')}"]]},
+            {"headers": [("Authorization", f"Basic {_basic_auth_token(b'pair-tuple:pass')}")]},
+            {
+                "headers": [
+                    ("Accept", "application/json"),
+                    ("Proxy-Authorization", f"Basic {_basic_auth_token(b'proxy-pair:pass')}"),
+                ]
+            },
+        ],
+    )
+    def test_basic_auth_structured_headers_pair_arrays_are_detected(self, data: dict[str, object]) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"pairs": [["Authorization", f"Basic {_basic_auth_token(b'pair-list:pass')}"]]},
+            {"pairs": [("Proxy-Authorization", f"Basic {_basic_auth_token(b'proxy-pair:pass')}")]},
+            {"pairs": [[["Authorization", f"Basic {_basic_auth_token(b'nested-pair-list:pass')}"]]]},
+            {"pairs": [((("Proxy-Authorization", f"Basic {_basic_auth_token(b'nested-pair-tuple:pass')}"),))]},
+        ],
+    )
+    def test_basic_auth_structured_non_header_pair_arrays_do_not_gain_header_context(
+        self,
+        data: dict[str, object],
+    ) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_structured_long_bytes_header_value_is_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"long-bytes:pass")
+        value = b"Basic " + token.encode("ascii") + b" " + (b"x" * 9000)
+
+        findings = detector.scan_dict({"Authorization": value})
+
+        basic_findings = _basic_auth_findings(findings)
+        assert basic_findings
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    def test_basic_auth_structured_long_bytes_header_value_keeps_trailing_secret_coverage(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"long-bytes:pass")
+        aws_key = "AKIA1234567890ABCDEF"
+        value = b"Basic " + token.encode("ascii") + b" " + (b"x" * 9000) + f"\naws_key={aws_key}\n".encode()
+
+        findings = detector.scan_dict({"Authorization": value})
+
+        assert _basic_auth_findings(findings)
+        assert any(finding.get("secret_type") == "AWS Access Key" for finding in findings)
+        assert aws_key not in json.dumps(findings, sort_keys=True)
+
+    def test_basic_auth_structured_bytes_header_value_scans_adjacent_secret_once(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"bytes:pass")
+        password = "super_secret_password_123"
+        value = f"Basic {token} password={password}".encode("ascii")
+
+        findings = detector.scan_dict({"Authorization": value})
+
+        assert _basic_auth_findings(findings)
+        password_findings = [finding for finding in findings if finding.get("secret_type") == "Hardcoded Password"]
+        assert len(password_findings) == 1
+        assert password not in json.dumps(findings, sort_keys=True)
+
+    def test_basic_auth_full_value_whitelist_still_suppresses_detection(self) -> None:
+        token = _basic_auth_token(b"user:pass")
+        detector = SecretsDetector(config={"whitelist": [f"Basic {token}"]})
+
+        findings = detector.scan_text(f"Authorization: Basic {token}", context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_token_value_whitelist_still_suppresses_detection(self) -> None:
+        token = _basic_auth_token(b"user:pass")
+        detector = SecretsDetector(config={"whitelist": [token]})
+
+        findings = detector.scan_text(f"Authorization: Basic {token}", context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_honors_min_secret_length_override(self) -> None:
+        token = _basic_auth_token(b"user:pass")
+        detector = SecretsDetector(config={"min_secret_length": 100})
+
+        findings = detector.scan_text(f"Authorization: Basic {token}", context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_custom_pattern_without_capture_group_does_not_crash(self) -> None:
+        detector = SecretsDetector(
+            config={"patterns": [(r"Basic +[A-Za-z]+", "Basic Auth Credentials")], "require_high_confidence": False}
+        )
+
+        findings = detector.scan_text("Authorization: Basic prose", context="auth-config")
+
+        assert isinstance(findings, list)
+
+    def test_basic_auth_valid_token_without_header_key_is_ignored_in_structured_data(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"structured:s3cr3t")
+
+        findings = detector.scan_dict({"audio_tokenizer": f"Basic {token}"})
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_near_match_does_not_suppress_url_userinfo_credentials(self) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(
+            "Basic links:\nmongodb+srv://username:password123@cluster.mongodb.net/database\n",
+            context="README.md",
+        )
+
+        assert _basic_auth_findings(findings) == []
+        assert any(finding["secret_type"] == "MongoDB Connection String" for finding in findings)
+
+    def test_basic_auth_binary_polyglot_header_is_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"polyglot:p@ssw0rd")
+
+        findings = detector.scan_bytes(b"\x89PNG\r\nAuthorization: Basic " + token.encode("ascii") + b"\r\n\x00")
+
+        assert _basic_auth_findings(findings)
+
+    def test_basic_auth_binary_bare_token_is_ignored(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"polyglot:p@ssw0rd")
+
+        findings = detector.scan_bytes(b"\x89PNG\r\nBasic " + token.encode("ascii") + b"\r\n\x00")
+
+        assert _basic_auth_findings(findings) == []
 
     def test_detect_database_connections(self):
         """Test detection of database connection strings."""
@@ -476,3 +1606,21 @@ def test_secret_finding_limit_is_explicit() -> None:
     assert findings[-1]["type"] == "detector_finding_limit"
     assert findings[-1]["max_findings"] == 2
     assert findings[-1]["analysis_incomplete"] is True
+
+
+def test_basic_auth_finding_limit_is_explicit_and_redacted() -> None:
+    detector = SecretsDetector({"max_findings": 2})
+    tokens = [_basic_auth_token(f"user{index}:pass{index}".encode()) for index in range(5)]
+
+    findings = detector.scan_model_weights(
+        "\n".join(f"Authorization: Basic {token}" for token in tokens),
+        "headers.txt",
+    )
+
+    reported = _basic_auth_findings(findings)
+    assert len(reported) == 2
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert findings[-1]["max_findings"] == 2
+    assert findings[-1]["analysis_incomplete"] is True
+    serialized = json.dumps(findings, sort_keys=True)
+    assert all(token not in serialized for token in tokens)

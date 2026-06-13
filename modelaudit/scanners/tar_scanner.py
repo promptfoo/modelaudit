@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bz2
+import contextlib
 import errno
 import gzip
 import lzma
@@ -13,9 +14,18 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, ClassVar, cast
+from typing import Any, BinaryIO, ClassVar, cast
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.file.detection import (
+    _NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS,
+    _NemoRouteResolutionLimitExceeded,
+    _resolve_safe_tar_link_target_name,
+    _resolve_safe_tar_path_through_symlinks,
+    _resolve_safe_tar_symlink_target_at_destination,
+    bounded_tar_info_class,
+    is_declared_text_content_filename,
+)
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
@@ -49,9 +59,9 @@ TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY = "_tar_skip_reachable_nemo_config_scan"
 TAR_SHARED_SCAN_BUDGET_CONFIG_KEY = "_tar_shared_scan_budget"
 TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON = "tar_entry_extraction_incomplete"
 TAR_TOTAL_SIZE_INCOMPLETE_REASON = "tar_total_size_limit_exceeded"
-TAR_STREAM_BUDGET_INCOMPLETE_REASON = "tar_stream_budget_exceeded"
 TAR_SPECIAL_MEMBER_INCOMPLETE_REASON = "tar_special_member_unsupported"
 TAR_SPARSE_MEMBER_INCOMPLETE_REASON = "tar_sparse_member_unsupported"
+TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON = "tar_compressed_trailing_data"
 TAR_SPARSE_PAX_SIZE_FIELDS = frozenset({"GNU.sparse.size", "GNU.sparse.realsize"})
 
 _GZIP_MAGIC = b"\x1f\x8b"
@@ -73,7 +83,7 @@ class _TarStreamBudgetExceeded(ValueError):
         *,
         bytes_read: int,
         max_bytes: int,
-        reason: str = TAR_STREAM_BUDGET_INCOMPLETE_REASON,
+        reason: str,
     ) -> None:
         super().__init__(message)
         self.bytes_read = bytes_read
@@ -85,9 +95,6 @@ class _TarStreamBudgetExceeded(ValueError):
 class _TarSharedScanBudget:
     max_total_uncompressed_size: int
     member_bytes_consumed: int = 0
-
-    def remaining_member_bytes(self) -> int:
-        return max(self.max_total_uncompressed_size - self.member_bytes_consumed, 0)
 
 
 class _TarBoundedStream:
@@ -109,8 +116,11 @@ class _TarBoundedStream:
                 max_bytes=self.max_read_size,
                 reason="tar_metadata_read_limit_exceeded",
             )
+        read_size = size
+        if self.max_bytes > 0:
+            read_size = min(size, self.max_bytes - self.bytes_read + 1)
 
-        data = self._fileobj.read(size)
+        data = self._fileobj.read(read_size)
         self.bytes_read += len(data)
         if self.max_bytes > 0 and self.bytes_read > self.max_bytes:
             raise _TarStreamBudgetExceeded(
@@ -124,50 +134,6 @@ class _TarBoundedStream:
 
 def _tar_padded_size(size: int) -> int:
     return ((max(size, 0) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
-
-
-class _ModelAuditTarInfo(tarfile.TarInfo):
-    """TarInfo variant that rejects oversized extension headers before parsing."""
-
-    _modelaudit_max_metadata_bytes: ClassVar[int] = 0
-
-    @staticmethod
-    def _bounded_stream_bytes_read(tar_file: tarfile.TarFile) -> int:
-        stream_fileobj = getattr(getattr(tar_file, "fileobj", None), "fileobj", None)
-        bytes_read = getattr(stream_fileobj, "bytes_read", 0)
-        return bytes_read if isinstance(bytes_read, int) else 0
-
-    def _check_extension_header_size(self, tar_file: tarfile.TarFile, header_kind: str) -> None:
-        max_metadata_bytes = getattr(type(self), "_modelaudit_max_metadata_bytes", 0)
-        if not isinstance(max_metadata_bytes, int) or max_metadata_bytes <= 0:
-            return
-        padded_size = _tar_padded_size(self.size)
-        if padded_size > max_metadata_bytes:
-            raise _TarStreamBudgetExceeded(
-                (
-                    f"TAR {header_kind} extension header exceeds bounded metadata limit "
-                    f"({padded_size} > {max_metadata_bytes} bytes)"
-                ),
-                bytes_read=self._bounded_stream_bytes_read(tar_file),
-                max_bytes=max_metadata_bytes,
-                reason="tar_metadata_read_limit_exceeded",
-            )
-
-    def _proc_pax(self, tar_file: tarfile.TarFile) -> tarfile.TarInfo:
-        self._check_extension_header_size(tar_file, "PAX")
-        return cast(tarfile.TarInfo, cast(Any, super())._proc_pax(tar_file))
-
-    def _proc_gnulong(self, tar_file: tarfile.TarFile) -> tarfile.TarInfo:
-        self._check_extension_header_size(tar_file, "GNU long-name")
-        return cast(tarfile.TarInfo, cast(Any, super())._proc_gnulong(tar_file))
-
-
-def _tarinfo_class_with_metadata_limit(max_metadata_bytes: int) -> type[_ModelAuditTarInfo]:
-    return type(
-        "_BoundedModelAuditTarInfo",
-        (_ModelAuditTarInfo,),
-        {"_modelaudit_max_metadata_bytes": max_metadata_bytes},
-    )
 
 
 class TarScanner(BaseScanner):
@@ -219,17 +185,16 @@ class TarScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        filename = os.path.basename(path).lower()
-        if filename.endswith((".tar.gz", ".tgz")):
-            return cls._compressed_tar_has_valid_header(path, "gzip")
-        if filename.endswith((".tar.bz2", ".tbz2")):
-            return cls._compressed_tar_has_valid_header(path, "bzip2")
-        if filename.endswith((".tar.xz", ".txz")):
-            return cls._compressed_tar_has_valid_header(path, "xz")
-
         try:
-            return tarfile.is_tarfile(path)
-        except Exception:
+            compression_codec = cls._detect_compressed_tar_wrapper(path)
+            if compression_codec is not None:
+                return cls._compressed_tar_has_valid_header(path, compression_codec)
+            with open(path, "rb") as file_obj:
+                prefix = file_obj.read(_TAR_HEADER_PROBE_BYTES)
+            if cls._looks_like_empty_tar_prefix(prefix):
+                return cls._is_empty_tar_archive(path)
+            return cls._tar_header_probe_is_valid(prefix)
+        except (EOFError, OSError, lzma.LZMAError):
             return False
 
     def scan(self, path: str) -> ScanResult:
@@ -295,8 +260,8 @@ class TarScanner(BaseScanner):
                     details={
                         "file_size": file_size,
                         "max_file_read_size": hash_read_limit,
-                        "analysis_incomplete": True,
-                        "scan_outcome_reason": "tar_file_integrity_hash_skipped",
+                        "hash_skipped": True,
+                        "skip_reason": "tar_file_integrity_hash_skipped",
                     },
                 )
             )
@@ -350,10 +315,8 @@ class TarScanner(BaseScanner):
         else:
             positive_limits.append(DEFAULT_MAX_TAR_TOTAL_UNCOMPRESSED_SIZE)
 
-        for config_key in ("max_total_size",):
-            configured_public_limit = self.config.get(config_key)
-            if configured_public_limit is None or configured_public_limit == 0:
-                continue
+        configured_public_limit = self.config.get("max_total_size")
+        if configured_public_limit is not None and configured_public_limit != 0:
             positive_limits.append(
                 self._normalize_positive_int_config(
                     configured_public_limit,
@@ -377,6 +340,15 @@ class TarScanner(BaseScanner):
     def _tar_metadata_limit(self) -> int:
         return max(1, self.max_metadata_bytes)
 
+    @staticmethod
+    def _metadata_budget_exception(message: str, bytes_read: int, max_bytes: int) -> Exception:
+        return _TarStreamBudgetExceeded(
+            message,
+            bytes_read=bytes_read,
+            max_bytes=max_bytes,
+            reason="tar_metadata_read_limit_exceeded",
+        )
+
     @contextmanager
     def _open_tar_stream(self, path: str) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream | None, str | None]]:
         """Open a TAR stream through a bounded decompressed-byte reader."""
@@ -389,7 +361,10 @@ class TarScanner(BaseScanner):
                         mode="r:",
                         tarinfo=cast(
                             type[tarfile.TarInfo],
-                            _tarinfo_class_with_metadata_limit(self._tar_metadata_limit()),
+                            bounded_tar_info_class(
+                                self._tar_metadata_limit(),
+                                exception_factory=self._metadata_budget_exception,
+                            ),
                         ),
                     )
                 )
@@ -417,7 +392,10 @@ class TarScanner(BaseScanner):
                     bufsize=tarfile.BLOCKSIZE,
                     tarinfo=cast(
                         type[tarfile.TarInfo],
-                        _tarinfo_class_with_metadata_limit(self._tar_metadata_limit()),
+                        bounded_tar_info_class(
+                            self._tar_metadata_limit(),
+                            exception_factory=self._metadata_budget_exception,
+                        ),
                     ),
                 )
             )
@@ -500,9 +478,11 @@ class TarScanner(BaseScanner):
         *,
         archive_path: str,
         member: tarfile.TarInfo,
+        effective_name: str | None = None,
     ) -> bool:
         """Fail closed when generic TAR streaming reaches a linked root NeMo config."""
-        if not self._is_reachable_nemo_root_config(member.name):
+        config_name = effective_name or member.name
+        if not self._is_reachable_nemo_root_config(config_name):
             return False
 
         mark_archive_scan_incomplete(result, "nemo_link_semantics_incomplete")
@@ -511,15 +491,38 @@ class TarScanner(BaseScanner):
             passed=False,
             message="Root NeMo config is link-mediated; generic TAR analysis is conservative",
             severity=IssueSeverity.INFO,
-            location=f"{archive_path}:{member.name}",
+            location=f"{archive_path}:{config_name}",
             details={
                 "entry": member.name,
+                "effective_entry": config_name,
                 "target": member.linkname,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": "nemo_link_semantics_incomplete",
             },
         )
         return True
+
+    @staticmethod
+    def _record_nemo_link_resolution_incomplete(
+        result: ScanResult,
+        *,
+        archive_path: str,
+        entry_name: str,
+        message: str,
+    ) -> None:
+        mark_archive_scan_incomplete(result, "nemo_link_semantics_incomplete")
+        result.add_check(
+            name="NeMo Link Semantics",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=f"{archive_path}:{entry_name}",
+            details={
+                "entry": entry_name,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "nemo_link_semantics_incomplete",
+            },
+        )
 
     @staticmethod
     def _rewrite_archive_location(location: str | None, tmp_path: str, archive_location: str) -> str:
@@ -609,6 +612,7 @@ class TarScanner(BaseScanner):
         member: tarfile.TarInfo,
         *,
         suffix: str,
+        basename: str | None = None,
     ) -> tuple[str, int]:
         """Stream a TAR member to disk while enforcing the configured size limit."""
         max_entry_size = self._get_max_entry_size()
@@ -622,22 +626,37 @@ class TarScanner(BaseScanner):
 
         total_size = 0
         tmp_path: str | None = None
+        tmp_dir: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp_path = tmp.name
+
+            def copy_member_to(tmp_file: BinaryIO) -> int:
+                copied_size = 0
                 while True:
                     chunk = fileobj.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
                     if not chunk:
                         break
-                    total_size += len(chunk)
-                    if total_size > max_entry_size:
+                    copied_size += len(chunk)
+                    if copied_size > max_entry_size:
                         raise _TarEntryExtractionIncomplete(
                             f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes"
                         )
-                    tmp.write(chunk)
+                    tmp_file.write(chunk)
+                return copied_size
+
+            if basename is None:
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as named_tmp:
+                    tmp_path = named_tmp.name
+                    total_size = copy_member_to(cast(BinaryIO, named_tmp))
+            else:
+                tmp_dir = tempfile.mkdtemp(prefix="modelaudit_tar_")
+                tmp_path = os.path.join(tmp_dir, basename)
+                with open(tmp_path, "wb") as tmp_file:
+                    total_size = copy_member_to(tmp_file)
         except Exception:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            if tmp_dir and os.path.isdir(tmp_dir):
+                os.rmdir(tmp_dir)
             raise
         finally:
             fileobj.close()
@@ -719,8 +738,10 @@ class TarScanner(BaseScanner):
                 return False
 
             with open(path, "rb") as file_obj:
-                empty_data = file_obj.read(file_size)
-                return len(empty_data) == file_size and empty_data == b"\0" * file_size
+                first_block = file_obj.read(tarfile.BLOCKSIZE)
+                if first_block != b"\0" * tarfile.BLOCKSIZE:
+                    return False
+                return all(not any(chunk) for chunk in iter(lambda: file_obj.read(64 * 1024), b""))
         except OSError:
             return False
 
@@ -794,6 +815,37 @@ class TarScanner(BaseScanner):
             details=details,
         )
 
+    def _reserve_member_work(
+        self,
+        result: ScanResult,
+        path: str,
+        member: tarfile.TarInfo,
+        shared_budget: _TarSharedScanBudget,
+        archive_uncompressed_size: int,
+        *,
+        work_size: int | None = None,
+    ) -> tuple[int, bool]:
+        """Reserve declared member work before traversal can consume its body."""
+        member_size = max(member.size if work_size is None else work_size, 0)
+        archive_uncompressed_size += member_size
+        projected_total = shared_budget.member_bytes_consumed + member_size
+        if (
+            shared_budget.max_total_uncompressed_size > 0
+            and projected_total > shared_budget.max_total_uncompressed_size
+        ):
+            mark_archive_scan_incomplete(result, TAR_TOTAL_SIZE_INCOMPLETE_REASON)
+            self._add_tar_aggregate_size_check(
+                result,
+                path,
+                passed=False,
+                archive_uncompressed_size=projected_total,
+                member_name=member.name,
+            )
+            return archive_uncompressed_size, False
+
+        shared_budget.member_bytes_consumed = projected_total
+        return archive_uncompressed_size, True
+
     def _project_compressed_stream_size(self, bounded_stream: _TarBoundedStream, member: tarfile.TarInfo) -> int:
         return self._finalize_tar_stream_size(bounded_stream.bytes_read + _tar_padded_size(member.size))
 
@@ -811,38 +863,50 @@ class TarScanner(BaseScanner):
             return False
 
         projected_stream_size = self._project_compressed_stream_size(bounded_stream, member)
-        actual_ratio = projected_stream_size / compressed_size
-        if projected_stream_size > self.max_decompressed_bytes:
-            self._add_compressed_wrapper_limit_check(
-                result,
-                passed=False,
-                path=path,
-                message=f"Decompressed size exceeded limit ({projected_stream_size} > {self.max_decompressed_bytes})",
-                decompressed_size=projected_stream_size,
-                compressed_size=compressed_size,
-                compression_codec=compression_codec,
-                actual_ratio=actual_ratio,
-            )
-            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
-            return True
+        return self._record_compressed_stream_limit(
+            result,
+            path,
+            stream_size=projected_stream_size,
+            compressed_size=compressed_size,
+            compression_codec=compression_codec,
+        )
 
-        if actual_ratio > self.max_decompression_ratio:
-            self._add_compressed_wrapper_limit_check(
-                result,
-                passed=False,
-                path=path,
-                message=(
-                    f"Decompression ratio exceeded limit ({actual_ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
-                ),
-                decompressed_size=projected_stream_size,
-                compressed_size=compressed_size,
-                compression_codec=compression_codec,
-                actual_ratio=actual_ratio,
-            )
-            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
-            return True
+    def _record_compressed_stream_limit(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        stream_size: int,
+        compressed_size: int,
+        compression_codec: str,
+        emit_pass: bool = False,
+    ) -> bool:
+        actual_ratio = (stream_size / compressed_size) if compressed_size > 0 else 0.0
+        if stream_size > self.max_decompressed_bytes:
+            passed = False
+            message = f"Decompressed size exceeded limit ({stream_size} > {self.max_decompressed_bytes})"
+        elif compressed_size > 0 and actual_ratio > self.max_decompression_ratio:
+            passed = False
+            message = f"Decompression ratio exceeded limit ({actual_ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
+        elif emit_pass:
+            passed = True
+            message = f"Decompressed size/ratio are within limits ({stream_size} bytes, {actual_ratio:.1f}x)"
+        else:
+            return False
 
-        return False
+        self._add_compressed_wrapper_limit_check(
+            result,
+            passed=passed,
+            path=path,
+            message=message,
+            decompressed_size=stream_size,
+            compressed_size=compressed_size,
+            compression_codec=compression_codec,
+            actual_ratio=actual_ratio,
+        )
+        if not passed:
+            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
+        return not passed
 
     def _record_tar_stream_budget_exceeded(
         self,
@@ -882,16 +946,63 @@ class TarScanner(BaseScanner):
             )
         mark_archive_scan_incomplete(result, exc.reason)
 
-    def _preflight_tar_archive(self, path: str, result: ScanResult) -> bool:
-        """Stream TAR headers once to enforce entry-count and wrapper-size limits before extraction."""
+    @staticmethod
+    def _drain_compressed_tar_tail(
+        tar: tarfile.TarFile,
+        bounded_stream: _TarBoundedStream,
+        result: ScanResult,
+        path: str,
+    ) -> bool:
+        """Consume the complete wrapper stream and reject data after the TAR end marker."""
+        has_nonzero_trailing_data = False
+        read_size = min(ARCHIVE_MEMBER_COPY_CHUNK_BYTES, bounded_stream.max_read_size)
+        # Header traversal uses one-block buffering to avoid prefetching member bodies
+        # before policy checks. Once TAR EOF is proven, larger reads are safe.
+        cast(Any, tar.fileobj).bufsize = read_size
+        try:
+            while chunk := tar.fileobj.read(read_size):
+                has_nonzero_trailing_data = has_nonzero_trailing_data or any(chunk)
+        except _TarStreamBudgetExceeded:
+            raise
+        except Exception as exc:
+            TarScanner._record_incomplete_tar_scan(result, path, exc)
+            return False
+
+        if not has_nonzero_trailing_data:
+            return True
+
+        mark_archive_scan_incomplete(result, TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON)
+        result.add_check(
+            name="Compressed TAR Trailing Data",
+            passed=False,
+            message="Compressed wrapper contains non-zero data after the TAR end marker",
+            severity=IssueSeverity.WARNING,
+            rule_code="S902",
+            location=path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON,
+            },
+        )
+        return False
+
+    def _preflight_tar_archive(
+        self,
+        path: str,
+        result: ScanResult,
+        *,
+        reserve_member_budget: bool = False,
+    ) -> bool:
+        """Stream TAR headers once to enforce wrapper and optional aggregate limits."""
         entry_count = 0
         compressed_size = os.path.getsize(path)
         compression_codec: str | None = None
         consumed_size = 0
+        archive_uncompressed_size = 0
+        shared_budget = self._get_or_create_shared_budget() if reserve_member_budget else None
 
         try:
             with self._open_tar_stream(path) as (tar, bounded_stream, compression_codec):
-                compressed_size = os.path.getsize(path)
                 while True:
                     try:
                         member = tar.next()
@@ -901,6 +1012,12 @@ class TarScanner(BaseScanner):
                         raise
 
                     if member is None:
+                        if (
+                            compression_codec is not None
+                            and bounded_stream is not None
+                            and not self._drain_compressed_tar_tail(tar, bounded_stream, result, path)
+                        ):
+                            return False
                         break
 
                     entry_count += 1
@@ -916,41 +1033,31 @@ class TarScanner(BaseScanner):
                         )
                         return False
 
+                    if shared_budget is not None and member.size > 0:
+                        work_size = member.size
+                        if self._member_declares_sparse_data(member):
+                            work_size = max(work_size, tar.offset - member.offset_data)
+                        archive_uncompressed_size, budget_reserved = self._reserve_member_work(
+                            result,
+                            path,
+                            member,
+                            shared_budget,
+                            archive_uncompressed_size,
+                            work_size=work_size,
+                        )
+                        if not budget_reserved:
+                            return False
+
                     if compression_codec is not None and bounded_stream is not None:
                         consumed_size = max(consumed_size, bounded_stream.bytes_read)
                         estimated_stream_size = self._finalize_tar_stream_size(consumed_size)
-                        actual_ratio = (estimated_stream_size / compressed_size) if compressed_size > 0 else 0.0
-
-                        if estimated_stream_size > self.max_decompressed_bytes:
-                            self._add_compressed_wrapper_limit_check(
-                                result,
-                                passed=False,
-                                path=path,
-                                message=(
-                                    f"Decompressed size exceeded limit "
-                                    f"({estimated_stream_size} > {self.max_decompressed_bytes})"
-                                ),
-                                decompressed_size=estimated_stream_size,
-                                compressed_size=compressed_size,
-                                compression_codec=compression_codec,
-                                actual_ratio=actual_ratio,
-                            )
-                            return False
-
-                        if compressed_size > 0 and actual_ratio > self.max_decompression_ratio:
-                            self._add_compressed_wrapper_limit_check(
-                                result,
-                                passed=False,
-                                path=path,
-                                message=(
-                                    "Decompression ratio exceeded limit "
-                                    f"({actual_ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
-                                ),
-                                decompressed_size=estimated_stream_size,
-                                compressed_size=compressed_size,
-                                compression_codec=compression_codec,
-                                actual_ratio=actual_ratio,
-                            )
+                        if self._record_compressed_stream_limit(
+                            result,
+                            path,
+                            stream_size=estimated_stream_size,
+                            compressed_size=compressed_size,
+                            compression_codec=compression_codec,
+                        ):
                             return False
 
                 if bounded_stream is not None:
@@ -964,54 +1071,25 @@ class TarScanner(BaseScanner):
                 details={"entries": entry_count, "max_entries": self.max_entries},
                 rule_code=None,
             )
+            if shared_budget is not None:
+                self._add_tar_aggregate_size_check(
+                    result,
+                    path,
+                    passed=True,
+                    archive_uncompressed_size=archive_uncompressed_size,
+                )
 
             if compression_codec is not None:
-                final_stream_size = self._finalize_tar_stream_size(consumed_size)
-                actual_ratio = (final_stream_size / compressed_size) if compressed_size > 0 else 0.0
-
-                if final_stream_size > self.max_decompressed_bytes:
-                    self._add_compressed_wrapper_limit_check(
-                        result,
-                        passed=False,
-                        path=path,
-                        message=(
-                            f"Decompressed size exceeded limit ({final_stream_size} > {self.max_decompressed_bytes})"
-                        ),
-                        decompressed_size=final_stream_size,
-                        compressed_size=compressed_size,
-                        compression_codec=compression_codec,
-                        actual_ratio=actual_ratio,
-                    )
-                    return False
-
-                if compressed_size > 0 and actual_ratio > self.max_decompression_ratio:
-                    self._add_compressed_wrapper_limit_check(
-                        result,
-                        passed=False,
-                        path=path,
-                        message=(
-                            "Decompression ratio exceeded limit "
-                            f"({actual_ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
-                        ),
-                        decompressed_size=final_stream_size,
-                        compressed_size=compressed_size,
-                        compression_codec=compression_codec,
-                        actual_ratio=actual_ratio,
-                    )
-                    return False
-
-                self._add_compressed_wrapper_limit_check(
+                final_stream_size = consumed_size
+                if self._record_compressed_stream_limit(
                     result,
-                    passed=True,
                     path=path,
-                    message=(
-                        f"Decompressed size/ratio are within limits ({final_stream_size} bytes, {actual_ratio:.1f}x)"
-                    ),
-                    decompressed_size=final_stream_size,
+                    stream_size=final_stream_size,
                     compressed_size=compressed_size,
                     compression_codec=compression_codec,
-                    actual_ratio=actual_ratio,
-                )
+                    emit_pass=True,
+                ):
+                    return False
 
         except _TarStreamBudgetExceeded as exc:
             self._record_tar_stream_budget_exceeded(
@@ -1080,6 +1158,28 @@ class TarScanner(BaseScanner):
             )
         )
 
+    @staticmethod
+    def _record_unsupported_member_body(
+        result: ScanResult,
+        path: str,
+        member: tarfile.TarInfo,
+    ) -> None:
+        mark_archive_scan_incomplete(result, TAR_SPECIAL_MEMBER_INCOMPLETE_REASON)
+        result.add_check(
+            name="TAR Member Coverage",
+            passed=False,
+            message=f"TAR metadata entry {member.name} declares an unsupported body",
+            severity=IssueSeverity.INFO,
+            rule_code="S902",
+            location=f"{path}:{member.name}",
+            details={
+                "entry": member.name,
+                "size": member.size,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": TAR_SPECIAL_MEMBER_INCOMPLETE_REASON,
+            },
+        )
+
     def _scan_tar_file(self, path: str, depth: int = 0) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
@@ -1142,10 +1242,13 @@ class TarScanner(BaseScanner):
         shared_budget = self._get_or_create_shared_budget()
         stream_budget_failed = False
         reached_eof = False
+        wrapper_integrity_failed = False
+        symlink_targets: dict[str, str] = {}
+        materialized_symlinks: dict[str, tarfile.TarInfo] = {}
+        link_resolution_budget = [_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS]
 
         try:
             with self._open_tar_stream(path) as (tar, bounded_stream, compression_codec):
-                compressed_size = os.path.getsize(path)
                 security_only_nested_entries = self.config.get(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY)
                 if not isinstance(security_only_nested_entries, set):
                     security_only_nested_entries = set()
@@ -1179,6 +1282,13 @@ class TarScanner(BaseScanner):
 
                     if member is None:
                         reached_eof = True
+                        if (
+                            compression_codec is not None
+                            and bounded_stream is not None
+                            and not self._drain_compressed_tar_tail(tar, bounded_stream, result, path)
+                        ):
+                            scan_complete = False
+                            wrapper_integrity_failed = True
                         break
 
                     entry_count += 1
@@ -1211,25 +1321,19 @@ class TarScanner(BaseScanner):
                             details={"entry": name},
                             rule_code="S405",
                         )
-                        if member.isfile():
-                            archive_uncompressed_size += member.size
-                            projected_total = shared_budget.member_bytes_consumed + member.size
-                            if (
-                                shared_budget.max_total_uncompressed_size > 0
-                                and projected_total > shared_budget.max_total_uncompressed_size
-                            ):
+                        if member.size > 0:
+                            archive_uncompressed_size, budget_reserved = self._reserve_member_work(
+                                result,
+                                path,
+                                member,
+                                shared_budget,
+                                archive_uncompressed_size,
+                                work_size=max(member.size, tar.offset - member.offset_data),
+                            )
+                            if not budget_reserved:
                                 scan_complete = False
                                 aggregate_size_check_recorded = True
-                                mark_archive_scan_incomplete(result, TAR_TOTAL_SIZE_INCOMPLETE_REASON)
-                                self._add_tar_aggregate_size_check(
-                                    result,
-                                    path,
-                                    passed=False,
-                                    archive_uncompressed_size=projected_total,
-                                    member_name=name,
-                                )
                                 break
-                            shared_budget.member_bytes_consumed = projected_total
 
                             if self._record_projected_compressed_member_limit(
                                 result,
@@ -1296,16 +1400,124 @@ class TarScanner(BaseScanner):
                                 scan_status="rejected" if link_rejected else "link_validated",
                             )
                         )
+                        if not link_rejected and member.issym():
+                            try:
+                                destination_name = _resolve_safe_tar_path_through_symlinks(
+                                    member.name,
+                                    symlink_targets,
+                                    link_resolution_budget,
+                                    follow_final_symlink=False,
+                                )
+                                target_name = (
+                                    _resolve_safe_tar_symlink_target_at_destination(member, destination_name)
+                                    if destination_name is not None
+                                    else None
+                                )
+                            except _NemoRouteResolutionLimitExceeded:
+                                destination_name = None
+                                target_name = None
+                            if destination_name is None or target_name is None:
+                                scan_complete = False
+                                self._record_nemo_link_resolution_incomplete(
+                                    result,
+                                    archive_path=path,
+                                    entry_name=member.name,
+                                    message="TAR symlink destinations exceeded bounded NeMo resolution",
+                                )
+                            else:
+                                symlink_targets[destination_name] = target_name
+                                materialized_symlinks[destination_name] = member
+                        elif not link_rejected:
+                            try:
+                                destination_name = _resolve_safe_tar_path_through_symlinks(
+                                    member.name,
+                                    symlink_targets,
+                                    link_resolution_budget,
+                                    follow_final_symlink=False,
+                                )
+                                target_name = _resolve_safe_tar_link_target_name(member)
+                                resolved_target_name = (
+                                    _resolve_safe_tar_path_through_symlinks(
+                                        target_name,
+                                        symlink_targets,
+                                        link_resolution_budget,
+                                        follow_final_symlink=False,
+                                    )
+                                    if target_name is not None
+                                    else None
+                                )
+                                target_symlink = (
+                                    materialized_symlinks.get(resolved_target_name)
+                                    if resolved_target_name is not None
+                                    else None
+                                )
+                                redirected_target = (
+                                    _resolve_safe_tar_symlink_target_at_destination(target_symlink, destination_name)
+                                    if target_symlink is not None and destination_name is not None
+                                    else None
+                                )
+                            except _NemoRouteResolutionLimitExceeded:
+                                destination_name = None
+                                resolved_target_name = None
+                                target_symlink = None
+                                redirected_target = None
+                            if destination_name is None or resolved_target_name is None:
+                                scan_complete = False
+                                self._record_nemo_link_resolution_incomplete(
+                                    result,
+                                    archive_path=path,
+                                    entry_name=member.name,
+                                    message="TAR hardlink destinations exceeded bounded NeMo resolution",
+                                )
+                            elif target_symlink is not None:
+                                if redirected_target is None:
+                                    scan_complete = False
+                                    self._record_nemo_link_resolution_incomplete(
+                                        result,
+                                        archive_path=path,
+                                        entry_name=member.name,
+                                        message="TAR hardlink destinations exceeded bounded NeMo resolution",
+                                    )
+                                else:
+                                    symlink_targets[destination_name] = redirected_target
+                                    materialized_symlinks[destination_name] = target_symlink
                         if not link_rejected and self._record_reachable_nemo_link_incomplete(
                             result,
                             archive_path=path,
                             member=member,
+                            effective_name=destination_name,
                         ):
                             scan_complete = False
+                        if member.size > 0:
+                            scan_complete = False
+                            self._record_unsupported_member_body(result, path, member)
+                            archive_uncompressed_size, budget_reserved = self._reserve_member_work(
+                                result,
+                                path,
+                                member,
+                                shared_budget,
+                                archive_uncompressed_size,
+                            )
+                            if not budget_reserved:
+                                aggregate_size_check_recorded = True
+                            break
                         continue
 
                     if member.isdir():
                         contents.append(self._member_inventory_entry(path, member, scan_status="directory"))
+                        if member.size > 0:
+                            scan_complete = False
+                            self._record_unsupported_member_body(result, path, member)
+                            archive_uncompressed_size, budget_reserved = self._reserve_member_work(
+                                result,
+                                path,
+                                member,
+                                shared_budget,
+                                archive_uncompressed_size,
+                            )
+                            if not budget_reserved:
+                                aggregate_size_check_recorded = True
+                            break
                         continue
 
                     if self._member_declares_sparse_data(member):
@@ -1318,6 +1530,30 @@ class TarScanner(BaseScanner):
                             reason=TAR_SPARSE_MEMBER_INCOMPLETE_REASON,
                             message=f"TAR sparse entry {name} was not extracted; sparse member coverage is incomplete",
                         )
+                        sparse_work_size = max(member.size, tar.offset - member.offset_data)
+                        archive_uncompressed_size, budget_reserved = self._reserve_member_work(
+                            result,
+                            path,
+                            member,
+                            shared_budget,
+                            archive_uncompressed_size,
+                            work_size=sparse_work_size,
+                        )
+                        if not budget_reserved:
+                            aggregate_size_check_recorded = True
+                            break
+                        if self._record_projected_compressed_member_limit(
+                            result,
+                            path,
+                            member,
+                            bounded_stream,
+                            compression_codec=compression_codec,
+                            compressed_size=compressed_size,
+                        ):
+                            stream_budget_failed = True
+                            break
+                        if compression_codec is not None:
+                            break
                         continue
 
                     if not member.isfile():
@@ -1334,23 +1570,15 @@ class TarScanner(BaseScanner):
                             ),
                         )
                         if member.size > 0:
-                            archive_uncompressed_size += member.size
-                            projected_total = shared_budget.member_bytes_consumed + member.size
-                            if (
-                                shared_budget.max_total_uncompressed_size > 0
-                                and projected_total > shared_budget.max_total_uncompressed_size
-                            ):
+                            archive_uncompressed_size, budget_reserved = self._reserve_member_work(
+                                result,
+                                path,
+                                member,
+                                shared_budget,
+                                archive_uncompressed_size,
+                            )
+                            if not budget_reserved:
                                 aggregate_size_check_recorded = True
-                                mark_archive_scan_incomplete(result, TAR_TOTAL_SIZE_INCOMPLETE_REASON)
-                                self._add_tar_aggregate_size_check(
-                                    result,
-                                    path,
-                                    passed=False,
-                                    archive_uncompressed_size=projected_total,
-                                    member_name=name,
-                                )
-                            else:
-                                shared_budget.member_bytes_consumed = projected_total
 
                             stream_budget_exceeded = self._record_projected_compressed_member_limit(
                                 result,
@@ -1366,15 +1594,16 @@ class TarScanner(BaseScanner):
                                 break
                         continue
 
-                    archive_uncompressed_size += member.size
-                    projected_total = shared_budget.member_bytes_consumed + member.size
-                    if (
-                        shared_budget.max_total_uncompressed_size > 0
-                        and projected_total > shared_budget.max_total_uncompressed_size
-                    ):
+                    archive_uncompressed_size, budget_reserved = self._reserve_member_work(
+                        result,
+                        path,
+                        member,
+                        shared_budget,
+                        archive_uncompressed_size,
+                    )
+                    if not budget_reserved:
                         scan_complete = False
                         aggregate_size_check_recorded = True
-                        mark_archive_scan_incomplete(result, TAR_TOTAL_SIZE_INCOMPLETE_REASON)
                         contents.append(
                             self._member_inventory_entry(
                                 path,
@@ -1383,15 +1612,7 @@ class TarScanner(BaseScanner):
                                 scan_outcome_reason=TAR_TOTAL_SIZE_INCOMPLETE_REASON,
                             )
                         )
-                        self._add_tar_aggregate_size_check(
-                            result,
-                            path,
-                            passed=False,
-                            archive_uncompressed_size=projected_total,
-                            member_name=name,
-                        )
                         break
-                    shared_budget.member_bytes_consumed = projected_total
 
                     if self._record_projected_compressed_member_limit(
                         result,
@@ -1414,24 +1635,46 @@ class TarScanner(BaseScanner):
                         break
 
                     try:
-                        name_lower = name.lower()
-                        is_tar_extension = any(name_lower.endswith(ext) for ext in self.supported_extensions)
-                        if is_tar_extension:
-                            for ext in self.supported_extensions:
-                                if name_lower.endswith(ext):
-                                    suffix = ext
-                                    break
-                            else:
-                                suffix = ".tar"
-                        else:
-                            safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name))
-                            suffix = f"_{safe_name}"
+                        effective_member_name = _resolve_safe_tar_path_through_symlinks(
+                            name,
+                            symlink_targets,
+                            link_resolution_budget,
+                        )
+                    except _NemoRouteResolutionLimitExceeded:
+                        effective_member_name = None
+                    if effective_member_name is None:
+                        scan_complete = False
+                        self._record_nemo_link_resolution_incomplete(
+                            result,
+                            archive_path=path,
+                            entry_name=name,
+                            message="TAR member destination exceeded bounded NeMo symlink resolution",
+                        )
 
-                        tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=suffix)
+                    try:
+                        name_lower = name.lower()
+                        member_basename = os.path.basename(name.replace("\\", "/"))
+                        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", member_basename) or "member"
+                        tar_suffix = next(
+                            (extension for extension in self.supported_extensions if name_lower.endswith(extension)),
+                            None,
+                        )
+                        is_tar_extension = tar_suffix is not None
+                        suffix = tar_suffix if tar_suffix is not None else f"_{safe_name}"
+                        basename = safe_name if is_declared_text_content_filename(member_basename) else None
+
+                        tmp_path, total_size = self._extract_member_to_tempfile(
+                            tar,
+                            member,
+                            suffix=suffix,
+                            basename=basename,
+                        )
+                        tmp_dir = os.path.dirname(tmp_path) if basename is not None else None
                         try:
-                            if is_tar_extension and tarfile.is_tarfile(tmp_path):
+                            if is_tar_extension and TarScanner.can_handle(tmp_path):
                                 nested_config = dict(self.config)
                                 nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
+                                nested_config.pop(TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY, None)
                                 nested_config["cache_enabled"] = False
                                 nested_config["_archive_depth"] = depth + 1
                                 nested_result = self._scan_nested_archive_entry(tmp_path, nested_config)
@@ -1460,7 +1703,7 @@ class TarScanner(BaseScanner):
                                 else:
                                     if not self._scan_reachable_nemo_config_member(
                                         archive_path=path,
-                                        member_name=name,
+                                        member_name=effective_member_name or name,
                                         member_size=member.size,
                                         tmp_path=tmp_path,
                                         result=result,
@@ -1469,6 +1712,7 @@ class TarScanner(BaseScanner):
 
                                     nested_config = dict(self.config)
                                     nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
+                                    nested_config.pop(TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY, None)
                                     nested_config["cache_enabled"] = False
                                     nested_config["_archive_depth"] = depth + 1
                                     file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
@@ -1486,6 +1730,9 @@ class TarScanner(BaseScanner):
                             contents.append(asset_entry)
                         finally:
                             os.unlink(tmp_path)
+                            if tmp_dir is not None:
+                                with contextlib.suppress(OSError):
+                                    os.rmdir(tmp_dir)
                     except _TarStreamBudgetExceeded as exc:
                         scan_complete = False
                         stream_budget_failed = True
@@ -1572,51 +1819,23 @@ class TarScanner(BaseScanner):
                 archive_uncompressed_size=archive_uncompressed_size,
             )
 
-        if compression_codec is not None and bounded_stream is not None and not stream_budget_failed:
-            final_stream_size = self._finalize_tar_stream_size(bounded_stream.bytes_read)
-            actual_ratio = (final_stream_size / compressed_size) if compressed_size > 0 else 0.0
-            if final_stream_size > self.max_decompressed_bytes:
+        if (
+            reached_eof
+            and compression_codec is not None
+            and bounded_stream is not None
+            and not stream_budget_failed
+            and not wrapper_integrity_failed
+        ):
+            final_stream_size = bounded_stream.bytes_read
+            if self._record_compressed_stream_limit(
+                result,
+                path,
+                stream_size=final_stream_size,
+                compressed_size=compressed_size,
+                compression_codec=compression_codec,
+                emit_pass=True,
+            ):
                 scan_complete = False
-                self._add_compressed_wrapper_limit_check(
-                    result,
-                    passed=False,
-                    path=path,
-                    message=f"Decompressed size exceeded limit ({final_stream_size} > {self.max_decompressed_bytes})",
-                    decompressed_size=final_stream_size,
-                    compressed_size=compressed_size,
-                    compression_codec=compression_codec,
-                    actual_ratio=actual_ratio,
-                )
-                mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
-            elif compressed_size > 0 and actual_ratio > self.max_decompression_ratio:
-                scan_complete = False
-                self._add_compressed_wrapper_limit_check(
-                    result,
-                    passed=False,
-                    path=path,
-                    message=(
-                        "Decompression ratio exceeded limit "
-                        f"({actual_ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
-                    ),
-                    decompressed_size=final_stream_size,
-                    compressed_size=compressed_size,
-                    compression_codec=compression_codec,
-                    actual_ratio=actual_ratio,
-                )
-                mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
-            else:
-                self._add_compressed_wrapper_limit_check(
-                    result,
-                    passed=True,
-                    path=path,
-                    message=(
-                        f"Decompressed size/ratio are within limits ({final_stream_size} bytes, {actual_ratio:.1f}x)"
-                    ),
-                    decompressed_size=final_stream_size,
-                    compressed_size=compressed_size,
-                    compression_codec=compression_codec,
-                    actual_ratio=actual_ratio,
-                )
 
         result.metadata["contents"] = contents
         result.metadata["file_size"] = os.path.getsize(path)

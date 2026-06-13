@@ -2,15 +2,15 @@
 
 import pickle
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.core_results import add_issue_to_model
+from modelaudit.core_results import add_issue_to_model, results_have_inconclusive_outcome
 
 # Ensure models are rebuilt for forward references
 from modelaudit.models import ModelAuditResultModel, rebuild_models
-from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 rebuild_models()
 
@@ -59,6 +59,31 @@ def test_exit_code_clean_scan_with_debug_issues():
             ),
         ]
     )
+    assert determine_exit_code(results) == 0
+
+
+def test_exit_code_clean_scan_with_runtime_version_skip_check() -> None:
+    """Expected CVE applicability skips should not become incomplete coverage exits."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="CVE PyTorch Version Check",
+                status=CheckStatus.SKIPPED,
+                message="PyTorch runtime version unavailable",
+                severity=IssueSeverity.INFO,
+                location="weights.pt",
+                details={
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is False
     assert determine_exit_code(results) == 0
 
 
@@ -267,6 +292,271 @@ def test_exit_code_inconclusive_pickle_with_security_findings() -> None:
     assert determine_exit_code(results) == 1
 
 
+def test_exit_code_analysis_incomplete_metadata_without_scan_outcome() -> None:
+    """Incomplete coverage metadata should fail closed even before scan_outcome normalization."""
+    results = _create_result_model(
+        file_metadata={"model.bin": {"analysis_incomplete": True}},
+    )
+
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_incomplete_coverage_reason_without_scan_outcome() -> None:
+    """Incomplete coverage reasons should be enough to drive aggregate exit semantics."""
+    results = _create_result_model(
+        file_metadata={"model.bin": {"scan_outcome_reasons": ["bounded_probe_exhausted"]}},
+    )
+
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_issue_details_incomplete_without_security_findings() -> None:
+    """Issue-only incomplete coverage evidence should fail closed."""
+    results = _create_result_model(
+        issues=[
+            Issue(
+                message="DVC output limit exceeded - not all declared outputs were scanned",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "reason": "dvc_output_limit_exceeded",
+                },
+                timestamp=0.0,
+                why=None,
+                type="dvc_output_limit_exceeded",
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_check_details_incomplete_without_security_findings() -> None:
+    """Check-only incomplete coverage evidence should also fail closed."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="DVC Output Resolution",
+                status=CheckStatus.FAILED,
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_check_details_bare_analysis_incomplete_fails_closed() -> None:
+    """Bare analysis_incomplete in record details is incomplete coverage evidence."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="Embedded Secret Scan",
+                status=CheckStatus.FAILED,
+                message="Embedded secret scan truncated",
+                severity=IssueSeverity.INFO,
+                location="model.bin",
+                details={"analysis_incomplete": True},
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_issue_with_skipped_status_still_treats_bare_analysis_incomplete_as_coverage_failure() -> None:
+    """Only skipped checks get the bare analysis_incomplete exemption; issues stay fail-closed."""
+    results = _create_result_model(
+        issues=[
+            Issue(
+                message="DVC output coverage incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True},
+                timestamp=0.0,
+                why=None,
+                type="dvc_analysis_incomplete",
+                status="skipped",
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_skipped_check_explicit_incomplete_reason_fails_closed() -> None:
+    """Skipped checks with explicit coverage outcome markers still fail closed."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="PyTorch Runtime CVE Applicability",
+                status=CheckStatus.SKIPPED,
+                message="PyTorch runtime version is unknown",
+                severity=IssueSeverity.INFO,
+                location="model.pt",
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "pytorch_runtime_version_unknown",
+                },
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_skipped_bare_analysis_incomplete_fails_closed() -> None:
+    """Skipped checks are clean only for explicit runtime-version applicability skips."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="Embedded Secret Scan",
+                status=CheckStatus.SKIPPED,
+                message="Embedded secret scan skipped after bounded read",
+                severity=IssueSeverity.INFO,
+                location="model.bin",
+                details={"analysis_incomplete": True},
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_bare_analysis_incomplete_preserves_security_exit() -> None:
+    """Security findings still exit 1 when bare incomplete coverage evidence coexists."""
+    results = _create_result_model(
+        issues=[
+            Issue(
+                message="Embedded secret scan truncated",
+                severity=IssueSeverity.INFO,
+                location="model.bin",
+                details={"analysis_incomplete": True},
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+            Issue(
+                message="Dangerous pickle global",
+                severity=IssueSeverity.CRITICAL,
+                location="payload.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 1
+
+
+def test_exit_code_consolidated_check_findings_preserve_incomplete_coverage() -> None:
+    """Consolidated check findings should not hide detail-only incomplete coverage."""
+    child = _create_result_model(
+        checks=[
+            Check(
+                name="DVC Output Resolution",
+                status=CheckStatus.FAILED,
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={
+                    "component_count": 2,
+                    "findings": [
+                        {"analysis_incomplete": True, "scan_outcome_reason": "dvc_output_limit_exceeded"},
+                        {"component": "covered-sibling"},
+                    ],
+                },
+                timestamp=0.0,
+            ),
+        ],
+    )
+    aggregate = _create_result_model()
+
+    aggregate.aggregate_scan_result(child.model_dump())
+
+    assert aggregate.success is False
+    assert results_have_inconclusive_outcome(aggregate) is True
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_direct_aggregate_scan_result_preserves_consolidated_incomplete_coverage() -> None:
+    """Direct ScanResult aggregation should recurse through consolidated check details."""
+    scan_result = ScanResult(scanner_name="synthetic")
+    scan_result.add_check(
+        name="DVC Output Resolution",
+        passed=False,
+        message="DVC output resolution incomplete",
+        severity=IssueSeverity.INFO,
+        location="model.dvc",
+        details={
+            "component_count": 2,
+            "findings": [{"scan_outcome_reasons": ["dvc_output_limit_exceeded"]}],
+        },
+    )
+    scan_result.finish(success=True)
+    aggregate = _create_result_model()
+
+    aggregate.aggregate_scan_result_direct(scan_result)
+
+    assert aggregate.success is False
+    assert results_have_inconclusive_outcome(aggregate) is True
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_exit_code_issue_details_incomplete_with_security_findings() -> None:
+    """Security findings still exit 1 while issue-only coverage remains visible."""
+    results = _create_result_model(
+        issues=[
+            Issue(
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+            Issue(
+                message="Dangerous pickle global",
+                severity=IssueSeverity.WARNING,
+                location="payload.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 1
+
+
+def test_exit_code_empty_coverage_reason_placeholder_remains_clean() -> None:
+    """Empty reason placeholders should not become incomplete coverage by themselves."""
+    results = _create_result_model(
+        file_metadata={"model.bin": {"scan_outcome_reason": "", "scan_outcome_reasons": []}},
+    )
+
+    assert determine_exit_code(results) == 0
+
+
 def test_exit_code_empty_results():
     """Test exit code with minimal results structure."""
     results = _create_result_model(files_scanned=0)
@@ -276,6 +566,20 @@ def test_exit_code_empty_results():
 def test_exit_code_no_files_scanned():
     """Test exit code 2 when no files are scanned."""
     results = _create_result_model(files_scanned=0)
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_dry_run_no_files_scanned_success() -> None:
+    """Dry-run previews should succeed even when no local files are scanned."""
+    results = _create_result_model(files_scanned=0)
+    cast(Any, results).dry_run = True
+    assert determine_exit_code(results) == 0
+
+
+def test_exit_code_dry_run_operational_error_still_errors() -> None:
+    """Dry-run mode should not mask operational failures."""
+    results = _create_result_model(files_scanned=0, has_errors=True)
+    cast(Any, results).dry_run = True
     assert determine_exit_code(results) == 2
 
 
@@ -358,7 +662,7 @@ def test_exit_code_file_scan_failure(tmp_path: Path) -> None:
 
 
 def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(tmp_path: Path) -> None:
-    """Warning findings should not become exit code 2 just because the message looks like a parse error."""
+    """Warning findings keep exit 1 even when a bare failed scan is normalized as incomplete."""
     test_file = tmp_path / "malicious.pkl"
     test_file.write_bytes(b"payload")
 
@@ -384,7 +688,7 @@ def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(
         results = scan_model_directory_or_file(str(test_file))
 
     assert results.has_errors is False
-    assert results.success is True
+    assert results.success is False
     assert determine_exit_code(results) == 1
 
 
@@ -413,6 +717,42 @@ def test_scan_result_operational_flag_keeps_exit_code_2(tmp_path: Path) -> None:
     assert determine_exit_code(results) == 2
 
 
+def test_scan_result_operational_flag_with_security_and_incomplete_keeps_exit_code_2(tmp_path: Path) -> None:
+    """Explicit operational failures outrank security findings even with incomplete metadata."""
+    test_file = tmp_path / "timeout-danger.pkl"
+    test_file.write_bytes(b"payload")
+
+    scan_result = ScanResult(scanner_name="pickle")
+    scan_result.add_issue(
+        "Dangerous pickle global: os.system",
+        severity=IssueSeverity.WARNING,
+        location=str(test_file),
+    )
+    scan_result.add_check(
+        name="Scan Timeout Check",
+        passed=False,
+        message="Scan timeout: simulated timeout",
+        severity=IssueSeverity.INFO,
+        location=str(test_file),
+        details={"timeout": 1},
+    )
+    scan_result.metadata["operational_error"] = True
+    scan_result.metadata["operational_error_reason"] = "scan_timeout"
+    scan_result.metadata["analysis_incomplete"] = True
+    scan_result.metadata["scan_outcome"] = "inconclusive"
+    scan_result.metadata["scan_outcome_reasons"] = ["opcode_budget_exceeded"]
+    scan_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file", return_value=scan_result):
+        results = scan_model_directory_or_file(str(test_file))
+
+    assert results.has_errors is True
+    assert results.success is False
+    assert results.file_metadata[str(test_file)]["analysis_incomplete"] is True
+    assert any(issue.severity == IssueSeverity.WARNING for issue in results.issues)
+    assert determine_exit_code(results) == 2
+
+
 def test_scan_result_info_only_failed_scan_without_outcome_fails_closed(tmp_path: Path) -> None:
     """Bare success=False results should become inconclusive instead of exiting clean."""
     test_file = tmp_path / "trailing.npy"
@@ -438,7 +778,7 @@ def test_scan_result_info_only_failed_scan_without_outcome_fails_closed(tmp_path
 
 
 def test_scan_result_inconclusive_with_security_finding_keeps_exit_code_1(tmp_path: Path) -> None:
-    """Security findings should outrank inconclusive metadata in aggregate scan results."""
+    """Security findings should outrank incomplete coverage for exit code, not aggregate success."""
     test_file = tmp_path / "budget-danger.pkl"
     test_file.write_bytes(b"payload")
 
@@ -458,7 +798,7 @@ def test_scan_result_inconclusive_with_security_finding_keeps_exit_code_1(tmp_pa
         results = scan_model_directory_or_file(str(test_file))
 
     assert results.has_errors is False
-    assert results.success is True
+    assert results.success is False
     assert determine_exit_code(results) == 1
 
 

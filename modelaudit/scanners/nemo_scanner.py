@@ -17,6 +17,9 @@ from typing import Any, ClassVar
 from ..core_results import (
     OPERATIONAL_ERROR_REASON_METADATA_KEY,
     mark_operational_scan_error,
+    metadata_has_incomplete_coverage,
+    record_details_have_incomplete_coverage,
+    records_have_incomplete_coverage,
     scan_result_has_operational_error,
 )
 from ..utils import is_absolute_archive_path, sanitize_archive_path
@@ -1159,6 +1162,9 @@ _NESTED_OPERATIONAL_CHECK_NAMES = {
     "xml_model_routing_incomplete": "XML Model Routing",
 }
 _NESTED_OPERATIONAL_REASON_FALLBACK = "nemo_referenced_nested_operational_error"
+_NESTED_COVERAGE_ONLY_INCOMPLETE_REASONS = frozenset({"recognized_format_scanner_unavailable"})
+_NESTED_COVERAGE_ONLY_INCOMPLETE_SUFFIXES = ("_routing_incomplete",)
+_NESTED_NON_PROPAGATING_INCOMPLETE_REASONS = frozenset({"xgboost_binary_structure_too_small"})
 
 
 class _NemoConfigTraversalLimit(Exception):
@@ -1228,6 +1234,89 @@ def _scan_result_has_security_findings(result: ScanResult) -> bool:
     return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def _is_nested_coverage_only_incomplete_reason(reason: str) -> bool:
+    return reason in _NESTED_COVERAGE_ONLY_INCOMPLETE_REASONS or reason.endswith(
+        _NESTED_COVERAGE_ONLY_INCOMPLETE_SUFFIXES
+    )
+
+
+def _is_nested_non_propagating_incomplete_reason(reason: str) -> bool:
+    return reason in _NESTED_NON_PROPAGATING_INCOMPLETE_REASONS
+
+
+def _append_incomplete_coverage_reason(reasons: list[str], candidate: Any) -> None:
+    if isinstance(candidate, str) and candidate and candidate not in reasons:
+        reasons.append(candidate)
+
+
+def _incomplete_coverage_reasons_from_details(details: Any, *, _depth: int = 0) -> tuple[str, ...]:
+    if not isinstance(details, dict) or _depth >= 4:
+        return ()
+
+    collected_reasons: list[str] = []
+    _append_incomplete_coverage_reason(collected_reasons, details.get("scan_outcome_reason"))
+    raw_reasons = details.get("scan_outcome_reasons")
+    if isinstance(raw_reasons, str):
+        _append_incomplete_coverage_reason(collected_reasons, raw_reasons)
+    elif isinstance(raw_reasons, (list, tuple, set, frozenset)):
+        for candidate in raw_reasons:
+            _append_incomplete_coverage_reason(collected_reasons, candidate)
+
+    findings = details.get("findings")
+    if isinstance(findings, dict):
+        for reason in _incomplete_coverage_reasons_from_details(findings, _depth=_depth + 1):
+            _append_incomplete_coverage_reason(collected_reasons, reason)
+    elif isinstance(findings, (list, tuple, set, frozenset)):
+        for finding in findings:
+            if isinstance(finding, dict):
+                for reason in _incomplete_coverage_reasons_from_details(finding, _depth=_depth + 1):
+                    _append_incomplete_coverage_reason(collected_reasons, reason)
+                nested_details = finding.get("details")
+                for reason in _incomplete_coverage_reasons_from_details(
+                    nested_details,
+                    _depth=_depth + 1,
+                ):
+                    _append_incomplete_coverage_reason(collected_reasons, reason)
+
+    nested_details = details.get("details")
+    if nested_details is not details:
+        for reason in _incomplete_coverage_reasons_from_details(nested_details, _depth=_depth + 1):
+            _append_incomplete_coverage_reason(collected_reasons, reason)
+
+    return tuple(collected_reasons)
+
+
+def _nested_record_incomplete_coverage_reasons(nested_result: ScanResult) -> tuple[str, ...]:
+    reasons: list[str] = []
+    for check in nested_result.checks:
+        if not record_details_have_incomplete_coverage(check, allow_skipped_check_exemption=True):
+            continue
+        for reason in _incomplete_coverage_reasons_from_details(getattr(check, "details", None)):
+            _append_incomplete_coverage_reason(reasons, reason)
+    for issue in nested_result.issues:
+        if not record_details_have_incomplete_coverage(issue):
+            continue
+        for reason in _incomplete_coverage_reasons_from_details(getattr(issue, "details", None)):
+            _append_incomplete_coverage_reason(reasons, reason)
+    return tuple(reasons)
+
+
+def _select_nested_incomplete_propagation_reason(
+    reasons: tuple[str, ...],
+    *,
+    nested_has_actionable_finding: bool,
+) -> str | None:
+    if nested_has_actionable_finding:
+        return reasons[0] if reasons else _NESTED_OPERATIONAL_REASON_FALLBACK
+    for reason in reasons:
+        if _is_nested_coverage_only_incomplete_reason(reason):
+            return reason
+    for reason in reasons:
+        if not _is_nested_non_propagating_incomplete_reason(reason):
+            return reason
+    return None
+
+
 def _get_nested_scanner_for_file(path: str, *, config: dict[str, Any]) -> BaseScanner | None:
     """Resolve nested scanners lazily to avoid scanner registry import cycles."""
     from modelaudit.scanners import get_scanner_for_file
@@ -1256,7 +1345,7 @@ class NemoScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext in cls.supported_extensions:
             # Preserve legacy coverage for `.nemo` archives whose config is malformed or missing.
-            return tarfile.is_tarfile(path)
+            return TarScanner.can_handle(path)
         return is_nemo_archive(path)
 
     def scan(self, path: str) -> ScanResult:
@@ -1281,7 +1370,11 @@ class NemoScanner(BaseScanner):
             return result
 
         preflight_result = ScanResult(scanner_name="tar")
-        if not tar_scanner._preflight_tar_archive(path, preflight_result):
+        if not tar_scanner._preflight_tar_archive(
+            path,
+            preflight_result,
+            reserve_member_budget=is_declared_nemo,
+        ):
             mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
             preflight_result.finish(success=False)
             result.merge(preflight_result)
@@ -3076,12 +3169,39 @@ class NemoScanner(BaseScanner):
         archive_location = f"{archive_path}:{entry_name}"
         actionable_severities = {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         raw_operational_reason = nested_result.metadata.get(OPERATIONAL_ERROR_REASON_METADATA_KEY)
-        operational_reason = (
-            raw_operational_reason if isinstance(raw_operational_reason, str) else _NESTED_OPERATIONAL_REASON_FALLBACK
+        raw_incomplete_reason = nested_result.metadata.get("scan_outcome_reason")
+        raw_incomplete_reasons = nested_result.metadata.get("scan_outcome_reasons")
+        reason_candidates: list[str] = []
+        _append_incomplete_coverage_reason(reason_candidates, raw_operational_reason)
+        _append_incomplete_coverage_reason(reason_candidates, raw_incomplete_reason)
+        if isinstance(raw_incomplete_reasons, str):
+            _append_incomplete_coverage_reason(reason_candidates, raw_incomplete_reasons)
+        elif isinstance(raw_incomplete_reasons, (list, tuple, set, frozenset)):
+            for reason in raw_incomplete_reasons:
+                _append_incomplete_coverage_reason(reason_candidates, reason)
+        for reason in _nested_record_incomplete_coverage_reasons(nested_result):
+            _append_incomplete_coverage_reason(reason_candidates, reason)
+        operational_reason = reason_candidates[0] if reason_candidates else _NESTED_OPERATIONAL_REASON_FALLBACK
+        nested_incomplete = (
+            metadata_has_incomplete_coverage(nested_result.metadata)
+            or records_have_incomplete_coverage(nested_result.checks, allow_skipped_check_exemption=True)
+            or records_have_incomplete_coverage(nested_result.issues)
         )
         nested_operational = scan_result_has_operational_error(nested_result)
+        nested_has_actionable_finding = any(
+            check.status == CheckStatus.FAILED and check.severity in actionable_severities
+            for check in nested_result.checks
+        ) or any(issue.severity in actionable_severities for issue in nested_result.issues)
+        propagation_reason = _select_nested_incomplete_propagation_reason(
+            tuple(reason_candidates) if reason_candidates else (_NESTED_OPERATIONAL_REASON_FALLBACK,),
+            nested_has_actionable_finding=nested_has_actionable_finding,
+        )
+        nested_incomplete_should_propagate = nested_incomplete and propagation_reason is not None
+        if nested_operational or nested_incomplete_should_propagate:
+            archive_incomplete_reason = operational_reason if nested_operational else propagation_reason
+            if archive_incomplete_reason is not None:
+                mark_archive_scan_incomplete(result, archive_incomplete_reason)
         if nested_operational:
-            mark_archive_scan_incomplete(result, operational_reason)
             mark_operational_scan_error(result, operational_reason)
 
         for check in nested_result.checks:

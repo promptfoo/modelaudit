@@ -3,8 +3,9 @@ import os
 import pickle
 import tarfile
 import tempfile
+import zipfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import pytest
 
@@ -23,6 +24,33 @@ from modelaudit.scanners.tar_scanner import (
     TarScanner,
 )
 from modelaudit.utils.file import detection as file_detection
+
+
+def _tar_octal_field(value: int, width: int) -> bytes:
+    return f"{value:0{width - 1}o}\0".encode()
+
+
+def _with_tar_checksum(header: bytearray) -> bytes:
+    header[148:156] = b"        "
+    header[148:156] = f"{sum(header):06o}\0 ".encode()
+    return bytes(header)
+
+
+def _old_gnu_sparse_tar_bytes(*, extension_blocks: int, physical_size: int = 0) -> bytes:
+    info = tarfile.TarInfo("sparse.bin")
+    info.type = tarfile.GNUTYPE_SPARSE
+    info.size = physical_size
+    header = bytearray(info.tobuf(format=tarfile.GNU_FORMAT))
+    header[482] = int(extension_blocks > 0)
+    header[483:495] = _tar_octal_field(max(physical_size, 1), 12)
+    extensions: list[bytes] = []
+    for index in range(extension_blocks):
+        block = bytearray(tarfile.BLOCKSIZE)
+        block[:12] = _tar_octal_field(index + 1, 12)
+        block[12:24] = _tar_octal_field(1, 12)
+        block[504] = int(index + 1 < extension_blocks)
+        extensions.append(bytes(block))
+    return _with_tar_checksum(header) + b"".join(extensions) + (b"\0" * physical_size) + (b"\0" * 1024)
 
 
 def _assert_inconclusive_aggregate_not_reused(
@@ -1398,7 +1426,8 @@ class TestTarScanner:
         integrity_checks = [check for check in result.checks if check.name == "File Integrity Hash"]
         assert len(integrity_checks) == 1
         assert integrity_checks[0].status == CheckStatus.SKIPPED
-        assert integrity_checks[0].details["scan_outcome_reason"] == "tar_file_integrity_hash_skipped"
+        assert integrity_checks[0].details["skip_reason"] == "tar_file_integrity_hash_skipped"
+        assert integrity_checks[0].details.get("analysis_incomplete") is not True
         assert result.metadata["file_hashes_skipped"] is True
         assert "file_hashes" not in result.metadata
         assert not any(
@@ -1468,6 +1497,60 @@ class TestTarScanner:
             for entry in result.metadata["contents"]
         )
         assert not any(entry["path"].endswith("later.txt") for entry in result.metadata["contents"])
+
+    def test_rejected_special_tar_member_counts_against_total_budget(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "rejected_special_budget.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("../unknown-special")
+            info.type = b"Z"
+            info.size = 128
+            archive.addfile(info, tarfile.io.BytesIO(b"A" * info.size))  # type: ignore[attr-defined]
+            later = tarfile.TarInfo("later.txt")
+            later.size = 5
+            archive.addfile(later, tarfile.io.BytesIO(b"later"))  # type: ignore[attr-defined]
+
+        result = TarScanner(
+            config={
+                "max_tar_total_uncompressed_size": 64,
+                "compressed_max_decompression_ratio": 10_000.0,
+            }
+        ).scan(str(archive_path))
+
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is False
+        assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
+        assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
+        assert result.metadata["archive_uncompressed_size"] >= 128
+        assert not any(entry["path"].endswith("later.txt") for entry in result.metadata["contents"])
+
+    @pytest.mark.parametrize("member_type", [tarfile.DIRTYPE, tarfile.SYMTYPE, tarfile.LNKTYPE])
+    def test_body_carrying_metadata_member_fails_closed(
+        self,
+        tmp_path: Path,
+        member_type: bytes,
+    ) -> None:
+        archive_path = tmp_path / f"body-metadata-{member_type.hex()}.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("metadata-entry")
+            info.type = member_type
+            info.linkname = "safe-target" if member_type in {tarfile.SYMTYPE, tarfile.LNKTYPE} else ""
+            info.size = 128
+            archive.addfile(info)
+
+        result = TarScanner(config={"max_tar_total_uncompressed_size": 64}).scan(str(archive_path))
+
+        assert result.success is False
+        assert "tar_special_member_unsupported" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "TAR Member Coverage"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "metadata-entry"
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "TAR Aggregate Size Limit Check" and check.status == CheckStatus.PASSED
+            for check in result.checks
+        )
 
     def test_large_tar_oversized_member_records_inventory_after_read_cap_bypass(self, tmp_path: Path) -> None:
         """Large skipped members should produce TAR-specific incomplete coverage and inventory."""
@@ -1998,16 +2081,40 @@ class TestTarScanner:
             later_info.size = len(later_payload)
             archive.addfile(later_info, tarfile.io.BytesIO(later_payload))  # type: ignore[attr-defined]
 
-        bytes_read = 0
-        original_read = tar_scanner_module._TarBoundedStream.read
+        with tarfile.open(archive_path, "r:") as archive:
+            first_member = archive.getmember("payload.bin")
+            payload_start = first_member.offset_data
+            payload_end = payload_start + first_member.size
 
-        def tracked_read(self: Any, size: int = -1) -> bytes:
-            nonlocal bytes_read
-            data = original_read(self, size)
-            bytes_read += len(data)
-            return data
+        payload_bytes_read = 0
+        original_open = open
 
-        monkeypatch.setattr(tar_scanner_module._TarBoundedStream, "read", tracked_read)
+        class TrackingFile:
+            def __init__(self, fileobj: Any) -> None:
+                self._fileobj = fileobj
+
+            def read(self, size: int = -1) -> bytes:
+                nonlocal payload_bytes_read
+                start = self._fileobj.tell()
+                data = cast(bytes, self._fileobj.read(size))
+                end = start + len(data)
+                payload_bytes_read += max(0, min(end, payload_end) - max(start, payload_start))
+                return data
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._fileobj, name)
+
+            def __enter__(self) -> "TrackingFile":
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                self._fileobj.close()
+
+        def tracked_open(path: str, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            fileobj = original_open(path, mode, *args, **kwargs)
+            return TrackingFile(fileobj) if os.fspath(path) == os.fspath(archive_path) and mode == "rb" else fileobj
+
+        monkeypatch.setattr(tar_scanner_module, "open", tracked_open, raising=False)
 
         result = scanner._scan_tar_file(str(archive_path))
 
@@ -2016,7 +2123,7 @@ class TestTarScanner:
         contents = result.metadata["contents"]
         assert any(entry["path"].endswith("payload.bin") for entry in contents)
         assert any(entry["path"].endswith("later.txt") for entry in contents)
-        assert bytes_read == 0
+        assert payload_bytes_read < tarfile.BLOCKSIZE
 
     def test_scan_compressed_tar_stops_after_oversized_member_without_streaming_body(
         self,
@@ -2382,7 +2489,7 @@ class TestTarScanner:
         assert any(entry["path"].endswith("unknown_special") for entry in result.metadata["contents"])
         assert any(entry["path"].endswith("later.txt") for entry in result.metadata["contents"])
 
-    def test_raw_tar_preflight_uses_seekable_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_raw_tar_scan_uses_seekable_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         archive_path = tmp_path / "seekable_preflight.tar"
         payload = b"A" * 1024
         with tarfile.open(archive_path, "w") as archive:
@@ -2669,6 +2776,53 @@ class TestTarScanner:
         assert len(limit_checks) == 1
         assert limit_checks[0].status == CheckStatus.PASSED
 
+    def test_scan_compressed_tar_counts_concatenated_wrapper_tail_toward_size_limit(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "concatenated_tail.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.txt")
+            payload = b"safe"
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+        with archive_path.open("ab") as archive_file:
+            archive_file.write(gzip.compress(b"B" * (1024 * 1024)))
+
+        result = TarScanner(
+            config={
+                "compressed_max_decompressed_bytes": 100 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            }
+        ).scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert result.success is False
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompressed size exceeded" in limit_checks[0].message.lower()
+        assert "tar_decompressed_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_compressed_tar_rejects_nonzero_concatenated_wrapper_tail(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "nonzero_tail.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.txt")
+            payload = b"safe"
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+        with archive_path.open("ab") as archive_file:
+            archive_file.write(gzip.compress(b"not-tar-data"))
+
+        result = TarScanner(
+            config={
+                "compressed_max_decompressed_bytes": 1024 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            }
+        ).scan(str(archive_path))
+
+        trailing_checks = [check for check in result.checks if check.name == "Compressed TAR Trailing Data"]
+        assert result.success is False
+        assert len(trailing_checks) == 1
+        assert trailing_checks[0].status == CheckStatus.FAILED
+        assert "tar_compressed_trailing_data" in result.metadata["scan_outcome_reasons"]
+
     def test_scan_compressed_tar_accounts_for_tar_record_padding(self, tmp_path: Path) -> None:
         """Wrapper limits should account for TAR record padding, even on tiny archives."""
         archive_path = tmp_path / "tiny.tar.gz"
@@ -2688,10 +2842,8 @@ class TestTarScanner:
         assert limit_checks[0].status == CheckStatus.FAILED
         assert "decompressed size exceeded" in limit_checks[0].message.lower()
 
-    def test_scan_tar_preflight_streams_members_without_getmembers(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Preflight should stream TAR members instead of materializing them with getmembers()."""
+    def test_tar_scan_streams_members_without_getmembers(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """TAR scanning should stream members instead of materializing them with getmembers()."""
         archive_path = tmp_path / "streamed.tar.gz"
 
         with tarfile.open(archive_path, "w:gz") as archive:
@@ -2702,7 +2854,7 @@ class TestTarScanner:
                 archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
 
         def fail_getmembers(self: tarfile.TarFile) -> list[tarfile.TarInfo]:
-            raise AssertionError("TarScanner should not call getmembers() during preflight")
+            raise AssertionError("TarScanner should not call getmembers() during scanning")
 
         monkeypatch.setattr(tarfile.TarFile, "getmembers", fail_getmembers)
 
@@ -2831,3 +2983,241 @@ class TestTarScanner:
         assert len(limit_checks) == 1
         assert limit_checks[0].status == CheckStatus.FAILED
         assert "decompression ratio exceeded" in limit_checks[0].message.lower()
+
+    def test_cumulative_pax_metadata_budget_fails_before_archive_scan(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "many-pax.tar.gz"
+        with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+            for index in range(3):
+                info = tarfile.TarInfo(f"entry-{index}.txt")
+                info.pax_headers = {"comment": "A" * (40 * 1024)}
+                archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+
+        assert file_detection._detect_tar_route(str(archive_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+        result = TarScanner(config={"max_tar_metadata_bytes": 64 * 1024}).scan(str(archive_path))
+
+        assert result.success is False
+        assert "tar_metadata_read_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "TAR Stream Budget" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    def test_cumulative_gnu_longname_metadata_budget_fails_closed(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "many-longnames.tar.gz"
+        with tarfile.open(archive_path, "w:gz", format=tarfile.GNU_FORMAT) as archive:
+            for index in range(3):
+                info = tarfile.TarInfo(("a" * (40 * 1024)) + f"-{index}.txt")
+                archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+
+        assert file_detection._detect_tar_route(str(archive_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+        result = TarScanner(config={"max_tar_metadata_bytes": 64 * 1024}).scan(str(archive_path))
+
+        assert result.success is False
+        assert "tar_metadata_read_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_gnu_sparse_extension_chain_is_bounded_during_route_and_scan(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "sparse-metadata.tar"
+        archive_path.write_bytes(_old_gnu_sparse_tar_bytes(extension_blocks=129))
+
+        assert file_detection._detect_tar_route(str(archive_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+        result = TarScanner(config={"max_tar_metadata_bytes": 64 * 1024}).scan(str(archive_path))
+
+        assert result.success is False
+        assert "tar_metadata_read_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_sparse_member_reserves_shared_work_before_compressed_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "sparse-body.tar.gz"
+        physical_size = 32 * 1024
+        archive_path.write_bytes(
+            gzip.compress(_old_gnu_sparse_tar_bytes(extension_blocks=0, physical_size=physical_size))
+        )
+        bytes_read = 0
+        original_read = tar_scanner_module._TarBoundedStream.read
+
+        def tracked_read(self: Any, size: int = -1) -> bytes:
+            nonlocal bytes_read
+            data = original_read(self, size)
+            bytes_read += len(data)
+            return data
+
+        monkeypatch.setattr(tar_scanner_module._TarBoundedStream, "read", tracked_read)
+
+        result = TarScanner(
+            config={
+                "max_tar_total_uncompressed_size": 1,
+                "compressed_max_decompressed_bytes": 100_000,
+                "compressed_max_decompression_ratio": 10_000.0,
+            }
+        ).scan(str(archive_path))
+
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is False
+        assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
+        assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
+        assert result.metadata["archive_uncompressed_size"] >= physical_size
+        assert bytes_read < physical_size
+
+    def test_truncated_route_scans_config_reached_through_ancestor_symlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+        archive_path = tmp_path / "ancestor-link.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            payload = b"x" * 128
+            info = tarfile.TarInfo("large.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+            link = tarfile.TarInfo("alias")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "."
+            archive.addfile(link)
+
+            config = b"model:\n  _target_: os.system\n"
+            info = tarfile.TarInfo("alias/model_config.yaml")
+            info.size = len(config)
+            archive.addfile(info, tarfile.io.BytesIO(config))  # type: ignore[attr-defined]
+
+        result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "tar"
+        assert result.success is False
+        assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
+    def test_truncated_route_scans_config_reached_through_hardlinked_symlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+        archive_path = tmp_path / "hardlinked-symlink.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            payload = b"x" * 128
+            info = tarfile.TarInfo("large.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+            directory_alias = tarfile.TarInfo("dir")
+            directory_alias.type = tarfile.SYMTYPE
+            directory_alias.linkname = "."
+            archive.addfile(directory_alias)
+
+            seed = tarfile.TarInfo("dir/seed")
+            seed.type = tarfile.SYMTYPE
+            seed.linkname = "."
+            archive.addfile(seed)
+
+            alias = tarfile.TarInfo("alias")
+            alias.type = tarfile.LNKTYPE
+            alias.linkname = "dir/seed"
+            archive.addfile(alias)
+
+            config = b"model:\n  _target_: os.system\n"
+            info = tarfile.TarInfo("alias/model_config.yaml")
+            info.size = len(config)
+            archive.addfile(info, tarfile.io.BytesIO(config))  # type: ignore[attr-defined]
+
+        result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "tar"
+        assert result.success is False
+        assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
+    @pytest.mark.parametrize("member_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+    def test_truncated_route_fails_closed_for_link_created_at_symlinked_root_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        member_type: bytes,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+        archive_path = tmp_path / f"linked-root-{member_type.hex()}.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            payload = b"x" * 128
+            info = tarfile.TarInfo("large.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+            config = b"model:\n  _target_: os.system\n"
+            info = tarfile.TarInfo("payload.yaml")
+            info.size = len(config)
+            archive.addfile(info, tarfile.io.BytesIO(config))  # type: ignore[attr-defined]
+
+            alias = tarfile.TarInfo("alias")
+            alias.type = tarfile.SYMTYPE
+            alias.linkname = "."
+            archive.addfile(alias)
+
+            root_link = tarfile.TarInfo("alias/model_config.yaml")
+            root_link.type = member_type
+            root_link.linkname = "payload.yaml"
+            archive.addfile(root_link)
+
+        result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "tar"
+        assert result.success is False
+        assert "nemo_link_semantics_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    def test_empty_tar_prefix_does_not_hide_malicious_zip(self, tmp_path: Path) -> None:
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[Any, tuple[str]]:
+                return (os.system, ("echo tar-prefix-zip",))
+
+        zip_path = tmp_path / "payload.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("data.pkl", pickle.dumps(DangerousPayload()))
+
+        polyglot_path = tmp_path / "payload.tar"
+        payload = (b"\0" * 1024) + zip_path.read_bytes()
+        payload += b"\0" * (-len(payload) % tarfile.BLOCKSIZE)
+        polyglot_path.write_bytes(payload)
+
+        assert zipfile.is_zipfile(polyglot_path)
+        assert file_detection.detect_file_format(str(polyglot_path)) == "zip"
+
+        result = core.scan_file(str(polyglot_path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "zip"
+        assert result.success is False
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    def test_outer_nemo_skip_flag_does_not_leak_into_nested_tar(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+        inner_path = tmp_path / "inner.tar.gz"
+        with tarfile.open(inner_path, "w:gz") as inner:
+            payload = b"x" * 128
+            info = tarfile.TarInfo("large.bin")
+            info.size = len(payload)
+            inner.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            config = b"model:\n  _target_: os.system\n"
+            info = tarfile.TarInfo("model_config.yaml")
+            info.size = len(config)
+            inner.addfile(info, tarfile.io.BytesIO(config))  # type: ignore[attr-defined]
+
+        outer_path = tmp_path / "outer.tar.gz"
+        with tarfile.open(outer_path, "w:gz") as outer:
+            root_config = b"model:\n  _target_: torch.nn.Linear\n"
+            info = tarfile.TarInfo("model_config.yaml")
+            info.size = len(root_config)
+            outer.addfile(info, tarfile.io.BytesIO(root_config))  # type: ignore[attr-defined]
+            nested = inner_path.read_bytes()
+            info = tarfile.TarInfo("inner.tar.gz")
+            info.size = len(nested)
+            outer.addfile(info, tarfile.io.BytesIO(nested))  # type: ignore[attr-defined]
+
+        result = core.scan_file(str(outer_path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)

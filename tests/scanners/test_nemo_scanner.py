@@ -1,11 +1,12 @@
 """Tests for CVE-2025-23304: NVIDIA NeMo Hydra _target_ injection."""
 
+import gzip
 import io
 import pickle
 import tarfile
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -16,14 +17,16 @@ try:
 except ImportError:
     HAS_YAML = False
 
+from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners import nemo_scanner as nemo_scanner_module
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 from modelaudit.utils.file import detection as file_detection
 
 _TMP_PATH_MARKER = "__MODELAUDIT_TMP__/"
+_NemoTarWriteMode = Literal["w", "w:gz"]
 
 
 def _create_nemo_file_from_bytes(
@@ -31,10 +34,11 @@ def _create_nemo_file_from_bytes(
     config_bytes: bytes,
     filename: str = "model.nemo",
     config_name: str = "model_config.yaml",
+    mode: _NemoTarWriteMode = "w",
 ) -> Path:
     """Helper to create a .nemo tar file with the given YAML config."""
     nemo_path = tmp_path / filename
-    with tarfile.open(nemo_path, "w") as tar:
+    with tarfile.open(nemo_path, mode) as tar:
         info = tarfile.TarInfo(name=config_name)
         info.size = len(config_bytes)
         tar.addfile(info, io.BytesIO(config_bytes))
@@ -46,22 +50,30 @@ def _create_nemo_file(
     config_dict: dict[str, Any] | None,
     filename: str = "model.nemo",
     config_name: str = "model_config.yaml",
+    mode: _NemoTarWriteMode = "w",
 ) -> Path:
     """Helper to create a .nemo tar file with the given YAML config."""
     if config_dict is None:
         nemo_path = tmp_path / filename
-        with tarfile.open(nemo_path, "w"):
+        with tarfile.open(nemo_path, mode):
             pass
         return nemo_path
 
     config_bytes = yaml.safe_dump(config_dict).encode() if HAS_YAML else b"{}"
-    return _create_nemo_file_from_bytes(tmp_path, config_bytes, filename=filename, config_name=config_name)
+    return _create_nemo_file_from_bytes(tmp_path, config_bytes, filename=filename, config_name=config_name, mode=mode)
 
 
 def _add_tar_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
     info = tarfile.TarInfo(name=name)
     info.size = len(payload)
     tar.addfile(info, io.BytesIO(payload))
+
+
+def _build_nemo_tar_bytes(config_bytes: bytes, *, mode: _NemoTarWriteMode = "w:gz") -> bytes:
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode=mode) as tar:
+        _add_tar_bytes(tar, "model_config.yaml", config_bytes)
+    return archive.getvalue()
 
 
 def _materialize_tmp_paths(value: Any, tmp_path: Path) -> Any:
@@ -124,6 +136,382 @@ class TestNemoScannerBasic:
         ]
         assert len(mismatch_checks) == 0
 
+    def test_gzip_framed_nemo_keeps_nemo_ownership_when_header_stays_gzip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Validated gzip TARs remain NeMo-owned when routing retains gzip framing."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}}, mode="w:gz")
+        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: "gzip")
+
+        file_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert file_result.scanner_name == "nemo"
+        assert not [check for check in file_result.checks if check.rule_code == "S901"]
+        assert aggregate_result.scanner_names == ["nemo"]
+        assert not [issue for issue in aggregate_result.issues if issue.severity == IssueSeverity.CRITICAL]
+        assert determine_exit_code(aggregate_result) == 0
+
+    def test_gzip_framed_malicious_nemo_keeps_nemo_findings_when_header_stays_gzip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retained gzip framing must not hide NeMo Hydra findings from either API."""
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model:\n  _target_: os.system\n  command: echo pwned\n",
+            mode="w:gz",
+        )
+        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: "gzip")
+
+        file_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert file_result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == "os.system"
+            for check in file_result.checks
+        )
+        assert aggregate_result.scanner_names == ["nemo"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == "os.system"
+            for issue in aggregate_result.issues
+        )
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_gzip_nemo_tail_validation_runs_once_with_scanner_limits(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "torch.nn.Linear"}},
+            mode="w:gz",
+        )
+        calls = 0
+        original_status = core_module.gzip_tar_trailing_data_status
+
+        def tracked_status(*args: Any, **kwargs: Any) -> str | None:
+            nonlocal calls
+            calls += 1
+            return original_status(*args, **kwargs)
+
+        monkeypatch.setattr(core_module, "gzip_tar_trailing_data_status", tracked_status)
+
+        result = scan_file(
+            str(path),
+            config={
+                "cache_scan_results": False,
+                "compressed_max_decompressed_bytes": 4 * 1024 * 1024 * 1024,
+            },
+        )
+
+        assert result.scanner_name == "nemo"
+        assert calls == 1
+
+    def test_gzip_nemo_tail_validation_uses_chunked_tar_reads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "torch.nn.Linear"}}, mode="w:gz")
+        observed_read_sizes: list[int] = []
+        original_read = file_detection._GzipTarBoundedReader.read
+
+        def tracked_read(reader: Any, size: int = -1) -> bytes:
+            observed_read_sizes.append(size)
+            return original_read(reader, size)
+
+        monkeypatch.setattr(file_detection._GzipTarBoundedReader, "read", tracked_read)
+
+        status = file_detection.gzip_tar_trailing_data_status(str(path))
+
+        assert status is None
+        assert 64 * 1024 in observed_read_sizes
+
+    def test_malformed_gzip_nemo_still_reports_s901(self, tmp_path: Path) -> None:
+        """A .nemo suffix plus gzip magic is not enough unless it is a valid TAR."""
+        path = tmp_path / "model.nemo"
+        path.write_bytes(b"\x1f\x8b\x08\x00truncated")
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        s901_checks = [check for check in result.checks if check.rule_code == "S901"]
+        assert result.scanner_name == "compressed"
+        assert s901_checks
+        assert any(
+            check.details.get("extension_format") == "nemo" and check.details.get("header_format") == "gzip"
+            for check in s901_checks
+        )
+
+    def test_gzip_non_tar_nemo_still_reports_s901(self, tmp_path: Path) -> None:
+        """A valid gzip stream with non-TAR content is still a spoofed .nemo container."""
+        path = tmp_path / "model.nemo"
+        path.write_bytes(gzip.compress(b"not a tar archive"))
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        s901_checks = [check for check in result.checks if check.rule_code == "S901"]
+        assert result.scanner_name == "compressed"
+        assert s901_checks
+        assert any(
+            check.details.get("extension_format") == "nemo" and check.details.get("header_format") == "gzip"
+            for check in s901_checks
+        )
+
+    def test_concatenated_gzip_nemo_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
+        """A second gzip member after TAR EOF must not be hidden by direct NeMo ownership."""
+        path = tmp_path / "concat.nemo"
+        path.write_bytes(
+            _build_nemo_tar_bytes(b"model:\n  _target_: nemo.Model\n")
+            + _build_nemo_tar_bytes(b"model:\n  _target_: os.system\n  command: echo pwned\n")
+        )
+
+        direct_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        integrity_checks = [
+            check
+            for check in direct_result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert direct_result.scanner_name == "nemo"
+        assert direct_result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "non-zero trailing data" in integrity_checks[0].message
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 2
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_concatenated_gzip_nemo_raw_member_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
+        """A non-TAR gzip member after TAR EOF must not be hidden by direct NeMo ownership."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}}, mode="w:gz")
+        path.write_bytes(path.read_bytes() + gzip.compress(_build_malicious_pickle()))
+
+        direct_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        integrity_checks = [
+            check
+            for check in direct_result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert file_detection.validate_file_type(str(path)) is False
+        assert direct_result.scanner_name == "nemo"
+        assert direct_result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "non-zero trailing data" in integrity_checks[0].message
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) != 0
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_concatenated_gzip_nemo_detects_nonzero_tail_after_zero_padding(self, tmp_path: Path) -> None:
+        """Post-EOF validation must not stop before hidden non-zero gzip member data."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}}, mode="w:gz")
+        path.write_bytes(path.read_bytes() + gzip.compress((b"\0" * (64 * 1024 + 1)) + _build_malicious_pickle()))
+
+        result = scan_file(
+            str(path),
+            config={
+                "cache_scan_results": False,
+                "compressed_max_decompressed_bytes": 2 * 1024 * 1024,
+                "compressed_max_decompression_ratio": 100000.0,
+            },
+        )
+
+        integrity_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "non-zero trailing data" in integrity_checks[0].message
+
+    def test_zero_tail_gzip_nemo_fails_closed_when_post_eof_tail_exceeds_limit(self, tmp_path: Path) -> None:
+        """All-zero post-EOF gzip data is still incomplete when policy limits prevent full validation."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}}, mode="w:gz")
+        path.write_bytes(path.read_bytes() + gzip.compress(b"\0" * (128 * 1024)))
+
+        result = scan_file(
+            str(path),
+            config={
+                "cache_scan_results": False,
+                "compressed_max_decompressed_bytes": 64 * 1024,
+                "compressed_max_decompression_ratio": 100000.0,
+            },
+        )
+
+        integrity_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "could not be fully validated" in integrity_checks[0].message
+
+    def test_truncated_gzip_nemo_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
+        """A readable TAR prefix is not enough when the outer gzip stream is incomplete."""
+        path = tmp_path / "truncated.nemo"
+        payload = _build_nemo_tar_bytes(b"model:\n  _target_: nemo.Model\n")
+        path.write_bytes(payload[:-1])
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        integrity_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "could not be fully validated" in integrity_checks[0].message
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_truncated_gzip_nemo_keeps_nemo_ownership_when_header_stays_gzip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retained gzip headers with invalid TAR tails still fail closed as NeMo-owned scans."""
+        path = tmp_path / "truncated-retained-gzip.nemo"
+        payload = _build_nemo_tar_bytes(b"model:\n  _target_: nemo.Model\n")
+        path.write_bytes(payload[:-1])
+        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: "gzip")
+
+        direct_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        integrity_checks = [
+            check
+            for check in direct_result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert direct_result.scanner_name == "nemo"
+        assert direct_result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "could not be fully validated" in integrity_checks[0].message
+        assert aggregate_result.scanner_names == ["nemo"]
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 2
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_truncated_gzip_nemo_keeps_s902_when_magic_route_is_tar(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Mixed gzip header and TAR magic routing must still validate the gzip tail."""
+        path = tmp_path / "truncated-gzip-magic-tar.nemo"
+        payload = _build_nemo_tar_bytes(b"model:\n  _target_: nemo.Model\n")
+        path.write_bytes(payload[:-1])
+        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: "gzip")
+        monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", lambda _path: "tar")
+
+        direct_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        integrity_checks = [
+            check
+            for check in direct_result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert direct_result.scanner_name == "nemo"
+        assert direct_result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert aggregate_result.scanner_names == ["nemo"]
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 2
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_missing_yaml_dependency_is_reported_as_warning(self, tmp_path, monkeypatch):
         """Missing PyYAML should be a non-passing warning, not a pass."""
         path = _create_nemo_file(tmp_path, {"model": "test"})
@@ -177,6 +565,19 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert details["cwe"] == "CWE-23"
         assert "remediation" in details
 
+    def test_gzip_framed_member_path_traversal_still_detected(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "traversal.nemo"
+        with tarfile.open(nemo_path, "w:gz") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "../../evil.txt", b"overwrite")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.rule_code == "S901"]
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
     def test_absolute_member_path_traversal_detects_cve_2025_23250(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "absolute.nemo"
         with tarfile.open(nemo_path, "w") as tar:
@@ -202,6 +603,23 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["entry"] == "weights_link"
+        assert cve_checks[0].details["target"] == "../../outside_weights.ckpt"
+
+    def test_gzip_framed_symlink_escape_still_detected(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "symlink.nemo"
+        with tarfile.open(nemo_path, "w:gz") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            link_info = tarfile.TarInfo(name="weights_link")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../../outside_weights.ckpt"
+            tar.addfile(link_info)
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.rule_code == "S901"]
         cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
         assert len(cve_checks) == 1
         assert cve_checks[0].details["entry"] == "weights_link"
@@ -234,6 +652,19 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert details["cwe"] == "CWE-502"
         assert "CVE-2026-24157" in details["related_cves"]
         assert details["nested_scanner"] == "pickle"
+
+    def test_gzip_framed_malicious_checkpoint_still_detected(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-rce.nemo"
+        with tarfile.open(nemo_path, "w:gz") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.rule_code == "S901"]
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
     def test_torch7_checkpoint_with_pt_suffix_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "torch7-checkpoint-rce.nemo"
@@ -3083,17 +3514,26 @@ class TestCVE202523304HydraTarget:
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert result.has_errors is False
         assert result.metadata["operational_error"] is True
         assert result.metadata["operational_error_reason"] == "nemo_routing_incomplete"
         assert any(
             check.name == "NeMo Routing"
             and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.INFO
             and "assets/payload.tar.gz" in str(check.location)
             for check in result.checks
         )
         assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
 
-    def test_referenced_incomplete_nemo_route_takes_precedence_over_security_findings(
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False, "max_tar_entries": 100},
+        )
+        assert aggregate.has_errors is False
+        assert determine_exit_code(aggregate) == 2
+
+    def test_referenced_incomplete_nemo_route_preserves_security_exit_code(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -3116,7 +3556,8 @@ class TestCVE202523304HydraTarget:
         )
 
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert determine_exit_code(result) == 2
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 1
 
     def test_nested_incomplete_nemo_route_does_not_promote_unrelated_info_checks(self, tmp_path: Path) -> None:
         extracted_path = str(tmp_path / "nested-payload.tar.gz")
@@ -3152,9 +3593,11 @@ class TestCVE202523304HydraTarget:
             "assets/payload.tar.gz",
         )
 
-        assert [check.name for check in result.checks] == ["NeMo Routing"]
+        assert result.checks == []
         assert result.issues == []
-        assert result.metadata["operational_error"] is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
 
     @pytest.mark.parametrize(
         ("reason", "check_name"),
@@ -3164,7 +3607,7 @@ class TestCVE202523304HydraTarget:
             ("xml_model_routing_incomplete", "XML Model Routing"),
         ],
     )
-    def test_nested_operational_incomplete_outcomes_are_propagated(
+    def test_nested_coverage_only_incomplete_outcomes_without_findings_are_propagated(
         self,
         tmp_path: Path,
         reason: str,
@@ -3193,10 +3636,205 @@ class TestCVE202523304HydraTarget:
             "assets/payload.bin",
         )
 
-        assert [check.name for check in result.checks] == [check_name]
+        assert result.checks == []
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert reason in result.metadata["scan_outcome_reasons"]
-        assert result.metadata["operational_error_reason"] == reason
+        assert "operational_error" not in result.metadata
+
+    @pytest.mark.parametrize("reason", ["compressed_decompression_limit_exceeded", "joblib_read_failed"])
+    def test_nested_fail_closed_incomplete_outcome_without_findings_is_propagated(
+        self,
+        tmp_path: Path,
+        reason: str,
+    ) -> None:
+        extracted_path = str(tmp_path / "nested-payload.tar.gz")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="joblib" if reason == "joblib_read_failed" else "compressed")
+        nested_result.metadata["analysis_incomplete"] = True
+        nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        nested_result.metadata["scan_outcome_reasons"] = [reason]
+        nested_result.add_check(
+            name="Nested Scanner Analysis",
+            passed=False,
+            message="Nested scanner analysis was incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+            details={"scan_outcome_reason": reason},
+        )
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.tar.gz",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
+    def test_nested_detail_only_incomplete_outcome_without_findings_is_propagated(self, tmp_path: Path) -> None:
+        """Nested detail-only coverage gaps should mark the NeMo archive incomplete."""
+        reason = "synthetic_nested_coverage_incomplete"
+        extracted_path = str(tmp_path / "nested-payload.pkl")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="pickle")
+        nested_result.add_check(
+            name="Nested Scanner Analysis",
+            passed=False,
+            message="Nested scanner analysis was incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+            details={"analysis_incomplete": True, "scan_outcome_reason": reason},
+        )
+        nested_result.finish(success=True)
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.pkl",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
+    def test_nested_skipped_bare_analysis_incomplete_check_without_findings_is_not_propagated(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        extracted_path = str(tmp_path / "nested-payload.pt")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="pytorch_zip")
+        nested_result.checks.append(
+            Check(
+                name="PyTorch Runtime Version",
+                status=CheckStatus.SKIPPED,
+                message="PyTorch runtime version not available; CVE applicability unknown",
+                severity=IssueSeverity.INFO,
+                location=extracted_path,
+                details={
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+            )
+        )
+        nested_result.finish(success=True)
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.pt",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert "scan_outcome" not in result.metadata
+        assert "scan_outcome_reasons" not in result.metadata
+        assert "operational_error" not in result.metadata
+
+    def test_nested_later_metadata_coverage_reason_is_propagated(self, tmp_path: Path) -> None:
+        extracted_path = str(tmp_path / "nested-payload.tar.gz")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="nemo")
+        nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        nested_result.metadata["scan_outcome_reasons"] = [
+            "xgboost_binary_structure_too_small",
+            "nemo_routing_incomplete",
+        ]
+        nested_result.add_check(
+            name="NeMo Routing",
+            passed=False,
+            message="Bounded route incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+        )
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.tar.gz",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
+    def test_nested_later_detail_coverage_reason_is_propagated(self, tmp_path: Path) -> None:
+        extracted_path = str(tmp_path / "nested-payload.tar.gz")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="nemo")
+        nested_result.add_check(
+            name="NeMo Routing",
+            passed=False,
+            message="Bounded route incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reasons": [
+                    "xgboost_binary_structure_too_small",
+                    "nemo_routing_incomplete",
+                ],
+            },
+        )
+        nested_result.finish(success=True)
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.tar.gz",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
+    def test_nested_structural_reject_without_findings_is_not_propagated(self, tmp_path: Path) -> None:
+        extracted_path = str(tmp_path / "tokenizer.model")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="xgboost")
+        nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        nested_result.metadata["scan_outcome_reasons"] = ["xgboost_binary_structure_too_small"]
+        nested_result.add_check(
+            name="XGBoost Binary Structure",
+            passed=False,
+            message="XGBoost binary payload is too small to validate",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+        )
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "artifacts/tokenizer.model",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert "scan_outcome" not in result.metadata
+        assert "operational_error" not in result.metadata
 
     def test_referenced_joblib_operational_failure_is_not_hidden_by_nemo_composition(self, tmp_path: Path) -> None:
         path = tmp_path / "referenced-joblib-container.jpg"
@@ -6328,7 +6966,7 @@ class TestCVE202523304HydraTarget:
             )
             metadata = aggregate.file_metadata[str(path)]
 
-            assert aggregate.success is True
+            assert aggregate.success is False
             assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
             assert metadata["scan_outcome_reasons"] == ["nemo_config_size_limit"]
             assert determine_exit_code(aggregate) == 1
@@ -6456,6 +7094,20 @@ class TestCVE202523304HydraTarget:
         suspicious = [c for c in result.checks if "Suspicious File" in c.name]
         assert len(suspicious) > 0, "Should detect executable in archive"
 
+    def test_gzip_framed_executable_file_in_archive_flagged(self, tmp_path: Path) -> None:
+        """Executable archive member checks still run after accepting gzip framing."""
+        nemo_path = tmp_path / "model.nemo"
+        with tarfile.open(nemo_path, "w:gz") as tar:
+            config_bytes = yaml.dump({"model": {"_target_": "nemo.Model"}}).encode()
+            _add_tar_bytes(tar, "config.yaml", config_bytes)
+            _add_tar_bytes(tar, "exploit.sh", b"#!/bin/bash\nrm -rf /")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.rule_code == "S901"]
+        suspicious = [check for check in result.checks if "Suspicious File" in check.name]
+        assert len(suspicious) > 0
+
     def test_no_yaml_configs_fail_closed_as_inconclusive(self, tmp_path: Path) -> None:
         """Archives with no YAML should not report a clean complete scan."""
         nemo_path = tmp_path / "model.nemo"
@@ -6507,3 +7159,22 @@ class TestCVE202523304HydraTarget:
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
         finally:
             reset_cache_manager()
+
+    def test_declared_nemo_enforces_tar_aggregate_budget_before_member_reads(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "over-budget.nemo"
+        with tarfile.open(nemo_path, "w") as archive:
+            _add_tar_bytes(archive, "weights.bin", b"x" * 128)
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+
+        result = NemoScanner(
+            config={
+                "max_tar_total_uncompressed_size": 64,
+                "max_total_size": 64,
+            }
+        ).scan(str(nemo_path))
+
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is False
+        assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
+        assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]

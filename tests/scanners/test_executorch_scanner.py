@@ -1565,7 +1565,7 @@ def test_executorch_zip_budget_failure_propagates_exit_code_and_is_not_cached(
             }
             aggregate = core.scan_model_directory_or_file(str(model_path), **scan_kwargs)
             metadata = aggregate.file_metadata[str(model_path)]
-            assert aggregate.success is True
+            assert aggregate.success is False
             assert metadata["analysis_incomplete"] is True
             assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
             assert reason in metadata["scan_outcome_reasons"]

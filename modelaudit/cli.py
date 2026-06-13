@@ -13,9 +13,10 @@ import stat
 import sys
 import time
 import unicodedata
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import click
 from pydantic import TypeAdapter
@@ -45,12 +46,27 @@ from .core import (
     determine_exit_code,
     scan_model_directory_or_file,
 )
+from .core_results import (
+    details_have_incomplete_coverage,
+    details_match_shard_family_paths,
+    metadata_has_incomplete_coverage,
+    record_details_have_incomplete_coverage,
+    records_have_incomplete_coverage_for_path,
+    results_have_incomplete_coverage_under_directory,
+    results_have_inconclusive_outcome,
+)
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .integrations.source_redaction import redact_source_value
-from .models import ModelAuditResultModel
+from .models import FileMetadataModel, ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
-from .scanner_results import IssueSeverity
+from .scanner_results import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    SCAN_OUTCOME_METADATA_KEY,
+    SCAN_OUTCOME_REASONS_METADATA_KEY,
+    Issue,
+    IssueSeverity,
+)
 from .scanner_selection import (
     SCANNER_SELECTION_CONFIG_KEY,
     collect_suppressed_preferred_scanners,
@@ -80,6 +96,11 @@ from .utils.helpers.auto_defaults import (
     parse_size_string,
 )
 from .utils.helpers.interrupt_handler import interruptible_scan
+from .utils.repository_context import (
+    REPOSITORY_CURRENT_FILE_CONFIG_KEY,
+    REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
+    REPOSITORY_SCAN_ROOT_CONFIG_KEY,
+)
 from .utils.sources.cloud_storage import (
     download_from_cloud,
     is_cleartext_cloud_url,
@@ -94,8 +115,11 @@ from .utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
     extract_model_id_from_path,
+    get_model_info,
     is_huggingface_file_url,
     is_huggingface_url,
+    parse_huggingface_file_url,
+    parse_huggingface_url_with_revision,
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
@@ -164,6 +188,313 @@ def _display_error(error: object, path: str) -> str:
     return _escape_terminal_text(display_error)
 
 
+def _preview_size_text(size_bytes: object) -> str:
+    """Return a stable human-readable byte size for dry-run previews."""
+    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+        return "Unknown size"
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    return f"{size_bytes} bytes"
+
+
+def _preview_inventory_size_text(size_bytes: object, unknown_size_count: object) -> str:
+    """Return a dry-run size string that marks incomplete selected-size inventory."""
+    if (
+        isinstance(size_bytes, int)
+        and not isinstance(size_bytes, bool)
+        and size_bytes > 0
+        and isinstance(unknown_size_count, int)
+        and not isinstance(unknown_size_count, bool)
+        and unknown_size_count > 0
+    ):
+        return f"At least {_preview_size_text(size_bytes)}"
+    return _preview_size_text(size_bytes)
+
+
+def _build_huggingface_dry_run_preview(
+    path: str,
+    runtime: "_ScanRuntimeConfig",
+    *,
+    source_kind: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a compact dry-run preview that is not a scan result payload."""
+    preview: dict[str, Any] = {
+        "dry_run": True,
+        "source": "huggingface",
+        "source_kind": source_kind,
+        "target": _display_scan_path(path),
+        "mode": "streaming" if runtime.scan_and_delete else "standard",
+        "artifact_downloads": 0,
+        "scanner_execution": False,
+    }
+    preview.update(metadata)
+    if runtime.scanner_selection_metadata is not None:
+        preview["scanner_selection"] = dict(runtime.scanner_selection_metadata)
+    return preview
+
+
+def _format_huggingface_dry_run_preview_text(preview: dict[str, Any]) -> str:
+    """Render one Hugging Face dry-run preview for human-readable output."""
+    target = _escape_terminal_text(preview.get("target", ""))
+    source_kind = _escape_terminal_text(str(preview.get("source_kind", "source")).replace("_", " "))
+    lines = [
+        f"📊 Preview for {style_text(target, fg='cyan')}:",
+        f"   Source: Hugging Face {source_kind}",
+    ]
+    if model_id := preview.get("model_id"):
+        lines.append(f"   Model: {_escape_terminal_text(model_id)}")
+    if filename := preview.get("filename"):
+        lines.append(f"   File: {_escape_terminal_text(filename)}")
+    if revision := preview.get("revision"):
+        lines.append(f"   Revision: {_escape_terminal_text(revision)}")
+    if resolved_revision := preview.get("resolved_revision"):
+        lines.append(f"   Resolved revision: {_escape_terminal_text(resolved_revision)}")
+    if "file_count" in preview:
+        lines.append(f"   Files: {_escape_terminal_text(preview['file_count'])}")
+    if "total_size_bytes" in preview or "size_bytes" in preview:
+        lines.append(f"   Size: {_escape_terminal_text(preview.get('human_size', 'Unknown size'))}")
+    inaccessible_gated_file_count = preview.get("inaccessible_gated_file_count")
+    if (
+        isinstance(inaccessible_gated_file_count, int)
+        and not isinstance(inaccessible_gated_file_count, bool)
+        and inaccessible_gated_file_count > 0
+    ):
+        gated_file_count = _escape_terminal_text(str(inaccessible_gated_file_count))
+        lines.append(f"   Access: {gated_file_count} selected file(s) are gated/inaccessible")
+    unknown_size_count = preview.get("unknown_size_count")
+    if isinstance(unknown_size_count, int) and not isinstance(unknown_size_count, bool) and unknown_size_count > 0:
+        lines.append(f"   Access: {_escape_terminal_text(str(unknown_size_count))} selected file size(s) unavailable")
+    lines.append(f"   Mode: {'Streaming dry run' if preview.get('mode') == 'streaming' else 'Dry run'}")
+    lines.append("   Artifact downloads: 0")
+    lines.append("   Scanner execution: none")
+    return "\n".join(lines)
+
+
+def _format_huggingface_dry_run_previews(previews: list[dict[str, Any]], output_format: str) -> str:
+    """Render collected Hugging Face dry-run previews."""
+    if output_format == "json":
+        payload: Any
+        payload = previews[0] if len(previews) == 1 else {"dry_run": True, "previews": previews}
+        return json.dumps(_JSON_VALUE_ADAPTER.dump_python(payload, mode="json"), indent=2)
+    return "\n\n".join(_format_huggingface_dry_run_preview_text(preview) for preview in previews)
+
+
+def _is_huggingface_dry_run_preview_path(path: str) -> bool:
+    """Return whether a path is handled by the Hugging Face dry-run preview planner."""
+    return is_huggingface_file_url(path) or is_huggingface_url(path)
+
+
+def _remaining_huggingface_plan_timeout_seconds(plan: Any) -> float | None:
+    """Return the remaining plan deadline for follow-up metadata requests."""
+    raw_deadline = getattr(plan, "deadline", None)
+    deadline = raw_deadline if isinstance(raw_deadline, (int, float)) and not isinstance(raw_deadline, bool) else None
+    if deadline is None:
+        return None
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        repo_id = getattr(plan, "repo_id", "repository")
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    return remaining
+
+
+def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
+    """Preview a Hugging Face repository scan without artifact downloads or scanners."""
+    from .utils.sources.huggingface import (
+        get_model_info,
+        plan_huggingface_model_download,
+        plan_huggingface_streaming_download,
+    )
+
+    if runtime.scan_and_delete:
+        plan = plan_huggingface_streaming_download(
+            path,
+            runtime.max_download_bytes,
+            timeout_seconds=runtime.timeout,
+            scannable_extensions=runtime.scannable_extensions,
+            scannable_filenames=runtime.scannable_filenames,
+            scannable_scanner_ids=runtime.scannable_scanner_ids,
+            allow_content_probes=False,
+            include_all_files=runtime.hf_stream_include_all_files,
+        )
+    else:
+        plan = plan_huggingface_model_download(
+            path,
+            runtime.max_download_bytes,
+            timeout_seconds=runtime.timeout,
+            allow_content_probes=False,
+        )
+
+    preview_timeout = _remaining_huggingface_plan_timeout_seconds(plan)
+    model_info_kwargs: dict[str, Any] = {"allow_content_probes": False}
+    if preview_timeout is not None:
+        model_info_kwargs["timeout_seconds"] = preview_timeout
+    if runtime.scan_and_delete:
+        model_info_kwargs["streaming_selection"] = True
+        model_info_kwargs["scannable_extensions"] = runtime.scannable_extensions
+        model_info_kwargs["scannable_filenames"] = runtime.scannable_filenames
+        model_info_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
+        model_info_kwargs["include_all_files"] = runtime.hf_stream_include_all_files
+    model_info = get_model_info(path, **model_info_kwargs)
+    total_size = model_info.get("total_size")
+    preserved_metadata = {
+        key: model_info[key]
+        for key in (
+            "inaccessible_gated_file_count",
+            "inaccessible_gated_bytes",
+            "inaccessible_gated_files",
+            "unknown_size_count",
+            "unknown_size_files",
+            "inventory_status",
+            "inventory_error",
+            "gated",
+            "repo_file_count",
+        )
+        if key in model_info
+    }
+    return _build_huggingface_dry_run_preview(
+        path,
+        runtime,
+        source_kind="model",
+        metadata={
+            "model_id": model_info.get("model_id") or model_info.get("repo_id") or _display_scan_path(path),
+            "file_count": model_info.get("file_count", 0),
+            "total_size_bytes": total_size
+            if isinstance(total_size, int) and not isinstance(total_size, bool)
+            else None,
+            "human_size": _preview_inventory_size_text(total_size, model_info.get("unknown_size_count")),
+            "selected_file_count": len(plan.selected_files),
+            "metadata_only": True,
+            **preserved_metadata,
+        },
+    )
+
+
+def _get_huggingface_file_metadata(
+    repo_id: str,
+    revision: str,
+    filename: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Fetch direct Hugging Face file metadata without downloading file content."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from exc
+
+    def remaining_request_timeout() -> float | None:
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+        return min(30.0, remaining)
+
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    if deadline is not None:
+        from .utils.sources.huggingface import _run_huggingface_worker_with_deadline
+
+        worker_result = _run_huggingface_worker_with_deadline(
+            "get_path_sizes",
+            {
+                "repo_id": repo_id,
+                "filenames": [filename],
+                "requested_revision": revision,
+                "resolved_revision": None,
+                "request_timeout": remaining_request_timeout(),
+            },
+            deadline,
+            repo_id,
+        )
+        value = worker_result.get("value")
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        resolved_revision = value.get("revision")
+        raw_sizes = value.get("sizes")
+        if not isinstance(raw_sizes, list):
+            raise RuntimeError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        file_size: int | None = None
+        found_file = False
+        for item in raw_sizes:
+            if not isinstance(item, dict) or item.get("path") != filename:
+                continue
+            found_file = True
+            raw_size = item.get("size")
+            file_size = (
+                raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+            )
+            break
+        if not found_file:
+            raise FileNotFoundError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        bounded_metadata: dict[str, Any] = {"size_bytes": file_size}
+        if isinstance(resolved_revision, str) and resolved_revision and resolved_revision != revision:
+            bounded_metadata["resolved_revision"] = resolved_revision
+        return bounded_metadata
+
+    api = HfApi()
+    repo_info_kwargs: dict[str, Any] = {"revision": revision, "files_metadata": False}
+    repo_info = api.repo_info(repo_id, **repo_info_kwargs)
+    resolved_revision = getattr(repo_info, "sha", None)
+    metadata_revision = resolved_revision if isinstance(resolved_revision, str) and resolved_revision else revision
+    paths_info_kwargs: dict[str, Any] = {"revision": metadata_revision}
+    paths_info = api.get_paths_info(repo_id, [filename], **paths_info_kwargs)
+    file_info = next((item for item in paths_info if getattr(item, "path", None) == filename), None)
+    if file_info is None:
+        raise FileNotFoundError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+
+    raw_size = getattr(file_info, "size", None)
+    size_bytes = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+    metadata: dict[str, Any] = {"size_bytes": size_bytes}
+    if isinstance(resolved_revision, str) and resolved_revision and resolved_revision != revision:
+        metadata["resolved_revision"] = resolved_revision
+    return metadata
+
+
+def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
+    """Preview a direct Hugging Face file scan without downloading it."""
+    from .utils.sources.huggingface import _format_size, _is_huggingface_commit_sha, parse_huggingface_file_url
+
+    repo_id, revision, filename = parse_huggingface_file_url(path)
+    file_metadata = _get_huggingface_file_metadata(repo_id, revision, filename, timeout_seconds=runtime.timeout)
+    size_bytes = file_metadata.get("size_bytes")
+    size_limit = runtime.max_download_bytes
+    if isinstance(size_limit, int) and not isinstance(size_limit, bool) and size_limit > 0:
+        resolved_revision = file_metadata.get("resolved_revision")
+        checked_revision = resolved_revision if isinstance(resolved_revision, str) else revision
+        if not _is_huggingface_commit_sha(checked_revision):
+            raise ValueError(
+                f"Unable to determine immutable revision for {_display_scan_path(path)}; refusing capped download"
+            )
+        if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
+            raise ValueError(f"Unable to determine file size for {_display_scan_path(path)}; refusing capped download")
+        if size_bytes > size_limit:
+            raise ValueError(
+                f"File size ({_format_size(size_bytes)}) exceeds maximum allowed size ({_format_size(size_limit)})"
+            )
+    return _build_huggingface_dry_run_preview(
+        path,
+        runtime,
+        source_kind="file",
+        metadata={
+            "model_id": repo_id,
+            "revision": revision,
+            "filename": filename,
+            "total_size_bytes": size_bytes,
+            "human_size": _preview_size_text(size_bytes),
+            "metadata_only": True,
+            **file_metadata,
+        },
+    )
+
+
 class _OutputWriteError(click.ClickException):
     """Report output failures using the scan command's documented error code."""
 
@@ -201,7 +532,7 @@ def _is_link_like_path(path: Path) -> bool:
         return True
 
     reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0) or 0
     if not reparse_attribute or not file_attributes & reparse_attribute:
         return False
 
@@ -470,7 +801,7 @@ def _open_windows_output_parent_lock(output_path: str, absolute_path: Path, pare
 def _windows_output_is_encrypted(fd: int) -> bool:
     """Return whether a pinned Windows output handle uses EFS encryption."""
     file_attribute_encrypted = getattr(stat, "FILE_ATTRIBUTE_ENCRYPTED", 0x00004000)
-    return bool(getattr(os.fstat(fd), "st_file_attributes", 0) & file_attribute_encrypted)
+    return bool((getattr(os.fstat(fd), "st_file_attributes", 0) or 0) & file_attribute_encrypted)
 
 
 def _reject_windows_encrypted_output(output_path: str, fd: int) -> None:
@@ -1347,6 +1678,8 @@ class _SourceDispatchResult:
     temp_path: str | None = None
     source_model_id: str | None = None
     source_model_source: str | None = None
+    repository_file_inventory: tuple[str, ...] = ()
+    repository_current_file: str | None = None
 
 
 @dataclass
@@ -1354,6 +1687,7 @@ class _ScanPathState:
     """Bookkeeping for scanned artifacts and deferred cleanup."""
 
     collect_dvc_coverage: bool = False
+    dry_run_previews: list[dict[str, Any]] = field(default_factory=list)
     scanned_paths: list[str] = field(default_factory=list)
     temp_cleanup_entries: list[tuple[str, bool]] = field(default_factory=list)
     sbom_paths_resolved: bool = False
@@ -1367,6 +1701,21 @@ class _ScanPathState:
         """Record an aggregate error that shard reconciliation does not own."""
         self.has_errors_outside_reconciled_shards = True
         audit_result.has_errors = True
+
+    def record_dry_run_preview(self, preview: dict[str, Any]) -> None:
+        """Record a source that was previewed without scanning."""
+        self.dry_run_previews.append(preview)
+
+    def has_no_scan_content(self, audit_result: ModelAuditResultModel) -> bool:
+        """Return whether no scanner populated the aggregate result."""
+        return (
+            audit_result.files_scanned == 0
+            and audit_result.bytes_scanned == 0
+            and not audit_result.issues
+            and not audit_result.checks
+            and not audit_result.assets
+            and not audit_result.scanner_names
+        )
 
     def record_non_shard_result_errors(self, scan_result: ModelAuditResultModel) -> None:
         """Preserve errors from results that cannot join final CLI shard reconciliation."""
@@ -1420,8 +1769,15 @@ class _ScanPathState:
                 self.scanned_paths.append(_display_scan_path(asset.path))
                 added_path = True
 
-        if not added_path and fallback_path is not None:
+        if not added_path and fallback_path is not None and not os.path.exists(fallback_path):
             self.scanned_paths.append(_display_scan_path(fallback_path))
+
+    def track_directory_paths_for_sbom(self, scan_result: ModelAuditResultModel) -> None:
+        """Track completed directory scan assets, including an authoritative empty set."""
+        self.sbom_paths_resolved = True
+        for asset in scan_result.assets:
+            if asset.path:
+                self.scanned_paths.append(_display_scan_path(asset.path))
 
     def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
         """Track temporary artifacts for post-SBOM cleanup."""
@@ -1437,39 +1793,123 @@ class _ScanPathState:
         *,
         scanner_config: dict[str, Any] | None = None,
     ) -> None:
-        """Record concrete artifacts and successful directory walks for later DVC pointers."""
-        if not self.collect_dvc_coverage or not scan_result.success:
+        """Record concrete artifacts and completed directory walks for later DVC pointers."""
+        if not self.collect_dvc_coverage:
             return
 
         scanner_policy = policy_from_config(scanner_config)
         if scanner_policy.active:
             from modelaudit.scanners import get_scanner_for_file
 
+        def resolve_coverage_path(file_path: str | None, *, base: Path | None = None) -> Path | None:
+            if not isinstance(file_path, str):
+                return None
+            try:
+                path = Path(file_path)
+                if base is not None and not path.is_absolute():
+                    path = base / path
+                return path.resolve()
+            except (OSError, RuntimeError, ValueError):
+                return None
+
         def record_covered_file(file_path: str) -> None:
             if scanner_policy.active and get_scanner_for_file(file_path, config=scanner_config) is None:
                 return
-            try:
-                resolved_path = Path(file_path).resolve()
-            except OSError:
+            resolved_path = resolve_coverage_path(file_path)
+            if resolved_path is None:
                 return
             if not resolved_path.is_file():
                 return
             self.dvc_covered_paths.add(str(resolved_path))
-            self.dvc_covered_directories.update(str(parent) for parent in resolved_path.parents)
+
+        def path_matches_shard_family(candidate_path: str | None, shard_paths: set[Path]) -> bool:
+            resolved_candidate = resolve_coverage_path(candidate_path)
+            if resolved_candidate is None:
+                return False
+            if resolved_candidate in shard_paths:
+                return True
+            if resolved_candidate.is_dir():
+                return any(shard_path.is_relative_to(resolved_candidate) for shard_path in shard_paths)
+            return False
+
+        def shard_family_has_incomplete_coverage(
+            shard_paths: set[Path],
+            *,
+            only_detected_shard_family: bool,
+        ) -> bool:
+            for metadata_path, metadata in scan_result.file_metadata.items():
+                if not (metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)):
+                    continue
+                if path_matches_shard_family(metadata_path, shard_paths):
+                    return True
+
+            incomplete_shard_checks = {
+                "Shard Scan",
+                "Sharded Model Coverage Check",
+                "Sharded Model Membership Check",
+            }
+            for records, allow_skipped_check_exemption in (
+                (scan_result.checks, True),
+                (scan_result.issues, False),
+            ):
+                for record in records:
+                    details = getattr(record, "details", None)
+                    details = details if isinstance(details, dict) else None
+                    if details is None:
+                        continue
+                    if not (
+                        details.get("operational_error") is True
+                        or record_details_have_incomplete_coverage(
+                            record,
+                            allow_skipped_check_exemption=allow_skipped_check_exemption,
+                        )
+                    ):
+                        continue
+                    if path_matches_shard_family(getattr(record, "location", None), shard_paths):
+                        return True
+                    if details_match_shard_family_paths(
+                        details,
+                        lambda candidate: path_matches_shard_family(candidate, shard_paths),
+                    ):
+                        return True
+                    if only_detected_shard_family and getattr(record, "name", None) in incomplete_shard_checks:
+                        return True
+
+            return False
 
         for asset in scan_result.assets:
             if not asset.path or asset.type == "error":
                 continue
             metadata = scan_result.file_metadata.get(asset.path)
             if metadata is not None and (
-                metadata.get("operational_error") is True or metadata.get("scan_outcome") == "inconclusive"
+                metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)
             ):
+                continue
+            if records_have_incomplete_coverage_for_path(
+                scan_result.checks,
+                asset.path,
+                allow_skipped_check_exemption=True,
+            ) or records_have_incomplete_coverage_for_path(scan_result.issues, asset.path):
                 continue
             record_covered_file(asset.path)
 
+        sharded_detection_families: list[tuple[list[Any], set[Path]]] = []
         for check in scan_result.checks:
             shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
             if check.name != "Sharded Model Detection" or not isinstance(shard_paths, list):
+                continue
+            resolved_shard_paths = {
+                resolved_path
+                for shard_path in shard_paths
+                if isinstance(shard_path, str) and (resolved_path := resolve_coverage_path(shard_path)) is not None
+            }
+            sharded_detection_families.append((shard_paths, resolved_shard_paths))
+        only_detected_shard_family = len(sharded_detection_families) <= 1
+        for shard_paths, resolved_shard_paths in sharded_detection_families:
+            if shard_family_has_incomplete_coverage(
+                resolved_shard_paths,
+                only_detected_shard_family=only_detected_shard_family,
+            ):
                 continue
             for shard_path in shard_paths:
                 if isinstance(shard_path, str):
@@ -1496,10 +1936,169 @@ class _ScanPathState:
                     resolved_directory = Path(root).resolve()
                 except OSError:
                     continue
-                if resolved_directory.is_relative_to(resolved_root):
-                    walked_directories.add(str(resolved_directory))
+                if not resolved_directory.is_relative_to(resolved_root):
+                    continue
+                if results_have_incomplete_coverage_under_directory(scan_result, str(resolved_directory)):
+                    continue
+                walked_directories.add(str(resolved_directory))
             if not walk_errors:
                 self.dvc_covered_directories.update(walked_directories)
+
+
+_HF_ACQUISITION_ERROR_REASON = "huggingface_acquisition_error"
+_HF_ACQUISITION_BLOCKED_REASON = "huggingface_acquisition_blocked"
+_HF_AUTH_BLOCKED_MARKERS = (
+    "gatedrepoerror",
+    "gated repo",
+    "gated repository",
+    "gated/inaccessible",
+    "gated_inaccessible",
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "repositorynotfounderror",
+    "repository not found",
+    "restricted",
+)
+
+
+class _HuggingFaceAcquisitionError(RuntimeError):
+    """Marker for Hugging Face stream failures before the first artifact is yielded."""
+
+
+class _HuggingFaceStreamInterruptedError(RuntimeError):
+    """Marker for Hugging Face stream failures after artifact scanning may have started."""
+
+
+def _track_huggingface_stream_acquisition(
+    file_generator: Iterator[tuple[Path, bool]],
+) -> Iterator[tuple[Path, bool]]:
+    """Distinguish pre-yield acquisition failures from interrupted streamed scans."""
+    yielded_artifact = False
+    try:
+        for file_path, is_last in file_generator:
+            yielded_artifact = True
+            yield file_path, is_last
+    except Exception as exc:
+        if yielded_artifact:
+            raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
+        raise _HuggingFaceAcquisitionError(str(exc)) from exc
+
+
+def _metadata_get_bool(metadata: Any, key: str) -> bool:
+    if isinstance(metadata, dict):
+        return bool(metadata.get(key))
+    getter = getattr(metadata, "get", None)
+    if callable(getter):
+        try:
+            return bool(getter(key))
+        except Exception:
+            return False
+    return bool(getattr(metadata, key, False))
+
+
+def _results_have_acquisition_error_metadata(results: ModelAuditResultModel | dict[str, Any]) -> bool:
+    if isinstance(results, ModelAuditResultModel):
+        return any(_metadata_get_bool(metadata, "acquisition_error") for metadata in results.file_metadata.values())
+    raw_metadata = results.get("file_metadata", {})
+    if not isinstance(raw_metadata, dict):
+        return False
+    return any(_metadata_get_bool(metadata, "acquisition_error") for metadata in raw_metadata.values())
+
+
+def _results_have_blocked_acquisition_metadata(results: ModelAuditResultModel | dict[str, Any]) -> bool:
+    if isinstance(results, ModelAuditResultModel):
+        return any(_metadata_get_bool(metadata, "blocked") for metadata in results.file_metadata.values())
+    raw_metadata = results.get("file_metadata", {})
+    if not isinstance(raw_metadata, dict):
+        return False
+    return any(_metadata_get_bool(metadata, "blocked") for metadata in raw_metadata.values())
+
+
+def _huggingface_requested_revision(path: str) -> str | None:
+    try:
+        if is_huggingface_file_url(path):
+            _repo_id, file_revision, _filename = parse_huggingface_file_url(path)
+            return file_revision
+        if is_huggingface_url(path):
+            _namespace, _repo_name, requested_revision = parse_huggingface_url_with_revision(path)
+            return requested_revision
+    except ValueError:
+        return None
+    return None
+
+
+def _classify_huggingface_acquisition_error(error_msg: str) -> tuple[str, bool, str]:
+    normalized = error_msg.lower()
+    if any(marker in normalized for marker in _HF_AUTH_BLOCKED_MARKERS):
+        return _HF_ACQUISITION_BLOCKED_REASON, True, "blocked"
+    return _HF_ACQUISITION_ERROR_REASON, False, "acquisition_error"
+
+
+def _huggingface_acquisition_source_key(path: str, requested_revision: str | None) -> str:
+    display_path = _display_scan_path(path)
+    if requested_revision and not is_huggingface_file_url(path):
+        return f"{display_path}@{requested_revision}"
+    return display_path
+
+
+def _record_huggingface_acquisition_error(
+    audit_result: ModelAuditResultModel,
+    path_state: _ScanPathState,
+    *,
+    path: str,
+    error_msg: str,
+) -> None:
+    """Record a Hugging Face source failure without claiming artifact coverage."""
+    requested_revision = _huggingface_requested_revision(path)
+    source_key = _huggingface_acquisition_source_key(path, requested_revision)
+    reason, blocked, category = _classify_huggingface_acquisition_error(error_msg)
+    issue_message = (
+        f"Hugging Face acquisition blocked for {source_key}; no model artifacts were scanned."
+        if blocked
+        else f"Hugging Face acquisition failed for {source_key}; no model artifacts were scanned."
+    )
+
+    details: dict[str, Any] = {
+        "source": "huggingface",
+        "source_url": source_key,
+        "acquisition_error": True,
+        "blocked": blocked,
+        "error_category": category,
+        "error": error_msg,
+        SCAN_OUTCOME_METADATA_KEY: INCONCLUSIVE_SCAN_OUTCOME,
+        "scan_outcome_reason": reason,
+        SCAN_OUTCOME_REASONS_METADATA_KEY: [reason],
+    }
+    if requested_revision is not None:
+        details["requested_revision"] = requested_revision
+
+    audit_result.issues.append(
+        Issue(
+            message=issue_message,
+            severity=IssueSeverity.INFO,
+            location=source_key,
+            details=details,
+            type="huggingface_acquisition_error",
+        )
+    )
+    audit_result.file_metadata[source_key] = FileMetadataModel(
+        source="huggingface",
+        source_url=source_key,
+        acquisition_error=True,
+        blocked=blocked,
+        error_category=category,
+        operational_error=True,
+        operational_error_reason=reason,
+        scan_outcome=INCONCLUSIVE_SCAN_OUTCOME,
+        scan_outcome_reason=reason,
+        scan_outcome_reasons=[reason],
+        requested_revision=requested_revision,
+    )
+    audit_result.has_errors = True
+    audit_result.success = False
+    path_state.mark_non_shard_error(audit_result)
 
 
 def should_use_color() -> bool:
@@ -2099,6 +2698,9 @@ def _configure_scan_logging(verbose: bool) -> None:
     logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
     logging.getLogger("modelaudit.utils.helpers.secure_hasher").setLevel(logging.WARNING)
     logging.getLogger("modelaudit.cache.cache_manager").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub.utils._http").setLevel(logging.WARNING)
 
 
 def _initialize_progress_tracking(
@@ -2201,7 +2803,7 @@ def _write_scan_sbom(
     asset_paths = list(
         dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
     )
-    if asset_paths and scan_and_delete:
+    if asset_paths and (scan_and_delete or not path_state.sbom_paths_resolved):
         paths_for_sbom = [_display_scan_path(path) for path in asset_paths]
     elif path_state.sbom_paths_resolved:
         paths_for_sbom = path_state.scanned_paths
@@ -2235,7 +2837,12 @@ def _format_scan_output(
         return format_sarif_output(audit_result, expanded_paths, verbose)
 
     redacted_result = redact_source_value(audit_result.model_dump(mode="python"))
-    return format_text_output(redacted_result if isinstance(redacted_result, dict) else {}, verbose)
+    output_text = format_text_output(redacted_result if isinstance(redacted_result, dict) else {}, verbose)
+    previews = getattr(audit_result, "previews", None)
+    if isinstance(previews, list) and previews:
+        preview_text = _format_huggingface_dry_run_previews(previews, "text")
+        return f"{preview_text}\n\n{output_text}" if output_text else preview_text
+    return output_text
 
 
 def _emit_scan_output(
@@ -2265,6 +2872,23 @@ def _emit_scan_output(
                     click.echo(f"Found {len(visible_issues)} informational issue(s)")
             else:
                 click.echo("No security issues found")
+        return
+
+    if output_format == "text":
+        click.echo("\n" + "─" * 80)
+    click.echo(output_text)
+
+
+def _emit_huggingface_dry_run_output(
+    output_text: str,
+    *,
+    output: str | None,
+    output_format: str,
+) -> None:
+    """Write dry-run preview output without scan-result summaries."""
+    if output:
+        _write_output_text_file(output, output_text)
+        click.echo(f"Preview written to {_display_path(output)}")
         return
 
     if output_format == "text":
@@ -2343,7 +2967,12 @@ def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_ti
     scan_duration = time.time() - scan_start_time
     try:
         if audit_result.has_errors:
-            record_scan_failed(scan_duration, "Scan completed with errors")
+            failure_reason = (
+                "Model acquisition failed"
+                if _results_have_acquisition_error_metadata(audit_result)
+                else "Scan completed with errors"
+            )
+            record_scan_failed(scan_duration, failure_reason)
         else:
             record_scan_completed(scan_duration, audit_result.model_dump())
     finally:
@@ -2537,6 +3166,10 @@ def _scan_local_or_downloaded_path(
                 source_result.source_model_id,
                 source_result.source_model_source,
             )
+        if source_result.repository_file_inventory:
+            config_overrides[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = source_result.repository_file_inventory
+        if source_result.repository_current_file:
+            config_overrides[REPOSITORY_CURRENT_FILE_CONFIG_KEY] = source_result.repository_current_file
 
         if runtime.max_file_size > 0 or runtime.max_total_size > 0:
             record_feature_used(
@@ -2567,6 +3200,8 @@ def _scan_local_or_downloaded_path(
         path_state.record_dvc_coverage(actual_path, scan_results, scanner_config=runtime.config)
         if is_dvc_pointer:
             path_state.track_streaming_paths_for_sbom(scan_results, None)
+        elif os.path.isdir(actual_path):
+            path_state.track_directory_paths_for_sbom(scan_results)
         else:
             path_state.scanned_paths.append(_display_scan_path(actual_path))
 
@@ -2575,36 +3210,50 @@ def _scan_local_or_downloaded_path(
         ]
         issue_count = len(visible_issues)
         has_critical = any(issue.severity == IssueSeverity.CRITICAL for issue in visible_issues)
+        has_incomplete_coverage = results_have_inconclusive_outcome(scan_results)
 
         if spinner:
             spinner.text = f"Scanned {style_text(display_path, fg='cyan')}"
-            if issue_count == 0:
+            if issue_count == 0 and has_incomplete_coverage:
+                spinner.fail(style_text("❔ Inconclusive (coverage incomplete)", fg="yellow", bold=True))
+            elif issue_count == 0:
                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
             elif has_critical:
+                status = f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)"
+                if has_incomplete_coverage:
+                    status += ", coverage incomplete"
                 spinner.fail(
                     style_text(
-                        f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
+                        status,
                         fg="red",
                         bold=True,
                     ),
                 )
             else:
+                status = f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}"
+                if has_incomplete_coverage:
+                    status += " (coverage incomplete)"
                 spinner.ok(
                     style_text(
-                        f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
+                        status,
                         fg="yellow",
                         bold=True,
                     ),
                 )
         elif runtime.show_styled_output:
-            if issue_count == 0:
+            if issue_count == 0 and has_incomplete_coverage:
+                click.echo(f"Scanned {display_path}: Inconclusive (coverage incomplete)")
+            elif issue_count == 0:
                 click.echo(f"Scanned {display_path}: Clean")
             else:
                 issues_str = "issue" if issue_count == 1 else "issues"
                 if has_critical:
-                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str} (CRITICAL)")
+                    status = f"Scanned {display_path}: Found {issue_count} {issues_str} (CRITICAL)"
                 else:
-                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str}")
+                    status = f"Scanned {display_path}: Found {issue_count} {issues_str}"
+                if has_incomplete_coverage:
+                    status += ", coverage incomplete"
+                click.echo(status)
     except Exception as exc:
         display_error = _display_error(exc, path)
         if spinner:
@@ -2645,6 +3294,29 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_file_url(path):
         display_path = _display_path(path)
+        if dry_run:
+            try:
+                preview = _build_huggingface_file_dry_run_preview(path, runtime)
+                source_model_id, source_model_source = extract_model_id_from_path(path)
+                path_state.record_dry_run_preview(preview)
+                return _SourceDispatchResult(
+                    actual_path=path,
+                    local_scan_required=False,
+                    source_model_id=source_model_id,
+                    source_model_source=source_model_source,
+                )
+            except Exception as exc:
+                error_msg = _display_error(exc, path)
+                logger.error(f"Failed to preview Hugging Face file {display_path}: {error_msg}")
+                click.echo(f"Error previewing file from {display_path}: {error_msg}", err=True)
+                _record_huggingface_acquisition_error(
+                    audit_result,
+                    path_state,
+                    path=path,
+                    error_msg=error_msg,
+                )
+                return None
+
         download_spinner = None
         temp_dir = None
         if runtime.show_styled_output and should_show_spinner():
@@ -2666,10 +3338,14 @@ def _resolve_scan_source_for_path(
                 hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
                 temp_dir = str(hf_cache_dir)
 
+            _repo_id, _revision, repository_current_file = parse_huggingface_file_url(path)
+            direct_repository_file_inventory: list[str] = []
             download_path = download_file_from_hf(
                 path,
                 cache_dir=hf_cache_dir,
                 max_size=runtime.max_download_bytes,
+                repository_file_inventory=direct_repository_file_inventory,
+                timeout_seconds=runtime.timeout,
             )
             source_model_id, source_model_source = extract_model_id_from_path(path)
 
@@ -2686,6 +3362,8 @@ def _resolve_scan_source_for_path(
                 temp_path=temp_dir,
                 source_model_id=source_model_id,
                 source_model_source=source_model_source,
+                repository_file_inventory=tuple(direct_repository_file_inventory),
+                repository_current_file=repository_current_file,
             )
         except Exception as exc:
             if download_spinner:
@@ -2696,7 +3374,12 @@ def _resolve_scan_source_for_path(
             error_msg = _display_error(exc, path)
             logger.error(f"Failed to download file from {display_path}: {error_msg}")
             click.echo(f"Error downloading file from {display_path}: {error_msg}", err=True)
-            path_state.mark_non_shard_error(audit_result)
+            _record_huggingface_acquisition_error(
+                audit_result,
+                path_state,
+                path=path,
+                error_msg=error_msg,
+            )
             path_state.defer_temp_cleanup(
                 temp_dir,
                 cache_enabled=runtime.cache_enabled,
@@ -2706,15 +3389,54 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_url(path):
         display_path = _display_path(path)
+        if dry_run:
+            try:
+                preview = _build_huggingface_model_dry_run_preview(path, runtime)
+                source_model_id, source_model_source = extract_model_id_from_path(path)
+                path_state.record_dry_run_preview(preview)
+                return _SourceDispatchResult(
+                    actual_path=path,
+                    local_scan_required=False,
+                    source_model_id=source_model_id,
+                    source_model_source=source_model_source,
+                )
+            except Exception as exc:
+                error_msg = _display_error(exc, path)
+                logger.error(f"Failed to preview Hugging Face model {display_path}: {error_msg}")
+                click.echo(f"Error previewing model from {display_path}: {error_msg}", err=True)
+                _record_huggingface_acquisition_error(
+                    audit_result,
+                    path_state,
+                    path=path,
+                    error_msg=error_msg,
+                )
+                return None
+
+        hf_stream_kwargs: dict[str, Any] = {}
+        if runtime.scan_and_delete:
+            if runtime.scannable_extensions is not None:
+                hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+            if runtime.scannable_filenames is not None:
+                hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+            if runtime.scannable_scanner_ids is not None:
+                hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
+            if runtime.hf_stream_include_all_files:
+                hf_stream_kwargs["include_all_files"] = True
+        hf_preview_kwargs: dict[str, Any] = {"timeout_seconds": runtime.timeout}
+        if runtime.scan_and_delete:
+            hf_preview_kwargs.update(hf_stream_kwargs)
+            hf_preview_kwargs["streaming_selection"] = True
+            hf_preview_kwargs.setdefault("include_all_files", False)
+
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
             try:
-                from .utils.sources.huggingface import get_model_info
-
-                model_info = get_model_info(path)
-                size_bytes = model_info["total_size"]
-                if size_bytes == 0:
+                model_info = get_model_info(path, **hf_preview_kwargs)
+                size_bytes = int(model_info.get("total_size") or 0)
+                inaccessible_gated_file_count = int(model_info.get("inaccessible_gated_file_count") or 0)
+                unknown_size_count = int(model_info.get("unknown_size_count") or 0)
+                if size_bytes == 0 and unknown_size_count:
                     size_str = "Unknown size"
                 elif size_bytes >= 1024 * 1024 * 1024:
                     size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
@@ -2722,11 +3444,20 @@ def _resolve_scan_source_for_path(
                     size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
                 else:
                     size_str = f"{size_bytes / 1024:.2f} KB"
+                if size_bytes > 0 and unknown_size_count:
+                    size_str = f"At least {size_str}"
 
                 model_id = _escape_terminal_text(str(model_info["model_id"]))
                 file_count = _escape_terminal_text(str(model_info["file_count"]))
                 click.echo(f"   Model: {model_id}")
                 click.echo(f"   Size: {size_str} ({file_count} files)")
+                if inaccessible_gated_file_count:
+                    gated_file_count = _escape_terminal_text(str(inaccessible_gated_file_count))
+                    click.echo(f"   Access: {gated_file_count} selected file(s) are gated/inaccessible")
+                if unknown_size_count:
+                    click.echo(
+                        f"   Access: {_escape_terminal_text(str(unknown_size_count))} selected file size(s) unavailable"
+                    )
 
                 if runtime.scan_and_delete:
                     click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
@@ -2767,49 +3498,60 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
-                hf_stream_kwargs: dict[str, Any] = {}
-                if runtime.scannable_extensions is not None:
-                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
-                if runtime.scannable_filenames is not None:
-                    hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
-                if runtime.scannable_scanner_ids is not None:
-                    hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
-                if runtime.hf_stream_include_all_files:
-                    hf_stream_kwargs["include_all_files"] = True
-                file_generator = download_model_streaming(
-                    path,
-                    cache_dir=hf_cache_dir,
-                    show_progress=runtime.show_progress,
-                    max_size=runtime.max_download_bytes,
-                    timeout_seconds=runtime.timeout,
-                    **hf_stream_kwargs,
+                stream_repository_file_inventory: list[str] = []
+                stream_namespace, stream_repo_name, _stream_requested_revision = parse_huggingface_url_with_revision(
+                    path
+                )
+                stream_hf_cache_root = hf_cache_dir / "huggingface"
+                stream_repository_scan_root = stream_hf_cache_root / stream_namespace
+                if stream_repo_name:
+                    stream_repository_scan_root = stream_repository_scan_root / stream_repo_name
+                file_generator = _track_huggingface_stream_acquisition(
+                    download_model_streaming(
+                        path,
+                        cache_dir=hf_cache_dir,
+                        show_progress=runtime.show_progress,
+                        max_size=runtime.max_download_bytes,
+                        timeout_seconds=runtime.timeout,
+                        repository_file_inventory=stream_repository_file_inventory,
+                        **hf_stream_kwargs,
+                    )
                 )
 
                 streaming_kwargs: dict[str, Any] = {}
                 if trusted_source_provenance is not None:
                     streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
+                streaming_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = stream_repository_file_inventory
+                streaming_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] = str(stream_repository_scan_root)
                 streaming_kwargs.update(_scanner_selection_overrides(runtime))
 
-                streaming_result = scan_model_streaming(
-                    file_generator=file_generator,
-                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
-                    _trusted_shard_family_root=(
-                        _make_trusted_stream_shard_root(str(hf_cache_dir / "huggingface"))
-                        if runtime.cache_enabled and trusted_source_provenance is not None
-                        else None
-                    ),
-                    timeout=runtime.timeout,
-                    delete_after_scan=True,
-                    blacklist_patterns=list(blacklist) if blacklist else None,
-                    max_file_size=runtime.max_file_size,
-                    max_total_size=runtime.max_total_size,
-                    strict_license=runtime.strict_license,
-                    skip_file_types=runtime.skip_non_model_files,
-                    use_hf_whitelist=runtime.use_hf_whitelist,
-                    cache_enabled=runtime.cache_enabled,
-                    cache_dir=runtime.cache_dir,
-                    **streaming_kwargs,
-                )
+                try:
+                    streaming_result = scan_model_streaming(
+                        file_generator=file_generator,
+                        shard_family_group=f"stream-invocation:{id(file_generator):x}",
+                        _trusted_shard_family_root=(
+                            _make_trusted_stream_shard_root(str(hf_cache_dir / "huggingface"))
+                            if runtime.cache_enabled and trusted_source_provenance is not None
+                            else None
+                        ),
+                        timeout=runtime.timeout,
+                        delete_after_scan=True,
+                        scan_root=str(stream_hf_cache_root),
+                        blacklist_patterns=list(blacklist) if blacklist else None,
+                        max_file_size=runtime.max_file_size,
+                        max_total_size=runtime.max_total_size,
+                        strict_license=runtime.strict_license,
+                        skip_file_types=runtime.skip_non_model_files,
+                        use_hf_whitelist=runtime.use_hf_whitelist,
+                        cache_enabled=runtime.cache_enabled,
+                        cache_dir=runtime.cache_dir,
+                        **streaming_kwargs,
+                    )
+                except _HuggingFaceAcquisitionError:
+                    raise
+                except Exception as exc:
+                    raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
+
                 path_state.record_non_shard_result_errors(streaming_result)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
@@ -2818,7 +3560,10 @@ def _resolve_scan_source_for_path(
                 record_download_completed("huggingface", download_duration, 0, display_path)
 
                 if runtime.show_styled_output:
-                    click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
+                    if streaming_result.has_errors or not streaming_result.success:
+                        click.echo(style_text("❌ Streaming scan incomplete", fg="red", bold=True))
+                    else:
+                        click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
                 return _SourceDispatchResult(
                     actual_path=path,
@@ -2834,12 +3579,14 @@ def _resolve_scan_source_for_path(
                 download_spinner.start()
 
             show_progress = runtime.show_styled_output and should_show_spinner()
+            download_repository_file_inventory: list[str] = []
             download_path = download_model(
                 path,
                 cache_dir=hf_cache_dir,
                 show_progress=show_progress,
                 max_size=runtime.max_download_bytes,
                 timeout_seconds=runtime.timeout,
+                repository_file_inventory=download_repository_file_inventory,
             )
             download_duration = time.time() - download_start
             try:
@@ -2860,7 +3607,23 @@ def _resolve_scan_source_for_path(
                 temp_path=temp_dir,
                 source_model_id=source_model_id,
                 source_model_source=source_model_source,
+                repository_file_inventory=tuple(download_repository_file_inventory),
             )
+        except _HuggingFaceStreamInterruptedError as exc:
+            if runtime.show_styled_output:
+                click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
+
+            error_msg = _display_error(exc, path)
+            logger.error(f"Streaming scan interrupted for {display_path}: {error_msg}")
+            click.echo(f"Error processing model from {display_path}: {error_msg}", err=True)
+            path_state.mark_non_shard_error(audit_result)
+            audit_result.success = False
+            path_state.defer_temp_cleanup(
+                temp_dir,
+                cache_enabled=runtime.cache_enabled,
+                verbose=verbose,
+            )
+            return None
         except Exception as exc:
             if runtime.show_styled_output:
                 click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
@@ -2881,7 +3644,12 @@ def _resolve_scan_source_for_path(
                 logger.error(f"Failed to process model from {display_path}: {error_msg}")
                 click.echo(f"Error processing model from {display_path}: {error_msg}", err=True)
 
-            path_state.mark_non_shard_error(audit_result)
+            _record_huggingface_acquisition_error(
+                audit_result,
+                path_state,
+                path=path,
+                error_msg=error_msg,
+            )
             path_state.defer_temp_cleanup(
                 temp_dir,
                 cache_enabled=runtime.cache_enabled,
@@ -3916,6 +4684,22 @@ def scan_command(
     record_scan_started(list(paths), telemetry_options)
 
     expanded_paths = _resolve_scan_paths(paths, scan_start_time)
+    huggingface_preview_paths: list[str] = []
+    if dry_run:
+        huggingface_preview_paths = [path for path in expanded_paths if _is_huggingface_dry_run_preview_path(path)]
+        if huggingface_preview_paths and len(huggingface_preview_paths) != len(expanded_paths):
+            non_preview_paths = [
+                _display_path(path) for path in expanded_paths if not _is_huggingface_dry_run_preview_path(path)
+            ]
+            click.echo(
+                "Error: Hugging Face dry-run previews cannot be combined with paths that require scanning: "
+                f"{', '.join(non_preview_paths)}",
+                err=True,
+            )
+            record_scan_failed(time.time() - scan_start_time, "Mixed Hugging Face dry-run preview inputs")
+            flush_telemetry()
+            sys.exit(2)
+
     runtime = _resolve_scan_runtime_config(
         expanded_paths,
         format=format,
@@ -3936,6 +4720,14 @@ def scan_command(
         severity=severity,
         scan_start_time=scan_start_time,
     )
+    if dry_run and huggingface_preview_paths and runtime.output_format == "sarif":
+        click.echo(
+            "Error: Hugging Face dry-run previews support text or json output, not sarif",
+            err=True,
+        )
+        record_scan_failed(time.time() - scan_start_time, "Unsupported Hugging Face dry-run preview output")
+        flush_telemetry()
+        sys.exit(2)
     _show_scan_runtime_defaults(
         runtime,
         expanded_paths,
@@ -3955,6 +4747,8 @@ def scan_command(
     from .models import create_initial_audit_result
 
     audit_result = create_initial_audit_result()
+    if dry_run:
+        cast(Any, audit_result).dry_run = True
     if runtime.scanner_selection_metadata is not None:
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
     path_state = _ScanPathState(
@@ -4042,6 +4836,35 @@ def scan_command(
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
 
+    if dry_run and huggingface_preview_paths and path_state.has_no_scan_content(audit_result):
+        try:
+            try:
+                if audit_result.has_errors:
+                    record_scan_failed(time.time() - scan_start_time, "Dry-run preview completed with errors")
+                    flush_telemetry()
+                    sys.exit(2)
+                if path_state.dry_run_previews:
+                    output_text = _format_huggingface_dry_run_previews(
+                        path_state.dry_run_previews, runtime.output_format
+                    )
+                    _emit_huggingface_dry_run_output(
+                        output_text,
+                        output=output,
+                        output_format=runtime.output_format,
+                    )
+            finally:
+                _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
+        except _OutputWriteError:
+            record_scan_failed(time.time() - scan_start_time, "Unable to write scan output")
+            flush_telemetry()
+            raise
+        record_scan_completed(time.time() - scan_start_time, {"dry_run": True, "previews": path_state.dry_run_previews})
+        flush_telemetry()
+        sys.exit(0)
+
+    if dry_run and path_state.dry_run_previews:
+        cast(Any, audit_result).previews = path_state.dry_run_previews
+
     try:
         try:
             _write_scan_sbom(
@@ -4081,6 +4904,7 @@ def scan_command(
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
+    has_incomplete_coverage = _results_have_incomplete_coverage(results)
 
     # Add scan summary header
     output_lines.append(style_text("\n📊 SCAN SUMMARY", fg="white", bold=True))
@@ -4252,6 +5076,19 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         if len(check_groups) > 5:
             output_lines.append(f"    ... and {len(check_groups) - 5} more check types")
 
+    if has_incomplete_coverage:
+        incomplete_summaries = _incomplete_coverage_summaries(results)
+        output_lines.append("")
+        output_lines.append(style_text("  Scan Coverage:", fg="bright_black"))
+        output_lines.append(
+            "  " + style_text("⚠️  Incomplete security coverage", fg="yellow", bold=True),
+        )
+        for file_path, reason in incomplete_summaries[:5]:
+            output_lines.append(f"    • {_escape_terminal_text(file_path)}: {_escape_terminal_text(reason)}")
+        incomplete_count = len(incomplete_summaries)
+        if incomplete_count > 5:
+            output_lines.append(f"    ... and {incomplete_count - 5} more incomplete files")
+
     # Add issue summary
     issues = results.get("issues", [])
     # Filter out DEBUG severity issues when not in verbose mode
@@ -4356,9 +5193,17 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     else:
         # Check if no files were scanned to show appropriate message
         files_scanned = results.get("files_scanned", 0)
-        if files_scanned == 0:
+        if results.get("dry_run"):
+            output_lines.append(
+                "  " + style_text("✅ Dry-run preview complete; no files were scanned", fg="green", bold=True),
+            )
+        elif files_scanned == 0:
             output_lines.append(
                 "  " + style_text("⚠️  No model files found to scan", fg="yellow", bold=True),
+            )
+        elif has_incomplete_coverage:
+            output_lines.append(
+                "  " + style_text("⚠️  Security coverage incomplete", fg="yellow", bold=True),
             )
         else:
             output_lines.append(
@@ -4372,18 +5217,30 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
     # Check if scan had operational errors first (highest priority in exit code)
     has_operational_errors = bool(results.get("has_errors"))
+    has_acquisition_errors = _results_have_acquisition_error_metadata(results)
+    has_blocked_acquisition = _results_have_blocked_acquisition_metadata(results)
     files_scanned = results.get("files_scanned", 0)
+    is_dry_run = bool(results.get("dry_run"))
     has_critical_findings = any(_get_issue_attr(issue, "severity") == "critical" for issue in visible_issues)
     has_warning_findings = any(_get_issue_attr(issue, "severity") == "warning" for issue in visible_issues)
     has_security_findings = has_critical_findings or has_warning_findings
     if has_operational_errors:
         status_icon = "❌"
-        status_msg = "SCAN COMPLETED WITH OPERATIONAL ERRORS"
+        if has_acquisition_errors:
+            status_msg = "MODEL ACQUISITION BLOCKED" if has_blocked_acquisition else "MODEL ACQUISITION FAILED"
+        else:
+            status_msg = "SCAN COMPLETED WITH OPERATIONAL ERRORS"
         status_color = "red"
         output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
-        output_lines.append(
-            f"  {style_text('Review warnings above and use --verbose for troubleshooting details.', fg='yellow')}"
-        )
+        if has_acquisition_errors:
+            guidance = (
+                "No model artifacts were scanned for blocked Hugging Face source(s)."
+                if has_blocked_acquisition
+                else "No model artifacts were scanned for failed Hugging Face source(s)."
+            )
+        else:
+            guidance = "Review warnings above and use --verbose for troubleshooting details."
+        output_lines.append(f"  {style_text(guidance, fg='yellow')}")
     # Determine overall status
     elif has_security_findings:
         if has_critical_findings:
@@ -4394,8 +5251,12 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             status_icon = "⚠️"
             status_msg = "WARNINGS DETECTED"
             status_color = "yellow"
+        if has_incomplete_coverage:
+            status_msg += "; COVERAGE INCOMPLETE"
         status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
         output_lines.append(f"  {status_line}")
+    elif is_dry_run:
+        output_lines.append(f"  {style_text('✅ DRY RUN PREVIEW COMPLETE', fg='green', bold=True)}")
     # Check if no files were scanned
     elif files_scanned == 0:
         status_icon = "❌"
@@ -4405,6 +5266,12 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(
             f"  {style_text('Warning: No model files were found at the specified location.', fg='yellow')}"
         )
+    elif has_incomplete_coverage:
+        status_icon = "⚠️"
+        status_msg = "SCAN COVERAGE INCOMPLETE"
+        status_color = "yellow"
+        output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
+        output_lines.append(f"  {style_text('Some selected files could not be fully analyzed.', fg='yellow')}")
     elif visible_issues:
         if has_critical_findings:
             status_icon = "❌"
@@ -4440,6 +5307,107 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(encouragement_line)
 
     return "\n".join(output_lines)
+
+
+def _results_have_incomplete_coverage(results: dict[str, Any]) -> bool:
+    return bool(_incomplete_coverage_summaries(results))
+
+
+def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, str]]:
+    summaries: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    file_metadata = results.get("file_metadata")
+    if isinstance(file_metadata, dict):
+        for file_path, metadata in file_metadata.items():
+            if metadata_has_incomplete_coverage(metadata):
+                _append_incomplete_coverage_summary(
+                    summaries,
+                    seen,
+                    str(file_path),
+                    _incomplete_coverage_reason(metadata),
+                )
+
+    for collection_name in ("issues", "checks"):
+        records = results.get(collection_name)
+        if not isinstance(records, list):
+            continue
+        fallback_location = collection_name[:-1]
+        for record in records:
+            details = _get_issue_attr(record, "details", {})
+            if not record_details_have_incomplete_coverage(
+                record,
+                allow_skipped_check_exemption=collection_name == "checks",
+            ):
+                continue
+            location = (
+                _get_issue_attr(record, "location")
+                or _get_issue_attr(record, "name")
+                or _get_issue_attr(record, "type")
+                or fallback_location
+            )
+            _append_incomplete_coverage_summary(
+                summaries,
+                seen,
+                str(location),
+                _incomplete_coverage_reason(details),
+            )
+
+    return summaries
+
+
+def _append_incomplete_coverage_summary(
+    summaries: list[tuple[str, str]],
+    seen: set[tuple[str, str]],
+    location: str,
+    reason: str,
+) -> None:
+    summary = (location, reason)
+    if summary in seen:
+        return
+    seen.add(summary)
+    summaries.append(summary)
+
+
+def _incomplete_coverage_reason(metadata: Any, *, _depth: int = 0) -> str:
+    if not isinstance(metadata, dict):
+        return "incomplete coverage"
+
+    reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+
+    reason = metadata.get("reason")
+    if isinstance(reason, str) and reason:
+        return reason
+
+    reason = metadata.get("incomplete_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+
+    reasons = metadata.get("scan_outcome_reasons")
+    if isinstance(reasons, str) and reasons:
+        return reasons
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        joined_reasons = ", ".join(str(reason) for reason in reasons if reason)
+        if joined_reasons:
+            return joined_reasons
+
+    if metadata.get("analysis_incomplete") is True:
+        return "analysis_incomplete"
+    if metadata.get("scan_outcome") == "inconclusive":
+        return "inconclusive"
+
+    if _depth < 4:
+        findings = metadata.get("findings")
+        if isinstance(findings, dict) and details_have_incomplete_coverage(findings):
+            return _incomplete_coverage_reason(findings, _depth=_depth + 1)
+        if isinstance(findings, (list, tuple, set, frozenset)):
+            for finding in findings:
+                if details_have_incomplete_coverage(finding):
+                    return _incomplete_coverage_reason(finding, _depth=_depth + 1)
+
+    return "incomplete coverage"
 
 
 def _get_issue_attr(issue: dict[str, Any] | Any, attr: str, default: Any = None) -> Any:
