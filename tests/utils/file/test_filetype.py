@@ -3564,6 +3564,34 @@ def test_detect_file_format_does_not_treat_license_prose_as_encoded_payload_budg
     assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
+@pytest.mark.parametrize("separator", ["-", "_"])
+def test_detect_file_format_keeps_urlsafe_shaped_legal_prose_on_text_route(
+    tmp_path: Path,
+    separator: str,
+) -> None:
+    def alpha_suffix(index: int) -> str:
+        letters = []
+        value = index
+        for _ in range(3):
+            letters.append(chr(ord("a") + (value % 26)))
+            value //= 26
+        return "".join(letters)
+
+    path = tmp_path / "LICENSE"
+    words = [
+        f"third{separator}party{separator}{alpha_suffix(index)}"
+        for index in range(file_detection._LEGAL_TEXT_MAX_ENCODED_TOKENS + 1)
+    ]
+    path.write_text(
+        "MIT License\nCopyright Example\n" + " ".join(words),
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
+
+
 def test_detect_file_format_accepts_legal_text_at_exact_route_size_limit(tmp_path: Path) -> None:
     path = tmp_path / "NOTICE"
     prefix = b"NOTICE\nCopyright (c) Example\nPermission is hereby granted.\n"
@@ -3818,6 +3846,18 @@ def test_detect_file_format_fails_closed_for_binary_pickle_embedded_in_legal_tex
 
     assert detect_file_format(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     assert detect_file_format_from_magic(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_for_urlsafe_base64_encoded_pickle(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    embedded_pickle = b"\xfb" + b"cposix\nsystem\n(S'id'\ntR."
+    token = base64.urlsafe_b64encode(embedded_pickle)
+    assert b"-" in token or b"_" in token
+    path.write_bytes(b"MIT License\nCopyright Example\n" + token + b"\n")
+
+    assert detect_file_format(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_detect_file_format_fails_closed_for_long_embedded_protocol0_legal_name(tmp_path: Path) -> None:

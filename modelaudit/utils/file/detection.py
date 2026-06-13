@@ -457,7 +457,7 @@ _LEGAL_TEXT_SIGNAL_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_LEGAL_TEXT_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
+_LEGAL_TEXT_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{10,}={0,2}(?![A-Za-z0-9+/_=-])")
 _LEGAL_TEXT_HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
 _LEGAL_TEXT_MAX_ENCODED_TOKENS = 64
 _LEGAL_TEXT_MAX_DECODED_BYTES = 1024 * 1024
@@ -5339,11 +5339,12 @@ def _decoded_token_pickle_route(decoded: bytes) -> str | None:
 
 def _decode_base64_route_token(token: bytes) -> bytes:
     padding = b"=" * ((4 - (len(token) % 4)) % 4)
-    return base64.b64decode(token + padding, validate=True)
+    return base64.b64decode(token + padding, altchars=b"-_", validate=True)
 
 
 def _is_plain_alphabetic_base64_word(token: bytes) -> bool:
-    return b"=" not in token and token.isalpha()
+    normalized = token.replace(b"-", b"").replace(b"_", b"")
+    return b"=" not in token and normalized.isalpha()
 
 
 def _pickletools_global_argument(argument: object) -> tuple[str, str] | None:

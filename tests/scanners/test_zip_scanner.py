@@ -1,3 +1,4 @@
+import base64
 import builtins
 import bz2
 import gzip
@@ -11143,6 +11144,19 @@ class TestZipScanner:
         result = self.scanner.scan(str(archive_path))
 
         _assert_inconclusive_pickle_member(result, archive_path, "NOTICE")
+
+    def test_scan_zip_fails_closed_for_urlsafe_base64_encoded_pickle_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "urlsafe_encoded_pickle.zip"
+        embedded_pickle = b"\xfb" + b"cposix\nsystem\n(S'id'\ntR."
+        token = base64.urlsafe_b64encode(embedded_pickle)
+        assert b"-" in token or b"_" in token
+        payload = b"MIT License\nCopyright Example\n" + token + b"\n"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        _assert_inconclusive_pickle_member(result, archive_path, "LICENSE")
 
     @pytest.mark.parametrize(
         "padding_size",

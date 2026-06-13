@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pickle
@@ -675,6 +676,18 @@ def test_scan_file_keeps_malicious_pickle_named_license_on_pickle_route(tmp_path
 def test_scan_file_fails_closed_for_binary_pickle_embedded_in_license_text(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     path.write_bytes(b"MIT License\nCopyright (c) Example\n" + b"\x80\x04cposix\nsystem\n(S'id'\ntR.")
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    _assert_incomplete_pickle_routing(result, path)
+
+
+def test_scan_file_fails_closed_for_urlsafe_base64_encoded_pickle(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    embedded_pickle = b"\xfb" + b"cposix\nsystem\n(S'id'\ntR."
+    token = base64.urlsafe_b64encode(embedded_pickle)
+    assert b"-" in token or b"_" in token
+    path.write_bytes(b"MIT License\nCopyright Example\n" + token + b"\n")
 
     result = scan_file(str(path), config={"cache_enabled": False})
 
