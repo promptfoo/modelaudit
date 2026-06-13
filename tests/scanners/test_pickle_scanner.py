@@ -293,22 +293,8 @@ def _legacy_pytorch_object_stream(
     storage_size: int,
     *,
     malicious_object: bool = False,
-    protocol: int = 2,
-    protocol0_storage_type: str = "torch.ByteStorage",
 ) -> bytes:
-    if protocol == 0:
-        if malicious_object:
-            raise ValueError("protocol 0 malicious fixture is not implemented")
-        object_stream = bytearray(b"]")
-        for key in storage_keys:
-            persistent_id = (
-                f"('storage', <class '{protocol0_storage_type}'>, '{key}', 'cpu', {storage_size}, None)".encode("ascii")
-            )
-            object_stream += b"P" + persistent_id + b"\na"
-        object_stream += b"."
-        return bytes(object_stream)
-
-    object_stream = bytearray(b"\x80" + bytes([protocol]) + b"]")
+    object_stream = bytearray(b"\x80\x02]")
     for key in storage_keys:
         encoded_key = key.encode("ascii")
         object_stream += b"(" + _binunicode(b"storage")
@@ -395,29 +381,21 @@ def _make_legacy_pytorch_container(
     declared_storage_size: int | None = None,
     malicious_object: bool = False,
     storage_keys: tuple[str, ...] = ("0",),
-    protocol: int = 2,
-    protocol0_storage_type: str = "torch.ByteStorage",
 ) -> tuple[bytes, int]:
     storage_size = len(storage_payload) if declared_storage_size is None else declared_storage_size
     control_streams = (
-        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=protocol),
-        pickle.dumps(1001, protocol=protocol),
+        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
+        pickle.dumps(1001, protocol=2),
         pickle.dumps(
             {
                 "protocol_version": 1001,
                 "little_endian": True,
                 "type_sizes": {"short": 2, "int": 4, "long": 8},
             },
-            protocol=protocol,
+            protocol=2,
         ),
-        _legacy_pytorch_object_stream(
-            storage_keys,
-            storage_size,
-            malicious_object=malicious_object,
-            protocol=protocol,
-            protocol0_storage_type=protocol0_storage_type,
-        ),
-        pickle.dumps(list(storage_keys), protocol=protocol),
+        _legacy_pytorch_object_stream(storage_keys, storage_size, malicious_object=malicious_object),
+        pickle.dumps(list(storage_keys), protocol=2),
     )
     pickle_end = sum(len(stream) for stream in control_streams)
     storage_record = b"".join(storage_size.to_bytes(8, "little") + storage_payload for _key in storage_keys)
@@ -488,49 +466,6 @@ def test_legacy_pytorch_storage_records_accept_memoized_protocols(protocol: int)
     assert records[0].element_size == 1
 
 
-def test_legacy_pytorch_storage_records_accept_protocol0_text_persid() -> None:
-    records = pickle_scanner._legacy_pytorch_storage_records(
-        _legacy_pytorch_object_stream(("0",), 4, protocol=0),
-        ("0",),
-    )
-
-    assert records is not None
-    assert len(records) == 1
-    assert records[0].key == "0"
-    assert records[0].element_count == 4
-    assert records[0].element_size == 1
-
-
-def test_legacy_pytorch_storage_records_accept_protocol0_torch_storage_module() -> None:
-    records = pickle_scanner._legacy_pytorch_storage_records(
-        _legacy_pytorch_object_stream(
-            ("0",),
-            4,
-            protocol=0,
-            protocol0_storage_type="torch.storage.UntypedStorage",
-        ),
-        ("0",),
-    )
-
-    assert records is not None
-    assert len(records) == 1
-    assert records[0].key == "0"
-    assert records[0].element_count == 4
-    assert records[0].element_size == 1
-
-
-def test_legacy_pytorch_storage_records_accept_multiple_storage_keys() -> None:
-    records = pickle_scanner._legacy_pytorch_storage_records(
-        _legacy_pytorch_object_stream(("0", "1"), 4),
-        ("0", "1"),
-    )
-
-    assert records is not None
-    assert [record.key for record in records] == ["0", "1"]
-    assert [record.element_count for record in records] == [4, 4]
-    assert [record.element_size for record in records] == [1, 1]
-
-
 def test_legacy_pytorch_storage_records_reject_missing_memo_reference() -> None:
     payload = b"\x80\x02(" + _binunicode(b"storage") + b"ctorch\nByteStorage\n"
     payload += _binunicode(b"0") + _binunicode(b"cpu") + b"K\x01h\xfa" + b"tQ."
@@ -549,12 +484,6 @@ def test_legacy_pytorch_storage_records_reject_out_of_bounds_view() -> None:
     payload = b"\x80\x02(" + _binunicode(b"storage") + b"ctorch\nByteStorage\n"
     payload += _binunicode(b"0") + _binunicode(b"cpu") + b"K\x04"
     payload += b"(" + _binunicode(b"1") + b"K\x03K\x02t" + b"tQ."
-
-    assert pickle_scanner._legacy_pytorch_storage_records(payload, ("0",)) is None
-
-
-def test_legacy_pytorch_storage_records_reject_protocol0_out_of_bounds_view() -> None:
-    payload = b"]P('storage', <class 'torch.ByteStorage'>, '0', 'cpu', 4, ('0', 3, 2))\na."
 
     assert pickle_scanner._legacy_pytorch_storage_records(payload, ("0",)) is None
 
@@ -2039,55 +1968,6 @@ def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_pat
     assert "known_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
     assert not any(check.details.get("notice_code") == "known_stream_truncated" for check in result.checks)
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
-
-
-def test_legacy_pytorch_container_accepts_protocol0_storage_tail(tmp_path: Path) -> None:
-    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 4, protocol=0)
-    path = tmp_path / "legacy-protocol0.pt"
-    path.write_bytes(payload)
-
-    result = PickleScanner().scan(str(path))
-
-    assert result.success is True
-    assert result.metadata["legacy_pytorch_container"] is True
-    assert result.metadata["legacy_pytorch_storage_key_count"] == 1
-    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
-    assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
-    assert not any(issue.rule_code == "S901" for issue in result.issues)
-
-
-def test_legacy_pytorch_container_accepts_protocol0_torch_storage_module_tail(tmp_path: Path) -> None:
-    payload, pickle_end = _make_legacy_pytorch_container(
-        b"A" * 4,
-        protocol=0,
-        protocol0_storage_type="torch.storage.UntypedStorage",
-    )
-    path = tmp_path / "legacy-protocol0-storage-module.pt"
-    path.write_bytes(payload)
-
-    result = PickleScanner().scan(str(path))
-
-    assert result.success is True
-    assert result.metadata["legacy_pytorch_container"] is True
-    assert result.metadata["legacy_pytorch_storage_key_count"] == 1
-    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
-    assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
-    assert not any(issue.rule_code == "S901" for issue in result.issues)
-
-
-def test_legacy_pytorch_container_accepts_multiple_storage_records(tmp_path: Path) -> None:
-    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 4, storage_keys=("0", "1"))
-    path = tmp_path / "legacy-multiple-storage.pt"
-    path.write_bytes(payload)
-
-    result = PickleScanner().scan(str(path))
-
-    assert result.success is True
-    assert result.metadata["legacy_pytorch_container"] is True
-    assert result.metadata["legacy_pytorch_storage_key_count"] == 2
-    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
-    assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
-    assert not any(issue.rule_code == "S901" for issue in result.issues)
 
 
 def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -> None:
@@ -3618,6 +3498,21 @@ def test_legacy_pytorch_rejects_custom_persid_without_trusting_storage_pid(tmp_p
     assert len(issues) == 1
     assert issues[0].rule_code == "S212"
     assert issues[0].details["opcode"] == "PERSID"
+
+
+def test_legacy_pytorch_rejects_protocol0_tuple_like_storage_persid(tmp_path: Path) -> None:
+    object_stream = b"]P('storage', <class 'torch.ByteStorage'>, '0', 'cpu', 64, None)\na."
+    payload, _pickle_end = _make_legacy_pytorch_container_with_object_stream(b"A" * 64, object_stream)
+    path = tmp_path / "legacy-protocol0-storage.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    _assert_legacy_storage_layout_incomplete(result)
+    issues = _persistent_id_issues(result, opcode="PERSID")
+    assert len(issues) == 1
+    assert issues[0].rule_code == "S212"
+    assert not _trusted_legacy_storage_pid_checks(result)
 
 
 def test_legacy_pytorch_rejects_extra_binpersid_without_trusting_first_storage_pid(tmp_path: Path) -> None:

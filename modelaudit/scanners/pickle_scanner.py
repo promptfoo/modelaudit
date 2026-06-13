@@ -90,13 +90,6 @@ _PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES = {
     "ShortStorage": 2,
     "UntypedStorage": 1,
 }
-_PYTORCH_LEGACY_PROTOCOL0_STORAGE_PID_RE = re.compile(
-    r"^\('storage', <class 'torch(?P<storage_module>\.storage)?\."
-    r"(?P<storage_name>[A-Za-z0-9_]+Storage)'>, "
-    r"'(?P<key>[0-9]{1,128})', '(?P<location>[^']+)', (?P<element_count>[0-9]{1,20}), "
-    r"(?P<view_metadata>None|\('[0-9]{1,128}', (?P<view_offset>[0-9]{1,20}), "
-    r"(?P<view_size>[0-9]{1,20})\))\)$"
-)
 _BASE64_CODE_EXECUTION_SEEDS: tuple[bytes, ...] = (
     b"ZXZhbCg",  # eval(
     b"ZXhlYyg",  # exec(
@@ -785,69 +778,11 @@ def _legacy_pytorch_storage_keys(data: bytes) -> tuple[str, ...] | None:
     return tuple(keys) if _pickle_stack_is_valid(data) else None
 
 
-def _legacy_pytorch_nonnegative_int(value: str) -> int | None:
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if 0 <= parsed <= (1 << 63) - 1 else None
-
-
-def _legacy_pytorch_protocol0_storage_record(
-    pid: str,
-    *,
-    expected_keys: set[str] | None,
-) -> tuple[bool, _LegacyPyTorchStorageRecord | None]:
-    if not pid.startswith("('storage',"):
-        return False, None
-    match = _PYTORCH_LEGACY_PROTOCOL0_STORAGE_PID_RE.match(pid)
-    if match is None:
-        return True, None
-
-    storage_name = match.group("storage_name")
-    key = match.group("key")
-    location = match.group("location")
-    element_count = _legacy_pytorch_nonnegative_int(match.group("element_count"))
-    if (
-        storage_name not in _PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES
-        or (expected_keys is not None and key not in expected_keys)
-        or not location
-        or element_count is None
-    ):
-        return True, None
-
-    if match.group("view_metadata") != "None":
-        view_offset = _legacy_pytorch_nonnegative_int(match.group("view_offset"))
-        view_size = _legacy_pytorch_nonnegative_int(match.group("view_size"))
-        if (
-            view_offset is None
-            or view_size is None
-            or view_offset > element_count
-            or view_size > element_count - view_offset
-        ):
-            return True, None
-
-    storage_module = "torch.storage" if match.group("storage_module") else "torch"
-    return (
-        True,
-        _LegacyPyTorchStorageRecord(
-            key=key,
-            element_count=element_count,
-            element_size=_PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES[storage_name],
-            storage_type_module=storage_module,
-            storage_type_name=storage_name,
-            storage_type_position=None,
-        ),
-    )
-
-
 def _legacy_pytorch_storage_record_from_pid(
     pid: object,
     *,
     expected_keys: set[str] | None,
 ) -> tuple[bool, _LegacyPyTorchStorageRecord | None]:
-    if isinstance(pid, str):
-        return _legacy_pytorch_protocol0_storage_record(pid, expected_keys=expected_keys)
     if not isinstance(pid, tuple) or not pid or pid[0] != "storage":
         return False, None
     if len(pid) != 6:
@@ -1016,11 +951,7 @@ def _legacy_pytorch_storage_records(
                 if stack:
                     stack.append(stack[-1])
             elif opcode_name == "PERSID":
-                is_storage, record = _legacy_pytorch_storage_record_from_pid(arg, expected_keys=expected_keys)
-                if not is_storage or record is None or (record.key in records and records[record.key] != record):
-                    return None
-                records[record.key] = record
-                stack.append(unknown)
+                return None
             elif opcode_name == "BINPERSID":
                 pid = stack.pop() if stack else unknown
                 is_storage, record = _legacy_pytorch_storage_record_from_pid(pid, expected_keys=expected_keys)

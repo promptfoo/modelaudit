@@ -9671,28 +9671,6 @@ def test_pytorch_zip_scanner_does_not_trust_noncanonical_protocol0_storage_persi
     )
 
 
-def test_pytorch_zip_scanner_does_not_trust_unknown_opcode_tail_in_data_pkl(tmp_path: Path) -> None:
-    payload = _pytorch_storage_persistent_id_payload("0") + b"A"
-    model_path = create_mock_pytorch_zip(
-        tmp_path / "storage_persistent_id_trailing_data_pkl.pt",
-        with_pickle=False,
-        prefix="archive",
-    )
-    with zipfile.ZipFile(model_path, "a") as zipf:
-        zipf.writestr("archive/data.pkl", payload)
-        zipf.writestr("archive/data/0", b"\x00" * 8)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "trusted_incomplete_tail" not in result.metadata
-    assert any(
-        issue.rule_code == "S901"
-        and issue.message == "Pickle parsing failed before full scan completion"
-        and issue.details.get("pickle_filename") == "archive/data.pkl"
-        for issue in result.issues
-    )
-
-
 def test_pytorch_zip_scanner_trusts_storage_persistent_ids_with_utf8_byte_key(tmp_path: Path) -> None:
     payload = _pytorch_storage_persistent_id_payload(b"0")
     model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_bytes.pt", with_pickle=False)

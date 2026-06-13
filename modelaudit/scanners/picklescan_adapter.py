@@ -421,6 +421,8 @@ def _to_issue_severity(severity: Severity) -> IssueSeverity:
 def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
     """Keep known benign malformed tails as INFO notices while preserving fail-closed truncation."""
     source_ext = _pickle_source_extension(report.source)
+    if report.has_security_findings:
+        return False
 
     first_pickle_end_pos = report.metadata.get("first_pickle_end_pos")
     has_trusted_pickle_boundary = isinstance(first_pickle_end_pos, int) and first_pickle_end_pos >= 0
@@ -433,9 +435,6 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
 
         exception_type = notice.details.get("exception_type")
         exception_message = str(notice.details.get("exception", ""))
-        if report.has_security_findings:
-            return False
-
         if (
             exception_type == "UnicodeDecodeError"
             and source_ext in {".bin", ".pkl", ".pickle"}

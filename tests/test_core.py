@@ -528,55 +528,6 @@ def _build_protocolless_binary_benign_scalar_pickle() -> bytes:
     return b"\x8c\x02os\x94."
 
 
-def _build_legacy_pytorch_storage_tail_pickle(
-    *,
-    protocol: int = 2,
-    storage_keys: tuple[str, ...] = ("0",),
-    protocol0_storage_type: str = "torch.ByteStorage",
-) -> bytes:
-    """Build a legacy PyTorch container with control pickles followed by raw storage bytes."""
-    storage_payload = b"ABCD"
-    storage_size = len(storage_payload)
-
-    def binunicode(value: bytes) -> bytes:
-        return b"X" + len(value).to_bytes(4, "little") + value
-
-    if protocol == 0:
-        object_stream = bytearray(b"]")
-        for key in storage_keys:
-            persistent_id = (
-                f"('storage', <class '{protocol0_storage_type}'>, '{key}', 'cpu', {storage_size}, None)".encode("ascii")
-            )
-            object_stream += b"P" + persistent_id + b"\na"
-        object_stream += b"."
-    elif protocol == 2:
-        object_stream = bytearray(b"\x80\x02]")
-        for key in storage_keys:
-            encoded_key = key.encode("ascii")
-            object_stream += b"(" + binunicode(b"storage")
-            object_stream += b"ctorch\nByteStorage\n" + binunicode(encoded_key)
-            object_stream += binunicode(b"cpu") + b"K\x04NtQa"
-        object_stream += b"."
-    else:
-        raise ValueError(f"unsupported protocol: {protocol}")
-    control_streams = (
-        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=protocol),
-        pickle.dumps(1001, protocol=protocol),
-        pickle.dumps(
-            {
-                "protocol_version": 1001,
-                "little_endian": True,
-                "type_sizes": {"short": 2, "int": 4, "long": 8},
-            },
-            protocol=protocol,
-        ),
-        bytes(object_stream),
-        pickle.dumps(list(storage_keys), protocol=protocol),
-    )
-    storage_records = b"".join(storage_size.to_bytes(8, "little") + storage_payload for _key in storage_keys)
-    return b"".join(control_streams) + storage_records
-
-
 def _build_printable_utf8_ambiguous_binary_route() -> bytes:
     """Build printable UTF-8 bytes that still require binary fail-closed routing."""
     return (b'""' + ("é" * 17).encode("utf-8")) * 4097
@@ -5597,7 +5548,7 @@ def test_scan_file_detects_python_in_gzip_safetensors_with_nonmember_trailing_da
     )
 
     aggregate = scan_model_directory_or_file(str(polyglot), cache_enabled=False)
-    assert determine_exit_code(aggregate) == 0
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_scan_file_keeps_zero_prefixed_nonmember_gzip_trailing_data_clean(tmp_path: Path) -> None:
@@ -9994,112 +9945,6 @@ def test_scan_file_routes_misnamed_pytorch_zip_by_content(tmp_path: Path) -> Non
 
     assert result.scanner_name == "pytorch_zip"
     assert any("data.pkl" in (issue.location or "") for issue in result.issues)
-
-
-def test_scan_model_directory_or_file_trusts_legacy_pytorch_storage_tail(tmp_path: Path) -> None:
-    model_path = tmp_path / "weights.pt"
-    model_path.write_bytes(_build_legacy_pytorch_storage_tail_pickle())
-
-    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
-    metadata = aggregate.file_metadata[str(model_path)]
-
-    assert determine_exit_code(aggregate) == 0
-    assert metadata["legacy_pytorch_container"] is True
-    assert metadata["legacy_pytorch_storage_start"] == 208
-    assert metadata["legacy_pytorch_storage_end"] == 220
-    assert metadata["pickle_report_status"] == "complete"
-    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
-    assert not any(issue.rule_code == "S212" for issue in aggregate.issues)
-
-
-def test_scan_model_directory_or_file_trusts_protocol0_legacy_pytorch_storage_tail(tmp_path: Path) -> None:
-    payload = _build_legacy_pytorch_storage_tail_pickle(protocol=0)
-    model_path = tmp_path / "weights.pt"
-    model_path.write_bytes(payload)
-
-    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
-    metadata = aggregate.file_metadata[str(model_path)]
-
-    assert determine_exit_code(aggregate) == 1
-    assert metadata["legacy_pytorch_container"] is True
-    assert metadata["legacy_pytorch_storage_key_count"] == 1
-    assert metadata["legacy_pytorch_storage_end"] == len(payload)
-    assert metadata["pickle_report_status"] == "complete"
-    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
-    assert any(issue.rule_code == "S212" for issue in aggregate.issues)
-
-
-def test_scan_model_directory_or_file_trusts_protocol0_torch_storage_module_tail(tmp_path: Path) -> None:
-    payload = _build_legacy_pytorch_storage_tail_pickle(
-        protocol=0,
-        protocol0_storage_type="torch.storage.UntypedStorage",
-    )
-    model_path = tmp_path / "weights.pt"
-    model_path.write_bytes(payload)
-
-    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
-    metadata = aggregate.file_metadata[str(model_path)]
-
-    assert determine_exit_code(aggregate) == 1
-    assert metadata["legacy_pytorch_container"] is True
-    assert metadata["legacy_pytorch_storage_key_count"] == 1
-    assert metadata["legacy_pytorch_storage_end"] == len(payload)
-    assert metadata["pickle_report_status"] == "complete"
-    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
-    assert any(issue.rule_code == "S212" for issue in aggregate.issues)
-
-
-def test_scan_model_directory_or_file_trusts_nested_legacy_pytorch_storage_tail(tmp_path: Path) -> None:
-    archive_path = tmp_path / "legacy-storage-tail.zip"
-    _create_misnamed_zip(archive_path, {"weights.pt": _build_legacy_pytorch_storage_tail_pickle()})
-
-    aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
-    metadata = aggregate.file_metadata[str(archive_path)]
-
-    assert determine_exit_code(aggregate) == 0
-    assert metadata["legacy_pytorch_container"] is True
-    assert metadata["legacy_pytorch_storage_start"] == 208
-    assert metadata["legacy_pytorch_storage_end"] == 220
-    assert metadata["pickle_report_status"] == "complete"
-    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
-    assert not any(issue.rule_code == "S212" for issue in aggregate.issues)
-
-
-def test_scan_model_directory_or_file_trusts_nested_protocol0_torch_storage_module_tail(tmp_path: Path) -> None:
-    payload = _build_legacy_pytorch_storage_tail_pickle(
-        protocol=0,
-        protocol0_storage_type="torch.storage.UntypedStorage",
-    )
-    archive_path = tmp_path / "nested-protocol0-storage-module.zip"
-    _create_misnamed_zip(archive_path, {"weights.pt": payload})
-
-    aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
-    metadata = aggregate.file_metadata[str(archive_path)]
-
-    assert determine_exit_code(aggregate) == 1
-    assert metadata["legacy_pytorch_container"] is True
-    assert metadata["legacy_pytorch_storage_key_count"] == 1
-    assert metadata["legacy_pytorch_storage_end"] == len(payload)
-    assert metadata["pickle_report_status"] == "complete"
-    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
-    assert any(issue.rule_code == "S212" for issue in aggregate.issues)
-
-
-def test_scan_model_directory_or_file_trusts_nested_multi_storage_legacy_pytorch_tail(tmp_path: Path) -> None:
-    payload = _build_legacy_pytorch_storage_tail_pickle(storage_keys=("0", "1"))
-    archive_path = tmp_path / "legacy-multi-storage-tail.zip"
-    _create_misnamed_zip(archive_path, {"weights.pt": payload})
-
-    aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
-    metadata = aggregate.file_metadata[str(archive_path)]
-
-    assert determine_exit_code(aggregate) == 0
-    assert metadata["legacy_pytorch_container"] is True
-    assert metadata["legacy_pytorch_storage_key_count"] == 2
-    assert metadata["legacy_pytorch_storage_end"] == len(payload)
-    assert metadata["pickle_report_status"] == "complete"
-    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
-    assert not any(issue.rule_code == "S212" for issue in aggregate.issues)
 
 
 @pytest.mark.parametrize(
