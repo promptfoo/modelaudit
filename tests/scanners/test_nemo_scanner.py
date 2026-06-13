@@ -21,6 +21,7 @@ from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners import nemo_scanner as nemo_scanner_module
+from modelaudit.scanners import tar_scanner as tar_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 from modelaudit.utils.file import detection as file_detection
@@ -391,6 +392,63 @@ class TestNemoScannerBasic:
         assert integrity_checks
         assert integrity_checks[0].rule_code == "S902"
         assert "could not be fully validated" in integrity_checks[0].message
+
+    def test_compressed_nemo_preflight_projects_member_before_reading_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_path / "projected-ratio.nemo"
+        payload = b"A" * (1024 * 1024)
+        with tarfile.open(path, "w:gz") as archive:
+            info = tarfile.TarInfo("weights.bin")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        header_only_ratio = tarfile.RECORDSIZE / path.stat().st_size
+
+        max_stream_bytes_read = 0
+        original_read = tar_scanner_module._TarBoundedStream.read
+
+        def track_stream_read(stream: tar_scanner_module._TarBoundedStream, size: int = -1) -> bytes:
+            nonlocal max_stream_bytes_read
+            data = original_read(stream, size)
+            max_stream_bytes_read = max(max_stream_bytes_read, stream.bytes_read)
+            return data
+
+        monkeypatch.setattr(tar_scanner_module._TarBoundedStream, "read", track_stream_read)
+
+        result = NemoScanner(
+            config={
+                "compressed_max_decompressed_bytes": 2 * 1024 * 1024,
+                "compressed_max_decompression_ratio": header_only_ratio * 2,
+            }
+        ).scan(str(path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert result.success is False
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompression ratio exceeded" in limit_checks[0].message.lower()
+        assert max_stream_bytes_read == tarfile.BLOCKSIZE
+
+    def test_compressed_nemo_preflight_handles_truncated_member_body(self, tmp_path: Path) -> None:
+        path = tmp_path / "truncated-member.nemo"
+        info = tarfile.TarInfo("weights.bin")
+        info.size = 1024 * 1024
+        path.write_bytes(gzip.compress(info.tobuf() + (b"A" * 100)))
+
+        result = NemoScanner(
+            config={
+                "compressed_max_decompressed_bytes": 2 * 1024 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            }
+        ).scan(str(path))
+
+        scan_checks = [check for check in result.checks if check.name == "TAR File Scan"]
+        assert result.success is False
+        assert len(scan_checks) == 1
+        assert scan_checks[0].status == CheckStatus.FAILED
+        assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
 
     def test_truncated_gzip_nemo_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
         """A readable TAR prefix is not enough when the outer gzip stream is incomplete."""

@@ -1049,6 +1049,15 @@ class TarScanner(BaseScanner):
                             return False
 
                     if compression_codec is not None and bounded_stream is not None:
+                        if self._record_projected_compressed_member_limit(
+                            result,
+                            path,
+                            member,
+                            bounded_stream,
+                            compression_codec=compression_codec,
+                            compressed_size=compressed_size,
+                        ):
+                            return False
                         consumed_size = max(consumed_size, bounded_stream.bytes_read)
                         estimated_stream_size = self._finalize_tar_stream_size(consumed_size)
                         if self._record_compressed_stream_limit(
@@ -1099,6 +1108,9 @@ class TarScanner(BaseScanner):
                 compression_codec=compression_codec,
                 compressed_size=compressed_size,
             )
+            return False
+        except (EOFError, OSError, tarfile.TarError, lzma.LZMAError) as exc:
+            self._record_incomplete_tar_scan(result, path, exc)
             return False
 
         return True

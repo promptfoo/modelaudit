@@ -6251,6 +6251,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         magic_format = "unknown"
     elif header_format == "zip":
         magic_format = "zip"
+    elif header_format == "hdf5" and hdf5_signature_offset is not None:
+        magic_format = "hdf5"
     elif header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}:
         magic_format = header_format
     else:
@@ -6333,9 +6335,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
-    if (
-        header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT
-    ) and hdf5_signature_offset is None:
+    if header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_nemo_routing_result(path)
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size

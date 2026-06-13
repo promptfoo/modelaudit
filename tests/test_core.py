@@ -2559,9 +2559,8 @@ def _write_large_benign_keras_hdf5(path: Path) -> None:
         handle.truncate(core_module.DEFAULT_MAX_FILE_READ_SIZE + 4096)
 
 
-def _write_large_valid_userblock_keras_hdf5(path: Path) -> int:
+def _write_large_valid_userblock_keras_hdf5(path: Path, *, userblock_size: int = 16 * 1024 * 1024) -> int:
     h5py = pytest.importorskip("h5py")
-    userblock_size = 16 * 1024 * 1024
     assert userblock_size > HDF5_SIGNATURE_SCAN_MAX_BYTES
     with h5py.File(path, "w", userblock_size=userblock_size) as h5_file:
         h5_file.attrs["model_config"] = json.dumps(
@@ -2570,6 +2569,25 @@ def _write_large_valid_userblock_keras_hdf5(path: Path) -> int:
         h5_file.attrs["keras_version"] = "3.13.2"
     with path.open("ab") as handle:
         handle.truncate(core_module.DEFAULT_MAX_FILE_READ_SIZE + 4096)
+    return userblock_size
+
+
+def _write_tar_hdf5_userblock(path: Path, members: list[tuple[str, bytes]]) -> int:
+    h5py = pytest.importorskip("h5py")
+    userblock_size = 1024 * 1024
+    with h5py.File(path, "w", userblock_size=userblock_size) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]}},
+        )
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+        for name, data in members:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    assert tar_payload.tell() <= userblock_size
+    with path.open("r+b") as handle:
+        handle.write(tar_payload.getvalue())
     return userblock_size
 
 
@@ -8721,6 +8739,89 @@ def test_scan_file_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_p
     assert "hdf5_userblock_zip_probe_incomplete" in result.metadata["scan_outcome_reasons"]
     assert result.metadata["file_backed_scan"] is True
     assert cache_entries == 0
+
+
+def test_scan_file_fails_closed_for_inconclusive_tar_inside_valid_hdf5_userblock(tmp_path: Path) -> None:
+    model_path = tmp_path / "inconclusive-tar-userblock.h5"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [
+            ("weights.bin", b"A" * (128 * 1024)),
+            ("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n"),
+        ],
+    )
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+    cache_dir = tmp_path / "cache"
+    cache_config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    reset_cache_manager()
+    try:
+        file_result = scan_file(str(model_path), config=cache_config)
+        repeated_result = scan_file(str(model_path), config=cache_config)
+        cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+    finally:
+        reset_cache_manager()
+
+    result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    metadata = result.file_metadata[str(model_path)]
+
+    assert file_result.success is False
+    assert repeated_result.success is False
+    assert cache_entries == 0
+    assert "nemo_routing_incomplete" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 2
+
+
+def test_scan_file_preserves_nemo_finding_inside_valid_hdf5_userblock(tmp_path: Path) -> None:
+    model_path = tmp_path / "nemo-tar-userblock.h5"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [
+            ("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n"),
+            ("weights.bin", b"benign weights"),
+        ],
+    )
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == "nemo"
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in result.checks
+    )
+
+
+def test_scan_file_preserves_large_zeroed_hdf5_userblock_above_16_mib(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "large-zeroed-userblock.h5"
+    userblock_size = _write_large_valid_userblock_keras_hdf5(model_path, userblock_size=32 * 1024 * 1024)
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == "hdf5"
+    assert file_detection.detect_file_format_from_magic(str(model_path)) == "hdf5"
+
+    zero_userblock_checks = 0
+    original_check = file_detection._has_zero_filled_hdf5_userblock
+
+    def count_zero_userblock_checks(path: Path, signature_offset: int) -> bool:
+        nonlocal zero_userblock_checks
+        zero_userblock_checks += 1
+        return original_check(path, signature_offset)
+
+    monkeypatch.setattr(file_detection, "_has_zero_filled_hdf5_userblock", count_zero_userblock_checks)
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert zero_userblock_checks == 1
 
 
 def test_directory_scan_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_probe(

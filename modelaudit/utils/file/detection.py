@@ -1,5 +1,6 @@
 import bz2
 import codecs
+import errno
 import gzip
 import json
 import lzma
@@ -253,6 +254,7 @@ _ZIP_MAGIC_SIGNATURES = (
 _TAR_BLOCK_SIZE = 512
 _TAR_EMPTY_ARCHIVE_PROBE_BYTES = 2 * _TAR_BLOCK_SIZE
 _TAR_EMPTY_ARCHIVE_MAX_VERIFY_BYTES = 10 * 1024 * 1024
+_HDF5_ZERO_USERBLOCK_MAX_DENSE_VERIFY_BYTES = 64 * 1024 * 1024
 _TAR_FORMAT_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 _TAR_USTAR_OFFSET = 257
 _TAR_USTAR_MAGIC_SIZE = 5
@@ -6398,6 +6400,33 @@ def _looks_like_uncompressed_tar_header(header: bytes) -> bool:
     return _has_tar_ustar_signature(header) or _has_valid_tar_checksum_header(header)
 
 
+def _has_zero_filled_hdf5_userblock(file_path: Path, signature_offset: int) -> bool:
+    """Verify a zero userblock with bounded dense reads or a sparse-hole proof."""
+    try:
+        with file_path.open("rb") as stream:
+            if hasattr(os, "SEEK_DATA"):
+                try:
+                    next_data_offset = os.lseek(stream.fileno(), 0, os.SEEK_DATA)
+                    if next_data_offset >= signature_offset:
+                        return True
+                except OSError as exc:
+                    if exc.errno == errno.ENXIO:
+                        return True
+
+            if signature_offset > _HDF5_ZERO_USERBLOCK_MAX_DENSE_VERIFY_BYTES:
+                return False
+            stream.seek(0)
+            remaining = signature_offset
+            while remaining > 0:
+                chunk = stream.read(min(64 * 1024, remaining))
+                if not chunk or any(chunk):
+                    return False
+                remaining -= len(chunk)
+            return True
+    except OSError:
+        return False
+
+
 def _classify_empty_tar_prefix(file_path: Path, header: bytes, file_size: int) -> str | None:
     """Classify an apparent empty TAR without trusting its zero prefix alone."""
     has_empty_prefix = (
@@ -6408,6 +6437,10 @@ def _classify_empty_tar_prefix(file_path: Path, header: bytes, file_size: int) -
     )
     if not has_empty_prefix:
         return None
+
+    hdf5_signature_offset = find_hdf5_signature_offset(str(file_path))
+    if hdf5_signature_offset is not None and _has_zero_filled_hdf5_userblock(file_path, hdf5_signature_offset):
+        return "hdf5"
 
     if file_size <= _TAR_EMPTY_ARCHIVE_MAX_VERIFY_BYTES:
         try:
