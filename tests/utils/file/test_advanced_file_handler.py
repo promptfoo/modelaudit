@@ -516,7 +516,9 @@ class TestShardedModelDetector:
         result = AdvancedFileHandler(str(first), CompletingShardScanner()).scan()
 
         assert shard_info is not None
-        assert shard_info["out_of_scope_shards"] == [str(second)]
+        assert [os.path.normcase(os.path.normpath(path)) for path in shard_info["out_of_scope_shards"]] == [
+            os.path.normcase(os.path.normpath(str(second)))
+        ]
         assert result.success is False
         assert "out_of_scope_model_shards" in result.metadata["scan_outcome_reasons"]
 
