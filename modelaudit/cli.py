@@ -3290,10 +3290,13 @@ def _scan_local_or_downloaded_path(
             use_hf_whitelist=runtime.use_hf_whitelist,
             **config_overrides,
         )
-        path_state.record_validated_shard_targets(
-            scan_results,
-            pre_scan_target=pre_scan_shard_target,
-        )
+        if os.path.isfile(actual_path):
+            path_state.record_validated_shard_targets(
+                scan_results,
+                pre_scan_target=pre_scan_shard_target,
+            )
+        else:
+            path_state.record_non_shard_result_errors(scan_results)
         audit_result.aggregate_scan_result(scan_results.model_dump())
         if is_dvc_pointer and has_prior_dvc_coverage:
             audit_result.content_hash = None

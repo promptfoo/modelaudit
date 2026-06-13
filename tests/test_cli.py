@@ -888,6 +888,32 @@ def test_scan_multiple_paths(tmp_path):
     )
 
 
+def test_scan_directory_preserves_zero_based_safetensors_index_authority(tmp_path: Path) -> None:
+    """Final CLI reconciliation must not reinterpret an indexed directory family as one-based."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_names = [f"model-{index:05d}-of-00002.safetensors" for index in range(2)]
+    for shard_name in shard_names:
+        (tmp_path / shard_name).write_bytes(struct.pack("<Q", len(header)) + header)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {f"tensor-{index}": shard_name for index, shard_name in enumerate(shard_names)}}),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(tmp_path), "--scanners", "safetensors", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is True
+    assert not any(
+        record.get("details", {}).get("scan_outcome_reason") == "unexpected_model_shards"
+        for record in [*output_payload["checks"], *output_payload["issues"]]
+    )
+
+
 def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_path: Path) -> None:
     """Explicit shard paths should be reconciled across their separate parent directories."""
     header = b'{"__metadata__":{"format":"pt"}}'

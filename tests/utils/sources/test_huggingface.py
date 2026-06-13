@@ -4213,6 +4213,29 @@ class TestModelDownloadStreaming:
                 budget,
             )
 
+    def test_remote_safetensors_validation_accepts_non_model_shard_stem(self) -> None:
+        """Remote index authority must support valid arbitrary SafeTensors shard stems."""
+        shard_files = [
+            "diffusion_pytorch_model-00001-of-00002.safetensors",
+            "diffusion_pytorch_model-00002-of-00002.safetensors",
+        ]
+        repo_files = ["model.safetensors.index.json", *shard_files]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps(
+            {"weight_map": {f"tensor-{index}": shard for index, shard in enumerate(shard_files)}}
+        ).encode()
+
+        with patch("requests.get", return_value=_FakeRangeResponse(payload)):
+            result = _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                shard_files,
+                budget,
+            )
+
+        assert result == [*shard_files, "model.safetensors.index.json"]
+
     def test_remote_safetensors_validation_metadata_only_refuses_index_reads(self) -> None:
         """Metadata-only planning must not range-read SafeTensors index content."""
         repo_files = [

@@ -1657,22 +1657,24 @@ def _safe_remote_safetensors_index_target(index_file: str, raw_target: str) -> s
     return (index_parent / target_path).as_posix()
 
 
-def _remote_safetensors_family_files(
-    filenames: Collection[str],
-    shard_pattern: str,
-) -> dict[tuple[str, int], set[str]]:
-    """Index remote SafeTensors shard paths by logical parent and declared total."""
-    families: dict[tuple[str, int], set[str]] = {}
+def _remote_safetensors_shard_parts(filename: str) -> tuple[str, int, int] | None:
+    """Parse an arbitrary-stem remote SafeTensors shard name."""
+    match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(PurePosixPath(filename).name)
+    if match is None:
+        return None
+    return match.group("stem"), int(match.group("index")), int(match.group("total"))
+
+
+def _remote_safetensors_family_files(filenames: Collection[str]) -> dict[tuple[str, str, int], set[str]]:
+    """Index remote SafeTensors shard paths by logical parent, stem, and declared total."""
+    families: dict[tuple[str, str, int], set[str]] = {}
     for filename in filenames:
         remote_path = PurePosixPath(filename)
-        shard_match = re.fullmatch(shard_pattern, remote_path.name)
-        if shard_match is None or (shard_match.lastindex or 0) < 2:
+        shard_parts = _remote_safetensors_shard_parts(filename)
+        if shard_parts is None:
             continue
-        try:
-            shard_total = int(shard_match.group(2))
-        except (IndexError, ValueError):
-            continue
-        families.setdefault((remote_path.parent.as_posix(), shard_total), set()).add(filename)
+        shard_stem, _shard_index, shard_total = shard_parts
+        families.setdefault((remote_path.parent.as_posix(), shard_stem, shard_total), set()).add(filename)
     return families
 
 
@@ -1692,8 +1694,6 @@ def _validate_remote_safetensors_indexes(
     from modelaudit.utils.file.handlers import (
         MAX_SAFETENSORS_SHARD_INDEX_BYTES,
         SAFETENSORS_INDEX_NAME,
-        SAFETENSORS_SHARD_PATTERN,
-        ShardedModelDetector,
     )
 
     repo_file_set = set(repo_files)
@@ -1708,8 +1708,8 @@ def _validate_remote_safetensors_indexes(
     selected_safetensors_ancestor_dirs = {
         ancestor.as_posix() for path in selected_safetensors_paths for ancestor in path.parents
     }
-    selected_family_keys = set(_remote_safetensors_family_files(selected_files, SAFETENSORS_SHARD_PATTERN))
-    repo_family_files = _remote_safetensors_family_files(repo_files, SAFETENSORS_SHARD_PATTERN)
+    selected_family_keys = set(_remote_safetensors_family_files(selected_files))
+    repo_family_files = _remote_safetensors_family_files(repo_files)
     relevant_index_files: list[str] = []
     strongly_relevant_index_files: set[str] = set()
     for index_file in repo_files:
@@ -1771,7 +1771,7 @@ def _validate_remote_safetensors_indexes(
 
         raw_targets = list(index_doc["weight_map"].values())
         if not strongly_relevant:
-            scoped_target_families: set[tuple[str, int]] = set()
+            scoped_target_families: set[tuple[str, str, int]] = set()
             for raw_target in raw_targets:
                 if not isinstance(raw_target, str):
                     continue
@@ -1780,12 +1780,12 @@ def _validate_remote_safetensors_indexes(
                 except ValueError:
                     continue
                 scoped_target_path = PurePosixPath(scoped_target)
-                scoped_match = ShardedModelDetector.match_safetensors_shard_filename(scoped_target_path.name)
-                if scoped_match is None:
+                scoped_parts = _remote_safetensors_shard_parts(scoped_target)
+                if scoped_parts is None:
                     continue
-                scoped_total = scoped_match.get("expected_total_shards")
-                if isinstance(scoped_total, int) and scoped_total > 0:
-                    scoped_target_families.add((scoped_target_path.parent.as_posix(), scoped_total))
+                scoped_stem, _scoped_index, scoped_total = scoped_parts
+                if scoped_total > 0:
+                    scoped_target_families.add((scoped_target_path.parent.as_posix(), scoped_stem, scoped_total))
             if selected_family_keys.isdisjoint(scoped_target_families):
                 continue
         if not all(isinstance(target, str) for target in raw_targets):
@@ -1797,20 +1797,19 @@ def _validate_remote_safetensors_indexes(
 
         target_indices: set[int] = set()
         expected_total: int | None = None
-        target_families: dict[tuple[str, int], set[str]] = {}
+        target_families: dict[tuple[str, str, int], set[str]] = {}
         for target_number, target_file in enumerate(target_files, start=1):
             if target_number % 128 == 0:
                 probe_budget.check_deadline(repo_id)
             target_path = PurePosixPath(target_file)
-            shard_match = ShardedModelDetector.match_safetensors_shard_filename(target_path.name)
-            if shard_match is None:
+            shard_parts = _remote_safetensors_shard_parts(target_file)
+            if shard_parts is None:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: "
                     f"SafeTensors index {repo_id}/{index_file} references a non-SafeTensors shard target"
                 )
-            shard_index = shard_match.get("current_shard_index")
-            shard_total = shard_match.get("expected_total_shards")
-            if not isinstance(shard_index, int) or not isinstance(shard_total, int) or shard_total <= 0:
+            shard_stem, shard_index, shard_total = shard_parts
+            if shard_total <= 0:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: "
                     f"SafeTensors index {repo_id}/{index_file} references an invalid shard target"
@@ -1823,7 +1822,7 @@ def _validate_remote_safetensors_indexes(
                     f"SafeTensors index {repo_id}/{index_file} has inconsistent shard totals"
                 )
             target_indices.add(shard_index)
-            target_families.setdefault((target_path.parent.as_posix(), shard_total), set()).add(target_file)
+            target_families.setdefault((target_path.parent.as_posix(), shard_stem, shard_total), set()).add(target_file)
 
         if len(target_families) > 1:
             raise ValueError(
