@@ -649,15 +649,16 @@ DOCUMENTATION_JS_OPTION = (
     + DOCUMENTATION_ENV_OPTION_ARGUMENT
     + rb")|--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?)"
 )
-DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
-    DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:"
+DOCUMENTATION_PIP_INSTALL_COMMAND = (
     rb"(?:"
     + DOCUMENTATION_PYTHON_LAUNCHER
     + rb"(?:\s+"
     + DOCUMENTATION_PYTHON_OPTION
     + rb"){0,8}\s+-m\s+)?pip(?:[0-9.]+)?"
     rb"(?:\s+" + DOCUMENTATION_PIP_OPTION + rb"){0,8}\s+install"
-    rb"|pipx\s+install"
+)
+DOCUMENTATION_PACKAGE_INSTALL_COMMAND = (
+    rb"(?:" + DOCUMENTATION_PIP_INSTALL_COMMAND + rb"|pipx\s+install"
     rb"|uv\s+(?:pip\s+install|add)"
     rb"|(?:conda|mamba|micromamba)\s+install"
     rb"|poetry\s+add"
@@ -667,8 +668,19 @@ DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     rb"|cargo\s+install"
     rb"|gem\s+install"
     rb"|go\s+install"
-    rb")\b",
+    rb")\b"
+)
+DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + DOCUMENTATION_PACKAGE_INSTALL_COMMAND,
     re.IGNORECASE,
+)
+DOCUMENTATION_DIRECT_PACKAGE_INSTALL_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_PIP_INSTALL_COMMAND + rb"\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_PACKAGE_VERSION_ARGUMENT_PATTERN = re.compile(
+    rb"\s+[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?"
+    rb"==(?P<version>[0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*$"
 )
 DOCUMENTATION_PACKAGE_INSTALL_PROSE_TAIL_PATTERN = re.compile(
     rb"(?:\b(?:is|are|was|were)\s+(?:covered|described|documented|explained)\s+(?:at|in|on)"
@@ -1584,22 +1596,41 @@ class TextScanner(BaseScanner):
             return False
         position = finding.get("position")
         ip = finding.get("ip")
-        if not isinstance(position, int) or not isinstance(ip, str):
+        if not isinstance(position, int) or position < 0 or position > len(payload) or not isinstance(ip, str):
             return False
-        line_parts = cls._finding_line_parts(payload, finding)
-        if line_parts is None:
-            return False
-        line, line_position = line_parts
         ip_bytes = ip.encode()
-        return (
-            DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(line.lstrip()) is not None
-            and b"://" not in line
-            and line_position >= 2
-            and line[line_position - 2 : line_position] == b"=="
-            and payload[position : position + len(ip_bytes)] == ip_bytes
-            and payload.find(ip_bytes) == position
-            and payload.find(ip_bytes, position + len(ip_bytes)) == -1
+        line_start_limit = max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_separator = max(
+            payload.rfind(b"\n", line_start_limit, position),
+            payload.rfind(b"\r", line_start_limit, position),
         )
+        if previous_separator < 0 and line_start_limit > 0:
+            return False
+        line_start = previous_separator + 1
+        line_end_limit = min(len(payload), position + len(ip_bytes) + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        next_separators = (
+            separator
+            for separator in (
+                payload.find(b"\n", position, line_end_limit),
+                payload.find(b"\r", position, line_end_limit),
+            )
+            if separator >= 0
+        )
+        line_end = min(next_separators, default=line_end_limit)
+        if line_end == line_end_limit and line_end_limit < len(payload):
+            return False
+        line = payload[line_start:line_end]
+        line_position = position - line_start
+        stripped = line.lstrip()
+        leading_bytes = len(line) - len(stripped)
+        install_match = DOCUMENTATION_DIRECT_PACKAGE_INSTALL_PATTERN.match(stripped)
+        if install_match is None:
+            return False
+        argument_match = DOCUMENTATION_PACKAGE_VERSION_ARGUMENT_PATTERN.fullmatch(stripped[install_match.end() :])
+        if argument_match is None:
+            return False
+        version_position = leading_bytes + install_match.end() + argument_match.start("version")
+        return line_position == version_position and argument_match.group("version") == ip_bytes
 
     @staticmethod
     def _documentation_f_string_expression_contains_position(token_text: str, local_position: int) -> bool:
