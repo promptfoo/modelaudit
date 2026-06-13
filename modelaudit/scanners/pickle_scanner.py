@@ -1992,7 +1992,7 @@ def _pickle_literal_contains_imported_network_alias_call(context: bytes) -> bool
 
 
 def _pickle_literal_has_executable_network_context(literal: bytes) -> bool:
-    context = _PICKLE_LITERAL_URL_RE.sub(b" ", literal)
+    context = re.sub(rb"\\\r?\n[ \t]*", b"", _PICKLE_LITERAL_URL_RE.sub(b" ", literal))
     lowered = context.lower()
     compact = re.sub(rb"\s+", b"", lowered)
     if any(seed in lowered or seed in compact for seed in _EXECUTABLE_NETWORK_LITERAL_SEEDS):
@@ -4511,8 +4511,9 @@ class PickleScanner(BaseScanner):
         lower_data = data.lower()
         present_bytes = frozenset(lower_data)
 
-        self._scan_raw_text_indicators(data, result, source, lower_data=lower_data, present_bytes=present_bytes)
-        self._scan_encoded_text_indicators(data, result, source)
+        raw_scan_data = _pickle_literal_url_stripped_scan_view(data)
+        self._scan_raw_text_indicators(data, raw_scan_data, result, source, lower_data, present_bytes)
+        self._scan_encoded_text_indicators(raw_scan_data, result, source)
         self._analyze_cve_patterns(
             data,
             result,
@@ -4877,13 +4878,12 @@ class PickleScanner(BaseScanner):
     def _scan_raw_text_indicators(
         self,
         data: bytes,
+        scan_data: bytes,
         result: ScanResult,
         source: str,
-        *,
         lower_data: bytes | None = None,
         present_bytes: frozenset[int] | None = None,
     ) -> None:
-        scan_data = _pickle_literal_url_stripped_scan_view(data)
         if scan_data is data:
             lower = data.lower() if lower_data is None else lower_data
         else:

