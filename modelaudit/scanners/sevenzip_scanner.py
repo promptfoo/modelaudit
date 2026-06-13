@@ -1493,7 +1493,7 @@ class SevenZipScanner(BaseScanner):
                 file_result = self._scan_nested_archive_entry(scan_path, nested_config)
 
             self._rewrite_nested_result_context(file_result, scan_path, archive_path, original_name)
-            result.merge(file_result)
+            result.merge_member_result(file_result, original_name)
             return not member_scan_incomplete(file_result)
 
         except Exception as e:

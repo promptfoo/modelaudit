@@ -950,6 +950,33 @@ def test_compressed_scanner_scans_each_concatenated_member(
     assert member_routing_checks[1].details["inner_scanner"] == "pickle"
 
 
+def test_compressed_scanner_member_hash_identity_is_path_independent(tmp_path: Path) -> None:
+    compressed_payload = gzip.compress(b"harmless prelude\n") + gzip.compress(pickle.dumps(_MaliciousPayload()))
+    first_path = tmp_path / "first" / "payload.txt.gz"
+    second_path = tmp_path / "second" / "payload.txt.gz"
+    first_path.parent.mkdir()
+    second_path.parent.mkdir()
+    first_path.write_bytes(compressed_payload)
+    second_path.write_bytes(compressed_payload)
+
+    first = scan_model_directory_or_file(str(first_path), cache_enabled=False)
+    second = scan_model_directory_or_file(str(second_path), cache_enabled=False)
+    first_metadata = first.file_metadata[str(first_path)].model_dump(mode="json", exclude_none=True)
+    second_metadata = second.file_metadata[str(second_path)].model_dump(mode="json", exclude_none=True)
+
+    assert first.content_hash == second.content_hash
+    assert first_metadata["file_hashes"]["sha256"] == second_metadata["file_hashes"]["sha256"]
+    for metadata in (first_metadata, second_metadata):
+        member_hashes = metadata["member_file_hashes"]
+        member_records = [
+            record
+            for record in member_hashes.values()
+            if isinstance(record, dict) and record.get("path_segments") == ["payload.txt#member-2"]
+        ]
+        assert len(member_records) == 1
+        assert str(tmp_path) not in member_records[0]["logical_path"]
+
+
 def test_compressed_scanner_rejects_excess_concatenated_members(tmp_path: Path) -> None:
     path = tmp_path / "too_many_members.pkl.zlib"
     path.write_bytes(zlib.compress(b"a") + zlib.compress(b"b") + zlib.compress(b"c"))
