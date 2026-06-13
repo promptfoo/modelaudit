@@ -38,7 +38,7 @@ from importlib.machinery import (
 from importlib.util import cache_from_source
 from pathlib import Path, PurePosixPath
 from types import CodeType, ModuleType
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -725,6 +725,85 @@ def _write_rebindable_trusted_torch_utils_package(site_packages: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _write_source_dependent_trusted_torch_utils_package(site_packages: Path) -> None:
+    package_dir = site_packages / "torch"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "_utils.py").write_text(
+        "\n".join(
+            [
+                "def _restore_device_fake_mode(tensor):",
+                "    return tensor",
+                "def _rebuild_tensor_v2(tensor):",
+                "    return _restore_device_fake_mode(tensor)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _scan_source_dependent_torch_rebuild_tensor_v2(
+    tmp_path: Path,
+    *,
+    rebound_name: str = "",
+    marker_text: str = "",
+) -> dict[str, Any]:
+    payload_path = tmp_path / "poststartup-torch-rebuild-tensor-v2.pkl"
+    payload_path.write_bytes(_metadata_reduce_payload("torch._utils", "_rebuild_tensor_v2") + b".")
+    marker = tmp_path / f"{payload_path.stem}.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_source_dependent_trusted_torch_utils_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import torch._utils as torch_utils\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "rebound_name = sys.argv[2]\n"
+        "marker = Path(sys.argv[3])\n"
+        "marker_text = sys.argv[4]\n"
+        "if rebound_name:\n"
+        "    namespace = {'__name__': 'torch._utils', 'marker': marker, 'marker_text': marker_text}\n"
+        "    source = (\n"
+        "        f'def {rebound_name}(arg):\\n'\n"
+        "        \"    marker.write_text(marker_text, encoding='utf-8')\\n\"\n"
+        "        '    return None\\n'\n"
+        "    )\n"
+        "    exec(compile(source, str(Path(torch_utils.__file__)), 'exec'), namespace)\n"
+        "    setattr(torch_utils, rebound_name, namespace[rebound_name])\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "if rebound_name:\n"
+        "    pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), rebound_name, str(marker), marker_text],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    return cast(dict[str, Any], json.loads(completed.stdout))
 
 
 def _write_cross_module_rebind_target_package(site_packages: Path) -> None:
@@ -8218,6 +8297,55 @@ def test_scan_file_trusts_source_backed_framework_reference_imported_after_scann
     assert not any(
         finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
         and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_trusts_source_dependent_framework_reconstruction_loaded_after_startup(
+    tmp_path: Path,
+) -> None:
+    output = _scan_source_dependent_torch_rebuild_tensor_v2(tmp_path)
+    assert output["status"] == ScanStatus.COMPLETE.value
+    assert output["verdict"] == SafetyVerdict.CLEAN.value
+    assert not any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "torch._utils._rebuild_tensor_v2"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_late_loaded_framework_reconstruction_function_is_rebound(
+    tmp_path: Path,
+) -> None:
+    output = _scan_source_dependent_torch_rebuild_tensor_v2(
+        tmp_path,
+        rebound_name="_rebuild_tensor_v2",
+        marker_text="forged-function",
+    )
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "torch._utils._rebuild_tensor_v2"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_late_loaded_framework_reconstruction_helper_is_rebound(
+    tmp_path: Path,
+) -> None:
+    output = _scan_source_dependent_torch_rebuild_tensor_v2(
+        tmp_path,
+        rebound_name="_restore_device_fake_mode",
+        marker_text="forged-helper",
+    )
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "torch._utils._rebuild_tensor_v2"
         for finding in output["findings"]
     )
 
