@@ -1616,6 +1616,7 @@ def test_scan_model_streaming_total_one_rebases_pinned_result_paths(
     assert determine_exit_code(result) == 0
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows open-handle pinning prevents source replacement")
 def test_scan_model_streaming_total_one_source_change_after_pinning_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

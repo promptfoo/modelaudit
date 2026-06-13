@@ -2206,6 +2206,10 @@ class TestAdvancedFileHandler:
         assert restricted.bytes_scanned == shard_one.stat().st_size
         assert expanded.bytes_scanned == shard_one.stat().st_size + shard_two.stat().st_size
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="Windows hard-link pinning changes shard identity, so family caching is disabled",
+    )
     def test_cached_advanced_scan_keys_index_search_root(
         self,
         tmp_path: Path,
