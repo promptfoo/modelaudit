@@ -88,7 +88,12 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file_with_metadata, should_skip_file
-from .utils.file.handlers import ShardedModelDetector, ValidatedShardTargets, _count_expected_shard_indices
+from .utils.file.handlers import (
+    SAFETENSORS_SHARD_PATTERN,
+    ShardedModelDetector,
+    ValidatedShardTargets,
+    _count_expected_shard_indices,
+)
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -1684,6 +1689,14 @@ class _SourceDispatchResult:
     repository_current_file: str | None = None
 
 
+@dataclass(frozen=True)
+class _ExplicitShardFamily:
+    """Trusted reconciliation metadata for one explicit local shard argument."""
+
+    group: str
+    authoritative_index_base: str | None = None
+
+
 @dataclass
 class _ScanPathState:
     """Bookkeeping for scanned artifacts and deferred cleanup."""
@@ -1696,7 +1709,7 @@ class _ScanPathState:
     dvc_covered_paths: set[str] = field(default_factory=set)
     dvc_covered_directories: set[str] = field(default_factory=set)
     validated_shard_targets: ValidatedShardTargets = field(default_factory=dict)
-    explicit_shard_family_groups: dict[str, str] = field(default_factory=dict)
+    explicit_shard_families: dict[str, _ExplicitShardFamily] = field(default_factory=dict)
     has_errors_outside_reconciled_shards: bool = False
 
     def mark_non_shard_error(self, audit_result: ModelAuditResultModel) -> None:
@@ -1724,10 +1737,10 @@ class _ScanPathState:
         if scan_result.has_errors:
             self.has_errors_outside_reconciled_shards = True
 
-    def explicit_shard_family_group_for(self, path: str) -> str | None:
-        """Return the opt-in family group only for an exact explicit file argument."""
+    def explicit_shard_family_for(self, path: str) -> _ExplicitShardFamily | None:
+        """Return trusted family metadata only for an exact explicit file argument."""
         normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
-        return self.explicit_shard_family_groups.get(normalized_path)
+        return self.explicit_shard_families.get(normalized_path)
 
     def record_validated_shard_targets(
         self,
@@ -1742,11 +1755,12 @@ class _ScanPathState:
             metadata = scan_result.file_metadata.get(asset.path)
             if metadata is not None and metadata.get("operational_error") is True:
                 continue
-            explicit_family_group = self.explicit_shard_family_group_for(asset.path)
+            explicit_family = self.explicit_shard_family_for(asset.path)
             post_scan_target = _snapshot_validated_shard_target(
                 asset.path,
-                family_group=explicit_family_group,
-                family_group_policy="explicit" if explicit_family_group else None,
+                family_group=explicit_family.group if explicit_family else None,
+                family_group_policy="explicit" if explicit_family else None,
+                authoritative_shard_index_base=(explicit_family.authoritative_index_base if explicit_family else None),
             )
             if not post_scan_target:
                 continue
@@ -2251,8 +2265,51 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
     return expanded, missing_globs
 
 
-def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str]:
-    """Map exact local file arguments to conservative explicit-family groups."""
+def _validated_explicit_shard_index_base(
+    paths: list[str],
+    *,
+    scope: str,
+    expected_total: int,
+) -> str | None:
+    """Return a validated index base when one index governs exactly the explicit paths."""
+    shard_info = ShardedModelDetector.detect_shards(
+        paths[0],
+        allowed_paths=paths,
+        index_search_root=scope,
+    )
+    if not isinstance(shard_info, dict):
+        return None
+    index_base = shard_info.get("shard_index_base")
+    if (
+        index_base not in {"zero", "one"}
+        or not isinstance(shard_info.get("safetensors_index_path"), str)
+        or shard_info.get("safetensors_index_error")
+        or shard_info.get("expected_total_shards") != expected_total
+        or shard_info.get("total_shards") != expected_total
+    ):
+        return None
+    if any(
+        shard_info.get(key)
+        for key in (
+            "missing_shard_count",
+            "unexpected_shard_count",
+            "unreadable_shard_count",
+            "out_of_scope_shard_count",
+            "unvalidated_shard_count",
+            "duplicate_shard_count",
+        )
+    ):
+        return None
+    normalized_shards = {
+        os.path.normcase(os.path.normpath(os.path.abspath(shard_path)))
+        for shard_path in shard_info.get("shards", [])
+        if isinstance(shard_path, str)
+    }
+    return index_base if normalized_shards == set(paths) else None
+
+
+def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, _ExplicitShardFamily]:
+    """Map exact local file arguments to conservative explicit-family metadata."""
     grouped_paths: dict[tuple[str, int], list[tuple[str, Path, int]]] = {}
     seen_paths: set[str] = set()
     for path_str in paths:
@@ -2295,8 +2352,8 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str
             (normalized_path, Path(resolved_path), shard_index)
         )
 
-    groups: dict[str, str] = {}
-    for (pattern, expected_total), records in grouped_paths.items():
+    groups: dict[str, _ExplicitShardFamily] = {}
+    for (_pattern, expected_total), records in grouped_paths.items():
         targets_by_scope: dict[str, dict[int, list[str]]] = {}
         scopes_by_source: dict[str, set[str]] = {}
         for normalized_path, resolved_path_obj, shard_index in records:
@@ -2306,25 +2363,45 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str
                 source_scopes.add(normalized_scope)
                 targets_by_scope.setdefault(normalized_scope, {}).setdefault(shard_index, []).append(normalized_path)
 
-        complete_scopes: set[str] = set()
+        complete_scopes: dict[str, str | None] = {}
+        expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(expected_total)
         for scope, targets_by_index in targets_by_scope.items():
-            expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(
-                pattern,
-                expected_total,
-                set(targets_by_index),
+            complete_by_name = (
+                len(targets_by_index) == _count_expected_shard_indices(expected_indices)
+                and all(shard_index in expected_indices for shard_index in targets_by_index)
+                and all(len(targets) == 1 for targets in targets_by_index.values())
             )
-            if len(targets_by_index) != _count_expected_shard_indices(expected_indices):
-                continue
-            if any(shard_index not in expected_indices for shard_index in targets_by_index):
-                continue
-            if any(len(targets) != 1 for targets in targets_by_index.values()):
-                continue
-            complete_scopes.add(scope)
+            authoritative_index_base: str | None = None
+            if not complete_by_name:
+                if _pattern != SAFETENSORS_SHARD_PATTERN:
+                    continue
+                scoped_paths = [path for targets in targets_by_index.values() for path in targets]
+                authoritative_index_base = _validated_explicit_shard_index_base(
+                    scoped_paths,
+                    scope=scope,
+                    expected_total=expected_total,
+                )
+                if authoritative_index_base is None:
+                    continue
+                authoritative_indices = ShardedModelDetector._expected_index_range(
+                    expected_total,
+                    zero_based=authoritative_index_base == "zero",
+                )
+                if (
+                    len(targets_by_index) != _count_expected_shard_indices(authoritative_indices)
+                    or any(shard_index not in authoritative_indices for shard_index in targets_by_index)
+                    or any(len(targets) != 1 for targets in targets_by_index.values())
+                ):
+                    continue
+            complete_scopes[scope] = authoritative_index_base
         for normalized_path, _resolved_path, _shard_index in records:
-            matching_scopes = scopes_by_source[normalized_path] & complete_scopes
+            matching_scopes = scopes_by_source[normalized_path] & complete_scopes.keys()
             if matching_scopes:
                 family_scope = max(matching_scopes, key=lambda scope: len(Path(scope).parts))
-                groups[normalized_path] = f"explicit-cli:{family_scope}"
+                groups[normalized_path] = _ExplicitShardFamily(
+                    group=f"explicit-cli:{family_scope}",
+                    authoritative_index_base=complete_scopes[family_scope],
+                )
     return groups
 
 
@@ -3093,12 +3170,13 @@ def _scan_local_or_downloaded_path(
     """Scan a local artifact or a downloaded path resolved by source dispatch."""
     actual_path = source_result.actual_path
     display_path = _display_path(path)
-    explicit_family_group = path_state.explicit_shard_family_group_for(actual_path)
+    explicit_family = path_state.explicit_shard_family_for(actual_path)
     pre_scan_shard_target = (
         _snapshot_validated_shard_target(
             actual_path,
-            family_group=explicit_family_group,
-            family_group_policy="explicit" if explicit_family_group else None,
+            family_group=explicit_family.group if explicit_family else None,
+            family_group_policy="explicit" if explicit_family else None,
+            authoritative_shard_index_base=explicit_family.authoritative_index_base if explicit_family else None,
         )
         if os.path.isfile(actual_path)
         else {}
@@ -4764,7 +4842,7 @@ def scan_command(
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
     path_state = _ScanPathState(
         collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths),
-        explicit_shard_family_groups=_explicit_local_shard_family_groups(paths) if assume_shard_family else {},
+        explicit_shard_families=_explicit_local_shard_family_groups(paths) if assume_shard_family else {},
     )
 
     # Scan each path with interrupt handling

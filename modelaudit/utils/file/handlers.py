@@ -379,6 +379,7 @@ def _build_advanced_shard_family_cache_fingerprint(
         "out_of_scope_shard_count",
         "unreadable_shard_count",
         "unvalidated_shard_count",
+        "unexpected_shard_count",
     ):
         count = shard_info.get(count_key)
         if count is not None and (type(count) is not int or count != 0):
@@ -390,6 +391,7 @@ def _build_advanced_shard_family_cache_fingerprint(
         "out_of_scope_shards",
         "unreadable_shards",
         "unvalidated_shards",
+        "unexpected_shards",
     ):
         suspect_members = shard_info.get(members_key)
         if suspect_members is not None and (not isinstance(suspect_members, list) or suspect_members):
@@ -515,12 +517,6 @@ def _summarize_missing_shard_indices(
     return missing_indices, missing_count, missing_count > len(missing_indices)
 
 
-def _is_single_safetensors_shard_path(path: str | os.PathLike[str]) -> bool:
-    """Return whether a path names the only member of a SafeTensors shard family."""
-    shard_match = ShardedModelDetector.match_safetensors_shard_filename(Path(path).name)
-    return bool(shard_match is not None and shard_match.get("expected_total_shards") == 1)
-
-
 class ShardedModelDetector:
     """Detect and handle sharded model files."""
 
@@ -543,30 +539,30 @@ class ShardedModelDetector:
     @classmethod
     def expected_indices_for_shard_family(
         cls,
-        pattern: str,
         expected_total: int,
-        present_indices: set[int] | None = None,
         authoritative_indices: ExpectedShardIndices | None = None,
     ) -> tuple[ExpectedShardIndices, str]:
         """Return the expected shard indices and the base policy used for a shard family."""
         if authoritative_indices is not None:
             zero_based = cls._expected_index_range(expected_total, zero_based=True)
             one_based = cls._expected_index_range(expected_total, zero_based=False)
-            authoritative_set = set(authoritative_indices)
-            if authoritative_set == set(zero_based):
+            if authoritative_indices == zero_based or (
+                not isinstance(authoritative_indices, range)
+                and len(authoritative_indices) == _count_expected_shard_indices(zero_based)
+                and all(index in zero_based for index in authoritative_indices)
+            ):
                 return zero_based, "zero"
-            if authoritative_set == set(one_based):
+            if authoritative_indices == one_based or (
+                not isinstance(authoritative_indices, range)
+                and len(authoritative_indices) == _count_expected_shard_indices(one_based)
+                and all(index in one_based for index in authoritative_indices)
+            ):
                 return one_based, "one"
-            return frozenset(authoritative_set), "custom"
+            return frozenset(authoritative_indices), "custom"
 
         one_based = cls._expected_index_range(expected_total, zero_based=False)
-        if pattern != SAFETENSORS_SHARD_PATTERN:
-            return one_based, "one"
-
-        observed_indices = present_indices or set()
-        zero_based = cls._expected_index_range(expected_total, zero_based=True)
-        if 0 in observed_indices and all(index in zero_based for index in observed_indices):
-            return zero_based, "zero"
+        # A shard named 00000 is not sufficient evidence that the family is
+        # zero-based. Only a validated SafeTensors index may change the base.
         return one_based, "one"
 
     @classmethod
@@ -694,14 +690,14 @@ class ShardedModelDetector:
 
             zero_based = cls._expected_index_range(index_expected_total, zero_based=True)
             one_based = cls._expected_index_range(index_expected_total, zero_based=False)
-            if target_indices == set(zero_based):
+            if all(index in zero_based for index in target_indices):
                 return _SafetensorsShardIndexInventory(
                     index_path=index_path,
                     expected_source_paths=frozenset(expected_paths),
                     expected_indices=zero_based,
                     index_base="zero",
                 )
-            if target_indices == set(one_based):
+            if all(index in one_based for index in target_indices):
                 return _SafetensorsShardIndexInventory(
                     index_path=index_path,
                     expected_source_paths=frozenset(expected_paths),
@@ -998,9 +994,7 @@ class ShardedModelDetector:
                         else None
                     )
                     expected_indices, index_base = cls.expected_indices_for_shard_family(
-                        pattern,
                         requested_expected_total,
-                        present_indices,
                         authoritative_indices=authoritative_indices,
                     )
                     shard_info["shard_index_base"] = index_base
@@ -1644,6 +1638,8 @@ class ParallelShardHandler:
     def _expected_family_members(self) -> set[str]:
         """Return every lexical family member categorized during detection."""
         members: set[str] = set()
+        pattern = self.shard_info.get("pattern")
+        expected_total = self.shard_info.get("expected_total_shards")
         for key in (
             "shards",
             "unreadable_shards",
@@ -1654,7 +1650,17 @@ class ParallelShardHandler:
         ):
             values = self.shard_info.get(key)
             if isinstance(values, list):
-                members.update(str(Path(value).absolute()) for value in values if isinstance(value, str))
+                for value in values:
+                    if not isinstance(value, str) or not isinstance(pattern, str):
+                        continue
+                    match = re.fullmatch(pattern, Path(value).name)
+                    if match is None:
+                        continue
+                    if isinstance(expected_total, int) and (match.lastindex or 0) >= 2:
+                        with suppress(IndexError, ValueError):
+                            if int(match.group(2)) != expected_total:
+                                continue
+                    members.add(str(Path(value).absolute()))
         return members
 
     def _current_family_members(self) -> set[str]:

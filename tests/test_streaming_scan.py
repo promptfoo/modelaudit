@@ -14,8 +14,9 @@ import time
 import uuid
 import zipfile
 from collections.abc import Iterator
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -1209,16 +1210,14 @@ def test_scan_model_directory_hf_cache_onnx_external_data_keeps_snapshot_alias_i
 
 
 @pytest.mark.parametrize("delete_after_scan", [False, True])
-@pytest.mark.parametrize("start_index", [0, 1], ids=["zero-based", "one-based"])
 def test_scan_model_streaming_reconciles_cross_directory_shard_coverage(
     delete_after_scan: bool,
-    start_index: int,
 ) -> None:
     """A complete streamed family should not fail merely because each shard has its own directory."""
     header = b'{"__metadata__":{"format":"pt"}}'
     with ExitStack() as stack:
         shards: list[Path] = []
-        for shard_index in range(start_index, start_index + 3):
+        for shard_index in range(1, 4):
             staging_root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
             shard_dir = staging_root / "huggingface" / "models--org--repo" / "snapshots" / "revision"
             shard_dir.mkdir(parents=True)
@@ -1247,6 +1246,66 @@ def test_scan_model_streaming_reconciles_cross_directory_shard_coverage(
             "scan_outcome_message" not in metadata.model_dump(exclude_none=True)
             for metadata in result.file_metadata.values()
         )
+
+
+def test_scan_model_streaming_zero_based_family_without_index_fails_closed(tmp_path: Path) -> None:
+    """Observed shard names alone must not authorize a zero-based family."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shards: list[Path] = []
+    for shard_index in range(3):
+        shard_dir = tmp_path / f"modelaudit_stream_part-{shard_index}"
+        shard_dir.mkdir(mode=0o700)
+        shard = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        shards.append(shard)
+
+    result = scan_model_streaming(
+        file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+        timeout=30,
+        delete_after_scan=False,
+        shard_family_group="trusted-stream:model-a",
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "unexpected_model_shards" for check in result.checks)
+
+
+def test_scan_model_streaming_zero_based_family_uses_validated_index(tmp_path: Path) -> None:
+    """A stable index may authorize a complete zero-based streaming family."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shards: list[Path] = []
+    weight_map: dict[str, str] = {}
+    for shard_index in range(2):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir(mode=0o700)
+        shard = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        shards.append(shard)
+        weight_map[f"tensor-{shard_index}"] = shard.relative_to(tmp_path).as_posix()
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}),
+        encoding="utf-8",
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        shard_family_group="trusted-stream:model-a",
+        _trusted_shard_family_root=_make_trusted_stream_shard_root(str(tmp_path)),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not any(
+        check.details.get("scan_outcome_reason") in {"missing_model_shards", "unexpected_model_shards"}
+        for check in result.checks
+    )
 
 
 def test_scan_model_streaming_preserves_max_total_size_failure_after_shard_reconciliation(
@@ -1416,10 +1475,28 @@ def test_scan_model_streaming_total_one_mixed_base_family_fails_closed(
     assert determine_exit_code(result) == 2
     assert cached_result.success is False
     assert determine_exit_code(cached_result) == 2
-    assert all(
-        "unexpected_model_shards" in metadata.model_dump().get("scan_outcome_reasons", [])
-        for metadata in result.file_metadata.values()
+    assert "unexpected_model_shards" in result.file_metadata[str(shards[0])].model_dump().get(
+        "scan_outcome_reasons", []
     )
+
+
+def test_scan_model_streaming_total_one_zero_based_without_index_scans_payload(tmp_path: Path) -> None:
+    """Fail-closed zero-based coverage must not suppress payload findings."""
+    malicious_header = b'{"__metadata__":{"api_key":"SECRET_METADATA_TOKEN"}}'
+    shard = tmp_path / "model-00000-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(malicious_header)) + malicious_header)
+
+    result = scan_model_streaming(
+        file_generator=iter([(shard, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(check.details.get("scan_outcome_reason") == "unexpected_model_shards" for check in result.checks)
+    assert result.success is False
+    assert determine_exit_code(result) == 2
 
 
 def test_scan_model_streaming_total_one_duplicate_index_fails_closed(
@@ -1432,7 +1509,7 @@ def test_scan_model_streaming_total_one_duplicate_index_fails_closed(
     for source_number in range(2):
         shard_dir = tmp_path / f"modelaudit_stream_source-{source_number}"
         shard_dir.mkdir(mode=0o700)
-        shard = shard_dir / "model-00000-of-00001.safetensors"
+        shard = shard_dir / "model-00001-of-00001.safetensors"
         shard.write_bytes(struct.pack("<Q", len(header)) + header)
         shards.append(shard)
 
@@ -1488,7 +1565,88 @@ def test_scan_model_streaming_total_one_consults_authoritative_index(
 
     assert result.success is False
     assert determine_exit_code(result) == 2
-    assert any(check.details.get("scan_outcome_reason") == expected_reason for check in result.checks)
+    assert any(
+        expected_reason in metadata.model_dump().get("scan_outcome_reasons", [])
+        for metadata in result.file_metadata.values()
+    )
+
+
+def test_scan_model_streaming_total_one_rebases_pinned_result_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Descriptor-bound scans must report the original streamed shard path."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00000-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"tensor": shard.name}}),
+        encoding="utf-8",
+    )
+    pinned_dir = tmp_path / "alternate-pinned-path"
+    pinned_dir.mkdir()
+    pinned_path = pinned_dir / shard.name
+
+    @contextmanager
+    def alternate_pinned_path(_resolved_path: str, _target: dict[str, int | str]) -> Iterator[Any]:
+        shutil.copyfile(shard, pinned_path)
+        try:
+            yield SimpleNamespace(path=str(pinned_path), changed_during_scan=False)
+        finally:
+            pinned_path.unlink(missing_ok=True)
+
+    monkeypatch.setattr("modelaudit.core._pinned_shard_scan_path", alternate_pinned_path)
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(str(tmp_path)),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        skip_file_types=True,
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    shard_detection = next(check for check in result.checks if check.name == "Sharded Model Detection")
+    path_checks = [check for check in result.checks if check.name in {"Path Exists", "Path Readable"}]
+    assert shard_detection.details["shards"] == [str(shard)]
+    assert path_checks
+    assert all(check.details["path"] == str(shard) for check in path_checks)
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+
+
+def test_scan_model_streaming_total_one_source_change_after_pinning_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A total-one source replaced after its pinned scan cannot reconcile cleanly."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    replacement_header = b'{"__metadata__":{"format":"tf"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    replacement = tmp_path / "replacement.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    replacement.write_bytes(struct.pack("<Q", len(replacement_header)) + replacement_header)
+    real_scan_file = scan_file
+
+    def replace_source_after_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        result = real_scan_file(path, config=config)
+        replacement.replace(shard)
+        return result
+
+    monkeypatch.setattr("modelaudit.core.scan_file", replace_source_after_scan)
+
+    result = scan_model_streaming(
+        file_generator=iter([(shard, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        shard_family_group="trusted-stream:model-a",
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
 
 
 @pytest.mark.parametrize("start_index", [0, 1], ids=["zero-based", "one-based"])
@@ -1523,9 +1681,13 @@ def test_scan_model_streaming_preserves_malicious_cross_directory_shard_findings
 
     assert result.files_scanned == 3
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-    assert determine_exit_code(result) == 1
-    assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
-    assert not any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+    assert determine_exit_code(result) == (2 if start_index == 0 else 1)
+    if start_index == 0:
+        assert any(check.details.get("scan_outcome_reason") == "unexpected_model_shards" for check in result.checks)
+        assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+    else:
+        assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+        assert not any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
 
 
 def test_streaming_shard_alias_aba_cannot_hide_malicious_content() -> None:
@@ -1585,7 +1747,7 @@ def test_streaming_total_one_shard_alias_aba_cannot_hide_malicious_content(tmp_p
     safe = tmp_path / "safe.safetensors"
     malicious.write_bytes(struct.pack("<Q", len(malicious_header)) + malicious_header)
     safe.write_bytes(struct.pack("<Q", len(safe_header)) + safe_header)
-    alias = tmp_path / "model-00000-of-00001.safetensors"
+    alias = tmp_path / "model-00001-of-00001.safetensors"
     alias.symlink_to(malicious.name)
     real_scan_file = scan_file
 

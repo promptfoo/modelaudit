@@ -1760,9 +1760,10 @@ def _validate_remote_safetensors_indexes(
                 "Hugging Face selective filtering incomplete: "
                 f"SafeTensors index {repo_id}/{index_file} shard count does not match filenames"
             )
-        if target_indices not in (
-            set(range(0, expected_total)),
-            set(range(1, expected_total + 1)),
+        zero_based = range(0, expected_total)
+        one_based = range(1, expected_total + 1)
+        if not all(index in zero_based for index in target_indices) and not all(
+            index in one_based for index in target_indices
         ):
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "

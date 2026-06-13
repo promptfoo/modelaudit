@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- validate SafeTensors index-driven zero-based shard families without widening selected scanners to foreign shard formats
+- validate SafeTensors index-driven zero-based shard families without widening selected scanners to foreign shard formats, trusting zero-based names without index authority, exposing transient descriptor paths, or accepting post-pin source changes in streaming results
 - keep nested archive and PyTorch ZIP member hashes separate from parent artifact integrity hashes across JSON, cache, SARIF, SBOM, and streaming scans
 - suppress installed source-trusted inert Hugging Face training metadata and safe NumPy RNG-state reconstruction noise while keeping default-install, unresolved, rebound, or shadowed PyTorch ZIP framework metadata suspicious unless trusted source can be inspected
 - contextualize SafeTensors license metadata so ordinary embedded license text does not produce URL or long-value noise while preserving malformed and executable metadata detections

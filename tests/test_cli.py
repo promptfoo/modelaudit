@@ -919,6 +919,50 @@ def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_pat
     )
 
 
+@pytest.mark.parametrize(("with_index", "expected_exit_code"), [(False, 2), (True, 0)])
+def test_scan_multiple_cross_directory_zero_based_shards_requires_index_authority(
+    tmp_path: Path,
+    with_index: bool,
+    expected_exit_code: int,
+) -> None:
+    """Explicit zero-based families reconcile only when an exact index governs them."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    weight_map: dict[str, str] = {}
+    for shard_index in range(2):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        _make_trusted_shard_parent(shard_dir)
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+        weight_map[f"tensor-{shard_index}"] = shard_path.relative_to(tmp_path).as_posix()
+    if with_index:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}),
+            encoding="utf-8",
+        )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == expected_exit_code, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is with_index
+    if with_index:
+        assert not any(
+            check.get("details", {}).get("scan_outcome_reason") in {"missing_model_shards", "unexpected_model_shards"}
+            for check in output_payload["checks"]
+        )
+    else:
+        assert any(
+            check.get("details", {}).get("scan_outcome_reason") == "unexpected_model_shards"
+            for check in output_payload["checks"]
+        )
+
+
 def test_scan_cross_directory_shards_ignores_duplicate_explicit_argument(tmp_path: Path) -> None:
     """Repeating one exact shard argument must not invalidate a complete family."""
     header = b'{"__metadata__":{"format":"pt"}}'

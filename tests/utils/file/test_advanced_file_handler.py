@@ -377,6 +377,24 @@ class TestShardedModelDetector:
         assert shard_info["missing_shard_count"] == 1
         assert shard_info["missing_shard_indices"] == [2]
 
+    def test_detect_zero_based_safetensors_without_index_fails_closed(self, tmp_path: Path) -> None:
+        """Zero-based names require a validated SafeTensors index."""
+        shard_zero = tmp_path / "model-00000-of-00002.safetensors"
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_zero.write_bytes(b"zero")
+        shard_one.write_bytes(b"one")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_zero))
+        result = AdvancedFileHandler(str(shard_zero), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["shard_index_base"] == "one"
+        assert shard_info["unexpected_shards"] == [str(shard_zero)]
+        assert shard_info["missing_shard_indices"] == [2]
+        assert result.success is False
+        assert "unexpected_model_shards" in result.metadata["scan_outcome_reasons"]
+        assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
+
     def test_detect_zero_based_safetensors_missing_index_target_fails_closed(self, tmp_path: Path) -> None:
         """A zero-based index inventory must not hide an absent shard."""
         shard_zero = tmp_path / "model-00000-of-00003.safetensors"
@@ -781,6 +799,19 @@ class TestShardedModelDetector:
         assert shard_info["missing_shard_count"] == 999999999998
         assert len(shard_info["missing_shard_indices"]) == MAX_RECORDED_MISSING_SHARD_INDICES
         assert shard_info["missing_shard_indices_truncated"] is True
+
+    def test_expected_indices_accept_huge_authoritative_range_without_materializing_it(self) -> None:
+        """Validated range comparison must remain constant-space for huge declared totals."""
+        expected_total = 999_999_999_999
+        authoritative_indices = range(0, expected_total)
+
+        expected_indices, index_base = ShardedModelDetector.expected_indices_for_shard_family(
+            expected_total,
+            authoritative_indices=authoritative_indices,
+        )
+
+        assert expected_indices == authoritative_indices
+        assert index_base == "zero"
 
     def test_detect_shards_ignores_suffix_near_matches(self, tmp_path: Path) -> None:
         """Shard routing should not count files that only prefix-match a shard name."""
@@ -2502,6 +2533,7 @@ class TestAdvancedFileHandler:
             ("out_of_scope_shard_count", 1),
             ("unreadable_shard_count", 1),
             ("unvalidated_shard_count", 1),
+            ("unexpected_shard_count", 1),
             ("duplicate_shard_count", True),
             ("missing_shard_count", "1"),
         ],
@@ -2535,6 +2567,7 @@ class TestAdvancedFileHandler:
             ("out_of_scope_shards", ["outside"]),
             ("unreadable_shards", ["unreadable"]),
             ("unvalidated_shards", ["unvalidated"]),
+            ("unexpected_shards", ["unexpected"]),
             ("duplicate_shards", "duplicate"),
             ("missing_shard_indices_truncated", True),
             ("missing_shard_indices_truncated", 0),
