@@ -2210,13 +2210,22 @@ def test_scan_model_streaming_openvino_prefetched_companion_changes_content_hash
     assert first_result.content_hash != second_result.content_hash
 
 
-def test_scan_model_streaming_onnx_external_data_contributes_content_hash(tmp_path: Path) -> None:
+def test_scan_model_streaming_onnx_external_data_contributes_content_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A staged ONNX external_data sidecar must remain part of the streaming aggregate hash."""
     model_path = tmp_path / "model.onnx"
     sidecar_path = tmp_path / "model.onnx_data"
     model_path.write_bytes(create_external_onnx_payload(tmp_path))
     sidecar_path.write_bytes(struct.pack("f", 1.0))
     expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+    onnx = pytest.importorskip("onnx")
+    monkeypatch.setattr(
+        onnx,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("streaming sidecar discovery must not preload ONNX"),
+    )
 
     result = scan_model_streaming(
         file_generator=iter([(model_path, True)]),
@@ -2244,6 +2253,178 @@ def test_scan_model_streaming_onnx_external_data_contributes_content_hash(tmp_pa
     assert_only_onnx_external_schema_validation_skipped(changed_result)
     assert changed_result.content_hash == changed_hash
     assert changed_result.content_hash != result.content_hash
+
+
+def test_streamed_onnx_sidecar_discovery_invokes_interrupt_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit import core
+    from modelaudit.scanners import onnx_scanner
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    onnx = pytest.importorskip("onnx")
+    parsed_model = onnx.load_model_from_string(model_path.read_bytes())
+    callback_invocations = 0
+
+    def cancel() -> None:
+        nonlocal callback_invocations
+        callback_invocations += 1
+        if callback_invocations == 3:
+            raise KeyboardInterrupt
+
+    def load_without_invoking_callback(
+        _path: str,
+        _file_size: int,
+        _interrupt_check: Any,
+        *,
+        expected_stat: os.stat_result,
+    ) -> Any:
+        assert expected_stat.st_size == model_path.stat().st_size
+        return parsed_model, object()
+
+    monkeypatch.setattr(core, "check_interrupted", cancel)
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", load_without_invoking_callback)
+
+    with pytest.raises(KeyboardInterrupt):
+        core._streamed_onnx_external_data_hash_paths(model_path)
+    assert callback_invocations == 3
+
+
+def test_streamed_onnx_sidecar_discovery_honors_scan_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit import core
+    from modelaudit.scanners import onnx_scanner
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+
+    def invoke_interrupt_check(
+        _path: str,
+        _file_size: int,
+        interrupt_check: Any,
+        *,
+        expected_stat: os.stat_result,
+    ) -> Any:
+        assert expected_stat.st_size == model_path.stat().st_size
+        interrupt_check()
+        pytest.fail("expired ONNX discovery should stop before parsing")
+
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", invoke_interrupt_check)
+
+    with pytest.raises(TimeoutError, match="external_data discovery exceeded"):
+        core._streamed_onnx_external_data_hash_paths(model_path, deadline=time.time() - 1)
+
+
+def test_scan_model_streaming_onnx_sidecar_discovery_enforces_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners import onnx_scanner
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+
+    def delay_until_deadline(
+        _path: str,
+        _file_size: int,
+        interrupt_check: Any,
+        *,
+        expected_stat: os.stat_result,
+    ) -> Any:
+        assert expected_stat.st_size == model_path.stat().st_size
+        time.sleep(1.05)
+        interrupt_check()
+        pytest.fail("expired ONNX discovery should not return a parsed model")
+
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", delay_until_deadline)
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=1,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.content_hash is None
+
+
+def test_scan_model_streaming_defers_hash_when_onnx_sidecar_discovery_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners import onnx_scanner
+
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(struct.pack("f", 1.0))
+
+    def fail_bounded_discovery(*_args: Any, **_kwargs: Any) -> Any:
+        raise onnx_scanner._OnnxStructureParseError(
+            "retained_object_limit_exceeded",
+            "bounded discovery exhausted its retained-object budget",
+        )
+
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", fail_bounded_discovery)
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert result.content_hash is None
+
+
+def test_scan_model_streaming_defers_file_backed_onnx_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.utils.helpers import file_hash as file_hash_module
+
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(struct.pack("f", 1.0))
+    hashed_paths: list[Path] = []
+
+    def record_hash(path: Path) -> str:
+        hashed_paths.append(path)
+        return "a" * 64
+
+    monkeypatch.setattr(file_hash_module, "compute_sha256_hash", record_hash)
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=True,
+        scanners=["onnx"],
+        skip_file_types=False,
+        onnx_raw_detector_max_bytes=1,
+    )
+
+    assert result.content_hash is None
+    assert hashed_paths == []
+    assert result.bytes_scanned == model_path.stat().st_size + sidecar_path.stat().st_size
+    assert result.file_metadata[str(model_path)]["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+    assert any(
+        check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+        for check in result.checks
+    )
 
 
 def test_scan_model_streaming_onnx_external_data_refetch_does_not_duplicate_content_hash(
