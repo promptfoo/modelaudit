@@ -37,6 +37,7 @@ from .tar_scanner import (
     TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY,
     TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY,
     TarScanner,
+    _tar_shared_scan_budget_exhausted,
     _tar_shared_scan_budget_scope,
 )
 
@@ -1701,7 +1702,7 @@ class NemoScanner(BaseScanner):
                 if not self._tar_member_materializes_file_content(member):
                     continue
 
-                if inspect_embedded_members:
+                if inspect_embedded_members and not _tar_shared_scan_budget_exhausted(self.config):
                     self._scan_embedded_member_for_known_risks(tar, member, path, result)
 
                 # Check for suspicious files in the archive
@@ -2051,9 +2052,13 @@ class NemoScanner(BaseScanner):
             )
             return False
 
+        nemo_owned_entries.update(referenced_member_name for _, referenced_member_name in referenced_members)
         for config_path, referenced_member_name in referenced_members:
-            nemo_owned_entries.add(referenced_member_name)
             referenced_member_contexts.setdefault(referenced_member_name, (config_file, config_path))
+
+        for config_path, referenced_member_name in referenced_members:
+            if _tar_shared_scan_budget_exhausted(self.config):
+                break
             if referenced_member_name in scanned_member_entries:
                 continue
             referenced_member_scanned = self._scan_config_referenced_member(
@@ -2923,6 +2928,9 @@ class NemoScanner(BaseScanner):
         entry_name: str | None = None,
     ) -> None:
         """Run existing nested scanners over small NeMo checkpoint members."""
+        if _tar_shared_scan_budget_exhausted(self.config):
+            return
+
         report_entry = entry_name or member.name
         max_scan_bytes = self._normalize_positive_int_config(
             self.config.get("max_nemo_checkpoint_scan_bytes"),
@@ -3020,6 +3028,9 @@ class NemoScanner(BaseScanner):
         scanned_regular_checkpoint_sources: set[tuple[str, int]],
     ) -> bool:
         """Scan `nemo:`-referenced archive members through content-based nested dispatch."""
+        if _tar_shared_scan_budget_exhausted(self.config):
+            return False
+
         try:
             member = tar.getmember(referenced_member_name)
         except KeyError:

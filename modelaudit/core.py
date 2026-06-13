@@ -6335,7 +6335,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
-    if header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+    nemo_routing_inconclusive = (
+        header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    )
+    validated_hdf5_nemo_overlap = nemo_routing_inconclusive and hdf5_signature_offset is not None
+    if nemo_routing_inconclusive and not validated_hdf5_nemo_overlap:
         sr = _make_incomplete_nemo_routing_result(path)
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
@@ -6571,6 +6575,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             elif (
                 is_xgboost_pickle_spoof
                 or bypass_cache_for_pytorch_read_limit
+                or validated_hdf5_nemo_overlap
                 or (scanner_id == "nemo" and gzip_tar_trailing_status is not None)
             ):
                 result = scanner.scan(path)
@@ -6644,6 +6649,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     unavailable_preferred_scanner_id is not None
                     or is_xgboost_pickle_spoof
                     or bypass_cache_for_pytorch_read_limit
+                    or validated_hdf5_nemo_overlap
                     or (scanner_class.name == "nemo" and gzip_tar_trailing_status is not None)
                 ):
                     result = scanner.scan(path)
@@ -6764,6 +6770,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             else:
                 sr = _make_unavailable_recognized_format_result(path, magic_format, scanner_id)
             result = sr
+
+    if validated_hdf5_nemo_overlap:
+        result.merge(_make_incomplete_nemo_routing_result(path))
 
     if skipped_overlap_scanner_id:
         add_scanner_selection_skip_check(

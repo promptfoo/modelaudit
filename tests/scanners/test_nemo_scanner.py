@@ -22,6 +22,7 @@ except ImportError:
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanners import archive_dispatch
 from modelaudit.scanners import nemo_scanner as nemo_scanner_module
 from modelaudit.scanners import tar_scanner as tar_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
@@ -102,6 +103,54 @@ def _create_nemo_with_nested_tar_checkpoints(
                 _add_tar_bytes(nested_archive, f"tensor-{index}.bin", bytes([index]) * payload_size)
             _add_tar_bytes(archive, f"weights-{index}.ckpt", checkpoint.getvalue())
     return nemo_path
+
+
+class _NestedWorkCounters:
+    def __init__(self) -> None:
+        self.checkpoint_dispatches = 0
+        self.reference_dispatches = 0
+        self.nested_extractions = 0
+        self.extracted_members: list[str] = []
+        self.decompressed_bytes = 0
+
+
+def _track_nested_work(monkeypatch: pytest.MonkeyPatch) -> _NestedWorkCounters:
+    counters = _NestedWorkCounters()
+    original_checkpoint_dispatch = nemo_scanner_module._get_nested_scanner_for_file
+    original_reference_dispatch = archive_dispatch.scan_nested_file
+    original_extract = NemoScanner._extract_member_to_tempfile
+    original_gzip_read = gzip.GzipFile.read
+
+    def count_checkpoint_dispatch(path: str, *, config: dict[str, Any]) -> Any:
+        counters.checkpoint_dispatches += 1
+        return original_checkpoint_dispatch(path, config=config)
+
+    def count_reference_dispatch(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        counters.reference_dispatches += 1
+        return original_reference_dispatch(path, config=config)
+
+    def count_extract(
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        *,
+        suffix_source: str | None = None,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        counters.extracted_members.append(member.name)
+        if suffix_source is not None:
+            counters.nested_extractions += 1
+        return original_extract(tar, member, suffix_source=suffix_source, max_bytes=max_bytes)
+
+    def count_gzip_read(stream: gzip.GzipFile, size: int = -1) -> bytes:
+        data = original_gzip_read(stream, size)
+        counters.decompressed_bytes += len(data)
+        return data
+
+    monkeypatch.setattr(nemo_scanner_module, "_get_nested_scanner_for_file", count_checkpoint_dispatch)
+    monkeypatch.setattr(archive_dispatch, "scan_nested_file", count_reference_dispatch)
+    monkeypatch.setattr(NemoScanner, "_extract_member_to_tempfile", staticmethod(count_extract))
+    monkeypatch.setattr(gzip.GzipFile, "read", count_gzip_read)
+    return counters
 
 
 def _build_nemo_tar_bytes(config_bytes: bytes, *, mode: _NemoTarWriteMode = "w:gz") -> bytes:
@@ -7526,9 +7575,129 @@ class TestCVE202523304HydraTarget:
         finally:
             reset_cache_manager()
 
+    def test_declared_nemo_aggregate_budget_exhaustion_stops_later_nested_work(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        checkpoint = io.BytesIO()
+        with tarfile.open(fileobj=checkpoint, mode="w:gz") as nested_archive:
+            _add_tar_bytes(nested_archive, "tensor.bin", b"x" * 8_000)
+        checkpoint_payload = checkpoint.getvalue()
+
+        nemo_path = tmp_path / "many-nested-checkpoints.nemo"
+        with tarfile.open(nemo_path, "w") as archive:
+            _add_tar_bytes(archive, "weights-0.ckpt", checkpoint_payload)
+            _add_tar_bytes(archive, "artifacts/tokenizer.model", checkpoint_payload)
+            _add_tar_bytes(
+                archive,
+                "model_config.yaml",
+                (b"model:\n  _target_: os.system\ntokenizer:\n  model: nemo:artifacts/tokenizer.model\n"),
+            )
+            for index in range(1, 100):
+                _add_tar_bytes(archive, f"weights-{index}.ckpt", checkpoint_payload)
+
+        counters = _track_nested_work(monkeypatch)
+        result = scan_file(
+            str(nemo_path),
+            config={
+                "cache_enabled": False,
+                "max_tar_total_uncompressed_size": 15_000,
+            },
+        )
+
+        aggregate_checks = [
+            check
+            for check in result.checks
+            if check.name == "TAR Aggregate Size Limit Check" and check.status == CheckStatus.FAILED
+        ]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(aggregate_checks) == 1
+        assert aggregate_checks[0].rule_code == "S410"
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(check.details.get("target") == "os.system" for check in result.checks)
+        assert counters.checkpoint_dispatches == 1
+        assert counters.reference_dispatches == 0
+        assert counters.nested_extractions == 1
+        assert all(member_name == "weights-0.ckpt" for member_name in counters.extracted_members)
+        assert 0 < counters.decompressed_bytes <= 2 * tarfile.RECORDSIZE
+
+        aggregate_result = scan_model_directory_or_file(
+            str(nemo_path),
+            max_tar_total_uncompressed_size=15_000,
+            cache_scan_results=False,
+        )
+        assert aggregate_result.success is False
+        assert any(issue.details.get("target") == "os.system" for issue in aggregate_result.issues)
+        assert determine_exit_code(aggregate_result) == 1
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_total_uncompressed_size=15_000,
+            )
+
+            assert cached_aggregate.success is False
+            assert determine_exit_code(cached_aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_declared_nemo_reference_budget_exhaustion_stops_later_references(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nested_tar = io.BytesIO()
+        with tarfile.open(fileobj=nested_tar, mode="w:gz") as nested_archive:
+            _add_tar_bytes(nested_archive, "tensor.bin", b"x" * 8_000)
+        nested_payload = nested_tar.getvalue()
+
+        nemo_path = tmp_path / "nested-references.nemo"
+        config_payload = b"artifacts:\n" + b"".join(
+            f"  item_{index}: nemo:artifacts/{index}.bin\n".encode() for index in range(3)
+        )
+        with tarfile.open(nemo_path, "w") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", config_payload)
+            for index in range(3):
+                _add_tar_bytes(archive, f"artifacts/{index}.bin", nested_payload)
+
+        counters = _track_nested_work(monkeypatch)
+        result = scan_file(
+            str(nemo_path),
+            config={
+                "cache_enabled": False,
+                "max_tar_total_uncompressed_size": 4_000,
+            },
+        )
+
+        aggregate_checks = [
+            check
+            for check in result.checks
+            if check.name == "TAR Aggregate Size Limit Check" and check.status == CheckStatus.FAILED
+        ]
+        assert result.success is False
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(aggregate_checks) == 1
+        assert counters.checkpoint_dispatches == 0
+        assert counters.reference_dispatches == 1
+        assert counters.nested_extractions == 1
+        assert not {"artifacts/1.bin", "artifacts/2.bin"}.intersection(counters.extracted_members)
+        assert 0 < counters.decompressed_bytes <= 2 * tarfile.RECORDSIZE
+
     def test_declared_nemo_nested_checkpoint_within_aggregate_budget_remains_complete(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         nemo_path = _create_nemo_with_nested_tar_checkpoints(
             tmp_path,
@@ -7537,6 +7706,7 @@ class TestCVE202523304HydraTarget:
             payload_size=8_000,
         )
 
+        counters = _track_nested_work(monkeypatch)
         result = scan_file(
             str(nemo_path),
             config={
@@ -7548,6 +7718,10 @@ class TestCVE202523304HydraTarget:
 
         assert result.scanner_name == "nemo"
         assert result.success is True
+        assert counters.checkpoint_dispatches == 1
+        assert result.metadata.get("analysis_incomplete") is not True
+        assert "scan_outcome" not in result.metadata
+        assert not result.metadata.get("scan_outcome_reasons")
         assert not [
             check
             for check in result.checks

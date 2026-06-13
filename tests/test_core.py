@@ -8775,11 +8775,83 @@ def test_scan_file_fails_closed_for_inconclusive_compressed_tar_inside_valid_hdf
     result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
     metadata = result.file_metadata[str(model_path)]
 
+    assert file_result.scanner_name == "keras_h5"
+    assert repeated_result.scanner_name == "keras_h5"
     assert file_result.success is False
     assert repeated_result.success is False
     assert cache_entries == 0
+    assert "nemo_routing_incomplete" in file_result.metadata["scan_outcome_reasons"]
+    assert "keras_h5" in result.scanner_names
+    assert "unknown" not in result.scanner_names
     assert "nemo_routing_incomplete" in metadata["scan_outcome_reasons"]
     assert determine_exit_code(result) == 2
+
+
+def test_scan_file_preserves_keras_finding_for_inconclusive_tar_inside_valid_hdf5_userblock(
+    tmp_path: Path,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "malicious-inconclusive-tar-userblock.h5"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [
+            ("weights.bin", b"A" * (128 * 1024)),
+            ("model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n"),
+        ],
+        compressed=True,
+    )
+    with h5py.File(model_path, "r+") as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "config": {"function": "lambda x: __import__('os').system('id')"},
+                        }
+                    ]
+                },
+            }
+        )
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+    cache_dir = tmp_path / "cache"
+    cache_config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    reset_cache_manager()
+    try:
+        file_result = scan_file(str(model_path), config=cache_config)
+        repeated_result = scan_file(str(model_path), config=cache_config)
+        cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+    finally:
+        reset_cache_manager()
+
+    aggregate_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    metadata = aggregate_result.file_metadata[str(model_path)]
+
+    for result in (file_result, repeated_result):
+        assert result.scanner_name == "keras_h5"
+        assert result.success is False
+        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+        assert any(
+            issue.message == "Lambda layer contains dangerous Python code" and issue.severity == IssueSeverity.CRITICAL
+            for issue in result.issues
+        )
+
+    assert cache_entries == 0
+    assert "keras_h5" in aggregate_result.scanner_names
+    assert "unknown" not in aggregate_result.scanner_names
+    assert "nemo_routing_incomplete" in metadata["scan_outcome_reasons"]
+    assert any(
+        issue.message == "Lambda layer contains dangerous Python code" and issue.severity == IssueSeverity.CRITICAL
+        for issue in aggregate_result.issues
+    )
+    assert determine_exit_code(aggregate_result) == 1
 
 
 def test_scan_file_preserves_nemo_finding_inside_valid_hdf5_userblock(tmp_path: Path) -> None:
@@ -8795,7 +8867,7 @@ def test_scan_file_preserves_nemo_finding_inside_valid_hdf5_userblock(tmp_path: 
     assert find_hdf5_signature_offset(str(model_path)) == userblock_size
     assert file_detection.detect_file_format(str(model_path)) == "nemo"
 
-    result = scan_file(str(model_path), config={"cache_scan_results": False})
+    result = scan_file(str(model_path), config={"cache_enabled": False})
 
     assert any(
         check.name == "CVE-2025-23304: Dangerous Hydra _target_"
@@ -8826,7 +8898,7 @@ def test_scan_file_preserves_large_zeroed_hdf5_userblock_above_16_mib(
 
     monkeypatch.setattr(file_detection, "_has_zero_filled_hdf5_userblock", count_zero_userblock_checks)
 
-    result = scan_file(str(model_path), config={"cache_scan_results": False})
+    result = scan_file(str(model_path), config={"cache_enabled": False})
 
     assert result.scanner_name == "keras_h5"
     assert zero_userblock_checks == 1

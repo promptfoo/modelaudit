@@ -101,6 +101,12 @@ class _TarCompressedPhysicalTrailingData(ValueError):
 class _TarSharedScanBudget:
     max_total_uncompressed_size: int
     member_bytes_consumed: int = 0
+    exhausted: bool = False
+
+
+def _tar_shared_scan_budget_exhausted(config: dict[str, Any]) -> bool:
+    budget = config.get(TAR_SHARED_SCAN_BUDGET_CONFIG_KEY)
+    return isinstance(budget, _TarSharedScanBudget) and budget.exhausted
 
 
 @contextmanager
@@ -937,11 +943,15 @@ class TarScanner(BaseScanner):
         """Reserve declared member work before traversal can consume its body."""
         member_size = max(member.size if work_size is None else work_size, 0)
         archive_uncompressed_size += member_size
+        if shared_budget.exhausted:
+            return archive_uncompressed_size, False
+
         projected_total = shared_budget.member_bytes_consumed + member_size
         if (
             shared_budget.max_total_uncompressed_size > 0
             and projected_total > shared_budget.max_total_uncompressed_size
         ):
+            shared_budget.exhausted = True
             mark_archive_scan_incomplete(result, TAR_TOTAL_SIZE_INCOMPLETE_REASON)
             self._add_tar_aggregate_size_check(
                 result,
