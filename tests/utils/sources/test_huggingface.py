@@ -3685,9 +3685,9 @@ class TestModelDownloadStreaming:
         ).encode()
         repo_files = ["model.safetensors.index.json", *target_files]
         budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-        budget.check_deadline = MagicMock(side_effect=[None, None, TimeoutError("deadline expired")])
 
         with (
+            patch.object(budget, "check_deadline", side_effect=[None, None, TimeoutError("deadline expired")]),
             patch("requests.get", return_value=_FakeRangeResponse(payload)),
             pytest.raises(TimeoutError, match="deadline expired"),
         ):
