@@ -103,6 +103,7 @@ class _HuggingFaceProbeBudget:
     deadline: float | None = None
     file_sizes: dict[str, int] = field(default_factory=dict)
     prefixes: dict[str, bytes] = field(default_factory=dict)
+    transferred_bytes: int = 0
 
     def reserve(self, repo_id: str, max_bytes: int) -> None:
         """Reserve a bounded remote read or fail closed before issuing it."""
@@ -205,6 +206,14 @@ class _HuggingFaceStrictRangeError(RuntimeError):
         super().__init__(str(error))
         self.error = error
         self.bytes_transferred = bytes_transferred
+
+
+class _DuplicateAwareJsonObject(dict[str, Any]):
+    """JSON object retaining values hidden by duplicate keys."""
+
+    def __init__(self, values: dict[str, Any], overwritten_items: list[tuple[str, Any]]) -> None:
+        super().__init__(values)
+        self.overwritten_items = overwritten_items
 
 
 def _remote_safetensors_source_path(repo_id: str, revision: str, filename: str) -> str:
@@ -692,8 +701,6 @@ def _scan_remote_huggingface_safetensors_header(
                     if payload_range.validator != first_range.validator:
                         raise ValueError("Hugging Face SafeTensors object validator changed during overlap probe")
                     payload_probe = payload_range.data
-                    if payload_probe.startswith(b"\x89HDF\r\n\x1a\n") and "keras_h5" in active_overlap_scanner_ids:
-                        overlap_scanner_ids = sorted({*overlap_scanner_ids, "keras_h5"})
 
                     if "keras_h5" in active_overlap_scanner_ids:
                         from ..file.hdf5 import (
@@ -785,15 +792,7 @@ def _scan_remote_huggingface_safetensors_header(
                         file_size=declared_size,
                         include_pickle=True,
                     )
-                    payload_overlap_scanner_ids = _remote_safetensors_structural_overlap_scanner_ids(
-                        payload_probe,
-                        active_overlap_scanner_ids,
-                        file_size=max(0, declared_size - len(header_payload)),
-                        include_pickle=False,
-                    )
-                    overlap_scanner_ids = sorted(
-                        {*overlap_scanner_ids, *structural_overlap_scanner_ids, *payload_overlap_scanner_ids}
-                    )
+                    overlap_scanner_ids = sorted({*overlap_scanner_ids, *structural_overlap_scanner_ids})
 
             bytes_transferred = total_bytes_transferred + attempt_bytes_transferred
             suffix = ".safetensors" if not Path(filename).suffix else Path(filename).suffix
@@ -1031,6 +1030,22 @@ def _remote_index_parent_prefix(index_filename: str) -> str:
     return "" if parent.as_posix() == "." else f"{parent.as_posix().rstrip('/')}/"
 
 
+def _remote_safetensors_index_filename_family(
+    index_filename: str,
+    selected_safetensors: Collection[str],
+) -> set[str]:
+    """Return selected shards that the index filename can identify without parsing it."""
+    index_family = index_filename[: -len(".safetensors.index.json")]
+    standalone_name = f"{index_family}.safetensors".casefold()
+    shard_prefix = f"{index_family}-".casefold()
+    return {
+        filename
+        for filename in selected_safetensors
+        if filename.casefold() == standalone_name
+        or (filename.casefold().startswith(shard_prefix) and _has_hf_safetensors_shard_shape(filename))
+    }
+
+
 def _normalize_safetensors_index_shard_path(index_filename: str, shard_name: object) -> tuple[str | None, str | None]:
     if not isinstance(shard_name, str) or not shard_name:
         return None, "non-string or empty shard reference"
@@ -1066,14 +1081,16 @@ def _loads_json_without_duplicate_keys(raw: bytes) -> tuple[Any | None, list[str
         nonlocal duplicate_key_count
         obj: dict[str, Any] = {}
         seen: set[str] = set()
+        overwritten_items: list[tuple[str, Any]] = []
         for key, value in pairs:
             if key in seen:
                 duplicate_key_count += 1
+                overwritten_items.append((key, obj[key]))
                 if key not in duplicate_keys and len(duplicate_keys) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
                     duplicate_keys.append(key)
             seen.add(key)
             obj[key] = value
-        return obj
+        return _DuplicateAwareJsonObject(obj, overwritten_items)
 
     try:
         text = raw.decode("utf-8")
@@ -1171,13 +1188,12 @@ def _remote_safetensors_index_details_by_file(
     *,
     deadline: float | None,
     max_transferred_bytes: int | None,
-) -> tuple[dict[str, dict[str, Any]], int]:
+) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes]]:
     """Return per-shard details from bounded SafeTensors index manifests."""
     selected_files = set(model_files)
     repo_file_set = set(repo_files)
-    selected_safetensors = set(model_files)
-    if not selected_safetensors:
-        return {}, 0
+    if not selected_files:
+        return {}, 0, {}
 
     details_by_file: dict[str, dict[str, Any]] = {}
 
@@ -1185,40 +1201,39 @@ def _remote_safetensors_index_details_by_file(
         details_by_file[filename] = _merge_remote_index_details(details_by_file.get(filename), details)
 
     total_index_bytes = 0
+    acquired_index_bytes: dict[str, bytes] = {}
     for index_filename in sorted(filename for filename in repo_files if _is_safetensors_index_file(filename)):
+        filename_family = _remote_safetensors_index_filename_family(index_filename, selected_files)
         if deadline is not None and time.monotonic() >= deadline:
             failure = _index_failure_details(index_filename, "index_reconciliation_timed_out")
-            for filename in selected_safetensors:
+            for filename in filename_family:
                 attach_details(filename, failure)
             break
         parent_prefix = _remote_index_parent_prefix(index_filename)
-        selected_under_index = sorted(
-            filename for filename in selected_safetensors if not parent_prefix or filename.startswith(parent_prefix)
-        )
-        if not selected_under_index:
+        if not any(not parent_prefix or filename.startswith(parent_prefix) for filename in selected_files):
             continue
 
         index_size = path_sizes.get(index_filename)
         if index_size is None:
             failure = _index_failure_details(index_filename, "missing_index_size")
-            for filename in selected_under_index:
+            for filename in filename_family:
                 attach_details(filename, failure)
             continue
         if index_size > _MAX_HF_SAFETENSORS_INDEX_BYTES:
             failure = _index_failure_details(index_filename, "index_exceeds_limit", index_size=index_size)
-            for filename in selected_under_index:
+            for filename in filename_family:
                 attach_details(filename, failure)
             continue
         if total_index_bytes + index_size > _MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES:
             failure = _index_failure_details(
                 index_filename, "aggregate_index_bytes_exceed_limit", index_size=index_size
             )
-            for filename in selected_under_index:
+            for filename in filename_family:
                 attach_details(filename, failure)
             continue
         if max_transferred_bytes is not None and total_index_bytes + index_size > max_transferred_bytes:
             failure = _index_failure_details(index_filename, "index_exceeds_max_size_budget", index_size=index_size)
-            for filename in selected_under_index:
+            for filename in filename_family:
                 attach_details(filename, failure)
             continue
 
@@ -1234,6 +1249,7 @@ def _remote_safetensors_index_details_by_file(
             )
             index_bytes_transferred = index_range.bytes_transferred
             total_index_bytes += index_range.bytes_transferred
+            acquired_index_bytes[index_filename] = index_range.data
             parsed, duplicate_keys, duplicate_key_count, parse_error = _loads_json_without_duplicate_keys(
                 index_range.data
             )
@@ -1242,12 +1258,21 @@ def _remote_safetensors_index_details_by_file(
             if not isinstance(parsed, dict):
                 raise ValueError("SafeTensors index root is not a JSON object")
             metadata = parsed.get("metadata")
-            weight_map = parsed.get("weight_map")
             if metadata is not None and not isinstance(metadata, dict):
                 raise ValueError("SafeTensors index metadata is not a JSON object")
-            if not isinstance(weight_map, dict):
+            weight_map_values = [parsed.get("weight_map")]
+            if isinstance(parsed, _DuplicateAwareJsonObject):
+                weight_map_values.extend(value for key, value in parsed.overwritten_items if key == "weight_map")
+            weight_maps = [value for value in weight_map_values if isinstance(value, dict)]
+            if not weight_maps:
                 raise ValueError("SafeTensors index weight_map is not a JSON object")
-            if len(weight_map) > _MAX_HF_SAFETENSORS_INDEX_TENSORS:
+            invalid_weight_map_count = len(weight_map_values) - len(weight_maps)
+            weight_map_items: list[tuple[str, Any]] = []
+            for weight_map in weight_maps:
+                weight_map_items.extend(weight_map.items())
+                if isinstance(weight_map, _DuplicateAwareJsonObject):
+                    weight_map_items.extend(weight_map.overwritten_items)
+            if len(weight_map_items) > _MAX_HF_SAFETENSORS_INDEX_TENSORS:
                 raise ValueError("SafeTensors index weight_map exceeds tensor entry limit")
         except Exception as exc:
             if isinstance(exc, _HuggingFaceStrictRangeError):
@@ -1260,14 +1285,14 @@ def _remote_safetensors_index_details_by_file(
                 index_size=index_size,
                 error=exc,
             )
-            for filename in selected_under_index:
+            for filename in filename_family:
                 attach_details(filename, failure)
             continue
 
         referenced_by_file: dict[str, list[str]] = {}
-        invalid_entries: list[str] = []
+        invalid_entries = ["weight_map occurrence is not a JSON object"] * invalid_weight_map_count
         reconciliation_timed_out = False
-        for entry_index, (tensor_name, shard_name) in enumerate(weight_map.items()):
+        for entry_index, (tensor_name, shard_name) in enumerate(weight_map_items):
             if entry_index % 1024 == 0 and deadline is not None and time.monotonic() >= deadline:
                 reconciliation_timed_out = True
                 break
@@ -1287,7 +1312,8 @@ def _remote_safetensors_index_details_by_file(
                 bytes_transferred=index_range.bytes_transferred,
                 index_size=index_size,
             )
-            for filename in selected_under_index:
+            scoped_files = filename_family.union(referenced_by_file).intersection(selected_files)
+            for filename in scoped_files:
                 attach_details(filename, failure)
             continue
 
@@ -1325,7 +1351,7 @@ def _remote_safetensors_index_details_by_file(
                 bytes_transferred=index_range.bytes_transferred,
                 index_size=index_size,
             )
-            for filename in selected_under_index:
+            for filename in filename_family.union(selected_referenced):
                 attach_details(filename, failure)
             continue
 
@@ -1336,7 +1362,7 @@ def _remote_safetensors_index_details_by_file(
                 bytes_transferred=index_range.bytes_transferred,
                 index_size=index_size,
             )
-            for filename in selected_under_index:
+            for filename in filename_family.union(selected_referenced):
                 attach_details(filename, failure)
             continue
 
@@ -1356,7 +1382,7 @@ def _remote_safetensors_index_details_by_file(
             "index_bytes_transferred": index_range.bytes_transferred,
             "index_object_validator": index_range.validator,
             "index_final_host": urlparse(index_range.final_url).hostname,
-            "index_weight_map_tensor_count": len(weight_map),
+            "index_weight_map_tensor_count": len(weight_map_items),
             "index_referenced_shard_count": len(referenced_files),
             "index_missing_shard_count": len(missing_files),
             "index_missing_shards": missing_files[:20],
@@ -1386,7 +1412,7 @@ def _remote_safetensors_index_details_by_file(
             ),
         }
         attach_filenames = (
-            selected_under_index
+            sorted(filename_family.union(selected_referenced))
             if duplicate_keys or invalid_entries or invalid_total_size or not selected_referenced
             else selected_referenced
         )
@@ -1400,7 +1426,7 @@ def _remote_safetensors_index_details_by_file(
             details["index_tensor_names_digest"] = tensor_digests_by_file.get(filename, _tensor_name_digest(()))
             attach_details(filename, details)
 
-    return details_by_file, total_index_bytes
+    return details_by_file, total_index_bytes, acquired_index_bytes
 
 
 def _combine_remote_safetensors_shard_details(
@@ -1444,10 +1470,10 @@ def _remote_safetensors_shard_details_by_file(
     *,
     deadline: float | None,
     max_transferred_bytes: int | None,
-) -> tuple[dict[str, dict[str, Any]], int]:
+) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes]]:
     """Return per-shard remote coverage details from filenames and index manifests."""
     filename_details = _remote_safetensors_filename_shard_details_by_file(model_files, repo_files)
-    index_details, index_bytes = _remote_safetensors_index_details_by_file(
+    index_details, index_bytes, acquired_index_bytes = _remote_safetensors_index_details_by_file(
         repo_id,
         model_files,
         repo_files,
@@ -1456,7 +1482,11 @@ def _remote_safetensors_shard_details_by_file(
         deadline=deadline,
         max_transferred_bytes=max_transferred_bytes,
     )
-    return _combine_remote_safetensors_shard_details(filename_details, index_details), index_bytes
+    return (
+        _combine_remote_safetensors_shard_details(filename_details, index_details),
+        index_bytes,
+        acquired_index_bytes,
+    )
 
 
 @dataclass
@@ -1556,7 +1586,8 @@ def _read_huggingface_prefix(
     if len(cached_prefix) >= max_bytes or (known_size is not None and len(cached_prefix) >= known_size):
         return cached_prefix[:max_bytes]
 
-    budget.reserve(repo_id, max_bytes)
+    reserved_bytes = min(max_bytes, known_size) if known_size is not None else max_bytes
+    budget.reserve(repo_id, reserved_bytes)
     try:
         import requests
         from huggingface_hub import hf_hub_url
@@ -1584,6 +1615,7 @@ def _read_huggingface_prefix(
                 budget.check_deadline(repo_id)
                 if not chunk:
                     continue
+                budget.transferred_bytes += len(chunk)
                 chunks.append(chunk)
                 total += len(chunk)
                 if total >= max_bytes:
@@ -1593,7 +1625,7 @@ def _read_huggingface_prefix(
             if file_size is not None:
                 budget.record_file_size(repo_id, filename, file_size)
                 if file_size <= len(prefix):
-                    budget.refund(max_bytes - len(prefix))
+                    budget.refund(reserved_bytes - len(prefix))
             if len(prefix) > len(cached_prefix):
                 budget.prefixes[filename] = prefix
         return prefix
@@ -1668,6 +1700,7 @@ def _read_huggingface_tail(
                 budget.check_deadline(repo_id)
                 if not chunk:
                     continue
+                budget.transferred_bytes += len(chunk)
                 chunks.append(chunk)
                 total += len(chunk)
                 if total >= read_size:
@@ -1753,6 +1786,7 @@ def _read_huggingface_range(
                 budget.check_deadline(repo_id)
                 if not chunk:
                     continue
+                budget.transferred_bytes += len(chunk)
                 remote_chunks.append(chunk)
                 total += len(chunk)
                 if total >= remote_size:
@@ -2613,6 +2647,11 @@ def _detect_huggingface_content_route_format(
     llamafile_route = _detect_huggingface_llamafile_route(repo_id, filename, revision, budget, prefix)
     if llamafile_route is not None:
         return llamafile_route
+
+    from modelaudit.utils.file._compression import is_zlib_header
+
+    if is_zlib_header(prefix[:2]) and prefix[1] & 0x20:
+        return "zlib"
 
     if _looks_like_safetensors_prefix(repo_id, filename, revision, budget, prefix):
         if remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
@@ -4810,17 +4849,24 @@ def plan_huggingface_streaming_download(
         deadline=deadline,
     )
     size_preflight_files = model_files
+    minimum_safetensors_read_bytes = 0
+    safetensors_header_files: set[str] = set()
     if _stream_safetensors_headers:
         safetensors_selection_enabled = scannable_scanner_ids is None or "safetensors" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
         if safetensors_selection_enabled:
-            size_preflight_files = [
+            safetensors_header_files = {
                 filename
                 for filename in model_files
-                if PurePosixPath(filename).suffix.lower() != ".safetensors"
-                and selection.content_route_formats.get(filename) != "safetensors"
-            ]
+                if selection.content_route_formats.get(filename) == "safetensors"
+                or (
+                    PurePosixPath(filename).suffix.lower() == ".safetensors"
+                    and selection.content_route_formats.get(filename) is None
+                )
+            }
+            minimum_safetensors_read_bytes = 8 * len(safetensors_header_files)
+            size_preflight_files = [filename for filename in model_files if filename not in safetensors_header_files]
     revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
         repo_id,
         size_preflight_files,
@@ -4828,6 +4874,45 @@ def plan_huggingface_streaming_download(
         resolved_revision=repo_revision,
         deadline=deadline,
     )
+    declared_safetensors_probe_files = [
+        filename
+        for filename in safetensors_header_files
+        if PurePosixPath(filename).suffix.lower() == ".safetensors"
+        and selection.content_route_formats.get(filename) is None
+    ]
+    if (
+        size_limit is not None
+        and declared_safetensors_probe_files
+        and _active_safetensors_overlap_scanner_ids(scannable_scanner_ids)
+    ):
+        probe_sizes, probe_revision = _get_huggingface_path_sizes(
+            repo_id,
+            declared_safetensors_probe_files,
+            resolved_revision=repo_revision,
+            deadline=deadline,
+        )
+        if probe_revision != repo_revision:
+            raise ValueError(
+                f"Cannot stream {repo_id}: file metadata revision {probe_revision} "
+                f"did not match listing revision {repo_revision}"
+            )
+        for filename in declared_safetensors_probe_files:
+            file_size = probe_sizes.get(filename)
+            if file_size is None:
+                raise ValueError(f"Cannot stream {repo_id}: unknown size for selected file {filename}")
+            selected_sizes[filename] = file_size
+            minimum_safetensors_read_bytes += min(file_size, _HF_CONTENT_SNIFF_BYTES)
+            if not allow_content_probes or file_size <= _HF_CONTENT_SNIFF_BYTES:
+                minimum_safetensors_read_bytes += file_size
+    minimum_selected_bytes = minimum_safetensors_read_bytes + sum(
+        selected_sizes.get(filename, 0) for filename in size_preflight_files
+    )
+    if size_limit is not None and minimum_selected_bytes > size_limit:
+        raise ValueError(
+            f"Cannot stream {repo_id}: selected files plus minimum remote SafeTensors routing reads "
+            f"require at least {minimum_selected_bytes} bytes, "
+            f"exceeding max size {size_limit} bytes"
+        )
     return HuggingFaceDownloadPlan(
         namespace=namespace,
         repo_name=repo_name,
@@ -4973,12 +5058,15 @@ def download_model_streaming(
             scannable_scanner_ids is None
             or "safetensors" in {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}
         )
-        safetensors_header_files = (
+        safetensors_header_candidates = (
             {
                 filename
                 for filename in model_files
-                if PurePosixPath(filename).suffix.lower() == ".safetensors"
-                or selection.content_route_formats.get(filename) == "safetensors"
+                if selection.content_route_formats.get(filename) == "safetensors"
+                or (
+                    PurePosixPath(filename).suffix.lower() == ".safetensors"
+                    and selection.content_route_formats.get(filename) is None
+                )
             }
             if safetensors_header_streaming_allowed
             else set()
@@ -4991,15 +5079,15 @@ def download_model_streaming(
                 and any(
                     not _remote_index_parent_prefix(filename)
                     or selected_file.startswith(_remote_index_parent_prefix(filename))
-                    for selected_file in safetensors_header_files
+                    for selected_file in safetensors_header_candidates
                 )
             }
-            if safetensors_header_files
+            if safetensors_header_candidates
             else set()
         )
         selected_sizes: dict[str, int] = dict(plan.selected_sizes)
         path_sizes: dict[str, int | None] = {}
-        if _include_scan_results and (size_limit is not None or safetensors_header_files):
+        if _include_scan_results and (size_limit is not None or safetensors_header_candidates):
             size_lookup_files = sorted(set(model_files).union(safetensors_index_files))
             path_sizes, metadata_revision = _get_huggingface_path_sizes(
                 repo_id,
@@ -5013,21 +5101,55 @@ def download_model_streaming(
                     f"did not match listing revision {repo_revision}"
                 )
             for filename in model_files:
-                if size_limit is None and filename not in safetensors_header_files:
+                if size_limit is None and filename not in safetensors_header_candidates:
                     continue
                 file_size = path_sizes.get(filename)
                 if file_size is None:
                     raise Exception(f"Cannot stream {repo_id}: unknown size for selected file {filename}")
                 selected_sizes[filename] = file_size
         download_revision = plan.download_revision if not _include_scan_results else repo_revision
-        shard_details_by_file, remote_index_bytes_transferred = _remote_safetensors_shard_details_by_file(
+        safetensors_header_files: set[str] = set()
+        content_probe_budget = (
+            _HuggingFaceProbeBudget(
+                remaining_bytes=min(_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES, size_limit)
+                if size_limit is not None
+                else _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
+                deadline=deadline,
+                file_sizes={filename: selected_sizes[filename] for filename in safetensors_header_candidates},
+            )
+            if _active_safetensors_overlap_scanner_ids(scannable_scanner_ids)
+            else None
+        )
+        for filename in model_files:
+            if filename not in safetensors_header_candidates:
+                continue
+            detected_format = selection.content_route_formats.get(filename)
+            if detected_format == "safetensors" or content_probe_budget is None:
+                safetensors_header_files.add(filename)
+                continue
+            detected_format = _detect_huggingface_content_route_format(
+                repo_id,
+                filename,
+                repo_revision,
+                content_probe_budget,
+            )
+            if detected_format == "safetensors":
+                safetensors_header_files.add(filename)
+            elif detected_format is not None:
+                selection.content_route_formats[filename] = detected_format
+        content_probe_bytes_transferred = content_probe_budget.transferred_bytes if content_probe_budget else 0
+        (
+            shard_details_by_file,
+            remote_index_bytes_transferred,
+            acquired_index_bytes,
+        ) = _remote_safetensors_shard_details_by_file(
             repo_id,
             sorted(safetensors_header_files),
             repo_files,
             repo_revision,
             path_sizes,
             deadline=deadline,
-            max_transferred_bytes=size_limit,
+            max_transferred_bytes=(size_limit - content_probe_bytes_transferred if size_limit is not None else None),
         )
         openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
@@ -5058,12 +5180,13 @@ def download_model_streaming(
         # Download each file one at a time. OpenVINO XML/BIN pairs are staged
         # together, then only the XML is yielded so the scanner owns the logical
         # model and the weights sidecar is not routed as standalone PyTorch.
-        downloaded_total_size = remote_index_bytes_transferred
+        downloaded_total_size = content_probe_bytes_transferred + remote_index_bytes_transferred
         prefetched_selected_paths: dict[str, Path] = {}
         downloaded_selected_paths: dict[str, Path] = {}
         downloaded_context_paths: dict[str, Path] = {}
         context_cleanup_paths: set[Path] = set()
-        accounted_selected_filenames: set[str] = set()
+        acquired_index_temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
+        accounted_selected_filenames = acquired_index_bytes.keys() & selected_file_set
         consumed_filenames: set[str] = set()
 
         def emit_file(path: Path, cleanup_paths: list[Path], is_last: bool) -> Iterator[tuple[Path, bool]]:
@@ -5135,6 +5258,22 @@ def download_model_streaming(
                 )
             return Path(local_path)
 
+        def materialize_acquired_index(filename: str) -> Path | None:
+            payload = acquired_index_bytes.get(filename)
+            if payload is None:
+                return None
+            validated_filename = _validate_huggingface_repo_filename(repo_id, filename)
+            temp_dir = tempfile.TemporaryDirectory(prefix="modelaudit_hf_index_")
+            try:
+                temp_path = Path(temp_dir.name).joinpath(*PurePosixPath(validated_filename).parts)
+                temp_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path.write_bytes(payload)
+            except Exception:
+                temp_dir.cleanup()
+                raise
+            acquired_index_temp_dirs.append(temp_dir)
+            return temp_path
+
         def download_selected_file(filename: str) -> Path:
             nonlocal downloaded_total_size
             downloaded_file = downloaded_selected_paths.get(filename)
@@ -5156,6 +5295,8 @@ def download_model_streaming(
 
             # Download single file
             downloaded_file = prefetched_selected_paths.pop(filename, None)
+            if downloaded_file is None or not downloaded_file.is_file():
+                downloaded_file = materialize_acquired_index(filename)
             if downloaded_file is None or not downloaded_file.is_file():
                 downloaded_file = download_stream_file(filename)
             if size_limit is not None and not already_accounted:
@@ -5322,6 +5463,9 @@ def download_model_streaming(
             for external_path in context_cleanup_paths:
                 with suppress(OSError):
                     external_path.unlink()
+            for temp_dir in acquired_index_temp_dirs:
+                with suppress(OSError):
+                    temp_dir.cleanup()
 
     except Exception as e:
         raise Exception(

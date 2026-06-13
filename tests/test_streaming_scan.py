@@ -3567,6 +3567,60 @@ def test_scan_model_streaming_precomputed_remote_result_does_not_delete_local_ma
     assert result.assets
 
 
+def test_scan_model_streaming_preserves_precomputed_inconclusive_failure_without_cache_write() -> None:
+    """A failed source-native result must remain an operational failure and bypass local caching."""
+    source_path = "hf://test/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model.safetensors"
+    precomputed = ScanResult(scanner_name="safetensors")
+    precomputed.bytes_scanned = 8
+    precomputed.metadata.update(
+        {
+            "remote_header_only": True,
+            "remote_source_path": source_path,
+            "source_path": source_path,
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "remote_safetensors_header_range_failed",
+            "scan_outcome_reasons": ["remote_safetensors_header_range_failed"],
+            "operational_error": True,
+            "operational_error_reason": "remote_safetensors_header_range_failed",
+        }
+    )
+    precomputed.add_check(
+        name="Remote SafeTensors Header Acquisition",
+        passed=False,
+        message="Remote SafeTensors header could not be acquired",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "remote_safetensors_header_range_failed",
+            "operational_error": True,
+        },
+    )
+    precomputed.finish(success=False)
+
+    with (
+        patch("modelaudit.core.scan_file") as mock_scan_file,
+        patch("modelaudit.cache.scan_results_cache.ScanResultsCache.store_result") as mock_cache_store,
+    ):
+        result = scan_model_streaming(
+            file_generator=iter([(Path("model.safetensors"), True, precomputed)]),
+            timeout=30,
+            delete_after_scan=True,
+            cache_enabled=True,
+        )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == 8
+    assert determine_exit_code(result) == 2
+    assert result.file_metadata[source_path].model_dump()["scan_outcome"] == "inconclusive"
+    mock_scan_file.assert_not_called()
+    mock_cache_store.assert_not_called()
+
+
 def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
     temp_test_files: list[Path],
 ) -> None:
