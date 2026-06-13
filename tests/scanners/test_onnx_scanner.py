@@ -7011,16 +7011,24 @@ def _write_terminal_varint_onnx(tmp_path: Path) -> Path:
     return _write_onnx_payload(tmp_path, "terminal-varint.onnx", _proto_varint(1, 8) + b"\x80")
 
 
-def _write_packed_int_parse_work_bomb_onnx(tmp_path: Path) -> Path:
+def _write_packed_integer_tensor_payload_onnx(
+    tmp_path: Path,
+    *,
+    field_number: int,
+    data_type: int,
+    count: int = 100,
+) -> Path:
+    packed_values = b"".join(_encode_proto_varint(128) for _ in range(count))
     tensor = (
-        _proto_varint(1, 100)
-        + _proto_varint(2, int(TensorProto.INT32))
-        + _proto_bytes(5, b"\x00" * 100)
+        _proto_varint(1, count)
+        + _proto_varint(2, data_type)
+        + _proto_bytes(field_number, packed_values)
         + _proto_bytes(8, b"W")
     )
-    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"packed-int-work-bomb")
-    path = tmp_path / "packed-int-work-bomb.onnx"
-    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph))
+    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"packed-integer-payload")
+    path = tmp_path / f"packed-integer-{field_number}.onnx"
+    opset = _proto_varint(2, 18)
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph) + _proto_bytes(8, opset))
     return path
 
 
@@ -7175,6 +7183,37 @@ def _write_result_growth_onnx(tmp_path: Path, *, kind: str, count: int = 10) -> 
     path = tmp_path / f"result-growth-{kind}.onnx"
     path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph))
     return path
+
+
+def _write_safe_external_data_then_traversal_onnx(tmp_path: Path, *, safe_count: int = 3) -> Path:
+    graph = _proto_bytes(2, b"graph")
+    for index in range(safe_count):
+        location = f"safe-{index}.bin"
+        (tmp_path / location).write_bytes(b"x")
+        entry = _proto_bytes(1, b"location") + _proto_bytes(2, location.encode())
+        tensor = (
+            _proto_varint(1, 1)
+            + _proto_varint(2, int(TensorProto.UINT8))
+            + _proto_bytes(8, f"safe-{index}".encode())
+            + _proto_bytes(13, entry)
+            + _proto_varint(14, int(TensorProto.EXTERNAL))
+        )
+        graph += _proto_bytes(5, tensor)
+
+    traversal_entry = _proto_bytes(1, b"location") + _proto_bytes(2, b"../escape.bin")
+    traversal_tensor = (
+        _proto_varint(1, 1)
+        + _proto_varint(2, int(TensorProto.UINT8))
+        + _proto_bytes(8, b"traversal")
+        + _proto_bytes(13, traversal_entry)
+        + _proto_varint(14, int(TensorProto.EXTERNAL))
+    )
+    graph += _proto_bytes(5, traversal_tensor)
+    return _write_onnx_payload(
+        tmp_path,
+        "safe-external-data-then-traversal.onnx",
+        _proto_varint(1, 8) + _proto_bytes(7, graph),
+    )
 
 
 class TestLargeOnnxFileBackedInspection:
@@ -7735,21 +7774,13 @@ class TestLargeOnnxFileBackedInspection:
             state.check_interrupted()
         assert calls == 1
 
-    @pytest.mark.parametrize(
-        "writer",
-        [
-            _write_packed_int_parse_work_bomb_onnx,
-            _write_unknown_field_parse_work_bomb_onnx,
-        ],
-    )
-    def test_file_backed_parse_work_is_bounded(
+    def test_file_backed_unknown_field_parse_work_is_bounded(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        writer: Any,
     ) -> None:
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_MAX_PARSE_STEPS", 20)
-        model_path = writer(tmp_path)
+        model_path = _write_unknown_field_parse_work_bomb_onnx(tmp_path)
 
         result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
 
@@ -7771,15 +7802,46 @@ class TestLargeOnnxFileBackedInspection:
         finally:
             reset_cache_manager()
 
-    def test_file_backed_packed_varints_charge_parse_work(self, tmp_path: Path) -> None:
-        model_path = _write_packed_int_parse_work_bomb_onnx(tmp_path)
+    @pytest.mark.parametrize(
+        ("field_number", "data_type", "field_name"),
+        [
+            (5, int(TensorProto.INT32), "int32_data"),
+            (7, int(TensorProto.INT64), "int64_data"),
+            (11, int(TensorProto.UINT64), "uint64_data"),
+        ],
+    )
+    def test_file_backed_packed_integer_payloads_skip_per_element_parse_work(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        field_number: int,
+        data_type: int,
+        field_name: str,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_MAX_PARSE_STEPS", 20)
+        model_path = _write_packed_integer_tensor_payload_onnx(
+            tmp_path,
+            field_number=field_number,
+            data_type=data_type,
+        )
 
-        _model, state = onnx_scanner_module._load_onnx_structure_file_backed(
+        native = onnx.load_model_from_string(model_path.read_bytes())
+        onnx.checker.check_model(native)
+        lite, state = onnx_scanner_module._load_onnx_structure_file_backed(
             str(model_path),
             model_path.stat().st_size,
         )
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
 
-        assert state.parse_steps > state.fields_seen
+        native_values = getattr(native.graph.initializer[0], field_name)
+        lite_values = getattr(lite.graph.initializer[0], field_name)
+        assert len(native_values) == 100
+        assert len(lite_values) >= len(native_values)
+        assert state.parse_steps == state.fields_seen
+        assert state.omitted_packed_varint_fields == 1
+        assert state.omitted_packed_varint_bytes == 200
+        assert result.metadata["onnx_structure_parse"]["omitted_packed_varint_bytes"] == 200
+        assert not any("protobuf_parse_step_limit_exceeded" in str(check.details) for check in result.checks)
 
     def test_file_backed_loader_detects_same_size_source_mutation(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path)
@@ -7842,6 +7904,28 @@ class TestLargeOnnxFileBackedInspection:
             assert len(result.metadata["custom_domains"]) == 2
         else:
             assert len(self._checks(result, "External Data Reference Check")) == 2
+
+    def test_external_traversal_findings_are_not_starved_by_safe_result_groups(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_RESULT_MAX_DISTINCT_GROUPS", 2)
+        model_path = _write_safe_external_data_then_traversal_onnx(tmp_path)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        assert len(self._checks(result, "External Data Reference Check")) == 2
+        assert self._checks(result, "ONNX Result Reporting Coverage")[-1].details["omitted_count"] == 1
+        cves = {check.details.get("cve_id") for check in result.checks}
+        assert {"CVE-2022-25882", "CVE-2025-51480"}.issubset(cves)
+
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            recursive=False,
+            onnx_raw_detector_max_bytes=1,
+        )
+        assert determine_exit_code(aggregate) == 1
 
     def test_file_backed_tensor_size_results_are_aggregated(self, tmp_path: Path) -> None:
         model_path = _write_result_growth_onnx(tmp_path, kind="tensor", count=100)

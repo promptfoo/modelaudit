@@ -2992,6 +2992,8 @@ class _OnnxStructureParseState:
     interrupt_check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
     omitted_raw_data_fields: int = 0
     omitted_raw_data_bytes: int = 0
+    omitted_packed_varint_fields: int = 0
+    omitted_packed_varint_bytes: int = 0
     node_count: int = 0
     tensor_count: int = 0
     graph_count: int = 0
@@ -3074,6 +3076,8 @@ class _OnnxStructureParseState:
             "parse_mode": "file_backed_structure",
             "omitted_raw_data_fields": self.omitted_raw_data_fields,
             "omitted_raw_data_bytes": self.omitted_raw_data_bytes,
+            "omitted_packed_varint_fields": self.omitted_packed_varint_fields,
+            "omitted_packed_varint_bytes": self.omitted_packed_varint_bytes,
             "node_count": self.node_count,
             "tensor_count": self.tensor_count,
             "graph_count": self.graph_count,
@@ -3395,11 +3399,13 @@ def _parse_onnx_tensor(
                 _read_onnx_varint(handle, end)
                 counts[key_name] += 1
             elif wire_type == 2:
-                _length, payload_end = _read_onnx_length_bounds(handle, end)
-                while handle.tell() < payload_end:
-                    state.check_interrupted()
-                    _read_onnx_varint(handle, payload_end)
-                    counts[key_name] += 1
+                length, payload_end = _read_onnx_length_bounds(handle, end)
+                # Packed integer values are tensor payload. The serialized byte
+                # length is a conservative upper bound on element count and lets
+                # file-backed scans skip multi-GB payloads in constant work.
+                counts[key_name] += length
+                state.omitted_packed_varint_fields += 1
+                state.omitted_packed_varint_bytes += length
                 handle.seek(payload_end)
             else:
                 _skip_onnx_unknown_field(handle, wire_type, end)
@@ -4847,6 +4853,7 @@ class OnnxScanner(BaseScanner):
         symlink_traversal_files: dict[str, _OnnxExternalLocationAggregate] = {}
         safe_files: set[str] = set()
         tracked_locations: set[str] = set()
+        tracked_unsafe_locations: set[str] = set()
         omitted_external_results = 0
         external_size_validations = 0
         missing_location = _OnnxExternalLocationAggregate()
@@ -4855,15 +4862,18 @@ class OnnxScanner(BaseScanner):
             groups: dict[str, _OnnxExternalLocationAggregate],
             location: str,
             tensor_name: str,
+            *,
+            preserve_security_finding: bool = False,
         ) -> None:
             nonlocal omitted_external_results
             aggregate = groups.get(location)
             if aggregate is None:
-                if location not in tracked_locations:
-                    if len(tracked_locations) >= _ONNX_RESULT_MAX_DISTINCT_GROUPS:
+                tracked_group = tracked_unsafe_locations if preserve_security_finding else tracked_locations
+                if location not in tracked_group:
+                    if len(tracked_group) >= _ONNX_RESULT_MAX_DISTINCT_GROUPS:
                         omitted_external_results += 1
                         return
-                    tracked_locations.add(location)
+                    tracked_group.add(location)
                 aggregate = _OnnxExternalLocationAggregate()
                 groups[location] = aggregate
             aggregate.add(tensor_name)
@@ -4901,12 +4911,22 @@ class OnnxScanner(BaseScanner):
                     not trusted_hf_cache_alias and not _is_contained_in(external_path, resolved_model_dir)
                 )
                 if symlink_escapes_model_dir:
-                    aggregate_location(symlink_traversal_files, location, tensor.name)
+                    aggregate_location(
+                        symlink_traversal_files,
+                        location,
+                        tensor.name,
+                        preserve_security_finding=True,
+                    )
                 elif has_symlink_component and not external_path.exists():
                     aggregate_location(missing_files, location, tensor.name)
                 elif escapes_model_dir:
                     # Track for per-file CVE-2025-51480 (write direction) reporting
-                    aggregate_location(traversal_files, location, tensor.name)
+                    aggregate_location(
+                        traversal_files,
+                        location,
+                        tensor.name,
+                        preserve_security_finding=True,
+                    )
                 elif not external_path.exists():
                     aggregate_location(missing_files, location, tensor.name)
                 else:
