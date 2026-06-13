@@ -7,8 +7,12 @@ false positive security alerts while maintaining detection of real threats.
 
 import contextlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -286,7 +290,7 @@ class TestFalsePositiveFixes:
         has_extreme = any("extremely large weight values" in a["description"] for a in anomalies)
         assert has_outlier or has_extreme, "Should detect the injected anomaly"
 
-    def test_bert_model_no_false_positive_executables(self, tmp_path):
+    def test_bert_model_no_false_positive_executables(self, tmp_path: Path) -> None:
         """Test that BERT models with random MZ bytes don't trigger false positives."""
         if not HAS_TORCH:
             pytest.skip("torch not installed")
@@ -320,7 +324,7 @@ class TestFalsePositiveFixes:
             f.write(modified_data)
 
         # Scan the file
-        result = self._run_cli_scan(str(bert_file))
+        result = self._run_cli_scan_subprocess(str(bert_file))
 
         # Should not flag as executable
         assert result["exit_code"] == 0, "BERT model with random MZ bytes should not be flagged"
@@ -423,7 +427,7 @@ class TestFalsePositiveFixes:
             f"{[str(issue) for issue in scan_result.issues]}"
         )
 
-    def test_comprehensive_gpt2_model_scan(self, tmp_path):
+    def test_comprehensive_gpt2_model_scan(self, tmp_path: Path) -> None:
         """Comprehensive test simulating a complete GPT-2 model directory scan."""
         # Create a realistic GPT-2 model directory structure
         model_dir = tmp_path / "gpt2_model"
@@ -496,7 +500,7 @@ class TestFalsePositiveFixes:
                 optimizer_weights.create_dataset("iteration:0", data=[1000])
 
         # Scan the entire directory
-        result = self._run_cli_scan(str(model_dir))
+        result = self._run_cli_scan_subprocess(str(model_dir))
 
         # Should complete with no issues
         assert result["exit_code"] == 0, "Complete GPT-2 model directory should scan clean"
@@ -566,5 +570,63 @@ class TestFalsePositiveFixes:
 
         finally:
             # Clean up
+            with contextlib.suppress(FileNotFoundError):
+                Path(output_file).unlink()
+
+    def _run_cli_scan_subprocess(self, path: str) -> dict[str, Any]:
+        """Run CLI scan in a fresh process so fixture imports do not pollute scanner state."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            output_file = str(Path(f.name).resolve())
+
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "\n".join(
+                        [
+                            "import sys",
+                            "import modelaudit.cli as cli",
+                            "if sys.platform == 'darwin':",
+                            "    cli._darwin_fd_has_extended_acl = lambda _fd: False",
+                            "sys.argv = [",
+                            "    'modelaudit', 'scan', sys.argv[1],",
+                            "    '--format', 'json', '--output', sys.argv[2],",
+                            "]",
+                            "cli.main()",
+                        ]
+                    ),
+                    path,
+                    output_file,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "PROMPTFOO_DISABLE_TELEMETRY": "1",
+                    "NO_ANALYTICS": "1",
+                },
+            )
+            try:
+                with open(output_file) as f:
+                    scan_results = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                scan_results = {"issues": []}
+
+            issues = scan_results.get("issues", [])
+            has_warnings = any(issue.get("severity") in ["warning", "critical"] for issue in issues)
+            has_errors = any(issue.get("severity") == "critical" for issue in issues)
+
+            return {
+                "exit_code": completed.returncode,
+                "has_warnings": has_warnings,
+                "has_errors": has_errors,
+                "issues": issues,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+
+        finally:
             with contextlib.suppress(FileNotFoundError):
                 Path(output_file).unlink()

@@ -122,6 +122,7 @@ class _PytorchStorageReferenceParse:
 class _ValidatedPytorchStorageDataPklMembers:
     storage_keys_by_data_pkl: dict[str, set[str]]
     persistent_id_downgrade_keys_by_data_pkl: dict[str, set[str]]
+    storage_member_sizes_by_data_pkl: dict[str, dict[str, int]]
 
 
 _TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
@@ -531,6 +532,9 @@ class PyTorchZipScanner(BaseScanner):
                     path,
                     trusted_pytorch_storage_persistent_id_data_pkl_members=(
                         validated_storage_data_pkl_members.persistent_id_downgrade_keys_by_data_pkl
+                    ),
+                    pytorch_data_pickle_storage_sizes_by_data_pkl=(
+                        validated_storage_data_pkl_members.storage_member_sizes_by_data_pkl
                     ),
                 )
                 self._scan_nested_zip_members(zip_file, safe_entries, result, path)
@@ -2041,6 +2045,7 @@ class PyTorchZipScanner(BaseScanner):
         path: str,
         *,
         trusted_pytorch_storage_persistent_id_data_pkl_members: dict[str, set[str]],
+        pytorch_data_pickle_storage_sizes_by_data_pkl: dict[str, dict[str, int]],
     ) -> int:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -2060,6 +2065,7 @@ class PyTorchZipScanner(BaseScanner):
             name = self._get_zip_member_name(info)
             pickle_data_size = info.file_size
             pickle_source = f"{path}:{name}"
+            pytorch_data_pickle_storage_sizes = pytorch_data_pickle_storage_sizes_by_data_pkl.get(name)
 
             if self.pickle_scanner is None:
                 bytes_scanned += pickle_data_size
@@ -2106,6 +2112,7 @@ class PyTorchZipScanner(BaseScanner):
                         file_like,
                         len(data),
                         source=pickle_source,
+                        _pytorch_zip_storage_member_sizes=pytorch_data_pickle_storage_sizes,
                     )
             else:
                 # Stream to a spooled temp file to avoid OOM and provide seek()
@@ -2124,6 +2131,7 @@ class PyTorchZipScanner(BaseScanner):
                         spool,  # type: ignore[arg-type]
                         member_size,
                         source=pickle_source,
+                        _pytorch_zip_storage_member_sizes=pytorch_data_pickle_storage_sizes,
                     )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
@@ -2312,6 +2320,7 @@ class PyTorchZipScanner(BaseScanner):
 
         trusted_members: dict[str, set[str]] = {}
         persistent_id_downgrade_members: dict[str, set[str]] = {}
+        storage_member_sizes_by_data_pkl: dict[str, dict[str, int]] = {}
         storage_reference_bytes_read = 0
         storage_reference_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
         for data_pkl_member, data_pkl_entries in entries_by_name.items():
@@ -2424,10 +2433,14 @@ class PyTorchZipScanner(BaseScanner):
                 and reference_parse.all_persistent_ids_are_pytorch_storage
             ):
                 persistent_id_downgrade_members[data_pkl_member] = trusted_storage_keys
+                storage_member_sizes_by_data_pkl[data_pkl_member] = {
+                    storage_key: storage_entries_by_key[storage_key].file_size for storage_key in trusted_storage_keys
+                }
 
         return _ValidatedPytorchStorageDataPklMembers(
             storage_keys_by_data_pkl=trusted_members,
             persistent_id_downgrade_keys_by_data_pkl=persistent_id_downgrade_members,
+            storage_member_sizes_by_data_pkl=storage_member_sizes_by_data_pkl,
         )
 
     def _record_storage_reference_validation_incomplete(

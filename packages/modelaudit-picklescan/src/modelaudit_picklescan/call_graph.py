@@ -747,16 +747,6 @@ def _executable_value_functions(value: object) -> tuple[FunctionType, ...]:
     return ()
 
 
-def _extend_snapshot_functions(
-    functions: deque[FunctionType],
-    value: object,
-    traverse_function_module: str | None,
-) -> None:
-    for function in _executable_value_functions(value):
-        if traverse_function_module is None or function.__globals__.get("__name__") == traverse_function_module:
-            functions.append(function)
-
-
 def _type_member_without_hooks(class_: type[object], name: str) -> tuple[bool, object | None]:
     for base in type.__getattribute__(class_, "__mro__"):
         namespace = type.__getattribute__(base, "__dict__")
@@ -841,12 +831,7 @@ def _value_is_data_descriptor(value: object) -> bool:
     return False
 
 
-def _trusted_executable_value_snapshot(
-    value: object,
-    *,
-    allow_unresolved_attribute_paths: bool = False,
-    traverse_function_module: str | None = None,
-) -> _TrustedExecutableValueSnapshot:
+def _trusted_executable_value_snapshot(value: object) -> _TrustedExecutableValueSnapshot:
     referenced_globals: list[_FunctionReferencedGlobalsSnapshot] = []
     functions = deque(_executable_value_functions(value))
     seen_functions: set[FunctionType] = set()
@@ -899,8 +884,6 @@ def _trusted_executable_value_snapshot(
             for path in () if mutable_state_safe else attribute_paths.get(name, ()):
                 resolved, dependency, dispatch_dependencies = _runtime_attribute_path_without_hooks(global_value, path)
                 if not resolved:
-                    if allow_unresolved_attribute_paths:
-                        continue
                     return _runtime_value_snapshot(value), tuple(referenced_globals), False
                 dependency_snapshots.append(
                     (
@@ -909,9 +892,9 @@ def _trusted_executable_value_snapshot(
                         tuple(_runtime_value_snapshot(dispatch) for dispatch in dispatch_dependencies),
                     )
                 )
-                _extend_snapshot_functions(functions, dependency, traverse_function_module)
+                functions.extend(_executable_value_functions(dependency))
                 for dispatch in dispatch_dependencies:
-                    _extend_snapshot_functions(functions, dispatch, traverse_function_module)
+                    functions.extend(_executable_value_functions(dispatch))
             global_snapshots.append(
                 (
                     name,
@@ -930,9 +913,9 @@ def _trusted_executable_value_snapshot(
             )
         )
         for name in global_names:
-            _extend_snapshot_functions(functions, globals_namespace[name], traverse_function_module)
+            functions.extend(_executable_value_functions(globals_namespace[name]))
         for name in builtin_names:
-            _extend_snapshot_functions(functions, builtins_namespace[name], traverse_function_module)
+            functions.extend(_executable_value_functions(builtins_namespace[name]))
     return _runtime_value_snapshot(value), tuple(referenced_globals), True
 
 
@@ -1437,7 +1420,6 @@ _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES = frozenset(
         ("torch.serialization", "_get_layout"),
     }
 )
-_TRUSTED_SOURCE_DEPENDENT_FRAMEWORK_RECONSTRUCTION_REFERENCES = frozenset({("torch._utils", "_rebuild_tensor_v2")})
 _TRUSTED_LOADED_EXTENSION_EXPORT_OWNERS = MappingProxyType(
     {
         ("numpy._core.multiarray", "_reconstruct"): ("numpy._core._multiarray_umath",),
@@ -2275,201 +2257,6 @@ def import_only_reference_is_proven_trusted_for_pickle_invocation(
         name,
         pickle_entrypoint_methods=entrypoint_methods,
         pickle_invokes_metaclass_call=invokes_metaclass_call,
-    ) or (
-        str(reference.get("opcode", "")) == "REDUCE"
-        and _loaded_site_package_framework_reconstruction_function_matches_trusted_source(
-            module_name,
-            name,
-        )
-    )
-
-
-def _loaded_site_package_framework_reconstruction_function_matches_trusted_source(
-    module_name: str,
-    name: str,
-) -> bool:
-    if (
-        module_name,
-        name,
-    ) not in _TRUSTED_SOURCE_DEPENDENT_FRAMEWORK_RECONSTRUCTION_REFERENCES or _trusted_module_origin_kind(
-        module_name
-    ) != "site_packages":
-        return False
-    module_state = _current_loaded_interpreter_module_state(module_name)
-    reference_state = _current_loaded_interpreter_reference_state(module_name, name)
-    _track_loaded_interpreter_module_state(module_name, module_state)
-    _track_loaded_interpreter_reference_state(module_name, name, reference_state)
-    if not module_state[0] or module_state[1] is None or module_state[2] is None or not reference_state[0]:
-        return False
-    if not _loaded_module_metadata_matches_spec_without_hooks(module_name, *module_state[1:]):
-        return False
-    value = reference_state[1]
-    return isinstance(value, FunctionType) and _trusted_framework_function_dependency_graph_matches_source(
-        value,
-        expected_module=module_name,
-        expected_name=name,
-    )
-
-
-def _trusted_framework_function_dependency_graph_matches_source(
-    function: FunctionType,
-    *,
-    expected_module: str,
-    expected_name: str,
-) -> bool:
-    if function.__globals__.get("__name__") != expected_module or function.__code__.co_name != _reference_leaf_name(
-        expected_name
-    ):
-        return False
-    snapshot = _trusted_executable_value_snapshot(
-        function,
-        allow_unresolved_attribute_paths=True,
-        traverse_function_module=expected_module,
-    )
-    return _trusted_source_dependent_executable_snapshot_matches_source(
-        snapshot,
-        expected_name=expected_name,
-    )
-
-
-def _trusted_source_dependent_executable_snapshot_matches_source(
-    snapshot: _TrustedExecutableValueSnapshot,
-    *,
-    expected_name: str,
-) -> bool:
-    if not snapshot[2] or not _trusted_framework_dependency_snapshot_matches_source(
-        snapshot[0],
-        expected_name=expected_name,
-    ):
-        return False
-    for function, globals_namespace, global_snapshots, builtins_namespace, builtin_snapshots in snapshot[1]:
-        if not _trusted_framework_function_matches_source_and_runtime_state(function):
-            return False
-        if type(globals_namespace) is not dict:
-            return False
-        if not _trusted_builtin_snapshots_match_import_runtime(builtins_namespace, builtin_snapshots):
-            return False
-        for _name, global_snapshot, dependency_snapshots, _mutable_state_safe in global_snapshots:
-            if not _trusted_framework_dependency_snapshot_matches_source(global_snapshot, expected_name=_name):
-                return False
-            for _path, dependency_snapshot, dispatch_snapshots in dependency_snapshots:
-                dependency_name = _path[-1] if _path else None
-                if not _trusted_framework_dependency_snapshot_matches_source(
-                    dependency_snapshot,
-                    expected_name=dependency_name,
-                ):
-                    return False
-                if any(
-                    not _trusted_framework_dependency_snapshot_matches_source(dispatch_snapshot)
-                    for dispatch_snapshot in dispatch_snapshots
-                ):
-                    return False
-    return True
-
-
-def _trusted_framework_dependency_snapshot_matches_source(
-    snapshot: _RuntimeValueSnapshot,
-    *,
-    expected_name: str | None = None,
-) -> bool:
-    value = snapshot[0]
-    function = snapshot[1]
-    if function is not None:
-        if expected_name is not None and function.__code__.co_name != _reference_leaf_name(expected_name):
-            return False
-        return _function_matches_own_trusted_source(function) and _runtime_function_snapshot_is_source_independent(
-            snapshot
-        )
-    if isinstance(value, BuiltinFunctionType):
-        module_name = BuiltinFunctionType.__getattribute__(value, "__module__")
-        function_name = BuiltinFunctionType.__getattribute__(value, "__name__")
-        return (
-            type(module_name) is str
-            and type(function_name) is str
-            and (expected_name is None or function_name == _reference_leaf_name(expected_name))
-            and _loaded_trusted_reference_identity_matches_source(module_name, function_name, value)
-        )
-    if type(value) is ModuleType:
-        module_name = ModuleType.__getattribute__(value, "__name__")
-        return type(module_name) is str and _loaded_trusted_module_matches_source(module_name)
-    if _runtime_value_is_class(value):
-        class_ = cast(type[object], value)
-        module_name = type.__getattribute__(class_, "__module__")
-        class_name = type.__getattribute__(class_, "__name__")
-        return (
-            type(module_name) is str
-            and type(class_name) is str
-            and (expected_name is None or class_name == _reference_leaf_name(expected_name))
-            and _loaded_trusted_reference_identity_matches_source(module_name, class_name, value)
-        )
-    return not _runtime_type_member_is_executable(value)
-
-
-def _trusted_builtin_snapshots_match_import_runtime(
-    builtins_namespace: object,
-    builtin_snapshots: tuple[tuple[str, _RuntimeValueSnapshot], ...],
-) -> bool:
-    if not builtin_snapshots:
-        return True
-    if type(_IMPORT_RUNTIME_BUILTINS) is not dict or builtins_namespace is not _IMPORT_RUNTIME_BUILTINS:
-        return False
-    for name, snapshot in builtin_snapshots:
-        expected = _IMPORT_RUNTIME_BUILTIN_VALUE_SNAPSHOTS.get(name)
-        if expected is None:
-            return False
-        if not _runtime_value_matches_snapshot(snapshot[0], expected) or not _runtime_value_matches_snapshot(
-            _IMPORT_RUNTIME_BUILTINS[name],
-            expected,
-        ):
-            return False
-    return True
-
-
-def _function_matches_own_trusted_source(function: FunctionType) -> bool:
-    globals_namespace = function.__globals__
-    if type(globals_namespace) is not dict:
-        return False
-    module_name = globals_namespace.get("__name__")
-    return (
-        type(module_name) is str
-        and _trusted_module_origin_kind(module_name) in {"stdlib", "site_packages"}
-        and _function_owner_matches_trusted_source(function, expected_module=module_name)
-    )
-
-
-def _trusted_framework_function_matches_source_and_runtime_state(function: FunctionType) -> bool:
-    return _function_matches_own_trusted_source(function) and _runtime_function_snapshot_is_source_independent(
-        _runtime_value_snapshot(function)
-    )
-
-
-def _loaded_trusted_reference_identity_matches_source(module_name: str, name: str, value: object) -> bool:
-    if _trusted_module_origin_kind(module_name) not in {"stdlib", "site_packages"}:
-        return False
-    module_state = _current_loaded_interpreter_module_state(module_name)
-    reference_state = _current_loaded_interpreter_reference_state(module_name, name)
-    _track_loaded_interpreter_module_state(module_name, module_state)
-    _track_loaded_interpreter_reference_state(module_name, name, reference_state)
-    return (
-        module_state[0]
-        and module_state[1] is not None
-        and module_state[2] is not None
-        and reference_state[0]
-        and reference_state[1] is value
-        and _loaded_module_metadata_matches_spec_without_hooks(module_name, *module_state[1:])
-    )
-
-
-def _loaded_trusted_module_matches_source(module_name: str) -> bool:
-    if _trusted_module_origin_kind(module_name) not in {"stdlib", "site_packages"}:
-        return False
-    module_state = _current_loaded_interpreter_module_state(module_name)
-    _track_loaded_interpreter_module_state(module_name, module_state)
-    return (
-        module_state[0]
-        and module_state[1] is not None
-        and module_state[2] is not None
-        and _loaded_module_metadata_matches_spec_without_hooks(module_name, *module_state[1:])
     )
 
 
