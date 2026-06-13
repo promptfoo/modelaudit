@@ -678,7 +678,7 @@ class TarScanner(BaseScanner):
                                 scan_complete = False
 
                             self._rewrite_nested_result_context(nested_result, tmp_path, path, name)
-                            result.merge(nested_result)
+                            result.merge_member_result(nested_result, name)
                             asset_entry = asset_from_scan_result(f"{path}:{name}", nested_result)
                         else:
                             scan_archive_member_for_known_risks(
@@ -709,7 +709,7 @@ class TarScanner(BaseScanner):
                                 if member_scan_incomplete(file_result):
                                     scan_complete = False
 
-                                result.merge(file_result)
+                                result.merge_member_result(file_result, name)
                                 asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
 
                                 if file_result.scanner_name == "unknown":
