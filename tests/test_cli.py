@@ -989,6 +989,71 @@ def test_scan_multiple_cross_directory_zero_based_shards_requires_index_authorit
         )
 
 
+def test_scan_multiple_cross_directory_shards_refreshes_index_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit reconciliation must not reuse authority captured before per-path scans."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def create_shard(parent: str, index: int) -> Path:
+        shard_dir = tmp_path / parent
+        _make_trusted_shard_parent(shard_dir)
+        shard = shard_dir / f"model-{index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        return shard
+
+    selected_shards = [create_shard("a", 0), create_shard("b", 1)]
+    decoy_shards = [create_shard("d", 0), create_shard("c", 1)]
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def write_index(shards: list[Path]) -> None:
+        index_path.write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        f"tensor-{index}": shard.relative_to(tmp_path).as_posix() for index, shard in enumerate(shards)
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_index(selected_shards)
+    original_resolve_source = cli_module._resolve_scan_source_for_path
+    resolve_count = 0
+
+    def replace_index_before_each_scan(*args: Any, **kwargs: Any) -> Any:
+        nonlocal resolve_count
+        resolve_count += 1
+        write_index(
+            [selected_shards[0], decoy_shards[1]] if resolve_count == 1 else [decoy_shards[0], selected_shards[1]]
+        )
+        return original_resolve_source(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_resolve_scan_source_for_path", replace_index_before_each_scan)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *(str(shard) for shard in selected_shards),
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "unexpected_model_shards"
+        for check in output_payload["checks"]
+    )
+
+
 def test_scan_cross_directory_shards_ignores_duplicate_explicit_argument(tmp_path: Path) -> None:
     """Repeating one exact shard argument must not invalidate a complete family."""
     header = b'{"__metadata__":{"format":"pt"}}'

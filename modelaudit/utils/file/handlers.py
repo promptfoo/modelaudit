@@ -5,6 +5,7 @@ This module provides advanced utilities for scanning large model files (400B+ pa
 with bounded windowed I/O, sharded model support, and distributed scanning capabilities.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -89,6 +90,7 @@ class _SafetensorsShardIndexInventory:
     expected_source_paths: frozenset[str]
     expected_indices: ExpectedShardIndices
     index_base: str
+    fingerprint: str | None = None
     error: str | None = None
 
 
@@ -654,6 +656,7 @@ class ShardedModelDetector:
                 for field in ("st_size", "st_mtime_ns", "st_ctime_ns")
             ):
                 raise ValueError("safetensors index changed while reading")
+            index_fingerprint = hashlib.sha256(index_bytes).hexdigest()
             index_doc = json.loads(index_bytes.decode("utf-8"))
             if not isinstance(index_doc, dict):
                 raise ValueError("safetensors index root must be an object")
@@ -702,6 +705,7 @@ class ShardedModelDetector:
                     expected_source_paths=frozenset(expected_paths),
                     expected_indices=zero_based,
                     index_base="zero",
+                    fingerprint=index_fingerprint,
                 )
             if all(index in one_based for index in target_indices):
                 return _SafetensorsShardIndexInventory(
@@ -709,6 +713,7 @@ class ShardedModelDetector:
                     expected_source_paths=frozenset(expected_paths),
                     expected_indices=one_based,
                     index_base="one",
+                    fingerprint=index_fingerprint,
                 )
             raise ValueError("safetensors index shard indices are ambiguous")
         except Exception as exc:
@@ -865,6 +870,8 @@ class ShardedModelDetector:
                     if index_inventory.error is not None:
                         shard_info["safetensors_index_error"] = index_inventory.error
                         unvalidated_shards.append(str(index_inventory.index_path))
+                    elif index_inventory.fingerprint is not None:
+                        shard_info["safetensors_index_fingerprint"] = index_inventory.fingerprint
 
                 # Collect local siblings and caller-snapshotted peers; validated index targets are added below.
                 candidate_paths: dict[str, Path] = {}

@@ -1186,11 +1186,23 @@ class TestModelDownload:
         assert [call.args[1] for call in mock_check_disk_space.call_args_list] == [10, 1_000]
         mock_snapshot_download.assert_called_once()
 
-    def test_download_model_pickle_selection_probes_safetensors_suffix(
+    @pytest.mark.parametrize(
+        ("filename", "extensions", "scanner_id"),
+        [
+            ("payload.safetensors", {".pkl", ".pickle"}, "pickle"),
+            ("model.safetensors.index.json", {".pkl", ".pickle"}, "pickle"),
+            ("payload.safetensors", {".gz"}, "compressed"),
+        ],
+        ids=["pickle-suffix", "pickle-index-name", "compressed-suffix"],
+    )
+    def test_download_model_overlap_selection_probes_safetensors_candidates(
         self,
         tmp_path: Path,
+        filename: str,
+        extensions: set[str],
+        scanner_id: str,
     ) -> None:
-        """Explicit pickle selection must content-route renamed payloads despite a SafeTensors suffix."""
+        """Overlap scanners must content-route payloads hidden behind SafeTensors names."""
         download_path = tmp_path / "download"
         download_path.mkdir()
         mock_snapshot_download = MagicMock(return_value=str(download_path))
@@ -1198,19 +1210,17 @@ class TestModelDownload:
         def snapshot_side_effect(**kwargs: object) -> str:
             allow_patterns = cast(list[str], kwargs["allow_patterns"])
             for filename in allow_patterns:
-                (download_path / filename).write_bytes(b"payload")
+                (download_path / filename).write_bytes(payload)
             return str(download_path)
 
+        payload = b"cos\nsystem\n(S'echo pwn'\ntR." if scanner_id == "pickle" else gzip.compress(b"payload")
         mock_snapshot_download.side_effect = snapshot_side_effect
         with (
             patch(
                 "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-                return_value=(["payload.safetensors"], _HF_TEST_REVISION, None),
+                return_value=([filename], _HF_TEST_REVISION, None),
             ),
-            patch(
-                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
-                return_value="pickle",
-            ) as mock_detect_content,
+            patch("requests.get", return_value=_FakeRangeResponse(payload)) as mock_requests_get,
             patch(
                 "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes", return_value=({}, _HF_TEST_REVISION)
             ),
@@ -1219,13 +1229,13 @@ class TestModelDownload:
             result = download_model(
                 "https://huggingface.co/test/model",
                 cache_dir=tmp_path / "cache",
-                scannable_extensions={".pkl", ".pickle"},
-                scannable_scanner_ids={"pickle"},
+                scannable_extensions=extensions,
+                scannable_scanner_ids={scanner_id},
             )
 
         assert result == download_path
-        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["payload.safetensors"]
-        mock_detect_content.assert_called_once()
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == [filename]
+        mock_requests_get.assert_called_once()
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -4219,7 +4229,8 @@ class TestModelDownloadStreaming:
             "diffusion_pytorch_model-00001-of-00002.safetensors",
             "diffusion_pytorch_model-00002-of-00002.safetensors",
         ]
-        repo_files = ["model.safetensors.index.json", *shard_files]
+        index_file = "diffusion_pytorch_model.safetensors.index.json"
+        repo_files = [index_file, *shard_files]
         budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
         payload = json.dumps(
             {"weight_map": {f"tensor-{index}": shard for index, shard in enumerate(shard_files)}}
@@ -4234,7 +4245,28 @@ class TestModelDownloadStreaming:
                 budget,
             )
 
-        assert result == [*shard_files, "model.safetensors.index.json"]
+        assert result == [*shard_files, index_file]
+
+    def test_remote_safetensors_validation_rejects_missing_prefixed_index_target(self) -> None:
+        """Prefixed SafeTensors indexes must not bypass missing-target validation."""
+        index_file = "diffusion_pytorch_model.safetensors.index.json"
+        first_shard = "diffusion_pytorch_model-00001-of-00002.safetensors"
+        missing_shard = "diffusion_pytorch_model-00002-of-00002.safetensors"
+        repo_files = [index_file, first_shard]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps({"weight_map": {"first": first_shard, "second": missing_shard}}).encode()
+
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(payload)),
+            pytest.raises(ValueError, match="references missing model shard"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                [first_shard],
+                budget,
+            )
 
     def test_remote_safetensors_validation_metadata_only_refuses_index_reads(self) -> None:
         """Metadata-only planning must not range-read SafeTensors index content."""

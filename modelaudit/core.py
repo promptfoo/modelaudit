@@ -1194,6 +1194,7 @@ def _snapshot_validated_shard_target(
     trusted_root_marker: object | None = None,
     authoritative_shard_index_base: str | None = None,
     authoritative_shard_index_path: str | None = None,
+    authoritative_shard_index_fingerprint: str | None = None,
 ) -> ValidatedShardTargets:
     """Snapshot one selected shard path after resolving it to a regular file."""
     source = Path(source_path)
@@ -1238,12 +1239,18 @@ def _snapshot_validated_shard_target(
         )
         if trusted_family_group:
             target["family_group"] = trusted_family_group
-    if authoritative_shard_index_base in {"zero", "one"}:
+    if (
+        authoritative_shard_index_base in {"zero", "one"}
+        and isinstance(authoritative_shard_index_path, str)
+        and authoritative_shard_index_path
+        and isinstance(authoritative_shard_index_fingerprint, str)
+        and authoritative_shard_index_fingerprint
+    ):
         target["authoritative_shard_index_base"] = authoritative_shard_index_base
-        if isinstance(authoritative_shard_index_path, str) and authoritative_shard_index_path:
-            target["authoritative_shard_index_path"] = os.path.normcase(
-                os.path.normpath(os.path.abspath(authoritative_shard_index_path))
-            )
+        target["authoritative_shard_index_path"] = os.path.normcase(
+            os.path.normpath(os.path.abspath(authoritative_shard_index_path))
+        )
+        target["authoritative_shard_index_fingerprint"] = authoritative_shard_index_fingerprint
     return {str(source.absolute()): target}
 
 
@@ -1536,7 +1543,13 @@ def _validated_shard_family_scopes(
     if isinstance(family_group, str) and family_group:
         scopes.add(f"trusted-group:{family_group}")
     authoritative_index_path = target.get("authoritative_shard_index_path")
-    if isinstance(authoritative_index_path, str) and target.get("authoritative_shard_index_base") in {"zero", "one"}:
+    authoritative_index_fingerprint = target.get("authoritative_shard_index_fingerprint")
+    if (
+        isinstance(authoritative_index_path, str)
+        and target.get("authoritative_shard_index_base") in {"zero", "one"}
+        and isinstance(authoritative_index_fingerprint, str)
+        and authoritative_index_fingerprint
+    ):
         scopes.add(f"validated-index:{authoritative_index_path}")
     return scopes
 
@@ -1573,13 +1586,36 @@ def _group_validated_shard_family_targets(
 def _authoritative_shard_indices_for_group(
     expected_total: int,
     targets_by_index: dict[int, list[tuple[str, dict[str, int | str]]]],
-) -> range | None:
-    """Return an index-authorized base only when every target carries the same proof."""
-    targets = [target for records in targets_by_index.values() for _source_path, target in records]
-    bases = [target.get("authoritative_shard_index_base") for target in targets]
-    if not bases or any(base not in {"zero", "one"} for base in bases) or len(set(bases)) != 1:
-        return None
-    return ShardedModelDetector._expected_index_range(expected_total, zero_based=bases[0] == "zero")
+) -> tuple[range | None, bool]:
+    """Return consistent index authority and whether any target claimed it."""
+    proofs: set[tuple[str, str, str]] = set()
+    authority_present = False
+    missing_proof = False
+    for records in targets_by_index.values():
+        for _source_path, target in records:
+            index_base = target.get("authoritative_shard_index_base")
+            index_path = target.get("authoritative_shard_index_path")
+            index_fingerprint = target.get("authoritative_shard_index_fingerprint")
+            if all(value is None for value in (index_base, index_path, index_fingerprint)):
+                missing_proof = True
+                continue
+            authority_present = True
+            if (
+                not isinstance(index_base, str)
+                or index_base not in {"zero", "one"}
+                or not isinstance(index_path, str)
+                or not index_path
+                or not isinstance(index_fingerprint, str)
+                or not index_fingerprint
+            ):
+                return None, True
+            proofs.add((index_base, index_path, index_fingerprint))
+    if not authority_present:
+        return None, False
+    if missing_proof or len(proofs) != 1:
+        return None, True
+    index_base, _index_path, _index_fingerprint = next(iter(proofs))
+    return ShardedModelDetector._expected_index_range(expected_total, zero_based=index_base == "zero"), True
 
 
 def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTargets) -> set[str]:
@@ -1588,7 +1624,12 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
 
     complete_sources: set[str] = set()
     for (_pattern, expected_total, _family_scope), targets_by_index in grouped_targets.items():
-        authoritative_indices = _authoritative_shard_indices_for_group(expected_total, targets_by_index)
+        authoritative_indices, authority_present = _authoritative_shard_indices_for_group(
+            expected_total,
+            targets_by_index,
+        )
+        if authority_present and authoritative_indices is None:
+            continue
         expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(
             expected_total,
             authoritative_indices=authoritative_indices,
@@ -1674,18 +1715,26 @@ def _record_unexpected_validated_shard_families(
     recorded = False
     seen_locations: set[str] = set()
     for (_pattern, expected_total, _family_scope), targets_by_index in grouped_targets.items():
-        authoritative_indices = _authoritative_shard_indices_for_group(expected_total, targets_by_index)
+        authoritative_indices, authority_present = _authoritative_shard_indices_for_group(
+            expected_total,
+            targets_by_index,
+        )
         expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(
             expected_total,
             authoritative_indices=authoritative_indices,
         )
-        unexpected_sources = tuple(
-            sorted(
-                source_path
-                for shard_index, records in targets_by_index.items()
-                for source_path, _target in (records if shard_index not in expected_indices else records[1:])
+        if authority_present and authoritative_indices is None:
+            unexpected_sources = tuple(
+                sorted(source_path for records in targets_by_index.values() for source_path, _target in records)
             )
-        )
+        else:
+            unexpected_sources = tuple(
+                sorted(
+                    source_path
+                    for shard_index, records in targets_by_index.items()
+                    for source_path, _target in (records if shard_index not in expected_indices else records[1:])
+                )
+            )
         if not unexpected_sources:
             continue
         sources = tuple(
@@ -7786,6 +7835,13 @@ def scan_model_streaming(
                     and isinstance(source_safetensors_shard_info.get("safetensors_index_path"), str)
                     else None
                 )
+                authoritative_shard_index_fingerprint = (
+                    source_safetensors_shard_info.get("safetensors_index_fingerprint")
+                    if authoritative_shard_index_path is not None
+                    and isinstance(source_safetensors_shard_info, dict)
+                    and isinstance(source_safetensors_shard_info.get("safetensors_index_fingerprint"), str)
+                    else None
+                )
                 scan_repository_inventory_context = streaming_repository_inventory_context()
                 if scan_repository_inventory_context.files:
                     scan_config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = scan_repository_inventory_context
@@ -7810,6 +7866,7 @@ def scan_model_streaming(
                     trusted_root_marker=_trusted_shard_family_root,
                     authoritative_shard_index_base=authoritative_shard_index_base,
                     authoritative_shard_index_path=authoritative_shard_index_path,
+                    authoritative_shard_index_fingerprint=authoritative_shard_index_fingerprint,
                 )
                 selected_resolved_path = str(scan_path)
                 pre_scan_shard_target: ValidatedShardTargets = {}
@@ -7831,6 +7888,7 @@ def scan_model_streaming(
                                 trusted_root_marker=_trusted_shard_family_root,
                                 authoritative_shard_index_base=authoritative_shard_index_base,
                                 authoritative_shard_index_path=authoritative_shard_index_path,
+                                authoritative_shard_index_fingerprint=authoritative_shard_index_fingerprint,
                             )
                             scan_config[_SHARD_ALREADY_PINNED_CONFIG_KEY] = True
                             if is_single_safetensors_stream and single_source_shard_info is not None:
@@ -8024,6 +8082,7 @@ def scan_model_streaming(
                         trusted_root_marker=_trusted_shard_family_root,
                         authoritative_shard_index_base=authoritative_shard_index_base,
                         authoritative_shard_index_path=authoritative_shard_index_path,
+                        authoritative_shard_index_fingerprint=authoritative_shard_index_fingerprint,
                     )
                     stable_while_scanning = bool(
                         pre_scan_shard_target and pre_scan_shard_target == post_scan_shard_target
@@ -8040,6 +8099,7 @@ def scan_model_streaming(
                         trusted_root_marker=_trusted_shard_family_root,
                         authoritative_shard_index_base=authoritative_shard_index_base,
                         authoritative_shard_index_path=authoritative_shard_index_path,
+                        authoritative_shard_index_fingerprint=authoritative_shard_index_fingerprint,
                     )
                     stable_after_unpinning = False
                     if not pinned_target_changed and initial_shard_target and final_shard_target:
@@ -8056,6 +8116,9 @@ def scan_model_streaming(
                                 "ctime_ns",
                                 "nlink",
                                 "family_group",
+                                "authoritative_shard_index_base",
+                                "authoritative_shard_index_path",
+                                "authoritative_shard_index_fingerprint",
                             )
                         )
                     shard_target_stable = stable_while_scanning and stable_after_unpinning

@@ -44,7 +44,6 @@ logger = logging.getLogger(__name__)
 _HF_CONTENT_SNIFF_BYTES = 8 * 1024
 _HF_CONTENT_SNIFF_MAX_FILES = 256
 _HF_SAFETENSORS_INDEX_MAX_FILES = 256
-_HF_SAFETENSORS_INDEX_FILENAME = "model.safetensors.index.json"
 _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
@@ -1459,11 +1458,21 @@ def _skip_hf_safetensors_probe_candidate(
     """Mirror filtered SafeTensors exclusions in content and metadata-only plans."""
     if allow_index_expansion:
         return False
-    if PurePosixPath(filename).name == _HF_SAFETENSORS_INDEX_FILENAME:
+    if selected_route_scanner_ids is not None and not _hf_safetensors_routes_excluded_by_selection(
+        selected_route_scanner_ids,
+        None,
+    ):
+        return False
+    if _is_hf_safetensors_index_filename(filename):
         return True
-    return filename.endswith(".safetensors") and (
-        selected_route_scanner_ids is None or "pickle" not in selected_route_scanner_ids
-    )
+    return filename.lower().endswith(".safetensors")
+
+
+def _is_hf_safetensors_index_filename(filename: str) -> bool:
+    """Return whether a remote path names a standard or prefixed SafeTensors index."""
+    basename = PurePosixPath(filename).name.lower()
+    suffix = ".safetensors.index.json"
+    return len(basename) > len(suffix) and basename.endswith(suffix)
 
 
 def _select_huggingface_model_files(
@@ -1497,7 +1506,7 @@ def _select_huggingface_model_files(
     )
     if not allow_content_probes:
         selected_safetensors_indexes = [
-            filename for filename in model_files if PurePosixPath(filename).name == _HF_SAFETENSORS_INDEX_FILENAME
+            filename for filename in model_files if _is_hf_safetensors_index_filename(filename)
         ]
         if allow_safetensors_index_expansion and selected_safetensors_indexes:
             _raise_metadata_only_hf_selection_incomplete(repo_id, selected_safetensors_indexes)
@@ -1691,10 +1700,7 @@ def _validate_remote_safetensors_indexes(
     validated_target_files: set[str] | None = None,
 ) -> list[str]:
     """Validate and expand selected SafeTensors shard inventories when enabled."""
-    from modelaudit.utils.file.handlers import (
-        MAX_SAFETENSORS_SHARD_INDEX_BYTES,
-        SAFETENSORS_INDEX_NAME,
-    )
+    from modelaudit.utils.file.handlers import MAX_SAFETENSORS_SHARD_INDEX_BYTES
 
     repo_file_set = set(repo_files)
     selected_files = set(model_files)
@@ -1713,7 +1719,7 @@ def _validate_remote_safetensors_indexes(
     relevant_index_files: list[str] = []
     strongly_relevant_index_files: set[str] = set()
     for index_file in repo_files:
-        if PurePosixPath(index_file).name != SAFETENSORS_INDEX_NAME:
+        if not _is_hf_safetensors_index_filename(index_file):
             continue
         index_parent = PurePosixPath(index_file).parent
         strongly_relevant = index_parent in selected_safetensors_parents
@@ -2408,9 +2414,7 @@ def _select_streamable_hf_files(
 
     probe_budget: _HuggingFaceProbeBudget | None = None
     complete_safetensors_shard_files = set(_complete_hf_safetensors_shard_files(repo_files))
-    selected_safetensors_indexes = {
-        filename for filename in model_files if PurePosixPath(filename).name == _HF_SAFETENSORS_INDEX_FILENAME
-    }
+    selected_safetensors_indexes = {filename for filename in model_files if _is_hf_safetensors_index_filename(filename)}
     if (
         sniff_renamed_files
         and not selected_safetensors_indexes

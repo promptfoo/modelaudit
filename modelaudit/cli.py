@@ -1695,7 +1695,9 @@ class _ExplicitShardFamily:
     """Trusted reconciliation metadata for one explicit local shard argument."""
 
     group: str
-    authoritative_index_base: str | None = None
+    authoritative_index_scope: str | None = None
+    authoritative_index_expected_total: int | None = None
+    authoritative_index_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -1757,11 +1759,16 @@ class _ScanPathState:
             if metadata is not None and metadata.get("operational_error") is True:
                 continue
             explicit_family = self.explicit_shard_family_for(asset.path)
+            authoritative_index_proof = _current_explicit_shard_index_proof(explicit_family)
             post_scan_target = _snapshot_validated_shard_target(
                 asset.path,
                 family_group=explicit_family.group if explicit_family else None,
                 family_group_policy="explicit" if explicit_family else None,
-                authoritative_shard_index_base=(explicit_family.authoritative_index_base if explicit_family else None),
+                authoritative_shard_index_base=(authoritative_index_proof[0] if authoritative_index_proof else None),
+                authoritative_shard_index_path=(authoritative_index_proof[1] if authoritative_index_proof else None),
+                authoritative_shard_index_fingerprint=(
+                    authoritative_index_proof[2] if authoritative_index_proof else None
+                ),
             )
             if not post_scan_target:
                 continue
@@ -2278,24 +2285,29 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
     return expanded, missing_globs
 
 
-def _validated_explicit_shard_index_base(
-    paths: list[str],
+def _validated_explicit_shard_index_proof(
+    paths: tuple[str, ...],
     *,
     scope: str,
     expected_total: int,
-) -> str | None:
-    """Return a validated index base when one index governs exactly the explicit paths."""
+) -> tuple[str, str, str] | None:
+    """Return stable index authority when one index governs exactly the explicit paths."""
     shard_info = ShardedModelDetector.detect_shards(
         paths[0],
-        allowed_paths=paths,
+        allowed_paths=list(paths),
         index_search_root=scope,
     )
     if not isinstance(shard_info, dict):
         return None
     index_base = shard_info.get("shard_index_base")
+    index_path = shard_info.get("safetensors_index_path")
+    index_fingerprint = shard_info.get("safetensors_index_fingerprint")
     if (
         index_base not in {"zero", "one"}
-        or not isinstance(shard_info.get("safetensors_index_path"), str)
+        or not isinstance(index_path, str)
+        or not index_path
+        or not isinstance(index_fingerprint, str)
+        or not index_fingerprint
         or shard_info.get("safetensors_index_error")
         or shard_info.get("expected_total_shards") != expected_total
         or shard_info.get("total_shards") != expected_total
@@ -2318,7 +2330,31 @@ def _validated_explicit_shard_index_base(
         for shard_path in shard_info.get("shards", [])
         if isinstance(shard_path, str)
     }
-    return index_base if normalized_shards == set(paths) else None
+    if normalized_shards != set(paths):
+        return None
+    return (
+        index_base,
+        os.path.normcase(os.path.normpath(os.path.abspath(index_path))),
+        index_fingerprint,
+    )
+
+
+def _current_explicit_shard_index_proof(
+    family: _ExplicitShardFamily | None,
+) -> tuple[str, str, str] | None:
+    """Refresh index authority for one explicit family at the snapshot boundary."""
+    if (
+        family is None
+        or family.authoritative_index_scope is None
+        or family.authoritative_index_expected_total is None
+        or not family.authoritative_index_paths
+    ):
+        return None
+    return _validated_explicit_shard_index_proof(
+        family.authoritative_index_paths,
+        scope=family.authoritative_index_scope,
+        expected_total=family.authoritative_index_expected_total,
+    )
 
 
 def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, _ExplicitShardFamily]:
@@ -2376,7 +2412,7 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, _Ex
                 source_scopes.add(normalized_scope)
                 targets_by_scope.setdefault(normalized_scope, {}).setdefault(shard_index, []).append(normalized_path)
 
-        complete_scopes: dict[str, str | None] = {}
+        complete_scopes: dict[str, bool] = {}
         expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(expected_total)
         for scope, targets_by_index in targets_by_scope.items():
             complete_by_name = (
@@ -2384,21 +2420,21 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, _Ex
                 and all(shard_index in expected_indices for shard_index in targets_by_index)
                 and all(len(targets) == 1 for targets in targets_by_index.values())
             )
-            authoritative_index_base: str | None = None
+            authoritative_index_proof: tuple[str, str, str] | None = None
             if not complete_by_name:
                 if _pattern != SAFETENSORS_SHARD_PATTERN:
                     continue
-                scoped_paths = [path for targets in targets_by_index.values() for path in targets]
-                authoritative_index_base = _validated_explicit_shard_index_base(
+                scoped_paths = tuple(path for targets in targets_by_index.values() for path in targets)
+                authoritative_index_proof = _validated_explicit_shard_index_proof(
                     scoped_paths,
                     scope=scope,
                     expected_total=expected_total,
                 )
-                if authoritative_index_base is None:
+                if authoritative_index_proof is None:
                     continue
                 authoritative_indices = ShardedModelDetector._expected_index_range(
                     expected_total,
-                    zero_based=authoritative_index_base == "zero",
+                    zero_based=authoritative_index_proof[0] == "zero",
                 )
                 if (
                     len(targets_by_index) != _count_expected_shard_indices(authoritative_indices)
@@ -2406,14 +2442,20 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, _Ex
                     or any(len(targets) != 1 for targets in targets_by_index.values())
                 ):
                     continue
-            complete_scopes[scope] = authoritative_index_base
+            complete_scopes[scope] = authoritative_index_proof is not None
         for normalized_path, _resolved_path, _shard_index in records:
             matching_scopes = scopes_by_source[normalized_path] & complete_scopes.keys()
             if matching_scopes:
                 family_scope = max(matching_scopes, key=lambda scope: len(Path(scope).parts))
+                has_authoritative_index = complete_scopes[family_scope]
+                authoritative_index_paths = tuple(
+                    path for targets in targets_by_scope[family_scope].values() for path in targets
+                )
                 groups[normalized_path] = _ExplicitShardFamily(
                     group=f"explicit-cli:{family_scope}",
-                    authoritative_index_base=complete_scopes[family_scope],
+                    authoritative_index_scope=(family_scope if has_authoritative_index else None),
+                    authoritative_index_expected_total=(expected_total if has_authoritative_index else None),
+                    authoritative_index_paths=(authoritative_index_paths if has_authoritative_index else ()),
                 )
     return groups
 
@@ -3184,12 +3226,15 @@ def _scan_local_or_downloaded_path(
     actual_path = source_result.actual_path
     display_path = _display_path(path)
     explicit_family = path_state.explicit_shard_family_for(actual_path)
+    authoritative_index_proof = _current_explicit_shard_index_proof(explicit_family)
     pre_scan_shard_target = (
         _snapshot_validated_shard_target(
             actual_path,
             family_group=explicit_family.group if explicit_family else None,
             family_group_policy="explicit" if explicit_family else None,
-            authoritative_shard_index_base=explicit_family.authoritative_index_base if explicit_family else None,
+            authoritative_shard_index_base=(authoritative_index_proof[0] if authoritative_index_proof else None),
+            authoritative_shard_index_path=(authoritative_index_proof[1] if authoritative_index_proof else None),
+            authoritative_shard_index_fingerprint=(authoritative_index_proof[2] if authoritative_index_proof else None),
         )
         if os.path.isfile(actual_path)
         else {}

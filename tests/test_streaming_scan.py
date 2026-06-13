@@ -1309,6 +1309,72 @@ def test_scan_model_streaming_zero_based_family_uses_validated_index(tmp_path: P
     )
 
 
+@pytest.mark.parametrize(
+    ("first_index", "replace_index_between_shards", "expected_success"),
+    [(0, False, True), (0, True, False), (1, False, True), (1, True, False)],
+    ids=["zero-stable", "zero-aba", "one-stable", "one-aba"],
+)
+def test_scan_model_streaming_requires_one_index_generation_for_indexed_family(
+    tmp_path: Path,
+    first_index: int,
+    replace_index_between_shards: bool,
+    expected_success: bool,
+) -> None:
+    """Cross-file reconciliation must not combine authority from different index contents."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def create_shard(parent: str, index: int) -> Path:
+        shard_dir = tmp_path / parent
+        shard_dir.mkdir()
+        shard = shard_dir / f"model-{index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        return shard
+
+    selected_shards = [create_shard("a", first_index), create_shard("b", first_index + 1)]
+    decoy_shards = [create_shard("d", first_index), create_shard("c", first_index + 1)]
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def write_index(shards: list[Path]) -> None:
+        index_path.write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        f"tensor-{index}": shard.relative_to(tmp_path).as_posix() for index, shard in enumerate(shards)
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_index([selected_shards[0], decoy_shards[1]] if replace_index_between_shards else selected_shards)
+
+    def shard_stream() -> Iterator[tuple[Path, bool]]:
+        yield selected_shards[0], False
+        if replace_index_between_shards:
+            write_index([decoy_shards[0], selected_shards[1]])
+        yield selected_shards[1], True
+
+    result = scan_model_streaming(
+        file_generator=shard_stream(),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        shard_family_group="trusted-stream:model-a",
+        _trusted_shard_family_root=_make_trusted_stream_shard_root(str(tmp_path)),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is expected_success
+    assert determine_exit_code(result) == (0 if expected_success else 2)
+    coverage_reasons = {
+        check.details.get("scan_outcome_reason")
+        for check in result.checks
+        if check.details.get("scan_outcome_reason") in {"missing_model_shards", "unexpected_model_shards"}
+    }
+    assert bool(coverage_reasons) is not expected_success
+
+
 def test_scan_model_streaming_preserves_max_total_size_failure_after_shard_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
