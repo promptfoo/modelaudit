@@ -327,7 +327,10 @@ class TestFalsePositiveFixes:
         result = self._run_cli_scan_subprocess(str(bert_file))
 
         # Should not flag as executable
-        assert result["exit_code"] == 0, "BERT model with random MZ bytes should not be flagged"
+        assert result["exit_code"] == 0, (
+            "BERT model with random MZ bytes should not be flagged; "
+            f"issues={result['issues']!r}; stdout={result['stdout']!r}; stderr={result['stderr']!r}"
+        )
         assert not any("Windows executable" in issue.get("message", "") for issue in result["issues"]), (
             "Should not detect Windows executable in BERT model"
         )
@@ -503,9 +506,31 @@ class TestFalsePositiveFixes:
         result = self._run_cli_scan_subprocess(str(model_dir))
 
         # Should complete with no issues
-        assert result["exit_code"] == 0, "Complete GPT-2 model directory should scan clean"
+        assert result["exit_code"] == 0, (
+            "Complete GPT-2 model directory should scan clean; "
+            f"issues={result['issues']!r}; stdout={result['stdout']!r}; stderr={result['stderr']!r}"
+        )
         assert result["has_warnings"] is False, "GPT-2 model should not have warnings"
         assert result["has_errors"] is False, "GPT-2 model should not have errors"
+
+    def test_cli_subprocess_scan_forces_utf8_output_encoding(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fresh CLI subprocess scans must not inherit a legacy stdout encoding."""
+        monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+        model_dir = tmp_path / "gpt2_model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "gpt2", "architectures": ["GPT2LMHeadModel"]}),
+            encoding="utf-8",
+        )
+
+        result = self._run_cli_scan_subprocess(str(model_dir))
+
+        assert result["exit_code"] == 0, (
+            "CLI subprocess should force UTF-8 output even when parent requests cp1252; "
+            f"issues={result['issues']!r}; stdout={result['stdout']!r}; stderr={result['stderr']!r}"
+        )
 
     def _run_cli_scan(self, path):
         """Helper method to run CLI scan and parse results."""
@@ -602,10 +627,13 @@ class TestFalsePositiveFixes:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env={
                     **os.environ,
                     "PROMPTFOO_DISABLE_TELEMETRY": "1",
                     "NO_ANALYTICS": "1",
+                    "PYTHONIOENCODING": "utf-8",
                 },
             )
             try:
