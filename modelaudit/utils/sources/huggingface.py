@@ -1708,7 +1708,7 @@ def _validate_remote_safetensors_indexes(
     if not allow_index_expansion:
         return updated_model_files
     selected_safetensors_paths = [
-        PurePosixPath(filename) for filename in selected_files if filename.endswith(".safetensors")
+        PurePosixPath(filename) for filename in selected_files if filename.lower().endswith(".safetensors")
     ]
     selected_safetensors_parents = {path.parent for path in selected_safetensors_paths}
     selected_safetensors_ancestor_dirs = {

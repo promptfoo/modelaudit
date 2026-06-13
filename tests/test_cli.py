@@ -40,7 +40,7 @@ from modelaudit.cli import (
     format_text_output,
 )
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.models import FileMetadataModel, ModelAuditResultModel, create_initial_audit_result
+from modelaudit.models import AssetModel, FileMetadataModel, ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.repository_context import (
     REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
@@ -989,11 +989,19 @@ def test_scan_multiple_cross_directory_zero_based_shards_requires_index_authorit
         )
 
 
+@pytest.mark.parametrize(
+    ("first_index", "index_mode", "expected_exit_code"),
+    [(0, "stable", 0), (0, "swap", 2), (1, "stable", 0), (1, "swap", 2), (1, "invalid", 2)],
+    ids=["zero-stable", "zero-aba", "one-stable", "one-aba", "one-invalid"],
+)
 def test_scan_multiple_cross_directory_shards_refreshes_index_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    first_index: int,
+    index_mode: str,
+    expected_exit_code: int,
 ) -> None:
-    """Explicit reconciliation must not reuse authority captured before per-path scans."""
+    """Explicit reconciliation must require one stable index generation for either base."""
     header = b'{"__metadata__":{"format":"pt"}}'
 
     def create_shard(parent: str, index: int) -> Path:
@@ -1003,8 +1011,78 @@ def test_scan_multiple_cross_directory_shards_refreshes_index_authority(
         shard.write_bytes(struct.pack("<Q", len(header)) + header)
         return shard
 
-    selected_shards = [create_shard("a", 0), create_shard("b", 1)]
-    decoy_shards = [create_shard("d", 0), create_shard("c", 1)]
+    selected_shards = [create_shard("a", first_index), create_shard("b", first_index + 1)]
+    decoy_shards = [create_shard("d", first_index), create_shard("c", first_index + 1)]
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def write_index(shards: list[Path]) -> None:
+        index_path.write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        f"tensor-{index}": shard.relative_to(tmp_path).as_posix() for index, shard in enumerate(shards)
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_index([selected_shards[0], decoy_shards[1]] if index_mode == "invalid" else selected_shards)
+    original_resolve_source = cli_module._resolve_scan_source_for_path
+    resolve_count = 0
+
+    def replace_index_before_each_scan(*args: Any, **kwargs: Any) -> Any:
+        nonlocal resolve_count
+        resolve_count += 1
+        if index_mode == "swap":
+            write_index(
+                [selected_shards[0], decoy_shards[1]] if resolve_count == 1 else [decoy_shards[0], selected_shards[1]]
+            )
+        return original_resolve_source(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_resolve_scan_source_for_path", replace_index_before_each_scan)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *(str(shard) for shard in selected_shards),
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == expected_exit_code, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is (expected_exit_code == 0)
+    coverage_reasons = {
+        check.get("details", {}).get("scan_outcome_reason")
+        for check in output_payload["checks"]
+        if check.get("details", {}).get("scan_outcome_reason") in {"missing_model_shards", "unexpected_model_shards"}
+    }
+    assert bool(coverage_reasons) is (expected_exit_code == 2)
+    if expected_exit_code == 2:
+        assert "missing_model_shards" in coverage_reasons
+
+
+def test_scan_same_directory_shards_rejects_split_index_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit shards cannot combine proof from separate valid index generations."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def create_shard(parent: Path, index: int) -> Path:
+        parent.mkdir(exist_ok=True)
+        shard = parent / f"model-{index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        return shard
+
+    selected_shards = [create_shard(tmp_path, 1), create_shard(tmp_path, 2)]
+    decoy_shards = [create_shard(tmp_path / "decoy-a", 1), create_shard(tmp_path / "decoy-b", 2)]
+    hidden_shards = [shard.with_suffix(".saved") for shard in selected_shards]
     index_path = tmp_path / "model.safetensors.index.json"
 
     def write_index(shards: list[Path]) -> None:
@@ -1026,9 +1104,13 @@ def test_scan_multiple_cross_directory_shards_refreshes_index_authority(
     def replace_index_before_each_scan(*args: Any, **kwargs: Any) -> Any:
         nonlocal resolve_count
         resolve_count += 1
-        write_index(
-            [selected_shards[0], decoy_shards[1]] if resolve_count == 1 else [decoy_shards[0], selected_shards[1]]
-        )
+        if resolve_count == 1:
+            selected_shards[1].replace(hidden_shards[1])
+            write_index([selected_shards[0], decoy_shards[1]])
+        else:
+            hidden_shards[1].replace(selected_shards[1])
+            selected_shards[0].replace(hidden_shards[0])
+            write_index([decoy_shards[0], selected_shards[1]])
         return original_resolve_source(*args, **kwargs)
 
     monkeypatch.setattr(cli_module, "_resolve_scan_source_for_path", replace_index_before_each_scan)
@@ -1048,10 +1130,89 @@ def test_scan_multiple_cross_directory_shards_refreshes_index_authority(
     assert result.exit_code == 2, result.output
     output_payload = parse_click_json_output(result.output)
     assert output_payload["success"] is False
-    assert any(
-        check.get("details", {}).get("scan_outcome_reason") == "unexpected_model_shards"
-        for check in output_payload["checks"]
+    boundary_check = next(
+        (
+            check
+            for check in output_payload["checks"]
+            if check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+        ),
+        None,
     )
+    assert boundary_check is not None, output_payload["checks"]
+    assert boundary_check["details"]["reason"] == "shard_target_changed_during_scan"
+
+
+def test_scan_path_state_revalidates_index_authority_for_cached_results(tmp_path: Path) -> None:
+    """Reused scan output cannot record a target after its index authority stops governing it."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def create_shard(parent: str, index: int) -> Path:
+        shard_dir = tmp_path / parent
+        _make_trusted_shard_parent(shard_dir)
+        shard = shard_dir / f"model-{index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        return shard
+
+    selected_shards = [create_shard("a", 1), create_shard("b", 2)]
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def write_index(shards: list[Path], *, key_prefix: str = "tensor") -> None:
+        index_path.write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        f"{key_prefix}-{index}": shard.relative_to(tmp_path).as_posix()
+                        for index, shard in enumerate(shards)
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_index(selected_shards)
+    shard_paths = tuple(str(shard) for shard in selected_shards)
+    path_state = _ScanPathState(explicit_shard_families=_explicit_local_shard_family_groups(shard_paths))
+    family = path_state.explicit_shard_family_for(str(selected_shards[0]))
+    assert family is not None
+    initial_proof = cli_module._current_explicit_shard_index_proof(family)
+    assert initial_proof is not None
+    pre_scan_target = cli_module._snapshot_validated_shard_target(
+        str(selected_shards[0]),
+        family_group=family.group,
+        family_group_policy="explicit",
+        authoritative_shard_index_base=initial_proof[0],
+        authoritative_shard_index_path=initial_proof[1],
+        authoritative_shard_index_fingerprint=initial_proof[2],
+    )
+    cached_result = create_initial_audit_result()
+    cached_result.assets.append(
+        AssetModel(
+            path=str(selected_shards[0]),
+            type="safetensors",
+            size=selected_shards[0].stat().st_size,
+        )
+    )
+    cached_result.file_metadata[str(selected_shards[0])] = FileMetadataModel(
+        file_size=selected_shards[0].stat().st_size
+    )
+
+    path_state.record_validated_shard_targets(cached_result, pre_scan_target=pre_scan_target)
+    assert path_state.validated_shard_targets
+
+    path_state.validated_shard_targets.clear()
+    write_index(selected_shards, key_prefix="changed")
+    path_state.record_validated_shard_targets(cached_result, pre_scan_target=pre_scan_target)
+
+    assert path_state.validated_shard_targets == {}
+    assert cached_result.success is False
+    assert cached_result.has_errors is True
+    assert any(
+        check.name == "Sharded Model Boundary Check"
+        and check.details.get("scan_outcome_reason") == "shard_boundary_changed"
+        and check.details.get("reason") == "shard_target_changed_during_scan"
+        for check in cached_result.checks
+    )
+    assert cached_result.file_metadata[str(selected_shards[0])]["operational_error_reason"] == "shard_boundary_changed"
 
 
 def test_scan_cross_directory_shards_ignores_duplicate_explicit_argument(tmp_path: Path) -> None:

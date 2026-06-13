@@ -4268,6 +4268,27 @@ class TestModelDownloadStreaming:
                 budget,
             )
 
+    def test_remote_safetensors_validation_rejects_missing_uppercase_custom_stem_target(self) -> None:
+        """Case-insensitive shard routing must retain governing index validation."""
+        index_file = "CUSTOM.SAFETENSORS.INDEX.JSON"
+        first_shard = "CUSTOM-00001-of-00002.SAFETENSORS"
+        missing_shard = "CUSTOM-00002-of-00002.SAFETENSORS"
+        repo_files = [index_file, first_shard]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps({"weight_map": {"first": first_shard, "second": missing_shard}}).encode()
+
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(payload)),
+            pytest.raises(ValueError, match="references missing model shard"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                [first_shard],
+                budget,
+            )
+
     def test_remote_safetensors_validation_metadata_only_refuses_index_reads(self) -> None:
         """Metadata-only planning must not range-read SafeTensors index content."""
         repo_files = [
