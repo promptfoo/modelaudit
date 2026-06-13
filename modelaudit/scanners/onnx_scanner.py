@@ -2919,8 +2919,6 @@ class _OnnxLiteFunction:
     attribute: list[str] = field(default_factory=list)
     opset_import: list[_OnnxLiteOpsetImport] = field(default_factory=list)
     attribute_proto: list[_OnnxLiteAttribute] = field(default_factory=list)
-    initializer: list[_OnnxLiteTensor] = field(default_factory=list)
-    sparse_initializer: list[_OnnxLiteSparseTensor] = field(default_factory=list)
     value_info: list[_OnnxLiteValueInfo] = field(default_factory=list)
 
 

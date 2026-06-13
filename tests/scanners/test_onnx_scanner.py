@@ -7060,6 +7060,24 @@ def _write_function_value_info_bomb_onnx(tmp_path: Path, *, count: int = 3) -> P
     return path
 
 
+def _write_function_schema_near_match_onnx(tmp_path: Path) -> Path:
+    external_entry = _proto_bytes(1, b"location") + _proto_bytes(2, b"../escape.bin")
+    tensor = (
+        _proto_varint(1, 1)
+        + _proto_varint(2, int(TensorProto.FLOAT))
+        + _proto_bytes(8, b"not-a-function-initializer")
+        + _proto_bytes(13, external_entry)
+        + _proto_varint(14, int(TensorProto.EXTERNAL))
+    )
+    metadata = _proto_bytes(1, b"owner") + _proto_bytes(2, b"modelaudit")
+    function = _proto_bytes(1, b"Fn") + _proto_bytes(14, metadata) + _proto_bytes(15, tensor)
+    graph = _proto_bytes(2, b"graph")
+    model = _proto_varint(1, 8) + _proto_bytes(7, graph) + _proto_bytes(25, function)
+    path = tmp_path / "function-schema-near-match.onnx"
+    path.write_bytes(model)
+    return path
+
+
 def _write_training_binding_bomb_onnx(tmp_path: Path, *, count: int = 3) -> Path:
     binding = _proto_bytes(1, b"old") + _proto_bytes(2, b"new")
     training_info = _proto_bytes(1, _proto_bytes(2, b"init")) + b"".join(_proto_bytes(3, binding) for _ in range(count))
@@ -7431,6 +7449,34 @@ class TestLargeOnnxFileBackedInspection:
             and check.details["op_type"] == "PythonOp"
             for check in file_backed.checks
         )
+
+    def test_function_proto_unknown_tensor_field_matches_onnx_1_21_schema(self, tmp_path: Path) -> None:
+        model_path = _write_function_schema_near_match_onnx(tmp_path)
+
+        fields_by_number = {field.number: field for field in onnx.FunctionProto.DESCRIPTOR.fields}
+        native = onnx.load_model_from_string(model_path.read_bytes())
+        lite, state = onnx_scanner_module._load_onnx_structure_file_backed(
+            str(model_path),
+            model_path.stat().st_size,
+        )
+
+        native_tensors = [
+            tensor
+            for tensors in onnx_scanner_module._iter_model_external_data_tensor_groups(native)
+            for tensor in tensors
+        ]
+        lite_tensors = [
+            tensor
+            for tensors in onnx_scanner_module._iter_model_external_data_tensor_groups(lite)
+            for tensor in tensors
+        ]
+
+        assert fields_by_number[14].name == "metadata_props"
+        assert 15 not in fields_by_number
+        assert native.functions[0].metadata_props[0].key == "owner"
+        assert native.functions[0].metadata_props[0].value == "modelaudit"
+        assert native_tensors == lite_tensors == []
+        assert state.coverage_gaps == {}
 
     def test_forced_file_backed_schema_does_not_reopen_path_or_validate_format(
         self,
