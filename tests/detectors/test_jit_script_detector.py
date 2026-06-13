@@ -461,6 +461,29 @@ class TestJITScriptDetector:
 
         assert not any(finding.type == "analysis_incomplete" for finding in findings)
 
+    def test_scan_model_ignores_pytorch_tensor_metadata_assignment_near_matches(self) -> None:
+        detector = JITScriptDetector()
+        chunks = []
+        for index in range(jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 20):
+            tensor_name = f"transformer.resblocks.{index}.attention.output.weight".encode()
+            chunks.append(
+                b"X\x06\x00\x00\x00cuda:0r"
+                + index.to_bytes(2, "little")
+                + b"\x00\x00M\x00\x04tr=\x00\x00QK\x00M\x00\x04\x85r>\x00\x00X"
+                + len(tensor_name).to_bytes(4, "little")
+                + tensor_name
+            )
+        data = b"".join(chunks)
+
+        findings = detector.scan_model(data, "pytorch", "tensor_metadata.pkl")
+
+        assert not jit_script_module._embedded_python_source_start_budget_exceeded(data)
+        assert not any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON
+            for finding in findings
+        )
+
     def test_scan_model_fails_closed_after_source_start_probe_budget(self) -> None:
         detector = JITScriptDetector()
         data = b"\n".join(

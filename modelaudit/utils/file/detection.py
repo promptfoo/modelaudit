@@ -3,21 +3,29 @@ import codecs
 import json
 import lzma
 import math
+import os
 import pickletools
 import posixpath
 import re
+import stat
 import struct
 import sys
 import tarfile
+import unicodedata
 import zipfile
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal, cast
 
-from ...scanner_registry_metadata import get_extension_format_map, get_registered_scanner_extensions
+from ...scanner_registry_metadata import (
+    TEXT_CONTENT_ROUTED_FILENAMES,
+    get_extension_format_map,
+    get_registered_scanner_extensions,
+)
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 from .hdf5 import find_hdf5_signature_offset
@@ -52,10 +60,21 @@ _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES = _TF_METAGRAPH_MAX_VALIDATE_BYTES
 _TF_METAGRAPH_MAX_ROUTING_FIELDS = 32768
 _TF_METAGRAPH_MAX_ROUTING_DEPTH = 64
 _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
+_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES = 10 * 1024 * 1024
+_CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES = _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
 _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
+_CONTENT_ROUTE_TEXT_WHITESPACE_CHARS = frozenset({"\t", "\n", "\r", "\f"})
+_CONTENT_ROUTE_TEXT_OWNER_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"})
+_CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS = frozenset({"\t", "\n", "\r", "\f", "=", ":", "#", "[", "{"})
 _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
     bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
 )
+_CONTENT_ROUTE_DECLARED_TEXT_ASSET_FILENAMES = frozenset(TEXT_CONTENT_ROUTED_FILENAMES) | {
+    "model_card.md",
+    "readme.md",
+}
+_CONTENT_ROUTE_DECLARED_DOCUMENTATION_PREFIXES = ("model_card.", "modelcard.", "readme.")
+_CONTENT_ROUTE_DECLARED_DOCUMENTATION_EXTENSIONS = frozenset({".md", ".markdown", ".rst", ".txt"})
 _TensorFlowProtoRoute = Literal[
     "unknown",
     "tf_metagraph",
@@ -65,6 +84,8 @@ _TensorFlowProtoRoute = Literal[
     "inconclusive",
 ]
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
+_SentencePieceModelProtoRoute = Literal["unknown", "strong", "malformed_candidate"]
+_GzipTarTrailingStatus = Literal["invalid", "nonzero"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _TORCH7_ASCII_HEADER_MAX_LINE_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
@@ -89,6 +110,65 @@ _ONNX_MODEL_FIELD_WIRE_TYPES = {
 _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
+_SENTENCEPIECE_MODEL_PROTO_READ_BYTES = 10 * 1024 * 1024
+_SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES = 4096
+_SENTENCEPIECE_MODEL_MAX_FIELDS = 512 * 1024
+_SENTENCEPIECE_MIN_STRONG_PIECES = 8
+_SENTENCEPIECE_MAX_PIECE_FIELDS = 16
+_SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES = 4096
+_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES = 512
+_SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS = 512
+_SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES = 64 * 1024
+_SENTENCEPIECE_MAX_TRAINER_SPEC_TEXT_BYTES = 4096
+_SENTENCEPIECE_UNKNOWN_PIECE_TYPE = 2
+_SENTENCEPIECE_BYTE_PIECE_TYPE = 6
+_SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT = 256
+_SENTENCEPIECE_IDENTITY_TOKENS = frozenset({"<unk>", "<s>", "</s>", "<pad>", "<bos>", "<eos>"})
+_SENTENCEPIECE_BYTE_FALLBACK_RE = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
+_SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS = frozenset(
+    {
+        3,
+        4,
+        6,
+        11,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        32,
+        33,
+        34,
+        35,
+        40,
+        41,
+        42,
+        43,
+        49,
+        50,
+        52,
+    }
+)
+_SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS = frozenset({1, 2, 5, 7, 30, 31, 36, 44, 45, 46, 47, 48, 53, 54})
+_SENTENCEPIECE_TRAINER_SPEC_FIXED32_FIELDS = frozenset({10, 15, 51})
+_SENTENCEPIECE_TRAINER_SPEC_FIXED64_FIELDS: frozenset[int] = frozenset()
+_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES = {
+    1: 2,
+    2: 2,
+    3: 0,
+    4: 0,
+    5: 0,
+    6: 2,
+}
 _COREML_PROTO_PREFIX_WIRE_TYPES = frozenset({0, 1, 2, 3, 5})
 _COREML_GROUP_BUDGET_EXHAUSTED: Literal["budget_exhausted"] = "budget_exhausted"
 _COREML_GROUP_INCOMPLETE: Literal["incomplete"] = "incomplete"
@@ -173,6 +253,9 @@ _TAR_USTAR_MAGIC_SIZE = 5
 _TAR_USTAR_MIN_BYTES = _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
 _TAR_CHECKSUM_OFFSET = 148
 _TAR_CHECKSUM_SIZE = 8
+_TAR_GZIP_POST_EOF_TRAILING_READ_BYTES = 64 * 1024
+_TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+_TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSION_RATIO = 250.0
 _TAR_NUMERIC_FIELD_SLICES = (
     (100, 108),  # mode
     (108, 116),  # uid
@@ -227,6 +310,7 @@ _XML_MODEL_ROOT_FORMATS = {
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 PROTOBUF_MODEL_CANDIDATE_FORMAT = "protobuf_model_candidate"
+SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT = "sentencepiece_model_proto_inconclusive"
 JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES = 1024 * 1024
 JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES = 2 * JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
 _JAX_JSON_CHECKPOINT_IDENTITY_KEYS = frozenset(
@@ -286,14 +370,64 @@ _FLAX_MSGPACK_PROBE_LENGTH_SIZES = {
     0xDA: (2, 0),
     0xDB: (4, 0),
 }
+VALID_MEDIA_ROUTING_FORMAT = "valid_media"
+MEDIA_ROUTE_READ_BYTES = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+MEDIA_ROUTE_TAIL_READ_BYTES = 64 * 1024
+_MEDIA_ROUTE_MAX_PNG_CHUNKS = 4096
+_MEDIA_STRUCTURAL_PROOF_READ_BYTES = 10 * 1024 * 1024
+_PNG_CRC_READ_CHUNK_BYTES = 64 * 1024
+_JPEG_SCAN_READ_CHUNK_BYTES = 64 * 1024
+_MEDIA_ROUTING_SUFFIXES = frozenset({".jpeg", ".jpg", ".png"})
+_MEDIA_TRAILING_PADDING = b"\x00\t\n\r "
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_IEND_CHUNK = b"IEND"
+_PNG_IEND_TRAILER = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+_JPEG_STANDALONE_MARKERS = frozenset((0x01, 0xD8, 0xD9, *range(0xD0, 0xD8)))
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
+TOKENIZER_JSON_ROUTING_READ_BYTES = 16 * 1024 * 1024
+TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES = 64 * 1024 * 1024
+TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES = 64 * 1024 * 1024
+_HF_TOKENIZER_STREAM_CHUNK_BYTES = 1024 * 1024
+_HF_TOKENIZER_STREAM_MAX_KEY_BYTES = 4096
 _UTF8_BOM = b"\xef\xbb\xbf"
 _JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+_JSON_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
+_JSON_SIMPLE_ESCAPE_BYTES = frozenset(b'"\\/bfnrt')
+_JSON_SIMPLE_ESCAPE_DECODED_CHARS = {
+    ord('"'): '"',
+    ord("\\"): "\\",
+    ord("/"): "/",
+    ord("b"): "\b",
+    ord("f"): "\f",
+    ord("n"): "\n",
+    ord("r"): "\r",
+    ord("t"): "\t",
+}
+_JSON_VALUE_DELIMITERS = b",}] \t\r\n"
 _MXNET_SYMBOL_PREFIX_MAX_VALUES = 4096
 _MXNET_SYMBOL_MAX_KEY_BYTES = 64
 _MXNET_SYMBOL_ROOT_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
 _MXNET_SYMBOL_STREAM_CHUNK_BYTES = 64 * 1024
+_HF_TOKENIZER_JSON_FILENAMES = frozenset({"tokenizer.json"})
+_HF_TOKENIZER_JSON_ROUTE_FILENAMES = frozenset(
+    {"tokenizer", "tokenizer.json", "tokenizer.txt", "tokenizer.bin", "tokenizer_config.json"}
+)
+_HF_TOKENIZER_STREAM_DECODED_TAIL_CHARS = 64
+_HF_TOKENIZER_ROOT_KEYS = frozenset({"version", "added_tokens"})
+_HF_TOKENIZER_MODEL_TYPES = frozenset({"BPE", "Unigram", "WordPiece", "WordLevel"})
+_HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS = frozenset({"added_tokens"})
+_HF_TOKENIZER_MODEL_TOKEN_DATA_KEYS = frozenset({"merges", "vocab"})
+_HF_TOKENIZER_TEMPLATE_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+_JSON_PROBE_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
+_JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE = re.compile(
+    rb"(?:\{|\\u007b)(?:\{|\\u007b|%|\\u0025|#|\\u0023)",
+    re.IGNORECASE,
+)
+_HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(_JAX_JSON_CHECKPOINT_IDENTITY_KEYS | _JAX_JSON_CHECKPOINT_MARKER_KEYS)
+_HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS = (
+    _HF_TOKENIZER_TEMPLATE_KEYS | _MXNET_SYMBOL_ROOT_KEYS | {"learner"} | _JAX_JSON_CHECKPOINT_MARKER_KEYS
+)
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
@@ -573,6 +707,1171 @@ def inspect_mxnet_symbol_root_keys(handle: BinaryIO) -> set[str]:
                 expecting_key = True
 
     return duplicates if seen >= _MXNET_SYMBOL_ROOT_KEYS else set()
+
+
+def _json_probe_skip_whitespace(probe: bytes, offset: int) -> int:
+    while offset < len(probe) and probe[offset] in b" \t\r\n":
+        offset += 1
+    return offset
+
+
+def _json_probe_skip_whitespace_reverse(probe: bytes, offset: int) -> int | None:
+    offset -= 1
+    while offset >= 0 and probe[offset] in b" \t\r\n":
+        offset -= 1
+    return offset if offset >= 0 else None
+
+
+def _json_probe_skip_string(probe: bytes, offset: int) -> int | None:
+    if offset >= len(probe) or probe[offset] != ord('"'):
+        return None
+    offset += 1
+    while offset < len(probe):
+        byte = probe[offset]
+        if byte == ord('"'):
+            return offset + 1
+        if byte < 0x20:
+            return None
+        if byte == ord("\\"):
+            offset += 1
+            if offset >= len(probe):
+                return None
+            escape = probe[offset]
+            if escape == ord("u"):
+                if offset + 4 >= len(probe):
+                    return None
+                if any(hex_byte not in _JSON_HEX_BYTES for hex_byte in probe[offset + 1 : offset + 5]):
+                    return None
+                offset += 4
+            elif escape not in _JSON_SIMPLE_ESCAPE_BYTES:
+                return None
+        offset += 1
+    return None
+
+
+def _json_probe_decode_string(probe: bytes, start: int, end: int) -> str | None:
+    try:
+        value = json.JSONDecoder().decode(probe[start:end].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _json_probe_skip_primitive(probe: bytes, offset: int) -> int | None:
+    for literal in (b"true", b"false", b"null"):
+        end = offset + len(literal)
+        if probe.startswith(literal, offset) and end < len(probe) and probe[end] in _JSON_VALUE_DELIMITERS:
+            return end
+
+    match = _JSON_NUMBER_PREFIX_RE.match(probe, offset)
+    if match is None:
+        return None
+    end = match.end()
+    if end >= len(probe):
+        return None
+    return end if probe[end] in _JSON_VALUE_DELIMITERS else None
+
+
+def _json_probe_skip_value(probe: bytes, offset: int) -> int | None:
+    offset = _json_probe_skip_whitespace(probe, offset)
+    if offset >= len(probe):
+        return None
+
+    first = probe[offset]
+    if first == ord('"'):
+        return _json_probe_skip_string(probe, offset)
+
+    if first in {ord("{"), ord("[")}:
+        stack = [ord("}") if first == ord("{") else ord("]")]
+        offset += 1
+        while offset < len(probe):
+            byte = probe[offset]
+            if byte == ord('"'):
+                string_end = _json_probe_skip_string(probe, offset)
+                if string_end is None:
+                    return None
+                offset = string_end
+                continue
+            if byte in {ord("{"), ord("[")}:
+                stack.append(ord("}") if byte == ord("{") else ord("]"))
+            elif stack and byte == stack[-1]:
+                stack.pop()
+                if not stack:
+                    return offset + 1
+            offset += 1
+        return None
+
+    return _json_probe_skip_primitive(probe, offset)
+
+
+def _json_probe_has_only_trailing_whitespace(probe: bytes, offset: int) -> bool:
+    return _json_probe_skip_whitespace(probe, offset) == len(probe)
+
+
+class _JSONProbeIncomplete(Exception):
+    """Raised when a bounded JSON probe ends before the current value does."""
+
+
+class _JSONProbeInvalid(Exception):
+    """Raised when a bounded JSON probe sees invalid JSON structure."""
+
+
+@dataclass
+class _HFTokenizerJSONProbeState:
+    has_template_evidence: bool = False
+    incomplete_model_member_key: str | None = None
+
+
+@dataclass
+class _JSONStreamContext:
+    kind: str
+    path: tuple[str, ...]
+    mode: str
+    pending_key: str | None = None
+    pending_route_key: str | None = None
+    skip_templates: bool = False
+
+
+def _json_probe_string_has_template_indicator(probe: bytes, start: int, end: int) -> bool:
+    raw_value = probe[start:end]
+    for indicator in _JSON_PROBE_TEMPLATE_INDICATORS:
+        if indicator.encode("utf-8") in raw_value:
+            return True
+
+    value = _json_probe_decode_string(probe, start, end)
+    return bool(value and any(indicator in value for indicator in _JSON_PROBE_TEMPLATE_INDICATORS))
+
+
+def _json_probe_root_string_value_has_jax_identity(probe: bytes, key: str, value_offset: int) -> bool:
+    if key not in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS or value_offset >= len(probe) or probe[value_offset] != ord('"'):
+        return False
+    value_end = _json_probe_skip_string(probe, value_offset)
+    if value_end is None:
+        return False
+    value = _json_probe_decode_string(probe, value_offset, value_end)
+    return bool(value and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value))
+
+
+def _decoded_tail_has_complete_jax_identity(decoded_tail: str) -> bool:
+    return any(match.end() < len(decoded_tail) for match in _JAX_JSON_CHECKPOINT_IDENTITY_RE.finditer(decoded_tail))
+
+
+def _json_probe_skip_string_or_raise(probe: bytes, offset: int) -> int:
+    end = _json_probe_skip_string(probe, offset)
+    if end is None:
+        raise _JSONProbeIncomplete
+    return end
+
+
+def _json_probe_skip_value_with_template_scan(
+    probe: bytes,
+    offset: int,
+    state: _HFTokenizerJSONProbeState,
+    *,
+    depth: int = 0,
+    scan_string_template_indicators: bool = True,
+) -> int:
+    if depth > 64:
+        raise _JSONProbeInvalid
+
+    offset = _json_probe_skip_whitespace(probe, offset)
+    if offset >= len(probe):
+        raise _JSONProbeIncomplete
+
+    first = probe[offset]
+    if first == ord('"'):
+        end = _json_probe_skip_string_or_raise(probe, offset)
+        if scan_string_template_indicators and _json_probe_string_has_template_indicator(probe, offset, end):
+            state.has_template_evidence = True
+        return end
+
+    if first == ord("{"):
+        return _json_probe_skip_object_with_template_scan(
+            probe,
+            offset,
+            state,
+            depth=depth + 1,
+            scan_string_template_indicators=scan_string_template_indicators,
+        )
+    if first == ord("["):
+        return _json_probe_skip_array_with_template_scan(
+            probe,
+            offset,
+            state,
+            depth=depth + 1,
+            scan_string_template_indicators=scan_string_template_indicators,
+        )
+
+    next_offset = _json_probe_skip_value(probe, offset)
+    if next_offset is None:
+        raise _JSONProbeIncomplete
+    return next_offset
+
+
+def _json_probe_skip_array_with_template_scan(
+    probe: bytes,
+    offset: int,
+    state: _HFTokenizerJSONProbeState,
+    *,
+    depth: int,
+    scan_string_template_indicators: bool,
+) -> int:
+    if depth > 64:
+        raise _JSONProbeInvalid
+
+    offset = _json_probe_skip_whitespace(probe, offset + 1)
+    if offset >= len(probe):
+        raise _JSONProbeIncomplete
+    if probe[offset] == ord("]"):
+        return offset + 1
+
+    while True:
+        offset = _json_probe_skip_value_with_template_scan(
+            probe,
+            offset,
+            state,
+            depth=depth + 1,
+            scan_string_template_indicators=scan_string_template_indicators,
+        )
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+        if probe[offset] == ord("]"):
+            return offset + 1
+        if probe[offset] != ord(","):
+            raise _JSONProbeInvalid
+        offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+
+
+def _json_probe_skip_object_with_template_scan(
+    probe: bytes,
+    offset: int,
+    state: _HFTokenizerJSONProbeState,
+    *,
+    depth: int,
+    scan_string_template_indicators: bool,
+) -> int:
+    if depth > 64:
+        raise _JSONProbeInvalid
+
+    offset = _json_probe_skip_whitespace(probe, offset + 1)
+    if offset >= len(probe):
+        raise _JSONProbeIncomplete
+    if probe[offset] == ord("}"):
+        return offset + 1
+
+    while True:
+        key_start = offset
+        key_end = _json_probe_skip_string_or_raise(probe, offset)
+        key = _json_probe_decode_string(probe, key_start, key_end)
+        if key is None:
+            raise _JSONProbeInvalid
+        if scan_string_template_indicators and key in _HF_TOKENIZER_TEMPLATE_KEYS:
+            state.has_template_evidence = True
+
+        offset = _json_probe_skip_whitespace(probe, key_end)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+        if probe[offset] != ord(":"):
+            raise _JSONProbeInvalid
+
+        offset = _json_probe_skip_value_with_template_scan(
+            probe,
+            offset + 1,
+            state,
+            depth=depth + 1,
+            scan_string_template_indicators=scan_string_template_indicators,
+        )
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+        if probe[offset] == ord("}"):
+            return offset + 1
+        if probe[offset] != ord(","):
+            raise _JSONProbeInvalid
+        offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+
+
+def _hf_tokenizer_probe_model_object(
+    probe: bytes,
+    offset: int,
+    state: _HFTokenizerJSONProbeState,
+) -> tuple[int | None, bool]:
+    """Return the model-object end offset when complete plus schema evidence."""
+    state.incomplete_model_member_key = None
+    offset = _json_probe_skip_whitespace(probe, offset)
+    if offset >= len(probe) or probe[offset] != ord("{"):
+        raise _JSONProbeInvalid
+
+    saw_model_type = False
+    saw_vocab = False
+    offset += 1
+    while offset < len(probe):
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            return None, saw_model_type and saw_vocab
+        if probe[offset] == ord("}"):
+            return offset + 1, saw_model_type and saw_vocab
+        if probe[offset] != ord('"'):
+            raise _JSONProbeInvalid
+
+        key_start = offset
+        key_end = _json_probe_skip_string_or_raise(probe, offset)
+        key = _json_probe_decode_string(probe, key_start, key_end)
+        if key is None:
+            raise _JSONProbeInvalid
+        if key in _HF_TOKENIZER_TEMPLATE_KEYS:
+            state.has_template_evidence = True
+
+        offset = _json_probe_skip_whitespace(probe, key_end)
+        if offset >= len(probe) or probe[offset] != ord(":"):
+            raise _JSONProbeInvalid
+        value_offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if value_offset >= len(probe):
+            state.incomplete_model_member_key = key
+            return None, saw_model_type and saw_vocab
+
+        model_type_value = False
+        if key == "type" and probe[value_offset] == ord('"'):
+            value_end = _json_probe_skip_string_or_raise(probe, value_offset)
+            model_type = _json_probe_decode_string(probe, value_offset, value_end)
+            model_type_value = model_type in _HF_TOKENIZER_MODEL_TYPES
+
+        if key in _HF_TOKENIZER_MODEL_TOKEN_DATA_KEYS:
+            if probe[value_offset] not in {ord("{"), ord("[")}:
+                raise _JSONProbeInvalid
+            if key == "vocab":
+                saw_vocab = True
+            try:
+                next_offset = _json_probe_skip_value_with_template_scan(
+                    probe,
+                    value_offset,
+                    state,
+                    depth=1,
+                    scan_string_template_indicators=False,
+                )
+            except _JSONProbeIncomplete:
+                state.incomplete_model_member_key = key
+                return None, saw_model_type and saw_vocab
+        else:
+            try:
+                next_offset = _json_probe_skip_value_with_template_scan(
+                    probe,
+                    value_offset,
+                    state,
+                    depth=1,
+                )
+            except _JSONProbeIncomplete:
+                state.incomplete_model_member_key = key
+                return None, saw_model_type and saw_vocab
+        if key == "type":
+            saw_model_type = model_type_value
+
+        offset = next_offset
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            state.incomplete_model_member_key = key
+            return None, saw_model_type and saw_vocab
+        if probe[offset] == ord(","):
+            offset += 1
+            if offset >= len(probe):
+                state.incomplete_model_member_key = key
+                return None, saw_model_type and saw_vocab
+            continue
+        if probe[offset] == ord("}"):
+            return offset + 1, saw_model_type and saw_vocab
+        raise _JSONProbeInvalid
+
+    return None, saw_model_type and saw_vocab
+
+
+def _hf_tokenizer_suffix_has_route_conflict(
+    file_path: Path,
+    file_size: int,
+    *,
+    allow_after_any_value: bool = False,
+    allow_after_vocab_array: bool = False,
+) -> bool:
+    """Return whether a bounded suffix exposes late scanner-owned root evidence."""
+    return _hf_tokenizer_suffix_has_structural_route_key(
+        file_path,
+        file_size,
+        _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS,
+        allow_after_any_value=allow_after_any_value,
+        allow_after_vocab_array=allow_after_vocab_array,
+    ) or _hf_tokenizer_suffix_has_structural_route_key(
+        file_path,
+        file_size,
+        _JAX_JSON_CHECKPOINT_IDENTITY_KEYS,
+        allow_after_any_value=allow_after_any_value,
+        allow_after_vocab_array=allow_after_vocab_array,
+        require_jax_identity_value=True,
+    )
+
+
+def _hf_tokenizer_suffix_has_structural_route_key(
+    file_path: Path,
+    file_size: int,
+    keys: frozenset[str],
+    *,
+    allow_after_any_value: bool = False,
+    allow_after_vocab_array: bool = False,
+    require_jax_identity_value: bool = False,
+) -> bool:
+    """Return whether a bounded suffix exposes a key after a completed value."""
+    if file_size <= TOKENIZER_JSON_ROUTING_READ_BYTES:
+        return False
+
+    try:
+        read_size = min(file_size, _STRUCTURED_JSON_TRAILING_READ_BYTES)
+        with file_path.open("rb") as stream:
+            stream.seek(max(0, file_size - read_size))
+            suffix = stream.read(read_size)
+    except OSError:
+        return True
+
+    for offset, byte in enumerate(suffix):
+        if byte != ord(","):
+            continue
+        previous_offset = _json_probe_skip_whitespace_reverse(suffix, offset)
+        if previous_offset is None:
+            continue
+        if not allow_after_any_value and suffix[previous_offset] != ord("}"):
+            previous_container_offset = _json_probe_skip_whitespace_reverse(suffix, previous_offset)
+            if not (
+                allow_after_vocab_array
+                and suffix[previous_offset] == ord("]")
+                and previous_container_offset is not None
+                and suffix[previous_container_offset] == ord("]")
+            ):
+                continue
+        offset = _json_probe_skip_whitespace(suffix, offset + 1)
+        if offset >= len(suffix) or suffix[offset] != ord('"'):
+            continue
+        key_start = offset
+        key_end = _json_probe_skip_string(suffix, offset)
+        if key_end is None:
+            continue
+        key = _json_probe_decode_string(suffix, key_start, key_end)
+        if key not in keys:
+            continue
+        offset = _json_probe_skip_whitespace(suffix, key_end)
+        if offset >= len(suffix) or suffix[offset] != ord(":"):
+            continue
+        if require_jax_identity_value and key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+            value_offset = _json_probe_skip_whitespace(suffix, offset + 1)
+            if _json_probe_root_string_value_has_jax_identity(suffix, key, value_offset):
+                return True
+            continue
+        if not require_jax_identity_value or key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+            return True
+    return _hf_tokenizer_stream_has_structural_route_key(
+        file_path,
+        keys,
+        require_jax_identity_value=require_jax_identity_value,
+    )
+
+
+def _hf_tokenizer_stream_path_skips_templates(path: tuple[str, ...]) -> bool:
+    return (len(path) >= 1 and path[0] in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS) or (
+        len(path) >= 2 and path[0] == "model" and path[1] in _HF_TOKENIZER_MODEL_TOKEN_DATA_KEYS
+    )
+
+
+def _hf_tokenizer_stream_has_structural_route_key(
+    file_path: Path,
+    keys: frozenset[str],
+    *,
+    require_jax_identity_value: bool = False,
+) -> bool:
+    """Return whether a bounded-memory structural scan finds tokenizer route evidence."""
+    indicator_bytes = tuple(indicator.encode("utf-8") for indicator in _JSON_PROBE_TEMPLATE_INDICATORS)
+    indicator_tail_size = max(len(indicator) for indicator in indicator_bytes) - 1
+    scan_template_values = bool(keys & _HF_TOKENIZER_TEMPLATE_KEYS) and not require_jax_identity_value
+    stack: list[_JSONStreamContext] = []
+    in_string = False
+    string_is_key = False
+    string_skip_templates = False
+    string_route_key: str | None = None
+    string_key_bytes = bytearray()
+    string_value_bytes = bytearray()
+    string_tail = b""
+    string_jax_identity_tail = ""
+    string_jax_unicode_escape: bytearray | None = None
+    string_jax_utf8_decoder: codecs.IncrementalDecoder | None = None
+    string_jax_escape_pending = False
+    string_jax_decode_invalid = False
+    string_value_has_jax_identity = False
+    escaped = False
+    in_primitive = False
+    primitive_done = False
+
+    def current_value_path() -> tuple[str, ...]:
+        if not stack:
+            return ()
+        context = stack[-1]
+        if context.kind == "object" and context.mode == "value" and context.pending_key is not None:
+            return (*context.path, context.pending_key)
+        return context.path
+
+    def current_value_skips_templates() -> bool:
+        inherited = bool(stack and stack[-1].skip_templates)
+        path = current_value_path()
+        return inherited or _hf_tokenizer_stream_path_skips_templates(path)
+
+    def mark_value_complete() -> None:
+        if not stack:
+            return
+        context = stack[-1]
+        context.mode = "after_value"
+        context.pending_key = None
+        context.pending_route_key = None
+
+    def push_context(kind: str) -> None:
+        path = current_value_path()
+        stack.append(
+            _JSONStreamContext(
+                kind=kind,
+                path=path,
+                mode="key" if kind == "object" else "value",
+                skip_templates=current_value_skips_templates(),
+            )
+        )
+
+    def append_jax_identity_text(text: str) -> None:
+        nonlocal string_jax_identity_tail, string_value_has_jax_identity
+        if not text:
+            return
+        combined_identity = string_jax_identity_tail + text
+        if _decoded_tail_has_complete_jax_identity(combined_identity):
+            string_value_has_jax_identity = True
+        string_jax_identity_tail = combined_identity[-_HF_TOKENIZER_STREAM_DECODED_TAIL_CHARS:]
+
+    def jax_identity_utf8_boundary_is_clean() -> bool:
+        nonlocal string_jax_decode_invalid
+        if string_jax_utf8_decoder is None:
+            string_jax_decode_invalid = True
+            return False
+        if string_jax_utf8_decoder.getstate()[0]:
+            string_jax_decode_invalid = True
+            return False
+        return True
+
+    def feed_jax_identity_byte(byte: int) -> None:
+        nonlocal string_jax_decode_invalid, string_jax_escape_pending, string_jax_unicode_escape
+        if string_jax_decode_invalid:
+            return
+        if string_jax_unicode_escape is not None:
+            if byte not in _JSON_HEX_BYTES:
+                string_jax_decode_invalid = True
+                return
+            string_jax_unicode_escape.append(byte)
+            if len(string_jax_unicode_escape) == 4:
+                append_jax_identity_text(chr(int(bytes(string_jax_unicode_escape), 16)))
+                string_jax_unicode_escape = None
+            return
+        if string_jax_escape_pending:
+            string_jax_escape_pending = False
+            if byte == ord("u"):
+                string_jax_unicode_escape = bytearray()
+                return
+            decoded_char = _JSON_SIMPLE_ESCAPE_DECODED_CHARS.get(byte)
+            if decoded_char is None:
+                string_jax_decode_invalid = True
+                return
+            append_jax_identity_text(decoded_char)
+            return
+        if byte == ord("\\"):
+            if jax_identity_utf8_boundary_is_clean():
+                string_jax_escape_pending = True
+            return
+        if byte < 0x20 or string_jax_utf8_decoder is None:
+            string_jax_decode_invalid = True
+            return
+        try:
+            append_jax_identity_text(string_jax_utf8_decoder.decode(bytes((byte,)), final=False))
+        except UnicodeDecodeError:
+            string_jax_decode_invalid = True
+
+    def finish_jax_identity_string() -> None:
+        nonlocal string_jax_decode_invalid, string_value_has_jax_identity
+        if string_jax_decode_invalid or string_jax_escape_pending or string_jax_unicode_escape is not None:
+            string_jax_decode_invalid = True
+            return
+        if string_jax_utf8_decoder is not None:
+            try:
+                append_jax_identity_text(string_jax_utf8_decoder.decode(b"", final=True))
+            except UnicodeDecodeError:
+                string_jax_decode_invalid = True
+                return
+        if _decoded_tail_has_complete_jax_identity(f'{string_jax_identity_tail}"'):
+            string_value_has_jax_identity = True
+
+    def handle_structural_byte(byte: int) -> None:
+        nonlocal in_primitive, primitive_done
+        if byte in b" \t\r\n":
+            return
+        if byte == ord("{"):
+            push_context("object")
+            return
+        if byte == ord("["):
+            push_context("array")
+            return
+        if byte in {ord("}"), ord("]")}:
+            if stack:
+                stack.pop()
+                mark_value_complete()
+            return
+        if not stack:
+            return
+        context = stack[-1]
+        if byte == ord(":"):
+            if context.kind == "object" and context.mode == "colon":
+                context.mode = "value"
+            return
+        if byte == ord(","):
+            if context.kind == "object" and context.mode == "after_value":
+                context.mode = "key"
+                context.pending_key = None
+            elif context.kind == "array" and context.mode == "after_value":
+                context.mode = "value"
+            return
+        if (context.kind == "object" and context.mode == "value") or (
+            context.kind == "array" and context.mode == "value"
+        ):
+            in_primitive = True
+            primitive_done = False
+
+    try:
+        with file_path.open("rb") as stream:
+            first_chunk = True
+            bytes_read = 0
+            while bytes_read < TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES:
+                remaining = TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES - bytes_read
+                chunk = stream.read(min(_HF_TOKENIZER_STREAM_CHUNK_BYTES, remaining))
+                if not chunk:
+                    return False
+                bytes_read += len(chunk)
+                if first_chunk:
+                    first_chunk = False
+                    if chunk.startswith(_UTF8_BOM):
+                        chunk = chunk[len(_UTF8_BOM) :]
+                for byte in chunk:
+                    if in_string:
+                        if string_is_key and len(string_key_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES:
+                            string_key_bytes.append(byte)
+                        if (
+                            not string_is_key
+                            and string_route_key is not None
+                            and len(string_value_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES
+                        ):
+                            string_value_bytes.append(byte)
+                        if not string_is_key and string_route_key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+                            if byte == ord('"') and not escaped:
+                                finish_jax_identity_string()
+                            else:
+                                feed_jax_identity_byte(byte)
+                        if scan_template_values and not string_is_key and not string_skip_templates:
+                            combined = string_tail + bytes((byte,))
+                            if any(indicator in combined for indicator in indicator_bytes) or (
+                                _JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE.search(combined) is not None
+                            ):
+                                return True
+                            string_tail = combined[-max(indicator_tail_size, 12) :]
+                        if escaped:
+                            escaped = False
+                            continue
+                        if byte == ord("\\"):
+                            escaped = True
+                            continue
+                        if byte != ord('"'):
+                            continue
+
+                        in_string = False
+                        if string_is_key:
+                            key_bytes = bytes(string_key_bytes)
+                            key = (
+                                _json_probe_decode_string(key_bytes, 0, len(key_bytes))
+                                if len(key_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES
+                                else None
+                            )
+                            context = stack[-1] if stack else None
+                            if context and context.kind == "object" and context.mode == "key":
+                                route_key_is_template = key in _HF_TOKENIZER_TEMPLATE_KEYS
+                                route_key_is_root = context.path == ()
+                                if (
+                                    route_key_is_template
+                                    and key in keys
+                                    and not require_jax_identity_value
+                                    and not context.skip_templates
+                                ):
+                                    return True
+                                if key in keys and route_key_is_root:
+                                    if require_jax_identity_value:
+                                        if key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+                                            return True
+                                        if key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+                                            context.pending_route_key = key
+                                    else:
+                                        return True
+                                context.pending_key = key
+                                context.mode = "colon"
+                        else:
+                            if string_route_key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+                                if string_value_has_jax_identity and not string_jax_decode_invalid:
+                                    return True
+                                value_bytes = bytes(string_value_bytes)
+                                value = (
+                                    _json_probe_decode_string(value_bytes, 0, len(value_bytes))
+                                    if len(value_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES
+                                    else None
+                                )
+                                if value and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value):
+                                    return True
+                            mark_value_complete()
+                        continue
+
+                    if in_primitive:
+                        if byte in b" \t\r\n":
+                            primitive_done = True
+                            continue
+                        if byte in b",}]":
+                            in_primitive = False
+                            primitive_done = False
+                            mark_value_complete()
+                            handle_structural_byte(byte)
+                            continue
+                        if primitive_done:
+                            return False
+                        continue
+
+                    context = stack[-1] if stack else None
+                    if byte == ord('"') and (
+                        context is None
+                        or (context.kind == "object" and context.mode in {"key", "value"})
+                        or (context.kind == "array" and context.mode == "value")
+                    ):
+                        in_string = True
+                        escaped = False
+                        string_is_key = bool(context and context.kind == "object" and context.mode == "key")
+                        string_skip_templates = current_value_skips_templates()
+                        string_route_key = (
+                            context.pending_route_key
+                            if context and context.kind == "object" and context.mode == "value"
+                            else None
+                        )
+                        string_key_bytes = bytearray(b'"') if string_is_key else bytearray()
+                        string_value_bytes = bytearray(b'"') if string_route_key is not None else bytearray()
+                        string_tail = b""
+                        string_jax_identity_tail = ""
+                        string_jax_unicode_escape = None
+                        string_jax_utf8_decoder = (
+                            codecs.getincrementaldecoder("utf-8")("strict")
+                            if string_route_key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS
+                            else None
+                        )
+                        string_jax_escape_pending = False
+                        string_jax_decode_invalid = False
+                        string_value_has_jax_identity = False
+                        continue
+
+                    handle_structural_byte(byte)
+            return not (
+                scan_template_values and (string_skip_templates or any(context.skip_templates for context in stack))
+            )
+    except OSError:
+        return False
+
+
+def _hf_tokenizer_json_has_decoded_route_evidence(
+    path: str | Path,
+    keys: frozenset[str],
+    *,
+    scan_nested_templates: bool = False,
+    require_jax_identity_value: bool = False,
+) -> bool:
+    """Return whether bounded tokenizer JSON exposes decoded route-key evidence."""
+    file_path = Path(path)
+    if not _is_hf_tokenizer_json_route_candidate_path(file_path):
+        return False
+    try:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        if file_size < 4:
+            return False
+        read_size = min(
+            file_size,
+            max(TOKENIZER_JSON_ROUTING_READ_BYTES, TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES),
+        )
+        probe = read_magic_bytes(str(file_path), read_size)
+    except OSError:
+        return False
+
+    sample_is_prefix = file_size > len(probe)
+    probe = probe[len(_UTF8_BOM) :] if probe.startswith(_UTF8_BOM) else probe
+    offset = _json_probe_skip_whitespace(probe, 0)
+    if offset >= len(probe) or probe[offset] != ord("{"):
+        return False
+
+    offset += 1
+    while offset < len(probe):
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe) or probe[offset] == ord("}"):
+            return False
+        if probe[offset] != ord('"'):
+            return False
+
+        key_start = offset
+        key_end = _json_probe_skip_string(probe, offset)
+        if key_end is None:
+            return _hf_tokenizer_suffix_has_structural_route_key(
+                file_path,
+                file_size,
+                keys,
+                require_jax_identity_value=require_jax_identity_value,
+            )
+        key = _json_probe_decode_string(probe, key_start, key_end)
+        if key is None:
+            return False
+        if key in keys and not require_jax_identity_value:
+            return True
+
+        offset = _json_probe_skip_whitespace(probe, key_end)
+        if offset >= len(probe) or probe[offset] != ord(":"):
+            return False
+        value_offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if value_offset >= len(probe):
+            return _hf_tokenizer_suffix_has_structural_route_key(
+                file_path,
+                file_size,
+                keys,
+                allow_after_any_value=key != "model",
+                allow_after_vocab_array=scan_nested_templates and key == "model",
+                require_jax_identity_value=require_jax_identity_value,
+            )
+        if key in keys and require_jax_identity_value:
+            if key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+                return True
+            if _json_probe_root_string_value_has_jax_identity(probe, key, value_offset):
+                return True
+
+        if scan_nested_templates:
+            state = _HFTokenizerJSONProbeState()
+            try:
+                if key == "model":
+                    next_offset, _model_schema = _hf_tokenizer_probe_model_object(probe, value_offset, state)
+                else:
+                    next_offset = _json_probe_skip_value_with_template_scan(
+                        probe,
+                        value_offset,
+                        state,
+                        depth=1,
+                        scan_string_template_indicators=key not in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS,
+                    )
+            except (_JSONProbeIncomplete, _JSONProbeInvalid):
+                model_member_key = state.incomplete_model_member_key if key == "model" else None
+                return sample_is_prefix and _hf_tokenizer_suffix_has_structural_route_key(
+                    file_path,
+                    file_size,
+                    keys,
+                    allow_after_any_value=key != "model"
+                    or (scan_nested_templates and key == "model" and model_member_key not in {None, "vocab"}),
+                    allow_after_vocab_array=scan_nested_templates and key == "model" and model_member_key == "vocab",
+                    require_jax_identity_value=require_jax_identity_value,
+                )
+            if state.has_template_evidence:
+                return True
+            if next_offset is None:
+                model_member_key = state.incomplete_model_member_key if key == "model" else None
+                return sample_is_prefix and _hf_tokenizer_suffix_has_structural_route_key(
+                    file_path,
+                    file_size,
+                    keys,
+                    allow_after_any_value=key != "model"
+                    or (scan_nested_templates and key == "model" and model_member_key not in {None, "vocab"}),
+                    allow_after_vocab_array=scan_nested_templates and key == "model" and model_member_key == "vocab",
+                    require_jax_identity_value=require_jax_identity_value,
+                )
+        else:
+            next_offset = _json_probe_skip_value(probe, value_offset)
+            if next_offset is None:
+                return sample_is_prefix and _hf_tokenizer_suffix_has_structural_route_key(
+                    file_path,
+                    file_size,
+                    keys,
+                    allow_after_any_value=key != "model",
+                    require_jax_identity_value=require_jax_identity_value,
+                )
+
+        offset = _json_probe_skip_whitespace(probe, next_offset)
+        if offset >= len(probe):
+            return sample_is_prefix and _hf_tokenizer_suffix_has_structural_route_key(
+                file_path,
+                file_size,
+                keys,
+                allow_after_any_value=key != "model",
+                allow_after_vocab_array=scan_nested_templates and key == "model",
+                require_jax_identity_value=require_jax_identity_value,
+            )
+        if probe[offset] == ord(","):
+            offset += 1
+            continue
+        if probe[offset] == ord("}"):
+            return False
+        return False
+
+    return False
+
+
+def _is_hf_tokenizer_json_schema_path(file_path: Path) -> bool:
+    return file_path.name.lower() in _HF_TOKENIZER_JSON_FILENAMES and file_path.suffix.lower() == ".json"
+
+
+def _is_hf_tokenizer_json_route_candidate_path(file_path: Path) -> bool:
+    return file_path.name.lower() in _HF_TOKENIZER_JSON_ROUTE_FILENAMES
+
+
+def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
+    """Return whether exact tokenizer.json has tokenizer evidence but malformed JSON."""
+    file_path = Path(path)
+    if not _is_hf_tokenizer_json_schema_path(file_path):
+        return False
+    try:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        if file_size < 4:
+            return False
+        read_size = min(file_size, TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES)
+        probe = read_magic_bytes(str(file_path), read_size)
+    except OSError:
+        return False
+
+    sample_is_prefix = file_size > len(probe)
+    probe = probe[len(_UTF8_BOM) :] if probe.startswith(_UTF8_BOM) else probe
+    offset = _json_probe_skip_whitespace(probe, 0)
+    if offset >= len(probe) or probe[offset] != ord("{"):
+        return False
+
+    root_keys: set[str] = set()
+    saw_model_key = False
+    saw_model_schema = False
+    state = _HFTokenizerJSONProbeState()
+
+    def has_tokenizer_root_evidence() -> bool:
+        return saw_model_schema or saw_model_key or root_keys >= _HF_TOKENIZER_ROOT_KEYS
+
+    offset += 1
+    while offset < len(probe):
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            return sample_is_prefix and has_tokenizer_root_evidence()
+        if probe[offset] == ord("}"):
+            return has_tokenizer_root_evidence() and not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
+        if probe[offset] != ord('"'):
+            return has_tokenizer_root_evidence()
+
+        key_start = offset
+        key_end = _json_probe_skip_string(probe, offset)
+        if key_end is None:
+            return has_tokenizer_root_evidence()
+        key = _json_probe_decode_string(probe, key_start, key_end)
+        if key is None:
+            return has_tokenizer_root_evidence()
+
+        offset = _json_probe_skip_whitespace(probe, key_end)
+        if offset >= len(probe) or probe[offset] != ord(":"):
+            return has_tokenizer_root_evidence()
+        value_offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if value_offset >= len(probe):
+            return sample_is_prefix and has_tokenizer_root_evidence()
+
+        if key in _HF_TOKENIZER_ROOT_KEYS:
+            root_keys.add(key)
+        if key == "model":
+            saw_model_key = True
+            try:
+                next_offset, model_schema = _hf_tokenizer_probe_model_object(probe, value_offset, state)
+            except (_JSONProbeIncomplete, _JSONProbeInvalid):
+                return has_tokenizer_root_evidence()
+            saw_model_schema = saw_model_schema or model_schema
+            if next_offset is None:
+                return sample_is_prefix and has_tokenizer_root_evidence()
+        else:
+            try:
+                next_offset = _json_probe_skip_value_with_template_scan(
+                    probe,
+                    value_offset,
+                    state,
+                    depth=1,
+                    scan_string_template_indicators=key not in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS,
+                )
+            except (_JSONProbeIncomplete, _JSONProbeInvalid):
+                return has_tokenizer_root_evidence()
+
+        offset = _json_probe_skip_whitespace(probe, next_offset)
+        if offset >= len(probe):
+            return sample_is_prefix and has_tokenizer_root_evidence()
+        if probe[offset] == ord(","):
+            offset += 1
+            continue
+        if probe[offset] == ord("}"):
+            return has_tokenizer_root_evidence() and not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
+        return has_tokenizer_root_evidence()
+
+    return sample_is_prefix and has_tokenizer_root_evidence()
+
+
+def huggingface_tokenizer_json_has_template_route_evidence(path: str | Path) -> bool:
+    """Return whether bounded tokenizer JSON evidence should route to Jinja scanning."""
+    if is_huggingface_tokenizer_json_file(path):
+        return False
+    return _hf_tokenizer_json_has_decoded_route_evidence(
+        path,
+        _HF_TOKENIZER_TEMPLATE_KEYS,
+        scan_nested_templates=True,
+    )
+
+
+def huggingface_tokenizer_json_has_jax_route_evidence(path: str | Path) -> bool:
+    """Return whether bounded tokenizer JSON evidence should route to JAX scanning."""
+    if is_huggingface_tokenizer_json_file(path):
+        return False
+    return _hf_tokenizer_json_has_decoded_route_evidence(
+        path,
+        _HF_TOKENIZER_JAX_ROUTE_KEYS,
+        require_jax_identity_value=True,
+    )
+
+
+def huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(path: str | Path) -> bool:
+    """Return whether tokenizer JSON evidence should preserve MXNet/XGBoost routing."""
+    return _hf_tokenizer_json_has_decoded_route_evidence(
+        path,
+        _MXNET_SYMBOL_ROOT_KEYS | {"learner"},
+    )
+
+
+def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
+    """Return whether bounded filename and schema evidence proves tokenizer JSON ownership."""
+    file_path = Path(path)
+    if not _is_hf_tokenizer_json_schema_path(file_path):
+        return False
+    try:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        if file_size < 4:
+            return False
+        read_size = min(file_size, TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES)
+        probe = read_magic_bytes(str(file_path), read_size)
+    except OSError:
+        return False
+
+    sample_is_prefix = file_size > len(probe)
+    probe = probe[len(_UTF8_BOM) :] if probe.startswith(_UTF8_BOM) else probe
+    offset = _json_probe_skip_whitespace(probe, 0)
+    if offset >= len(probe) or probe[offset] != ord("{"):
+        return False
+
+    root_keys: set[str] = set()
+    saw_model_schema = False
+    state = _HFTokenizerJSONProbeState()
+    offset += 1
+    while offset < len(probe):
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            return False
+        if probe[offset] == ord("}"):
+            return (
+                not sample_is_prefix
+                and root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                and saw_model_schema
+                and not state.has_template_evidence
+                and _json_probe_has_only_trailing_whitespace(
+                    probe,
+                    offset + 1,
+                )
+            )
+        if probe[offset] != ord('"'):
+            return False
+
+        key_start = offset
+        key_end = _json_probe_skip_string(probe, offset)
+        if key_end is None:
+            return False
+        key = _json_probe_decode_string(probe, key_start, key_end)
+        if key is None:
+            return False
+
+        offset = _json_probe_skip_whitespace(probe, key_end)
+        if offset >= len(probe) or probe[offset] != ord(":"):
+            return False
+        value_offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if value_offset >= len(probe):
+            return False
+
+        if (
+            key in _MXNET_SYMBOL_ROOT_KEYS
+            or key == "learner"
+            or key in _HF_TOKENIZER_TEMPLATE_KEYS
+            or key in _JAX_JSON_CHECKPOINT_MARKER_KEYS
+            or _json_probe_root_string_value_has_jax_identity(probe, key, value_offset)
+        ):
+            return False
+        if key in _HF_TOKENIZER_ROOT_KEYS:
+            root_keys.add(key)
+        if key == "model":
+            try:
+                next_offset, model_schema = _hf_tokenizer_probe_model_object(probe, value_offset, state)
+            except (_JSONProbeIncomplete, _JSONProbeInvalid):
+                return False
+            saw_model_schema = saw_model_schema or model_schema
+            if state.has_template_evidence:
+                return False
+            if next_offset is None:
+                return False
+        else:
+            try:
+                next_offset = _json_probe_skip_value_with_template_scan(
+                    probe,
+                    value_offset,
+                    state,
+                    depth=1,
+                    scan_string_template_indicators=key not in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS,
+                )
+            except _JSONProbeIncomplete:
+                return False
+            except _JSONProbeInvalid:
+                return False
+            if state.has_template_evidence:
+                return False
+
+        offset = _json_probe_skip_whitespace(probe, next_offset)
+        if offset >= len(probe):
+            return False
+        if probe[offset] == ord(","):
+            offset += 1
+            continue
+        if probe[offset] == ord("}"):
+            return (
+                not sample_is_prefix
+                and root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                and saw_model_schema
+                and not state.has_template_evidence
+                and _json_probe_has_only_trailing_whitespace(
+                    probe,
+                    offset + 1,
+                )
+            )
+        return False
+
+    return False
 
 
 def _detect_mxnet_symbol_prefix_route(
@@ -881,6 +2180,16 @@ def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
 
 def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str | None:
     """Route plausible JSON symbol content or preserve bounded ambiguity."""
+    tokenizer_has_mxnet_or_xgboost = huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(file_path)
+    if not tokenizer_has_mxnet_or_xgboost and (
+        huggingface_tokenizer_json_has_template_route_evidence(file_path)
+        or huggingface_tokenizer_json_has_jax_route_evidence(file_path)
+    ):
+        return None
+    if is_huggingface_tokenizer_json_file(file_path):
+        return None
+    if not tokenizer_has_mxnet_or_xgboost and _malformed_hf_tokenizer_json_has_schema_evidence(file_path):
+        return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
     if file_path.name.lower().endswith("-symbol.json"):
         # Canonical symbol names already belong to MXNetScanner; do not let a
         # discovery budget prevent its bounded fail-closed analysis from running.
@@ -1380,6 +2689,810 @@ def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None 
     return None
 
 
+@dataclass
+class _SentencePieceTrainerSpecSignals:
+    model_type: int | None = None
+    vocab_size: int | None = None
+    unk_id: int = 0
+    unk_id_explicit: bool = False
+    unk_piece: str | None = None
+    unk_piece_explicit: bool = False
+    byte_fallback: bool = False
+    byte_fallback_explicit: bool = False
+
+    @property
+    def has_core_metadata(self) -> bool:
+        return self.model_type is not None and self.vocab_size is not None
+
+    def merge_from(self, other: "_SentencePieceTrainerSpecSignals") -> None:
+        if other.model_type is not None:
+            self.model_type = other.model_type
+        if other.vocab_size is not None:
+            self.vocab_size = other.vocab_size
+        if other.unk_id_explicit:
+            self.unk_id = other.unk_id
+            self.unk_id_explicit = True
+        if other.unk_piece_explicit:
+            self.unk_piece = other.unk_piece
+            self.unk_piece_explicit = True
+        if other.byte_fallback_explicit:
+            self.byte_fallback = other.byte_fallback
+            self.byte_fallback_explicit = True
+
+
+@dataclass
+class _SentencePiecePieceProtoSignals:
+    piece_text: str | None = None
+    piece_type: int | None = None
+    decoded_text_bytes: int = 0
+
+
+def _decode_proto_int32_varint(value: int) -> int:
+    """Decode proto2 int32 values that may be sign-extended into a uint64 varint."""
+    if value >= 1 << 63:
+        value -= 1 << 64
+    return value
+
+
+def _decode_bounded_proto_string(data: bytes, start: int, end: int, *, max_bytes: int) -> str | None:
+    if end < start or end - start > max_bytes:
+        return None
+    try:
+        value = data[start:end].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not value or "\x00" in value:
+        return None
+    return value
+
+
+def _parse_sentencepiece_piece_proto(data: bytes, start: int, end: int) -> tuple[str, int | None] | None:
+    """Return the token text and optional type for one SentencePiece piece."""
+    if end - start > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
+        return None
+
+    offset = start
+    fields_seen = 0
+    piece_text: str | None = None
+    piece_type: int | None = None
+    has_score = False
+    while offset < end and fields_seen < _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return None
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset, end)
+            if bounds is None:
+                return None
+            length, value_start, _value_end, actual_value_end = bounds
+            if length == 0 or length > _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES or actual_value_end > end:
+                return None
+            piece_text = _decode_bounded_proto_string(
+                data,
+                value_start,
+                actual_value_end,
+                max_bytes=_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES,
+            )
+            if piece_text is None:
+                return None
+            offset = actual_value_end
+        elif field_number == 2 and wire_type == 5:
+            fixed32_end = value_offset + 4
+            if fixed32_end > end:
+                return None
+            has_score = True
+            offset = fixed32_end
+        elif field_number == 3 and wire_type == 0:
+            type_result = _read_proto_varint(data, value_offset, end)
+            if type_result is None:
+                return None
+            piece_type, offset = type_result
+            if not 1 <= piece_type <= 6:
+                return None
+        else:
+            skipped_offset = _skip_proto_value(data, value_offset, wire_type, end)
+            if skipped_offset is None:
+                return None
+            offset = skipped_offset
+        fields_seen += 1
+
+    if offset != end or fields_seen >= _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        return None
+    if piece_text is None or not has_score:
+        return None
+    return piece_text, piece_type
+
+
+def _parse_sentencepiece_trainer_spec_proto(
+    data: bytes,
+    start: int,
+    end: int,
+) -> _SentencePieceTrainerSpecSignals | None:
+    """Parse enough TrainerSpec structure to identify custom unknown-piece models."""
+    if end - start > _SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES:
+        return None
+
+    offset = start
+    fields_seen = 0
+    signals = _SentencePieceTrainerSpecSignals()
+    while offset < end and fields_seen < _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return None
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number in _SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS:
+            if wire_type != 0:
+                return None
+            value_result = _read_proto_varint(data, value_offset, end)
+            if value_result is None:
+                return None
+            value, offset = value_result
+            if field_number == 3 and 1 <= value <= 4:
+                signals.model_type = value
+            elif field_number == 4 and value > 0:
+                signals.vocab_size = value
+            elif field_number == 35:
+                if value not in {0, 1}:
+                    return None
+                signals.byte_fallback = bool(value)
+                signals.byte_fallback_explicit = True
+            elif field_number == 40:
+                signals.unk_id = _decode_proto_int32_varint(value)
+                signals.unk_id_explicit = True
+        elif field_number in _SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS:
+            if wire_type != 2:
+                return None
+            bounds = _read_length_delimited_proto_value(data, value_offset, end)
+            if bounds is None:
+                return None
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > end:
+                return None
+            if field_number == 45:
+                signals.unk_piece = _decode_bounded_proto_string(
+                    data,
+                    value_start,
+                    actual_value_end,
+                    max_bytes=_SENTENCEPIECE_MAX_TRAINER_SPEC_TEXT_BYTES,
+                )
+                if signals.unk_piece is None:
+                    return None
+                signals.unk_piece_explicit = True
+            offset = actual_value_end
+        elif field_number in _SENTENCEPIECE_TRAINER_SPEC_FIXED32_FIELDS:
+            if wire_type != 5:
+                return None
+            offset = value_offset + 4
+            if offset > end:
+                return None
+        elif field_number in _SENTENCEPIECE_TRAINER_SPEC_FIXED64_FIELDS:
+            if wire_type != 1:
+                return None
+            offset = value_offset + 8
+            if offset > end:
+                return None
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type, end)
+            if next_offset is None:
+                return None
+            offset = next_offset
+
+        fields_seen += 1
+
+    if offset != end or fields_seen >= _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS:
+        return None
+    return signals
+
+
+def _is_well_formed_sentencepiece_submessage(
+    data: bytes,
+    start: int,
+    end: int,
+    *,
+    expected_wire_types: dict[int, int] | None = None,
+    max_fields: int = _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS,
+) -> bool:
+    offset = start
+    fields_seen = 0
+    while offset < end and fields_seen < max_fields:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if expected_wire_types is not None and expected_wire_types.get(field_number, wire_type) != wire_type:
+            return False
+        next_offset = _skip_proto_value(data, value_offset, wire_type, end)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+
+    return offset == end and fields_seen < max_fields
+
+
+def _is_well_formed_sentencepiece_submessage_stream(
+    stream: BinaryIO,
+    end_offset: int,
+    *,
+    expected_wire_types: dict[int, int] | None = None,
+    max_fields: int = _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS,
+) -> bool:
+    fields_seen = 0
+    while stream.tell() < end_offset and fields_seen < max_fields:
+        tag = _read_proto_varint_stream(stream, end_offset)
+        if tag is None:
+            return False
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if expected_wire_types is not None and expected_wire_types.get(field_number, wire_type) != wire_type:
+            return False
+        skip_status = _skip_proto_stream_value(
+            stream,
+            wire_type,
+            end_offset,
+            field_number=field_number,
+        )
+        if skip_status is not True:
+            return False
+        fields_seen += 1
+
+    return stream.tell() == end_offset and fields_seen < max_fields
+
+
+def _is_sentencepiece_special_identity_piece(piece: str) -> bool:
+    return piece in _SENTENCEPIECE_IDENTITY_TOKENS
+
+
+def _is_sentencepiece_byte_fallback_piece(piece: str) -> bool:
+    return _SENTENCEPIECE_BYTE_FALLBACK_RE.fullmatch(piece) is not None
+
+
+def _has_strong_sentencepiece_model_proto_evidence(
+    *,
+    piece_count: int,
+    typed_piece_count: int,
+    special_identity_piece_count: int,
+    unknown_piece_count: int,
+    unknown_piece_index: int | None,
+    unknown_piece_text: str | None,
+    byte_piece_count: int,
+    byte_piece_texts: set[str],
+    malformed_byte_piece: bool,
+    trainer_spec: _SentencePieceTrainerSpecSignals | None,
+) -> bool:
+    if unknown_piece_count != 1 or unknown_piece_index is None or unknown_piece_text is None:
+        return False
+    if malformed_byte_piece:
+        return False
+    if byte_piece_count:
+        if trainer_spec is None or not trainer_spec.byte_fallback:
+            return False
+        if (
+            byte_piece_count != _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+            or len(byte_piece_texts) != _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+        ):
+            return False
+    elif trainer_spec is not None and trainer_spec.byte_fallback:
+        return False
+
+    if (
+        trainer_spec is not None
+        and trainer_spec.has_core_metadata
+        and trainer_spec.vocab_size == piece_count
+        and 0 <= trainer_spec.unk_id < piece_count
+        and trainer_spec.unk_id == unknown_piece_index
+        and (not trainer_spec.unk_piece_explicit or trainer_spec.unk_piece == unknown_piece_text)
+    ):
+        return True
+
+    if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES:
+        return False
+    return typed_piece_count >= 3 and special_identity_piece_count >= 3
+
+
+def _has_sufficient_sentencepiece_piece_scan_evidence(
+    *,
+    piece_count: int,
+    unknown_piece_count: int,
+    unknown_piece_index: int | None,
+    unknown_piece_text: str | None,
+    byte_piece_count: int,
+    byte_piece_texts: set[str],
+    malformed_byte_piece: bool,
+) -> bool:
+    if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES:
+        return False
+    if unknown_piece_count != 1 or unknown_piece_index is None or unknown_piece_text is None:
+        return False
+    if malformed_byte_piece:
+        return False
+    return not byte_piece_count or (
+        byte_piece_count == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+        and len(byte_piece_texts) == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+    )
+
+
+def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool:
+    """Recognize a SentencePiece ModelProto from repeated scored pieces."""
+    offset = 0
+    fields_seen = 0
+    piece_count = 0
+    typed_piece_count = 0
+    special_identity_piece_count = 0
+    unknown_piece_count = 0
+    unknown_piece_index: int | None = None
+    unknown_piece_text: str | None = None
+    byte_piece_count = 0
+    byte_piece_texts: set[str] = set()
+    malformed_byte_piece = False
+    trainer_spec: _SentencePieceTrainerSpecSignals | None = None
+    strong_match = False
+
+    def accept_incomplete_prefix() -> bool:
+        return False
+
+    while offset < len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return accept_incomplete_prefix()
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if wire_type not in {0, 1, 2, 5}:
+            return False
+        if field_number in {1, 2, 3, 4, 5} and wire_type != 2:
+            return False
+
+        if field_number == 1:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            length, value_start, _sampled_value_end, actual_value_end = bounds
+            if length == 0 or actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            parsed_piece = _parse_sentencepiece_piece_proto(data, value_start, actual_value_end)
+            if parsed_piece is None:
+                return False
+            piece, piece_type = parsed_piece
+            piece_index = piece_count
+            piece_count += 1
+            if piece_type is not None:
+                typed_piece_count += 1
+            if _is_sentencepiece_special_identity_piece(piece):
+                special_identity_piece_count += 1
+            if piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
+                unknown_piece_count += 1
+                unknown_piece_index = piece_index
+                unknown_piece_text = piece
+            elif piece_type == _SENTENCEPIECE_BYTE_PIECE_TYPE:
+                byte_piece_count += 1
+                if _is_sentencepiece_byte_fallback_piece(piece):
+                    byte_piece_texts.add(piece)
+                else:
+                    malformed_byte_piece = True
+            offset = actual_value_end
+        elif field_number == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            parsed_trainer_spec = _parse_sentencepiece_trainer_spec_proto(data, value_start, actual_value_end)
+            if parsed_trainer_spec is None:
+                return False
+            if trainer_spec is None:
+                trainer_spec = parsed_trainer_spec
+            else:
+                trainer_spec.merge_from(parsed_trainer_spec)
+            offset = actual_value_end
+        elif field_number == 3:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            if not _is_well_formed_sentencepiece_submessage(
+                data,
+                value_start,
+                actual_value_end,
+                expected_wire_types=_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES,
+            ):
+                return False
+            offset = actual_value_end
+        elif field_number in {4, 5}:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            if not _is_well_formed_sentencepiece_submessage(data, value_start, actual_value_end):
+                return False
+            offset = actual_value_end
+        else:
+            return False
+
+        fields_seen += 1
+        strong_match = _has_strong_sentencepiece_model_proto_evidence(
+            piece_count=piece_count,
+            typed_piece_count=typed_piece_count,
+            special_identity_piece_count=special_identity_piece_count,
+            unknown_piece_count=unknown_piece_count,
+            unknown_piece_index=unknown_piece_index,
+            unknown_piece_text=unknown_piece_text,
+            byte_piece_count=byte_piece_count,
+            byte_piece_texts=byte_piece_texts,
+            malformed_byte_piece=malformed_byte_piece,
+            trainer_spec=trainer_spec,
+        )
+
+    return (
+        strong_match and not sample_is_prefix and offset == len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS
+    )
+
+
+def _read_bounded_sentencepiece_submessage(stream: BinaryIO, value_end: int, *, max_bytes: int) -> bytes | None:
+    length = value_end - stream.tell()
+    if length < 0 or length > max_bytes:
+        return None
+    payload = stream.read(length)
+    return payload if len(payload) == length else None
+
+
+def _parse_sentencepiece_piece_proto_stream(
+    stream: BinaryIO,
+    value_end: int,
+    *,
+    decode_text: bool,
+    max_decoded_text_bytes: int,
+) -> _SentencePiecePieceProtoSignals | None:
+    """Validate one piece submessage while avoiding unnecessary text reads."""
+    if value_end - stream.tell() > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
+        return None
+
+    fields_seen = 0
+    text_bounds: tuple[int, int] | None = None
+    piece_type: int | None = None
+    has_score = False
+    while stream.tell() < value_end and fields_seen < _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        tag = _read_proto_varint_stream(stream, value_end)
+        if tag is None:
+            return None
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_proto_length_delimited_bounds_stream(stream, value_end)
+            if bounds is None:
+                return None
+            length, value_start, actual_value_end = bounds
+            if length == 0 or length > _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES:
+                return None
+            text_bounds = (value_start, actual_value_end)
+            stream.seek(actual_value_end)
+        elif field_number == 2 and wire_type == 5:
+            fixed32_end = stream.tell() + 4
+            if fixed32_end > value_end:
+                return None
+            has_score = True
+            stream.seek(fixed32_end)
+        elif field_number == 3 and wire_type == 0:
+            parsed_type = _read_proto_varint_stream(stream, value_end)
+            if parsed_type is None or not 1 <= parsed_type <= 6:
+                return None
+            piece_type = parsed_type
+        else:
+            skip_status = _skip_proto_stream_value(
+                stream,
+                wire_type,
+                value_end,
+                field_number=field_number,
+            )
+            if skip_status is not True:
+                return None
+        fields_seen += 1
+
+    if stream.tell() != value_end or fields_seen >= _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        return None
+    if text_bounds is None or not has_score:
+        return None
+
+    should_decode_text = decode_text or piece_type in {
+        _SENTENCEPIECE_UNKNOWN_PIECE_TYPE,
+        _SENTENCEPIECE_BYTE_PIECE_TYPE,
+        3,
+        4,
+        5,
+    }
+    if not should_decode_text:
+        return _SentencePiecePieceProtoSignals(piece_type=piece_type)
+
+    text_start, text_end = text_bounds
+    text_length = text_end - text_start
+    if text_length > max_decoded_text_bytes:
+        return None
+    stream.seek(text_start)
+    payload = stream.read(text_length)
+    if len(payload) != text_length:
+        return None
+    stream.seek(value_end)
+    piece_text = _decode_bounded_proto_string(
+        payload,
+        0,
+        len(payload),
+        max_bytes=_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES,
+    )
+    if piece_text is None:
+        return None
+    return _SentencePiecePieceProtoSignals(
+        piece_text=piece_text,
+        piece_type=piece_type,
+        decoded_text_bytes=text_length,
+    )
+
+
+def _parse_sentencepiece_trainer_spec_proto_stream(
+    stream: BinaryIO,
+    value_end: int,
+) -> _SentencePieceTrainerSpecSignals | None:
+    payload = _read_bounded_sentencepiece_submessage(
+        stream,
+        value_end,
+        max_bytes=_SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES,
+    )
+    if payload is None:
+        return None
+    return _parse_sentencepiece_trainer_spec_proto(payload, 0, len(payload))
+
+
+def _classify_sentencepiece_model_proto_stream(
+    stream: BinaryIO,
+    file_size: int,
+    *,
+    max_decoded_piece_text_bytes: int = _SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+) -> _SentencePieceModelProtoRoute:
+    offset = 0
+    fields_seen = 0
+    piece_count = 0
+    typed_piece_count = 0
+    special_identity_piece_count = 0
+    unknown_piece_count = 0
+    unknown_piece_index: int | None = None
+    unknown_piece_text: str | None = None
+    byte_piece_count = 0
+    byte_piece_texts: set[str] = set()
+    malformed_byte_piece = False
+    trainer_spec: _SentencePieceTrainerSpecSignals | None = None
+    strong_match = False
+    decoded_piece_text_bytes = 0
+
+    def reject_candidate() -> _SentencePieceModelProtoRoute:
+        return "malformed_candidate" if piece_count else "unknown"
+
+    while offset < file_size and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        tag = _read_proto_varint_stream(stream, file_size)
+        if tag is None:
+            return reject_candidate()
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return reject_candidate()
+
+        if field_number == 1:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            decode_piece_text = not _has_sufficient_sentencepiece_piece_scan_evidence(
+                piece_count=piece_count,
+                unknown_piece_count=unknown_piece_count,
+                unknown_piece_index=unknown_piece_index,
+                unknown_piece_text=unknown_piece_text,
+                byte_piece_count=byte_piece_count,
+                byte_piece_texts=byte_piece_texts,
+                malformed_byte_piece=malformed_byte_piece,
+            )
+            parsed_piece = _parse_sentencepiece_piece_proto_stream(
+                stream,
+                actual_value_end,
+                decode_text=decode_piece_text,
+                max_decoded_text_bytes=max_decoded_piece_text_bytes - decoded_piece_text_bytes,
+            )
+            if parsed_piece is None:
+                return reject_candidate()
+            decoded_piece_text_bytes += parsed_piece.decoded_text_bytes
+            piece = parsed_piece.piece_text
+            piece_type = parsed_piece.piece_type
+            piece_index = piece_count
+            piece_count += 1
+            if piece_type is not None:
+                typed_piece_count += 1
+            if piece is not None and _is_sentencepiece_special_identity_piece(piece):
+                special_identity_piece_count += 1
+            if piece_type is not None:
+                if piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
+                    if piece is None:
+                        return reject_candidate()
+                    unknown_piece_count += 1
+                    unknown_piece_index = piece_index
+                    unknown_piece_text = piece
+                elif piece_type == _SENTENCEPIECE_BYTE_PIECE_TYPE:
+                    if piece is None:
+                        return reject_candidate()
+                    byte_piece_count += 1
+                    if _is_sentencepiece_byte_fallback_piece(piece):
+                        byte_piece_texts.add(piece)
+                    else:
+                        malformed_byte_piece = True
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        elif field_number == 2:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            parsed_trainer_spec = _parse_sentencepiece_trainer_spec_proto_stream(stream, actual_value_end)
+            if parsed_trainer_spec is None:
+                return reject_candidate()
+            if trainer_spec is None:
+                trainer_spec = parsed_trainer_spec
+            else:
+                trainer_spec.merge_from(parsed_trainer_spec)
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        elif field_number == 3:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            if not _is_well_formed_sentencepiece_submessage_stream(
+                stream,
+                actual_value_end,
+                expected_wire_types=_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES,
+            ):
+                return reject_candidate()
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        elif field_number in {4, 5}:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            if not _is_well_formed_sentencepiece_submessage_stream(stream, actual_value_end):
+                return reject_candidate()
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        else:
+            return reject_candidate()
+
+        fields_seen += 1
+        strong_match = _has_strong_sentencepiece_model_proto_evidence(
+            piece_count=piece_count,
+            typed_piece_count=typed_piece_count,
+            special_identity_piece_count=special_identity_piece_count,
+            unknown_piece_count=unknown_piece_count,
+            unknown_piece_index=unknown_piece_index,
+            unknown_piece_text=unknown_piece_text,
+            byte_piece_count=byte_piece_count,
+            byte_piece_texts=byte_piece_texts,
+            malformed_byte_piece=malformed_byte_piece,
+            trainer_spec=trainer_spec,
+        )
+
+    if strong_match and stream.tell() == file_size and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        return "strong"
+    return "malformed_candidate" if piece_count else "unknown"
+
+
+@lru_cache(maxsize=1024)
+def _classify_sentencepiece_model_proto_file_cached(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    fingerprint_head: bytes,
+    fingerprint_tail: bytes,
+) -> _SentencePieceModelProtoRoute:
+    del mtime_ns, ctime_ns, fingerprint_head, fingerprint_tail
+    file_path = Path(path)
+    try:
+        with file_path.open("rb") as handle:
+            if size <= _SENTENCEPIECE_MODEL_PROTO_READ_BYTES:
+                payload = handle.read(size)
+                if len(payload) != size:
+                    return "unknown"
+                return _classify_sentencepiece_model_proto_stream(BytesIO(payload), size)
+            return _classify_sentencepiece_model_proto_stream(
+                handle,
+                size,
+                max_decoded_piece_text_bytes=_SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+            )
+    except OSError:
+        return "unknown"
+
+
+def _sentencepiece_model_proto_cache_fingerprint(file_path: Path, size: int) -> tuple[bytes, bytes]:
+    try:
+        with file_path.open("rb") as handle:
+            head = handle.read(min(size, _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES))
+            if size <= _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES:
+                return head, b""
+            handle.seek(max(size - _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES, 0))
+            tail = handle.read(_SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES)
+            return head, tail
+    except OSError:
+        return b"", b""
+
+
+def _classify_sentencepiece_model_proto_file(path: str | Path) -> _SentencePieceModelProtoRoute:
+    file_path = Path(path)
+    try:
+        if not file_path.is_file():
+            return "unknown"
+        stat = file_path.stat()
+        if stat.st_size < 32:
+            return "unknown"
+        fingerprint_head, fingerprint_tail = _sentencepiece_model_proto_cache_fingerprint(file_path, stat.st_size)
+        return _classify_sentencepiece_model_proto_file_cached(
+            str(file_path.resolve()),
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            fingerprint_head,
+            fingerprint_tail,
+        )
+    except OSError:
+        return "unknown"
+
+
+def _is_malformed_sentencepiece_model_proto_candidate_file(path: str | Path) -> bool:
+    return _classify_sentencepiece_model_proto_file(path) == "malformed_candidate"
+
+
+def _should_fail_closed_malformed_sentencepiece_model_proto_file(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {"", ".proto"} and _is_malformed_sentencepiece_model_proto_candidate_file(path)
+
+
+def _should_treat_sentencepiece_model_proto_file_as_unknown(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {".model", ".proto"} and is_sentencepiece_model_proto_file(path)
+
+
+def is_sentencepiece_model_proto_file(path: str | Path) -> bool:
+    """Return True for strongly identified SentencePiece tokenizer ModelProto files."""
+    return _classify_sentencepiece_model_proto_file(path) == "strong"
+
+
 def _skip_coreml_proto_group(
     data: bytes,
     offset: int,
@@ -1816,7 +3929,12 @@ def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
 SAFETENSORS_ROUTING_HEADER_PARSE_BYTES: int = 16 * 1024 * 1024
 
 
-def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = False) -> bool:
+def _looks_like_proto0_or_1_pickle(
+    sample: bytes,
+    *,
+    sample_is_prefix: bool = False,
+    max_probe_opcodes: int = PROTO0_1_MAX_PROBE_OPCODES,
+) -> bool:
     """Best-effort protocol 0/1 detection via bounded pickle opcode parsing."""
     if len(sample) < 2:
         return False
@@ -1846,10 +3964,11 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = Fa
                     return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(
                         stripped_trailing,
                         sample_is_prefix=sample_is_prefix,
+                        max_probe_opcodes=max_probe_opcodes,
                     )
                 if opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
                     has_non_trivial_opcode = True
-                if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
+                if opcode_count >= max_probe_opcodes:
                     return False
         except ValueError as exc:
             exc_message = str(exc)
@@ -3162,6 +5281,13 @@ def _detect_safetensors_content_route(path: Path | None, magic8: bytes, file_siz
     return "safetensors"
 
 
+def _resolve_safetensors_flax_overlap(path: Path) -> str | None:
+    """Prefer a proven Flax route for renamed text-suffix SafeTensors overlaps."""
+    if path.suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+        return None
+    return "flax_msgpack" if _probe_flax_msgpack_checkpoint_file(path) is True else None
+
+
 def _resolve_safetensors_tensorflow_overlap(path: Path, file_size: int) -> str:
     """Prefer fully validated SafeTensors framing over only ambiguous protobuf evidence."""
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
@@ -3793,6 +5919,103 @@ def _resolve_tar_hardlink_fallback_member(
     return None
 
 
+def _normalize_positive_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return default
+    return normalized if normalized > 0 else default
+
+
+def _normalize_positive_float(value: Any, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return default
+    return normalized if normalized > 0 else default
+
+
+def _gzip_tar_trailing_data_status(
+    path: Path,
+    *,
+    max_decompressed_bytes: int | None = None,
+    max_decompression_ratio: float | None = None,
+) -> _GzipTarTrailingStatus | None:
+    """Return proven gzip TAR stream-tail status after the TAR EOF padding."""
+    decompressed_limit = _normalize_positive_int(
+        max_decompressed_bytes,
+        _TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSED_BYTES,
+    )
+    ratio_limit = _normalize_positive_float(
+        max_decompression_ratio,
+        _TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSION_RATIO,
+    )
+    try:
+        compressed_size = path.stat().st_size
+        with path.open("rb") as raw:
+            if raw.read(len(_GZIP_MAGIC)) != _GZIP_MAGIC:
+                return None
+            try:
+                is_tar = tarfile.is_tarfile(path)
+            except (EOFError, tarfile.TarError):
+                return None
+            if not is_tar:
+                return None
+            raw.seek(0)
+            with tarfile.open(fileobj=raw, mode="r:gz") as archive:
+                archive.getmembers()
+                trailing_size = 0
+                while True:
+                    trailing = archive.fileobj.read(_TAR_GZIP_POST_EOF_TRAILING_READ_BYTES)
+                    if not trailing:
+                        return None
+                    if any(byte != 0 for byte in trailing):
+                        return "nonzero"
+
+                    trailing_size += len(trailing)
+                    if trailing_size > decompressed_limit:
+                        return "invalid"
+                    if compressed_size > 0 and trailing_size / compressed_size > ratio_limit:
+                        return "invalid"
+    except (EOFError, OSError, tarfile.TarError, zlib.error):
+        return "invalid"
+
+
+def has_gzip_tar_nonzero_trailing_data(
+    path: str,
+    *,
+    max_decompressed_bytes: int | None = None,
+    max_decompression_ratio: float | None = None,
+) -> bool:
+    """Return whether a gzip TAR has non-zero trailing data after archive EOF."""
+    return (
+        gzip_tar_trailing_data_status(
+            path,
+            max_decompressed_bytes=max_decompressed_bytes,
+            max_decompression_ratio=max_decompression_ratio,
+        )
+        == "nonzero"
+    )
+
+
+def gzip_tar_trailing_data_status(
+    path: str,
+    *,
+    max_decompressed_bytes: int | None = None,
+    max_decompression_ratio: float | None = None,
+) -> _GzipTarTrailingStatus | None:
+    """Return proven gzip TAR stream-tail status after archive EOF."""
+    return _gzip_tar_trailing_data_status(
+        Path(path),
+        max_decompressed_bytes=max_decompressed_bytes,
+        max_decompression_ratio=max_decompression_ratio,
+    )
+
+
 def _detect_tar_route(path: str) -> str | None:
     """Return the safe content route for a valid TAR-backed artifact."""
     file_path = Path(path)
@@ -3945,7 +6168,10 @@ def is_nemo_archive(path: str) -> bool:
 def _is_tar_archive(path: str) -> bool:
     """Return whether a path is a TAR archive, including compressed wrappers."""
     try:
-        return tarfile.is_tarfile(path)
+        if not tarfile.is_tarfile(path):
+            return False
+        file_path = Path(path)
+        return _gzip_tar_trailing_data_status(file_path) is None
     except Exception:
         return False
 
@@ -4411,6 +6637,8 @@ def _detect_renamed_tensorflow_protobuf(
 ) -> str:
     """Recognize renamed MetaGraph/SavedModel protobufs after bounded field discovery."""
     suffix = file_path.suffix.lower()
+    if is_huggingface_tokenizer_json_file(file_path):
+        return "unknown"
     if _is_complete_bounded_printable_text(file_path, file_size):
         return "unknown"
     route = _classify_bounded_tensorflow_protobuf(file_path, file_size)
@@ -4960,39 +7188,207 @@ def has_jax_json_checkpoint_structure(payload: object) -> bool:
     return False
 
 
-def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
-    """Return True for JAX JSON, None for bounded ambiguity, else False."""
+def _has_jax_json_checkpoint_prefix_identity(prefix: bytes) -> bool:
+    """Recognize explicit top-level JAX identity in a truncated JSON object."""
     try:
-        if not file_path.is_file():
+        prefix_text = prefix.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        # A bounded read may end between the bytes of the final UTF-8 code
+        # point. Preserve complete top-level fields that precede that split,
+        # but do not ignore malformed bytes inside the sampled prefix.
+        if error.end != len(prefix) or error.reason != "unexpected end of data":
             return False
-        file_size = file_path.stat().st_size
-        with file_path.open("rb") as stream:
-            prefix = stream.read(min(file_size, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1))
+        try:
+            prefix_text = prefix[: error.start].decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return False
+
+    def skip_json_whitespace(offset: int) -> int:
+        while offset < len(prefix_text) and prefix_text[offset] in " \t\r\n":
+            offset += 1
+        return offset
+
+    decoder = json.JSONDecoder()
+    offset = skip_json_whitespace(0)
+    if offset >= len(prefix_text) or prefix_text[offset] != "{":
+        return False
+    offset += 1
+
+    while True:
+        offset = skip_json_whitespace(offset)
+        if offset >= len(prefix_text) or prefix_text[offset] == "}":
+            return False
+
+        try:
+            key, key_end = decoder.raw_decode(prefix_text, offset)
+        except (ValueError, RecursionError):
+            return False
+        if not isinstance(key, str):
+            return False
+
+        offset = skip_json_whitespace(key_end)
+        if offset >= len(prefix_text) or prefix_text[offset] != ":":
+            return False
+        offset = skip_json_whitespace(offset + 1)
+
+        if key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+            return True
+
+        try:
+            value, value_end = decoder.raw_decode(prefix_text, offset)
+        except (ValueError, RecursionError):
+            return False
+        if (
+            key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS
+            and isinstance(value, str)
+            and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value)
+        ):
+            return True
+
+        offset = skip_json_whitespace(value_end)
+        if offset >= len(prefix_text) or prefix_text[offset] == "}":
+            return False
+        if prefix_text[offset] != ",":
+            return False
+        offset += 1
+
+
+def _same_regular_file_identity(current: os.stat_result, expected: os.stat_result) -> bool:
+    """Compare a descriptor/path identity used by bounded routing reads."""
+    return stat.S_ISREG(current.st_mode) and all(
+        getattr(current, field) == getattr(expected, field)
+        for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    )
+
+
+_JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE: Literal["unavailable"] = "unavailable"
+_JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS: Literal["ambiguous"] = "ambiguous"
+_JaxJsonCheckpointProbeState = bool | Literal["unavailable", "ambiguous"] | None
+
+
+def _jax_json_checkpoint_prefix_failure_result(
+    file_path: Path,
+    expected_stat: os.stat_result,
+) -> Literal["unavailable"] | None:
+    """Fall through unchanged unavailable files but fail closed on retargets."""
+    try:
+        current_stat = file_path.lstat()
     except OSError:
         return None
+    if _same_regular_file_identity(current_stat, expected_stat):
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+    return None
+
+
+def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Literal["unavailable"] | None:
+    """Read the routing prefix without following a changed lexical entry."""
+    try:
+        expected_stat = file_path.lstat()
+    except OSError:
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+
+    try:
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        file_attributes = getattr(expected_stat, "st_file_attributes", 0) or 0
+        if (
+            not stat.S_ISREG(expected_stat.st_mode)
+            or stat.S_ISLNK(expected_stat.st_mode)
+            or bool(reparse_flag and file_attributes & reparse_flag)
+        ):
+            return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(file_path, flags)
+        except OSError:
+            return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+        try:
+            opened_stat = os.fstat(descriptor)
+            if not _same_regular_file_identity(opened_stat, expected_stat):
+                return None
+            read_limit = min(expected_stat.st_size, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)
+            chunks: list[bytes] = []
+            remaining = read_limit
+            while remaining > 0:
+                try:
+                    chunk = os.read(descriptor, remaining)
+                except OSError:
+                    return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if not _same_regular_file_identity(os.fstat(descriptor), expected_stat):
+                return None
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+    return expected_stat.st_size, b"".join(chunks)
+
+
+def _probe_jax_json_checkpoint_file_state(file_path: Path) -> _JaxJsonCheckpointProbeState:
+    """Return bounded JAX JSON routing state without flattening refusal causes."""
+    snapshot = _read_jax_json_checkpoint_prefix(file_path)
+    if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+    if snapshot is None:
+        return None
+    file_size, prefix = snapshot
 
     if not _could_start_json_object(prefix):
         normalized_prefix = prefix.lstrip()
         if normalized_prefix.startswith(b"\xef\xbb\xbf"):
             normalized_prefix = normalized_prefix[3:].lstrip()
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES and not normalized_prefix:
-            return None
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
 
     try:
         payload = json.loads(prefix.decode("utf-8-sig"))
-    except (UnicodeDecodeError, ValueError, RecursionError):
+    except json.JSONDecodeError:
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
             # A visible non-JAX value cannot prove the unseen tail has no later
             # JAX identity field; preserve bounded ambiguity instead of skipping.
-            return None
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
+    except UnicodeDecodeError:
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
+        if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
+        return False
+    except (ValueError, RecursionError):
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
+        # Python parser limits can reject otherwise valid JSON (for example an
+        # oversized integer). That is not evidence that the file lacks a later
+        # JAX identity field, so retain it as a bounded ambiguous candidate.
+        return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
     return has_jax_json_checkpoint_structure(payload)
+
+
+def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous: bool = False) -> bool | None:
+    """Return True for JAX JSON, None for bounded ambiguity or retargets, else False."""
+    probe_state = _probe_jax_json_checkpoint_file_state(file_path)
+    if probe_state == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
+        return None if unavailable_is_ambiguous else False
+    if probe_state == _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS:
+        return None
+    return probe_state
 
 
 def is_jax_json_checkpoint_file(path: str | Path) -> bool:
     """Preserve confirmed and bounded-inconclusive JAX JSON candidates for scanning."""
     return _probe_jax_json_checkpoint_file(Path(path)) is not False
+
+
+def is_confirmed_jax_json_checkpoint_file(path: str | Path) -> bool:
+    """Return whether bounded JSON evidence positively identifies JAX metadata."""
+    return _probe_jax_json_checkpoint_file(Path(path)) is True
 
 
 def _probe_content_routed_jax_json_checkpoint(file_path: Path) -> bool | None:
@@ -5345,23 +7741,788 @@ def _is_complete_structured_json_content_owner(file_path: Path, file_size: int) 
 
 
 def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool:
-    """Return whether a small complete file cannot contain binary structure tags."""
+    """Return whether a small complete file is ordinary UTF-8 text."""
     if file_size > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES:
         return False
     try:
         payload = read_magic_bytes(str(file_path), file_size)
     except OSError:
         return False
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return all(char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text)
+
+
+def _has_content_route_text_owner_structure(text: str) -> bool:
+    """Return whether printable UTF-8 has ordinary text/config/tokenizer structure."""
+    if any(
+        unicodedata.category(character) in {"Cc", "Cs"} and character not in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS
+        for character in text
+    ):
+        return False
+    if not any(char in _CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS for char in text):
+        return False
+    ordinary_text_lines = 0
+    suspicious_scalar_lines = 0
+    for line in text.splitlines() or [text]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        ascii_alnum_count = sum(1 for char in stripped if char.isascii() and char.isalnum())
+        if (
+            len(stripped) >= 8
+            and any(not char.isascii() for char in stripped)
+            and any(char in {'"', "'", "`"} for char in stripped)
+            and len(set(stripped)) <= 8
+        ):
+            suspicious_scalar_lines += 1
+            continue
+        if ascii_alnum_count >= 2:
+            ordinary_text_lines += 1
+    return ordinary_text_lines > suspicious_scalar_lines
+
+
+def _looks_like_onnx_opset_import_proto_prefix(data: bytes) -> bool:
+    """Return whether a value resembles ONNX OperatorSetIdProto."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(data) and fields_seen < 16:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return False
+            length, _value_start, _value_end, actual_value_end = bounds
+            return 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES and actual_value_end <= len(data)
+        if field_number == 2 and wire_type == 0:
+            value_result = _read_proto_varint(data, value_offset)
+            return value_result is not None and 0 < value_result[0] <= 10000
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+    return False
+
+
+def _looks_like_onnx_string_entry_proto_prefix(data: bytes) -> bool:
+    """Return whether a value resembles ONNX StringStringEntryProto."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(data) and fields_seen < 16:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number in {1, 2} and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return False
+            length, _value_start, _value_end, actual_value_end = bounds
+            return 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES and actual_value_end <= len(data)
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+    return False
+
+
+def _has_bounded_onnx_model_text_candidate_field_signal(
+    payload: bytes,
+    field_number: int,
+    wire_type: int,
+    value_offset: int,
+) -> bool:
+    """Return whether a known ONNX field has a model-like value."""
+    expected_wire_type = _ONNX_MODEL_FIELD_WIRE_TYPES.get(field_number)
+    if expected_wire_type != wire_type:
+        return False
+    if wire_type == 0:
+        value_result = _read_proto_varint(payload, value_offset)
+        return value_result is not None and field_number in {1, 5} and 0 < value_result[0] <= 10000
+    if wire_type != 2:
+        return _skip_proto_value(payload, value_offset, wire_type) is not None
+
+    bounds = _read_length_delimited_proto_value(payload, value_offset)
+    if bounds is None:
+        return False
+    length, value_start, value_end, actual_value_end = bounds
+    if length <= 0 or actual_value_end > len(payload):
+        return False
+    value = payload[value_start:value_end]
+    if field_number == 7:
+        graph_status = _looks_like_onnx_graph_proto_stream(
+            BytesIO(value),
+            len(value),
+            [_ONNX_GRAPH_MAX_ROUTING_FIELDS],
+        )
+        return graph_status is not False
+    if field_number == 8:
+        return _looks_like_onnx_opset_import_proto_prefix(value)
+    if field_number == 14:
+        return _looks_like_onnx_string_entry_proto_prefix(value)
+    if field_number in {20, 25, 26}:
+        return _looks_like_proto_message_prefix(value) and bool(
+            value.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES)
+        )
+    return False
+
+
+def _has_bounded_coreml_model_text_candidate_field_signal(
+    payload: bytes,
+    field_number: int,
+    wire_type: int,
+    value_offset: int,
+) -> bool:
+    """Return whether a known CoreML field has a model-like value."""
+    if field_number == 1 and wire_type == 0:
+        value_result = _read_proto_varint(payload, value_offset)
+        return value_result is not None and 0 < value_result[0] <= 10000
+    if not ((field_number == 2 or field_number in _COREML_MODEL_TYPE_FIELDS) and wire_type == 2):
+        return False
+
+    bounds = _read_length_delimited_proto_value(payload, value_offset)
+    if bounds is None:
+        return False
+    length, value_start, value_end, actual_value_end = bounds
+    if length <= 0 or actual_value_end > len(payload):
+        return False
+    value = payload[value_start:value_end]
+    if field_number == 2:
+        return _looks_like_coreml_description_proto_prefix(value) is not False
+    return _looks_like_proto_message_prefix(value) and bool(value.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES))
+
+
+def _has_bounded_protobuf_model_text_candidate_signal_bytes(payload: bytes) -> bool:
+    """Return whether text-like bytes use known protobuf model fields."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(payload) and fields_seen < 64:
+        tag_result = _read_proto_varint(payload, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if _has_bounded_onnx_model_text_candidate_field_signal(payload, field_number, wire_type, value_offset):
+            return True
+        if _has_bounded_coreml_model_text_candidate_field_signal(payload, field_number, wire_type, value_offset):
+            return True
+
+        next_offset = _skip_proto_value(payload, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+    return False
+
+
+def _has_bounded_protobuf_model_text_candidate_signal(file_path: Path, file_size: int) -> bool:
+    """Return whether a text-like protobuf prefix uses known model fields."""
+    try:
+        payload = read_magic_bytes(str(file_path), min(file_size, _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES))
+    except OSError:
+        return False
+    return _has_bounded_protobuf_model_text_candidate_signal_bytes(payload)
+
+
+def _is_complete_bounded_printable_text_content_owner_bytes(
+    file_path: Path,
+    file_size: int,
+    payload: bytes,
+) -> bool:
+    """Return whether printable bytes can safely own this complete file."""
+    suffix = file_path.suffix.lower()
+    declared_text_filename = is_declared_text_content_filename(file_path.name)
+    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or declared_text_filename
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if has_text_owner_window
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes or len(payload) < file_size:
+        return False
+    payload = payload[:file_size]
+    if (
+        declared_text_filename
+        and file_size > FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        and b"\n" not in payload
+        and b"\r" not in payload
+    ):
+        return False
+    if not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
+        if has_text_owner_window and file_size > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES:
+            try:
+                text = payload.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                return False
+            return _has_content_route_text_owner_structure(text)
+        return True
+    if not has_text_owner_window:
+        return False
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return _has_content_route_text_owner_structure(text) and all(
+        char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text
+    )
+
+
+def _is_complete_bounded_text_payload(payload: bytes) -> bool:
+    """Return whether complete bounded bytes are safe text for declared text assets."""
+    if any(byte in _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES for byte in payload):
+        return False
+    return _is_complete_bounded_printable_text_content_owner_bytes(Path("vocab.txt"), len(payload), payload)
+
+
+def _is_complete_declared_text_payload(payload: bytes) -> bool:
+    """Return whether a declared text asset has complete, line-oriented text content."""
+    if not _is_complete_bounded_text_payload(payload):
+        return False
+    return not (len(payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES and b"\n" not in payload and b"\r" not in payload)
+
+
+def is_declared_text_content_filename(filename: str) -> bool:
+    """Return whether a basename is declared as tokenizer or documentation text."""
+    normalized = PurePosixPath(filename.replace("\\", "/")).name.lower()
+    return normalized in _CONTENT_ROUTE_DECLARED_TEXT_ASSET_FILENAMES or (
+        normalized.startswith(_CONTENT_ROUTE_DECLARED_DOCUMENTATION_PREFIXES)
+        and PurePosixPath(normalized).suffix in _CONTENT_ROUTE_DECLARED_DOCUMENTATION_EXTENSIONS
+    )
+
+
+def _is_complete_declared_text_asset(file_path: Path, file_size: int) -> bool:
+    """Return whether a declared tokenizer/documentation text asset owns the file."""
+    if not is_declared_text_content_filename(file_path.name):
+        return False
+    if file_size > _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    return _is_complete_declared_text_payload(payload)
+
+
+def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
+    """Return whether printable text can safely own this complete file."""
+    suffix = file_path.suffix.lower()
+    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(
+        file_path.name
+    )
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if has_text_owner_window
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    return _is_complete_bounded_printable_text_content_owner_bytes(file_path, file_size, payload)
+
+
+def _is_complete_bounded_ascii_printable_text_content_owner_bytes(
+    file_path: Path,
+    file_size: int,
+    payload: bytes,
+) -> bool:
+    """Return whether complete ASCII bytes can safely veto a protobuf candidate."""
+    suffix = file_path.suffix.lower()
+    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(
+        file_path.name
+    )
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if has_text_owner_window
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes or len(payload) < file_size:
+        return False
+    payload = payload[:file_size]
     return not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES)
+
+
+def _is_complete_bounded_ascii_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
+    """Return whether complete ASCII text can safely veto a protobuf candidate."""
+    suffix = file_path.suffix.lower()
+    has_text_owner_window = suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES or is_declared_text_content_filename(
+        file_path.name
+    )
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if has_text_owner_window
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    return _is_complete_bounded_ascii_printable_text_content_owner_bytes(file_path, file_size, payload)
 
 
 def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: int) -> bool:
     """Keep ambiguous binary model protobufs scannable without claiming proven text."""
     if file_path.suffix.lower() in {".py", ".pyw"} and not _has_bounded_non_source_control_signal(file_path, file_size):
         return False
-    return not _is_complete_structured_json_content_owner(
-        file_path, file_size
-    ) and not _is_complete_bounded_printable_text(file_path, file_size)
+    if is_huggingface_tokenizer_json_file(file_path):
+        return False
+    if _is_complete_structured_json_content_owner(file_path, file_size):
+        return False
+    if (
+        file_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        and _has_bounded_protobuf_model_text_candidate_signal(file_path, file_size)
+    ):
+        return not _is_complete_bounded_ascii_printable_text_content_owner(file_path, file_size)
+    return not _is_complete_bounded_ascii_printable_text_content_owner(file_path, file_size)
+
+
+def _detect_media_pickle_polyglot_route(trailing: bytes, *, sample_is_prefix: bool) -> str | None:
+    """Return a pickle route only for strong serialized bytes after valid media."""
+    candidate = trailing.lstrip(_MEDIA_TRAILING_PADDING)
+    if not candidate:
+        return None
+    if _looks_like_binary_pickle_protocol(candidate[:4]):
+        if _has_bounded_binary_pickle_security_signal(candidate):
+            return "pickle"
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if sample_is_prefix else None
+    protocol_less_state = _classify_protocolless_binary_pickle_security_signal(
+        candidate,
+        sample_is_prefix=sample_is_prefix,
+    )
+    if protocol_less_state is True:
+        return "pickle"
+    if protocol_less_state is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=sample_is_prefix):
+        return "pickle"
+    return None
+
+
+def _find_bounded_png_end(sample: bytes) -> int | None:
+    """Return the first byte after a complete bounded PNG stream."""
+    if not sample.startswith(_PNG_SIGNATURE):
+        return None
+
+    offset = len(_PNG_SIGNATURE)
+    saw_ihdr = False
+    while offset + 12 <= len(sample):
+        chunk_length = int.from_bytes(sample[offset : offset + 4], "big")
+        chunk_type = sample[offset + 4 : offset + 8]
+        chunk_end = offset + 12 + chunk_length
+        if chunk_end > len(sample):
+            return None
+        if not saw_ihdr:
+            if chunk_type != b"IHDR" or chunk_length != 13:
+                return None
+            saw_ihdr = True
+        elif chunk_type == b"IHDR":
+            return None
+        chunk_payload_start = offset + 8
+        chunk_payload_end = chunk_payload_start + chunk_length
+        expected_crc = int.from_bytes(sample[chunk_payload_end:chunk_end], "big")
+        actual_crc = zlib.crc32(chunk_type + sample[chunk_payload_start:chunk_payload_end]) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            return None
+        if chunk_type == _PNG_IEND_CHUNK:
+            return chunk_end if chunk_length == 0 else None
+        offset = chunk_end
+    return None
+
+
+def _png_chunk_crc_matches_with_reader(
+    chunk_type: bytes,
+    chunk_length: int,
+    payload_offset: int,
+    read_at: Callable[[int, int], bytes],
+) -> bool:
+    checksum = zlib.crc32(chunk_type)
+    remaining = chunk_length
+    offset = payload_offset
+    while remaining > 0:
+        read_size = min(remaining, _PNG_CRC_READ_CHUNK_BYTES)
+        payload = read_at(offset, read_size)
+        if len(payload) != read_size:
+            return False
+        checksum = zlib.crc32(payload, checksum)
+        offset += read_size
+        remaining -= read_size
+    expected_crc = read_at(payload_offset + chunk_length, 4)
+    if len(expected_crc) != 4:
+        return False
+    return (checksum & 0xFFFFFFFF) == int.from_bytes(expected_crc, "big")
+
+
+def _find_png_end_with_reader(file_size: int, read_at: Callable[[int, int], bytes]) -> int | None:
+    """Return the first byte after a complete PNG stream using sparse bounded reads."""
+    if file_size < len(_PNG_SIGNATURE) + 12:
+        return None
+    try:
+        if read_at(0, len(_PNG_SIGNATURE)) != _PNG_SIGNATURE:
+            return None
+
+        offset = len(_PNG_SIGNATURE)
+        saw_ihdr = False
+        crc_bytes_checked = 0
+        for _ in range(_MEDIA_ROUTE_MAX_PNG_CHUNKS):
+            if offset + 8 > file_size:
+                return None
+            chunk_header = read_at(offset, 8)
+            if len(chunk_header) != 8:
+                return None
+            chunk_length = int.from_bytes(chunk_header[:4], "big")
+            chunk_type = chunk_header[4:8]
+            chunk_end = offset + 12 + chunk_length
+            if chunk_end > file_size:
+                return None
+            if not saw_ihdr:
+                if chunk_type != b"IHDR" or chunk_length != 13:
+                    return None
+                saw_ihdr = True
+            elif chunk_type == b"IHDR":
+                return None
+            crc_proof_bytes = chunk_length + 4
+            if crc_bytes_checked + crc_proof_bytes > _MEDIA_STRUCTURAL_PROOF_READ_BYTES:
+                return None
+            if not _png_chunk_crc_matches_with_reader(chunk_type, chunk_length, offset + 8, read_at):
+                return None
+            crc_bytes_checked += crc_proof_bytes
+            if chunk_type == _PNG_IEND_CHUNK:
+                return chunk_end if chunk_length == 0 else None
+            offset = chunk_end
+    except OSError:
+        return None
+    return None
+
+
+def _find_jpeg_end_with_reader(file_size: int, read_at: Callable[[int, int], bytes]) -> int | None:
+    """Return the first byte after a complete JPEG stream using bounded reads."""
+    if file_size < 4:
+        return None
+
+    def read_exact(offset: int, size: int) -> bytes:
+        data = read_limited(offset, size)
+        if len(data) != size:
+            raise OSError("short JPEG read")
+        return data
+
+    bytes_requested = 0
+
+    def read_limited(offset: int, size: int) -> bytes:
+        nonlocal bytes_requested
+        if size <= 0:
+            return b""
+        if bytes_requested + size > _MEDIA_STRUCTURAL_PROOF_READ_BYTES:
+            raise OSError("bounded JPEG proof exceeded")
+        data = read_at(offset, size)
+        bytes_requested += size
+        return data
+
+    try:
+        if read_exact(0, 2) != b"\xff\xd8":
+            return None
+
+        offset = 2
+        while offset < file_size:
+            if read_exact(offset, 1) != b"\xff":
+                return None
+            while offset < file_size and read_exact(offset, 1) == b"\xff":
+                offset += 1
+            if offset >= file_size:
+                return None
+            marker = read_exact(offset, 1)[0]
+            offset += 1
+            if marker == 0x00:
+                return None
+            if marker == 0xD9:
+                return offset
+            if marker in _JPEG_STANDALONE_MARKERS:
+                continue
+            if offset + 2 > file_size:
+                return None
+            segment_length = int.from_bytes(read_exact(offset, 2), "big")
+            if segment_length < 2:
+                return None
+            segment_end = offset + segment_length
+            if segment_end > file_size:
+                return None
+            if marker != 0xDA:
+                offset = segment_end
+                continue
+
+            offset = segment_end
+            while offset < file_size:
+                chunk = read_limited(offset, min(_JPEG_SCAN_READ_CHUNK_BYTES, file_size - offset))
+                if not chunk:
+                    return None
+                index = 0
+                advanced_to_next_chunk = False
+                while True:
+                    marker_index = chunk.find(b"\xff", index)
+                    if marker_index < 0:
+                        offset += len(chunk)
+                        advanced_to_next_chunk = True
+                        break
+                    marker_offset = offset + marker_index
+                    if marker_offset + 1 >= file_size:
+                        return None
+                    marker = read_exact(marker_offset + 1, 1)[0]
+                    if marker == 0x00 or 0xD0 <= marker <= 0xD7:
+                        next_index = marker_index + 2
+                        if next_index >= len(chunk):
+                            offset = marker_offset + 2
+                            advanced_to_next_chunk = True
+                            break
+                        index = next_index
+                        continue
+                    if marker == 0xD9:
+                        return marker_offset + 2
+                    if marker == 0xFF:
+                        next_index = marker_index + 1
+                        if next_index >= len(chunk):
+                            offset = marker_offset + 1
+                            advanced_to_next_chunk = True
+                            break
+                        index = next_index
+                        continue
+                    offset = marker_offset
+                    break
+                if not advanced_to_next_chunk:
+                    break
+    except OSError:
+        return None
+    return None
+
+
+def _find_bounded_jpeg_end(sample: bytes) -> int | None:
+    """Return the first byte after a complete bounded JPEG stream."""
+    if not sample.startswith(b"\xff\xd8"):
+        return None
+
+    offset = 2
+    while offset < len(sample):
+        if sample[offset] != 0xFF:
+            return None
+        while offset < len(sample) and sample[offset] == 0xFF:
+            offset += 1
+        if offset >= len(sample):
+            return None
+        marker = sample[offset]
+        offset += 1
+        if marker == 0x00:
+            return None
+        if marker == 0xD9:
+            return offset
+        if marker in _JPEG_STANDALONE_MARKERS:
+            continue
+        if offset + 2 > len(sample):
+            return None
+        segment_length = int.from_bytes(sample[offset : offset + 2], "big")
+        if segment_length < 2:
+            return None
+        segment_end = offset + segment_length
+        if segment_end > len(sample):
+            return None
+        if marker != 0xDA:
+            offset = segment_end
+            continue
+
+        offset = segment_end
+        while offset < len(sample):
+            marker_offset = sample.find(b"\xff", offset)
+            if marker_offset < 0 or marker_offset + 1 >= len(sample):
+                return None
+            marker = sample[marker_offset + 1]
+            if marker == 0x00 or 0xD0 <= marker <= 0xD7:
+                offset = marker_offset + 2
+                continue
+            if marker == 0xD9:
+                return marker_offset + 2
+            if marker == 0xFF:
+                offset = marker_offset + 1
+                continue
+            offset = marker_offset
+            break
+    return None
+
+
+def _detect_complete_media_route_from_trailing(trailing: bytes, *, sample_is_prefix: bool) -> str | None:
+    """Classify bytes after a complete media stream."""
+    pickle_route = _detect_media_pickle_polyglot_route(trailing, sample_is_prefix=sample_is_prefix)
+    if pickle_route is not None:
+        return pickle_route
+    if sample_is_prefix or trailing.lstrip(_MEDIA_TRAILING_PADDING):
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return VALID_MEDIA_ROUTING_FORMAT
+
+
+def _could_start_bounded_media_route(file_path: Path, sample: bytes, *, sample_is_prefix: bool = True) -> bool:
+    """Return whether bounded bytes plausibly begin a supported media stream."""
+    if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
+        return False
+    if sample.startswith(_PNG_SIGNATURE):
+        return (
+            len(sample) >= len(_PNG_SIGNATURE) + 8
+            and sample[len(_PNG_SIGNATURE) : len(_PNG_SIGNATURE) + 8] == b"\x00\x00\x00\rIHDR"
+        )
+    if len(sample) < 3 or not sample.startswith(b"\xff\xd8") or sample[2] != 0xFF:
+        return False
+    marker_offset = 2
+    while marker_offset < len(sample) and sample[marker_offset] == 0xFF:
+        marker_offset += 1
+    if marker_offset >= len(sample):
+        return True
+    marker = sample[marker_offset]
+    if marker == 0x00:
+        return False
+    if marker in _JPEG_STANDALONE_MARKERS:
+        return True
+    if marker_offset + 3 > len(sample):
+        return sample_is_prefix
+    segment_length = int.from_bytes(sample[marker_offset + 1 : marker_offset + 3], "big")
+    if segment_length < 2:
+        return False
+    return sample_is_prefix or marker_offset + 1 + segment_length <= len(sample)
+
+
+def _detect_bounded_media_route_from_sample(
+    file_path: Path,
+    sample: bytes,
+    *,
+    sample_is_prefix: bool,
+) -> str | None:
+    """Return clean-media or strong media/pickle polyglot routing evidence."""
+    if not _could_start_bounded_media_route(file_path, sample, sample_is_prefix=sample_is_prefix):
+        return None
+    if sample.startswith(_PNG_SIGNATURE):
+        media_end = _find_bounded_png_end(sample)
+    elif sample.startswith(b"\xff\xd8"):
+        media_end = _find_bounded_jpeg_end(sample)
+    else:
+        return None
+    if media_end is None:
+        return None
+    return _detect_complete_media_route_from_trailing(sample[media_end:], sample_is_prefix=sample_is_prefix)
+
+
+def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail: bytes) -> str | None:
+    """Return bounded media routing evidence from remote head and tail probes."""
+    if not prefix or not tail or not _could_start_bounded_media_route(file_path, prefix, sample_is_prefix=True):
+        return None
+
+    prefix_route = _detect_bounded_media_route_from_sample(file_path, prefix, sample_is_prefix=tail != prefix)
+    if prefix_route is not None:
+        return prefix_route
+
+    if prefix.startswith(_PNG_SIGNATURE):
+        media_end = tail.find(_PNG_IEND_TRAILER)
+        if media_end < 0:
+            return None
+        media_end += len(_PNG_IEND_TRAILER)
+    elif prefix.startswith(b"\xff\xd8"):
+        media_end = tail.find(b"\xff\xd9")
+        if media_end < 0:
+            return None
+        media_end += 2
+    else:
+        return None
+
+    pickle_route = _detect_media_pickle_polyglot_route(tail[media_end:], sample_is_prefix=False)
+    if pickle_route is not None:
+        return pickle_route
+    if tail[media_end:].lstrip(_MEDIA_TRAILING_PADDING):
+        return None
+    return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def _read_local_media_range(file_path: Path, sample: bytes, offset: int, size: int) -> bytes:
+    if size <= 0:
+        return b""
+    end = offset + size
+    if offset >= 0 and end <= len(sample):
+        return sample[offset:end]
+    with file_path.open("rb") as handle:
+        handle.seek(offset)
+        return handle.read(size)
+
+
+def _detect_seekable_png_media_route(file_path: Path, file_size: int, sample: bytes) -> str | None:
+    media_end = _find_png_end_with_reader(
+        file_size,
+        lambda offset, size: _read_local_media_range(file_path, sample, offset, size),
+    )
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    trailing = _read_local_media_range(file_path, sample, media_end, read_size)
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
+def _detect_seekable_jpeg_media_route(file_path: Path, file_size: int, sample: bytes) -> str | None:
+    media_end = _find_jpeg_end_with_reader(
+        file_size,
+        lambda offset, size: _read_local_media_range(file_path, sample, offset, size),
+    )
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    trailing = _read_local_media_range(file_path, sample, media_end, read_size)
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
+def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
+    """Inspect a bounded complete media sample before serialized fallback routing."""
+    if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
+        return None
+    try:
+        sample = read_magic_bytes(str(file_path), min(file_size, MEDIA_ROUTE_READ_BYTES + 1))
+    except OSError:
+        return None
+    sample_route = _detect_bounded_media_route_from_sample(
+        file_path,
+        sample,
+        sample_is_prefix=file_size > len(sample),
+    )
+    if sample_route is not None:
+        return sample_route
+    sample_is_prefix = file_size > len(sample)
+    if sample.startswith(_PNG_SIGNATURE) and _could_start_bounded_media_route(
+        file_path, sample, sample_is_prefix=sample_is_prefix
+    ):
+        return _detect_seekable_png_media_route(file_path, file_size, sample)
+    if sample.startswith(b"\xff\xd8") and _could_start_bounded_media_route(
+        file_path, sample, sample_is_prefix=sample_is_prefix
+    ):
+        return _detect_seekable_jpeg_media_route(file_path, file_size, sample)
+    return None
 
 
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
@@ -5373,13 +8534,15 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
         size = file_path.stat().st_size
     except OSError:
         return False
+    if _detect_bounded_media_route(file_path, size) is not None:
+        return False
     if ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES:
         json_document_probe = _probe_complete_structured_json_document(file_path, size)
         if json_document_probe is True:
             return False
         if json_document_probe is None and ext not in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES:
             return True
-        if _is_complete_bounded_printable_text(file_path, size):
+        if _is_complete_bounded_printable_text_content_owner(file_path, size):
             return False
     if ext == "":
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(
@@ -5549,10 +8712,19 @@ def detect_format_from_magic_bytes(
     safetensors_route = _detect_safetensors_content_route(file_path, magic8, file_size)
     if safetensors_route is not None:
         if safetensors_route == "safetensors" and file_path is not None:
+            flax_overlap_route = _resolve_safetensors_flax_overlap(file_path)
+            if flax_overlap_route is not None:
+                return flax_overlap_route
             return _resolve_safetensors_tensorflow_overlap(file_path, file_size)
         return safetensors_route
     if structural_torch7_route:
         return "torch7"
+    if file_path is not None:
+        media_route = _detect_bounded_media_route(file_path, file_size)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return "unknown"
+        if media_route is not None:
+            return media_route
     if _looks_like_binary_pickle_protocol(magic4) and (
         file_path is None or not _could_be_content_routed_flax_msgpack(file_path)
     ):
@@ -5601,6 +8773,12 @@ def detect_format_from_magic_bytes(
         )
         if xgboost_route is not None:
             return xgboost_route
+
+    if file_path is not None and _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+        return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+    if file_path is not None and _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+        return "unknown"
 
     renamed_tensorflow_format = "unknown"
     if file_path is not None:
@@ -5718,6 +8896,12 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result != "unknown":
                 return format_result
 
+            media_route = _detect_bounded_media_route(file_path, size)
+            if media_route == VALID_MEDIA_ROUTING_FORMAT:
+                return "unknown"
+            if media_route is not None:
+                return media_route
+
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
             pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
@@ -5752,6 +8936,9 @@ def detect_file_format_from_magic(path: str) -> str:
                 if xgboost_route is not None:
                     return xgboost_route
 
+            if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+                return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
             if (
                 _allows_renamed_binary_content_route(file_path)
                 and _detect_executorch_content_route(file_path, magic8) == "executorch"
@@ -5775,6 +8962,9 @@ def detect_file_format_from_magic(path: str) -> str:
                     return xml_format
             if _could_be_content_routed_flax_msgpack(file_path):
                 return "flax_msgpack"
+
+            if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+                return "unknown"
 
             renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
             if renamed_tensorflow_format != "unknown":
@@ -5892,6 +9082,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
+        media_route = _detect_bounded_media_route(file_path, size)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return "unknown"
+        if media_route is not None:
+            return media_route
+
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
             if len(prefix) < max_probe_size:
@@ -5927,6 +9123,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             xgboost_route = _detect_extensionless_xgboost_ubjson_route(prefix[:xgboost_probe_size])
             if xgboost_route is not None:
                 return xgboost_route
+
+        if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+        if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+            return "unknown"
 
         if (
             _allows_renamed_binary_content_route(file_path)
@@ -6045,10 +9247,18 @@ def detect_file_format(path: str) -> str:
         safetensors_route = _detect_safetensors_content_route(file_path, magic8, size)
         if safetensors_route is not None:
             if safetensors_route == "safetensors":
+                flax_overlap_route = _resolve_safetensors_flax_overlap(file_path)
+                if flax_overlap_route is not None:
+                    return flax_overlap_route
                 return _resolve_safetensors_tensorflow_overlap(file_path, size)
             return safetensors_route
         if structural_torch7_route:
             return "torch7"
+        media_route = _detect_bounded_media_route(file_path, size)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return "unknown"
+        if media_route is not None:
+            return media_route
         could_be_flax = _could_be_content_routed_flax_msgpack(file_path)
         if _looks_like_binary_pickle_protocol(magic4) and not could_be_flax:
             return "pickle"
@@ -6133,6 +9343,12 @@ def detect_file_format(path: str) -> str:
         if xgboost_route is not None:
             return xgboost_route
 
+    if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+        return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+    if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+        return "unknown"
+
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
         file_path,
         size,
@@ -6146,6 +9362,9 @@ def detect_file_format(path: str) -> str:
         return renamed_tensorflow_format
 
     if _is_safetensors_routing_candidate(file_path, magic8, size):
+        flax_overlap_route = _resolve_safetensors_flax_overlap(file_path)
+        if flax_overlap_route is not None:
+            return flax_overlap_route
         if renamed_tensorflow_format == "inconclusive":
             return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
         return "safetensors"
@@ -6187,6 +9406,8 @@ def detect_file_format(path: str) -> str:
         )
         if xgboost_route is not None:
             return xgboost_route
+        if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)
@@ -6401,14 +9622,17 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
             return True
 
         # PyTorch binary files are flexible in format
-        if ext_format == "pytorch_binary" and header_format in {
-            "pytorch_binary",
-            "pickle",
-            "r_serialized",
-            "zip",
-            "unknown",  # .bin files can contain arbitrary binary data
-        }:
-            return True
+        if ext_format == "pytorch_binary":
+            if header_format in {
+                "pytorch_binary",
+                "pickle",
+                "r_serialized",
+                "zip",
+                "unknown",  # .bin files can contain arbitrary binary data
+            }:
+                return True
+            if header_format == "onnx" and file_path.suffix.lower() == ".bin":
+                return True
 
         # TensorFlow protobuf files (.pb extension)
         if ext_format == "protobuf" and header_format in {
@@ -6467,9 +9691,12 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
                 return False
             return header_format == expected_codec
 
-        # NeMo files are TAR archives with a dedicated or structurally recognized route.
-        if ext_format == "nemo" and header_format in {"tar", "nemo"}:
-            return True
+        # NeMo files are TAR archives, commonly carried in gzip-compressed TAR wrappers.
+        if ext_format == "nemo":
+            if header_format in {"tar", "nemo"}:
+                return True
+            if header_format == "gzip":
+                return _is_tar_archive(path)
 
         # ExecuTorch files may be ZIP archives or valid FlatBuffers binaries.
         if ext_format == "executorch":

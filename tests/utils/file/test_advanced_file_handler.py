@@ -442,9 +442,108 @@ class TestShardedModelDetector:
         assert shard_info["shards"] == [str(shard) for shard in adapter_shards]
         assert result.success is True
 
+    def test_detect_safetensors_same_directory_unrelated_index_does_not_poison_family(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A valid index for one total must not govern a co-located different-total family."""
+        indexed_shards = [
+            tmp_path / "model-00001-of-00002.safetensors",
+            tmp_path / "model-00002-of-00002.safetensors",
+        ]
+        standalone = tmp_path / "model-00001-of-00001.safetensors"
+        for shard in (*indexed_shards, standalone):
+            shard.write_bytes(shard.name.encode())
+        _write_safetensors_index(tmp_path, [shard.name for shard in indexed_shards])
+
+        shard_info = ShardedModelDetector.detect_shards(str(standalone))
+        result = AdvancedFileHandler(str(standalone), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert "safetensors_index_path" not in shard_info
+        assert "safetensors_index_error" not in shard_info
+        assert shard_info["shards"] == [str(standalone)]
+        assert result.success is True
+
+    def test_detect_safetensors_index_spanning_nested_sibling_directories(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A governing root index may define one family across sibling directories."""
+        header = b'{"__metadata__":{"format":"pt"}}'
+        shards = [
+            tmp_path / "a" / "model-00000-of-00002.safetensors",
+            tmp_path / "b" / "model-00001-of-00002.safetensors",
+        ]
+        for shard in shards:
+            shard.parent.mkdir()
+            shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        _write_safetensors_index(tmp_path, [shard.relative_to(tmp_path).as_posix() for shard in shards])
+
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]))
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, scanners=["safetensors"])
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard) for shard in shards]
+        assert "missing_shard_count" not in shard_info
+        assert "out_of_scope_shard_count" not in shard_info
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+
+    def test_detect_safetensors_nested_index_rejects_symlink_outside_root(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Index-relative nested targets cannot authorize an external symlink target."""
+        model_root = tmp_path / "model"
+        first = model_root / "a" / "model-00000-of-00002.safetensors"
+        second = model_root / "b" / "model-00001-of-00002.safetensors"
+        outside = tmp_path / "outside.safetensors"
+        first.parent.mkdir(parents=True)
+        second.parent.mkdir(parents=True)
+        first.write_bytes(b"first")
+        outside.write_bytes(b"outside")
+        second.symlink_to(outside)
+        _write_safetensors_index(
+            model_root,
+            [first.relative_to(model_root).as_posix(), second.relative_to(model_root).as_posix()],
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(first))
+        result = AdvancedFileHandler(str(first), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["out_of_scope_shards"] == [str(second)]
+        assert result.success is False
+        assert "out_of_scope_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_complete_single_safetensors_rejects_post_detection_index_change(self, tmp_path: Path) -> None:
+        """Changing the governing index during a direct scan must fail closed."""
+        family_a = tmp_path / "a" / "model-00000-of-00001.safetensors"
+        family_b = tmp_path / "b" / "model-00000-of-00001.safetensors"
+        family_a.parent.mkdir()
+        family_b.parent.mkdir()
+        family_a.write_bytes(b"a")
+        family_b.write_bytes(b"b")
+        index_path = _write_safetensors_index(tmp_path, [family_a.relative_to(tmp_path).as_posix()])
+
+        class IndexSwappingScanner(CompletingShardScanner):
+            def scan(self, shard_path: str) -> ScanResult:
+                _write_safetensors_index(tmp_path, [family_b.relative_to(tmp_path).as_posix()])
+                return super().scan(shard_path)
+
+        result = AdvancedFileHandler(str(family_a), IndexSwappingScanner()).scan()
+
+        assert json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]["tensor_0"].startswith("b/")
+        assert result.success is False
+        assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
+
+    @pytest.mark.parametrize("cache_enabled", [False, True], ids=["no-cache", "cache"])
     def test_complete_single_safetensors_header_scan_is_platform_independent_when_pin_unavailable(
         self,
         tmp_path: Path,
+        cache_enabled: bool,
     ) -> None:
         """A complete one-shard SafeTensors family should scan as one file without descriptor pinning."""
         header = b'{"__metadata__":{"format":"pt"},"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
@@ -459,7 +558,12 @@ class TestShardedModelDetector:
                 side_effect=AssertionError("single SafeTensors shard should not require descriptor pinning"),
             ),
         ):
-            result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, scanners=["safetensors"])
+            result = scan_model_directory_or_file(
+                str(tmp_path),
+                cache_enabled=cache_enabled,
+                cache_dir=str(tmp_path / "cache"),
+                scanners=["safetensors"],
+            )
 
         assert result.success is True
         assert determine_exit_code(result) == 0

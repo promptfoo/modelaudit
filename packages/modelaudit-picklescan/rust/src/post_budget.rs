@@ -283,6 +283,8 @@ fn handle_post_budget_opcode(
                 name,
                 position: opcode.pos,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             };
             stack.push(StackValue::Global(reference.clone()));
             record_post_budget_global_ref(&reference, false, opcode.next, tail, sink);
@@ -302,6 +304,8 @@ fn handle_post_budget_opcode(
                 name: format!("code_{extension_code}"),
                 position: opcode.pos,
                 malformed: true,
+                memo_index: None,
+                memo_read: false,
             };
             stack.push(StackValue::Global(reference.clone()));
             record_post_budget_global_ref(&reference, false, opcode.next, tail, sink);
@@ -328,6 +332,8 @@ fn handle_post_budget_opcode(
                 name,
                 position: opcode.pos,
                 malformed: false,
+                memo_index: None,
+                memo_read: false,
             };
             stack.push(StackValue::Constructed(reference.clone()));
             record_post_budget_global_ref(&reference, true, opcode.next, tail, sink);
@@ -367,12 +373,16 @@ fn resolve_post_budget_stack_global(
             name,
             position,
             malformed: false,
+            memo_index: None,
+            memo_read: false,
         },
         (module, name) => GlobalRef {
             module: module.unwrap_or_else(|| "__unknown__".to_string()),
             name: name.unwrap_or_else(|| "__unknown__".to_string()),
             position,
             malformed: true,
+            memo_index: None,
+            memo_read: false,
         },
     }
 }

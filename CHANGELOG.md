@@ -10,8 +10,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - validate SafeTensors index-driven zero-based shard families without widening selected scanners to foreign shard formats
+- suppress installed source-trusted inert Hugging Face training metadata and safe NumPy RNG-state reconstruction noise while keeping default-install, unresolved, rebound, or shadowed PyTorch ZIP framework metadata suspicious unless trusted source can be inspected
+- contextualize SafeTensors license metadata so ordinary embedded license text does not produce URL or long-value noise while preserving malformed and executable metadata detections
+- reconstruct bounded wrapped SafeTensors license base64 tails and fail closed on residual URL encodings before suppressing metadata URL and length findings
+- validate Basic Auth credentials only in bounded authorization-header context with decodable username/password tokens
+- propagate file-level inconclusive and incomplete-coverage metadata into aggregate success, strict JSON, exit-code, and cache semantics
+- preserve declared ONNX external data sidecars during Hugging Face streaming scans
+- inspect large Keras HDF5 models through file-backed metadata traversal instead of rejecting them at the generic whole-file read cap; aggregate `content_hash` is omitted for these large file-backed HDF5 scans
+- paginate and bound large Hugging Face repository inventories before streaming so unfiltered scans preserve complete coverage
+- dispatch logical model directories through their owning scanners, preserving bounded complete SavedModel asset probes before supplemental child-file coverage
+- stream large Flax MessagePack tensor bodies by declared length without tripping the 512 MiB decode budget
+- avoid critical pickle `getattr` findings for proven Ultralytics `Detect.forward` reconstruction while preserving unsafe traversal controls
+- detect GGUF curl short-option remote fetches, ignore spaced Python attribute calls, and truncate large tokenizer metadata arrays with explicit counts
+- require concrete GGUF metadata evidence for S902 findings instead of flagging benign URLs, chat-template syntax, slashes, or pipes
+- deduplicate repeated ONNX custom-operator domain findings into bounded per-domain reports while preserving affected-file evidence
+- avoid Hugging Face streaming body probes for declared-suffix artifacts excluded by scanner selection while preserving selected renamed content routes
+- exclude Hugging Face local-dir cache sidecars from scan inventory, routing, issue locations, and SBOM components while preserving hidden artifact scanning
+- keep strongly identified SentencePiece tokenizer `.model` artifacts, including custom-unknown models with disabled special tokens, out of XGBoost routing while preserving fail-closed `.model` ambiguity for malformed tails.
+- tolerate picklescan reports that omit private metadata
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds
+- skip PyTorch ZIP tensor storage members referenced by `data.pkl` during hidden-pickle discovery while preserving fail-closed coverage for ambiguous storage layouts
+- stream bounded PyTorch ZIP and legacy pickle metadata analysis for oversized legacy `.pt` and `.bin` shards instead of stopping at the generic read-size cap
+- distinguish PyTorch checkpoint producer-version metadata from active runtime CVE applicability, resolve runtime torch metadata only from trusted install roots, report unknown runtime applicability explicitly, carry same-revision repository SafeTensors inventory into PyTorch pickle applicability details, and preserve artifact-level pickle and tensor-structure findings
+- omit isolated C&C vocabulary tokens from strongly identified tokenizer vocabularies while preserving active network and command findings
+- downgrade filename/content mismatch findings only after an alternate ONNX scanner validates the protobuf format while keeping malformed, spoofed, polyglot, and incomplete routes actionable
+- restrict Jinja SSTI indicators to executable template spans so prose mentions of request handling do not produce critical findings
+- treat canonical storage persistent IDs as informational only after legacy PyTorch framing, storage tuples, and storage payloads validate completely
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
+- preview Hugging Face repository and direct-file scans under `--dry-run` without downloading or scanning, backed by an opt-in pinned false-positive regression harness
+- make Hugging Face streaming dry runs emit metadata-only previews without artifact downloads, scanner execution, or full scan-result JSON
+- report gated or unauthorized Hugging Face acquisitions as failed, inconclusive source outcomes without claiming artifact coverage, and preserve partial findings from interrupted Hugging Face streaming scans
+- show Hugging Face preview access notices when selected gated files have unknown sizes
+- treat known ONNX Runtime `com.microsoft` optimized-export operators as low-noise vendor metadata while preserving S1111 for unknown custom domains and ambiguous vendor claims
+- recognize current GGUF IQ3_S, IQ4_XS, and BF16 tensor types while preserving bounded inconclusive handling for unsupported or malformed tensor metadata
 - scope both ONNX weight scanners to bounded semantic weight lineage across nested graphs, control flow, local functions, constants, Gather/Einsum, and static views; fail closed on ambiguous or sparse coverage; and evaluate extreme tails per conceptual output without suppressing repeated malicious patterns or flagging clean heavy tails
 - derive PyTorch ZIP pickle opcode summaries from exact opcode evidence instead of matching substrings in finding text
 - accept current SafeTensors FP8, sub-byte float, and complex tensors
@@ -65,6 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - require explicit boolean opt-in before weight-distribution scans call torch.load and bound primitive PyTorch ZIP fallback extraction
 - fail closed when OCI layer TAR metadata, member counts, or cumulative extracted bytes exceed inspection budgets
 - fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
+- keep complete bounded UTF-8 text assets out of Flax MessagePack routing while preserving fail-closed scalar-stream coverage
 - detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
 - redact credential-bearing source identifiers in exported SARIF and SBOM reports

@@ -4,6 +4,26 @@ from __future__ import annotations
 
 from typing import Any
 
+TOKENIZER_VOCABULARY_CONTENT_FILENAMES = [
+    "tokenizer-vocab.txt",
+    "tokenizer.txt",
+    "tokenizer_vocab.txt",
+    "tokens.txt",
+    "vocab.txt",
+    "vocabulary.txt",
+]
+
+TEXT_CONTENT_ROUTED_FILENAMES = [
+    "readme",
+    "model_card",
+    "requirements.txt",
+    ".env",
+    *TOKENIZER_VOCABULARY_CONTENT_FILENAMES,
+    "merges.txt",
+    "labels.txt",
+    "classes.txt",
+]
+
 # Extension-only format detection is intentionally narrower than scanner routing:
 # generic config/text extensions are routed by scanner descriptors and content
 # gates, but they are not authoritative enough for magic-vs-extension validation.
@@ -252,8 +272,8 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "module": "modelaudit.scanners.text_scanner",
         "class": "TextScanner",
         "description": "Scans ML-related text files",
-        "extensions": [".txt", ".md", ".markdown", ".rst"],
-        "content_routed_filenames": ["readme", "model_card", "requirements.txt"],
+        "extensions": [".txt", ".md", ".markdown", ".rst", ".env"],
+        "content_routed_filenames": TEXT_CONTENT_ROUTED_FILENAMES,
         "priority": 0,
         "dependencies": [],
         "numpy_sensitive": False,
@@ -278,7 +298,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "content_routed_filenames": [
             "config.json",
             "model.json",
-            "tokenizer.json",
             "params.json",
             "hyperparams.yaml",
             "training_args.json",
@@ -288,7 +307,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
             "requirements.txt",
             "metadata.json",
             "index.json",
-            "tokenizer_config.json",
             "model_config.json",
         ],
         "priority": 12,
@@ -344,9 +362,11 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "module": "modelaudit.scanners.jax_checkpoint_scanner",
         "class": "JaxCheckpointScanner",
         "description": "Scans JAX checkpoint files in various serialization formats",
-        "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"],
+        "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle", ""],
+        "content_routed_extensions": [".json"],
+        "content_routed_filenames": ["metadata.json", "orbax_checkpoint_metadata.json"],
         "header_formats": ["jax_checkpoint"],
-        "priority": 15,
+        "priority": 11,
         "dependencies": [],
         "numpy_sensitive": False,
     },

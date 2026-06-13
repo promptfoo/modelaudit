@@ -47,7 +47,7 @@ MAX_PARALLEL_WORKERS = 4
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
-_SINGLE_SAFETENSORS_AS_FILE_CONFIG_KEY = "_trusted_single_safetensors_as_file"
+_PREVALIDATED_SHARD_INFO_CONFIG_KEY = "_trusted_prevalidated_shard_info"
 SAFETENSORS_SHARD_PATTERN = r"model-(\d+)-of-(\d+)\.safetensors"
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
@@ -83,7 +83,7 @@ class _PinnedShardScan:
 
 @dataclass(frozen=True)
 class _SafetensorsShardIndexInventory:
-    """Validated shard filenames from model.safetensors.index.json."""
+    """SafeTensors shard inventory or a captured index-validation error."""
 
     index_path: Path
     expected_source_paths: frozenset[str]
@@ -623,7 +623,7 @@ class ShardedModelDetector:
         pattern: str,
         expected_total: int | None,
     ) -> _SafetensorsShardIndexInventory:
-        """Parse one SafeTensors index into an authoritative shard inventory."""
+        """Parse one SafeTensors index, returning its shard inventory or a validation error."""
         try:
             resolved_index = index_path.resolve(strict=True)
             hf_cache_root = _find_hf_cache_root(index_path.absolute())
@@ -732,6 +732,8 @@ class ShardedModelDetector:
             return False
         if current_total != expected_total:
             return False
+        if _count_expected_shard_indices(inventory.expected_indices) != expected_total:
+            return False
         current_parent = os.path.dirname(normalized_current)
         expected_parents = {os.path.dirname(source_path) for source_path in inventory.expected_source_paths}
         return current_parent in expected_parents
@@ -744,7 +746,7 @@ class ShardedModelDetector:
         expected_total: int | None,
         current_file: Path,
     ) -> _SafetensorsShardIndexInventory | None:
-        """Parse a governing SafeTensors index into an authoritative shard inventory."""
+        """Load a governing SafeTensors index inventory or captured validation error."""
         if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
             return None
 
@@ -752,10 +754,7 @@ class ShardedModelDetector:
             index_path = index_dir / SAFETENSORS_INDEX_NAME
             if not (index_path.exists() or index_path.is_symlink()):
                 continue
-            inventory_total = expected_total if index_dir == dir_path else None
-            inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, inventory_total)
-            if index_dir == dir_path:
-                return inventory
+            inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, None)
             if inventory.error is not None:
                 return inventory
             if cls._safetensors_inventory_governs_file(inventory, current_file, pattern, expected_total):
@@ -834,8 +833,7 @@ class ShardedModelDetector:
                         shard_info["safetensors_index_error"] = index_inventory.error
                         unvalidated_shards.append(str(index_inventory.index_path))
 
-                # Find local siblings plus any cross-directory peers that the
-                # caller already resolved and snapshotted for this scan.
+                # Collect local siblings and caller-snapshotted peers; validated index targets are added below.
                 candidate_paths: dict[str, Path] = {}
                 for candidate in (*dir_path.glob("*"), *validated_peer_paths):
                     normalized_candidate = os.path.normcase(os.path.normpath(os.path.abspath(candidate)))
@@ -872,14 +870,19 @@ class ShardedModelDetector:
                             if normalized_allowed_targets is not None
                             else None
                         )
+                        inventory_root = (
+                            index_inventory.index_path.parent
+                            if index_inventory is not None and index_inventory.error is None
+                            else dir_path
+                        )
                         if normalized_allowed_targets is not None and expected_target is None:
-                            if not _is_resolved_path_within_directory(dir_path, resolved_file):
+                            if not _is_resolved_path_within_directory(inventory_root, resolved_file):
                                 out_of_scope_shards.append(str(file))
                             else:
                                 unvalidated_shards.append(str(file))
                             continue
                         if allowed_path_set is not None and normalized_resolved_file not in allowed_path_set:
-                            if not _is_resolved_path_within_directory(dir_path, resolved_file):
+                            if not _is_resolved_path_within_directory(inventory_root, resolved_file):
                                 out_of_scope_shards.append(str(file))
                             else:
                                 unvalidated_shards.append(str(file))
@@ -888,7 +891,7 @@ class ShardedModelDetector:
                             allowed_path_set is None
                             and normalized_allowed_targets is None
                             and not _is_resolved_path_within_directory(
-                                dir_path,
+                                inventory_root,
                                 resolved_file,
                             )
                             and str(file.absolute()) != requested_path
@@ -1798,11 +1801,12 @@ class AdvancedFileHandler:
         self.timeout = timeout
         self.start_time = time.time()
         scanner_config = getattr(scanner, "config", {})
-        single_safetensors_as_file = (
-            isinstance(scanner_config, dict)
-            and scanner_config.get(_SINGLE_SAFETENSORS_AS_FILE_CONFIG_KEY) is True
-            and _is_single_safetensors_shard_path(file_path)
+        prevalidated_shard_info = (
+            scanner_config.get(_PREVALIDATED_SHARD_INFO_CONFIG_KEY) if isinstance(scanner_config, dict) else None
         )
+        self.uses_prevalidated_shard_info = isinstance(prevalidated_shard_info, dict)
+        self.allowed_shard_paths = allowed_shard_paths
+        self.allowed_shard_targets = allowed_shard_targets
         self.shard_boundary_error = _grouped_shard_boundary_error(
             file_path,
             allowed_shard_paths,
@@ -1810,14 +1814,24 @@ class AdvancedFileHandler:
         )
 
         # Check for sharded model
+        self.detected_shard_info = (
+            None
+            if self.shard_boundary_error is not None
+            else (
+                dict(prevalidated_shard_info)
+                if isinstance(prevalidated_shard_info, dict)
+                else ShardedModelDetector.detect_shards(
+                    file_path,
+                    allowed_paths=allowed_shard_paths,
+                    allowed_targets=allowed_shard_targets,
+                )
+            )
+        )
         self.shard_info = (
             None
-            if self.shard_boundary_error is not None or single_safetensors_as_file
-            else ShardedModelDetector.detect_shards(
-                file_path,
-                allowed_paths=allowed_shard_paths,
-                allowed_targets=allowed_shard_targets,
-            )
+            if self.detected_shard_info is not None
+            and _is_complete_single_safetensors_shard_info(self.detected_shard_info)
+            else self.detected_shard_info
         )
 
         # Get file/model size
@@ -1844,17 +1858,32 @@ class AdvancedFileHandler:
         if self.shard_boundary_error is not None:
             return _shard_boundary_failure_result(self.scanner.name, self.file_path, self.shard_boundary_error)
         if self.is_sharded:
-            return self._scan_sharded_model()
+            result = self._scan_sharded_model()
         elif self.total_size > LARGE_MODEL_THRESHOLD_200GB:
-            return self._scan_large_file_distributed()
+            result = self._scan_large_file_distributed()
         elif self.total_size > EXTREME_MODEL_THRESHOLD:
-            return self._scan_with_mmap()
+            result = self._scan_with_mmap()
         else:
             # Fall back to regular large file handler
             from .large_file_handler import LargeFileHandler
 
             handler = LargeFileHandler(self.file_path, self.scanner, self.progress_callback, self.timeout)
-            return handler.scan()
+            result = handler.scan()
+
+        if not self.uses_prevalidated_shard_info:
+            current_shard_info = ShardedModelDetector.detect_shards(
+                self.file_path,
+                allowed_paths=self.allowed_shard_paths,
+                allowed_targets=self.allowed_shard_targets,
+            )
+            if current_shard_info != self.detected_shard_info:
+                return _preserve_findings_with_shard_boundary_failure(
+                    result,
+                    self.scanner.name,
+                    self.file_path,
+                    {"path": self.file_path, "reason": "shard_family_changed_during_scan"},
+                )
+        return result
 
     def _supports_bounded_large_file_analysis(self) -> bool:
         """Return True when the scanner exposes a bounded large-file strategy."""
@@ -2216,12 +2245,7 @@ def scan_advanced_large_file(
     config = getattr(scanner, "config", {})
     cache_enabled = config.get("cache_enabled", True)
     cache_dir = config.get("cache_dir")
-    single_safetensors_as_file = (
-        isinstance(config, dict)
-        and config.get(_SINGLE_SAFETENSORS_AS_FILE_CONFIG_KEY) is True
-        and _is_single_safetensors_shard_path(file_path)
-    )
-
+    prevalidated_shard_info = config.get(_PREVALIDATED_SHARD_INFO_CONFIG_KEY)
     boundary_error = _grouped_shard_boundary_error(file_path, allowed_shard_paths, allowed_shard_targets)
     if boundary_error is not None:
         return _shard_boundary_failure_result(scanner.name, file_path, boundary_error)
@@ -2231,8 +2255,8 @@ def scan_advanced_large_file(
         return scanner.scan(file_path)  # type: ignore[no-any-return]
 
     shard_info = (
-        None
-        if single_safetensors_as_file
+        dict(prevalidated_shard_info)
+        if isinstance(prevalidated_shard_info, dict)
         else ShardedModelDetector.detect_shards(
             file_path,
             allowed_paths=allowed_shard_paths,
