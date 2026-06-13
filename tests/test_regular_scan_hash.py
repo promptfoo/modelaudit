@@ -868,6 +868,156 @@ class TestHashGenerationEdgeCases:
 
         assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")
 
+    def test_hash_files_by_path_defers_file_backed_onnx(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit import core
+
+        model_path = tmp_path / "model.onnx"
+        later_path = tmp_path / "later.pkl"
+        _write_regular_scan_onnx_model(model_path)
+        later_path.write_bytes(pickle.dumps({"safe": True}))
+        monkeypatch.setattr(
+            core,
+            "_calculate_file_hash",
+            lambda *_args, **_kwargs: pytest.fail("files beyond the deferred ONNX budget must not be hashed"),
+        )
+
+        hashes = core._hash_files_by_path(
+            [str(model_path), str(later_path)],
+            config={
+                "max_total_size": model_path.stat().st_size - 1,
+                "onnx_raw_detector_max_bytes": 1,
+            },
+        )
+
+        assert hashes[str(model_path)].startswith("unhashable_file_backed_onnx_")
+        assert hashes[str(later_path)].startswith("unhashable_max_total_size_")
+
+    def test_file_backed_onnx_hash_deferral_uses_bounded_content_routing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from modelaudit.utils.file.detection import (
+            PROTOBUF_MODEL_CANDIDATE_FORMAT,
+            detect_file_format_for_skip_filter,
+        )
+        from modelaudit.utils.helpers.cache_decorator import should_defer_hash_for_file_backed_onnx
+
+        renamed_model = tmp_path / "renamed"
+        ambiguous_model = tmp_path / "ambiguous.conf"
+        foreign_zip = tmp_path / "foreign.onnx"
+        _write_regular_scan_onnx_model(renamed_model)
+        _write_regular_scan_onnx_model(ambiguous_model)
+        ambiguous_model.write_bytes((b"\x12\x01a" * 4097) + ambiguous_model.read_bytes())
+        with zipfile.ZipFile(foreign_zip, "w") as archive:
+            archive.writestr("payload.txt", "not ONNX")
+        config = {"onnx_raw_detector_max_bytes": 1}
+
+        assert should_defer_hash_for_file_backed_onnx(str(renamed_model), config)
+        assert not should_defer_hash_for_file_backed_onnx(str(foreign_zip), config)
+        assert detect_file_format_for_skip_filter(str(ambiguous_model)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        assert should_defer_hash_for_file_backed_onnx(
+            str(ambiguous_model),
+            {**config, "scanners": ["protobuf_model_candidate"]},
+        )
+        assert not should_defer_hash_for_file_backed_onnx(
+            str(ambiguous_model),
+            {**config, "scanners": ["metadata"]},
+        )
+        assert not should_defer_hash_for_file_backed_onnx(
+            str(renamed_model),
+            {**config, "scanners": ["metadata"]},
+        )
+
+        metadata_result = scan_model_directory_or_file(
+            str(ambiguous_model),
+            cache_enabled=False,
+            scanners=["metadata"],
+            skip_file_types=False,
+            onnx_raw_detector_max_bytes=1,
+        )
+        expected_hash = compute_aggregate_hash([hashlib.sha256(ambiguous_model.read_bytes()).hexdigest()])
+        assert metadata_result.content_hash == expected_hash
+
+    def test_single_file_backed_onnx_bypasses_aggregate_and_cache_hashes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit import core
+        from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
+
+        model_path = tmp_path / "model.onnx"
+        _write_regular_scan_onnx_model(model_path)
+        monkeypatch.setattr(
+            core,
+            "_calculate_file_hash",
+            lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must not be aggregate-hashed"),
+        )
+        monkeypatch.setattr(
+            SecureFileHasher,
+            "hash_file",
+            lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must not be cache-hashed"),
+        )
+        monkeypatch.setattr(
+            SecureFileHasher,
+            "hash_file_with_stat",
+            lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must not be cache-hashed"),
+        )
+
+        result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            onnx_raw_detector_max_bytes=1,
+        )
+
+        assert result.content_hash is None
+        assert result.file_metadata[str(model_path)]["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+
+    def test_directory_file_backed_onnx_omits_aggregate_but_hashes_other_files(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit import core
+
+        model_path = tmp_path / "model.onnx"
+        sidecar = tmp_path / "weights.data"
+        safe_path = tmp_path / "safe.pkl"
+        sidecar.write_bytes(b"W" * 4096)
+        _write_regular_scan_onnx_model(
+            model_path,
+            external_location=sidecar.name,
+            external_size=sidecar.stat().st_size,
+        )
+        _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+        safe_path.write_bytes(pickle.dumps({"safe": True}))
+        original_hash = core._calculate_file_hash
+        hashed: list[Path] = []
+
+        def track_hash(path: str, *, deadline: float | None = None) -> str:
+            hashed.append(Path(path))
+            if Path(path) in {model_path, sidecar}:
+                pytest.fail("file-backed ONNX owners and context sidecars must not be aggregate-hashed")
+            return original_hash(path, deadline=deadline)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            onnx_raw_detector_max_bytes=1,
+        )
+
+        assert safe_path in hashed
+        assert model_path not in hashed
+        assert sidecar not in hashed
+        assert result.bytes_scanned == sum(path.stat().st_size for path in (model_path, sidecar, safe_path))
+        assert result.content_hash is None
+
     def test_hash_files_by_path_defers_oversized_pytorch_zip_ckpt_read_limit(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1384,6 +1534,40 @@ class TestHashGenerationEdgeCases:
 
 
 class TestOnnxExternalDataContentHash:
+    def test_directory_hash_is_deferred_when_onnx_sidecar_discovery_is_incomplete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A bounded discovery failure must not produce a partial aggregate hash."""
+        from modelaudit.scanners import onnx_scanner
+
+        model_path = tmp_path / "model.onnx"
+        sidecar = tmp_path / "weights.data"
+        sidecar.write_bytes(b"\x01\x02\x03\x04")
+        _write_regular_scan_onnx_model(
+            model_path,
+            external_location=sidecar.name,
+            external_size=sidecar.stat().st_size,
+        )
+        _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+
+        def fail_bounded_discovery(*_args: Any, **_kwargs: Any) -> Any:
+            raise onnx_scanner._OnnxStructureParseError(
+                "retained_object_limit_exceeded",
+                "bounded discovery exhausted its retained-object budget",
+            )
+
+        monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", fail_bounded_discovery)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            scanners=["onnx"],
+        )
+
+        assert result.content_hash is None
+
     def test_directory_hash_ignores_stale_external_data_on_inline_tensor(
         self,
         tmp_path: Path,
@@ -1417,6 +1601,12 @@ class TestOnnxExternalDataContentHash:
         sidecar.write_bytes(b"\x01\x02\x03\x04")
         _write_regular_scan_onnx_model(model_path, external_location=sidecar.name, external_size=sidecar.stat().st_size)
         _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+        onnx = pytest.importorskip("onnx")
+        monkeypatch.setattr(
+            onnx,
+            "load",
+            lambda *_args, **_kwargs: pytest.fail("directory sidecar discovery must not preload ONNX"),
+        )
 
         result = scan_model_directory_or_file(
             str(tmp_path),
@@ -1494,10 +1684,12 @@ class TestOnnxExternalDataContentHash:
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
         assert result.content_hash is None
 
+    @pytest.mark.parametrize("defer_owner_hash", [False, True])
     def test_directory_hash_omits_hash_when_onnx_sidecar_exceeds_max_total_size(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        defer_owner_hash: bool,
     ) -> None:
         """Sidecar bytes should participate in max_total_size accounting."""
         from modelaudit import core
@@ -1521,6 +1713,7 @@ class TestOnnxExternalDataContentHash:
             cache_enabled=False,
             scanners=["onnx"],
             max_total_size=model_path.stat().st_size,
+            onnx_raw_detector_max_bytes=1 if defer_owner_hash else 512 * 1024 * 1024,
         )
 
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size

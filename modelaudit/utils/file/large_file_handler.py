@@ -18,6 +18,7 @@ from ..helpers.cache_decorator import (
     should_bypass_cache_for_safetensors_header_limit,
     should_bypass_cache_for_unavailable_hdf5_analysis,
     should_bypass_cache_for_zip_entry_preflight,
+    should_defer_hash_for_file_backed_onnx,
 )
 
 # Lazy import to avoid circular dependency
@@ -254,6 +255,10 @@ def scan_large_file(
 
     if should_bypass_cache_for_file_backed_hdf5(file_path):
         logger.debug(f"Bypassing large-file cache for file-backed HDF5 inspection: {file_path}")
+        return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
+
+    if should_defer_hash_for_file_backed_onnx(file_path, config):
+        logger.debug(f"Bypassing large-file cache for file-backed ONNX inspection: {file_path}")
         return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
 
     # If caching is disabled, proceed with direct scan
