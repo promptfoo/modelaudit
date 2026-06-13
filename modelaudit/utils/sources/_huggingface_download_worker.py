@@ -15,6 +15,8 @@ def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str
         from modelaudit.utils.sources.huggingface import _list_huggingface_repo_files_at_revision
 
         requested_revision = operation_kwargs.get("revision")
+        if requested_revision is None:
+            requested_revision = operation_kwargs.get("requested_revision")
         files, revision = _list_huggingface_repo_files_at_revision(
             operation_kwargs["repo_id"],
             requested_revision=requested_revision,
@@ -32,13 +34,9 @@ def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str
     elif operation == "get_model_size":
         from huggingface_hub import HfApi
 
-        model_info_kwargs: dict[str, Any] = {}
-        request_timeout = operation_kwargs.get("request_timeout")
-        if request_timeout is not None:
-            model_info_kwargs["timeout"] = request_timeout
-        requested_revision = operation_kwargs.get("revision")
-        if requested_revision is not None:
-            model_info_kwargs["revision"] = requested_revision
+        model_info_kwargs: dict[str, Any] = {"timeout": operation_kwargs.get("request_timeout")}
+        if operation_kwargs.get("revision") is not None:
+            model_info_kwargs["revision"] = operation_kwargs["revision"]
         model_info = HfApi().model_info(operation_kwargs["repo_id"], **model_info_kwargs)
         total_size = sum(
             file_info.size
