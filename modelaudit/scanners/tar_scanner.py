@@ -1038,6 +1038,23 @@ class TarScanner(BaseScanner):
             )
         mark_archive_scan_incomplete(result, exc.reason)
 
+    @staticmethod
+    def _record_compressed_tar_trailing_data(result: ScanResult, path: str) -> None:
+        """Record physical compressed-wrapper data that cannot belong to the TAR."""
+        mark_archive_scan_incomplete(result, TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON)
+        result.add_check(
+            name="Compressed TAR Trailing Data",
+            passed=False,
+            message="Compressed wrapper contains data after the TAR end marker",
+            severity=IssueSeverity.WARNING,
+            rule_code="S902",
+            location=path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON,
+            },
+        )
+
     def _drain_compressed_tar_tail(
         self,
         tar: tarfile.TarFile,
@@ -1086,19 +1103,7 @@ class TarScanner(BaseScanner):
         if not has_trailing_data:
             return True
 
-        mark_archive_scan_incomplete(result, TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON)
-        result.add_check(
-            name="Compressed TAR Trailing Data",
-            passed=False,
-            message="Compressed wrapper contains data after the TAR end marker",
-            severity=IssueSeverity.WARNING,
-            rule_code="S902",
-            location=path,
-            details={
-                "analysis_incomplete": True,
-                "scan_outcome_reason": TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON,
-            },
-        )
+        self._record_compressed_tar_trailing_data(result, path)
         return False
 
     def _preflight_tar_archive(
@@ -1230,6 +1235,9 @@ class TarScanner(BaseScanner):
                 compression_codec=compression_codec,
                 compressed_size=compressed_size,
             )
+            return False
+        except _TarCompressedPhysicalTrailingData:
+            self._record_compressed_tar_trailing_data(result, path)
             return False
         except (EOFError, OSError, tarfile.TarError, lzma.LZMAError) as exc:
             self._record_incomplete_tar_scan(result, path, exc)
@@ -1408,6 +1416,11 @@ class TarScanner(BaseScanner):
                             compression_codec=compression_codec,
                             compressed_size=compressed_size,
                         )
+                        break
+                    except _TarCompressedPhysicalTrailingData:
+                        scan_complete = False
+                        wrapper_integrity_failed = True
+                        self._record_compressed_tar_trailing_data(result, path)
                         break
                     except tarfile.TarError:
                         raise

@@ -1,7 +1,9 @@
 """Tests for CVE-2025-23304: NVIDIA NeMo Hydra _target_ injection."""
 
+import bz2
 import gzip
 import io
+import lzma
 import pickle
 import tarfile
 import zipfile
@@ -252,6 +254,57 @@ class TestNemoScannerBasic:
             reader.read(1024)
 
         assert source.tell() == int(compressed_size * max_ratio) + 1
+
+    @pytest.mark.parametrize(
+        "compression_codec",
+        ["bzip2", "xz"],
+    )
+    def test_content_routed_bzip2_xz_physical_tail_fails_closed_during_preflight(
+        self,
+        tmp_path: Path,
+        compression_codec: Literal["bzip2", "xz"],
+    ) -> None:
+        path = tmp_path / "renamed-model.bin"
+        info = tarfile.TarInfo("model_config.yaml")
+        info.size = 1024 * 1024
+        truncated_tar = info.tobuf() + (b"A" * 100)
+        compressed_tar = bz2.compress(truncated_tar) if compression_codec == "bzip2" else lzma.compress(truncated_tar)
+        path.write_bytes(compressed_tar + b"physical trailing payload")
+
+        result = scan_file(
+            str(path),
+            config={
+                "cache_enabled": False,
+                "compressed_max_decompressed_bytes": 2 * 1024 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            },
+        )
+
+        trailing_checks = [check for check in result.checks if check.name == "Compressed TAR Trailing Data"]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert len(trailing_checks) == 1
+        assert trailing_checks[0].status == CheckStatus.FAILED
+        assert trailing_checks[0].rule_code == "S902"
+        assert "tar_compressed_trailing_data" in result.metadata["scan_outcome_reasons"]
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                compressed_max_decompressed_bytes=2 * 1024 * 1024,
+                compressed_max_decompression_ratio=100_000.0,
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 1
+            assert any(issue.rule_code == "S902" for issue in aggregate.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_malformed_gzip_nemo_still_reports_s901(self, tmp_path: Path) -> None:
         """A .nemo suffix plus gzip magic is not enough unless it is a valid TAR."""
