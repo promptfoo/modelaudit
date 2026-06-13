@@ -2308,7 +2308,9 @@ class TestJITScriptDetector:
 
         assert any(f.type == "code_execution_pattern" and f.pattern == expected_pattern for f in findings)
 
-    def test_scan_model_ignores_long_passive_reference_chain_with_bounded_replay(self) -> None:
+    def test_scan_model_ignores_long_passive_reference_chain_with_bounded_replay(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         detector = JITScriptDetector()
         padding_line = b"# pad\n"
         padding = padding_line * (
@@ -2319,10 +2321,49 @@ class TestJITScriptDetector:
         )
         source = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_39999)('safe')\n" + padding
 
+        original_extraction_windows = jit_script_module._embedded_python_extraction_windows
+
+        def assert_unique_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
+            windows = original_extraction_windows(data)
+            assert len(windows) == len(set(windows))
+            return windows
+
+        def reject_heavy_replay(*_args: object, **_kwargs: object) -> bool:
+            raise AssertionError("proven passive forwarding must not enter heavyweight replay")
+
+        monkeypatch.setattr(jit_script_module, "_embedded_python_extraction_windows", assert_unique_extraction_windows)
+        monkeypatch.setattr(jit_script_module, "_late_assignment_binds_builtins_mapping", reject_heavy_replay)
+
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert not any(
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+        incomplete_reasons = {
+            finding.details.get("reason") for finding in findings if finding.type == "analysis_incomplete"
+        }
+        assert {
+            jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON,
+            jit_script_module._EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON,
+        } <= incomplete_reasons
+
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            b"print = rp.run_path\nvalue_0 = print(rp.run_path)\n",
+            b"value_0 = print(rp.run_path('payload.py'))\n",
+        ],
+    )
+    def test_scan_model_does_not_treat_executing_print_shapes_as_passive(self, binding: bytes) -> None:
+        detector = JITScriptDetector()
+        forwards = b"".join(f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 64))
+        source = b"\x00\xffimport runpy as rp\n" + binding + forwards + b"value_63('safe')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
         )
 
     def test_scan_model_detects_forwarded_conditional_alias_beyond_replay_budget(self) -> None:
