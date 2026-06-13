@@ -3931,6 +3931,46 @@ def test_scan_huggingface_url_passes_max_size_to_download(
     mock_rmtree.assert_called()
 
 
+@patch("modelaudit.cli.is_huggingface_url", return_value=True)
+@patch("modelaudit.cli.get_model_info")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_standard_preserves_selected_extensionless_filenames(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_get_model_info: MagicMock,
+    _mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Standard previews and downloads must share selected exact filename routes."""
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "README").write_text("metadata", encoding="utf-8")
+    mock_download.return_value = downloaded_dir
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 8,
+        "file_count": 1,
+        "inventory_status": "complete",
+        "inaccessible_gated_bytes": 0,
+        "unknown_size_count": 0,
+    }
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--no-cache", "--scanners", "metadata", "--format", "text", "hf://test/model"],
+    )
+
+    assert result.exit_code == 0, result.output
+    expected_filenames = frozenset({"readme", "model_card"})
+    assert mock_get_model_info.call_args.kwargs["scannable_filenames"] == expected_filenames
+    assert mock_download.call_args.kwargs["scannable_filenames"] == expected_filenames
+    mock_rmtree.assert_called()
+
+
 def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> None:
     downloaded_dir = tmp_path / "downloaded"
     downloaded_dir.mkdir()

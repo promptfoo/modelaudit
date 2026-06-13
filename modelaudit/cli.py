@@ -333,6 +333,7 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
             timeout_seconds=runtime.timeout,
             allow_content_probes=False,
             scannable_extensions=runtime.scannable_extensions,
+            scannable_filenames=runtime.scannable_filenames,
             scannable_scanner_ids=runtime.scannable_scanner_ids,
         )
 
@@ -340,9 +341,9 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
     model_info_kwargs: dict[str, Any] = {"allow_content_probes": False}
     if preview_timeout is not None:
         model_info_kwargs["timeout_seconds"] = preview_timeout
+    model_info_kwargs["scannable_filenames"] = runtime.scannable_filenames
     if runtime.scan_and_delete:
         model_info_kwargs["streaming_selection"] = True
-        model_info_kwargs["scannable_filenames"] = runtime.scannable_filenames
         model_info_kwargs["include_all_files"] = runtime.hf_stream_include_all_files
     model_info_kwargs["scannable_extensions"] = runtime.scannable_extensions
     model_info_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
@@ -3522,6 +3523,12 @@ def _resolve_scan_source_for_path(
             if runtime.hf_stream_include_all_files:
                 hf_stream_kwargs["include_all_files"] = True
         hf_preview_kwargs: dict[str, Any] = {"timeout_seconds": runtime.timeout}
+        if runtime.scannable_extensions is not None:
+            hf_preview_kwargs["scannable_extensions"] = runtime.scannable_extensions
+        if runtime.scannable_filenames is not None:
+            hf_preview_kwargs["scannable_filenames"] = runtime.scannable_filenames
+        if runtime.scannable_scanner_ids is not None:
+            hf_preview_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
         if runtime.scan_and_delete:
             hf_preview_kwargs.update(hf_stream_kwargs)
             hf_preview_kwargs["streaming_selection"] = True
@@ -3687,6 +3694,7 @@ def _resolve_scan_source_for_path(
                 timeout_seconds=runtime.timeout,
                 repository_file_inventory=download_repository_file_inventory,
                 scannable_extensions=runtime.scannable_extensions,
+                scannable_filenames=runtime.scannable_filenames,
                 scannable_scanner_ids=runtime.scannable_scanner_ids,
             )
             download_duration = time.time() - download_start

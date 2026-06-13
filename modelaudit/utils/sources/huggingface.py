@@ -1472,6 +1472,7 @@ def _select_huggingface_model_files(
     revision: str,
     model_extensions: Collection[str],
     *,
+    scannable_filenames: Collection[str] | None = None,
     allow_content_probes: bool = True,
     allow_inaccessible_probe_errors: bool = False,
     inaccessible_probe_files: list[str] | None = None,
@@ -1480,8 +1481,16 @@ def _select_huggingface_model_files(
     deadline: float | None = None,
 ) -> list[str]:
     """Select extension matches, bounded content routes, and validated SafeTensors index families."""
+    selected_filenames = (
+        set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
+    )
     model_files = list(
-        dict.fromkeys(filename for filename in repo_files if _is_scannable_hf_file(filename, model_extensions))
+        dict.fromkeys(
+            filename
+            for filename in repo_files
+            if _is_scannable_hf_file(filename, model_extensions)
+            or PurePosixPath(filename).name.lower() in selected_filenames
+        )
     )
     selected_route_scanner_ids = (
         {str(scanner_id).lower() for scanner_id in scannable_scanner_ids} if scannable_scanner_ids is not None else None
@@ -1815,6 +1824,12 @@ def _validate_remote_safetensors_indexes(
                 )
             target_indices.add(shard_index)
             target_families.setdefault((target_path.parent.as_posix(), shard_total), set()).add(target_file)
+
+        if len(target_families) > 1:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} references multiple model shard families"
+            )
 
         if not index_selected:
             updated_model_files.append(index_file)
@@ -3415,6 +3430,7 @@ def _build_huggingface_model_info(
             repo_files,
             repo_revision,
             model_extensions,
+            scannable_filenames=scannable_filenames,
             allow_content_probes=allow_content_probes,
             allow_inaccessible_probe_errors=allow_inaccessible_probe_errors,
             inaccessible_probe_files=inaccessible_probe_files if allow_inaccessible_probe_errors else None,
@@ -3662,6 +3678,7 @@ def download_model(
     timeout_seconds: float | None = None,
     repository_file_inventory: list[str] | None = None,
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
 ) -> Path:
     """Download a model from HuggingFace.
@@ -3673,6 +3690,9 @@ def download_model(
         max_size: Optional maximum total selected download size in bytes
         timeout_seconds: Optional end-to-end acquisition deadline in seconds
         repository_file_inventory: Optional list filled with repository member names from metadata
+        scannable_extensions: Optional remote prefilter extensions from scanner selection policy
+        scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
+        scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
 
     Returns:
         Path to the downloaded model directory
@@ -3695,7 +3715,9 @@ def download_model(
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     # Disk space path setup. Selection-aware size evidence is collected after planning.
-    selection_is_filtered = scannable_extensions is not None or scannable_scanner_ids is not None
+    selection_is_filtered = (
+        scannable_extensions is not None or scannable_filenames is not None or scannable_scanner_ids is not None
+    )
     model_size = (
         None if selection_is_filtered else _get_model_size_with_deadline(repo_id, deadline, revision=requested_revision)
     )
@@ -3732,6 +3754,7 @@ def download_model(
             max_size,
             deadline=deadline,
             scannable_extensions=scannable_extensions,
+            scannable_filenames=scannable_filenames,
             scannable_scanner_ids=scannable_scanner_ids,
         )
         deadline = plan.deadline
@@ -3934,6 +3957,7 @@ def plan_huggingface_model_download(
     deadline: float | None = None,
     allow_content_probes: bool = True,
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
 ) -> HuggingFaceDownloadPlan:
     """Plan the bounded Hugging Face files a standard acquisition would download."""
@@ -3975,6 +3999,7 @@ def plan_huggingface_model_download(
         repo_files,
         repo_revision,
         model_extensions,
+        scannable_filenames=scannable_filenames,
         allow_content_probes=allow_content_probes,
         allow_safetensors_index_expansion=_allows_safetensors_index_expansion(
             scannable_extensions,

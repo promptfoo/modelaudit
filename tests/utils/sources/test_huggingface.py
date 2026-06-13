@@ -4040,6 +4040,34 @@ class TestModelDownloadStreaming:
         mock_detect.assert_not_called()
         mock_requests_get.assert_not_called()
 
+    def test_download_model_preserves_selected_extensionless_filename_routes(self, tmp_path: Path) -> None:
+        """Standard downloads must retain exact filename routes from scanner selection."""
+        repo_files = ["README", "model_card", "weights.safetensors"]
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        for filename in ("README", "model_card"):
+            (download_path / filename).write_text(filename, encoding="utf-8")
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect,
+            patch("huggingface_hub.snapshot_download", return_value=str(download_path)) as mock_snapshot_download,
+        ):
+            result = download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "cache",
+                scannable_extensions={".md", ".txt"},
+                scannable_filenames={"readme", "model_card"},
+                scannable_scanner_ids={"metadata"},
+            )
+
+        assert result == download_path
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["README", "model_card"]
+        mock_detect.assert_not_called()
+
     def test_model_plan_metadata_only_refuses_onnx_sidecar_ambiguity(self) -> None:
         """A standard dry-run cannot prove ONNX external_data companions without parsing the model."""
         with (
@@ -4153,6 +4181,35 @@ class TestModelDownloadStreaming:
                 repo_files,
                 _HF_TEST_REVISION,
                 selected_files,
+                budget,
+            )
+
+    def test_remote_safetensors_validation_rejects_split_directory_family(self) -> None:
+        """Shard indices from different directories must not combine into one complete family."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "base/model-00000-of-00002.safetensors",
+            "adapter/model-00001-of-00002.safetensors",
+        ]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps(
+            {
+                "weight_map": {
+                    "base": "base/model-00000-of-00002.safetensors",
+                    "adapter": "adapter/model-00001-of-00002.safetensors",
+                }
+            }
+        ).encode()
+
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(payload)),
+            pytest.raises(ValueError, match="references multiple model shard families"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                repo_files,
                 budget,
             )
 

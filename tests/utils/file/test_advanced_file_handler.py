@@ -496,21 +496,64 @@ class TestShardedModelDetector:
         ],
         ids=["nested-malformed-json", "nested-traversal-target"],
     )
-    def test_detect_safetensors_parent_index_invalid_nested_inventory_fails_closed(
+    def test_detect_safetensors_invalid_ancestor_index_does_not_poison_nested_family(
         self,
         tmp_path: Path,
         index_payload: str,
     ) -> None:
-        """Malformed and traversal-bearing parent indexes must not authorize nested shards."""
+        """Malformed and traversal-bearing ancestor indexes must not claim nested shards."""
         shard_dir = tmp_path / "shards"
         shard_dir.mkdir()
-        shard_zero = shard_dir / "model-00000-of-00001.safetensors"
-        shard_zero.write_bytes(b"zero")
+        shards = [
+            shard_dir / "model-00001-of-00002.safetensors",
+            shard_dir / "model-00002-of-00002.safetensors",
+        ]
+        for shard in shards:
+            shard.write_bytes(shard.name.encode())
         (tmp_path / "model.safetensors.index.json").write_text(index_payload, encoding="utf-8")
 
-        shard_info = ShardedModelDetector.detect_shards(str(shard_zero), index_search_root=tmp_path)
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]), index_search_root=tmp_path)
         result = AdvancedFileHandler(
-            str(shard_zero),
+            str(shards[0]),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert "safetensors_index_path" not in shard_info
+        assert "safetensors_index_error" not in shard_info
+        assert "unvalidated_shards" not in shard_info
+        assert shard_info["shards"] == [str(shard) for shard in shards]
+        assert result.success is True
+
+    def test_detect_safetensors_invalid_ancestor_index_governing_nested_family_fails_closed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A malformed ancestor that names the selected family must remain authoritative."""
+        shard_dir = tmp_path / "shards"
+        shard_dir.mkdir()
+        shards = [
+            shard_dir / "model-00001-of-00002.safetensors",
+            shard_dir / "model-00002-of-00002.safetensors",
+        ]
+        for shard in shards:
+            shard.write_bytes(shard.name.encode())
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "invalid": "../outside/model-00001-of-00002.safetensors",
+                        "selected": shards[0].relative_to(tmp_path).as_posix(),
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(shards[0]),
             CompletingShardScanner(),
             index_search_root=tmp_path,
         ).scan()

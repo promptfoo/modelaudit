@@ -626,6 +626,7 @@ class ShardedModelDetector:
         expected_total: int | None,
     ) -> _SafetensorsShardIndexInventory:
         """Parse one SafeTensors index, returning its shard inventory or a validation error."""
+        expected_paths: set[str] = set()
         try:
             resolved_index = index_path.resolve(strict=True)
             hf_cache_root = _find_hf_cache_root(index_path.absolute())
@@ -660,10 +661,15 @@ class ShardedModelDetector:
             if not isinstance(weight_map, dict) or not weight_map:
                 raise ValueError("safetensors index weight_map must be a non-empty object")
 
-            expected_paths: set[str] = set()
             target_indices: set[int] = set()
             index_expected_total: int | None = expected_total
             raw_targets = list(weight_map.values())
+            for raw_target in raw_targets:
+                if not isinstance(raw_target, str):
+                    continue
+                with suppress(ValueError):
+                    candidate_path = cls._safe_index_target_path(index_dir, raw_target)
+                    expected_paths.add(_normalized_absolute_path(candidate_path))
             if not all(isinstance(target, str) for target in raw_targets):
                 raise ValueError("safetensors index weight_map targets must be strings")
             unique_targets = set(raw_targets)
@@ -708,7 +714,7 @@ class ShardedModelDetector:
         except Exception as exc:
             return _SafetensorsShardIndexInventory(
                 index_path=index_path,
-                expected_source_paths=frozenset(),
+                expected_source_paths=frozenset(expected_paths),
                 expected_indices=cls._expected_index_range(expected_total or 1, zero_based=False),
                 index_base="invalid",
                 error=str(exc),
@@ -772,7 +778,9 @@ class ShardedModelDetector:
             index_path = index_dir / SAFETENSORS_INDEX_NAME
             if index_path.exists() or index_path.is_symlink():
                 inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, None)
-                if inventory.error is not None:
+                if inventory.error is not None and _normalized_absolute_path(index_dir) == _normalized_absolute_path(
+                    absolute_dir
+                ):
                     return inventory
                 if cls._safetensors_inventory_governs_file(inventory, current_file, pattern, expected_total):
                     return inventory
