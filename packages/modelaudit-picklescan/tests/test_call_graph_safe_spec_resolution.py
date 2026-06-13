@@ -8,12 +8,26 @@ import pickle
 import posixpath
 import subprocess
 import sys
+import sysconfig
 import tarfile
 from collections.abc import Iterator
-from importlib.machinery import BuiltinImporter, FileFinder, FrozenImporter, ModuleSpec, PathFinder
+from importlib.machinery import (
+    BYTECODE_SUFFIXES,
+    EXTENSION_SUFFIXES,
+    SOURCE_SUFFIXES,
+    BuiltinImporter,
+    ExtensionFileLoader,
+    FileFinder,
+    FrozenImporter,
+    ModuleSpec,
+    PathFinder,
+    SourceFileLoader,
+    SourcelessFileLoader,
+)
 from pathlib import Path
 from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Any, cast
+from zipimport import zipimporter
 
 import pytest
 
@@ -32,6 +46,17 @@ def _posixpath_text_regex_cache_name() -> str:
         if name in posixpath.expandvars.__code__.co_names:
             return name
     pytest.skip("posixpath.expandvars has no recognized text regex cache")
+    raise AssertionError("pytest.skip returned unexpectedly")
+
+
+def _pick_unloaded_stdlib_source_module() -> str:
+    for module in ("shlex", "fractions", "calendar", "tokenize", "pydoc"):
+        if module in sys.modules:
+            continue
+        spec = PathFinder.find_spec(module, [sysconfig.get_path("stdlib")])
+        if spec is not None and isinstance(spec.origin, str) and spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+            return module
+    pytest.skip("no unloaded stdlib source module available for search-path regression")
     raise AssertionError("pytest.skip returned unexpectedly")
 
 
@@ -1127,6 +1152,41 @@ def test_hostile_path_importer_cache_blocks_resolution_without_execution(
         _clear_call_graph_caches()
 
     assert calls == []
+
+
+def test_later_untrusted_path_importer_does_not_block_prior_stdlib_source_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _pick_unloaded_stdlib_source_module()
+    stdlib_path = sysconfig.get_path("stdlib")
+    assert stdlib_path is not None
+
+    stdlib_loader_details = (
+        (ExtensionFileLoader, list(EXTENSION_SUFFIXES)),
+        (SourceFileLoader, list(SOURCE_SUFFIXES)),
+        (SourcelessFileLoader, list(BYTECODE_SUFFIXES)),
+    )
+    stdlib_finder = FileFinder(stdlib_path, *stdlib_loader_details)
+    untrusted_entry = str(Path(stdlib_path) / "later-untrusted-importer")
+    importer_cache: dict[Any, Any] = dict(sys.path_importer_cache)
+    importer_cache[stdlib_path] = stdlib_finder
+    importer_cache[untrusted_entry] = object()
+
+    monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
+    monkeypatch.setattr(
+        sys,
+        "path_hooks",
+        [zipimporter, FileFinder.path_hook(*stdlib_loader_details)],
+    )
+    monkeypatch.setattr(sys, "path", [stdlib_path, untrusted_entry])
+    monkeypatch.setattr(sys, "path_importer_cache", importer_cache)
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._trusted_module_origin_kind(module) == "stdlib"
+        assert call_graph._resolve_module_source(module) is not None
+    finally:
+        _clear_call_graph_caches()
 
 
 def test_added_import_runtime_type_hook_blocks_resolution_without_execution() -> None:

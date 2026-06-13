@@ -9,6 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- keep trusted stdlib call-graph resolution working when later path entries use untrusted importers
 - suppress canonical PyTorch tensor rebuild warnings only for validated unloaded-runtime ZIP `data.pkl` storage context
 - suppress installed source-trusted inert Hugging Face training metadata and safe NumPy ndarray reconstruction noise while keeping default-install, unresolved, rebound, or shadowed framework metadata suspicious
 - skip PyTorch ZIP tensor storage members referenced by `data.pkl` during hidden-pickle discovery while preserving inconclusive outcomes for ambiguous storage evidence

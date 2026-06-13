@@ -2923,7 +2923,7 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
                 return None
         spec = loaded_spec
     else:
-        if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
+        if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or not _path_hooks_are_trusted():
             return None
         spec = standard_spec
     if spec is None:
@@ -3689,6 +3689,15 @@ def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
         if finder is not None and not _is_trusted_standard_path_importer(finder, cache_key):
             return True
     return False
+
+
+def _search_path_entry_uses_trusted_importer(entry: str) -> bool:
+    path_importer_cache = _runtime_path_importer_cache_without_hooks()
+    if path_importer_cache is None:
+        return False
+    cache_key = entry or os.getcwd()
+    finder = dict.get(path_importer_cache, cache_key)
+    return finder is None or _is_trusted_standard_path_importer(finder, cache_key)
 
 
 def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -4591,8 +4600,13 @@ def _has_untrusted_path_hook() -> bool:
     return _search_path_has_untrusted_importer(search_path)
 
 
+def _path_hooks_are_trusted() -> bool:
+    path_hooks = _runtime_path_hooks_without_hooks()
+    return path_hooks is not None and all(_is_standard_path_hook(hook) for hook in path_hooks)
+
+
 def _find_standard_path_spec(module_name: str, search_path: list[str]) -> ModuleSpec | None:
-    if not _interpreter_import_runtime_is_trusted() or _search_path_has_untrusted_importer(search_path):
+    if not _interpreter_import_runtime_is_trusted():
         _mark_shared_source_snapshot_unreusable()
         return None
 
@@ -4603,6 +4617,9 @@ def _find_standard_path_spec(module_name: str, search_path: list[str]) -> Module
         (SourcelessFileLoader, BYTECODE_SUFFIXES),
     )
     for entry in search_path:
+        if not _search_path_entry_uses_trusted_importer(entry):
+            _mark_shared_source_snapshot_unreusable()
+            return None
         try:
             zip_spec = zipimporter(entry).find_spec(module_name)
         except ImportError:
@@ -7651,7 +7668,7 @@ def _resolve_module_source(module_name: str) -> Path | None:
                 return loaded_source_path
         elif loaded_origin not in {"built-in", "frozen"}:
             return None
-    elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
+    elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or not _path_hooks_are_trusted():
         return None
 
     spec_origin = None
