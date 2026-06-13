@@ -387,3 +387,26 @@ def test_dependency_audit_runs_for_source_reachability_changes() -> None:
     assert "needs.changes.outputs.workflows == 'true'" in condition
     assert "needs.changes.outputs.python == 'true'" in condition
     assert "needs.changes.outputs.picklescan == 'true'" in condition
+
+
+def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
+    workflow = _load_workflow("test.yml")
+    jobs = _jobs(workflow)
+
+    coverage_job = jobs["coverage"]
+    assert isinstance(coverage_job, dict)
+    assert coverage_job["if"] == ("github.ref == 'refs/heads/main' || needs.changes.outputs.workflows == 'true'")
+    assert coverage_job["strategy"]["matrix"]["shard"] == [0, 1, 2, 3, 4]
+    coverage_steps = coverage_job["steps"]
+    assert isinstance(coverage_steps, list)
+    upload_step = _step_by_name(coverage_steps, "Upload coverage to Codecov")
+    assert upload_step["with"]["fail_ci_if_error"] is True
+
+    ci_success_job = jobs["ci-success"]
+    assert isinstance(ci_success_job, dict)
+    assert "coverage" in ci_success_job["needs"]
+    ci_success_steps = ci_success_job["steps"]
+    assert isinstance(ci_success_steps, list)
+    gate_script = _step_by_name(ci_success_steps, "Check if all jobs succeeded")["run"]
+    assert 'if [[ "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then' in gate_script
+    assert '[[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true' in gate_script

@@ -592,7 +592,7 @@ jobs:
         with:
           name: python-coverage-${{ matrix.shard }}
           files: ./coverage.xml
-          fail_ci_if_error: false
+          fail_ci_if_error: true
           verbose: true
 
   test-numpy-compatibility:
@@ -1074,8 +1074,8 @@ jobs:
     steps:
       - name: Check if all jobs succeeded
         run: |
-          # A job is considered successful if it either succeeded or was skipped
-          # (skipped means the job's conditions weren't met, which is fine)
+          # Most jobs may be skipped when their path conditions are not met.
+          # Jobs required for the current event are checked separately below.
           QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
           LINT_RESULT="${{ needs.lint.result }}"
           DEPENDENCY_AUDIT_RESULT="${{ needs.dependency-audit.result }}"
@@ -1127,10 +1127,15 @@ jobs:
           [[ "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$COVERAGE_RESULT" == "failure" || "$COVERAGE_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]] && FAILED=true
 
           # Conditional jobs: only fail if they should have run
+          # Coverage is mandatory on main and for workflow changes. Requiring
+          # exact success prevents a skipped shard matrix from passing the gate.
+          if [[ "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
+            [[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true
+          fi
+
           # License/lock checks run on main or when dependencies change
           if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
             [[ "$LICENSE_RESULT" == "failure" || "$LICENSE_RESULT" == "cancelled" ]] && FAILED=true
