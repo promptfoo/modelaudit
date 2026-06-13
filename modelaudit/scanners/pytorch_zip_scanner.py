@@ -208,6 +208,8 @@ _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
 _PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS = 10_000
+_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX = 2**63 - 1
+_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX_TEXT = str(_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX)
 _JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PYTORCH_ZIP_INTEGRITY_PREFIX_BYTES = 8 * 1024 * 1024
 _PYTORCH_ZIP_HASH_CHUNK_BYTES = 1024 * 1024
@@ -254,6 +256,7 @@ _PYTORCH_STORAGE_ITEM_SIZES = {
     "QInt8Storage": 1,
     "QUInt8Storage": 1,
     "ShortStorage": 2,
+    "UntypedStorage": 1,
 }
 _PYTORCH_STORAGE_REDACTED_BINPERSID_PREVIEW = re.compile(
     r"^tuple\(str_span\(len=7\), global:(?P<module>[A-Za-z_][A-Za-z0-9_.]*)\.(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
@@ -2570,6 +2573,20 @@ class PyTorchZipScanner(BaseScanner):
         value = field[1:-1]
         return None if "\\" in value else value
 
+    @staticmethod
+    def _parse_pytorch_storage_element_count_text(storage_size: str) -> int | None:
+        if not storage_size.isascii() or not storage_size.isdecimal():
+            return None
+        normalized = storage_size.lstrip("0") or "0"
+        if len(normalized) > len(_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX_TEXT):
+            return None
+        if (
+            len(normalized) == len(_PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX_TEXT)
+            and normalized > _PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX_TEXT
+        ):
+            return None
+        return int(normalized)
+
     @classmethod
     def _storage_ref_from_protocol0_persid_text(
         cls,
@@ -2597,8 +2614,8 @@ class PyTorchZipScanner(BaseScanner):
             return None
         if cls._quoted_protocol0_field_value(fields[3]) is None:
             return None
-        storage_size = fields[4]
-        if not storage_size.isascii() or not storage_size.isdecimal():
+        element_count = cls._parse_pytorch_storage_element_count_text(fields[4])
+        if element_count is None:
             return None
         return (
             storage_key,
@@ -2606,10 +2623,39 @@ class PyTorchZipScanner(BaseScanner):
                 module=module,
                 name=name,
                 location=cls._quoted_protocol0_field_value(fields[3]) or "",
-                element_count=int(storage_size),
+                element_count=element_count,
                 item_size=_PYTORCH_STORAGE_ITEM_SIZES.get(name),
             ),
         )
+
+    @classmethod
+    def _structural_storage_key_from_protocol0_persid_text(
+        cls,
+        pid_text: Any,
+        trusted_storage_keys: set[str] | None = None,
+    ) -> str | None:
+        text = cls._coerce_pickle_string_arg(pid_text)
+        if text is None:
+            return None
+        fields = cls._split_protocol0_persid_fields(text)
+        if fields is None or len(fields) < 4:
+            return None
+        if cls._quoted_protocol0_field_value(fields[0]) != "storage":
+            return None
+        storage_type_field = fields[1]
+        if not storage_type_field.startswith("<class '") or not storage_type_field.endswith("'>"):
+            return None
+        module, separator, name = storage_type_field[len("<class '") : -len("'>")].rpartition(".")
+        if not separator or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
+            return None
+        storage_key = cls._quoted_protocol0_field_value(fields[2])
+        if storage_key is None or not cls._is_ascii_decimal_digits(storage_key):
+            return None
+        if trusted_storage_keys is not None and storage_key not in trusted_storage_keys:
+            return None
+        if cls._quoted_protocol0_field_value(fields[3]) is None:
+            return None
+        return storage_key
 
     @classmethod
     def _storage_key_from_protocol0_persid_text(
@@ -2685,7 +2731,12 @@ class PyTorchZipScanner(BaseScanner):
             if cls._coerce_pickle_string_arg(pid[3]) is None:
                 return None
             storage_size = pid[4]
-            if not isinstance(storage_size, int) or isinstance(storage_size, bool) or storage_size < 0:
+            if (
+                not isinstance(storage_size, int)
+                or isinstance(storage_size, bool)
+                or storage_size < 0
+                or storage_size > _PYTORCH_STORAGE_TRUST_MAX_TENSOR_INDEX
+            ):
                 return None
             return (
                 storage_key,
@@ -2697,6 +2748,24 @@ class PyTorchZipScanner(BaseScanner):
                     item_size=_PYTORCH_STORAGE_ITEM_SIZES.get(storage_type.name),
                 ),
             )
+
+        def structural_storage_key_from_pid(pid: Any) -> str | None:
+            if not isinstance(pid, tuple) or len(pid) < 4:
+                return None
+            if pid[0] != "storage":
+                return None
+            storage_type = pid[1]
+            if not (
+                isinstance(storage_type, _PickleGlobalRef)
+                and (storage_type.module, storage_type.name) in _PYTORCH_STORAGE_GLOBALS
+            ):
+                return None
+            storage_key = cls._coerce_pickle_string_arg(pid[2])
+            if storage_key is None or not cls._is_ascii_decimal_digits(storage_key):
+                return None
+            if trusted_storage_keys is not None and storage_key not in trusted_storage_keys:
+                return None
+            return storage_key if cls._coerce_pickle_string_arg(pid[3]) is not None else None
 
         try:
             for opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(pickle_data), start=1):
@@ -2788,6 +2857,9 @@ class PyTorchZipScanner(BaseScanner):
                             all_persistent_ids_are_pytorch_storage = False
                         storage_refs_by_key[storage_key] = ref
                     else:
+                        structural_key = structural_storage_key_from_pid(pid)
+                        if structural_key is not None:
+                            referenced_keys.add(structural_key)
                         all_persistent_ids_are_pytorch_storage = False
                     stack.append(None)
                 elif opcode_name == "PERSID":
@@ -2800,6 +2872,12 @@ class PyTorchZipScanner(BaseScanner):
                             all_persistent_ids_are_pytorch_storage = False
                         storage_refs_by_key[storage_key] = ref
                     else:
+                        structural_key = cls._structural_storage_key_from_protocol0_persid_text(
+                            arg,
+                            trusted_storage_keys,
+                        )
+                        if structural_key is not None:
+                            referenced_keys.add(structural_key)
                         all_persistent_ids_are_pytorch_storage = False
                     stack.append(None)
                 else:
