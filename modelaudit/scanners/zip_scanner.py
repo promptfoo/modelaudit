@@ -13,6 +13,7 @@ from typing import Any, BinaryIO, ClassVar, cast
 
 from ..core_results import mark_operational_scan_error
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.file.detection import is_declared_text_content_filename
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
@@ -59,6 +60,7 @@ _ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_TOTAL = 64 * 1024 * 1024
 _ZIP_MAX_LOCAL_DESCRIPTOR_SEARCH_WORK = 1_000_000
 _ZIP_MAX_LOCAL_ENTRY_PADDING = 64 * 1024
 _ZIP_MAX_LOCAL_HEADER_CANDIDATES = 10000
+_ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH = 160
 _ZIP64_EOCD_LOCATOR_SIGNATURE = b"PK\x06\x07"
 _ZIP64_EOCD_LOCATOR_SIZE = 20
 _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
@@ -268,6 +270,28 @@ class ZipScanner(BaseScanner):
 
     def _is_content_only_member_entry(self, name: str) -> bool:
         return self._normalize_skip_entry_name(name) in self.content_only_member_entries
+
+    @staticmethod
+    def _archive_entry_basename(name: str) -> str:
+        return name.replace("\\", "/").rsplit("/", 1)[-1]
+
+    @staticmethod
+    def _safe_preserved_temp_basename(name: str) -> str:
+        if len(name) <= _ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH:
+            return name
+
+        stem, ext = os.path.splitext(name)
+        max_stem_length = max(1, _ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH - len(ext))
+        return f"{stem[:max_stem_length]}{ext}"
+
+    @classmethod
+    def _preserve_nested_routing_basename(cls, name: str) -> bool:
+        """Return True when nested scanner routing depends on the exact basename."""
+        basename = cls._archive_entry_basename(name).lower()
+        ext = os.path.splitext(basename)[1]
+        if ext in {".zip", ".npz", ".mar"}:
+            return True
+        return basename == ".env" or is_declared_text_content_filename(basename)
 
     def _is_known_unreadable_archive_entry(self, info: zipfile.ZipInfo) -> bool:
         return info.header_offset in self.known_unreadable_archive_entry_offsets
@@ -689,9 +713,9 @@ class ZipScanner(BaseScanner):
 
         descriptor_widths = {entry.uses_zip64_sizes or local_uses_zip64_sizes}
         local_zip64_data = cls._zip64_extra_field(extra)
-        if local_zip64_data is not None and len(local_zip64_data) >= 16:
-            # Python 3.10 can write zero local sizes with a ZIP64 extra field and
-            # still emit the 64-bit descriptor selected by force_zip64=True.
+        if local_zip64_data is not None:
+            # Python/PyTorch can write streamed members with zero local sizes and
+            # a partial ZIP64 extra field, then still emit the 64-bit descriptor.
             descriptor_widths.add(True)
         descriptor_size = 24 if True in descriptor_widths else 16
         try:
@@ -1555,6 +1579,30 @@ class ZipScanner(BaseScanner):
             raise zipfile.BadZipFile("ZIP archive is already closed")
         yield cast(BinaryIO, archive_fp)
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _open_member_temp_file(
+        suffix: str,
+        safe_name: str | None,
+        preserve_nested_routing_basename: bool,
+    ) -> Iterator[tuple[str, BinaryIO, str | None]]:
+        """Yield a writable temporary member path plus its optional parent directory."""
+        if preserve_nested_routing_basename:
+            tmp_dir = tempfile.mkdtemp()
+            try:
+                tmp_name = ZipScanner._safe_preserved_temp_basename(safe_name or "archive-member")
+                tmp_path = os.path.join(tmp_dir, tmp_name)
+                with open(tmp_path, "wb") as tmp:
+                    yield tmp_path, tmp, tmp_dir
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.rmdir(tmp_dir)
+                raise
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as named_tmp:
+            yield named_tmp.name, cast(BinaryIO, named_tmp), None
+
     def _scan_nested_archive_entry(self, path: str, nested_config: dict[str, Any]) -> ScanResult:
         """Dispatch a nested archive member through an injected callback or registry fallback."""
         nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
@@ -1945,47 +1993,74 @@ class ZipScanner(BaseScanner):
                     continue
 
                 # Extract and scan the file
+                tmp_dir: str | None = None
                 tmp_path: str | None = None
                 try:
                     max_entry_size = self._get_max_entry_size()
                     is_security_only_member = self._is_security_only_member_entry(name)
                     is_content_only_member = self._is_content_only_member_entry(name)
+                    is_mar_python_fallback = (
+                        archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member
+                    )
+                    preserve_nested_routing_basename = self._preserve_nested_routing_basename(name)
+                    safe_name: str | None = None
 
                     if is_content_only_member:
                         suffix = ""
-                    elif name.lower().endswith(".zip"):
-                        suffix = ".zip"
                     else:
-                        safe_name = re.sub(
+                        raw_safe_name = re.sub(
                             r"[^a-zA-Z0-9_.-]",
                             "_",
-                            os.path.basename(name),
+                            self._archive_entry_basename(name),
                         )
+                        safe_name = raw_safe_name if preserve_nested_routing_basename else raw_safe_name.strip("._")
+                        if not safe_name:
+                            safe_name = "archive-member"
+                        if is_mar_python_fallback:
+                            safe_name = f"member_{safe_name}"
+                            preserve_nested_routing_basename = False
                         suffix = f"_{safe_name}"
 
-                    try:
-                        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                            tmp_path = tmp.name
-                            total_size = 0
-                            with z.open(info) as entry:
-                                while True:
-                                    chunk = entry.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
-                                    if not chunk:
-                                        break
-                                    total_size += len(chunk)
-                                    if total_size > max_entry_size:
-                                        raise ValueError(
-                                            f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
-                                        )
-                                    if extracted_uncompressed_size + total_size > max_total_uncompressed_size:
-                                        raise ValueError(
-                                            "ZIP archive exceeds maximum total uncompressed size of "
-                                            f"{max_total_uncompressed_size} bytes",
-                                        )
-                                    tmp.write(chunk)
-                            extracted_uncompressed_size += total_size
+                    def copy_entry_to(
+                        tmp_file: BinaryIO,
+                        *,
+                        archive: zipfile.ZipFile = z,
+                        entry_info: zipfile.ZipInfo = info,
+                        entry_name: str = name,
+                        entry_size_limit: int = max_entry_size,
+                        total_size_before_entry: int = extracted_uncompressed_size,
+                        total_size_limit: int = max_total_uncompressed_size,
+                    ) -> int:
+                        copied_size = 0
+                        with archive.open(entry_info) as entry:
+                            while True:
+                                chunk = entry.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
+                                if not chunk:
+                                    break
+                                copied_size += len(chunk)
+                                if copied_size > entry_size_limit:
+                                    raise ValueError(
+                                        f"ZIP entry {entry_name} exceeds maximum size of {entry_size_limit} bytes",
+                                    )
+                                if total_size_before_entry + copied_size > total_size_limit:
+                                    raise ValueError(
+                                        "ZIP archive exceeds maximum total uncompressed size of "
+                                        f"{total_size_limit} bytes",
+                                    )
+                                tmp_file.write(chunk)
+                        return copied_size
 
-                        if archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member:
+                    try:
+                        with self._open_member_temp_file(
+                            suffix,
+                            safe_name,
+                            preserve_nested_routing_basename and not is_content_only_member,
+                        ) as (tmp_path, tmp, tmp_dir):
+                            total_size = copy_entry_to(tmp)
+
+                        extracted_uncompressed_size += total_size
+
+                        if is_mar_python_fallback:
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
                             if mar_python_result is not None:
                                 result.merge(mar_python_result)
@@ -2053,6 +2128,9 @@ class ZipScanner(BaseScanner):
                         if tmp_path is not None:
                             with contextlib.suppress(FileNotFoundError):
                                 os.unlink(tmp_path)
+                        if tmp_dir is not None:
+                            with contextlib.suppress(OSError):
+                                os.rmdir(tmp_dir)
 
                 except Exception as e:
                     scan_complete = False

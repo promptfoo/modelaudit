@@ -19,4 +19,4 @@ extension-module = ["pyo3/extension-module"]
 abi3 = ["pyo3/abi3-py310"]
 
 [dependencies]
-pyo3 = { version = "0.28.0" }
+pyo3 = { version = "0.29.0" }

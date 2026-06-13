@@ -38,9 +38,11 @@ from ..utils.file.detection import (
     ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
+    _is_malformed_sentencepiece_model_proto_candidate_file,
     detect_file_format,
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
@@ -87,6 +89,7 @@ _R_SERIALIZED_EXTENSIONS: frozenset[str] = frozenset({".rds", ".rda", ".rdata"})
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
+_SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON = "sentencepiece_model_proto_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _PICKLE_ROUTING_INCOMPLETE_REASON = "pickle_routing_incomplete"
@@ -437,6 +440,26 @@ def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
     )
     mark_inconclusive_scan_result(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
     mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_sentencepiece_model_proto_result(path: str) -> ScanResult:
+    """Fail closed when a nested SentencePiece-like protobuf fails ownership validation."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="SentencePiece ModelProto Routing",
+        passed=False,
+        message=(
+            "SentencePiece ModelProto routing was inconclusive because the payload "
+            "looked like a tokenizer protobuf but failed ownership validation"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
+    mark_operational_scan_error(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -1217,8 +1240,12 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     except (TypeError, ValueError):
         max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
     max_zip_directory_size = ZipScanner.central_directory_size_limit(raw_config)
+    malformed_sentencepiece_model_candidate = Path(
+        path
+    ).suffix.lower() == ".model" and _is_malformed_sentencepiece_model_proto_candidate_file(path)
     if (
-        (not is_safetensors_hdf5_overlap or hdf5_signature_offset in (None, 0))
+        not malformed_sentencepiece_model_candidate
+        and (not is_safetensors_hdf5_overlap or hdf5_signature_offset in (None, 0))
         and allows_zip_structure_analysis(scanner_selection, path)
         and ZipScanner.requires_preflight_result(
             path,
@@ -1415,6 +1442,11 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
 
         if trusted_content_format == XML_MODEL_INCONCLUSIVE_FORMAT:
             return with_safetensors_overlap(_make_incomplete_xml_model_result(path))
+        if (
+            routed_content_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+            or trusted_content_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+        ):
+            return with_safetensors_overlap(_make_incomplete_sentencepiece_model_proto_result(path))
         if routed_content_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
             return with_safetensors_overlap(_make_incomplete_protobuf_model_result(path))
         if trusted_content_format == PROTOBUF_MODEL_CANDIDATE_FORMAT and routed_content_format != "unknown":

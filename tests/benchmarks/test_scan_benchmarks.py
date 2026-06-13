@@ -8,6 +8,7 @@ import pytest
 
 from modelaudit.cache.cache_manager import reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.detectors.secrets import SecretsDetector
 from tests.helpers.file_creators import (
     create_malicious_pickle,
     create_mock_manifest,
@@ -264,3 +265,25 @@ def test_scan_warm_cached_repository_rescan(
 
     assert result.success is True
     assert result.files_scanned >= 3
+
+
+def test_rejected_basic_auth_candidates_scan_linearly(benchmark: Any) -> None:
+    detector = SecretsDetector()
+    text = " ".join(["Basic dXNlcjpwYXNz"] * 20_000)
+    benchmark.extra_info.update(
+        {
+            "workload": "rejected-basic-auth-candidates",
+            "bytes": len(text),
+            "files": 1,
+            "cache_state": "disabled",
+        }
+    )
+
+    findings = benchmark.pedantic(
+        lambda: detector.scan_text(text, context="README.md"),
+        iterations=1,
+        rounds=SCAN_ROUNDS,
+        warmup_rounds=WARMUP_ROUNDS,
+    )
+
+    assert not [finding for finding in findings if finding.get("secret_type") == "Basic Auth Credentials"]

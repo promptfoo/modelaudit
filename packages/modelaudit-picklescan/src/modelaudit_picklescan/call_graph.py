@@ -37,12 +37,16 @@ from importlib.util import MAGIC_NUMBER, cache_from_source, source_hash
 from pathlib import Path
 from types import (
     BuiltinFunctionType,
+    ClassMethodDescriptorType,
     CodeType,
     FunctionType,
     GetSetDescriptorType,
     MappingProxyType,
+    MemberDescriptorType,
+    MethodDescriptorType,
     MethodType,
     ModuleType,
+    WrapperDescriptorType,
 )
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
@@ -330,6 +334,13 @@ _IMPORT_RUNTIME_BUILTIN_NAMES = _import_runtime_builtin_names()
 _IMPORT_RUNTIME_BUILTINS_SNAPSHOT = (
     MappingProxyType(
         {name: _runtime_value_snapshot(_IMPORT_RUNTIME_BUILTINS[name]) for name in _IMPORT_RUNTIME_BUILTIN_NAMES}
+    )
+    if type(_IMPORT_RUNTIME_BUILTINS) is dict
+    else MappingProxyType({})
+)
+_IMPORT_RUNTIME_BUILTIN_VALUE_SNAPSHOTS = (
+    MappingProxyType(
+        {name: _runtime_value_snapshot(value) for name, value in _IMPORT_RUNTIME_BUILTINS.items() if type(name) is str}
     )
     if type(_IMPORT_RUNTIME_BUILTINS) is dict
     else MappingProxyType({})
@@ -681,9 +692,14 @@ def _loaded_reference_state_without_hooks(
     return True, value
 
 
+def _runtime_value_is_class(value: object) -> bool:
+    return type in type.__getattribute__(type(value), "__mro__")
+
+
 def _trusted_reference_executable_snapshot(value: object) -> _TrustedReferenceExecutableSnapshot:
     type_snapshots: tuple[tuple[type[object], Mapping[str, _TrustedExecutableValueSnapshot]], ...] = ()
-    if type(value) is type:
+    if _runtime_value_is_class(value):
+        class_ = cast(type[object], value)
         type_snapshots = tuple(
             (
                 base,
@@ -694,7 +710,7 @@ def _trusted_reference_executable_snapshot(value: object) -> _TrustedReferenceEx
                     }
                 ),
             )
-            for base in type.__getattribute__(value, "__mro__")
+            for base in type.__getattribute__(class_, "__mro__")
         )
     return _trusted_executable_value_snapshot(value), type_snapshots
 
@@ -718,10 +734,11 @@ def _executable_value_functions(value: object) -> tuple[FunctionType, ...]:
         return tuple(
             function for function in (value.fget, value.fset, value.fdel) if isinstance(function, FunctionType)
         )
-    if type(value) is type:
+    if _runtime_value_is_class(value):
+        class_ = cast(type[object], value)
         functions: list[FunctionType] = []
         for name in ("__new__", "__init__"):
-            for base in type.__getattribute__(value, "__mro__"):
+            for base in type.__getattribute__(class_, "__mro__"):
                 namespace = type.__getattribute__(base, "__dict__")
                 if name in namespace:
                     functions.extend(_executable_value_functions(namespace[name]))
@@ -1003,9 +1020,10 @@ def _trusted_reference_executable_matches_snapshot(
 ) -> bool:
     if not _trusted_executable_value_matches_snapshot(value, expected[0]):
         return False
-    if type(value) is not type:
+    if not _runtime_value_is_class(value):
         return not expected[1]
-    mro = type.__getattribute__(value, "__mro__")
+    class_ = cast(type[object], value)
+    mro = type.__getattribute__(class_, "__mro__")
     if len(mro) != len(expected[1]):
         return False
     for base, (expected_base, expected_namespace) in zip(mro, expected[1], strict=True):
@@ -1022,6 +1040,91 @@ def _trusted_reference_executable_matches_snapshot(
         ):
             return False
     return True
+
+
+_SOURCE_INDEPENDENT_DEFAULT_TYPES = frozenset(
+    {
+        type(None),
+        bool,
+        int,
+        float,
+        complex,
+        str,
+        bytes,
+        type(Ellipsis),
+        type(NotImplemented),
+    }
+)
+_MAX_SOURCE_INDEPENDENT_DEFAULT_DEPTH = 8
+
+
+def _source_independent_default_value(value: object, *, depth: int = 0) -> bool:
+    if depth > _MAX_SOURCE_INDEPENDENT_DEFAULT_DEPTH:
+        return False
+    if type(value) in _SOURCE_INDEPENDENT_DEFAULT_TYPES:
+        return True
+    if type(value) is tuple:
+        return all(_source_independent_default_value(item, depth=depth + 1) for item in value)
+    if type(value) is frozenset:
+        return all(_source_independent_default_value(item, depth=depth + 1) for item in value)
+    return False
+
+
+def _runtime_function_snapshot_is_source_independent(snapshot: _RuntimeValueSnapshot) -> bool:
+    if snapshot[1] is None:
+        return True
+    defaults = snapshot[3]
+    if defaults is not None and (
+        type(defaults) is not tuple or not all(_source_independent_default_value(default) for default in defaults)
+    ):
+        return False
+    keyword_defaults = snapshot[4]
+    if keyword_defaults is not None:
+        if type(keyword_defaults) is not dict:
+            return False
+        keyword_default_items = snapshot[5]
+        if len(keyword_defaults) != len(keyword_default_items):
+            return False
+        if any(
+            type(name) is not str or not _source_independent_default_value(value)
+            for name, value in keyword_default_items
+        ):
+            return False
+    return not snapshot[6]
+
+
+def _trusted_executable_value_runtime_dependencies_are_source_independent(
+    snapshot: _TrustedExecutableValueSnapshot,
+) -> bool:
+    if not snapshot[2] or not _runtime_function_snapshot_is_source_independent(snapshot[0]):
+        return False
+    if type(_IMPORT_RUNTIME_BUILTINS) is not dict:
+        return False
+    for function, _globals_namespace, global_snapshots, builtins_namespace, builtin_snapshots in snapshot[1]:
+        if not _runtime_function_snapshot_is_source_independent(_runtime_value_snapshot(function)):
+            return False
+        if global_snapshots:
+            return False
+        if builtins_namespace is not _IMPORT_RUNTIME_BUILTINS:
+            return False
+        for name, builtin_snapshot in builtin_snapshots:
+            expected = _IMPORT_RUNTIME_BUILTIN_VALUE_SNAPSHOTS.get(name)
+            if expected is None:
+                return False
+            if not _runtime_value_matches_snapshot(builtin_snapshot[0], expected):
+                return False
+            if not _runtime_value_matches_snapshot(_IMPORT_RUNTIME_BUILTINS[name], expected):
+                return False
+    return True
+
+
+def _trusted_reference_runtime_dependencies_are_source_independent(value: object) -> bool:
+    snapshot = _trusted_reference_executable_snapshot(value)
+    return _trusted_executable_value_runtime_dependencies_are_source_independent(snapshot[0]) and all(
+        _trusted_executable_value_runtime_dependencies_are_source_independent(member_snapshot)
+        for _base, namespace in snapshot[1]
+        for member_snapshot in namespace.values()
+    )
 
 
 def _trusted_class_namespace_addition_is_safe(name: str, value: object) -> bool:
@@ -1331,16 +1434,31 @@ _TRUSTED_LOADED_EXTENSION_EXPORT_OWNERS = MappingProxyType(
         ),
     }
 )
-_TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
-_TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = (
-    frozenset(
-        {
-            ("pathlib._local", "PurePath"),
-            ("pathlib._local", "PurePosixPath"),
-            ("pathlib._local", "PureWindowsPath"),
-        }
-    )
-    | _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
+_TRUSTED_FRAMEWORK_METADATA_REFERENCES = frozenset(
+    {
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("torch", "bfloat16"),
+        ("torch", "device"),
+        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+        ("transformers.training_args", "TrainingArguments"),
+    }
+)
+_TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES | _TRUSTED_FRAMEWORK_METADATA_REFERENCES
+_TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = frozenset(
+    {
+        ("pathlib._local", "PurePath"),
+        ("pathlib._local", "PurePosixPath"),
+        ("pathlib._local", "PureWindowsPath"),
+    }
 )
 # Canonical-looking specs in sys.modules are forgeable. Identity trust is
 # limited to interpreter modules already loaded when this module initializes.
@@ -1542,6 +1660,31 @@ _SHORT_SINK_SECONDARY_PRIORITY_TOKENS = ("exec", "system", "run")
 _CALLABLE_SINGLETON_ALIASES = {
     ("builtins", "help"): (("_sitebuiltins", "_Helper.__call__"),),
 }
+_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
+    {
+        "BFloat16Storage",
+        "BoolStorage",
+        "ByteStorage",
+        "CharStorage",
+        "ComplexDoubleStorage",
+        "ComplexFloatStorage",
+        "DoubleStorage",
+        "FloatStorage",
+        "HalfStorage",
+        "IntStorage",
+        "LongStorage",
+        "QInt32Storage",
+        "QInt8Storage",
+        "QUInt8Storage",
+        "QUInt4x2Storage",
+        "QUInt2x4Storage",
+        "ShortStorage",
+        "UntypedStorage",
+    }
+)
+_PYTORCH_STORAGE_GLOBALS = frozenset(
+    (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
+)
 _TORCH_EXTENSION_GLOBALS = frozenset(
     {
         "Size",
@@ -1677,6 +1820,7 @@ class _ModuleSourceContext:
 class _ClassSourceContext:
     module_name: str
     class_node: ast.ClassDef
+    module_statements: tuple[ast.stmt, ...]
     aliases: dict[str, str]
     local_defs: set[str]
     local_class_nodes: dict[str, ast.ClassDef]
@@ -2009,6 +2153,21 @@ def find_analyzed_callable_call_graph_global_positions(
     return frozenset(positions)
 
 
+def class_static_attribute_lookup_is_proven_source_backed(module: str, name: str, attribute: str) -> bool:
+    """Return whether a static class attribute lookup is source-backed as a plain method."""
+    class_target = _resolve_class_target(f"{module}.{name}")
+    if class_target is None:
+        return False
+    context = _source_class_context(class_target)
+    if context is None:
+        return False
+    return (
+        _class_lookup_has_source_backed_plain_metaclass(context)
+        and _class_has_plain_local_method(context.class_node, attribute)
+        and not _class_attribute_rebound_after_definition(context, attribute)
+    )
+
+
 def module_initialization_is_proven_inert(module_name: str) -> bool:
     """Return whether importing a source-backed module has no executable initialization."""
     parts = _bounded_module_name_parts(module_name)
@@ -2023,6 +2182,23 @@ def module_initialization_is_proven_inert(module_name: str) -> bool:
     return True
 
 
+def module_is_loaded_without_import_hooks(module_name: str) -> bool:
+    """Return whether a module is already loaded without invoking import hooks."""
+    state = _current_loaded_interpreter_module_state(module_name)
+    if state[0]:
+        _track_loaded_interpreter_module_state(module_name, state)
+    return state[0]
+
+
+def import_only_module_load_is_proven_safe_for_invocation(module_name: str) -> bool:
+    """Return whether invoking an import-only reference can safely resolve its module."""
+    return (
+        _trusted_module_origin_kind(module_name) == "stdlib"
+        or module_is_loaded_without_import_hooks(module_name)
+        or module_initialization_is_proven_inert(module_name)
+    )
+
+
 def _module_source_context_initialization_is_proven_inert(context: _ModuleSourceContext) -> bool:
     guarded_names = {"__getattr__", *_IMPORT_AFFECTING_MODULE_NAMES}
     return not any(
@@ -2032,7 +2208,13 @@ def _module_source_context_initialization_is_proven_inert(context: _ModuleSource
     ) and all(_module_initialization_statement_is_inert(statement) for statement in context.module_statements)
 
 
-def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool:
+def import_only_reference_is_proven_trusted(
+    module_name: str,
+    name: str,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
     """Return whether a known-safe reference resolves from a trusted installation path."""
     if _legacy_pickle_compat_reference_is_trusted(module_name, name):
         return True
@@ -2054,8 +2236,28 @@ def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool
         origin_kind in {"stdlib", "site_packages"}
         and _interpreter_module_origin_without_import_hooks(module_name) is None
     ):
-        return _loaded_trusted_reference_matches_baseline(module_name, name)
+        return _loaded_trusted_reference_matches_baseline(
+            module_name,
+            name,
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+            pickle_invokes_metaclass_call=pickle_invokes_metaclass_call,
+        )
     return True
+
+
+def import_only_reference_is_proven_trusted_for_pickle_invocation(
+    module_name: str,
+    name: str,
+    reference: Mapping[str, object],
+) -> bool:
+    """Return whether a trusted import reference is safe for one pickle invocation."""
+    entrypoint_methods, invokes_metaclass_call = _pickle_owner_proof_for_reference(reference)
+    return import_only_reference_is_proven_trusted(
+        module_name,
+        name,
+        pickle_entrypoint_methods=entrypoint_methods,
+        pickle_invokes_metaclass_call=invokes_metaclass_call,
+    )
 
 
 def import_only_module_requires_origin_review(module_name: str, name: str) -> bool:
@@ -2191,7 +2393,13 @@ def _interpreter_reference_is_trusted(module_name: str, name: str) -> bool:
     return state[0] and name in trusted and state[1] is trusted[name]
 
 
-def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> bool:
+def _loaded_trusted_reference_matches_baseline(
+    module_name: str,
+    name: str,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
     module_state = _current_loaded_interpreter_module_state(module_name)
     reference_state = _current_loaded_interpreter_reference_state(module_name, name)
     _track_loaded_interpreter_module_state(module_name, module_state)
@@ -2202,6 +2410,18 @@ def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> b
         return False
 
     expected = _TRUSTED_LOADED_REFERENCE_BASELINES.get((module_name, name))
+    origin_kind = _trusted_module_origin_kind(module_name)
+    if origin_kind == "site_packages":
+        if not _loaded_site_package_reference_owner_matches(
+            module_name,
+            name,
+            reference_state[1],
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+            pickle_invokes_metaclass_call=pickle_invokes_metaclass_call,
+        ):
+            return False
+        if expected is None:
+            return True
     if expected is None:
         return False
     return (
@@ -2209,6 +2429,451 @@ def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> b
         and _loaded_interpreter_reference_states_match(reference_state, expected[1])
         and _trusted_reference_executable_matches_snapshot(reference_state[1], expected[2])
     )
+
+
+def _loaded_site_package_reference_owner_matches(
+    module_name: str,
+    name: str,
+    value: object,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
+    if _loaded_extension_callable_bypasses_module_getattr(module_name, name):
+        return True
+    if type(value) is BuiltinFunctionType:
+        return False
+    if isinstance(value, FunctionType):
+        if value.__code__.co_name != _reference_leaf_name(name):
+            return False
+        return _function_owner_matches_trusted_source(
+            value,
+            expected_module=module_name,
+        ) and _trusted_reference_runtime_dependencies_are_source_independent(value)
+    if _runtime_value_is_class(value):
+        class_ = cast(type[object], value)
+        class_module = type.__getattribute__(class_, "__module__")
+        class_name = type.__getattribute__(class_, "__name__")
+        if (
+            type(class_module) is not str
+            or class_module != module_name
+            or type(class_name) is not str
+            or class_name != _reference_leaf_name(name)
+            or _trusted_python_module_source_path(class_module) is None
+        ):
+            return False
+        return _class_pickle_owner_matches_trusted_source(
+            class_,
+            expected_module=module_name,
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+            pickle_invokes_metaclass_call=pickle_invokes_metaclass_call,
+        ) and _class_pickle_runtime_dependencies_are_source_independent(
+            class_,
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+            pickle_invokes_metaclass_call=pickle_invokes_metaclass_call,
+        )
+    functions = _pickle_executable_functions(value)
+    if functions:
+        return all(
+            _function_owner_matches_trusted_source(function, expected_module=module_name) for function in functions
+        ) and _trusted_reference_runtime_dependencies_are_source_independent(value)
+    if callable(value):
+        return False
+    return _loaded_site_package_instance_owner_matches_trusted_source(
+        value,
+        expected_module=module_name,
+        expected_name=name,
+        pickle_entrypoint_methods=pickle_entrypoint_methods,
+    )
+
+
+def _reference_leaf_name(name: str) -> str:
+    return name.rpartition(".")[2]
+
+
+def _loaded_site_package_instance_owner_matches_trusted_source(
+    value: object,
+    *,
+    expected_module: str,
+    expected_name: str,
+    pickle_entrypoint_methods: tuple[str, ...] | None,
+) -> bool:
+    if pickle_entrypoint_methods is None:
+        return True
+    entrypoint_methods = _class_pickle_entrypoint_methods(pickle_entrypoint_methods)
+    if not any(method in _PICKLE_BUILD_ENTRYPOINT_METHODS for method in entrypoint_methods):
+        return True
+    class_ = type(value)
+    class_module = type.__getattribute__(class_, "__module__")
+    class_name = type.__getattribute__(class_, "__name__")
+    if (
+        type(class_module) is not str
+        or class_module != expected_module
+        or type(class_name) is not str
+        or class_name != _reference_leaf_name(expected_name)
+        or _trusted_python_module_source_path(class_module) is None
+    ):
+        return False
+    return _class_pickle_owner_matches_trusted_source(
+        class_,
+        expected_module=expected_module,
+        pickle_entrypoint_methods=entrypoint_methods,
+        pickle_invokes_metaclass_call=False,
+    ) and _class_pickle_runtime_dependencies_are_source_independent(
+        class_,
+        pickle_entrypoint_methods=entrypoint_methods,
+        pickle_invokes_metaclass_call=False,
+    )
+
+
+def _pickle_owner_proof_for_reference(
+    reference: Mapping[str, object],
+) -> tuple[tuple[str, ...] | None, bool | None]:
+    opcode = str(reference.get("opcode", ""))
+    if opcode in _NEWOBJ_OPCODES:
+        if not isinstance(reference.get("positional_arg_count"), int):
+            return (*_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS, "__new__"), False
+        return ("__new__",), False
+    if opcode in _BUILD_OPCODES:
+        methods: tuple[str, ...] = _PICKLE_BUILD_ENTRYPOINT_METHODS
+        if reference.get("build_uses_slot_state") is False:
+            methods = tuple(method for method in methods if method != "__setattr__")
+        return methods, False
+    if opcode in _CONSTRUCTOR_OPCODES:
+        return _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS, True
+    return None, None
+
+
+def _class_pickle_owner_matches_trusted_source(
+    class_: type[object],
+    *,
+    expected_module: str,
+    pickle_entrypoint_methods: tuple[str, ...] | None,
+    pickle_invokes_metaclass_call: bool | None,
+) -> bool:
+    invokes_metaclass_call = True if pickle_invokes_metaclass_call is None else pickle_invokes_metaclass_call
+    return (
+        (not invokes_metaclass_call or _class_metaclass_call_matches_trusted_source(class_))
+        and _class_pickle_executable_members_match_trusted_source(
+            class_,
+            expected_module=expected_module,
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+        )
+        and (
+            "__setattr__" not in _class_pickle_entrypoint_methods(pickle_entrypoint_methods)
+            or _class_pickle_data_descriptors_match_trusted_source(class_, expected_module=expected_module)
+        )
+    )
+
+
+def _class_pickle_entrypoint_methods(pickle_entrypoint_methods: tuple[str, ...] | None) -> tuple[str, ...]:
+    return pickle_entrypoint_methods or _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS
+
+
+def _class_pickle_executable_members_match_trusted_source(
+    class_: type[object],
+    *,
+    expected_module: str,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+) -> bool:
+    entrypoint_methods = _class_pickle_entrypoint_methods(pickle_entrypoint_methods)
+    for base in type.__getattribute__(class_, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        for member_name in entrypoint_methods:
+            if member_name in namespace and not _pickle_executable_member_matches_trusted_source(
+                base,
+                member_name,
+                namespace[member_name],
+                expected_module=expected_module,
+            ):
+                return False
+    return True
+
+
+def _class_metaclass_call_matches_trusted_source(class_: type[object]) -> bool:
+    metaclass = type(class_)
+    for base in type.__getattribute__(metaclass, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if "__call__" in namespace:
+            member = namespace["__call__"]
+            return _pickle_executable_member_matches_trusted_stdlib_source(base, "__call__", member)
+    return True
+
+
+def _class_pickle_runtime_dependencies_are_source_independent(
+    class_: type[object],
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None,
+    pickle_invokes_metaclass_call: bool | None,
+) -> bool:
+    entrypoint_methods = _class_pickle_entrypoint_methods(pickle_entrypoint_methods)
+    invokes_metaclass_call = True if pickle_invokes_metaclass_call is None else pickle_invokes_metaclass_call
+    snapshots: list[_TrustedExecutableValueSnapshot] = []
+    if invokes_metaclass_call:
+        metaclass = type(class_)
+        for base in type.__getattribute__(metaclass, "__mro__"):
+            namespace = type.__getattribute__(base, "__dict__")
+            if "__call__" in namespace:
+                member = namespace["__call__"]
+                if not _pickle_executable_member_matches_trusted_stdlib_source(base, "__call__", member):
+                    snapshots.append(_trusted_executable_value_snapshot(member))
+                break
+    for base in type.__getattribute__(class_, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        snapshots.extend(
+            _trusted_executable_value_snapshot(namespace[member_name])
+            for member_name in entrypoint_methods
+            if member_name in namespace
+            and not _pickle_executable_member_matches_trusted_stdlib_source(base, member_name, namespace[member_name])
+        )
+        if "__setattr__" in entrypoint_methods:
+            snapshots.extend(
+                _trusted_executable_value_snapshot(member)
+                for member in namespace.values()
+                if _runtime_type_member_is_data_descriptor(member)
+            )
+    return all(
+        _trusted_executable_value_runtime_dependencies_are_source_independent(snapshot) for snapshot in snapshots
+    )
+
+
+def _class_pickle_data_descriptors_match_trusted_source(class_: type[object], *, expected_module: str) -> bool:
+    for base in type.__getattribute__(class_, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        for member_name, member in namespace.items():
+            if _runtime_type_member_is_data_descriptor(member) and not _data_descriptor_matches_trusted_source(
+                base,
+                member_name,
+                member,
+                expected_module=expected_module,
+            ):
+                return False
+    return True
+
+
+def _data_descriptor_matches_trusted_source(
+    owner: type[object],
+    name: str,
+    member: object,
+    *,
+    expected_module: str,
+) -> bool:
+    if not _pickle_executable_member_matches_trusted_source(owner, name, member, expected_module=expected_module):
+        return False
+    descriptor_type = type(member)
+    for method_name in ("__set__", "__delete__"):
+        for base in type.__getattribute__(descriptor_type, "__mro__"):
+            namespace = type.__getattribute__(base, "__dict__")
+            if method_name in namespace:
+                if not _pickle_executable_member_matches_trusted_source(
+                    base,
+                    method_name,
+                    namespace[method_name],
+                    expected_module=expected_module,
+                ):
+                    return False
+                break
+    return True
+
+
+def _runtime_type_member_is_data_descriptor(value: object) -> bool:
+    return any(
+        "__set__" in type.__getattribute__(class_, "__dict__")
+        or "__delete__" in type.__getattribute__(class_, "__dict__")
+        for class_ in type.__getattribute__(type(value), "__mro__")
+    )
+
+
+def _pickle_executable_member_matches_trusted_source(
+    owner: type[object],
+    name: str,
+    member: object,
+    *,
+    expected_module: str,
+) -> bool:
+    if isinstance(member, classmethod | staticmethod):
+        member = member.__func__
+    if isinstance(member, FunctionType):
+        return _function_owner_matches_trusted_source(
+            member,
+            expected_module=expected_module,
+        ) or _function_owner_matches_trusted_stdlib_source(member)
+    if type(member) is property:
+        functions = tuple(
+            function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
+        )
+        return bool(functions) and all(
+            _function_owner_matches_trusted_source(function, expected_module=expected_module)
+            or _function_owner_matches_trusted_stdlib_source(function)
+            for function in functions
+        )
+    if _pickle_executable_member_matches_trusted_stdlib_source(owner, name, member):
+        return True
+    if _trusted_owner_bound_builtin_descriptor_matches(owner, name, member):
+        return True
+    return not _runtime_type_member_is_executable(member)
+
+
+def _pickle_executable_member_matches_trusted_stdlib_source(
+    owner: type[object],
+    name: str,
+    member: object,
+) -> bool:
+    if isinstance(member, classmethod | staticmethod):
+        member = member.__func__
+    if isinstance(member, FunctionType):
+        return _function_owner_matches_trusted_stdlib_source(member)
+    if type(member) is property:
+        functions = tuple(
+            function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
+        )
+        return bool(functions) and all(
+            _function_owner_matches_trusted_stdlib_source(function) for function in functions
+        )
+    if _trusted_owner_bound_builtin_descriptor_matches(owner, name, member):
+        return _trusted_runtime_stdlib_class_owner(owner)
+    return not _runtime_type_member_is_executable(member)
+
+
+def _trusted_owner_bound_builtin_descriptor_matches(owner: type[object], name: str, member: object) -> bool:
+    member_type = type(member)
+    if member_type is BuiltinFunctionType:
+        try:
+            member_name = BuiltinFunctionType.__getattribute__(member, "__name__")
+            bound_owner = BuiltinFunctionType.__getattribute__(member, "__self__")
+        except AttributeError:
+            return False
+        return member_name == name and bound_owner is owner and _trusted_runtime_class_owner(owner)
+    if member_type in {
+        ClassMethodDescriptorType,
+        GetSetDescriptorType,
+        MemberDescriptorType,
+        MethodDescriptorType,
+        WrapperDescriptorType,
+    }:
+        try:
+            member_name = member_type.__getattribute__(member, "__name__")
+            bound_owner = member_type.__getattribute__(member, "__objclass__")
+        except AttributeError:
+            return False
+        return member_name == name and bound_owner is owner and _trusted_runtime_class_owner(owner)
+    return False
+
+
+def _trusted_runtime_class_owner(owner: type[object]) -> bool:
+    module_name = type.__getattribute__(owner, "__module__")
+    return type(module_name) is str and (
+        module_name == "builtins" or _trusted_module_origin_kind(module_name) in {"stdlib", "site_packages"}
+    )
+
+
+def _trusted_runtime_stdlib_class_owner(owner: type[object]) -> bool:
+    module_name = type.__getattribute__(owner, "__module__")
+    return type(module_name) is str and (
+        module_name == "builtins" or _trusted_module_origin_kind(module_name) == "stdlib"
+    )
+
+
+def _pickle_executable_functions(value: object) -> tuple[FunctionType, ...]:
+    functions: list[FunctionType] = []
+
+    def add_functions(member: object) -> None:
+        if isinstance(member, classmethod | staticmethod):
+            member = member.__func__
+        if isinstance(member, FunctionType):
+            functions.append(member)
+            return
+        if isinstance(member, property):
+            functions.extend(
+                function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
+            )
+
+    add_functions(value)
+    if _runtime_value_is_class(value):
+        class_ = cast(type[object], value)
+        for base in type.__getattribute__(class_, "__mro__"):
+            namespace = type.__getattribute__(base, "__dict__")
+            for member_name in (
+                "__new__",
+                "__init__",
+                "__getattribute__",
+                "__getattr__",
+                "__setstate__",
+                "__setattr__",
+            ):
+                if member_name in namespace:
+                    add_functions(namespace[member_name])
+    return tuple(dict.fromkeys(functions))
+
+
+def _function_owner_matches_trusted_source(function: FunctionType, *, expected_module: str) -> bool:
+    globals_namespace = function.__globals__
+    if type(globals_namespace) is not dict:
+        return False
+    owner_module = globals_namespace.get("__name__")
+    if type(owner_module) is not str or owner_module != expected_module:
+        return False
+    source_path = _trusted_python_module_source_path(owner_module)
+    if source_path is None:
+        return False
+    try:
+        code_path = Path(function.__code__.co_filename).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+
+
+def _function_owner_matches_trusted_stdlib_source(function: FunctionType) -> bool:
+    globals_namespace = function.__globals__
+    if type(globals_namespace) is not dict:
+        return False
+    owner_module = globals_namespace.get("__name__")
+    if type(owner_module) is not str or _trusted_module_origin_kind(owner_module) != "stdlib":
+        return False
+    source_path = _trusted_python_module_source_path(owner_module)
+    if source_path is None:
+        return False
+    try:
+        code_path = Path(function.__code__.co_filename).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+
+
+def _function_code_matches_trusted_source(function: FunctionType, source_path: Path) -> bool:
+    code = function.__code__
+    return any(candidate == code for candidate in _trusted_source_code_objects(str(source_path)))
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=1024)
+def _trusted_source_code_objects(source_path: str) -> tuple[CodeType, ...]:
+    path = Path(source_path)
+    try:
+        source = _read_bounded_source_text(path)
+        module_code = compile(source, source_path, "exec", dont_inherit=True, optimize=sys.flags.optimize)
+    except Exception:
+        return ()
+    return tuple(_iter_code_objects(module_code))
+
+
+def _iter_code_objects(code: CodeType) -> Iterator[CodeType]:
+    yield code
+    for constant in code.co_consts:
+        if isinstance(constant, CodeType):
+            yield from _iter_code_objects(constant)
+
+
+def _trusted_python_module_source_path(module_name: str) -> Path | None:
+    if _trusted_module_origin_kind(module_name) not in {"stdlib", "site_packages"}:
+        return None
+    source_path = _loaded_module_source_path(module_name) or _current_module_source_path(module_name)
+    if source_path is None:
+        return None
+    try:
+        return Path(source_path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _interpreter_module_resolution_is_trusted(module_name: str) -> bool | None:
@@ -2651,10 +3316,13 @@ def _callable_singleton_aliases(module: str, name: str) -> tuple[tuple[str, str]
 
 
 def _is_pytorch_storage_persistent_id_reference(item: Mapping[str, object]) -> bool:
+    module = item.get("module")
+    name = item.get("name")
     return (
         item.get("pytorch_storage_persistent_id") is True
-        and item.get("module") == "torch"
-        and str(item.get("name", "")).endswith("Storage")
+        and type(module) is str
+        and type(name) is str
+        and (module, name) in _PYTORCH_STORAGE_GLOBALS
     )
 
 
@@ -4844,6 +5512,7 @@ def _collect_local_class_entrypoints(
                 aliases,
                 local_defs,
                 local_class_nodes,
+                statement_tuple,
             )
         )
         entrypoints = tuple(
@@ -4869,12 +5538,225 @@ def _class_method_nodes(class_node: ast.ClassDef) -> dict[str, ast.FunctionDef |
     }
 
 
+def _class_definition_has_dynamic_lookup_context(class_node: ast.ClassDef) -> bool:
+    return bool(class_node.decorator_list) or bool(class_node.keywords)
+
+
+def _class_has_plain_local_method(class_node: ast.ClassDef, method_name: str) -> bool:
+    plain_method_count = 0
+    for child in class_node.body:
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) and child.name == method_name:
+            if child.decorator_list:
+                return False
+            plain_method_count += 1
+            continue
+        if _class_body_statement_or_nested_statement_binds_name(child, method_name):
+            return False
+    return plain_method_count == 1
+
+
+def _class_body_statement_or_nested_statement_binds_name(statement: ast.stmt, name: str) -> bool:
+    return any(
+        _class_body_statement_binds_name(candidate, name) for candidate in _definition_scope_statements((statement,))
+    )
+
+
+def _class_lookup_has_source_backed_plain_metaclass(
+    context: _ClassSourceContext,
+    visited: frozenset[str] = frozenset(),
+) -> bool:
+    class_key = f"{context.module_name}.{context.class_node.name}"
+    if class_key in visited:
+        return True
+    if _class_definition_has_dynamic_lookup_context(context.class_node):
+        return False
+    next_visited = visited | {class_key}
+    base_targets = _class_base_targets_for_static_lookup(
+        context.class_node, context.module_name, context.aliases, context.local_defs
+    )
+    if base_targets is None:
+        return False
+    for base in base_targets:
+        base_context = _class_source_context_for_target(
+            base,
+            context.module_name,
+            context.aliases,
+            context.local_defs,
+            context.local_class_nodes,
+            context.module_statements,
+        )
+        if base_context is None or not _class_lookup_has_source_backed_plain_metaclass(base_context, next_visited):
+            return False
+    return True
+
+
+def _class_base_targets_for_static_lookup(
+    class_node: ast.ClassDef,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+) -> tuple[str, ...] | None:
+    targets: list[str] = []
+    for base in class_node.bases:
+        resolved = _resolve_expr(base, module_name, aliases, local_defs)
+        if resolved in {"object", "builtins.object"}:
+            continue
+        if resolved is None or "." not in resolved:
+            return None
+        targets.append(resolved)
+    return tuple(targets)
+
+
+def _class_body_statement_binds_name(statement: ast.stmt, name: str) -> bool:
+    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        return statement.name == name
+    if isinstance(statement, ast.Import):
+        return any((alias.asname or alias.name.split(".")[0]) == name for alias in statement.names)
+    if isinstance(statement, ast.ImportFrom):
+        return any((alias.asname or alias.name) == name for alias in statement.names)
+    if isinstance(statement, ast.Assign):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    if isinstance(statement, ast.AnnAssign | ast.AugAssign):
+        return _assignment_target_binds_name(statement.target, name)
+    if isinstance(statement, ast.Delete):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    return False
+
+
+def _class_attribute_rebound_after_definition(context: _ClassSourceContext, attribute: str) -> bool:
+    class_aliases = {context.class_node.name}
+    seen_class_definition = False
+    for statement in context.module_statements:
+        if statement is context.class_node:
+            seen_class_definition = True
+            continue
+        if not seen_class_definition:
+            continue
+        for candidate in _definition_scope_statements((statement,)):
+            if _statement_rebinds_name(candidate, context.class_node.name):
+                return True
+            if _statement_writes_class_attribute(candidate, class_aliases, attribute):
+                return True
+            class_aliases.update(_statement_class_alias_targets(candidate, class_aliases))
+        if _statement_contains_runtime_call(statement):
+            return True
+    return False
+
+
+def _statement_rebinds_name(statement: ast.stmt, name: str) -> bool:
+    if isinstance(statement, ast.Assign):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    if isinstance(statement, ast.AnnAssign | ast.AugAssign):
+        return _assignment_target_binds_name(statement.target, name)
+    if isinstance(statement, ast.Delete):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    if isinstance(statement, ast.For | ast.AsyncFor):
+        return _assignment_target_binds_name(statement.target, name)
+    if isinstance(statement, ast.With | ast.AsyncWith):
+        return any(
+            item.optional_vars is not None and _assignment_target_binds_name(item.optional_vars, name)
+            for item in statement.items
+        )
+    if isinstance(statement, ast.ExceptHandler):
+        return statement.name == name
+    return False
+
+
+def _statement_class_alias_targets(statement: ast.stmt, class_aliases: set[str]) -> set[str]:
+    if not isinstance(statement, ast.Assign | ast.AnnAssign) or statement.value is None:
+        return set()
+    targets = statement.targets if isinstance(statement, ast.Assign) else (statement.target,)
+    aliases: set[str] = set()
+    for target in targets:
+        aliases.update(_class_alias_targets_from_assignment(target, statement.value, class_aliases))
+    return aliases
+
+
+def _class_alias_targets_from_assignment(
+    target: ast.AST,
+    value: ast.AST,
+    class_aliases: set[str],
+) -> set[str]:
+    if isinstance(value, ast.Name) and value.id in class_aliases:
+        return _assignment_target_names(target)
+    if (
+        isinstance(target, ast.Tuple | ast.List)
+        and isinstance(value, ast.Tuple | ast.List)
+        and len(target.elts) == len(value.elts)
+    ):
+        aliases: set[str] = set()
+        for nested_target, nested_value in zip(target.elts, value.elts, strict=True):
+            aliases.update(_class_alias_targets_from_assignment(nested_target, nested_value, class_aliases))
+        return aliases
+    return set()
+
+
+def _statement_writes_class_attribute(statement: ast.stmt, class_aliases: set[str], attribute: str) -> bool:
+    if isinstance(statement, ast.Assign):
+        return any(_target_writes_class_attribute(target, class_aliases, attribute) for target in statement.targets)
+    if isinstance(statement, ast.AnnAssign | ast.AugAssign):
+        return _target_writes_class_attribute(statement.target, class_aliases, attribute)
+    if isinstance(statement, ast.Delete):
+        return any(_target_writes_class_attribute(target, class_aliases, attribute) for target in statement.targets)
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+        return _call_may_set_class_attribute(statement.value, class_aliases, attribute)
+    return False
+
+
+def _target_writes_class_attribute(target: ast.AST, class_aliases: set[str], attribute: str) -> bool:
+    return (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id in class_aliases
+        and target.attr == attribute
+    )
+
+
+def _call_may_set_class_attribute(call: ast.Call, class_aliases: set[str], attribute: str) -> bool:
+    if not _is_setattr_like_call(call.func) or len(call.args) < 2:
+        return False
+    receiver, name_arg = call.args[0], call.args[1]
+    if not isinstance(receiver, ast.Name) or receiver.id not in class_aliases:
+        return False
+    return not isinstance(name_arg, ast.Constant) or name_arg.value == attribute
+
+
+def _is_setattr_like_call(func: ast.AST) -> bool:
+    if isinstance(func, ast.Name):
+        return func.id == "setattr"
+    if isinstance(func, ast.Attribute):
+        return func.attr in {"setattr", "__setattr__"}
+    return False
+
+
+def _statement_contains_runtime_call(statement: ast.stmt) -> bool:
+    class RuntimeCallVisitor(ast.NodeVisitor):
+        found = False
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return None
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return None
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return None
+
+        def visit_Call(self, node: ast.Call) -> None:
+            self.found = True
+
+    visitor = RuntimeCallVisitor()
+    visitor.visit(statement)
+    return visitor.found
+
+
 def _inherited_class_methods(
     class_node: ast.ClassDef,
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
     local_class_nodes: dict[str, ast.ClassDef],
+    module_statements: tuple[ast.stmt, ...],
 ) -> dict[str, _InheritedClassMethod]:
     inherited: dict[str, _InheritedClassMethod] = {}
     direct_method_names = set(_class_method_nodes(class_node))
@@ -4909,6 +5791,7 @@ def _inherited_class_methods(
                 context.aliases,
                 context.local_defs,
                 context.local_class_nodes,
+                context.module_statements,
             )
             if nested_context is not None:
                 visit_base(nested_context)
@@ -4920,6 +5803,7 @@ def _inherited_class_methods(
             aliases,
             local_defs,
             local_class_nodes,
+            module_statements,
         )
         if base_context is not None:
             visit_base(base_context)
@@ -4932,12 +5816,14 @@ def _class_source_context_for_target(
     aliases: dict[str, str],
     local_defs: set[str],
     local_class_nodes: dict[str, ast.ClassDef],
+    module_statements: tuple[ast.stmt, ...],
 ) -> _ClassSourceContext | None:
     local_class_node = _local_class_node_from_target(class_target, module_name, local_class_nodes)
     if local_class_node is not None:
         return _ClassSourceContext(
             module_name=module_name,
             class_node=local_class_node,
+            module_statements=module_statements,
             aliases=aliases,
             local_defs=local_defs,
             local_class_nodes=local_class_nodes,
@@ -4990,6 +5876,7 @@ def _inherited_source_function_context(
         aliases,
         local_defs,
         _local_class_nodes(module_statements),
+        tuple(module_statements),
     ).get(method_name)
     if inherited_method is None:
         return None
@@ -5023,6 +5910,7 @@ def _source_class_context(class_name: str) -> _ClassSourceContext | None:
     return _ClassSourceContext(
         module_name=module_name,
         class_node=class_node,
+        module_statements=module_statements,
         aliases=aliases,
         local_defs=local_defs,
         local_class_nodes=_local_class_nodes(module_statements),
@@ -5895,6 +6783,7 @@ def _collect_function_calls(
                 aliases,
                 local_defs,
                 local_class_nodes,
+                statement_tuple,
             ).items():
                 function_name = f"{module_name}.{statement.name}.{method_name}"
                 if function_name in calls_by_function:

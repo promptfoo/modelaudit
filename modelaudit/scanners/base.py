@@ -193,6 +193,26 @@ class BaseScanner(ABC):
     supported_extensions: ClassVar[list[str]] = []
     default_max_file_read_size: ClassVar[int] = DEFAULT_MAX_FILE_READ_SIZE
 
+    @classmethod
+    def directory_owner_source_in_scope(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Return whether a directory-owner scan can read this regular file."""
+        return bool(relative_parts)
+
+    @classmethod
+    def directory_owner_directory_in_scope(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Return whether a directory-owner scan can inspect this directory entry."""
+        return bool(relative_parts)
+
+    @classmethod
+    def directory_owner_should_descend_into_directory(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Return whether a directory-owner namespace snapshot should descend into this directory."""
+        return cls.directory_owner_directory_in_scope(relative_parts)
+
+    @classmethod
+    def directory_owner_source_counts_toward_limits(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Return whether one owner-readable file consumes aggregate scan budgets."""
+        return cls.directory_owner_source_in_scope(relative_parts)
+
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}

@@ -1,6 +1,7 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
 import ast
+import hashlib
 import io
 import keyword
 import os
@@ -9,9 +10,17 @@ import token
 import tokenize
 from pathlib import Path
 from typing import Any, ClassVar
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
+from modelaudit.detectors.network_comm import redact_url_for_finding
+from modelaudit.detectors.secrets import SecretsDetector
+from modelaudit.scanner_registry_metadata import (
+    LEGAL_TEXT_SIDECAR_BASENAMES,
+    LEGAL_TEXT_SIDECAR_EXTENSIONS,
+    MAIN_OWNED_LEGAL_TEXT_FILENAMES,
+    TOKENIZER_VOCABULARY_CONTENT_FILENAMES,
+)
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import LOGICAL_SCAN_PATH_CONFIG_KEY, BaseScanner, CheckStatus, IssueSeverity, ScanResult
@@ -56,8 +65,55 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
         "url_detected",
     }
 )
-PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
+CORRELATABLE_DOCUMENTATION_NETWORK_FINDING_TYPES = PASSIVE_NETWORK_FINDING_TYPES | frozenset({"network_command"})
+DOCUMENTATION_NETWORK_EVIDENCE_TRAILING_DELIMITERS = ".,;:)]}'\"`>"
+DOCUMENTATION_NETWORK_EVIDENCE_LEADING_DELIMITERS = "<([{'\"`"
+DOCUMENTATION_NETWORK_URL_BOUNDARY_BYTES = b" \t\r\n\"'<>`"
+DOCUMENTATION_NETWORK_URL_MAX_SCHEME_BYTES = 32
+DOCUMENTATION_NETWORK_DESTINATION_TOKEN_PATTERN = re.compile(rb"[^\s;&|#]+")
+DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK = {
+    "DEBUG": 0,
+    "INFO": 1,
+    "LOW": 1,
+    "MEDIUM": 2,
+    "WARNING": 2,
+    "HIGH": 3,
+    "CRITICAL": 3,
+}
+DOCUMENTATION_NETWORK_FINDING_PRIORITY = {
+    "network_command": 40,
+    "cloud_storage_url": 30,
+    "url_detected": 20,
+    "ipv4_address": 10,
+    "ipv6_address": 10,
+    "domain_name": 0,
+    "domain": 0,
+}
+PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt", "merges.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
+PASSIVE_DATA_SECRET_TYPES = frozenset({"Basic Auth Credentials", "Bearer Token"})
+PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN = re.compile(
+    rb"^[ \t]*basic[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{2,8192}={0,2})[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+PASSIVE_DATA_BEARER_AUTH_LINE_PATTERN = re.compile(
+    rb"^[ \t]*bearer[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{20,8192}={0,2})[ \t]*\r?$",
+    re.IGNORECASE,
+)
+PASSIVE_DATA_BEARER_TOKEN_MARKER_BYTES = b"0123456789._~+/-"
+TOKENIZER_VOCABULARY_FILENAMES = frozenset(TOKENIZER_VOCABULARY_CONTENT_FILENAMES)
+TOKENIZER_VOCABULARY_PREFIXES = ("tokenizer_vocab", "tokenizer-vocab", "vocab")
+TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS = frozenset({"trojan", "zombie"})
+MIN_TOKENIZER_VOCABULARY_LINES = 8
+MIN_TOKENIZER_VOCABULARY_TOKEN_LINE_RATIO = 0.95
+MIN_STRONG_TOKENIZER_VOCABULARY_LINES = 128
+MIN_STRONG_TOKENIZER_VOCABULARY_SENTINELS = 4
+MIN_STRONG_TOKENIZER_VOCABULARY_SUBWORD_LINES = 4
+MAX_TOKENIZER_VOCABULARY_TOKEN_BYTES = 256
+MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES = 1024
+TOKENIZER_VOCABULARY_SENTINELS = frozenset({b"[PAD]", b"[UNK]", b"[CLS]", b"[SEP]", b"[MASK]"})
+TOKENIZER_VOCABULARY_SUBWORD_PREFIXES = ("##", "\u0120", "\u2581")
+TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES = ("</w>", "@@")
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 REQUIREMENTS_RAW_URL_PATTERN = re.compile(rb"https?://\S+", re.IGNORECASE)
 BARE_NETWORK_IPV4_TOKEN_PATTERN = re.compile(
@@ -72,11 +128,63 @@ BARE_NETWORK_TOKEN_PATTERNS = (
     BARE_NETWORK_IPV6_TOKEN_PATTERN,
     BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
 )
+DOCUMENTATION_BARE_DOMAIN_TLDS = frozenset(
+    {
+        "ai",
+        "app",
+        "au",
+        "ca",
+        "cc",
+        "cf",
+        "ch",
+        "cn",
+        "co",
+        "com",
+        "de",
+        "dev",
+        "edu",
+        "es",
+        "example",
+        "fr",
+        "ga",
+        "gov",
+        "int",
+        "io",
+        "it",
+        "jp",
+        "mil",
+        "ml",
+        "net",
+        "nl",
+        "no",
+        "org",
+        "pw",
+        "ru",
+        "se",
+        "tk",
+        "to",
+        "uk",
+        "us",
+        "xyz",
+    }
+)
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
+MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
+)
+DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"(?=[^\r\n]{0,4096}$)[^\r\n]*[rubfRUBF]*[\"']$"
+)
+DOCUMENTATION_CODE_LITERAL_BLOCK_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"(?=[^\r\n]{0,4096}$)[^\r\n]*[\[{(][ \t]*(?:#.*)?$"
+)
+DOCUMENTATION_CODE_RETURN_STRING_PATTERN = re.compile(
+    rb"(?:^|[\r\n;{[(])[ \t]*(?:return|yield)\s+(?:[\s(\[{]{0,4096})?[rubfRUBF]*[\"']?$"
 )
 DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     rb"<(?:a\b[^<>]{0,4096}\bhref|img\b[^<>]{0,4096}\bsrc)\s*=\s*[\"']?$",
@@ -89,6 +197,49 @@ DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
+DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
+DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
+DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[,{])\s*(?P<field>[A-Za-z][A-Za-z0-9_-]*)\s*=\s*(?P<delimiter>[{\"']?)[^,\r\n]{0,4096}$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[,{])\s*url\s*=\s*(?P<delimiter>[{\"']?)\s*$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS = frozenset(
+    {
+        b"abstract",
+        b"address",
+        b"archiveprefix",
+        b"author",
+        b"booktitle",
+        b"copyright",
+        b"doi",
+        b"edition",
+        b"editor",
+        b"eprint",
+        b"howpublished",
+        b"institution",
+        b"isbn",
+        b"issn",
+        b"journal",
+        b"license",
+        b"month",
+        b"note",
+        b"number",
+        b"organization",
+        b"pages",
+        b"primaryclass",
+        b"publisher",
+        b"school",
+        b"series",
+        b"title",
+        b"url",
+        b"volume",
+        b"year",
+    }
+)
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
 DOCUMENTATION_CONFIG_NETWORK_KEY = rb"(?:endpoint|callback|webhook)(?:s|[_-][A-Za-z0-9_.-]{1,128}|(?:url|uri)s?)?"
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
@@ -98,6 +249,27 @@ DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     + DOCUMENTATION_CONFIG_NETWORK_KEY
     + rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$",
     re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_MARKDOWN_MAPPING_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$"
+)
+DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?[\"']?$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_LIST_MAPPING_PATTERN = re.compile(
+    rb"(?:^|(?:\r?\n|\r))[ \t]*[-*+]\s+" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"\s*:\s*(?:\[\s*)?$"
+)
+DOCUMENTATION_CONFIG_MARKDOWN_UNQUOTED_MAPPING_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"\s*:\s*(?:\[\s*)?$"
 )
 DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])[\"']?" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"[\"']?\s*(?:=|:)\s*"
@@ -109,11 +281,42 @@ DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN = re.compile(
-    rb"[ \t]+[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
+    rb"[ \t]*(?:[-*+]\s+)?[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
     re.IGNORECASE,
 )
+DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN = re.compile(
+    rb"[ \t]*[-*+]\s+\S.*",
+    re.IGNORECASE,
+)
+DOCUMENTATION_LIST_ITEM_PREFIX_PATTERN = re.compile(rb"[ \t]*[-*+]\s+")
+DOCUMENTATION_CONFIG_XML_TAG_NAME = (
+    rb"(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:endpoint|callback|webhook)"
+    rb"(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?"
+)
 DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
-    rb"<(?:endpoint|callback|webhook)(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?>\s*$",
+    rb"<" + DOCUMENTATION_CONFIG_XML_TAG_NAME + rb">\s*$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_TAG_START_PATTERN = re.compile(
+    rb"<(?P<closing>/)?\s*(?P<tag>" + DOCUMENTATION_CONFIG_XML_TAG_NAME + rb")(?=[\s>/])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_QUOTED_VALUE_OPEN_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?(?P<quote>[\"'])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_NESTED_CONFIG_OBJECT_QUOTED_VALUE_OPEN_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])[\"']?"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']?\s*(?:=|:)\s*\{[^{}\r\n]{0,4096}[\"']?(?:url|uri)[\"']?\s*:\s*(?P<quote>[\"'])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_NESTED_CONFIG_QUOTED_VALUE_LINE_PATTERN = re.compile(
+    rb"[ \t]*(?:[-*+]\s+)?[\"']?(?:url|uri)[\"']?\s*:\s*(?P<quote>[\"'])",
     re.IGNORECASE,
 )
 DOCUMENTATION_PRIVILEGE_OPTION_WITH_ARGUMENT = (
@@ -574,7 +777,7 @@ class TextScanner(BaseScanner):
     """Scanner for text-based ML-related files."""
 
     name = "text"
-    supported_extensions: ClassVar[list[str]] = [".txt", ".md", ".markdown", ".rst"]
+    supported_extensions: ClassVar[list[str]] = [".txt", ".md", ".markdown", ".rst", ".env"]
     default_max_file_read_size = DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -598,9 +801,9 @@ class TextScanner(BaseScanner):
     def _is_legal_documentation_filename(cls, filename: str) -> bool:
         ext = os.path.splitext(filename)[1].lower()
         if not ext:
-            return filename in {"license", "notice"}
+            return filename in LEGAL_TEXT_SIDECAR_BASENAMES
         stem = filename[: -len(ext)]
-        return stem in {"license", "notice"} and ext in cls.supported_extensions
+        return stem in LEGAL_TEXT_SIDECAR_BASENAMES and ext in LEGAL_TEXT_SIDECAR_EXTENSIONS
 
     @classmethod
     def _is_valid_legal_documentation_file(cls, path: str) -> bool:
@@ -625,12 +828,10 @@ class TextScanner(BaseScanner):
         filename = os.path.basename(path).lower()
         if cls._is_model_card_documentation_filename(filename) or cls._is_readme_documentation_filename(filename):
             return True
+        if filename in MAIN_OWNED_LEGAL_TEXT_FILENAMES:
+            return True
         if cls._is_legal_documentation_filename(filename):
             return cls._is_valid_legal_documentation_file(path)
-
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
-            return False
 
         # Check for ML-related text files
         ml_text_files = {
@@ -642,24 +843,26 @@ class TextScanner(BaseScanner):
             "vocabulary.txt",
             "tokens.txt",
             "tokenizer.txt",
+            "merges.txt",
             "labels.txt",
             "classes.txt",
             "model_card.md",
             "model_card.rst",
             "model_card.txt",
             "modelcard.md",
-            "license",
-            "license.txt",
-            "license.md",
-            "license.rst",
-            "notice",
-            "notice.txt",
-            "notice.md",
-            "notice.rst",
             "requirements.txt",
+            ".env",
         }
+        if filename in ml_text_files:
+            return True
 
-        return filename in ml_text_files or any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in cls.supported_extensions:
+            return False
+        if ext == ".env":
+            return True
+
+        return any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
 
     @staticmethod
     def _get_file_size(path: str) -> int:
@@ -685,6 +888,7 @@ class TextScanner(BaseScanner):
             filename in DOCUMENTATION_TEXT_FILENAMES
             or cls._is_readme_documentation_filename(filename)
             or cls._is_model_card_documentation_filename(filename)
+            or cls._is_legal_documentation_filename(filename)
         )
 
     @staticmethod
@@ -693,14 +897,90 @@ class TextScanner(BaseScanner):
         return filename in PASSIVE_DATA_TEXT_FILENAMES or filename.startswith(PASSIVE_DATA_TEXT_PREFIXES)
 
     @staticmethod
-    def _finding_line_parts(payload: bytes, finding: dict[str, Any]) -> tuple[bytes, int] | None:
+    def _has_tokenizer_vocabulary_filename(path: str) -> bool:
+        filename = os.path.basename(path).lower()
+        return filename in TOKENIZER_VOCABULARY_FILENAMES or (
+            filename.endswith(".txt") and filename.startswith(TOKENIZER_VOCABULARY_PREFIXES)
+        )
+
+    @staticmethod
+    def _is_tokenizer_vocabulary_token_line(line: bytes) -> bool:
+        if not line or len(line) > MAX_TOKENIZER_VOCABULARY_TOKEN_BYTES:
+            return False
+        if line != line.strip():
+            return False
+        return not any(value <= 0x20 or value == 0x7F for value in line)
+
+    @staticmethod
+    def _find_next_line_separator(payload: bytes, start: int) -> tuple[int, int]:
+        payload_length = len(payload)
+        index = start
+        while index < payload_length:
+            value = payload[index]
+            if value == 0x0A:
+                return index, index + 1
+            if value == 0x0D:
+                next_start = index + 1
+                if next_start < payload_length and payload[next_start] == 0x0A:
+                    next_start += 1
+                return index, next_start
+            index += 1
+        return payload_length, payload_length
+
+    @classmethod
+    def _tokenizer_vocabulary_line_evidence(cls, payload: bytes) -> tuple[int, int, int, int]:
+        token_lines = 0
+        nonempty_lines = 0
+        sentinel_lines = 0
+        subword_lines = 0
+        line_start = 0
+        payload_length = len(payload)
+        while line_start < payload_length:
+            line_end, next_line_start = cls._find_next_line_separator(payload, line_start)
+            raw_line = payload[line_start:line_end]
+            line_start = next_line_start
+            line = raw_line.strip()
+            if not line:
+                continue
+            nonempty_lines += 1
+            if not cls._is_tokenizer_vocabulary_token_line(line):
+                continue
+            token_lines += 1
+            if line in TOKENIZER_VOCABULARY_SENTINELS:
+                sentinel_lines += 1
+            try:
+                line_text = line.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if line_text.startswith(TOKENIZER_VOCABULARY_SUBWORD_PREFIXES) or line_text.endswith(
+                TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES
+            ):
+                subword_lines += 1
+        return nonempty_lines, token_lines, sentinel_lines, subword_lines
+
+    @classmethod
+    def _has_line_oriented_tokenizer_vocabulary_evidence(cls, path: str, payload: bytes) -> bool:
+        nonempty_lines, token_lines, sentinel_lines, subword_lines = cls._tokenizer_vocabulary_line_evidence(payload)
+        if nonempty_lines == 0 or token_lines / nonempty_lines < MIN_TOKENIZER_VOCABULARY_TOKEN_LINE_RATIO:
+            return False
+
+        if cls._has_tokenizer_vocabulary_filename(path):
+            return nonempty_lines >= MIN_TOKENIZER_VOCABULARY_LINES
+
+        return (
+            nonempty_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_LINES
+            and sentinel_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_SENTINELS
+            and subword_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_SUBWORD_LINES
+        )
+
+    @classmethod
+    def _finding_line_parts(cls, payload: bytes, finding: dict[str, Any]) -> tuple[bytes, int] | None:
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
             return None
-        line_start = max(payload.rfind(b"\n", 0, position) + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
-        line_end = payload.find(b"\n", position)
-        if line_end < 0:
-            line_end = len(payload)
+        previous_separator = max(payload.rfind(b"\n", 0, position), payload.rfind(b"\r", 0, position))
+        line_start = max(previous_separator + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        line_end, _ = cls._find_next_line_separator(payload, position)
         line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
         return payload[line_start:line_end], position - line_start
 
@@ -750,12 +1030,52 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _documentation_without_closed_inline_code_spans(source: bytes) -> bytes:
+        if b"`" not in source:
+            return source
+
+        result = bytearray()
+        cursor = 0
+        while cursor < len(source):
+            if source[cursor : cursor + 1] != b"`":
+                result.append(source[cursor])
+                cursor += 1
+                continue
+
+            fence_end = cursor
+            while fence_end < len(source) and source[fence_end : fence_end + 1] == b"`":
+                fence_end += 1
+            fence = source[cursor:fence_end]
+            closing_fence = source.find(fence, fence_end)
+            if closing_fence < 0:
+                result.extend(source[cursor:])
+                break
+
+            if result and result[-1] not in b" \t\r\n":
+                result.append(ord(" "))
+            cursor = closing_fence + len(fence)
+            if cursor < len(source) and source[cursor] not in b" \t\r\n|,.;:)":
+                result.append(ord(" "))
+        return bytes(result)
+
+    @staticmethod
+    def _documentation_prefix_is_markdown_table_row(prefix: bytes) -> bool:
+        source = prefix.lstrip()
+        markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
+        if markdown_prefix is not None:
+            source = source[markdown_prefix.end() :].lstrip()
+        return source.startswith(b"|") and b"|" in source[1:]
+
+    @staticmethod
     def _documentation_prefix_has_enclosing_call(prefix: bytes) -> bool:
         """Return whether a bounded Python prefix leaves a function call open at the finding."""
         source = prefix.strip()
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
             source = source[markdown_prefix.end() :].lstrip()
+        source = TextScanner._documentation_without_closed_inline_code_spans(source).strip()
+        if TextScanner._documentation_prefix_is_markdown_table_row(source):
+            return False
         for fence_length in (3, 2, 1):
             fence = b"`" * fence_length
             if source.startswith(fence):
@@ -845,6 +1165,130 @@ class TextScanner(BaseScanner):
         return any(opening == "(" and is_call for opening, is_call in stack)
 
     @staticmethod
+    def _documentation_passive_markdown_link_match(prefix: bytes) -> re.Match[bytes] | None:
+        return DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN.search(prefix.rstrip())
+
+    @classmethod
+    def _documentation_prefix_is_passive_markdown_link(cls, prefix: bytes) -> bool:
+        return cls._documentation_passive_markdown_link_match(prefix) is not None
+
+    @classmethod
+    def _documentation_markdown_link_is_in_code_context(cls, prefix: bytes, link_start: int) -> bool:
+        code_prefix = prefix[:link_start]
+        return (
+            cls._documentation_assignment_is_actionable(code_prefix)
+            or DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CODE_CALL_PATTERN.search(code_prefix) is not None
+            or cls._documentation_markdown_link_config_is_actionable(code_prefix)
+        )
+
+    @classmethod
+    def _documentation_markdown_link_config_is_actionable(cls, code_prefix: bytes) -> bool:
+        stripped = code_prefix.rstrip()
+        return (
+            cls._documentation_structured_config_value_prefix_is_actionable(code_prefix)
+            or DOCUMENTATION_CONFIG_LIST_MAPPING_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CONFIG_MARKDOWN_UNQUOTED_MAPPING_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CONFIG_MARKDOWN_MAPPING_PATTERN.search(code_prefix) is not None
+            or (
+                stripped.endswith((b'"', b"'")) and DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(code_prefix) is not None
+            )
+            or cls._documentation_nested_config_is_actionable(code_prefix)
+            or DOCUMENTATION_CONFIG_TAG_PATTERN.search(code_prefix) is not None
+        )
+
+    @classmethod
+    def _documentation_markdown_link_context(cls, payload: bytes, position: int) -> tuple[bytes, int] | None:
+        line_start = max(payload.rfind(b"\n", 0, position) + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        line = payload[line_start:line_end]
+        line_position = position - line_start
+        for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
+            if match.start() <= line_position < match.end():
+                prefix = line[: match.start()]
+                markdown_match = cls._documentation_passive_markdown_link_match(prefix)
+                if markdown_match is None:
+                    return None
+                link_start = line_start + markdown_match.start()
+                context_start = max(0, link_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+                if context_start > 0:
+                    next_newline = payload.find(b"\n", context_start, link_start)
+                    if next_newline >= 0:
+                        context_start = next_newline + 1
+                return payload[context_start:link_start], link_start
+        return None
+
+    @classmethod
+    def _documentation_markdown_link_context_prefix(cls, payload: bytes, position: int) -> bytes | None:
+        context = cls._documentation_markdown_link_context(payload, position)
+        return context[0] if context is not None else None
+
+    @classmethod
+    def _documentation_markdown_link_xml_config_context_status(cls, payload: bytes, link_start: int) -> bool | None:
+        line_start = payload.rfind(b"\n", 0, link_start) + 1
+        context_start = max(line_start, link_start - MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES)
+        context_prefix = payload[context_start:link_start]
+        tag_match = None
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(context_prefix):
+            tag_match = match
+            break
+        if tag_match is None:
+            return None if context_start > line_start else False
+        return cls._documentation_config_xml_tag_value_is_open(context_prefix[tag_match.start() :])
+
+    @classmethod
+    def _documentation_markdown_link_has_open_xml_config_context(cls, payload: bytes, link_start: int) -> bool:
+        return cls._documentation_markdown_link_xml_config_context_status(payload, link_start) is True
+
+    @classmethod
+    def _documentation_position_is_in_actionable_markdown_link_context(cls, payload: bytes, position: int) -> bool:
+        context = cls._documentation_markdown_link_context(payload, position)
+        if context is None:
+            return False
+        context_prefix, link_start = context
+        line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
+        if cls._documentation_shell_comment_before_position(line_prefix, len(line_prefix)):
+            return False
+        if cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix):
+            return cls._documentation_markdown_link_config_is_actionable(
+                context_prefix
+            ) or cls._documentation_markdown_link_has_open_xml_config_context(
+                payload,
+                link_start,
+            )
+        return cls._documentation_markdown_link_is_in_code_context(
+            context_prefix,
+            len(context_prefix),
+        ) or cls._documentation_markdown_link_has_open_xml_config_context(
+            payload,
+            link_start,
+        )
+
+    @classmethod
+    def _documentation_position_is_in_passive_markdown_link(cls, payload: bytes, position: int) -> bool:
+        context = cls._documentation_markdown_link_context(payload, position)
+        if context is None:
+            return False
+        context_prefix, link_start = context
+        line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
+        passive_line_markdown_link = cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix)
+        literal_value_prefix = cls._documentation_markdown_link_leading_prefix_is_literal_value(line_prefix)
+        return cls._documentation_markdown_link_xml_config_context_status(payload, link_start) is False and (
+            (passive_line_markdown_link and not cls._documentation_markdown_link_config_is_actionable(context_prefix))
+            or (
+                not literal_value_prefix
+                and not cls._documentation_markdown_link_is_in_code_context(
+                    context_prefix,
+                    len(context_prefix),
+                )
+            )
+        )
+
+    @staticmethod
     def _documentation_comment_contains_position(payload: bytes, position: int) -> bool:
         """Return whether a bounded finding position is inside an HTML or C-style block comment."""
         context_start = max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
@@ -911,21 +1355,227 @@ class TextScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _documentation_nested_config_is_actionable(prefix: bytes) -> bool:
+    def _documentation_quoted_value_is_open(source: bytes, quote: int, value_start: int) -> bool:
+        escaped = False
+        cursor = value_start
+        while cursor < len(source):
+            value = source[cursor]
+            if escaped:
+                escaped = False
+                cursor += 1
+                continue
+            if value == ord("\\") and quote != ord("'"):
+                escaped = True
+                cursor += 1
+                continue
+            if value in {ord("\r"), ord("\n")}:
+                return False
+            if value == quote:
+                if quote == ord("'") and cursor + 1 < len(source) and source[cursor + 1] == quote:
+                    cursor += 2
+                    continue
+                return False
+            cursor += 1
+        return True
+
+    @staticmethod
+    def _documentation_xml_start_tag_end(prefix: bytes, search_start: int) -> int | None:
+        quote: int | None = None
+        cursor = search_start
+        while cursor < len(prefix):
+            value = prefix[cursor]
+            if quote is not None:
+                if value == quote:
+                    quote = None
+                cursor += 1
+                continue
+            if value in {ord("'"), ord('"')}:
+                quote = value
+            elif value == ord(">"):
+                return cursor
+            elif value == ord("<"):
+                return None
+            cursor += 1
+        return None
+
+    @classmethod
+    def _documentation_config_xml_tag_value_is_open(cls, prefix: bytes) -> bool:
+        open_tags: list[bytes] = []
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(prefix):
+            tag = match.group("tag").lower()
+            tag_end = cls._documentation_xml_start_tag_end(prefix, match.end())
+            if tag_end is None:
+                return True
+            if match.group("closing"):
+                if not open_tags or open_tags[-1] != tag:
+                    return True
+                open_tags.pop()
+                continue
+            tag_body = prefix[match.end() : tag_end].rstrip()
+            if tag_body.endswith(b"/"):
+                continue
+            open_tags.append(tag)
+        return bool(open_tags)
+
+    @classmethod
+    def _documentation_closed_config_xml_suffix_start(cls, prefix: bytes) -> int | None:
+        open_tags: list[bytes] = []
+        last_tag_end: int | None = None
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(prefix):
+            tag = match.group("tag").lower()
+            tag_end = cls._documentation_xml_start_tag_end(prefix, match.end())
+            if tag_end is None:
+                return None
+            last_tag_end = tag_end + 1
+            if match.group("closing"):
+                if not open_tags or open_tags[-1] != tag:
+                    return None
+                open_tags.pop()
+                continue
+            tag_body = prefix[match.end() : tag_end].rstrip()
+            if tag_body.endswith(b"/"):
+                continue
+            open_tags.append(tag)
+        if last_tag_end is None or open_tags:
+            return None
+        return last_tag_end
+
+    @classmethod
+    def _documentation_truncated_prefix_after_closed_xml_config_is_passive(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        context_start = max(line_start, position - MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES)
+        context_prefix = payload[context_start:position]
+        tag_match = None
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(context_prefix):
+            tag_match = match
+            break
+        if tag_match is None:
+            return False
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        tag_context = context_prefix[tag_match.start() :] + payload[position:line_end]
+        tag_context_position = position - (context_start + tag_match.start())
+        suffix_start = cls._documentation_closed_config_xml_suffix_start(tag_context[:tag_context_position])
+        if suffix_start is None:
+            return False
+        suffix_line = tag_context[suffix_start:]
+        suffix_position = tag_context_position - suffix_start
+        return not cls._documentation_line_is_code_shaped(suffix_line, suffix_position)
+
+    @classmethod
+    def _documentation_config_quoted_value_line_is_actionable(cls, line_prefix: bytes) -> bool:
+        for match in DOCUMENTATION_CONFIG_QUOTED_VALUE_OPEN_PATTERN.finditer(line_prefix):
+            quote = match.group("quote")[0]
+            if cls._documentation_quoted_value_is_open(line_prefix, quote, match.end()):
+                return True
+        return False
+
+    @classmethod
+    def _documentation_nested_config_quoted_value_is_actionable(cls, prefix: bytes) -> bool:
+        for object_match in DOCUMENTATION_NESTED_CONFIG_OBJECT_QUOTED_VALUE_OPEN_PATTERN.finditer(prefix):
+            quote = object_match.group("quote")[0]
+            if cls._documentation_quoted_value_is_open(prefix, quote, object_match.end()):
+                return True
+
+        lines = prefix.splitlines()
+        if len(lines) < 2:
+            return False
+        value_line = lines[-1]
+        value_match = DOCUMENTATION_NESTED_CONFIG_QUOTED_VALUE_LINE_PATTERN.match(value_line)
+        if value_match is None:
+            return False
+        quote = value_match.group("quote")[0]
+        if not cls._documentation_quoted_value_is_open(value_line, quote, value_match.end()):
+            return False
+
+        value_indent = cls._documentation_line_indent(value_line)
+        value_is_list_item = DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN.fullmatch(value_line) is not None
+        for line_index in range(len(lines) - 2, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                return False
+            line_indent = cls._documentation_line_indent(line)
+            if line_indent > value_indent or (line_indent == value_indent and not value_is_list_item):
+                continue
+            if DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line) is not None:
+                return True
+            list_item_prefix = DOCUMENTATION_LIST_ITEM_PREFIX_PATTERN.match(line)
+            if list_item_prefix is not None:
+                if value_indent <= line_indent:
+                    return False
+                if (
+                    DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line[list_item_prefix.end() :])
+                    is not None
+                ):
+                    return True
+                for parent_index in range(line_index - 1, -1, -1):
+                    parent_line = lines[parent_index]
+                    if not parent_line.strip():
+                        return False
+                    parent_indent = cls._documentation_line_indent(parent_line)
+                    if parent_indent > line_indent:
+                        continue
+                    return DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is not None
+                return False
+            return False
+        return False
+
+    @classmethod
+    def _documentation_structured_config_value_prefix_is_actionable(cls, prefix: bytes) -> bool:
+        line_prefix = prefix[prefix.rfind(b"\n") + 1 :]
+        return (
+            cls._documentation_config_quoted_value_line_is_actionable(line_prefix)
+            or cls._documentation_nested_config_quoted_value_is_actionable(prefix)
+            or cls._documentation_config_xml_tag_value_is_open(prefix)
+        )
+
+    @staticmethod
+    def _documentation_line_indent(line: bytes) -> int:
+        return len(line) - len(line.lstrip(b" \t"))
+
+    @classmethod
+    def _documentation_nested_config_is_actionable(cls, prefix: bytes) -> bool:
         if DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN.search(prefix) is not None:
             return True
         lines = prefix.splitlines()
         if len(lines) < 2:
             return False
-        parent_line, value_line = lines[-2:]
-        if (
-            DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is None
-            or DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN.fullmatch(value_line) is None
-        ):
+        value_line = lines[-1]
+        if DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN.fullmatch(value_line) is None:
             return False
-        parent_indent = len(parent_line) - len(parent_line.lstrip(b" \t"))
-        value_indent = len(value_line) - len(value_line.lstrip(b" \t"))
-        return value_indent > parent_indent
+        value_indent = cls._documentation_line_indent(value_line)
+        value_is_list_item = DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN.fullmatch(value_line) is not None
+        for line_index in range(len(lines) - 2, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                return False
+            line_indent = cls._documentation_line_indent(line)
+            if line_indent > value_indent or (line_indent == value_indent and not value_is_list_item):
+                continue
+            if DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line) is not None:
+                return True
+            list_item_prefix = DOCUMENTATION_LIST_ITEM_PREFIX_PATTERN.match(line)
+            if list_item_prefix is not None:
+                if value_indent <= line_indent:
+                    return False
+                if (
+                    DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line[list_item_prefix.end() :])
+                    is not None
+                ):
+                    return True
+                for parent_index in range(line_index - 1, -1, -1):
+                    parent_line = lines[parent_index]
+                    if not parent_line.strip():
+                        return False
+                    parent_indent = cls._documentation_line_indent(parent_line)
+                    if parent_indent > line_indent:
+                        continue
+                    return DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is not None
+                return False
+            return False
+        return False
 
     @staticmethod
     def _documentation_assignment_is_actionable(prefix: bytes) -> bool:
@@ -1099,6 +1749,14 @@ class TextScanner(BaseScanner):
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
         stripped = line.lstrip()
+        passive_markdown_link_match = cls._documentation_passive_markdown_link_match(prefix)
+        passive_markdown_link = passive_markdown_link_match is not None
+        markdown_table_context = cls._documentation_prefix_is_markdown_table_row(prefix)
+        markdown_link_code_context = (
+            cls._documentation_markdown_link_is_in_code_context(prefix, passive_markdown_link_match.start())
+            if passive_markdown_link_match is not None
+            else False
+        )
         shell_command_is_actionable = (
             cls._documentation_anchored_network_command_is_actionable(stripped)
             or cls._documentation_package_install_is_actionable(line, position)
@@ -1120,11 +1778,21 @@ class TextScanner(BaseScanner):
                 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
                 and cls._documentation_assignment_is_actionable(prefix)
             )
-            or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
-            or cls._documentation_prefix_has_enclosing_call(prefix)
+            or markdown_link_code_context
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            )
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and cls._documentation_prefix_has_enclosing_call(prefix)
+            )
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
+            or cls._documentation_structured_config_value_prefix_is_actionable(prefix)
         ):
             return True
 
@@ -1208,6 +1876,168 @@ class TextScanner(BaseScanner):
             previous_line_end = previous_line_start - 1
         return False
 
+    @staticmethod
+    def _documentation_multiline_return_contains_position(payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+        if current_indent == 0:
+            return False
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end]
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if previous_indent < current_indent:
+                    return DOCUMENTATION_PYTHON_BLOCK_VALUE_PREFIX_PATTERN.fullmatch(stripped) is not None
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @staticmethod
+    def _documentation_markdown_link_leading_prefix_is_passive(prefix: bytes) -> bool:
+        prefix = prefix.lstrip()
+        return (
+            not prefix or prefix.startswith(b"#") or DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.fullmatch(prefix) is not None
+        )
+
+    @staticmethod
+    def _documentation_markdown_link_leading_prefix_is_literal_value(prefix: bytes) -> bool:
+        stripped = prefix.strip()
+        return stripped.startswith((b'"', b"'", b"{", b"[", b"(")) or stripped.endswith((b",", b"{", b"["))
+
+    @classmethod
+    def _documentation_literal_continuation_line_is_passive_markdown_prefix(cls, line: bytes) -> bool:
+        markdown_match = cls._documentation_passive_markdown_link_match(line)
+        if markdown_match is None:
+            return False
+        return cls._documentation_markdown_link_leading_prefix_is_passive(line[: markdown_match.start()])
+
+    @classmethod
+    def _documentation_literal_continuation_line_is_code_shaped(cls, line: bytes) -> bool:
+        stripped = line.strip()
+        if cls._documentation_literal_continuation_line_is_passive_markdown_prefix(line):
+            return False
+        return (
+            stripped.startswith((b'"', b"'", b"{", b"[", b"(", b"-", b"+"))
+            or stripped.endswith((b",", b"{", b"[", b"("))
+            or bool(re.match(rb"\d", stripped))
+        )
+
+    @classmethod
+    def _documentation_zero_indent_multiline_literal_contains_position(
+        cls,
+        payload: bytes,
+        line_start: int,
+        current_line_prefix: bytes,
+        context_start: int,
+    ) -> bool:
+        if not cls._documentation_literal_continuation_line_is_code_shaped(current_line_prefix):
+            return False
+
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end].removesuffix(b"\r")
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                if DOCUMENTATION_CODE_LITERAL_BLOCK_PREFIX_PATTERN.search(previous_line) is not None:
+                    return True
+                if stripped.startswith((b"}", b"]", b")")):
+                    return False
+                if not cls._documentation_literal_continuation_line_is_code_shaped(previous_line):
+                    return False
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @classmethod
+    def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        if cls._documentation_prefix_is_markdown_table_row(current_line_prefix):
+            return False
+        if cls._documentation_shell_comment_before_position(current_line_prefix, len(current_line_prefix)):
+            return False
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end]
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if current_indent == 0 and previous_indent == 0:
+                    if cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:line_start]):
+                        return True
+                    previous_line_end = previous_line_start - 1
+                    continue
+                if previous_indent < current_indent:
+                    return cls._documentation_prefix_has_enclosing_call(previous_line)
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @classmethod
+    def _documentation_multiline_literal_contains_position(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if current_indent == 0:
+            if cls._documentation_position_is_in_passive_markdown_link(payload, position):
+                return False
+            return cls._documentation_zero_indent_multiline_literal_contains_position(
+                payload,
+                line_start,
+                current_line_prefix,
+                context_start,
+            )
+
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end].removesuffix(b"\r")
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if previous_indent < current_indent:
+                    return DOCUMENTATION_CODE_LITERAL_BLOCK_PREFIX_PATTERN.search(previous_line) is not None
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @classmethod
+    def _documentation_nested_config_contains_position(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if context_start > 0:
+            context_start = payload.rfind(b"\n", 0, context_start) + 1
+        return cls._documentation_nested_config_is_actionable(payload[context_start:position])
+
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         position = finding.get("position")
@@ -1215,25 +2045,51 @@ class TextScanner(BaseScanner):
             return False
         if cls._documentation_comment_contains_position(payload, position):
             return False
-        if cls._finding_line_prefix_is_truncated(payload, finding):
+        if cls._documentation_position_is_in_passive_bibliography_field(payload, position):
+            return False
+        if cls._documentation_multiline_return_contains_position(payload, position):
             return True
+        if cls._documentation_open_call_contains_position(payload, position):
+            return True
+        if cls._documentation_multiline_literal_contains_position(payload, position):
+            return True
+        if cls._documentation_position_is_in_actionable_markdown_link_context(payload, position):
+            return True
+        if cls._documentation_position_is_in_passive_markdown_link(payload, position):
+            return False
+        if cls._finding_line_prefix_is_truncated(payload, finding):
+            return not cls._documentation_truncated_prefix_after_closed_xml_config_is_passive(payload, position)
         line_parts = cls._finding_line_parts(payload, finding)
+        markdown_table_context = False
         if line_parts is not None:
             line, line_position = line_parts
+            markdown_table_context = cls._documentation_prefix_is_markdown_table_row(line[:line_position])
             if cls._documentation_line_is_code_shaped(line, line_position):
                 return True
+            if cls._documentation_shell_comment_before_position(line, line_position):
+                return False
         if cls._documentation_previous_line_continues_command(payload, position):
             return True
         if cls._documentation_python_definition_contains_finding(payload, position):
             return True
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
+        passive_markdown_link = cls._documentation_prefix_is_passive_markdown_link(prefix)
         return (
             cls._documentation_assignment_is_actionable(prefix)
-            or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
-            or cls._documentation_prefix_has_enclosing_call(prefix)
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            )
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and cls._documentation_prefix_has_enclosing_call(prefix)
+            )
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
+            or cls._documentation_structured_config_value_prefix_is_actionable(prefix)
         )
 
     @staticmethod
@@ -1501,6 +2357,188 @@ class TextScanner(BaseScanner):
             return False
         return any(isinstance(value, str) and line_text == value.casefold() for value in candidates)
 
+    @classmethod
+    def _is_bare_data_secret_token(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        if finding.get("secret_type") not in PASSIVE_DATA_SECRET_TYPES:
+            return False
+        line_parts = cls._finding_line_parts(payload, finding)
+        if line_parts is None:
+            return False
+        line, position = line_parts
+        length = finding.get("length")
+        if not isinstance(length, int) or length <= 0 or position + length > len(line):
+            return False
+        stripped = line.strip()
+        if not stripped or b"@" in stripped or b":" in stripped or b"=" in stripped:
+            return False
+        return line[position : position + length].strip() == stripped
+
+    @staticmethod
+    def _passive_data_basic_token_decodes_to_credentials(token: bytes) -> bool:
+        return SecretsDetector._basic_auth_token_decodes_to_credentials(token.decode("ascii"))
+
+    @staticmethod
+    def _passive_data_bearer_token_is_credential_like(token: bytes) -> bool:
+        unpadded_token = token.rstrip(b"=")
+        return any(byte in PASSIVE_DATA_BEARER_TOKEN_MARKER_BYTES for byte in unpadded_token)
+
+    @classmethod
+    def _passive_data_bare_secret_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        line = cls._finding_line(payload, finding)
+        if line is None:
+            return False
+
+        secret_type = finding.get("secret_type")
+        if secret_type == "Basic Auth Credentials":
+            match = PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN.match(line)
+            return match is not None and cls._passive_data_basic_token_decodes_to_credentials(match.group("token"))
+        if secret_type == "Bearer Token":
+            match = PASSIVE_DATA_BEARER_AUTH_LINE_PATTERN.match(line)
+            return match is not None and cls._passive_data_bearer_token_is_credential_like(match.group("token"))
+        return True
+
+    @classmethod
+    def _passive_data_auth_line_has_existing_finding(
+        cls,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        *,
+        line_start: int,
+        line_end: int,
+        secret_type: str,
+    ) -> bool:
+        for finding in findings:
+            if finding.get("secret_type") != secret_type:
+                continue
+            position = finding.get("position")
+            if isinstance(position, int) and line_start <= position <= line_end:
+                return True
+            line = cls._finding_line(payload, finding)
+            if line is not None and payload[line_start:line_end].strip() == line:
+                return True
+        return False
+
+    @classmethod
+    def _passive_data_auth_line_secret_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        *,
+        max_findings: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        if not cls._is_passive_data_sidecar(path):
+            return [], None
+
+        passive_findings: list[dict[str, Any]] = []
+        for match in PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN.finditer(payload):
+            token = match.group("token")
+            if not cls._passive_data_basic_token_decodes_to_credentials(token):
+                continue
+
+            secret_type = "Basic Auth Credentials"
+            line_start, line_end, _line_number = cls._documentation_line_bounds(payload, match.start())
+            if cls._passive_data_auth_line_has_existing_finding(
+                payload,
+                findings + passive_findings,
+                line_start=line_start,
+                line_end=line_end,
+                secret_type=secret_type,
+            ):
+                continue
+
+            token_position = match.start("token")
+            if len(findings) + len(passive_findings) >= max_findings:
+                return passive_findings, {
+                    "type": DETECTOR_FINDING_LIMIT_TYPE,
+                    "detector": "secrets",
+                    "severity": "INFO",
+                    "message": "Embedded secret findings exceeded the configured reporting limit",
+                    "max_findings": max_findings,
+                    "analysis_incomplete": True,
+                    "context": path,
+                }
+            passive_findings.append(
+                {
+                    "type": "embedded_secret",
+                    "severity": "CRITICAL",
+                    "secret_type": secret_type,
+                    "position": token_position,
+                    "length": len(token),
+                    "confidence": 0.8,
+                    "pattern": "passive_data_auth_line",
+                    "redacted_value": "Basic <redacted>",
+                    "message": f"{secret_type} detected in passive data sidecar (confidence: 80%)",
+                    "context": f"{path} pos:{token_position}",
+                    "recommendation": f"Remove {secret_type} from model data immediately",
+                    "passive_data_sidecar": True,
+                }
+            )
+        return passive_findings, None
+
+    @classmethod
+    def _is_isolated_tokenizer_vocabulary_cc_finding(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        if finding.get("type") != "cc_pattern":
+            return False
+
+        pattern = finding.get("pattern")
+        if not isinstance(pattern, str) or pattern.casefold() not in TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS:
+            return False
+
+        line = cls._finding_line(payload, finding)
+        if line is None or not cls._is_tokenizer_vocabulary_token_line(line):
+            return False
+
+        try:
+            line_text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+
+        for prefix in ("##", "\u0120", "\u2581"):
+            if line_text.startswith(prefix):
+                line_text = line_text[len(prefix) :]
+                break
+        for suffix in TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES:
+            if line_text.endswith(suffix):
+                line_text = line_text[: -len(suffix)]
+                break
+
+        pattern_text = pattern.casefold()
+        normalized_line_text = line_text.casefold()
+        return normalized_line_text in {pattern_text, f"{pattern_text}s"}
+
+    @classmethod
+    def _retarget_or_omit_tokenizer_vocabulary_cc_finding(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, bool]:
+        pattern = finding.get("pattern")
+        if finding.get("type") != "cc_pattern" or not isinstance(pattern, str):
+            return finding, False
+
+        pattern_text = pattern.casefold()
+        if pattern_text not in TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS:
+            return finding, False
+
+        pattern_bytes = pattern_text.encode()
+        lowered_payload = payload.lower()
+        search_start = 0
+        occurrences_examined = 0
+        while True:
+            position = lowered_payload.find(pattern_bytes, search_start)
+            if position < 0:
+                return None, False
+            occurrences_examined += 1
+            if occurrences_examined > MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES:
+                return finding, True
+            candidate = {**finding, "position": position}
+            if cls._is_isolated_tokenizer_vocabulary_cc_finding(payload, candidate):
+                search_start = position + len(pattern_bytes)
+                continue
+            candidate.pop("snippet", None)
+            return candidate, False
+
     @staticmethod
     def _all_network_candidate_lines_are_bare(payload: bytes) -> bool:
         for line in payload.splitlines():
@@ -1509,6 +2547,153 @@ class TextScanner(BaseScanner):
                 continue
             if b"@" in stripped or not any(pattern.fullmatch(stripped) for pattern in BARE_NETWORK_TOKEN_PATTERNS):
                 return False
+        return True
+
+    @staticmethod
+    def _documentation_position_is_in_bibliography_entry(
+        payload: bytes,
+        line_start: int,
+        position: int | None = None,
+    ) -> bool:
+        context_end = line_start if position is None else min(max(position, 0), len(payload))
+        context_start = max(0, context_end - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context = payload[context_start:context_end]
+        entry_start = None
+        for match in DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN.finditer(context):
+            entry_start = match.start()
+        if entry_start is None:
+            return False
+        entry_context = context[entry_start:]
+        return entry_context.count(b"{") > entry_context.count(b"}")
+
+    @staticmethod
+    def _documentation_bibliography_entry_closes_after_position(payload: bytes, position: int) -> bool:
+        position = min(max(position, 0), len(payload))
+        context_start = max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context_end = min(len(payload), position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context = payload[context_start:context_end]
+        relative_position = position - context_start
+        entry_start = None
+        for match in DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN.finditer(context[:relative_position]):
+            entry_start = match.start()
+        if entry_start is None:
+            return False
+        entry_context = context[entry_start:]
+        return entry_context.count(b"{") <= entry_context.count(b"}")
+
+    @classmethod
+    def _documentation_position_is_in_passive_bibliography_field(cls, payload: bytes, position: int) -> bool:
+        position = min(max(position, 0), len(payload))
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        if not cls._documentation_position_is_in_bibliography_entry(payload, line_start, position):
+            return False
+        line = payload[line_start:line_end]
+        line_position = position - line_start
+        field_match = DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN.search(line[:line_position])
+        if field_match is None:
+            return False
+        field = field_match.group("field").lower()
+        if field == b"url":
+            delimiter = field_match.group("delimiter")
+            return delimiter not in {b'"', b"'"} or cls._documentation_bibliography_entry_closes_after_position(
+                payload,
+                position,
+            )
+        return field in DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS
+
+    @classmethod
+    def _documentation_bibliography_url_field_is_passive(
+        cls,
+        payload: bytes,
+        line_start: int,
+        line: bytes,
+        position: int,
+    ) -> bool:
+        url_match = DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN.search(line[:position])
+        if url_match is None or not cls._documentation_position_is_in_bibliography_entry(
+            payload,
+            line_start,
+            line_start + position,
+        ):
+            return False
+        delimiter = url_match.group("delimiter")
+        return delimiter not in {b'"', b"'"} or cls._documentation_bibliography_entry_closes_after_position(
+            payload,
+            line_start + position,
+        )
+
+    @classmethod
+    def _documentation_network_token_lines_are_passive(cls, payload: bytes) -> bool:
+        line_start = 0
+        while line_start <= len(payload):
+            line_end = payload.find(b"\n", line_start)
+            if line_end < 0:
+                line_end = len(payload)
+            line = payload[line_start:line_end]
+            url_spans: list[tuple[int, int]] = []
+            for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
+                url_spans.append((match.start(), match.end()))
+                if cls._documentation_bibliography_url_field_is_passive(payload, line_start, line, match.start()):
+                    continue
+                absolute_position = line_start + match.start()
+                if (
+                    cls._documentation_line_is_code_shaped(
+                        line,
+                        match.start(),
+                    )
+                    or cls._documentation_multiline_return_contains_position(
+                        payload,
+                        absolute_position,
+                    )
+                    or cls._documentation_open_call_contains_position(payload, absolute_position)
+                    or cls._documentation_multiline_literal_contains_position(payload, absolute_position)
+                    or cls._documentation_nested_config_contains_position(payload, absolute_position)
+                ):
+                    return False
+            for pattern in (
+                BARE_NETWORK_IPV4_TOKEN_PATTERN,
+                BARE_NETWORK_IPV6_TOKEN_PATTERN,
+                BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
+            ):
+                for match in pattern.finditer(line):
+                    if any(start <= match.start() < end for start, end in url_spans):
+                        continue
+                    if pattern is BARE_NETWORK_DOMAIN_TOKEN_PATTERN:
+                        if cls._documentation_position_is_in_passive_bibliography_field(
+                            payload,
+                            line_start + match.start(),
+                        ):
+                            continue
+                        before = line[match.start() - 1 : match.start()] if match.start() > 0 else b""
+                        after = line[match.end() : match.end() + 1]
+                        if before in {b".", b"_"} or after in {b".", b"_"}:
+                            continue
+                        tld = match.group().rsplit(b".", 1)[-1].decode("utf-8", errors="ignore").casefold()
+                        if tld not in DOCUMENTATION_BARE_DOMAIN_TLDS:
+                            if DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN.search(line[: match.start()]) is not None:
+                                return False
+                            continue
+                    absolute_position = line_start + match.start()
+                    if (
+                        cls._documentation_line_is_code_shaped(
+                            line,
+                            match.start(),
+                        )
+                        or cls._documentation_multiline_return_contains_position(
+                            payload,
+                            absolute_position,
+                        )
+                        or cls._documentation_open_call_contains_position(payload, absolute_position)
+                        or cls._documentation_multiline_literal_contains_position(payload, absolute_position)
+                        or cls._documentation_nested_config_contains_position(payload, absolute_position)
+                    ):
+                        return False
+            if line_end == len(payload):
+                break
+            line_start = line_end + 1
         return True
 
     @staticmethod
@@ -1532,6 +2717,12 @@ class TextScanner(BaseScanner):
         findings: list[dict[str, Any]],
         finding_limit: dict[str, Any],
     ) -> bool:
+        if finding_limit.get(
+            "truncated_finding_type"
+        ) == "endpoint_redaction_classification" and cls._is_documentation_sidecar(path):
+            return all(
+                cls._sidecar_network_finding_is_informational(path, payload, finding) for finding in findings
+            ) and cls._documentation_network_token_lines_are_passive(payload)
         if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
         truncated_finding = finding_limit.get("truncated_finding")
@@ -1578,18 +2769,481 @@ class TextScanner(BaseScanner):
             finding,
         )
 
+    @staticmethod
+    def _documentation_line_bounds_lookup(
+        payload: bytes,
+        positions: list[int],
+    ) -> dict[int, tuple[int, int, int]]:
+        normalized_positions = sorted({min(max(position, 0), len(payload)) for position in positions})
+        lookup: dict[int, tuple[int, int, int]] = {}
+        if not normalized_positions:
+            return lookup
+
+        line_start = 0
+        line_number = 1
+        position_index = 0
+        while position_index < len(normalized_positions):
+            line_end = payload.find(b"\n", line_start)
+            if line_end < 0:
+                line_end = len(payload)
+            while position_index < len(normalized_positions) and normalized_positions[position_index] <= line_end:
+                lookup[normalized_positions[position_index]] = (line_start, line_end, line_number)
+                position_index += 1
+            if line_end == len(payload):
+                break
+            line_start = line_end + 1
+            line_number += 1
+        return lookup
+
+    @staticmethod
+    def _documentation_line_bounds(
+        payload: bytes,
+        position: int,
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
+    ) -> tuple[int, int, int]:
+        position = min(max(position, 0), len(payload))
+        if line_lookup is not None and (line_bounds := line_lookup.get(position)) is not None:
+            return line_bounds
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        return line_start, line_end, payload.count(b"\n", 0, line_start) + 1
+
+    @staticmethod
+    def _normalize_documentation_network_evidence_value(value: str) -> str:
+        normalized = value.strip().lstrip(DOCUMENTATION_NETWORK_EVIDENCE_LEADING_DELIMITERS)
+        normalized = normalized.rstrip(DOCUMENTATION_NETWORK_EVIDENCE_TRAILING_DELIMITERS)
+        if "://" in normalized:
+            normalized = redact_url_for_finding(normalized)
+        try:
+            parsed = urlsplit(normalized)
+        except ValueError:
+            return normalized.casefold()
+        if parsed.scheme and parsed.netloc:
+            return urlunsplit(
+                (
+                    parsed.scheme.casefold(),
+                    parsed.netloc.casefold(),
+                    parsed.path,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        return normalized.casefold()
+
+    @classmethod
+    def _documentation_network_evidence_from_span(
+        cls,
+        payload: bytes,
+        span_start: int,
+        span_end: int,
+        *,
+        kind: str,
+        value: str,
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
+    ) -> dict[str, Any]:
+        line_start, _line_end, line_number = cls._documentation_line_bounds(payload, span_start, line_lookup)
+        column = len(payload[line_start:span_start].decode("utf-8", errors="replace")) + 1
+        return {
+            "kind": kind,
+            "value": cls._normalize_documentation_network_evidence_value(value),
+            "line": line_number,
+            "column": column,
+            "span_start": span_start,
+            "span_end": span_end,
+        }
+
+    @staticmethod
+    def _documentation_url_scheme_byte_is_valid(value: int, *, first: bool = False) -> bool:
+        return (
+            (65 <= value <= 90)
+            or (97 <= value <= 122)
+            or (not first and ((48 <= value <= 57) or value in {ord("+"), ord("."), ord("-")}))
+        )
+
+    @classmethod
+    def _documentation_url_scheme_is_valid(cls, scheme: bytes) -> bool:
+        return (
+            bool(scheme)
+            and cls._documentation_url_scheme_byte_is_valid(scheme[0], first=True)
+            and all(cls._documentation_url_scheme_byte_is_valid(value) for value in scheme[1:])
+        )
+
+    @staticmethod
+    def _documentation_url_candidate_end(payload: bytes, span_start: int, line_end: int) -> int | None:
+        scan_end = min(line_end, span_start + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        span_end = span_start
+        while span_end < scan_end and payload[span_end] not in DOCUMENTATION_NETWORK_URL_BOUNDARY_BYTES:
+            span_end += 1
+        if (
+            span_end == scan_end
+            and span_end < line_end
+            and payload[span_end] not in DOCUMENTATION_NETWORK_URL_BOUNDARY_BYTES
+        ):
+            return None
+        return span_end
+
+    @classmethod
+    def _documentation_bare_url_span_at_position(
+        cls,
+        payload: bytes,
+        position: int,
+        line_start: int,
+        line_end: int,
+    ) -> tuple[int, int] | None:
+        if line_start >= line_end:
+            return None
+        position = min(max(position, line_start), line_end - 1)
+        separator_start = max(line_start, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        separator_end = min(
+            line_end,
+            position + DOCUMENTATION_NETWORK_URL_MAX_SCHEME_BYTES + len(b"://"),
+        )
+        matching_spans: list[tuple[int, int]] = []
+        seen_starts: set[int] = set()
+        separator = payload.find(b"://", separator_start, separator_end)
+        while separator >= 0:
+            candidate_starts: list[int] = []
+            if position <= separator and cls._documentation_url_scheme_is_valid(payload[position:separator]):
+                candidate_starts.append(position)
+
+            scheme_start = separator - 1
+            minimum_scheme_start = max(line_start, separator - DOCUMENTATION_NETWORK_URL_MAX_SCHEME_BYTES)
+            while scheme_start > minimum_scheme_start and cls._documentation_url_scheme_byte_is_valid(
+                payload[scheme_start - 1]
+            ):
+                scheme_start -= 1
+            if cls._documentation_url_scheme_is_valid(payload[scheme_start:separator]):
+                candidate_starts.append(scheme_start)
+
+            for candidate_start in candidate_starts:
+                if candidate_start in seen_starts:
+                    continue
+                seen_starts.add(candidate_start)
+                candidate_end = cls._documentation_url_candidate_end(payload, candidate_start, line_end)
+                if (
+                    candidate_end is not None
+                    and candidate_start <= position < candidate_end
+                    and BARE_NETWORK_URL_TOKEN_PATTERN.fullmatch(payload[candidate_start:candidate_end]) is not None
+                ):
+                    matching_spans.append((candidate_start, candidate_end))
+            separator = payload.find(b"://", separator + len(b"://"), separator_end)
+        if not matching_spans:
+            return None
+        return min(matching_spans, key=lambda span: (span[1] - span[0], -span[0]))
+
+    @classmethod
+    def _documentation_url_evidence_at_position(
+        cls,
+        payload: bytes,
+        position: int,
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
+    ) -> dict[str, Any] | None:
+        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position, line_lookup)
+        span = cls._documentation_bare_url_span_at_position(payload, position, line_start, line_end)
+        if span is not None:
+            span_start, span_end = span
+            raw_value = payload[span_start:span_end].decode("utf-8", errors="ignore")
+            return cls._documentation_network_evidence_from_span(
+                payload,
+                span_start,
+                span_end,
+                kind="url",
+                value=redact_url_for_finding(raw_value),
+                line_lookup=line_lookup,
+            )
+        return None
+
+    @classmethod
+    def _documentation_network_command_evidence(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
+    ) -> dict[str, Any] | None:
+        position = finding.get("position")
+        destination = finding.get("destination")
+        if not isinstance(position, int) or not isinstance(destination, str) or not destination:
+            return None
+
+        url_evidence = cls._documentation_url_evidence_at_position(payload, position, line_lookup)
+        if url_evidence is not None:
+            return url_evidence
+
+        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position, line_lookup)
+        line_position = position - line_start
+        destination_match = DOCUMENTATION_NETWORK_DESTINATION_TOKEN_PATTERN.match(
+            payload[line_start:line_end], line_position
+        )
+        if destination_match is None:
+            return None
+        return cls._documentation_network_evidence_from_span(
+            payload,
+            line_start + destination_match.start(),
+            line_start + destination_match.end(),
+            kind="destination",
+            value=destination,
+            line_lookup=line_lookup,
+        )
+
+    @staticmethod
+    def _documentation_network_command_is_correlatable(finding: dict[str, Any]) -> bool:
+        return finding.get("type") == "network_command" and finding.get("command_type") == "git_clone"
+
+    @classmethod
+    def _documentation_network_command_evidences(
+        cls,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        line_lookup: dict[int, tuple[int, int, int]],
+    ) -> list[dict[str, Any]]:
+        return [
+            evidence
+            for finding in findings
+            if cls._documentation_network_command_is_correlatable(finding)
+            if (evidence := cls._documentation_network_command_evidence(payload, finding, line_lookup)) is not None
+        ]
+
+    @staticmethod
+    def _documentation_network_evidence_at_position(
+        evidences: list[dict[str, Any]],
+        position: int,
+    ) -> dict[str, Any] | None:
+        matching_evidences = [
+            evidence for evidence in evidences if int(evidence["span_start"]) <= position < int(evidence["span_end"])
+        ]
+        if not matching_evidences:
+            return None
+        return min(matching_evidences, key=lambda evidence: int(evidence["span_end"]) - int(evidence["span_start"]))
+
+    @classmethod
+    def _documentation_network_finding_evidence(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+        command_evidences: list[dict[str, Any]],
+        line_lookup: dict[int, tuple[int, int, int]],
+    ) -> dict[str, Any] | None:
+        finding_type = finding.get("type")
+        position = finding.get("position")
+        if finding_type not in CORRELATABLE_DOCUMENTATION_NETWORK_FINDING_TYPES or not isinstance(position, int):
+            return None
+        if finding_type == "network_command" and not cls._documentation_network_command_is_correlatable(finding):
+            return None
+
+        url_evidence = cls._documentation_url_evidence_at_position(payload, position, line_lookup)
+        if url_evidence is not None:
+            if finding_type in {"cloud_storage_url", "url_detected"}:
+                finding_url = finding.get("url")
+                if isinstance(finding_url, str) and finding_url:
+                    normalized_finding_url = cls._normalize_documentation_network_evidence_value(finding_url)
+                    if str(url_evidence["value"]) != normalized_finding_url:
+                        return cls._documentation_network_evidence_from_span(
+                            payload,
+                            position,
+                            position + len(finding_url.encode("utf-8", errors="ignore")),
+                            kind="url",
+                            value=finding_url,
+                            line_lookup=line_lookup,
+                        )
+            return url_evidence
+
+        command_evidence = cls._documentation_network_evidence_at_position(command_evidences, position)
+        if command_evidence is not None:
+            return command_evidence
+
+        if finding_type == "network_command":
+            return cls._documentation_network_command_evidence(payload, finding, line_lookup)
+
+        if finding_type in {"domain", "domain_name"}:
+            value = finding.get("domain")
+            kind = "host"
+        elif finding_type in {"ipv4_address", "ipv6_address"}:
+            value = finding.get("ip")
+            kind = "ip"
+        elif finding_type in {"cloud_storage_url", "url_detected"}:
+            value = finding.get("url")
+            kind = "url"
+        else:
+            return None
+
+        if not isinstance(value, str) or not value:
+            return None
+        return cls._documentation_network_evidence_from_span(
+            payload,
+            position,
+            position + len(value.encode("utf-8", errors="ignore")),
+            kind=kind,
+            value=value,
+            line_lookup=line_lookup,
+        )
+
+    @staticmethod
+    def _documentation_network_finding_sort_key(finding: dict[str, Any], original_index: int) -> tuple[int, int, int]:
+        severity = str(finding.get("severity", "WARNING")).upper()
+        finding_type = str(finding.get("type", ""))
+        return (
+            DOCUMENTATION_NETWORK_FINDING_PRIORITY.get(finding_type, 0),
+            DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK.get(
+                severity,
+                DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK["WARNING"],
+            ),
+            -original_index,
+        )
+
+    @staticmethod
+    def _highest_documentation_network_severity(findings: list[dict[str, Any]]) -> str:
+        return max(
+            (str(finding.get("severity", "WARNING")).upper() for finding in findings),
+            key=lambda severity: DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK.get(
+                severity,
+                DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK["WARNING"],
+            ),
+        )
+
+    @staticmethod
+    def _documentation_network_evidence_fingerprint(evidence: dict[str, Any]) -> str:
+        material = "|".join(
+            (
+                "text-documentation-network-v1",
+                str(evidence["line"]),
+                str(evidence["column"]),
+                str(evidence["kind"]),
+                str(evidence["value"]),
+            )
+        )
+        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+        return f"text-doc-network:{digest}"
+
+    @staticmethod
+    def _documentation_network_related_finding(finding: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: finding[key]
+            for key in (
+                "type",
+                "severity",
+                "message",
+                "position",
+                "url",
+                "domain",
+                "ip",
+                "destination",
+                "command_type",
+                "provider",
+            )
+            if key in finding
+        }
+
+    @classmethod
+    def _annotate_documentation_network_finding(
+        cls,
+        finding: dict[str, Any],
+        evidence: dict[str, Any],
+        related_findings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        fingerprint = cls._documentation_network_evidence_fingerprint(evidence)
+        annotated = {
+            **finding,
+            "line": evidence["line"],
+            "column": evidence["column"],
+            "evidence_fingerprint": fingerprint,
+            "evidence_location": {
+                "line": evidence["line"],
+                "column": evidence["column"],
+                "span_start": evidence["span_start"],
+                "span_end": evidence["span_end"],
+            },
+            "normalized_evidence": {
+                "kind": evidence["kind"],
+                "value": evidence["value"],
+            },
+        }
+        if related_findings:
+            annotated["deduplicated_related_findings"] = related_findings
+            annotated["deduplicated_related_count"] = len(related_findings)
+        return annotated
+
+    @classmethod
+    def _deduplicate_documentation_network_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not cls._is_documentation_sidecar(path):
+            return findings
+
+        finding_positions = [position for finding in findings if isinstance((position := finding.get("position")), int)]
+        line_lookup = cls._documentation_line_bounds_lookup(payload, finding_positions)
+        command_evidences = cls._documentation_network_command_evidences(payload, findings, line_lookup)
+        grouped: dict[tuple[int, int, str, str], list[tuple[int, dict[str, Any], dict[str, Any]]]] = {}
+        ordered_items: list[tuple[str, int | tuple[int, int, str, str]]] = []
+        standalone: dict[int, dict[str, Any]] = {}
+        for index, finding in enumerate(findings):
+            evidence = cls._documentation_network_finding_evidence(payload, finding, command_evidences, line_lookup)
+            if evidence is None:
+                ordered_items.append(("standalone", index))
+                standalone[index] = finding
+                continue
+            key = (
+                int(evidence["line"]),
+                int(evidence["column"]),
+                str(evidence["kind"]),
+                str(evidence["value"]),
+            )
+            if key not in grouped:
+                ordered_items.append(("group", key))
+            grouped.setdefault(key, []).append((index, finding, evidence))
+
+        deduplicated: list[dict[str, Any]] = []
+        emitted_keys: set[tuple[int, int, str, str]] = set()
+        for item_type, item_value in ordered_items:
+            if item_type == "standalone":
+                assert isinstance(item_value, int)
+                deduplicated.append(standalone[item_value])
+                continue
+            assert not isinstance(item_value, int)
+            key = item_value
+            if key in emitted_keys:
+                continue
+            emitted_keys.add(key)
+            entries = grouped[key]
+            representative_index, representative, representative_evidence = max(
+                entries,
+                key=lambda entry: cls._documentation_network_finding_sort_key(entry[1], entry[0]),
+            )
+            severity = cls._highest_documentation_network_severity([entry[1] for entry in entries])
+            if str(representative.get("severity", "WARNING")).upper() != severity:
+                representative = {**representative, "severity": severity}
+            related_findings = [
+                cls._documentation_network_related_finding(related)
+                for related_index, related, _evidence in entries
+                if related_index != representative_index
+            ]
+            deduplicated.append(
+                cls._annotate_documentation_network_finding(
+                    representative,
+                    representative_evidence,
+                    related_findings,
+                )
+            )
+        return deduplicated
+
     @classmethod
     def _downgrade_sidecar_network_findings(
         cls,
         path: str,
         payload: bytes,
         findings: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, set[str]]:
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
+        classification_limit_sources: set[str] = set()
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
+        tokenizer_vocabulary_sidecar = cls._has_line_oriented_tokenizer_vocabulary_evidence(path, payload)
         last_retargetable_index = max(
             (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
             default=-1,
@@ -1605,10 +3259,50 @@ class TextScanner(BaseScanner):
                     index == last_retargetable_index,
                 )
                 classification_incomplete = classification_incomplete or retarget_incomplete
+                if retarget_incomplete:
+                    classification_limit_sources.add("documentation")
+            if tokenizer_vocabulary_sidecar:
+                retargeted_finding, tokenizer_retarget_incomplete = (
+                    cls._retarget_or_omit_tokenizer_vocabulary_cc_finding(payload, finding)
+                )
+                classification_incomplete = classification_incomplete or tokenizer_retarget_incomplete
+                retarget_incomplete = retarget_incomplete or tokenizer_retarget_incomplete
+                if tokenizer_retarget_incomplete:
+                    classification_limit_sources.add("tokenizer_vocabulary")
+                if retargeted_finding is None:
+                    continue
+                finding = retargeted_finding
             if not retarget_incomplete and cls._sidecar_network_finding_is_informational(path, payload, finding):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
-        return classified_findings, classification_incomplete
+        return classified_findings, classification_incomplete, classification_limit_sources
+
+    @classmethod
+    def _downgrade_sidecar_secret_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        *,
+        max_findings: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        if not cls._is_passive_data_sidecar(path):
+            return findings, None
+
+        findings = [
+            finding
+            for finding in findings
+            if not cls._is_bare_data_secret_token(payload, finding)
+            or cls._passive_data_bare_secret_finding_is_actionable(payload, finding)
+        ]
+        # Whole-line Basic/Bearer matches in passive sidecars can be real credentials.
+        passive_findings, finding_limit = cls._passive_data_auth_line_secret_findings(
+            path,
+            payload,
+            findings,
+            max_findings=max_findings,
+        )
+        return findings + passive_findings, finding_limit
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
@@ -1703,6 +3397,14 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 secret_findings, finding_limit = self._split_detector_finding_limit(secret_findings)
+                secret_findings, passive_finding_limit = self._downgrade_sidecar_secret_findings(
+                    path,
+                    inspected_payload,
+                    secret_findings,
+                    max_findings=max_findings,
+                )
+                if finding_limit is None:
+                    finding_limit = passive_finding_limit
                 if secret_findings or not truncated:
                     self.add_embedded_secret_findings(secret_findings, result, context=path)
                 if finding_limit is not None:
@@ -1738,7 +3440,14 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
-                network_findings, classification_incomplete = self._downgrade_sidecar_network_findings(
+                network_findings, classification_incomplete, classification_limit_sources = (
+                    self._downgrade_sidecar_network_findings(
+                        classification_path,
+                        inspected_payload,
+                        network_findings,
+                    )
+                )
+                network_findings = self._deduplicate_documentation_network_findings(
                     classification_path,
                     inspected_payload,
                     network_findings,
@@ -1747,14 +3456,34 @@ class TextScanner(BaseScanner):
                     self.add_network_communication_findings(network_findings, result, context=path)
                 if classification_incomplete:
                     detector_incomplete = True
+                    classification_limits = {
+                        "documentation": MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES,
+                        "tokenizer_vocabulary": MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES,
+                    }
+                    active_classification_limits = [
+                        classification_limits[source]
+                        for source in classification_limit_sources
+                        if source in classification_limits
+                    ]
+                    classification_details: dict[str, Any] = {
+                        "classification_limit_sources": sorted(classification_limit_sources),
+                    }
+                    if len(active_classification_limits) == 1:
+                        classification_details["max_classification_occurrences"] = active_classification_limits[0]
+                    if "documentation" in classification_limit_sources:
+                        classification_details["max_documentation_classification_occurrences"] = (
+                            MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
+                        )
+                    if "tokenizer_vocabulary" in classification_limit_sources:
+                        classification_details["max_tokenizer_vocabulary_cc_retarget_occurrences"] = (
+                            MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES
+                        )
                     self._mark_content_security_scan_incomplete(
                         result,
                         path,
                         reason=TEXT_CONTENT_SECURITY_CLASSIFICATION_LIMIT_REASON,
-                        message="Documentation network finding classification exceeded the work limit",
-                        details={
-                            "max_classification_occurrences": MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES,
-                        },
+                        message="Text network finding classification exceeded the work limit",
+                        details=classification_details,
                     )
                 if finding_limit is not None:
                     if self._passive_network_reporting_limit(
@@ -1891,7 +3620,7 @@ class TextScanner(BaseScanner):
                     details={"file_type": "documentation"},
                     rule_code=None,  # Passing check
                 )
-            elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt"]:
+            elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt", "merges.txt"]:
                 result.add_check(
                     name="File Type Identification",
                     passed=True,
