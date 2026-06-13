@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - validate SafeTensors index-driven zero-based shard families, prefixed remote indexes, and one-generation authority across streamed or explicit scans without widening selected scanners to foreign shard formats, suppressing overlap-capable routes, trusting names without index authority, exposing transient descriptor paths, or accepting post-pin source changes
+- treat dotted package versions in README and model-card pip install commands as informational without downgrading active URLs
 - bound embedded Python assignment-line probes, deduplicate exact extraction windows, and fast-path proven passive priority references without weakening incomplete-analysis reporting
 - avoid CLI crashes when redirected stdout or stderr use legacy encodings that cannot represent styled separator glyphs
 - suppress canonical PyTorch tensor rebuild warnings only inside validated unloaded-runtime ZIP storage context when paired with the coordinated `modelaudit-picklescan` fix, while older allowed picklescan versions continue to fail closed with the warning
