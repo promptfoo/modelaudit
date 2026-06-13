@@ -925,7 +925,7 @@ def _remote_safetensors_filename_shard_details_by_file(
     """Return per-shard filename coverage details derived from the immutable repository listing."""
     from modelaudit.utils.file.handlers import ShardedModelDetector, _summarize_missing_shard_indices
 
-    grouped: dict[tuple[str, str, int], dict[str, Any]] = {}
+    grouped: dict[tuple[str, str, int], dict[int, list[str]]] = {}
     selected = set(model_files)
     for filename in repo_files:
         match = ShardedModelDetector.match_shard_filename(PurePosixPath(filename).name)
@@ -943,13 +943,10 @@ def _remote_safetensors_filename_shard_details_by_file(
             continue
         parent = PurePosixPath(filename).parent.as_posix()
         key = (parent, pattern, expected_total)
-        entry = grouped.setdefault(key, {"expected_total_shards": expected_total, "by_index": {}, "filenames": []})
-        entry["filenames"].append(filename)
-        entry["by_index"].setdefault(shard_index, []).append(filename)
+        grouped.setdefault(key, {}).setdefault(shard_index, []).append(filename)
 
     details_by_file: dict[str, dict[str, Any]] = {}
-    for (_parent, pattern, expected_total), entry in grouped.items():
-        by_index = cast(dict[int, list[str]], entry["by_index"])
+    for (_parent, pattern, expected_total), by_index in grouped.items():
         missing_indices, missing_count, missing_truncated = _summarize_missing_shard_indices(
             set(by_index), expected_total
         )
@@ -5056,11 +5053,6 @@ def download_model_streaming(
         def scan_remote_safetensors(filename: str) -> Any:
             nonlocal downloaded_total_size
             declared_size = selected_sizes[filename]
-            if size_limit is not None and downloaded_total_size + 8 > size_limit:
-                raise ValueError(
-                    f"Cannot stream {repo_id}: remote SafeTensors header preflight for {filename} "
-                    f"would exceed max size {size_limit} bytes"
-                )
             scan_result = _scan_remote_huggingface_safetensors_header(
                 repo_id,
                 filename,
@@ -5072,12 +5064,7 @@ def download_model_streaming(
                 scanner_config=scanner_config,
                 active_scanner_ids=scannable_scanner_ids,
             )
-            transferred = scan_result.metadata.get("remote_bytes_transferred", scan_result.bytes_scanned)
-            transferred_bytes = (
-                transferred
-                if isinstance(transferred, int) and not isinstance(transferred, bool) and transferred >= 0
-                else scan_result.bytes_scanned
-            )
+            transferred_bytes = scan_result.bytes_scanned
             if size_limit is not None and downloaded_total_size + transferred_bytes > size_limit:
                 raise ValueError(
                     f"Cannot stream {repo_id}: remote SafeTensors header bytes plus prior downloads "

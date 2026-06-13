@@ -632,27 +632,6 @@ class SafeTensorsScanner(BaseScanner):
     def _is_unreadable_path_result(result: ScanResult) -> bool:
         return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
 
-    @staticmethod
-    def _is_file_type_validation_record(record: Any) -> bool:
-        details = getattr(record, "details", None)
-        return getattr(record, "name", None) == "File Type Validation" or (
-            isinstance(details, dict) and details.get("security_check") == "file_type_validation"
-        )
-
-    def _suppress_remote_stub_file_type_validation(self) -> None:
-        validation_result = self._path_validation_result
-        if validation_result is None:
-            return
-
-        validation_result.checks = [
-            check for check in validation_result.checks if not self._is_file_type_validation_record(check)
-        ]
-        validation_result.issues = [
-            issue for issue in validation_result.issues if not self._is_file_type_validation_record(issue)
-        ]
-        if not validation_result.checks and not validation_result.issues:
-            self._path_validation_result = None
-
     @classmethod
     def _finish_read_failure(cls, result: ScanResult, path: str, error: OSError) -> ScanResult:
         cls._mark_inconclusive(result, SAFETENSORS_READ_INCONCLUSIVE_REASON)
@@ -1354,7 +1333,6 @@ class SafeTensorsScanner(BaseScanner):
             return path_check_result
 
         if remote_header_only:
-            self._suppress_remote_stub_file_type_validation()
             if self._path_validation_result is None:
                 self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             remote_integrity = self.config.get(_REMOTE_HEADER_INTEGRITY_CONFIG_KEY)
@@ -1466,15 +1444,7 @@ class SafeTensorsScanner(BaseScanner):
                     )
                     result.metadata["analysis_incomplete"] = True
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON)
-                    remote_bytes_scanned = self.config.get(_REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY)
-                    result.bytes_scanned = (
-                        remote_bytes_scanned
-                        if remote_header_only
-                        and isinstance(remote_bytes_scanned, int)
-                        and not isinstance(remote_bytes_scanned, bool)
-                        and remote_bytes_scanned >= 0
-                        else file_size
-                    )
+                    result.bytes_scanned = scanned_bytes_for_result()
                     result.finish(success=False)
                     return result
 
@@ -1936,15 +1906,7 @@ class SafeTensorsScanner(BaseScanner):
                 # Bytes scanned = file size for local scans. Remote header-only scans
                 # report transferred header bytes while retaining the declared file size
                 # in metadata.
-                remote_bytes_scanned = self.config.get(_REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY)
-                result.bytes_scanned = (
-                    remote_bytes_scanned
-                    if remote_header_only
-                    and isinstance(remote_bytes_scanned, int)
-                    and not isinstance(remote_bytes_scanned, bool)
-                    and remote_bytes_scanned >= 0
-                    else file_size
-                )
+                result.bytes_scanned = scanned_bytes_for_result()
 
         except OSError as e:
             return self._finish_read_failure(result, path, e)

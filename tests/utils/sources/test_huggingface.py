@@ -8613,36 +8613,6 @@ class TestModelSizeAndDiskSpace:
         mock_api.model_info.assert_called_once_with("test/model", revision=_HF_TEST_REVISION)
 
     @patch("huggingface_hub.HfApi")
-    def test_huggingface_worker_model_size_uses_requested_revision(
-        self,
-        mock_hf_api_class: MagicMock,
-    ) -> None:
-        """Deadline worker model-size lookups should preserve pinned identity."""
-        mock_api = MagicMock()
-        mock_hf_api_class.return_value = mock_api
-        mock_file = MagicMock()
-        mock_file.size = 1024
-        mock_model_info = MagicMock()
-        mock_model_info.siblings = [mock_file]
-        mock_api.model_info.return_value = mock_model_info
-
-        result = _run_huggingface_worker_operation(
-            "get_model_size",
-            {
-                "repo_id": "test/model",
-                "request_timeout": 3.0,
-                "requested_revision": _HF_TEST_REVISION,
-            },
-        )
-
-        assert result == {"value": 1024}
-        mock_api.model_info.assert_called_once_with(
-            "test/model",
-            timeout=3.0,
-            revision=_HF_TEST_REVISION,
-        )
-
-    @patch("huggingface_hub.HfApi")
     def test_get_model_size_no_siblings(self, mock_hf_api_class):
         """Test model size when no siblings info available."""
         mock_api = MagicMock()

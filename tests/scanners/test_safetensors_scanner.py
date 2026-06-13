@@ -257,33 +257,6 @@ def test_remote_invalid_header_length_does_not_hash_sparse_stub(
     assert integrity_check.status == CheckStatus.PASSED
 
 
-def test_remote_header_only_suppresses_sparse_stub_file_type_validation(tmp_path: Path) -> None:
-    file_path = tmp_path / "remote-header.safetensors"
-    header = {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}
-    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    file_path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + b"\0")
-    format_validation = {
-        "path": os.path.abspath(file_path),
-        "file_type_valid": False,
-        "header_format": "pickle_routing_inconclusive",
-        "extension_format": "safetensors",
-    }
-
-    result = SafeTensorsScanner(
-        config={
-            FORMAT_VALIDATION_CONFIG_KEY: format_validation,
-            _REMOTE_HEADER_ONLY_CONFIG_KEY: True,
-            _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY: 8 + len(header_bytes),
-            _REMOTE_HEADER_INTEGRITY_CONFIG_KEY: {"range_semantics": "strict_206_content_range"},
-        }
-    ).scan(str(file_path))
-
-    assert result.success is True
-    assert result.issues == []
-    assert not any(check.name == "File Type Validation" for check in result.checks)
-    assert result.metadata["remote_header_only"] is True
-
-
 def test_tensor_cardinality_limit_bounds_result_amplification(tmp_path: Path) -> None:
     file_path = tmp_path / "many-tensors.safetensors"
     header = {f"tensor_{index}": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]} for index in range(5000)}
