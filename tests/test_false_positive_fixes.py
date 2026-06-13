@@ -7,8 +7,12 @@ false positive security alerts while maintaining detection of real threats.
 
 import contextlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -286,7 +290,7 @@ class TestFalsePositiveFixes:
         has_extreme = any("extremely large weight values" in a["description"] for a in anomalies)
         assert has_outlier or has_extreme, "Should detect the injected anomaly"
 
-    def test_bert_model_no_false_positive_executables(self, tmp_path):
+    def test_bert_model_no_false_positive_executables(self, tmp_path: Path) -> None:
         """Test that BERT models with random MZ bytes don't trigger false positives."""
         if not HAS_TORCH:
             pytest.skip("torch not installed")
@@ -320,10 +324,13 @@ class TestFalsePositiveFixes:
             f.write(modified_data)
 
         # Scan the file
-        result = self._run_cli_scan(str(bert_file))
+        result = self._run_cli_scan_subprocess(str(bert_file))
 
         # Should not flag as executable
-        assert result["exit_code"] == 0, "BERT model with random MZ bytes should not be flagged"
+        assert result["exit_code"] == 0, (
+            "BERT model with random MZ bytes should not be flagged; "
+            f"issues={result['issues']!r}; stdout={result['stdout']!r}; stderr={result['stderr']!r}"
+        )
         assert not any("Windows executable" in issue.get("message", "") for issue in result["issues"]), (
             "Should not detect Windows executable in BERT model"
         )
@@ -423,7 +430,7 @@ class TestFalsePositiveFixes:
             f"{[str(issue) for issue in scan_result.issues]}"
         )
 
-    def test_comprehensive_gpt2_model_scan(self, tmp_path):
+    def test_comprehensive_gpt2_model_scan(self, tmp_path: Path) -> None:
         """Comprehensive test simulating a complete GPT-2 model directory scan."""
         # Create a realistic GPT-2 model directory structure
         model_dir = tmp_path / "gpt2_model"
@@ -496,12 +503,84 @@ class TestFalsePositiveFixes:
                 optimizer_weights.create_dataset("iteration:0", data=[1000])
 
         # Scan the entire directory
-        result = self._run_cli_scan(str(model_dir))
+        result = self._run_cli_scan_subprocess(str(model_dir))
 
         # Should complete with no issues
-        assert result["exit_code"] == 0, "Complete GPT-2 model directory should scan clean"
+        assert result["exit_code"] == 0, (
+            "Complete GPT-2 model directory should scan clean; "
+            f"issues={result['issues']!r}; stdout={result['stdout']!r}; stderr={result['stderr']!r}"
+        )
         assert result["has_warnings"] is False, "GPT-2 model should not have warnings"
         assert result["has_errors"] is False, "GPT-2 model should not have errors"
+
+    def test_cli_subprocess_scan_forces_utf8_output_encoding(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fresh CLI subprocess scans must not inherit a legacy stdout encoding."""
+        monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+        model_dir = tmp_path / "gpt2_model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "gpt2", "architectures": ["GPT2LMHeadModel"]}),
+            encoding="utf-8",
+        )
+
+        result = self._run_cli_scan_subprocess(str(model_dir))
+
+        assert result["exit_code"] == 0, (
+            "CLI subprocess should force UTF-8 output even when parent requests cp1252; "
+            f"issues={result['issues']!r}; stdout={result['stdout']!r}; stderr={result['stderr']!r}"
+        )
+
+    def test_real_cli_scan_survives_legacy_cp1252_output_encoding(self, tmp_path: Path) -> None:
+        """The production CLI should not crash on decorative text under cp1252 stdout."""
+        model_dir = tmp_path / "gpt2_model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "gpt2", "architectures": ["GPT2LMHeadModel"]}),
+            encoding="utf-8",
+        )
+        output_file = tmp_path / "report.json"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "\n".join(
+                    [
+                        "import runpy",
+                        "import sys",
+                        "if sys.platform == 'darwin':",
+                        "    import modelaudit.cli as cli",
+                        "    cli._darwin_fd_has_extended_acl = lambda _fd: False",
+                        "sys.argv = [",
+                        "    'modelaudit', 'scan', sys.argv[1],",
+                        "    '--format', 'json', '--output', sys.argv[2],",
+                        "]",
+                        "runpy.run_module('modelaudit', run_name='__main__')",
+                    ]
+                ),
+                str(model_dir),
+                str(output_file),
+            ],
+            check=False,
+            capture_output=True,
+            encoding="cp1252",
+            env={
+                **os.environ,
+                "PROMPTFOO_DISABLE_TELEMETRY": "1",
+                "NO_ANALYTICS": "1",
+                "PYTHONIOENCODING": "cp1252",
+            },
+        )
+
+        assert completed.returncode == 0, (
+            "CLI should tolerate legacy cp1252 redirected output; "
+            f"stdout={completed.stdout!r}; stderr={completed.stderr!r}"
+        )
+        assert "\\u2500" in completed.stdout
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        assert report.get("issues") == []
+        assert report.get("files_scanned", 0) >= 1
 
     def _run_cli_scan(self, path):
         """Helper method to run CLI scan and parse results."""
@@ -566,5 +645,64 @@ class TestFalsePositiveFixes:
 
         finally:
             # Clean up
+            with contextlib.suppress(FileNotFoundError):
+                Path(output_file).unlink()
+
+    def _run_cli_scan_subprocess(self, path: str) -> dict[str, Any]:
+        """Run CLI scan in a fresh process so fixture imports do not pollute scanner state."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            output_file = str(Path(f.name).resolve())
+
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "\n".join(
+                        [
+                            "import sys",
+                            "import modelaudit.cli as cli",
+                            "if sys.platform == 'darwin':",
+                            "    cli._darwin_fd_has_extended_acl = lambda _fd: False",
+                            "sys.argv = [",
+                            "    'modelaudit', 'scan', sys.argv[1],",
+                            "    '--format', 'json', '--output', sys.argv[2],",
+                            "]",
+                            "cli.main()",
+                        ]
+                    ),
+                    path,
+                    output_file,
+                ],
+                check=False,
+                capture_output=True,
+                encoding="utf-8",
+                env={
+                    **os.environ,
+                    "PROMPTFOO_DISABLE_TELEMETRY": "1",
+                    "NO_ANALYTICS": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                },
+            )
+            try:
+                with open(output_file) as f:
+                    scan_results = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                scan_results = {"issues": []}
+
+            issues = scan_results.get("issues", [])
+            has_warnings = any(issue.get("severity") in ["warning", "critical"] for issue in issues)
+            has_errors = any(issue.get("severity") == "critical" for issue in issues)
+
+            return {
+                "exit_code": completed.returncode,
+                "has_warnings": has_warnings,
+                "has_errors": has_errors,
+                "issues": issues,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+
+        finally:
             with contextlib.suppress(FileNotFoundError):
                 Path(output_file).unlink()
