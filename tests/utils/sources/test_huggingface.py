@@ -6414,6 +6414,56 @@ class TestModelDownloadStreaming:
             ANY,
         )
 
+    def test_select_streamable_hf_files_skips_indexed_zero_based_shard_before_onnx_probe(self) -> None:
+        """A validated zero-based family excluded by selection must not reach content probing."""
+        repo_files = [
+            "model.onnx",
+            "model.safetensors.index.json",
+            "model-00000-of-00001.safetensors",
+        ]
+        index_payload = json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}).encode()
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(index_payload)),
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                return_value=None,
+            ) as mock_detect_content,
+        ):
+            selection = _select_streamable_hf_files(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert selection.filenames == ["model.onnx"]
+        assert [call.args[1] for call in mock_detect_content.call_args_list] == ["model.safetensors.index.json"]
+
+    def test_select_streamable_hf_files_probes_unindexed_zero_based_shard(self) -> None:
+        """A zero-based name without index authority must remain an unskippable probe candidate."""
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                return_value="safetensors",
+            ) as mock_detect_content,
+            pytest.raises(ValueError, match="detected SafeTensors shard candidates"),
+        ):
+            _select_streamable_hf_files(
+                "test/model",
+                ["model.onnx", "model-00000-of-00001.safetensors"],
+                _HF_TEST_REVISION,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        mock_detect_content.assert_called_once_with(
+            "test/model",
+            "model-00000-of-00001.safetensors",
+            _HF_TEST_REVISION,
+            ANY,
+        )
+
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(

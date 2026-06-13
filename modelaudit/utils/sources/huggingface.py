@@ -1677,6 +1677,7 @@ def _validate_remote_safetensors_indexes(
     allow_index_expansion: bool = True,
     allow_content_probes: bool = True,
     validated_index_files: list[str] | None = None,
+    validated_target_files: set[str] | None = None,
 ) -> list[str]:
     """Validate and expand selected SafeTensors shard inventories when enabled."""
     from modelaudit.utils.file.handlers import (
@@ -1858,6 +1859,8 @@ def _validate_remote_safetensors_indexes(
                 selected_files.add(target_file)
         if validated_index_files is not None and index_file not in validated_index_files:
             validated_index_files.append(index_file)
+        if validated_target_files is not None:
+            validated_target_files.update(target_files)
         probe_budget.check_deadline(repo_id)
 
     return updated_model_files
@@ -2101,10 +2104,22 @@ def _hf_safetensors_shard_excluded_by_selection(
     complete_safetensors_shard_files: Collection[str] | None = None,
 ) -> bool:
     """Return whether no selected scanner can claim a declared SafeTensors shard."""
-    if _parse_hf_safetensors_shard(filename) is None:
+    validated_complete_shard = complete_safetensors_shard_files is not None and (
+        filename in complete_safetensors_shard_files
+    )
+    if _parse_hf_safetensors_shard(filename) is None and not validated_complete_shard:
         return False
-    if complete_safetensors_shard_files is not None and filename not in complete_safetensors_shard_files:
+    if complete_safetensors_shard_files is not None and not validated_complete_shard:
         return False
+
+    return _hf_safetensors_routes_excluded_by_selection(selected_route_scanner_ids, selected_route_formats)
+
+
+def _hf_safetensors_routes_excluded_by_selection(
+    selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
+) -> bool:
+    """Return whether the selected routes cannot consume SafeTensors content."""
 
     # SafeTensors content routes intentionally include overlap-capable scanners
     # such as pickle and compressed, not only the SafeTensors scanner itself.
@@ -2153,6 +2168,18 @@ def _complete_hf_safetensors_shard_files(repo_files: Collection[str]) -> frozens
         for filenames in indexed_files.values():
             complete_files.update(filenames)
     return frozenset(complete_files)
+
+
+def _zero_based_hf_safetensors_shard_candidates(repo_files: Collection[str]) -> list[str]:
+    """Return zero-indexed shard-shaped files that require index authority."""
+    candidates: list[str] = []
+    for filename in repo_files:
+        match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(filename)
+        if match is None:
+            continue
+        if int(match.group("index")) == 0 and int(match.group("total")) > 0:
+            candidates.append(filename)
+    return list(dict.fromkeys(candidates))
 
 
 def _hf_detected_format_excluded_by_selected_route_formats(
@@ -2251,11 +2278,13 @@ def _streamable_hf_content_probe_candidates(
     selected_route_scanner_ids: set[str] | None,
     selected_route_formats: set[str] | None,
     exact_openvino_companion_candidates: Collection[str],
+    complete_safetensors_shard_files: Collection[str] | None = None,
 ) -> list[str]:
     """Return streaming files that the renamed-file sniff loop would inspect."""
     processed_files = set(selected_files)
     exact_openvino_companion_candidate_set = set(exact_openvino_companion_candidates)
-    complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
+    if complete_safetensors_shard_files is None:
+        complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
     candidates: list[str] = []
     for file_name in repo_files:
         if file_name in processed_files:
@@ -2364,6 +2393,34 @@ def _select_streamable_hf_files(
             model_files.append(file_name)
 
     probe_budget: _HuggingFaceProbeBudget | None = None
+    complete_safetensors_shard_files = set(_complete_hf_safetensors_shard_files(repo_files))
+    selected_safetensors_indexes = {
+        filename for filename in model_files if PurePosixPath(filename).name == _HF_SAFETENSORS_INDEX_FILENAME
+    }
+    if (
+        sniff_renamed_files
+        and not selected_safetensors_indexes
+        and _hf_safetensors_routes_excluded_by_selection(
+            selected_route_scanner_ids,
+            selected_route_formats,
+        )
+    ):
+        zero_based_candidates = _zero_based_hf_safetensors_shard_candidates(repo_files)
+        if zero_based_candidates:
+            probe_budget = _HuggingFaceProbeBudget(
+                remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
+                deadline=deadline,
+            )
+            validated_zero_based_targets: set[str] = set()
+            _validate_remote_safetensors_indexes(
+                repo_id,
+                repo_files,
+                revision,
+                zero_based_candidates,
+                probe_budget,
+                validated_target_files=validated_zero_based_targets,
+            )
+            complete_safetensors_shard_files.update(validated_zero_based_targets)
     exact_openvino_companion_candidates = (
         {
             companion
@@ -2381,16 +2438,18 @@ def _select_streamable_hf_files(
             selected_route_scanner_ids,
             selected_route_formats,
             exact_openvino_companion_candidates,
+            complete_safetensors_shard_files,
         )
         if candidate_files:
             _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
 
     if sniff_renamed_files:
         inspected_files = 0
-        probe_budget = _HuggingFaceProbeBudget(
-            remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
-            deadline=deadline,
-        )
+        if probe_budget is None:
+            probe_budget = _HuggingFaceProbeBudget(
+                remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
+                deadline=deadline,
+            )
         unskippable_detected_safetensors_shards: list[str] = []
         for file_name in _streamable_hf_content_probe_candidates(
             repo_files,
@@ -2398,6 +2457,7 @@ def _select_streamable_hf_files(
             selected_route_scanner_ids,
             selected_route_formats,
             exact_openvino_companion_candidates,
+            complete_safetensors_shard_files,
         ):
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
