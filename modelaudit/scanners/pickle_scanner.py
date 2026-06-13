@@ -8,19 +8,20 @@ import hashlib
 import io
 import pickletools
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar, TextIO, cast
 
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
+from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
-from ..scanner_results import mark_inconclusive_scan_result
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
+from ..scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, Check, Issue, mark_inconclusive_scan_result
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
@@ -39,10 +40,16 @@ _MIN_JAX_PICKLE_SCAN_LIMIT_BYTES = 1024
 _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES = 1 * 1024 * 1024
 _MAX_METADATA_PICKLE_READ_BYTES = 10 * 1024 * 1024
 _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
+_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE = "joblib.numpy_pickle"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME = "NumpyArrayWrapper"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE = f"{_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE}.{_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME}"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_PICKLE_MARKER = b"joblib.numpy_pickle\nNumpyArrayWrapper"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES = 10 * 1024 * 1024
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
 _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
 _HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
 _IPV4_DOT_DIGIT_RE = re.compile(rb"\d\.\d")
+_LOCATION_POSITION_RE = re.compile(r"\(pos (?P<position>\d+)\)\s*$")
 _MAX_RAW_ENCODED_TOKENS = 64
 _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
@@ -55,6 +62,8 @@ _PYTORCH_LEGACY_PROTOCOL_VERSION = 1001
 _PYTORCH_LEGACY_STREAM_COUNT = 5
 _PYTORCH_LEGACY_MAGIC_BINARY = _PYTORCH_LEGACY_MAGIC_NUMBER.to_bytes(10, "little")
 _PYTORCH_LEGACY_MAGIC_DECIMAL = str(_PYTORCH_LEGACY_MAGIC_NUMBER).encode("ascii")
+_PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES = 128
+_PYTORCH_LEGACY_INITIAL_LAYOUT_PROBE_BYTES = 512
 _PYTORCH_LEGACY_SYS_INFO_KEYS = frozenset({"protocol_version", "little_endian", "type_sizes"})
 _PYTORCH_LEGACY_MAX_CONTROL_BYTES = 10 * 1024 * 1024
 _PYTORCH_LEGACY_MAX_STORAGE_KEYS = 10_000
@@ -82,7 +91,8 @@ _PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES = {
     "UntypedStorage": 1,
 }
 _PYTORCH_LEGACY_PROTOCOL0_STORAGE_PID_RE = re.compile(
-    r"^\('storage', <class 'torch(?:\.storage)?\.(?P<storage_name>[A-Za-z0-9_]+Storage)'>, "
+    r"^\('storage', <class 'torch(?P<storage_module>\.storage)?\."
+    r"(?P<storage_name>[A-Za-z0-9_]+Storage)'>, "
     r"'(?P<key>[0-9]{1,128})', '(?P<location>[^']+)', (?P<element_count>[0-9]{1,20}), "
     r"(?P<view_metadata>None|\('[0-9]{1,128}', (?P<view_offset>[0-9]{1,20}), "
     r"(?P<view_size>[0-9]{1,20})\))\)$"
@@ -343,6 +353,10 @@ _PYTORCH_LEGACY_SYS_INFO_OPCODES = frozenset(
         *_PICKLE_STRING_OPCODE_NAMES,
     }
 )
+_PYTORCH_LEGACY_SYS_INFO_PROTOCOLS = frozenset({2, 3, 4, 5})
+_PICKLE_PROTO_OPCODE = 0x80
+_PICKLE_FRAME_OPCODE = 0x95
+_PICKLE_EMPTY_DICT_OPCODE = ord("}")
 _PYTORCH_LEGACY_STORAGE_KEY_OPCODES = frozenset(
     {
         "PROTO",
@@ -437,6 +451,8 @@ class _RootStreamPayloadRead:
     payload: bytes
     truncated: bool
     read_limit: int
+    requested_bytes: int
+    short_read: bool
 
 
 @dataclass(frozen=True)
@@ -451,12 +467,22 @@ class _LegacyPyTorchStorageRecord:
     key: str
     element_count: int
     element_size: int
+    storage_type_module: str
+    storage_type_name: str
+    storage_type_position: int | None = None
+
+
+@dataclass(frozen=True)
+class _LegacyPyTorchStoragePersistentIdRecord:
+    position: int
+    record: _LegacyPyTorchStorageRecord
 
 
 @dataclass(frozen=True)
 class _LegacyPickleGlobalRef:
     module: str
     name: str
+    position: int | None
 
 
 @dataclass(frozen=True)
@@ -464,6 +490,7 @@ class _LegacyPyTorchStreamLayout:
     boundaries: tuple[tuple[int, int], ...]
     storage_keys: tuple[str, ...]
     storage_records: tuple[_LegacyPyTorchStorageRecord, ...] | None
+    storage_persistent_ids: tuple[_LegacyPyTorchStoragePersistentIdRecord, ...] = ()
     storage_end: int | None = None
 
     @property
@@ -758,6 +785,129 @@ def _legacy_pytorch_storage_keys(data: bytes) -> tuple[str, ...] | None:
     return tuple(keys) if _pickle_stack_is_valid(data) else None
 
 
+def _legacy_pytorch_nonnegative_int(value: str) -> int | None:
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if 0 <= parsed <= (1 << 63) - 1 else None
+
+
+def _legacy_pytorch_protocol0_storage_record(
+    pid: str,
+    *,
+    expected_keys: set[str] | None,
+) -> tuple[bool, _LegacyPyTorchStorageRecord | None]:
+    if not pid.startswith("('storage',"):
+        return False, None
+    match = _PYTORCH_LEGACY_PROTOCOL0_STORAGE_PID_RE.match(pid)
+    if match is None:
+        return True, None
+
+    storage_name = match.group("storage_name")
+    key = match.group("key")
+    location = match.group("location")
+    element_count = _legacy_pytorch_nonnegative_int(match.group("element_count"))
+    if (
+        storage_name not in _PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES
+        or (expected_keys is not None and key not in expected_keys)
+        or not location
+        or element_count is None
+    ):
+        return True, None
+
+    if match.group("view_metadata") != "None":
+        view_offset = _legacy_pytorch_nonnegative_int(match.group("view_offset"))
+        view_size = _legacy_pytorch_nonnegative_int(match.group("view_size"))
+        if (
+            view_offset is None
+            or view_size is None
+            or view_offset > element_count
+            or view_size > element_count - view_offset
+        ):
+            return True, None
+
+    storage_module = "torch.storage" if match.group("storage_module") else "torch"
+    return (
+        True,
+        _LegacyPyTorchStorageRecord(
+            key=key,
+            element_count=element_count,
+            element_size=_PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES[storage_name],
+            storage_type_module=storage_module,
+            storage_type_name=storage_name,
+            storage_type_position=None,
+        ),
+    )
+
+
+def _legacy_pytorch_storage_record_from_pid(
+    pid: object,
+    *,
+    expected_keys: set[str] | None,
+) -> tuple[bool, _LegacyPyTorchStorageRecord | None]:
+    if isinstance(pid, str):
+        return _legacy_pytorch_protocol0_storage_record(pid, expected_keys=expected_keys)
+    if not isinstance(pid, tuple) or not pid or pid[0] != "storage":
+        return False, None
+    if len(pid) != 6:
+        return True, None
+    storage_type = pid[1]
+    key = pid[2]
+    location = pid[3]
+    element_count = pid[4]
+    view_metadata = pid[5]
+    valid_view_metadata = view_metadata is None or (
+        isinstance(view_metadata, tuple)
+        and len(view_metadata) == 3
+        and isinstance(view_metadata[0], str)
+        and view_metadata[0].isascii()
+        and view_metadata[0].isdecimal()
+        and len(view_metadata[0]) <= 128
+        and not isinstance(view_metadata[1], bool)
+        and isinstance(view_metadata[1], int)
+        and view_metadata[1] >= 0
+        and not isinstance(view_metadata[2], bool)
+        and isinstance(view_metadata[2], int)
+        and view_metadata[2] >= 0
+    )
+    if (
+        not isinstance(storage_type, _LegacyPickleGlobalRef)
+        or storage_type.module not in {"torch", "torch.storage"}
+        or storage_type.name not in _PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES
+        or not isinstance(key, str)
+        or (expected_keys is not None and key not in expected_keys)
+        or not key.isascii()
+        or not key.isdecimal()
+        or not isinstance(location, str)
+        or not location
+        or isinstance(element_count, bool)
+        or not isinstance(element_count, int)
+        or not 0 <= element_count <= (1 << 63) - 1
+        or not valid_view_metadata
+        or (
+            isinstance(view_metadata, tuple)
+            and (
+                not isinstance(element_count, int)
+                or view_metadata[1] > element_count
+                or view_metadata[2] > element_count - view_metadata[1]
+            )
+        )
+    ):
+        return True, None
+    return (
+        True,
+        _LegacyPyTorchStorageRecord(
+            key=key,
+            element_count=element_count,
+            element_size=_PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES[storage_type.name],
+            storage_type_module=storage_type.module,
+            storage_type_name=storage_type.name,
+            storage_type_position=storage_type.position,
+        ),
+    )
+
+
 def _legacy_pytorch_storage_records(
     data: bytes,
     storage_keys: tuple[str, ...],
@@ -792,110 +942,8 @@ def _legacy_pytorch_storage_records(
             return None
         return key if key >= 0 else None
 
-    def nonnegative_int(value: str) -> int | None:
-        try:
-            parsed = int(value)
-        except ValueError:
-            return None
-        return parsed if 0 <= parsed <= (1 << 63) - 1 else None
-
-    def storage_record_from_protocol0_pid(pid: str) -> tuple[bool, _LegacyPyTorchStorageRecord | None]:
-        if not pid.startswith("('storage',"):
-            return False, None
-        match = _PYTORCH_LEGACY_PROTOCOL0_STORAGE_PID_RE.match(pid)
-        if match is None:
-            return True, None
-        storage_name = match.group("storage_name")
-        key = match.group("key")
-        location = match.group("location")
-        element_count = nonnegative_int(match.group("element_count"))
-        if (
-            storage_name not in _PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES
-            or key not in expected_keys
-            or not location
-            or element_count is None
-        ):
-            return True, None
-        if match.group("view_metadata") != "None":
-            view_offset = nonnegative_int(match.group("view_offset"))
-            view_size = nonnegative_int(match.group("view_size"))
-            if (
-                view_offset is None
-                or view_size is None
-                or view_offset > element_count
-                or view_size > element_count - view_offset
-            ):
-                return True, None
-        return (
-            True,
-            _LegacyPyTorchStorageRecord(
-                key=key,
-                element_count=element_count,
-                element_size=_PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES[storage_name],
-            ),
-        )
-
-    def storage_record_from_pid(pid: object) -> tuple[bool, _LegacyPyTorchStorageRecord | None]:
-        if isinstance(pid, str):
-            return storage_record_from_protocol0_pid(pid)
-        if not isinstance(pid, tuple) or not pid or pid[0] != "storage":
-            return False, None
-        if len(pid) != 6:
-            return True, None
-        storage_type = pid[1]
-        key = pid[2]
-        location = pid[3]
-        element_count = pid[4]
-        view_metadata = pid[5]
-        valid_view_metadata = view_metadata is None or (
-            isinstance(view_metadata, tuple)
-            and len(view_metadata) == 3
-            and isinstance(view_metadata[0], str)
-            and view_metadata[0].isascii()
-            and view_metadata[0].isdecimal()
-            and len(view_metadata[0]) <= 128
-            and not isinstance(view_metadata[1], bool)
-            and isinstance(view_metadata[1], int)
-            and view_metadata[1] >= 0
-            and not isinstance(view_metadata[2], bool)
-            and isinstance(view_metadata[2], int)
-            and view_metadata[2] >= 0
-        )
-        if (
-            not isinstance(storage_type, _LegacyPickleGlobalRef)
-            or storage_type.module not in {"torch", "torch.storage"}
-            or storage_type.name not in _PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES
-            or not isinstance(key, str)
-            or key not in expected_keys
-            or not key.isascii()
-            or not key.isdecimal()
-            or not isinstance(location, str)
-            or not location
-            or isinstance(element_count, bool)
-            or not isinstance(element_count, int)
-            or not 0 <= element_count <= (1 << 63) - 1
-            or not valid_view_metadata
-            or (
-                isinstance(view_metadata, tuple)
-                and (
-                    not isinstance(element_count, int)
-                    or view_metadata[1] > element_count
-                    or view_metadata[2] > element_count - view_metadata[1]
-                )
-            )
-        ):
-            return True, None
-        return (
-            True,
-            _LegacyPyTorchStorageRecord(
-                key=key,
-                element_count=element_count,
-                element_size=_PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES[storage_type.name],
-            ),
-        )
-
     try:
-        for opcode_index, (opcode, arg, _position) in enumerate(pickletools.genops(data), start=1):
+        for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
             if opcode_index > _PYTORCH_LEGACY_MAX_CONTROL_OPCODES:
                 return None
             opcode_name = opcode.name
@@ -910,7 +958,7 @@ def _legacy_pytorch_storage_records(
                     stack.append(unknown)
                 else:
                     parts = arg.split()
-                    stack.append(_LegacyPickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else unknown)
+                    stack.append(_LegacyPickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else unknown)
             elif opcode_name == "STACK_GLOBAL":
                 if len(stack) < 2:
                     stack.clear()
@@ -918,7 +966,7 @@ def _legacy_pytorch_storage_records(
                 name = stack.pop()
                 module = stack.pop()
                 stack.append(
-                    _LegacyPickleGlobalRef(module, name)
+                    _LegacyPickleGlobalRef(module, name, position)
                     if isinstance(module, str) and isinstance(name, str)
                     else unknown
                 )
@@ -967,16 +1015,17 @@ def _legacy_pytorch_storage_records(
             elif opcode_name == "DUP":
                 if stack:
                     stack.append(stack[-1])
+            elif opcode_name == "PERSID":
+                is_storage, record = _legacy_pytorch_storage_record_from_pid(arg, expected_keys=expected_keys)
+                if not is_storage or record is None or (record.key in records and records[record.key] != record):
+                    return None
+                records[record.key] = record
+                stack.append(unknown)
             elif opcode_name == "BINPERSID":
                 pid = stack.pop() if stack else unknown
-                is_storage, record = storage_record_from_pid(pid)
-                if is_storage:
-                    if record is None or (record.key in records and records[record.key] != record):
-                        return None
-                    records[record.key] = record
-                stack.append(unknown)
-            elif opcode_name == "PERSID":
-                is_storage, record = storage_record_from_pid(arg if isinstance(arg, str) else unknown)
+                is_storage, record = _legacy_pytorch_storage_record_from_pid(pid, expected_keys=expected_keys)
+                if not is_storage:
+                    return None
                 if is_storage:
                     if record is None or (record.key in records and records[record.key] != record):
                         return None
@@ -995,6 +1044,134 @@ def _legacy_pytorch_storage_records(
     if not _pickle_stack_is_valid(data):
         return None
     return tuple(records[key] for key in storage_keys)
+
+
+def _legacy_pytorch_storage_persistent_id_records(
+    data: bytes,
+) -> tuple[_LegacyPyTorchStoragePersistentIdRecord, ...]:
+    marker = object()
+    unknown = object()
+    memo: dict[int, object] = {}
+    stack: list[object] = []
+    records: list[_LegacyPyTorchStoragePersistentIdRecord] = []
+
+    def pop_marked_tuple() -> tuple[object, ...] | None:
+        items: list[object] = []
+        while stack:
+            item = stack.pop()
+            if item is marker:
+                return tuple(reversed(items)) if len(items) <= 16 else None
+            items.append(item)
+        return None
+
+    def memo_key(value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            key = value
+        elif isinstance(value, str):
+            try:
+                key = int(value)
+            except ValueError:
+                return None
+        else:
+            return None
+        return key if key >= 0 else None
+
+    try:
+        for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
+            if opcode_index > _PYTORCH_LEGACY_MAX_CONTROL_OPCODES:
+                break
+            opcode_name = opcode.name
+            if opcode_name in {"PROTO", "FRAME", "STOP"}:
+                continue
+            if opcode_name == "MARK":
+                stack.append(marker)
+            elif opcode_name in _PICKLE_STRING_OPCODE_NAMES:
+                stack.append(arg if isinstance(arg, str) else unknown)
+            elif opcode_name == "GLOBAL":
+                if not isinstance(arg, str):
+                    stack.append(unknown)
+                else:
+                    parts = arg.split()
+                    stack.append(_LegacyPickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else unknown)
+            elif opcode_name == "STACK_GLOBAL":
+                if len(stack) < 2:
+                    stack.clear()
+                    continue
+                name = stack.pop()
+                module = stack.pop()
+                stack.append(
+                    _LegacyPickleGlobalRef(module, name, position)
+                    if isinstance(module, str) and isinstance(name, str)
+                    else unknown
+                )
+            elif opcode_name == "EMPTY_TUPLE":
+                stack.append(())
+            elif opcode_name == "TUPLE":
+                tuple_value = pop_marked_tuple()
+                stack.append(tuple_value if tuple_value is not None else unknown)
+            elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                tuple_size = int(opcode_name[-1])
+                if len(stack) < tuple_size:
+                    stack.clear()
+                    continue
+                items = stack[-tuple_size:]
+                del stack[-tuple_size:]
+                stack.append(tuple(items))
+            elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
+                stack.append(arg if isinstance(arg, int) and not isinstance(arg, bool) else unknown)
+            elif opcode_name == "NONE":
+                stack.append(None)
+            elif opcode_name == "NEWTRUE":
+                stack.append(True)
+            elif opcode_name == "NEWFALSE":
+                stack.append(False)
+            elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                key = memo_key(arg)
+                if key is not None:
+                    if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES and key not in memo:
+                        break
+                    memo[key] = stack[-1] if stack else unknown
+            elif opcode_name == "MEMOIZE":
+                if len(memo) >= _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
+                    break
+                memo[len(memo)] = stack[-1] if stack else unknown
+            elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
+                key = memo_key(arg)
+                stack.append(memo.get(key, unknown) if key is not None else unknown)
+            elif opcode_name == "POP":
+                if stack:
+                    stack.pop()
+            elif opcode_name == "POP_MARK":
+                pop_marked_tuple()
+            elif opcode_name == "DUP":
+                if stack:
+                    stack.append(stack[-1])
+            elif opcode_name == "BINPERSID":
+                pid = stack.pop() if stack else unknown
+                _is_storage, record = _legacy_pytorch_storage_record_from_pid(pid, expected_keys=None)
+                if record is not None and position is not None:
+                    records.append(_LegacyPyTorchStoragePersistentIdRecord(position=position, record=record))
+                stack.append(unknown)
+            else:
+                stack.clear()
+
+            if len(stack) > _PYTORCH_LEGACY_MAX_STACK_DEPTH:
+                break
+    except Exception:
+        return tuple(records)
+
+    return tuple(records)
+
+
+def _offset_legacy_pytorch_storage_record(
+    record: _LegacyPyTorchStorageRecord,
+    position_offset: int,
+) -> _LegacyPyTorchStorageRecord:
+    if record.storage_type_position is None:
+        return record
+    return replace(record, storage_type_position=position_offset + record.storage_type_position)
 
 
 def _might_be_legacy_pytorch(data: bytes) -> bool:
@@ -1060,8 +1237,141 @@ def _legacy_pytorch_stream_layout(data: bytes) -> _LegacyPyTorchStreamLayout | N
         return None
 
     object_start, object_end = boundaries[3]
-    storage_records = _legacy_pytorch_storage_records(probe_data[object_start:object_end], storage_keys)
-    return _LegacyPyTorchStreamLayout(tuple(boundaries), storage_keys, storage_records)
+    object_stream = probe_data[object_start:object_end]
+    storage_persistent_ids = tuple(
+        _LegacyPyTorchStoragePersistentIdRecord(
+            position=object_start + persistent_id.position,
+            record=_offset_legacy_pytorch_storage_record(persistent_id.record, object_start),
+        )
+        for persistent_id in _legacy_pytorch_storage_persistent_id_records(object_stream)
+    )
+    relative_storage_records = _legacy_pytorch_storage_records(object_stream, storage_keys)
+    storage_records = (
+        None
+        if relative_storage_records is None
+        else tuple(_offset_legacy_pytorch_storage_record(record, object_start) for record in relative_storage_records)
+    )
+    return _LegacyPyTorchStreamLayout(
+        tuple(boundaries),
+        storage_keys,
+        storage_records,
+        storage_persistent_ids,
+    )
+
+
+def _legacy_pytorch_control_probe_needs_more_bytes(data: bytes) -> bool:
+    if not _matches_legacy_pytorch_preamble(data):
+        return False
+
+    probe = io.BytesIO(data)
+    offset = 0
+    for stream_index in range(_PYTORCH_LEGACY_STREAM_COUNT):
+        extent, consumed, parsed_opcode = _probe_pickle_stream(
+            probe,
+            offset,
+            max_opcodes=_PYTORCH_LEGACY_MAX_CONTROL_OPCODES,
+        )
+        if extent is None:
+            return parsed_opcode and offset + consumed >= len(data)
+
+        end = offset + extent
+        if stream_index == 0 and _pickle_scalar_integer(data[:end]) != _PYTORCH_LEGACY_MAGIC_NUMBER:
+            return False
+        if stream_index == 1 and _pickle_scalar_integer(data[offset:end]) != _PYTORCH_LEGACY_PROTOCOL_VERSION:
+            return False
+        offset = end
+
+    return False
+
+
+def _legacy_pytorch_partial_sys_info_has_supported_prefix(data: bytes) -> bool:
+    """Return whether bytes are a valid prefix of a protocol 2-5 sys_info dict."""
+    if len(data) < 3 or data[0] != _PICKLE_PROTO_OPCODE or data[1] not in _PYTORCH_LEGACY_SYS_INFO_PROTOCOLS:
+        return False
+
+    protocol = data[1]
+    dict_offset = 2
+    if protocol >= 4 and data[dict_offset] == _PICKLE_FRAME_OPCODE:
+        frame_arg_end = dict_offset + 1 + 8
+        if len(data) < frame_arg_end:
+            return True
+        dict_offset = frame_arg_end
+        if len(data) == dict_offset:
+            return True
+
+    if data[dict_offset] != _PICKLE_EMPTY_DICT_OPCODE:
+        return False
+
+    try:
+        for opcode_index, (opcode, arg, _position) in enumerate(pickletools.genops(data), start=1):
+            if opcode_index > _PYTORCH_LEGACY_MAX_CONTROL_OPCODES:
+                return False
+            if opcode.name not in _PYTORCH_LEGACY_SYS_INFO_OPCODES:
+                return False
+            if opcode.name == "PROTO" and arg not in _PYTORCH_LEGACY_SYS_INFO_PROTOCOLS:
+                return False
+            if opcode.name == "FRAME" and protocol < 4:
+                return False
+            if opcode.name == "STOP":
+                return _matches_legacy_pytorch_sys_info(data)
+    except Exception:
+        return True
+    return True
+
+
+def _legacy_pytorch_incomplete_sys_info_needs_more_bytes(data: bytes) -> bool:
+    if not _matches_legacy_pytorch_preamble(data):
+        return False
+
+    probe = io.BytesIO(data)
+    offset = 0
+    for stream_index in range(_PYTORCH_LEGACY_STREAM_COUNT):
+        extent, consumed, parsed_opcode = _probe_pickle_stream(
+            probe,
+            offset,
+            max_opcodes=_PYTORCH_LEGACY_MAX_CONTROL_OPCODES,
+        )
+        if extent is None:
+            if stream_index != 2 or not parsed_opcode or offset + consumed < len(data):
+                return False
+            partial_sys_info = data[offset:]
+            return _legacy_pytorch_partial_sys_info_has_supported_prefix(partial_sys_info)
+
+        end = offset + extent
+        if stream_index == 0 and _pickle_scalar_integer(data[:end]) != _PYTORCH_LEGACY_MAGIC_NUMBER:
+            return False
+        if stream_index == 1 and _pickle_scalar_integer(data[offset:end]) != _PYTORCH_LEGACY_PROTOCOL_VERSION:
+            return False
+        offset = end
+
+    return False
+
+
+def _legacy_pytorch_object_probe_needs_more_bytes(data: bytes) -> bool:
+    if not _matches_legacy_pytorch_preamble(data):
+        return False
+
+    probe = io.BytesIO(data)
+    offset = 0
+    for stream_index in range(_PYTORCH_LEGACY_STREAM_COUNT):
+        extent, consumed, parsed_opcode = _probe_pickle_stream(
+            probe,
+            offset,
+            max_opcodes=_PYTORCH_LEGACY_MAX_CONTROL_OPCODES,
+        )
+        if extent is None:
+            return stream_index >= 3 and parsed_opcode and offset + consumed >= len(data)
+
+        end = offset + extent
+        if stream_index == 0 and _pickle_scalar_integer(data[:end]) != _PYTORCH_LEGACY_MAGIC_NUMBER:
+            return False
+        if stream_index == 1 and _pickle_scalar_integer(data[offset:end]) != _PYTORCH_LEGACY_PROTOCOL_VERSION:
+            return False
+        if stream_index == 2 and not _matches_legacy_pytorch_sys_info(data[offset:end]):
+            return False
+        offset = end
+
+    return False
 
 
 def _legacy_pytorch_storage_end(
@@ -1834,12 +2144,87 @@ def _is_legitimate_serialization_file(path: str) -> bool:
         return False
     try:
         with path_obj.open("rb") as handle:
-            if not _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)):
+            prefix = handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)
+            if not _looks_like_pickle(prefix):
                 return False
         report = StandalonePickleScanner().scan_file(path_obj, enrich_call_graph=False)
     except Exception:
         return False
-    return not report.has_security_findings and report.status.value != "error"
+    joblib_wrapper_reference_requires_span_proof = (
+        path_obj.suffix.lower() == ".joblib" and _JOBLIB_NUMPY_ARRAY_WRAPPER_PICKLE_MARKER in prefix
+    )
+    validated_joblib_control_references = (
+        _joblib_numpy_array_validated_raw_span_control_references(path_obj)
+        if joblib_wrapper_reference_requires_span_proof
+        else frozenset()
+    )
+    if (
+        joblib_wrapper_reference_requires_span_proof
+        and _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE not in validated_joblib_control_references
+    ):
+        return False
+
+    def validated_joblib_control_finding_is_trusted(finding: Any) -> bool:
+        details = getattr(finding, "details", {})
+        if not isinstance(details, Mapping):
+            return False
+        import_reference = str(details.get("import_reference", ""))
+        if import_reference not in validated_joblib_control_references:
+            return False
+        module = details.get("module")
+        name = details.get("name")
+        if not isinstance(module, str) or not isinstance(name, str):
+            return False
+        try:
+            return import_only_reference_is_proven_trusted(module, name)
+        except Exception:
+            return False
+
+    security_findings = tuple(
+        finding
+        for finding in report.findings
+        if not (finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and validated_joblib_control_finding_is_trusted(finding))
+    )
+    if security_findings:
+        return False
+    if report.status.value != "error":
+        return True
+    return joblib_wrapper_reference_requires_span_proof and bool(validated_joblib_control_references)
+
+
+def _joblib_numpy_array_validated_raw_span_control_references(path_obj: Path) -> frozenset[str]:
+    try:
+        if path_obj.suffix.lower() != ".joblib":
+            return frozenset()
+        file_size = path_obj.stat().st_size
+        if file_size <= 0 or file_size > _JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES:
+            return frozenset()
+        with path_obj.open("rb") as handle:
+            payload = handle.read(_JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES + 1)
+        if len(payload) != file_size:
+            return frozenset()
+        from .joblib_scanner import _pickle_without_joblib_numpy_array_data
+
+        sanitized = _pickle_without_joblib_numpy_array_data(payload)
+    except Exception:
+        return frozenset()
+    if sanitized is None:
+        return frozenset()
+    return frozenset(sanitized.validated_control_occurrences)
+
+
+def _joblib_numpy_array_wrapper_has_validated_raw_span(path_obj: Path) -> bool:
+    return _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE in _joblib_numpy_array_validated_raw_span_control_references(path_obj)
+
+
+def _joblib_numpy_array_wrapper_origin_is_trusted() -> bool:
+    try:
+        return import_only_reference_is_proven_trusted(
+            _JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE,
+            _JOBLIB_NUMPY_ARRAY_WRAPPER_NAME,
+        )
+    except Exception:
+        return False
 
 
 def _path_prefix_looks_like_pickle(path: str) -> bool:
@@ -2096,6 +2481,50 @@ class PickleScanner(BaseScanner):
             return None
         return PyTorchZipScanner(config=self.config).scan(path, timeout=self.timeout)
 
+    @staticmethod
+    def _can_defer_size_limit_for_legacy_pytorch(source: str) -> bool:
+        return Path(source).suffix.lower() in _PYTORCH_CONTAINER_EXTENSIONS
+
+    def _add_legacy_pytorch_bounded_analysis_check(
+        self,
+        result: ScanResult,
+        source: str,
+        *,
+        file_size: int | None,
+    ) -> None:
+        result.metadata["legacy_pytorch_bounded_analysis"] = True
+        if file_size is not None and file_size >= 0:
+            result.metadata["legacy_pytorch_bounded_analysis_file_size"] = file_size
+        result.metadata["legacy_pytorch_control_scan_limit_bytes"] = _PYTORCH_LEGACY_MAX_CONTROL_BYTES
+        result.metadata["legacy_pytorch_control_scan_max_opcodes"] = _PYTORCH_LEGACY_MAX_CONTROL_OPCODES
+        result.metadata["legacy_pytorch_max_storage_keys"] = _PYTORCH_LEGACY_MAX_STORAGE_KEYS
+        result.metadata["legacy_pytorch_stream_read_limit_bytes"] = (
+            self._standalone_pickle_scanner.options.max_known_stream_read_bytes
+        )
+        result.metadata["legacy_pytorch_suffix_scan_limit_bytes"] = max(
+            self._root_raw_scan_limit(),
+            _BINARY_TAIL_SCAN_BYTES,
+        )
+        details: dict[str, Any] = {
+            "file_size": file_size,
+            "max_file_read_size": self.max_file_read_size,
+            "control_scan_limit_bytes": _PYTORCH_LEGACY_MAX_CONTROL_BYTES,
+            "max_control_opcodes": _PYTORCH_LEGACY_MAX_CONTROL_OPCODES,
+            "max_storage_keys": _PYTORCH_LEGACY_MAX_STORAGE_KEYS,
+            "max_known_stream_read_bytes": self._standalone_pickle_scanner.options.max_known_stream_read_bytes,
+            "root_raw_scan_limit_bytes": self._root_raw_scan_limit(),
+            "binary_tail_scan_bytes": _BINARY_TAIL_SCAN_BYTES,
+            "timeout_seconds": self.timeout,
+            "tensor_storage_materialized": False,
+        }
+        result.add_check(
+            name="Legacy PyTorch Bounded Analysis",
+            passed=True,
+            message="Legacy PyTorch tensor storage was skipped after bounded control-stream validation",
+            location=source,
+            details=details,
+        )
+
     def _check_scan_stream_size_limit(self, file_size: int | None, source: str) -> ScanResult | None:
         normalized_size = None if file_size is None else max(file_size, 0)
         if (
@@ -2106,13 +2535,21 @@ class PickleScanner(BaseScanner):
         ):
             result = self._create_result()
             result.metadata["file_size"] = normalized_size
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+            result.metadata["scan_outcome_reasons"] = ["max_file_read_size_exceeded"]
             result.add_check(
                 name="File Size Limit",
                 passed=False,
                 message=f"File too large: {normalized_size} bytes (max: {self.max_file_read_size})",
                 severity=IssueSeverity.INFO,
                 location=source,
-                details={"file_size": normalized_size, "max_file_read_size": self.max_file_read_size},
+                details={
+                    "file_size": normalized_size,
+                    "max_file_read_size": self.max_file_read_size,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "max_file_read_size_exceeded",
+                },
             )
             result.finish(success=False)
             return result
@@ -2136,6 +2573,11 @@ class PickleScanner(BaseScanner):
             report = self._standalone_pickle_scanner.scan_bytes(payload, source=source)
         result = pickle_report_to_scan_result(report, scanner_name=self.name, scanner=self)
         result.metadata["pickle_primary_engine"] = "rust"
+        self._annotate_legacy_pytorch_storage_persistent_id_details_from_payload(
+            result,
+            payload,
+            position_offset=position_offset,
+        )
         return result
 
     @staticmethod
@@ -2265,6 +2707,7 @@ class PickleScanner(BaseScanner):
                 boundaries=layout.boundaries,
                 storage_keys=layout.storage_keys,
                 storage_records=layout.storage_records,
+                storage_persistent_ids=layout.storage_persistent_ids,
                 storage_end=storage_end,
             ),
             True,
@@ -2298,6 +2741,367 @@ class PickleScanner(BaseScanner):
         result.metadata["last_pickle_end_pos"] = position_offset + layout.pickle_end
         if layout.storage_key_count > 0:
             result.metadata["legacy_pytorch_storage_payload_skipped"] = True
+        PickleScanner._annotate_legacy_pytorch_storage_persistent_id_details(
+            result,
+            layout,
+            position_offset=position_offset,
+        )
+
+    @staticmethod
+    def _is_legacy_pytorch_storage_persistent_id_record(
+        details: dict[str, Any],
+        trusted_storage_keys: set[str],
+    ) -> bool:
+        if not PickleScanner._is_legacy_pytorch_binpersid_finding(details):
+            return False
+        storage_key = details.get("pytorch_storage_key")
+        return (
+            details.get("pytorch_storage_persistent_id") is True
+            and isinstance(storage_key, str)
+            and storage_key in trusted_storage_keys
+        )
+
+    @staticmethod
+    def _is_legacy_pytorch_binpersid_finding(details: dict[str, Any]) -> bool:
+        return details.get("pickle_rule_code") == "PERSISTENT_ID" and details.get("opcode") == "BINPERSID"
+
+    @staticmethod
+    def _is_unstructured_legacy_pytorch_binpersid_finding(details: dict[str, Any]) -> bool:
+        return (
+            PickleScanner._is_legacy_pytorch_binpersid_finding(details)
+            and "pytorch_storage_persistent_id" not in details
+            and "pytorch_storage_key" not in details
+        )
+
+    @staticmethod
+    def _legacy_pytorch_storage_import_reference(record: _LegacyPyTorchStorageRecord) -> str:
+        return f"{record.storage_type_module}.{record.storage_type_name}"
+
+    @classmethod
+    def _trusted_legacy_pytorch_storage_import_positions(
+        cls,
+        layout: _LegacyPyTorchStreamLayout,
+        *,
+        position_offset: int = 0,
+    ) -> dict[str, set[int]]:
+        storage_records = layout.storage_records or ()
+        trusted_import_positions: dict[str, set[int]] = {}
+        for record in storage_records:
+            if record.storage_type_position is None:
+                continue
+            trusted_import_positions.setdefault(cls._legacy_pytorch_storage_import_reference(record), set()).add(
+                position_offset + record.storage_type_position
+            )
+        return trusted_import_positions
+
+    @staticmethod
+    def _trusted_legacy_pytorch_storage_import_references(
+        result: ScanResult,
+        trusted_import_positions: Mapping[str, set[int]],
+    ) -> set[str]:
+        if result.metadata.get("import_references_truncated") is True:
+            return set()
+        if not trusted_import_positions:
+            return set()
+
+        import_references = result.metadata.get("import_references")
+        if not isinstance(import_references, list):
+            return set()
+
+        observed_import_positions: dict[str, set[int]] = {}
+        observed_imports_without_position: set[str] = set()
+        for raw_reference in import_references:
+            if not isinstance(raw_reference, dict):
+                continue
+            import_reference = raw_reference.get("import_reference")
+            if not isinstance(import_reference, str) or import_reference not in trusted_import_positions:
+                continue
+            position = raw_reference.get("position")
+            if type(position) is int:
+                observed_import_positions.setdefault(import_reference, set()).add(position)
+            else:
+                observed_imports_without_position.add(import_reference)
+
+        return {
+            import_reference
+            for import_reference, trusted_positions in trusted_import_positions.items()
+            if import_reference not in observed_imports_without_position
+            and (observed_positions := observed_import_positions.get(import_reference, set()))
+            and observed_positions <= trusted_positions
+        }
+
+    @classmethod
+    def _is_legacy_pytorch_storage_import_call_graph_finding(
+        cls,
+        details: dict[str, Any],
+        trusted_import_references: set[str],
+        trusted_import_positions: Mapping[str, set[int]],
+        location: str | None,
+    ) -> bool:
+        import_reference = details.get("import_reference")
+        opcode = details.get("opcode")
+        if not (
+            details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
+            and details.get("analysis") == "python_call_graph"
+            and "invocation_import_reference" not in details
+            and (opcode is None or opcode in {"GLOBAL", "STACK_GLOBAL"})
+            and isinstance(import_reference, str)
+        ):
+            return False
+        if import_reference in trusted_import_references:
+            return True
+        return cls._legacy_pytorch_storage_import_position_matches(
+            import_reference,
+            details,
+            trusted_import_positions,
+            location,
+        )
+
+    @classmethod
+    def _is_legacy_pytorch_storage_import_origin_finding(
+        cls,
+        details: dict[str, Any],
+        trusted_import_positions: Mapping[str, set[int]],
+        location: str | None,
+    ) -> bool:
+        import_reference = details.get("import_reference")
+        opcode = details.get("opcode")
+        if not (
+            details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+            and "invocation_import_reference" not in details
+            and details.get("invoked") is not True
+            and (opcode is None or opcode in {"GLOBAL", "STACK_GLOBAL"})
+            and isinstance(import_reference, str)
+        ):
+            return False
+        return cls._legacy_pytorch_storage_import_position_matches(
+            import_reference,
+            details,
+            trusted_import_positions,
+            location,
+        )
+
+    @staticmethod
+    def _legacy_pytorch_storage_import_position_matches(
+        import_reference: str,
+        details: dict[str, Any],
+        trusted_import_positions: Mapping[str, set[int]],
+        location: str | None,
+    ) -> bool:
+        positions = trusted_import_positions.get(import_reference, set())
+        if not positions:
+            return False
+        detail_position = details.get("position")
+        if type(detail_position) is int and detail_position in positions:
+            return True
+        return PickleScanner._pickle_location_position(location) in positions
+
+    @staticmethod
+    def _annotate_legacy_pytorch_storage_persistent_id_record(
+        details: dict[str, Any],
+        record: _LegacyPyTorchStorageRecord,
+    ) -> None:
+        details["pytorch_storage_persistent_id"] = True
+        details["pytorch_storage_key"] = record.key
+
+    @staticmethod
+    def _pickle_location_position(location: str | None) -> int | None:
+        if not isinstance(location, str):
+            return None
+        match = _LOCATION_POSITION_RE.search(location)
+        if match is None:
+            return None
+        try:
+            return int(match.group("position"))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _annotate_legacy_pytorch_storage_persistent_id_details(
+        cls,
+        result: ScanResult,
+        layout: _LegacyPyTorchStreamLayout,
+        *,
+        position_offset: int = 0,
+    ) -> None:
+        records_by_position = {
+            position_offset + persistent_id.position: persistent_id.record
+            for persistent_id in layout.storage_persistent_ids
+        }
+        if not records_by_position:
+            return
+
+        def annotate_record(finding_record: Check | Issue) -> None:
+            if not cls._is_unstructured_legacy_pytorch_binpersid_finding(finding_record.details):
+                return
+            position = cls._pickle_location_position(finding_record.location)
+            if position is None:
+                return
+            storage_record = records_by_position.get(position)
+            if storage_record is None:
+                return
+            cls._annotate_legacy_pytorch_storage_persistent_id_record(finding_record.details, storage_record)
+
+        for check in result.checks:
+            annotate_record(check)
+        for issue in result.issues:
+            annotate_record(issue)
+
+    @classmethod
+    def _annotate_legacy_pytorch_storage_persistent_id_details_from_payload(
+        cls,
+        result: ScanResult,
+        payload: bytes,
+        *,
+        position_offset: int = 0,
+    ) -> None:
+        storage_persistent_ids = _legacy_pytorch_storage_persistent_id_records(payload)
+        if not storage_persistent_ids:
+            return
+        layout = _LegacyPyTorchStreamLayout(
+            boundaries=(),
+            storage_keys=(),
+            storage_records=None,
+            storage_persistent_ids=storage_persistent_ids,
+        )
+        cls._annotate_legacy_pytorch_storage_persistent_id_details(
+            result,
+            layout,
+            position_offset=position_offset,
+        )
+
+    @classmethod
+    def _downgrade_legacy_pytorch_storage_persistent_ids(
+        cls,
+        result: ScanResult,
+        layout: _LegacyPyTorchStreamLayout,
+        *,
+        position_offset: int = 0,
+    ) -> None:
+        """Treat canonical storage BINPERSID records as informational in validated legacy PyTorch streams."""
+        trusted_storage_keys = set(layout.storage_keys)
+        trusted_storage_records = layout.storage_records or ()
+        trusted_structured_keys = {
+            check.details["pytorch_storage_key"]
+            for check in result.checks
+            if cls._is_legacy_pytorch_storage_persistent_id_record(check.details, trusted_storage_keys)
+        }
+        unstructured_checks = [
+            check for check in result.checks if cls._is_unstructured_legacy_pytorch_binpersid_finding(check.details)
+        ]
+        unstructured_issues = [
+            issue for issue in result.issues if cls._is_unstructured_legacy_pytorch_binpersid_finding(issue.details)
+        ]
+        remaining_records = tuple(
+            record for record in trusted_storage_records if record.key not in trusted_structured_keys
+        )
+        if len(unstructured_checks) == len(remaining_records) and len(unstructured_issues) == len(remaining_records):
+            for check, record in zip(unstructured_checks, remaining_records, strict=True):
+                cls._annotate_legacy_pytorch_storage_persistent_id_record(check.details, record)
+            for issue, record in zip(unstructured_issues, remaining_records, strict=True):
+                cls._annotate_legacy_pytorch_storage_persistent_id_record(issue.details, record)
+
+        downgraded_count = 0
+        downgraded_private_entries: list[dict[str, str]] = []
+        for check in result.checks:
+            if not cls._is_legacy_pytorch_storage_persistent_id_record(check.details, trusted_storage_keys):
+                continue
+            if check.rule_code is not None:
+                downgraded_private_entries.append({"name": check.name, "rule_code": check.rule_code})
+            check.status = CheckStatus.PASSED
+            check.severity = IssueSeverity.INFO
+            check.message = "PyTorch storage persistent ID found in validated legacy PyTorch stream"
+            check.details["trusted_legacy_pytorch_context"] = True
+            downgraded_count += 1
+
+        result.issues = [
+            issue
+            for issue in result.issues
+            if not cls._is_legacy_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
+        ]
+        trusted_storage_import_positions = cls._trusted_legacy_pytorch_storage_import_positions(
+            layout,
+            position_offset=position_offset,
+        )
+        if result.metadata.get("import_references_truncated") is True:
+            trusted_storage_import_positions = {}
+        trusted_storage_import_references = cls._trusted_legacy_pytorch_storage_import_references(
+            result,
+            trusted_storage_import_positions,
+        )
+
+        def is_trusted_storage_import_finding(check_or_issue: Check | Issue) -> bool:
+            return cls._is_legacy_pytorch_storage_import_call_graph_finding(
+                check_or_issue.details,
+                trusted_storage_import_references,
+                trusted_storage_import_positions,
+                check_or_issue.location,
+            ) or cls._is_legacy_pytorch_storage_import_origin_finding(
+                check_or_issue.details,
+                trusted_storage_import_positions,
+                check_or_issue.location,
+            )
+
+        downgraded_import_count = 0
+        for check in result.checks:
+            if not is_trusted_storage_import_finding(check):
+                continue
+            if check.rule_code is not None:
+                downgraded_private_entries.append({"name": check.name, "rule_code": check.rule_code})
+            check.status = CheckStatus.PASSED
+            check.severity = IssueSeverity.INFO
+            check.message = "PyTorch storage global import found in validated legacy PyTorch stream"
+            check.details["trusted_legacy_pytorch_context"] = True
+            check.details["pytorch_storage_import_reference"] = True
+            downgraded_import_count += 1
+
+        if downgraded_import_count:
+            result.metadata["legacy_pytorch_trusted_storage_import_count"] = downgraded_import_count
+            result.issues = [issue for issue in result.issues if not is_trusted_storage_import_finding(issue)]
+
+        if downgraded_count:
+            result.metadata["legacy_pytorch_trusted_storage_persistent_id_count"] = downgraded_count
+            clean_trusted_storage_downgrade = (
+                not result.has_errors
+                and not result.has_warnings
+                and not result.metadata.get("analysis_incomplete")
+                and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+                and result.metadata.get("pickle_verdict") in {"malicious", "suspicious"}
+            )
+            if clean_trusted_storage_downgrade:
+                cls._remove_private_actionable_failed_check_entries(result, downgraded_private_entries)
+                result.metadata["pickle_verdict"] = "clean"
+
+    @staticmethod
+    def _remove_private_actionable_failed_check_entries(
+        result: ScanResult,
+        entries_to_remove: list[dict[str, str]],
+    ) -> None:
+        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+        if not entries_to_remove or not isinstance(private_failed_checks, list):
+            return
+
+        unmatched_entries = list(entries_to_remove)
+        filtered_entries: list[Any] = []
+        for entry in private_failed_checks:
+            if isinstance(entry, dict):
+                matched_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(unmatched_entries)
+                        if entry.get("name") == candidate["name"] and entry.get("rule_code") == candidate["rule_code"]
+                    ),
+                    None,
+                )
+                if matched_index is not None:
+                    del unmatched_entries[matched_index]
+                    continue
+            filtered_entries.append(entry)
+
+        if filtered_entries:
+            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
+        else:
+            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
 
     @staticmethod
     def _mark_legacy_pytorch_storage_layout_incomplete(
@@ -2316,6 +3120,11 @@ class PickleScanner(BaseScanner):
         ]
         result.metadata["legacy_pytorch_storage_key_count"] = layout.storage_key_count
         result.metadata["legacy_pytorch_storage_start"] = position_offset + layout.pickle_end
+        PickleScanner._annotate_legacy_pytorch_storage_persistent_id_details(
+            result,
+            layout,
+            position_offset=position_offset,
+        )
         result.add_check(
             name="Legacy PyTorch Storage Layout",
             passed=False,
@@ -2325,6 +3134,44 @@ class PickleScanner(BaseScanner):
             details={
                 "storage_key_count": layout.storage_key_count,
                 "storage_start": position_offset + layout.pickle_end,
+                "control_scan_limit_bytes": _PYTORCH_LEGACY_MAX_CONTROL_BYTES,
+                "max_control_opcodes": _PYTORCH_LEGACY_MAX_CONTROL_OPCODES,
+                "max_storage_keys": _PYTORCH_LEGACY_MAX_STORAGE_KEYS,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
+
+    def _mark_legacy_pytorch_storage_payload_incomplete(
+        self,
+        result: ScanResult,
+        layout: _LegacyPyTorchStreamLayout,
+        source: str,
+        *,
+        file_size: int | None,
+        position_offset: int = 0,
+    ) -> None:
+        if layout.storage_key_count <= 0 or layout.storage_end is None:
+            return
+        reason = "legacy_pytorch_storage_payload_skipped"
+        self._mark_operational_incomplete(result, reason)
+        result.metadata["legacy_pytorch_storage_payload_incomplete"] = True
+        result.add_check(
+            name="Legacy PyTorch Storage Payload Coverage",
+            passed=False,
+            message="Legacy PyTorch tensor storage was skipped by bounded analysis",
+            severity=IssueSeverity.INFO,
+            location=source,
+            details={
+                "file_size": file_size,
+                "storage_key_count": layout.storage_key_count,
+                "storage_start": position_offset + layout.pickle_end,
+                "storage_end": position_offset + layout.storage_end,
+                "max_file_read_size": self.max_file_read_size,
+                "tensor_storage_materialized": False,
+                "operational_error": True,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": reason,
             },
@@ -2351,6 +3198,8 @@ class PickleScanner(BaseScanner):
             details={
                 "control_start": position_offset,
                 "control_scan_limit_bytes": _PYTORCH_LEGACY_MAX_CONTROL_BYTES,
+                "max_control_opcodes": _PYTORCH_LEGACY_MAX_CONTROL_OPCODES,
+                "max_storage_keys": _PYTORCH_LEGACY_MAX_STORAGE_KEYS,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": reason,
             },
@@ -2448,9 +3297,85 @@ class PickleScanner(BaseScanner):
 
     def _finish_after_wrapper_analysis(self, result: ScanResult, *, base_success: bool) -> None:
         success = base_success
-        if result.metadata.get("operational_error") or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        if result.metadata.get("trusted_incomplete_tail") is True:
+            success = True
+        elif (
+            result.metadata.get("operational_error") or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        ):
             success = False
         result.finish(success=success)
+
+    def _apply_legitimate_joblib_like_pickle_cleanup(self, result: ScanResult, path: str) -> None:
+        if Path(path).suffix.lower() != ".joblib":
+            return
+        if result.metadata.get("scan_outcome_reasons") != ["pickle_analysis_incomplete"]:
+            return
+        for key in ("trusted_incomplete_tail", "trusted_incomplete_tail_reason", "joblib_numpy_array_payload_count"):
+            result.metadata.pop(key, None)
+        try:
+            from .joblib_scanner import JoblibScanner, _pickle_without_joblib_numpy_array_data
+
+            sanitized = _pickle_without_joblib_numpy_array_data(self._read_file_safely(path))
+        except Exception:
+            return
+        if sanitized is None or sanitized.raw_array_count < 1:
+            return
+
+        if _joblib_numpy_array_wrapper_origin_is_trusted():
+            JoblibScanner._remove_validated_numpy_array_wrapper_findings(
+                result,
+                sanitized.validated_control_occurrences,
+            )
+        self._downgrade_pickle_parse_error_findings(result)
+        if self._has_warning_or_critical_findings(result):
+            result.finish(success=False)
+            return
+
+        for key in (
+            "analysis_incomplete",
+            "failure_reason",
+            "parsing_failed",
+            "scan_outcome",
+            "scan_outcome_message",
+            "scan_outcome_reasons",
+        ):
+            result.metadata.pop(key, None)
+        if result.metadata.get("pickle_report_status") == "inconclusive":
+            result.metadata["pickle_report_status"] = "complete"
+        if result.metadata.get("pickle_verdict") in {"suspicious", "unknown"}:
+            result.metadata["pickle_verdict"] = "clean"
+        result.trust_merged_child_failures()
+        result.metadata["trusted_incomplete_tail"] = True
+        result.metadata["trusted_incomplete_tail_reason"] = "joblib_pickle_tail"
+
+    @staticmethod
+    def _remove_trusted_joblib_numpy_array_wrapper_findings(result: ScanResult) -> None:
+        def is_trusted_wrapper_finding(finding: Any) -> bool:
+            details = getattr(finding, "details", {})
+            return (
+                getattr(finding, "rule_code", None) == "NON_ALLOWLISTED_GLOBAL"
+                and isinstance(details, dict)
+                and details.get("import_reference") == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
+            )
+
+        result.issues = [issue for issue in result.issues if not is_trusted_wrapper_finding(issue)]
+        result.checks = [check for check in result.checks if not is_trusted_wrapper_finding(check)]
+
+    @staticmethod
+    def _downgrade_pickle_parse_error_findings(result: ScanResult) -> None:
+        for issue in result.issues:
+            if issue.rule_code == "S901" and issue.details.get("category") == "parse_error":
+                issue.severity = IssueSeverity.INFO
+        for check in result.checks:
+            if check.rule_code == "S901" and check.details.get("category") == "parse_error":
+                check.severity = IssueSeverity.INFO
+
+    @staticmethod
+    def _has_warning_or_critical_findings(result: ScanResult) -> bool:
+        return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues) or any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        )
 
     @staticmethod
     def _mark_operational_incomplete(result: ScanResult, reason: str) -> None:
@@ -2561,6 +3486,29 @@ class PickleScanner(BaseScanner):
         )
         return probe_limit if total_size is None else min(max(total_size, 0), probe_limit)
 
+    def _legacy_pytorch_preamble_probe_size(self, total_size: int | None) -> int:
+        probe_limit = min(
+            _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES,
+            self._standalone_pickle_scanner.options.max_known_stream_read_bytes,
+        )
+        return probe_limit if total_size is None else min(max(total_size, 0), probe_limit)
+
+    def _legacy_pytorch_initial_layout_probe_size(self, total_size: int | None) -> int:
+        probe_limit = self._legacy_pytorch_preamble_probe_size(total_size)
+        if self.max_file_read_size and self.max_file_read_size > 0:
+            probe_limit = max(
+                probe_limit,
+                min(self.max_file_read_size, _PYTORCH_LEGACY_INITIAL_LAYOUT_PROBE_BYTES),
+            )
+        return min(probe_limit, self._legacy_pytorch_control_probe_size(total_size))
+
+    def _read_legacy_pytorch_preamble_probe(self, path: str, file_size: int) -> bytes:
+        probe_size = self._legacy_pytorch_preamble_probe_size(file_size)
+        if probe_size <= 0:
+            return b""
+        with open(path, "rb") as handle:
+            return self._read_stream_bytes(handle, probe_size)
+
     def _root_expensive_raw_scan_limit(self) -> int:
         limit = self.config.get("pickle_expensive_raw_scan_limit_bytes", _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES)
         try:
@@ -2646,26 +3594,49 @@ class PickleScanner(BaseScanner):
             remaining -= len(chunk)
         return b"".join(chunks)
 
-    def _read_stream_payload_for_root(self, file_obj: BinaryIO, file_size: int | None) -> _RootStreamPayloadRead:
+    def _read_stream_payload_for_root(
+        self,
+        file_obj: BinaryIO,
+        file_size: int | None,
+        *,
+        ignore_file_read_size: bool = False,
+        initial_payload: bytes = b"",
+    ) -> _RootStreamPayloadRead:
         if file_size is not None:
             limit = self._standalone_pickle_scanner.options.max_known_stream_read_bytes
-            if self.max_file_read_size and self.max_file_read_size > 0:
+            if not ignore_file_read_size and self.max_file_read_size and self.max_file_read_size > 0:
                 limit = min(limit, self.max_file_read_size)
         else:
             limit = min(
                 self._root_raw_scan_limit(),
                 self._standalone_pickle_scanner.options.max_unbounded_stream_read_bytes,
             )
-            if self.max_file_read_size and self.max_file_read_size > 0:
+            if not ignore_file_read_size and self.max_file_read_size and self.max_file_read_size > 0:
                 limit = min(limit, self.max_file_read_size)
         if limit <= 0:
-            return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=0)
+            return _RootStreamPayloadRead(
+                payload=initial_payload,
+                truncated=False,
+                read_limit=0,
+                requested_bytes=0,
+                short_read=False,
+            )
 
         read_target = limit if file_size is None else min(file_size, limit)
         if read_target <= 0:
-            return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=limit)
+            return _RootStreamPayloadRead(
+                payload=initial_payload,
+                truncated=False,
+                read_limit=limit,
+                requested_bytes=0,
+                short_read=False,
+            )
 
-        payload = self._read_stream_bytes(file_obj, read_target)
+        remaining_target = max(read_target - len(initial_payload), 0)
+        payload = initial_payload
+        if remaining_target > 0:
+            payload += self._read_stream_bytes(file_obj, remaining_target)
+        short_read = file_size is not None and len(payload) < read_target
         truncated = file_size is not None and file_size > read_target and len(payload) >= read_target
         if file_size is None and len(payload) >= read_target:
             truncated = True
@@ -2673,6 +3644,8 @@ class PickleScanner(BaseScanner):
             payload=payload,
             truncated=truncated,
             read_limit=limit,
+            requested_bytes=read_target,
+            short_read=short_read,
         )
 
     @staticmethod
@@ -2690,13 +3663,41 @@ class PickleScanner(BaseScanner):
         hash_complete: bool = True,
     ) -> None:
         sha256 = hashlib.sha256(payload).hexdigest()
-        result.metadata.setdefault("file_hashes", {})["sha256"] = sha256
+        hash_key = "sha256" if hash_complete else "sha256_prefix"
+        result.metadata.setdefault("file_hashes", {})[hash_key] = sha256
+        details: dict[str, Any] = {
+            hash_key: sha256,
+            "bytes_hashed": len(payload),
+            "hash_complete": hash_complete,
+        }
         result.add_check(
             name="File Integrity Check",
             passed=True,
-            message="Stream SHA256 hash calculated",
+            message="Stream SHA256 hash calculated" if hash_complete else "Stream SHA256 prefix hash calculated",
             location=source,
-            details={"sha256": sha256, "bytes_hashed": len(payload), "hash_complete": hash_complete},
+            details=details,
+        )
+
+    def _add_bounded_file_integrity_check(
+        self,
+        payload: bytes,
+        result: ScanResult,
+        path: str,
+        file_size: int,
+    ) -> None:
+        sha256 = hashlib.sha256(payload).hexdigest()
+        result.metadata.setdefault("file_hashes", {})["sha256_prefix"] = sha256
+        result.add_check(
+            name="File Integrity Check",
+            passed=True,
+            message="File SHA256 prefix hash calculated",
+            location=path,
+            details={
+                "sha256_prefix": sha256,
+                "bytes_hashed": len(payload),
+                "file_size": file_size,
+                "hash_complete": False,
+            },
         )
 
     def _add_seekable_stream_integrity_check(
@@ -2735,17 +3736,19 @@ class PickleScanner(BaseScanner):
                 file_obj.seek(start_position)
 
         sha256 = hasher.hexdigest()
-        result.metadata.setdefault("file_hashes", {})["sha256"] = sha256
+        hash_key = "sha256" if hash_complete else "sha256_prefix"
+        result.metadata.setdefault("file_hashes", {})[hash_key] = sha256
+        details: dict[str, Any] = {
+            hash_key: sha256,
+            "bytes_hashed": bytes_hashed,
+            "hash_complete": hash_complete,
+        }
         result.add_check(
             name="File Integrity Check",
             passed=True,
-            message="Stream SHA256 hash calculated",
+            message="Stream SHA256 hash calculated" if hash_complete else "Stream SHA256 prefix hash calculated",
             location=source,
-            details={
-                "sha256": sha256,
-                "bytes_hashed": bytes_hashed,
-                "hash_complete": hash_complete,
-            },
+            details=details,
         )
 
     def _add_stream_truncation_check(
@@ -2780,6 +3783,43 @@ class PickleScanner(BaseScanner):
                 "declared_size": declared_size,
                 "read_limit": read_result.read_limit,
                 "analysis_incomplete": True,
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
+
+    @staticmethod
+    def _add_stream_short_read_check(
+        read_result: _RootStreamPayloadRead,
+        result: ScanResult,
+        source: str,
+        declared_size: int | None,
+    ) -> None:
+        if not read_result.short_read:
+            return
+
+        reason = "non_seekable_stream_short_read"
+        mark_inconclusive_scan_result(result, reason)
+        result.metadata["pickle_stream_short_read"] = True
+        result.metadata["pickle_stream_root_scan_read_limit"] = read_result.read_limit
+        result.metadata["pickle_stream_root_scan_requested_bytes"] = read_result.requested_bytes
+        result.metadata["pickle_stream_bytes_buffered"] = len(read_result.payload)
+        if declared_size is not None:
+            result.metadata["pickle_stream_declared_size"] = declared_size
+        result.add_check(
+            name="Pickle Stream Read",
+            passed=False,
+            message="Known-size non-seekable pickle stream ended before declared bytes were available",
+            severity=IssueSeverity.WARNING,
+            location=source,
+            details={
+                "source": "pickle_stream_buffer",
+                "bytes_buffered": len(read_result.payload),
+                "bytes_requested": read_result.requested_bytes,
+                "declared_size": declared_size,
+                "read_limit": read_result.read_limit,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
             },
             rule_code="S902",
         )
@@ -3709,7 +4749,11 @@ class PickleScanner(BaseScanner):
         self._prepare_scan_context(source)
         size_check = self._check_scan_stream_size_limit(file_size, source)
         if size_check:
-            return size_check
+            if not self._can_defer_size_limit_for_legacy_pytorch(source):
+                return size_check
+            deferred_size_check = size_check
+        else:
+            deferred_size_check = None
         standalone_size = file_size if file_size is not None and file_size >= 0 else None
         stream_is_seekable = _stream_is_seekable(file_obj)
         start_position: int | None = None
@@ -3723,48 +4767,69 @@ class PickleScanner(BaseScanner):
                 start_position = file_obj.tell()
             except (AttributeError, OSError, ValueError) as error:
                 return self._stream_position_error_result(source, error)
-            result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
-            if result.metadata.get("operational_error"):
-                return result
-            try:
-                file_obj.seek(start_position)
-            except (AttributeError, OSError, ValueError) as error:
-                reason = "stream_rewind_failed"
-                self._mark_operational_incomplete(result, reason)
-                result.add_check(
-                    name="Pickle Stream Position",
-                    passed=False,
-                    message=f"Error rewinding pickle stream after native scan: {error!s}",
-                    severity=IssueSeverity.INFO,
-                    location=source,
-                    details={
-                        "category": reason,
-                        "exception": str(error),
-                        "exception_type": type(error).__name__,
-                        "operational_error": True,
-                        "analysis_incomplete": True,
-                        "scan_outcome_reason": reason,
-                    },
-                    rule_code="S902",
-                )
-                result.finish(success=False)
-                return result
-            try:
-                raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
-            except (AttributeError, OSError, ValueError) as error:
-                self._record_stream_coverage_failure(result, source, error)
-                return result
 
             control_probe_size = self._legacy_pytorch_control_probe_size(standalone_size)
-            if len(raw_data) >= control_probe_size:
+            if deferred_size_check is None:
+                result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
+                if result.metadata.get("operational_error"):
+                    return result
+                try:
+                    file_obj.seek(start_position)
+                except (AttributeError, OSError, ValueError) as error:
+                    reason = "stream_rewind_failed"
+                    self._mark_operational_incomplete(result, reason)
+                    result.add_check(
+                        name="Pickle Stream Position",
+                        passed=False,
+                        message=f"Error rewinding pickle stream after native scan: {error!s}",
+                        severity=IssueSeverity.INFO,
+                        location=source,
+                        details={
+                            "category": reason,
+                            "exception": str(error),
+                            "exception_type": type(error).__name__,
+                            "operational_error": True,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": reason,
+                        },
+                        rule_code="S902",
+                    )
+                    result.finish(success=False)
+                    return result
+                try:
+                    raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
+                except (AttributeError, OSError, ValueError) as error:
+                    self._record_stream_coverage_failure(result, source, error)
+                    return result
+            else:
+                try:
+                    file_obj.seek(start_position)
+                    preamble_probe = self._read_stream_bytes(
+                        file_obj,
+                        self._legacy_pytorch_preamble_probe_size(standalone_size),
+                    )
+                except (AttributeError, OSError, ValueError) as error:
+                    self._record_stream_coverage_failure(deferred_size_check, source, error)
+                    return deferred_size_check
+                if not _matches_legacy_pytorch_preamble(preamble_probe):
+                    with suppress(AttributeError, OSError, ValueError):
+                        file_obj.seek(start_position)
+                    return deferred_size_check
+                raw_data = b""
+
+            if deferred_size_check is None and len(raw_data) >= control_probe_size:
                 control_probe = raw_data[:control_probe_size]
             else:
                 try:
                     file_obj.seek(start_position)
                     control_probe = self._read_stream_bytes(file_obj, control_probe_size)
                 except (AttributeError, OSError, ValueError) as error:
-                    self._record_stream_coverage_failure(result, source, error)
-                    return result
+                    self._record_stream_coverage_failure(
+                        result if deferred_size_check is None else deferred_size_check,
+                        source,
+                        error,
+                    )
+                    return result if deferred_size_check is None else deferred_size_check
 
             def read_at(local_offset: int, size: int) -> bytes:
                 file_obj.seek(start_position + local_offset)
@@ -3775,11 +4840,21 @@ class PickleScanner(BaseScanner):
                 total_size=standalone_size,
                 read_at=read_at,
             )
+            if deferred_size_check is not None:
+                if legacy_layout is None:
+                    with suppress(AttributeError, OSError, ValueError):
+                        file_obj.seek(start_position)
+                    return deferred_size_check
+                raw_data = control_probe[: self._root_raw_scan_limit()]
             try:
                 file_obj.seek(start_position)
             except (AttributeError, OSError, ValueError) as error:
-                self._record_stream_coverage_failure(result, source, error)
-                return result
+                self._record_stream_coverage_failure(
+                    result if deferred_size_check is None else deferred_size_check,
+                    source,
+                    error,
+                )
+                return result if deferred_size_check is None else deferred_size_check
             if legacy_layout is not None:
                 result = self._scan_standalone_bytes(
                     control_probe[: legacy_layout.pickle_end],
@@ -3791,6 +4866,24 @@ class PickleScanner(BaseScanner):
                 if legacy_storage_valid:
                     assert legacy_layout.storage_end is not None
                     self._annotate_legacy_pytorch_layout(result, legacy_layout, position_offset=start_position)
+                    self._downgrade_legacy_pytorch_storage_persistent_ids(
+                        result,
+                        legacy_layout,
+                        position_offset=start_position,
+                    )
+                    self._add_legacy_pytorch_bounded_analysis_check(
+                        result,
+                        source,
+                        file_size=standalone_size,
+                    )
+                    if deferred_size_check is not None:
+                        self._mark_legacy_pytorch_storage_payload_incomplete(
+                            result,
+                            legacy_layout,
+                            source,
+                            file_size=standalone_size,
+                            position_offset=start_position,
+                        )
                     suffix_raw_limit = max(self._root_raw_scan_limit() - len(raw_data), 0)
                     try:
                         suffix_raw_data = self._scan_legacy_pytorch_seekable_suffix(
@@ -3826,12 +4919,62 @@ class PickleScanner(BaseScanner):
                     position_offset=start_position,
                 )
                 allow_binary_tail_scan = False
-            self._add_seekable_stream_integrity_check(file_obj, result, source, start_position, standalone_size)
+            elif deferred_size_check is not None:
+                return deferred_size_check
+            else:
+                self._annotate_legacy_pytorch_storage_persistent_id_details_from_payload(
+                    result,
+                    control_probe,
+                    position_offset=start_position,
+                )
+            if deferred_size_check is not None and legacy_layout is not None:
+                self._add_stream_integrity_check(raw_data, result, source, hash_complete=False)
+            else:
+                self._add_seekable_stream_integrity_check(file_obj, result, source, start_position, standalone_size)
             binary_tail_payload: bytes | None = None
             raw_position_offset = start_position
         else:
+            initial_payload = b""
             try:
-                stream_read = self._read_stream_payload_for_root(file_obj, standalone_size)
+                if deferred_size_check is not None:
+                    initial_payload = self._read_stream_bytes(
+                        file_obj,
+                        self._legacy_pytorch_preamble_probe_size(standalone_size),
+                    )
+                    if not _matches_legacy_pytorch_preamble(initial_payload):
+                        return deferred_size_check
+                    initial_layout, _initial_storage_valid = self._legacy_pytorch_layout_for_scan(
+                        initial_payload,
+                        total_size=standalone_size,
+                    )
+                    if initial_layout is None and _legacy_pytorch_incomplete_sys_info_needs_more_bytes(initial_payload):
+                        layout_probe_target = self._legacy_pytorch_initial_layout_probe_size(standalone_size)
+                        initial_payload += self._read_stream_bytes(
+                            file_obj,
+                            max(layout_probe_target - len(initial_payload), 0),
+                        )
+                        initial_layout, _initial_storage_valid = self._legacy_pytorch_layout_for_scan(
+                            initial_payload,
+                            total_size=standalone_size,
+                        )
+                    if initial_layout is None and _legacy_pytorch_object_probe_needs_more_bytes(initial_payload):
+                        probe_target = self._legacy_pytorch_control_probe_size(standalone_size)
+                        initial_payload += self._read_stream_bytes(
+                            file_obj,
+                            max(probe_target - len(initial_payload), 0),
+                        )
+                        initial_layout, _initial_storage_valid = self._legacy_pytorch_layout_for_scan(
+                            initial_payload,
+                            total_size=standalone_size,
+                        )
+                    if initial_layout is None:
+                        return deferred_size_check
+                stream_read = self._read_stream_payload_for_root(
+                    file_obj,
+                    standalone_size,
+                    ignore_file_read_size=deferred_size_check is not None,
+                    initial_payload=initial_payload,
+                )
             except (AttributeError, OSError, ValueError) as error:
                 return self._stream_read_error_result(source, error)
             payload = stream_read.payload
@@ -3842,9 +4985,26 @@ class PickleScanner(BaseScanner):
             if legacy_layout is not None:
                 result = self._scan_standalone_bytes(payload[: legacy_layout.pickle_end], source=source)
                 legacy_storage_valid = legacy_storage_valid and self._legacy_pytorch_control_scan_complete(result)
-                if legacy_storage_valid:
+                if legacy_storage_valid and stream_read.short_read:
+                    self._add_stream_short_read_check(stream_read, result, source, standalone_size)
+                    legacy_storage_valid = False
+                    allow_binary_tail_scan = False
+                elif legacy_storage_valid:
                     assert legacy_layout.storage_end is not None
                     self._annotate_legacy_pytorch_layout(result, legacy_layout)
+                    self._downgrade_legacy_pytorch_storage_persistent_ids(result, legacy_layout)
+                    self._add_legacy_pytorch_bounded_analysis_check(
+                        result,
+                        source,
+                        file_size=standalone_size,
+                    )
+                    if deferred_size_check is not None:
+                        self._mark_legacy_pytorch_storage_payload_incomplete(
+                            result,
+                            legacy_layout,
+                            source,
+                            file_size=standalone_size,
+                        )
                     suffix = payload[legacy_layout.storage_end :]
                     self._scan_legacy_pytorch_suffix_bytes(
                         result,
@@ -3858,30 +5018,44 @@ class PickleScanner(BaseScanner):
             else:
                 rust_stream_size = len(payload) if stream_read.truncated else standalone_size
                 result = self._scan_standalone_stream(io.BytesIO(payload), rust_stream_size, source=source)
+                self._annotate_legacy_pytorch_storage_persistent_id_details_from_payload(result, payload)
                 if _matches_legacy_pytorch_preamble(payload):
+                    if deferred_size_check is not None and not (stream_read.truncated or stream_read.short_read):
+                        return deferred_size_check
                     self._mark_legacy_pytorch_control_layout_incomplete(result, source)
                     allow_binary_tail_scan = False
+                elif deferred_size_check is not None:
+                    return deferred_size_check
             result.metadata["pickle_stream_bytes_buffered"] = len(payload)
             self._add_stream_integrity_check(
                 payload,
                 result,
                 source,
-                hash_complete=not stream_read.truncated,
+                hash_complete=not stream_read.truncated and not stream_read.short_read,
             )
             storage_only_omitted = (
                 legacy_layout is not None
                 and legacy_storage_valid
                 and legacy_layout.storage_end is not None
                 and stream_read.truncated
+                and not stream_read.short_read
                 and standalone_size is not None
                 and legacy_layout.storage_end == standalone_size
             )
-            if storage_only_omitted:
+            if stream_read.short_read and not result.metadata.get("pickle_stream_short_read"):
+                self._add_stream_short_read_check(stream_read, result, source, standalone_size)
+            elif storage_only_omitted:
                 assert legacy_layout is not None and legacy_layout.storage_end is not None
                 result.metadata["legacy_pytorch_storage_scan_bounded"] = True
                 result.metadata["legacy_pytorch_storage_bytes_buffered"] = max(
                     min(len(payload), legacy_layout.storage_end) - legacy_layout.pickle_end,
                     0,
+                )
+                self._mark_legacy_pytorch_storage_payload_incomplete(
+                    result,
+                    legacy_layout,
+                    source,
+                    file_size=standalone_size,
                 )
             else:
                 self._add_stream_truncation_check(stream_read, result, source, standalone_size)
@@ -3953,7 +5127,11 @@ class PickleScanner(BaseScanner):
 
         size_check = self._check_size_limit(path)
         if size_check:
-            return size_check
+            if not self._can_defer_size_limit_for_legacy_pytorch(path):
+                return size_check
+            deferred_size_check = size_check
+        else:
+            deferred_size_check = None
 
         zip_result = self._scan_zip_backed_pytorch_container(path)
         if zip_result is not None:
@@ -3962,15 +5140,24 @@ class PickleScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result = self._create_result()
         result.metadata["file_size"] = file_size
-        self.add_file_integrity_check(path, result)
         legacy_layout: _LegacyPyTorchStreamLayout | None = None
         legacy_storage_valid = False
         legacy_control_incomplete = False
         suffix_raw_data = b""
 
         try:
-            raw_data = self._read_root_raw_scan_window(path, file_size)
+            raw_data = b""
             with open(path, "rb") as layout_handle:
+                if deferred_size_check is not None:
+                    preamble_probe = self._read_stream_bytes(
+                        layout_handle,
+                        self._legacy_pytorch_preamble_probe_size(file_size),
+                    )
+                    if not _matches_legacy_pytorch_preamble(preamble_probe):
+                        return deferred_size_check
+                    layout_handle.seek(0)
+                else:
+                    raw_data = self._read_root_raw_scan_window(path, file_size)
                 control_probe = self._read_stream_bytes(
                     layout_handle,
                     self._legacy_pytorch_control_probe_size(file_size),
@@ -3985,6 +5172,16 @@ class PickleScanner(BaseScanner):
                     total_size=file_size,
                     read_at=read_at,
                 )
+            legacy_framing_matched = _matches_legacy_pytorch_preamble(control_probe)
+            if deferred_size_check is not None and legacy_layout is None:
+                return deferred_size_check
+            if deferred_size_check is not None:
+                raw_data = control_probe[: self._root_raw_scan_limit()]
+
+            if deferred_size_check is not None and legacy_layout is not None:
+                self._add_bounded_file_integrity_check(raw_data, result, path, file_size)
+            else:
+                self.add_file_integrity_check(path, result)
             if legacy_layout is not None:
                 scan_result = self._scan_standalone_bytes(control_probe[: legacy_layout.pickle_end], source=path)
                 legacy_storage_valid = legacy_storage_valid and self._legacy_pytorch_control_scan_complete(scan_result)
@@ -3992,6 +5189,19 @@ class PickleScanner(BaseScanner):
                 if legacy_storage_valid:
                     assert legacy_layout.storage_end is not None
                     self._annotate_legacy_pytorch_layout(scan_result, legacy_layout)
+                    self._downgrade_legacy_pytorch_storage_persistent_ids(scan_result, legacy_layout)
+                    self._add_legacy_pytorch_bounded_analysis_check(
+                        scan_result,
+                        path,
+                        file_size=file_size,
+                    )
+                    if deferred_size_check is not None:
+                        self._mark_legacy_pytorch_storage_payload_incomplete(
+                            scan_result,
+                            legacy_layout,
+                            path,
+                            file_size=file_size,
+                        )
                     suffix_raw_limit = max(self._root_raw_scan_limit() - len(detector_data), 0)
                     suffix_raw_data = self._scan_legacy_pytorch_file_suffix(
                         scan_result,
@@ -4005,7 +5215,8 @@ class PickleScanner(BaseScanner):
             else:
                 with open(path, "rb") as handle:
                     scan_result = self._scan_standalone_stream(handle, file_size, source=path)
-                if _matches_legacy_pytorch_preamble(control_probe):
+                self._annotate_legacy_pytorch_storage_persistent_id_details_from_payload(scan_result, control_probe)
+                if legacy_framing_matched:
                     self._mark_legacy_pytorch_control_layout_incomplete(scan_result, path)
                     legacy_control_incomplete = True
                 detector_data = raw_data
@@ -4039,6 +5250,7 @@ class PickleScanner(BaseScanner):
             except OSError as error:
                 self._record_file_read_failure(result, path, error)
                 return result
+        self._apply_legitimate_joblib_like_pickle_cleanup(result, path)
         self._finish_after_wrapper_analysis(result, base_success=scan_result.success)
         return result
 
