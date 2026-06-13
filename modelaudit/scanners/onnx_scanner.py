@@ -1957,7 +1957,7 @@ def _build_onnx_weight_analysis_plan(
             return _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
                 shape=lineage.shape,
-                data_type=lineage.data_type,
+                data_type=None,
                 transforms=lineage.transforms,
                 unresolved_reason=lineage.unresolved_reason or "quantize_linear_lineage_unsupported",
                 quantization=lineage.quantization,
@@ -3314,16 +3314,19 @@ def _build_onnx_weight_analysis_plan(
                                     raise ValueError("Quantized weight dequantization exceeds retained array budget")
                                 quantization_applied = True
                                 continue
+                            transform_input = transformed
                             if transform.kind == "Transpose":
                                 transformed = np.transpose(transformed, axes=transform.parameters)
                             elif transform.kind == "Reshape":
                                 transformed = np.reshape(transformed, transform.parameters)
-                            if (
-                                not quantization_applied
-                                and transformed.size
-                                and not np.shares_memory(array, transformed)
-                            ):
-                                raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
+                            if transformed.size and not np.shares_memory(transform_input, transformed):
+                                if not quantization_applied:
+                                    raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
+                                if retain_array_check is not None and not retain_array_check(
+                                    bounded_name,
+                                    int(transformed.nbytes),
+                                ):
+                                    raise ValueError("Post-dequantization transform exceeds retained array budget")
                         if not quantization_applied:
                             transformed = materialize_quantized_weights(transformed, consumer_group.quantization)
                             if retain_array_check is not None and not retain_array_check(

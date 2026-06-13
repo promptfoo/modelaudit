@@ -1770,6 +1770,84 @@ def create_quantized_conv_weight_model(
     return path
 
 
+def create_quantize_linear_qlinear_weight_model(
+    tmp_path: Path,
+    *,
+    op_type: str,
+    malicious: bool,
+) -> Path:
+    if op_type == "QLinearMatMul":
+        weights = np.zeros((100, 10), dtype=np.float32)
+        if malicious:
+            weights[50:55, 3] = 25.5
+        input_shape = [1, 100]
+        output_shape = [1, 10]
+    else:
+        weights = np.zeros((10, 4, 3, 3), dtype=np.float32)
+        if malicious:
+            weights[3, 0, :2, :3] = 25.5
+        input_shape = [1, 4, 8, 8]
+        output_shape = [1, 10, 6, 6]
+
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W_float"),
+        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="W_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="W_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="X_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="Y_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="Y_zero_point"),
+    ]
+    nodes = [helper.make_node("QuantizeLinear", ["W_float", "W_scale", "W_zero_point"], ["W_quantized"])]
+    if op_type == "QLinearMatMul":
+        nodes.append(
+            helper.make_node(
+                "QLinearMatMul",
+                [
+                    "X",
+                    "X_scale",
+                    "X_zero_point",
+                    "W_quantized",
+                    "W_scale",
+                    "W_zero_point",
+                    "Y_scale",
+                    "Y_zero_point",
+                ],
+                ["Y"],
+            ),
+        )
+    else:
+        nodes.append(
+            helper.make_node(
+                "QLinearConv",
+                [
+                    "X",
+                    "X_scale",
+                    "X_zero_point",
+                    "W_quantized",
+                    "W_scale",
+                    "W_zero_point",
+                    "Y_scale",
+                    "Y_zero_point",
+                ],
+                ["Y"],
+            ),
+        )
+    graph = helper.make_graph(
+        nodes,
+        "quantize_linear_qlinear_weight",
+        [helper.make_tensor_value_info("X", TensorProto.UINT8, input_shape)],
+        [helper.make_tensor_value_info("Y", TensorProto.UINT8, output_shape)],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model, full_check=True)
+    path = tmp_path / f"quantize-linear-{op_type.lower()}-{'malicious' if malicious else 'benign'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
 def create_qlinear_matmul_left_weight_model(tmp_path: Path, *, malicious: bool) -> Path:
     weights = np.zeros((10, 100), dtype=np.uint8)
     if malicious:
@@ -1855,6 +1933,35 @@ def create_qdq_transposed_weight_model(tmp_path: Path, *, malicious: bool = Fals
     model.ir_version = 8
     onnx.checker.check_model(model)
     path = tmp_path / "qdq-transposed-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_qdq_transpose_reshape_weight_model(tmp_path: Path) -> Path:
+    weights = np.zeros((10, 100), dtype=np.int8)
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W"),
+        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="zero_point"),
+        onnx.numpy_helper.from_array(np.asarray([20, 50], dtype=np.int64), name="shape"),
+    ]
+    nodes = [
+        helper.make_node("DequantizeLinear", ["W", "scale", "zero_point"], ["dequantized_weight"]),
+        helper.make_node("Transpose", ["dequantized_weight"], ["transposed_weight"], perm=[1, 0]),
+        helper.make_node("Reshape", ["transposed_weight", "shape"], ["reshaped_weight"]),
+        helper.make_node("MatMul", ["X", "reshaped_weight"], ["Y"]),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "qdq_transpose_reshape_weight",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 20])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 50])],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model, full_check=True)
+    path = tmp_path / "qdq-transpose-reshape-weight.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -7096,6 +7203,30 @@ class TestWeightDistributionSemantics:
         if malicious:
             assert checks[0].details["affected_neurons"] == [3]
 
+    @pytest.mark.parametrize("op_type", ["QLinearMatMul", "QLinearConv"])
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_quantize_linear_weight_lineage_fails_closed(
+        self,
+        tmp_path: Path,
+        op_type: str,
+        malicious: bool,
+    ) -> None:
+        model_path = create_quantize_linear_qlinear_weight_model(
+            tmp_path,
+            op_type=op_type,
+            malicious=malicious,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "quantize_linear_lineage_unsupported"
+
     def test_matmul_integer_dead_scale_branch_cannot_suppress_anomaly(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_weight_model(
             tmp_path,
@@ -7362,6 +7493,27 @@ class TestWeightDistributionSemantics:
         context = semantics["eligible"][0]
         assert context["lineage"] == ["DequantizeLinear", "Transpose"]
         assert context["quantization_axis"] == 0
+
+    def test_qdq_post_dequantization_copy_respects_retained_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "modelaudit.scanners.onnx_scanner._ONNX_WEIGHT_RETAINED_ARRAY_BUDGET_MULTIPLIER",
+            2,
+        )
+        model_path = create_qdq_transpose_reshape_weight_model(tmp_path)
+
+        result = OnnxScanner({"max_array_size": 4_001}).scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["extraction_failures"] == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
 
     @pytest.mark.parametrize("malicious", [False, True])
     def test_qlinear_matmul_nd_scale_broadcast_is_analyzed(
