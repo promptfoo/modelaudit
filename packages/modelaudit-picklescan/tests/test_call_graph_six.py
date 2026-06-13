@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pickle
 import shlex
+import subprocess
 import sys
 from importlib.util import find_spec
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 
 from modelaudit_picklescan import PickleReport, SafetyVerdict, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
-from modelaudit_picklescan.call_graph import _call_graph_entrypoints, _find_sink_path
+from modelaudit_picklescan.call_graph import _call_graph_entrypoints, _find_sink_path, _trusted_module_origin_kind
 
 
 def _has_module(module: str) -> bool:
@@ -144,6 +145,38 @@ def _has_critical_call_graph_finding(report: PickleReport, module: str, name: st
         and finding.details.get("sink") == sink
         for finding in report.findings
     )
+
+
+def _assert_pickle_payload_executes_in_subprocess(
+    payload: bytes,
+    marker: Path,
+    marker_content: str,
+    tmp_path: Path,
+    *,
+    expected_result: object,
+) -> None:
+    payload_path = tmp_path / "payload.pkl"
+    payload_path.write_bytes(payload)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib, pickle, sys; "
+                "result = pickle.loads(pathlib.Path(sys.argv[1]).read_bytes()); "
+                "print(repr(result))"
+            ),
+            str(payload_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == repr(expected_result)
+    assert marker.read_text() == marker_content
 
 
 @pytest.mark.parametrize(
@@ -301,5 +334,12 @@ def test_scan_bytes_blocks_six_moves_builtins_eval_rce(module: str, name: str, t
         return
 
     assert not marker.exists()
-    assert pickle.loads(payload) == len(marker_content)
-    assert marker.read_text() == marker_content
+    _assert_pickle_payload_executes_in_subprocess(
+        payload,
+        marker,
+        marker_content,
+        tmp_path,
+        expected_result=len(marker_content),
+    )
+    _trusted_module_origin_kind.cache_clear()
+    assert _trusted_module_origin_kind("builtins") == "stdlib"
