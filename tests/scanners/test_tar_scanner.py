@@ -2006,6 +2006,16 @@ class TestTarScanner:
         assert scanner.max_decompressed_bytes == DEFAULT_MAX_DECOMPRESSED_BYTES
         assert scanner.max_decompression_ratio == DEFAULT_MAX_DECOMPRESSION_RATIO
 
+        for nonfinite_ratio in (float("inf"), float("-inf"), float("nan")):
+            assert (
+                TarScanner(config={"compressed_max_decompression_ratio": nonfinite_ratio}).max_decompression_ratio
+                == DEFAULT_MAX_DECOMPRESSION_RATIO
+            )
+            assert (
+                file_detection._normalize_positive_float(nonfinite_ratio, DEFAULT_MAX_DECOMPRESSION_RATIO)
+                == DEFAULT_MAX_DECOMPRESSION_RATIO
+            )
+
     def test_extract_member_to_tempfile_streams_in_chunks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2784,7 +2794,7 @@ class TestTarScanner:
             info.size = len(payload)
             archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
         with archive_path.open("ab") as archive_file:
-            archive_file.write(gzip.compress(b"B" * (1024 * 1024)))
+            archive_file.write(gzip.compress(b"\0" * (1024 * 1024)))
 
         result = TarScanner(
             config={
@@ -2822,6 +2832,104 @@ class TestTarScanner:
         assert len(trailing_checks) == 1
         assert trailing_checks[0].status == CheckStatus.FAILED
         assert "tar_compressed_trailing_data" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("suffix", "mode"),
+        [
+            (".tar.bz2", "w:bz2"),
+            (".tar.xz", "w:xz"),
+        ],
+    )
+    def test_scan_bzip2_xz_tar_rejects_physical_trailing_bytes(
+        self,
+        tmp_path: Path,
+        suffix: str,
+        mode: Literal["w:bz2", "w:xz"],
+    ) -> None:
+        archive_path = tmp_path / f"physical-tail{suffix}"
+        with tarfile.open(archive_path, mode) as archive:
+            info = tarfile.TarInfo("payload.txt")
+            payload = b"safe"
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+        with archive_path.open("ab") as archive_file:
+            archive_file.write(b"physical trailing payload")
+
+        result = TarScanner(
+            config={
+                "compressed_max_decompressed_bytes": 1024 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            }
+        ).scan(str(archive_path))
+
+        trailing_checks = [check for check in result.checks if check.name == "Compressed TAR Trailing Data"]
+        assert result.success is False
+        assert len(trailing_checks) == 1
+        assert trailing_checks[0].status == CheckStatus.FAILED
+        assert "tar_compressed_trailing_data" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_xz_tar_accepts_valid_stream_padding(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "stream-padding.tar.xz"
+        with tarfile.open(archive_path, "w:xz") as archive:
+            info = tarfile.TarInfo("payload.txt")
+            payload = b"safe"
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+        with archive_path.open("ab") as archive_file:
+            archive_file.write(b"\0" * 4)
+
+        result = TarScanner(
+            config={
+                "compressed_max_decompressed_bytes": 1024 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            }
+        ).scan(str(archive_path))
+
+        trailing_checks = [check for check in result.checks if check.name == "Compressed TAR Trailing Data"]
+        assert result.success is True
+        assert trailing_checks == []
+
+    def test_scan_compressed_tar_stops_tail_at_ratio_limit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "high-ratio-tail.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.txt")
+            payload = b"safe"
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+        with archive_path.open("ab") as archive_file:
+            archive_file.write(gzip.compress(b"X" * (8 * 1024 * 1024)))
+
+        max_stream_bytes_read = 0
+        original_read = tar_scanner_module._TarBoundedStream.read
+
+        def track_stream_read(stream: tar_scanner_module._TarBoundedStream, size: int = -1) -> bytes:
+            nonlocal max_stream_bytes_read
+            try:
+                return original_read(stream, size)
+            finally:
+                max_stream_bytes_read = max(max_stream_bytes_read, stream.bytes_read)
+
+        monkeypatch.setattr(tar_scanner_module._TarBoundedStream, "read", track_stream_read)
+        max_ratio = 2.0
+        ratio_byte_limit = int(archive_path.stat().st_size * max_ratio)
+
+        result = TarScanner(
+            config={
+                "compressed_max_decompressed_bytes": 16 * 1024 * 1024,
+                "compressed_max_decompression_ratio": max_ratio,
+            }
+        ).scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert result.success is False
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompression ratio exceeded" in limit_checks[0].message.lower()
+        assert max_stream_bytes_read <= ratio_byte_limit + 1
 
     def test_scan_compressed_tar_accounts_for_tar_record_padding(self, tmp_path: Path) -> None:
         """Wrapper limits should account for TAR record padding, even on tiny archives."""

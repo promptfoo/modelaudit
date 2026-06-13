@@ -7,6 +7,7 @@ import contextlib
 import errno
 import gzip
 import lzma
+import math
 import os
 import re
 import tarfile
@@ -91,6 +92,10 @@ class _TarStreamBudgetExceeded(ValueError):
         self.reason = reason
 
 
+class _TarCompressedPhysicalTrailingData(ValueError):
+    """Raised when bytes after a complete compressed stream are not a valid stream."""
+
+
 @dataclass
 class _TarSharedScanBudget:
     max_total_uncompressed_size: int
@@ -130,6 +135,93 @@ class _TarBoundedStream:
                 reason="tar_decompressed_size_limit_exceeded",
             )
         return data
+
+
+class _StrictConcatenatedDecompressionReader:
+    """Stream bzip2/xz data without silently discarding physical trailing bytes."""
+
+    _RAW_READ_SIZE = 8 * 1024
+
+    def __init__(self, fileobj: BinaryIO, *, compression_codec: str) -> None:
+        self._fileobj = fileobj
+        self._compression_codec = compression_codec
+        self._decompressor = self._new_decompressor()
+        self._completed_streams = 0
+        self._eof = False
+
+    def _new_decompressor(self) -> Any:
+        if self._compression_codec == "bzip2":
+            return bz2.BZ2Decompressor()
+        if self._compression_codec == "xz":
+            return lzma.LZMADecompressor()
+        raise ValueError(f"Unsupported strict decompression codec: {self._compression_codec}")
+
+    def _read_after_xz_padding(self, initial: bytes) -> bytes | None:
+        """Skip valid four-byte XZ stream padding before a possible next stream."""
+        block = initial
+        padding_size = 0
+        while True:
+            nonzero_offset = len(block) - len(block.lstrip(b"\0"))
+            padding_size += nonzero_offset
+            block = block[nonzero_offset:]
+            if block:
+                if padding_size % 4 != 0:
+                    raise _TarCompressedPhysicalTrailingData("Invalid XZ stream padding")
+                return block
+
+            block = self._fileobj.read(self._RAW_READ_SIZE)
+            if not block:
+                if padding_size % 4 != 0:
+                    raise _TarCompressedPhysicalTrailingData("Invalid XZ stream padding")
+                return None
+
+    def _next_stream_input(self) -> bytes | None:
+        block = cast(bytes, self._decompressor.unused_data)
+        if not block:
+            block = self._fileobj.read(self._RAW_READ_SIZE)
+        if self._compression_codec == "xz":
+            return self._read_after_xz_padding(block)
+        return block or None
+
+    def _decompress(self, block: bytes, max_length: int) -> bytes:
+        try:
+            return cast(bytes, self._decompressor.decompress(block, max_length))
+        except (OSError, lzma.LZMAError) as exc:
+            if self._completed_streams > 0:
+                raise _TarCompressedPhysicalTrailingData(
+                    "Compressed wrapper contains invalid physical trailing data"
+                ) from exc
+            raise
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = ARCHIVE_MEMBER_COPY_CHUNK_BYTES
+        if size == 0 or self._eof:
+            return b""
+
+        output = bytearray()
+        while len(output) < size and not self._eof:
+            if self._decompressor.eof:
+                self._completed_streams += 1
+                block = self._next_stream_input()
+                if block is None:
+                    self._eof = True
+                    break
+                self._decompressor = self._new_decompressor()
+            elif self._decompressor.needs_input:
+                block = self._fileobj.read(self._RAW_READ_SIZE)
+                if not block:
+                    if self._completed_streams > 0:
+                        raise _TarCompressedPhysicalTrailingData(
+                            "Compressed wrapper contains truncated physical trailing data"
+                        )
+                    raise EOFError("Compressed file ended before the end-of-stream marker")
+            else:
+                block = b""
+
+            output.extend(self._decompress(block, size - len(output)))
+
+        return bytes(output)
 
 
 def _tar_padded_size(size: int) -> int:
@@ -178,7 +270,7 @@ class TarScanner(BaseScanner):
             normalized_value = float(value)
         except (TypeError, ValueError):
             return default
-        return normalized_value if normalized_value > 0 else default
+        return normalized_value if math.isfinite(normalized_value) and normalized_value > 0 else default
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -374,9 +466,9 @@ class TarScanner(BaseScanner):
             if compression_codec == "gzip":
                 decompressed: Any = stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb"))
             elif compression_codec == "bzip2":
-                decompressed = stack.enter_context(bz2.BZ2File(raw, mode="rb"))
+                decompressed = _StrictConcatenatedDecompressionReader(raw, compression_codec="bzip2")
             elif compression_codec == "xz":
-                decompressed = stack.enter_context(lzma.LZMAFile(raw, mode="rb"))
+                decompressed = _StrictConcatenatedDecompressionReader(raw, compression_codec="xz")
             else:  # pragma: no cover - _detect_compressed_tar_wrapper returns only supported codecs.
                 return
 
@@ -946,36 +1038,59 @@ class TarScanner(BaseScanner):
             )
         mark_archive_scan_incomplete(result, exc.reason)
 
-    @staticmethod
     def _drain_compressed_tar_tail(
+        self,
         tar: tarfile.TarFile,
         bounded_stream: _TarBoundedStream,
         result: ScanResult,
         path: str,
+        *,
+        compressed_size: int,
+        compression_codec: str,
     ) -> bool:
         """Consume the complete wrapper stream and reject data after the TAR end marker."""
-        has_nonzero_trailing_data = False
+        has_trailing_data = False
         read_size = min(ARCHIVE_MEMBER_COPY_CHUNK_BYTES, bounded_stream.max_read_size)
         # Header traversal uses one-block buffering to avoid prefetching member bodies
         # before policy checks. Once TAR EOF is proven, larger reads are safe.
         cast(Any, tar.fileobj).bufsize = read_size
         try:
-            while chunk := tar.fileobj.read(read_size):
-                has_nonzero_trailing_data = has_nonzero_trailing_data or any(chunk)
+            while True:
+                ratio_remaining = (compressed_size * self.max_decompression_ratio) - bounded_stream.bytes_read
+                tail_read_size = read_size
+                if ratio_remaining < read_size:
+                    tail_read_size = max(int(ratio_remaining) + 1, 1)
+                cast(Any, tar.fileobj).bufsize = tail_read_size
+                chunk = tar.fileobj.read(tail_read_size)
+                if not chunk:
+                    break
+                if self._record_compressed_stream_limit(
+                    result,
+                    path,
+                    stream_size=bounded_stream.bytes_read,
+                    compressed_size=compressed_size,
+                    compression_codec=compression_codec,
+                ):
+                    return False
+                has_trailing_data = any(chunk)
+                if has_trailing_data:
+                    break
         except _TarStreamBudgetExceeded:
             raise
+        except _TarCompressedPhysicalTrailingData:
+            has_trailing_data = True
         except Exception as exc:
             TarScanner._record_incomplete_tar_scan(result, path, exc)
             return False
 
-        if not has_nonzero_trailing_data:
+        if not has_trailing_data:
             return True
 
         mark_archive_scan_incomplete(result, TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON)
         result.add_check(
             name="Compressed TAR Trailing Data",
             passed=False,
-            message="Compressed wrapper contains non-zero data after the TAR end marker",
+            message="Compressed wrapper contains data after the TAR end marker",
             severity=IssueSeverity.WARNING,
             rule_code="S902",
             location=path,
@@ -991,7 +1106,7 @@ class TarScanner(BaseScanner):
         path: str,
         result: ScanResult,
         *,
-        reserve_member_budget: bool = False,
+        retain_member_budget: bool = True,
     ) -> bool:
         """Stream TAR headers once to enforce wrapper and optional aggregate limits."""
         entry_count = 0
@@ -999,7 +1114,8 @@ class TarScanner(BaseScanner):
         compression_codec: str | None = None
         consumed_size = 0
         archive_uncompressed_size = 0
-        shared_budget = self._get_or_create_shared_budget() if reserve_member_budget else None
+        shared_budget = self._get_or_create_shared_budget()
+        initial_member_bytes = shared_budget.member_bytes_consumed
 
         try:
             with self._open_tar_stream(path) as (tar, bounded_stream, compression_codec):
@@ -1015,7 +1131,14 @@ class TarScanner(BaseScanner):
                         if (
                             compression_codec is not None
                             and bounded_stream is not None
-                            and not self._drain_compressed_tar_tail(tar, bounded_stream, result, path)
+                            and not self._drain_compressed_tar_tail(
+                                tar,
+                                bounded_stream,
+                                result,
+                                path,
+                                compressed_size=compressed_size,
+                                compression_codec=compression_codec,
+                            )
                         ):
                             return False
                         break
@@ -1033,7 +1156,7 @@ class TarScanner(BaseScanner):
                         )
                         return False
 
-                    if shared_budget is not None and member.size > 0:
+                    if member.size > 0:
                         work_size = member.size
                         if self._member_declares_sparse_data(member):
                             work_size = max(work_size, tar.offset - member.offset_data)
@@ -1080,13 +1203,12 @@ class TarScanner(BaseScanner):
                 details={"entries": entry_count, "max_entries": self.max_entries},
                 rule_code=None,
             )
-            if shared_budget is not None:
-                self._add_tar_aggregate_size_check(
-                    result,
-                    path,
-                    passed=True,
-                    archive_uncompressed_size=archive_uncompressed_size,
-                )
+            self._add_tar_aggregate_size_check(
+                result,
+                path,
+                passed=True,
+                archive_uncompressed_size=archive_uncompressed_size,
+            )
 
             if compression_codec is not None:
                 final_stream_size = consumed_size
@@ -1113,6 +1235,8 @@ class TarScanner(BaseScanner):
             self._record_incomplete_tar_scan(result, path, exc)
             return False
 
+        if not retain_member_budget:
+            shared_budget.member_bytes_consumed = initial_member_bytes
         return True
 
     @staticmethod
@@ -1297,7 +1421,14 @@ class TarScanner(BaseScanner):
                         if (
                             compression_codec is not None
                             and bounded_stream is not None
-                            and not self._drain_compressed_tar_tail(tar, bounded_stream, result, path)
+                            and not self._drain_compressed_tar_tail(
+                                tar,
+                                bounded_stream,
+                                result,
+                                path,
+                                compressed_size=compressed_size,
+                                compression_codec=compression_codec,
+                            )
                         ):
                             scan_complete = False
                             wrapper_integrity_failed = True

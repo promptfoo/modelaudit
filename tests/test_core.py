@@ -2572,7 +2572,12 @@ def _write_large_valid_userblock_keras_hdf5(path: Path, *, userblock_size: int =
     return userblock_size
 
 
-def _write_tar_hdf5_userblock(path: Path, members: list[tuple[str, bytes]]) -> int:
+def _write_tar_hdf5_userblock(
+    path: Path,
+    members: list[tuple[str, bytes]],
+    *,
+    compressed: bool = False,
+) -> int:
     h5py = pytest.importorskip("h5py")
     userblock_size = 1024 * 1024
     with h5py.File(path, "w", userblock_size=userblock_size) as h5_file:
@@ -2580,7 +2585,7 @@ def _write_tar_hdf5_userblock(path: Path, members: list[tuple[str, bytes]]) -> i
             {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]}},
         )
     tar_payload = io.BytesIO()
-    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+    with tarfile.open(fileobj=tar_payload, mode="w:gz" if compressed else "w") as archive:
         for name, data in members:
             info = tarfile.TarInfo(name)
             info.size = len(data)
@@ -8741,7 +8746,9 @@ def test_scan_file_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_p
     assert cache_entries == 0
 
 
-def test_scan_file_fails_closed_for_inconclusive_tar_inside_valid_hdf5_userblock(tmp_path: Path) -> None:
+def test_scan_file_fails_closed_for_inconclusive_compressed_tar_inside_valid_hdf5_userblock(
+    tmp_path: Path,
+) -> None:
     model_path = tmp_path / "inconclusive-tar-userblock.h5"
     userblock_size = _write_tar_hdf5_userblock(
         model_path,
@@ -8749,6 +8756,7 @@ def test_scan_file_fails_closed_for_inconclusive_tar_inside_valid_hdf5_userblock
             ("weights.bin", b"A" * (128 * 1024)),
             ("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n"),
         ],
+        compressed=True,
     )
 
     assert find_hdf5_signature_offset(str(model_path)) == userblock_size

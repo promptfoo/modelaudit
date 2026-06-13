@@ -6057,7 +6057,7 @@ def _normalize_positive_float(value: Any, default: float) -> float:
         normalized = float(value)
     except (TypeError, ValueError):
         return default
-    return normalized if normalized > 0 else default
+    return normalized if math.isfinite(normalized) and normalized > 0 else default
 
 
 class _GzipTarProbeLimitExceeded(Exception):
@@ -6083,6 +6083,10 @@ class _GzipTarBoundedReader:
         if size is None or size < 0:
             size = _TAR_GZIP_POST_EOF_TRAILING_READ_BYTES
         read_size = min(size, self.max_bytes - self.bytes_read + 1)
+        if self.compressed_size > 0:
+            ratio_remaining = (self.compressed_size * self.max_ratio) - self.bytes_read
+            if ratio_remaining < read_size:
+                read_size = max(int(ratio_remaining) + 1, 1)
         data = cast(bytes, self._fileobj.read(read_size))
         self.bytes_read += len(data)
         if self.bytes_read > self.max_bytes:
@@ -6179,9 +6183,7 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
         return None
 
     try:
-        seekable_raw_tar_route = file_path.suffix.lower() == ".tar" and not _has_supported_tar_compression_wrapper(
-            file_path
-        )
+        seekable_raw_tar_route = not _has_supported_tar_compression_wrapper(file_path)
         tar_mode: Literal["r:", "r|*"] = "r:" if seekable_raw_tar_route else "r|*"
         with tarfile.open(
             file_path,
@@ -6429,18 +6431,21 @@ def _has_zero_filled_hdf5_userblock(file_path: Path, signature_offset: int) -> b
 
 def _classify_empty_tar_prefix(file_path: Path, header: bytes, file_size: int) -> str | None:
     """Classify an apparent empty TAR without trusting its zero prefix alone."""
-    has_empty_prefix = (
+    has_zero_prefix = (
         file_size >= _TAR_EMPTY_ARCHIVE_PROBE_BYTES
-        and file_size % _TAR_BLOCK_SIZE == 0
         and len(header) >= _TAR_EMPTY_ARCHIVE_PROBE_BYTES
         and header[:_TAR_EMPTY_ARCHIVE_PROBE_BYTES] == b"\0" * _TAR_EMPTY_ARCHIVE_PROBE_BYTES
     )
-    if not has_empty_prefix:
+    if not has_zero_prefix:
         return None
 
     hdf5_signature_offset = find_hdf5_signature_offset(str(file_path))
     if hdf5_signature_offset is not None and _has_zero_filled_hdf5_userblock(file_path, hdf5_signature_offset):
         return "hdf5"
+    if zipfile.is_zipfile(file_path):
+        return "zip"
+    if file_size % _TAR_BLOCK_SIZE != 0:
+        return None
 
     if file_size <= _TAR_EMPTY_ARCHIVE_MAX_VERIFY_BYTES:
         try:
@@ -6450,8 +6455,6 @@ def _classify_empty_tar_prefix(file_path: Path, header: bytes, file_size: int) -
         except OSError:
             return NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
-    if zipfile.is_zipfile(file_path):
-        return "zip"
     return NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 

@@ -1373,7 +1373,7 @@ class NemoScanner(BaseScanner):
         if not tar_scanner._preflight_tar_archive(
             path,
             preflight_result,
-            reserve_member_budget=is_declared_nemo,
+            retain_member_budget=is_declared_nemo,
         ):
             mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
             preflight_result.finish(success=False)
@@ -1875,7 +1875,7 @@ class NemoScanner(BaseScanner):
         with member_file:
             return member_file.read(2) == b"MZ"
 
-    def scan_reachable_root_config_bytes(
+    def _parse_yaml_config_bytes(
         self,
         raw: bytes,
         *,
@@ -1883,8 +1883,8 @@ class NemoScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
         declared_size: int | None = None,
-    ) -> bool:
-        """Analyze root NeMo config bytes reached by a generic TAR scan."""
+    ) -> dict[Any, Any] | list[Any] | None:
+        """Parse bounded NeMo YAML bytes with consistent incomplete outcomes."""
         config_size = declared_size if declared_size is not None else len(raw)
         if config_size > self.MAX_CONFIG_SIZE or len(raw) > self.MAX_CONFIG_SIZE:
             reported_size = max(config_size, len(raw))
@@ -1901,7 +1901,7 @@ class NemoScanner(BaseScanner):
                     "max_config_size": self.MAX_CONFIG_SIZE,
                 },
             )
-            return False
+            return None
 
         if not HAS_YAML:
             self._mark_inconclusive_scan_result(
@@ -1913,12 +1913,12 @@ class NemoScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 details={"config_file": config_file},
             )
-            return False
+            return None
 
         try:
-            config = yaml.safe_load(raw)
+            parsed_config = yaml.safe_load(raw)
         except yaml.YAMLError:
-            logger.debug("Failed to parse reachable YAML config %s in %s", config_file, archive_path)
+            logger.debug("Failed to parse NeMo YAML config %s in %s", config_file, archive_path)
             self._mark_inconclusive_scan_result(
                 result,
                 reason="nemo_config_yaml_parse_failed",
@@ -1927,9 +1927,9 @@ class NemoScanner(BaseScanner):
                 location=f"{archive_path}:{config_file}",
                 details={"config_file": config_file},
             )
-            return False
+            return None
         except RecursionError:
-            logger.debug("Reachable YAML config %s in %s exceeded parser recursion limits", config_file, archive_path)
+            logger.debug("NeMo YAML config %s in %s exceeded parser recursion limits", config_file, archive_path)
             self._mark_config_traversal_inconclusive(
                 result,
                 config_file=config_file,
@@ -1937,21 +1937,43 @@ class NemoScanner(BaseScanner):
                 reason="nemo_config_yaml_complexity_limit",
                 message="YAML config exceeded parser complexity limits",
             )
-            return False
+            return None
 
-        if not isinstance(config, dict | list):
+        if not isinstance(parsed_config, dict | list):
             self._mark_inconclusive_scan_result(
                 result,
                 reason="nemo_config_invalid_structure",
                 check_name="NeMo Config Structure",
-                message=f"YAML config {config_file} has unsupported top-level type: {type(config).__name__}",
+                message=(f"YAML config {config_file} has unsupported top-level type: {type(parsed_config).__name__}"),
                 location=f"{archive_path}:{config_file}",
                 details={
                     "config_file": config_file,
                     "expected_type": "dict_or_list",
-                    "actual_type": type(config).__name__,
+                    "actual_type": type(parsed_config).__name__,
                 },
             )
+            return None
+
+        return parsed_config
+
+    def scan_reachable_root_config_bytes(
+        self,
+        raw: bytes,
+        *,
+        config_file: str,
+        archive_path: str,
+        result: ScanResult,
+        declared_size: int | None = None,
+    ) -> bool:
+        """Analyze root NeMo config bytes reached by a generic TAR scan."""
+        config = self._parse_yaml_config_bytes(
+            raw,
+            config_file=config_file,
+            archive_path=archive_path,
+            result=result,
+            declared_size=declared_size,
+        )
+        if config is None:
             return False
 
         try:
@@ -1982,18 +2004,12 @@ class NemoScanner(BaseScanner):
     ) -> bool:
         """Analyze one YAML config entry, including a safe root-config link target."""
         if member.size > self.MAX_CONFIG_SIZE:
-            self._mark_inconclusive_scan_result(
-                result,
-                reason="nemo_config_size_limit",
-                check_name="NeMo Config Size Check",
-                message=f"Config file too large: {config_file} ({member.size} bytes)",
-                location=f"{archive_path}:{config_file}",
-                severity=IssueSeverity.WARNING,
-                details={
-                    "config_file": config_file,
-                    "size_bytes": member.size,
-                    "max_config_size": self.MAX_CONFIG_SIZE,
-                },
+            self._parse_yaml_config_bytes(
+                b"",
+                config_file=config_file,
+                archive_path=archive_path,
+                result=result,
+                declared_size=member.size,
             )
             return False
 
@@ -2001,59 +2017,16 @@ class NemoScanner(BaseScanner):
         if member_file is None:
             return False
         with member_file:
-            try:
-                raw = member_file.read(self.MAX_CONFIG_SIZE + 1)
-                if len(raw) > self.MAX_CONFIG_SIZE:
-                    self._mark_inconclusive_scan_result(
-                        result,
-                        reason="nemo_config_size_limit",
-                        check_name="NeMo Config Size Check",
-                        message=f"Config file too large: {config_file} ({len(raw)} bytes)",
-                        location=f"{archive_path}:{config_file}",
-                        severity=IssueSeverity.WARNING,
-                        details={
-                            "config_file": config_file,
-                            "size_bytes": len(raw),
-                            "max_config_size": self.MAX_CONFIG_SIZE,
-                        },
-                    )
-                    return False
-                config = yaml.safe_load(raw)
-            except yaml.YAMLError:
-                logger.debug("Failed to parse YAML config %s in %s", config_file, archive_path)
-                self._mark_inconclusive_scan_result(
-                    result,
-                    reason="nemo_config_yaml_parse_failed",
-                    check_name="NeMo Config YAML Parsing",
-                    message=f"Failed to parse YAML config {config_file}",
-                    location=f"{archive_path}:{config_file}",
-                    details={"config_file": config_file},
-                )
-                return False
-            except RecursionError:
-                logger.debug("YAML config %s in %s exceeded parser recursion limits", config_file, archive_path)
-                self._mark_config_traversal_inconclusive(
-                    result,
-                    config_file=config_file,
-                    archive_path=archive_path,
-                    reason="nemo_config_yaml_complexity_limit",
-                    message="YAML config exceeded parser complexity limits",
-                )
-                return False
+            raw = member_file.read(self.MAX_CONFIG_SIZE + 1)
 
-        if not isinstance(config, dict | list):
-            self._mark_inconclusive_scan_result(
-                result,
-                reason="nemo_config_invalid_structure",
-                check_name="NeMo Config Structure",
-                message=f"YAML config {config_file} has unsupported top-level type: {type(config).__name__}",
-                location=f"{archive_path}:{config_file}",
-                details={
-                    "config_file": config_file,
-                    "expected_type": "dict_or_list",
-                    "actual_type": type(config).__name__,
-                },
-            )
+        config = self._parse_yaml_config_bytes(
+            raw,
+            config_file=config_file,
+            archive_path=archive_path,
+            result=result,
+            declared_size=member.size,
+        )
+        if config is None:
             return False
 
         try:

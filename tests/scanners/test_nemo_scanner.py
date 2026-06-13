@@ -237,6 +237,22 @@ class TestNemoScannerBasic:
         assert status is None
         assert 64 * 1024 in observed_read_sizes
 
+    def test_gzip_nemo_tail_validation_bounds_ratio_read_overshoot(self) -> None:
+        compressed_size = 10
+        max_ratio = 2.0
+        source = io.BytesIO(b"x" * 1024)
+        reader = file_detection._GzipTarBoundedReader(
+            source,
+            max_bytes=1024,
+            max_ratio=max_ratio,
+            compressed_size=compressed_size,
+        )
+
+        with pytest.raises(file_detection._GzipTarProbeLimitExceeded):
+            reader.read(1024)
+
+        assert source.tell() == int(compressed_size * max_ratio) + 1
+
     def test_malformed_gzip_nemo_still_reports_s901(self, tmp_path: Path) -> None:
         """A .nemo suffix plus gzip magic is not enough unless it is a valid TAR."""
         path = tmp_path / "model.nemo"
@@ -7236,3 +7252,62 @@ class TestCVE202523304HydraTarget:
         assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
         assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
         assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_content_routed_nemo_enforces_tar_aggregate_budget_before_checkpoint_reads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = tmp_path / "over-budget.tar.gz"
+        with tarfile.open(nemo_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+            _add_tar_bytes(archive, "weights.ckpt", b"x" * 128)
+
+        def fail_checkpoint_extraction(*_args: Any, **_kwargs: Any) -> None:
+            pytest.fail("content-routed checkpoint was read after aggregate preflight rejection")
+
+        monkeypatch.setattr(NemoScanner, "_extract_member_to_tempfile", fail_checkpoint_extraction)
+        shared_budget = tar_scanner_module._TarSharedScanBudget(max_total_uncompressed_size=64)
+
+        result = NemoScanner(
+            config={
+                "max_tar_total_uncompressed_size": 64,
+                "max_total_size": 64,
+                tar_scanner_module.TAR_SHARED_SCAN_BUDGET_CONFIG_KEY: shared_budget,
+            }
+        ).scan(str(nemo_path))
+
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is False
+        assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
+        assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert shared_budget.member_bytes_consumed == len(b"model:\n  _target_: torch.nn.Linear\n")
+
+    def test_content_routed_nemo_preflight_does_not_double_charge_shared_budget(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "within-budget.tar.gz"
+        config_payload = b"model:\n  _target_: torch.nn.Linear\n"
+        weights_payload = b"safe weights"
+        with tarfile.open(nemo_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", config_payload)
+            _add_tar_bytes(archive, "weights.bin", weights_payload)
+
+        initial_consumed = 32
+        expected_consumed = initial_consumed + len(config_payload) + len(weights_payload)
+        shared_budget = tar_scanner_module._TarSharedScanBudget(
+            max_total_uncompressed_size=expected_consumed,
+            member_bytes_consumed=initial_consumed,
+        )
+
+        result = NemoScanner(
+            config={
+                "max_tar_total_uncompressed_size": expected_consumed,
+                "max_total_size": expected_consumed,
+                tar_scanner_module.TAR_SHARED_SCAN_BUDGET_CONFIG_KEY: shared_budget,
+            }
+        ).scan(str(nemo_path))
+
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is True
+        assert not any(check.status == CheckStatus.FAILED for check in aggregate_checks)
+        assert shared_budget.member_bytes_consumed == expected_consumed

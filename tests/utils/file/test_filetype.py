@@ -4283,13 +4283,13 @@ def test_detect_file_format_propagates_inconclusive_compressed_nemo_route(
     assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
-def test_detect_file_format_fails_closed_when_nemo_body_skip_budget_is_exhausted(
+def test_detect_file_format_fails_closed_when_compressed_nemo_body_skip_budget_is_exhausted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
     archive_path = tmp_path / "renamed-model.jpg"
-    with tarfile.open(archive_path, "w") as archive:
+    with tarfile.open(archive_path, "w:gz") as archive:
         first_payload = b"x" * 128
         first_info = tarfile.TarInfo("large-weights.bin")
         first_info.size = len(first_payload)
@@ -4305,12 +4305,14 @@ def test_detect_file_format_fails_closed_when_nemo_body_skip_budget_is_exhausted
     assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
+@pytest.mark.parametrize("suffix", [".tar", ".bin", ".pt"])
 def test_detect_file_format_seekable_raw_tar_preserves_nemo_route_after_large_member(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
 ) -> None:
     monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
-    archive_path = tmp_path / "large-nemo.tar"
+    archive_path = tmp_path / f"large-nemo{suffix}"
     with tarfile.open(archive_path, "w") as archive:
         first_payload = b"x" * 128
         first_info = tarfile.TarInfo("large-weights.bin")
