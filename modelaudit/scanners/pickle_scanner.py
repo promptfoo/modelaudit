@@ -17,7 +17,7 @@ from typing import Any, BinaryIO, ClassVar, TextIO, cast
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
-from modelaudit.detectors.network_comm import redact_url_for_finding
+from modelaudit.detectors.network_comm import NetworkCommDetector, redact_url_for_finding
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
@@ -286,28 +286,7 @@ _PICKLE_LITERAL_URL_RE = re.compile(
     rb"(?:[A-Za-z0-9\-._~:/?#[\]@!$&()*+,;=%-]|"
     rb"'(?=[A-Za-z0-9\-._~:/?#[\]@!$&*+,=%-]))+"
 )
-_PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS: tuple[bytes, ...] = (
-    b"dns.resolver",
-    b"ftp.connect",
-    b"getaddrinfo",
-    b"gethostbyaddr",
-    b"gethostbyname",
-    b"http.request",
-    b"imap.login",
-    b"mongo.connect",
-    b"redis.connect",
-    b"requests.delete",
-    b"requests.get",
-    b"requests.post",
-    b"requests.put",
-    b"smtp.connect",
-    b"socket.connect",
-    b"socket.create_connection",
-    b"ssh.connect",
-    b"telnet.open",
-    b"urlopen",
-    b"urlretrieve",
-)
+_PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS = tuple(NetworkCommDetector.NETWORK_FUNCTIONS)
 _EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
     b"__import__",
     b"cloudpickle.load",
@@ -585,7 +564,7 @@ class _PickleStackValue:
     record_indexes: tuple[int, ...] = ()
     global_module: str | None = None
     global_name: str | None = None
-    opaque_extension: bool = False
+    opaque_callable: bool = False
     build_state_consumer: bool = False
 
 
@@ -1580,7 +1559,7 @@ def _pickle_literal_record_value(*values: _PickleStackValue) -> _PickleStackValu
 
 
 def _pickle_stack_value_is_executable_network_consumer(value: _PickleStackValue) -> bool:
-    if value.opaque_extension:
+    if value.opaque_callable:
         return True
     if value.global_module is None or value.global_name is None:
         return False
@@ -1614,7 +1593,7 @@ def _pickle_constructed_object_value(callable_value: _PickleStackValue) -> _Pick
         text=callable_value.text,
         global_module=callable_value.global_module,
         global_name=callable_value.global_name,
-        opaque_extension=callable_value.opaque_extension,
+        opaque_callable=callable_value.opaque_callable,
         build_state_consumer=_pickle_stack_value_is_build_state_consumer(callable_value),
     )
 
@@ -1891,11 +1870,11 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
 
                 if opcode_name == "BINPERSID":
                     mark_literal_result_consumers(pop_value())
-                    push(unknown)
+                    push(_PickleStackValue(opaque_callable=True))
                     continue
 
                 if opcode_name == "PERSID":
-                    push(unknown)
+                    push(_PickleStackValue(opaque_callable=True))
                     continue
 
                 if opcode_name == "BUILD":
@@ -1906,7 +1885,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                     continue
 
                 if opcode_name in {"EXT1", "EXT2", "EXT4"}:
-                    push(_PickleStackValue(opaque_extension=True))
+                    push(_PickleStackValue(opaque_callable=True))
                     continue
 
                 if opcode_name in {
@@ -1941,6 +1920,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                 mark_unresolved_records_executable_consumers()
                 break
             if parsed_streams == 0:
+                mark_unresolved_records_executable_consumers()
                 break
             del builders[stream_builder_start:]
             last_literal_index = None
@@ -2098,6 +2078,7 @@ def _network_finding_dedupe_key(finding: dict[str, Any]) -> tuple[Any, ...]:
         finding.get("type"),
         finding.get("pattern_type"),
         finding.get("matched_text"),
+        finding.get("url"),
         finding.get("position"),
         finding.get("context"),
     )

