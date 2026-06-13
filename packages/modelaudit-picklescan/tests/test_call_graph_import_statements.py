@@ -301,13 +301,13 @@ def test_legacy_builtin_module_alias_does_not_require_origin_review() -> None:
     assert call_graph.import_only_module_requires_origin_review("__builtin__", "set") is False
 
 
-def test_unresolved_framework_reconstruction_reference_does_not_require_origin_review(
+def test_unresolved_framework_reconstruction_reference_requires_origin_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(call_graph, "_trusted_module_origin_kind", lambda _module_name: "unresolved")
 
-    assert call_graph.import_only_module_requires_origin_review("torch._utils", "_rebuild_tensor_v2") is False
-    assert call_graph.import_only_reference_is_proven_trusted("torch._utils", "_rebuild_tensor_v2") is True
+    assert call_graph.import_only_module_requires_origin_review("torch._utils", "_rebuild_tensor_v2") is True
+    assert call_graph.import_only_reference_is_proven_trusted("torch._utils", "_rebuild_tensor_v2") is False
     assert call_graph.import_only_module_requires_origin_review("torch._utils", "Gadget") is True
     assert call_graph.import_only_reference_is_proven_trusted("torch._utils", "Gadget") is False
 

@@ -6,6 +6,8 @@ import logging
 import os
 import time
 from collections import defaultdict
+from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
 from modelaudit.models import ModelAuditResultModel
@@ -25,7 +27,65 @@ logger = logging.getLogger("modelaudit.core.results")
 
 OPERATIONAL_ERROR_METADATA_KEY = "operational_error"
 OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
+ANALYSIS_INCOMPLETE_METADATA_KEY = "analysis_incomplete"
 SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
+SCAN_OUTCOME_REASON_METADATA_KEY = "scan_outcome_reason"
+SCAN_OUTCOME_REASONS_METADATA_KEY = "scan_outcome_reasons"
+_COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS = frozenset({"recognized_format_scanner_unavailable"})
+_COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES = ("_routing_incomplete",)
+_RUNTIME_VERSION_SKIP_DETAILS = {
+    "runtime_version_known": False,
+    "runtime_cve_applicability": "unknown",
+    "runtime_cve_version_gate": "local_environment_only",
+}
+_SHARD_FAMILY_PATH_DETAIL_KEYS = frozenset(
+    {
+        "duplicate_shards",
+        "location",
+        "missing_shards",
+        "out_of_scope_shards",
+        "path",
+        "paths",
+        "shard",
+        "shard_path",
+        "shard_paths",
+        "shards",
+        "unreadable_shards",
+        "unvalidated_shards",
+    }
+)
+_SHARD_FAMILY_NESTED_DETAIL_KEYS = frozenset({"details", "findings"})
+
+
+def _metadata_value(metadata: Any, key: str) -> Any:
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        return metadata.get(key)
+
+    getter = getattr(metadata, "get", None)
+    if callable(getter):
+        try:
+            return getter(key)
+        except Exception:
+            return None
+
+    return getattr(metadata, key, None)
+
+
+def _reason_is_coverage_only_operational_error(reason: str) -> bool:
+    return reason in _COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS or reason.endswith(
+        _COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES
+    )
+
+
+def metadata_has_coverage_only_operational_error(metadata: Any) -> bool:
+    """Return True when operational_error marks fail-closed coverage, not a scanner failure."""
+    if _metadata_value(metadata, OPERATIONAL_ERROR_METADATA_KEY) is not True:
+        return False
+
+    operational_reason = _metadata_value(metadata, OPERATIONAL_ERROR_REASON_METADATA_KEY)
+    return isinstance(operational_reason, str) and _reason_is_coverage_only_operational_error(operational_reason)
 
 
 def mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
@@ -45,7 +105,7 @@ def scan_result_has_operational_error(scan_result: ScanResult) -> bool:
     metadata = scan_result.metadata or {}
     explicit_flag = metadata.get(OPERATIONAL_ERROR_METADATA_KEY)
     if explicit_flag is not None:
-        return bool(explicit_flag)
+        return bool(explicit_flag) and not metadata_has_coverage_only_operational_error(metadata)
 
     return False
 
@@ -56,7 +116,9 @@ def results_have_operational_error(results: ModelAuditResultModel) -> bool:
         return True
 
     return any(
-        bool(metadata.get(OPERATIONAL_ERROR_METADATA_KEY)) for metadata in (results.file_metadata or {}).values()
+        bool(metadata.get(OPERATIONAL_ERROR_METADATA_KEY))
+        and not metadata_has_coverage_only_operational_error(metadata)
+        for metadata in (results.file_metadata or {}).values()
     )
 
 
@@ -78,19 +140,364 @@ def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
     return getattr(metadata, SCAN_OUTCOME_METADATA_KEY, None) == outcome
 
 
+def metadata_has_incomplete_coverage(metadata: Any, *, allow_bare_analysis_incomplete: bool = True) -> bool:
+    """Return True when metadata identifies incomplete scan coverage."""
+    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
+        return True
+    if allow_bare_analysis_incomplete and _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True:
+        return True
+    reason = _metadata_value(metadata, SCAN_OUTCOME_REASON_METADATA_KEY)
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = _metadata_value(metadata, SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(reason) for reason in reasons)
+
+    return False
+
+
+def _metadata_has_scan_outcome_or_reason_marker(metadata: Any) -> bool:
+    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
+        return True
+    reason = _metadata_value(metadata, SCAN_OUTCOME_REASON_METADATA_KEY)
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = _metadata_value(metadata, SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(reason) for reason in reasons)
+
+    return False
+
+
+def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
+    """Return True when record details explicitly identify incomplete coverage."""
+    if _metadata_has_scan_outcome_or_reason_marker(metadata):
+        return True
+    return _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
+
+
+def _record_is_clean_runtime_version_skip(record: Any) -> bool:
+    details = _metadata_value(record, "details")
+    status = _metadata_value(record, "status")
+    status_value = getattr(status, "value", status)
+    if not (
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
+        and _metadata_value(details, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
+        and not _metadata_has_scan_outcome_or_reason_marker(details)
+    ):
+        return False
+
+    return all(_metadata_value(details, key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
+
+
+def details_have_incomplete_coverage(
+    details: Any,
+    *,
+    allow_bare_analysis_incomplete: bool = True,
+    _depth: int = 0,
+) -> bool:
+    """Return True when details or consolidated detail findings identify incomplete coverage."""
+    if allow_bare_analysis_incomplete:
+        if _metadata_has_explicit_incomplete_coverage_marker(details):
+            return True
+    elif _metadata_has_scan_outcome_or_reason_marker(details):
+        return True
+    if _depth >= 4:
+        return False
+
+    findings = _metadata_value(details, "findings")
+    if isinstance(findings, dict):
+        return details_have_incomplete_coverage(
+            findings,
+            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+            _depth=_depth + 1,
+        )
+    if isinstance(findings, (list, tuple, set, frozenset)):
+        for finding in findings:
+            if details_have_incomplete_coverage(
+                finding,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+                _depth=_depth + 1,
+            ):
+                return True
+            nested_details = _metadata_value(finding, "details")
+            if nested_details is not finding and details_have_incomplete_coverage(
+                nested_details,
+                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
+                _depth=_depth + 1,
+            ):
+                return True
+
+    return False
+
+
+def details_match_shard_family_paths(
+    details: Any,
+    path_matches: Callable[[str], bool],
+    *,
+    _depth: int = 0,
+) -> bool:
+    """Return True when shard/path detail fields match a shard family."""
+    if details is None or _depth >= 4:
+        return False
+    if isinstance(details, str):
+        return path_matches(details)
+    if isinstance(details, (list, tuple, set, frozenset)):
+        return any(details_match_shard_family_paths(item, path_matches, _depth=_depth + 1) for item in details)
+    if not isinstance(details, dict):
+        return False
+
+    for key, value in details.items():
+        if (
+            key in _SHARD_FAMILY_PATH_DETAIL_KEYS or key in _SHARD_FAMILY_NESTED_DETAIL_KEYS
+        ) and details_match_shard_family_paths(value, path_matches, _depth=_depth + 1):
+            return True
+    return False
+
+
+def record_details_have_incomplete_coverage(
+    record: Any,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    """Return True when a retained issue/check detail object identifies incomplete coverage."""
+    if allow_skipped_check_exemption and _record_is_clean_runtime_version_skip(record):
+        return False
+    details = _metadata_value(record, "details")
+    return details_have_incomplete_coverage(details)
+
+
+def _location_matches_file_path(location: str, file_path: str) -> bool:
+    if location == file_path:
+        return True
+    if not location.startswith(file_path):
+        return False
+
+    suffix = location[len(file_path) :]
+    if not suffix:
+        return True
+
+    separators = {":", " ", "#", "(", "[", os.sep}
+    if os.altsep:
+        separators.add(os.altsep)
+    return suffix[:1] in separators
+
+
+def records_have_incomplete_coverage(
+    records: Iterable[Any] | None,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    """Return True when any retained issue/check carries incomplete coverage details."""
+    if records is None:
+        return False
+    try:
+        return any(
+            record_details_have_incomplete_coverage(
+                record,
+                allow_skipped_check_exemption=allow_skipped_check_exemption,
+            )
+            for record in records
+        )
+    except TypeError:
+        return False
+
+
+def record_has_incomplete_coverage_for_path(
+    record: Any,
+    file_path: str,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    """Return True when a retained issue/check marks a specific file's coverage incomplete."""
+    if not record_details_have_incomplete_coverage(
+        record,
+        allow_skipped_check_exemption=allow_skipped_check_exemption,
+    ):
+        return False
+
+    location = _metadata_value(record, "location")
+    if not isinstance(location, str) or not location:
+        return True
+
+    file_path_str = str(file_path)
+    if _location_matches_file_path(location, file_path_str):
+        return True
+    file_name = Path(file_path_str).name
+    if file_name and _location_matches_file_path(location, file_name):
+        return True
+
+    try:
+        resolved_file_path = str(Path(file_path_str).resolve(strict=False))
+        if _location_matches_file_path(location, resolved_file_path):
+            return True
+        if Path(location).resolve(strict=False) == Path(file_path_str).resolve(strict=False):
+            return True
+    except (OSError, RuntimeError, ValueError):
+        # Malformed or unresolvable locations still use the lexical fallback below.
+        pass
+
+    return False
+
+
+def records_have_incomplete_coverage_for_path(
+    records: Iterable[Any] | None,
+    file_path: str,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    """Return True when retained issue/check details make a file unsafe to treat as covered."""
+    if records is None:
+        return False
+    try:
+        return any(
+            record_has_incomplete_coverage_for_path(
+                record,
+                file_path,
+                allow_skipped_check_exemption=allow_skipped_check_exemption,
+            )
+            for record in records
+        )
+    except TypeError:
+        return False
+
+
+def _location_is_within_directory(location: str, directory_path: str) -> bool:
+    if _location_matches_file_path(location, directory_path):
+        return True
+
+    try:
+        resolved_directory = Path(directory_path).resolve(strict=False)
+        resolved_location = Path(location).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    try:
+        return resolved_location == resolved_directory or resolved_location.is_relative_to(resolved_directory)
+    except ValueError:
+        return False
+
+
+def record_has_incomplete_coverage_under_directory(
+    record: Any,
+    directory_path: str,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    """Return True when a retained issue/check makes a directory unsafe to blanket-cover."""
+    if not record_details_have_incomplete_coverage(
+        record,
+        allow_skipped_check_exemption=allow_skipped_check_exemption,
+    ):
+        return False
+
+    location = _metadata_value(record, "location")
+    if not isinstance(location, str) or not location:
+        return True
+
+    return _location_is_within_directory(location, str(directory_path))
+
+
+def records_have_incomplete_coverage_under_directory(
+    records: Iterable[Any] | None,
+    directory_path: str,
+    *,
+    allow_skipped_check_exemption: bool = False,
+) -> bool:
+    """Return True when retained issue/check details make a directory unsafe to blanket-cover."""
+    if records is None:
+        return False
+    try:
+        return any(
+            record_has_incomplete_coverage_under_directory(
+                record,
+                directory_path,
+                allow_skipped_check_exemption=allow_skipped_check_exemption,
+            )
+            for record in records
+        )
+    except TypeError:
+        return False
+
+
+def results_have_incomplete_coverage_under_directory(
+    results: ModelAuditResultModel,
+    directory_path: str,
+) -> bool:
+    """Return True when a directory subtree has incomplete or failed scan coverage."""
+    for asset in results.assets or []:
+        asset_path = getattr(asset, "path", None)
+        if not isinstance(asset_path, str) or not _location_is_within_directory(asset_path, directory_path):
+            continue
+        if getattr(asset, "type", None) == "error":
+            return True
+
+    for metadata_path, metadata in (results.file_metadata or {}).items():
+        if not _location_is_within_directory(metadata_path, directory_path):
+            continue
+        if _metadata_value(metadata, OPERATIONAL_ERROR_METADATA_KEY) is True or metadata_has_incomplete_coverage(
+            metadata
+        ):
+            return True
+
+    if records_have_incomplete_coverage_under_directory(results.issues, directory_path):
+        return True
+    return records_have_incomplete_coverage_under_directory(
+        results.checks,
+        directory_path,
+        allow_skipped_check_exemption=True,
+    )
+
+
 def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
-    """Return True when any scanned file completed with an explicit inconclusive outcome."""
-    return any(
-        _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME)
-        for metadata in (results.file_metadata or {}).values()
+    """Return True when any scanned file has incomplete coverage."""
+    if any(metadata_has_incomplete_coverage(metadata) for metadata in (results.file_metadata or {}).values()):
+        return True
+    if records_have_incomplete_coverage(results.issues):
+        return True
+    return records_have_incomplete_coverage(results.checks, allow_skipped_check_exemption=True)
+
+
+def _record_has_security_severity(record: Any) -> bool:
+    severity = _metadata_value(record, "severity")
+    raw_severity = getattr(severity, "value", severity)
+    if not isinstance(raw_severity, str):
+        return False
+    return raw_severity.lower().split(".", 1)[-1] in {
+        IssueSeverity.WARNING.value,
+        IssueSeverity.CRITICAL.value,
+    }
+
+
+def _record_has_critical_severity(record: Any) -> bool:
+    severity = _metadata_value(record, "severity")
+    raw_severity = getattr(severity, "value", severity)
+    if not isinstance(raw_severity, str):
+        return False
+    return raw_severity.lower().split(".", 1)[-1] == IssueSeverity.CRITICAL.value
+
+
+def _record_is_failed_security_check(record: Any) -> bool:
+    status = _metadata_value(record, "status")
+    raw_status = getattr(status, "value", status)
+    return (
+        isinstance(raw_status, str)
+        and raw_status.lower().split(".", 1)[-1] == "failed"
+        and _record_has_security_severity(record)
     )
 
 
 def results_have_security_findings(results: ModelAuditResultModel) -> bool:
-    """Return True when WARNING/CRITICAL issues were reported."""
-    return any(
-        hasattr(issue, "severity") and issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
-        for issue in (results.issues or [])
+    """Return True when WARNING/CRITICAL issues or failed checks were reported."""
+    return any(_record_has_security_severity(issue) for issue in (results.issues or [])) or any(
+        _record_is_failed_security_check(check) for check in (results.checks or [])
     )
 
 
@@ -99,7 +506,12 @@ def results_should_be_unsuccessful(results: ModelAuditResultModel) -> bool:
     if results_have_operational_error(results):
         return True
 
-    return results_have_inconclusive_outcome(results) and not results_have_security_findings(results)
+    if results_have_inconclusive_outcome(results):
+        return True
+
+    has_failed_security_check = any(_record_is_failed_security_check(check) for check in (results.checks or []))
+    has_critical_issue = any(_record_has_critical_severity(issue) for issue in (results.issues or []))
+    return has_failed_security_check and not has_critical_issue
 
 
 def to_telemetry_severity(severity: Any) -> str:
@@ -301,6 +713,10 @@ def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list
         else:
             asset_group = primary_asset
 
+        check_consolidation_key = details.get("check_consolidation_key") if isinstance(details, dict) else None
+        if isinstance(check_consolidation_key, str) and check_consolidation_key:
+            asset_group = f"{asset_group}#{check_consolidation_key}"
+
         group_key = (check_name, asset_group)
         check_groups[group_key].append(check)
 
@@ -482,6 +898,9 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
 
     if results.success is False:
         return 2
+
+    if getattr(results, "dry_run", False):
+        return 0
 
     if results.files_scanned == 0:
         return 2
