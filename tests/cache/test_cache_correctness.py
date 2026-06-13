@@ -118,6 +118,38 @@ def _identity_kwargs(cache: ScanResultsCache, file_path: str) -> dict[str, Any]:
     }
 
 
+def _wait_for_ancestor_identity_to_settle(cache: ScanResultsCache, file_path: Path) -> None:
+    previous = cache._capture_ancestor_identity(str(file_path))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        time.sleep(0.02)
+        current = cache._capture_ancestor_identity(str(file_path))
+        if ScanResultsCache._ancestor_identity_matches(previous, current):
+            return
+        previous = current
+    pytest.fail(f"ancestor identity did not settle for {file_path}")
+
+
+def _scope_cache_ancestor_identity_to_tree(
+    cache: ScanResultsCache,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_capture = cache._capture_ancestor_identity
+    root_path = Path(os.path.abspath(root))
+
+    def capture_ancestor_identity(file_path: str) -> AncestorIdentity:
+        identity = original_capture(file_path)
+        entries = tuple(
+            entry
+            for entry in identity
+            if (entry_path := Path(entry[0])) == root_path or root_path in entry_path.parents
+        )
+        return AncestorIdentity(entries)
+
+    monkeypatch.setattr(cache, "_capture_ancestor_identity", capture_ancestor_identity)
+
+
 def test_cache_config_hash_preserves_128_bits(tmp_path: Path) -> None:
     """Attacker-influenced scan context must not collapse to a short cache identity."""
     cache = ScanResultsCache(str(tmp_path / "cache"))
@@ -1067,7 +1099,10 @@ def test_batch_prefetch_bypasses_symlink_before_key_generation(
     batch_ops.prefetch_cache_metadata([str(symlink_path)])
 
 
-def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_path: Path) -> None:
+def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     trees_root = tmp_path / "trees"
     live_root = trees_root / "live"
     decoy_root = trees_root / "decoy"
@@ -1082,6 +1117,8 @@ def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_pa
     held_root = trees_root / "held"
 
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    _scope_cache_ancestor_identity_to_tree(cache_manager.cache, trees_root, monkeypatch)
     version_context = build_cache_version_context({"timeout": 30})
     calls = {"count": 0}
     swap_blocked = {"value": False}
@@ -1113,6 +1150,7 @@ def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_pa
     else:
         assert swap_blocked["value"] is False
         assert cache_manager.get_stats()["total_entries"] == 0
+    _wait_for_ancestor_identity_to_settle(cache_manager.cache, malicious_path)
     second = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
 
     assert first["payload_prefix"] == ("evil!:" if os.name == "nt" else "clean:")
@@ -1139,6 +1177,8 @@ def test_unmonitored_platform_does_not_cache_higher_ancestor_swap(
     held_root = trees_root / "held"
 
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    _scope_cache_ancestor_identity_to_tree(cache_manager.cache, trees_root, monkeypatch)
     version_context = build_cache_version_context({"timeout": 30})
     calls = {"count": 0}
     monkeypatch.setattr(sys, "platform", "darwin")
@@ -1155,9 +1195,11 @@ def test_unmonitored_platform_does_not_cache_higher_ancestor_swap(
         return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
 
     first = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
+    assert first["payload_prefix"] == "clean:"
+    assert cache_manager.get_stats()["total_entries"] == 0
+    _wait_for_ancestor_identity_to_settle(cache_manager.cache, malicious_path)
     second = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
 
-    assert first["payload_prefix"] == "clean:"
     assert second["payload_prefix"] == "evil!:"
     assert calls["count"] == 2
     assert cache_manager.get_stats()["total_entries"] == 1
