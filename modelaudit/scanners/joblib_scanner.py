@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import bz2
+import hashlib
 import io
 import lzma
 import math
@@ -771,7 +772,14 @@ class JoblibScanner(BaseScanner):
             "Unable to decompress joblib file: " + "; ".join(decode_errors or ["no supported decoder matched"]),
         )
 
-    def _scan_pickle_payload(self, payload: bytes, result: ScanResult, context: str) -> None:
+    def _scan_pickle_payload(
+        self,
+        payload: bytes,
+        result: ScanResult,
+        context: str,
+        *,
+        member_identity: str | None = None,
+    ) -> None:
         """Analyze a raw or decompressed pickle payload with CVE and opcode checks."""
         sanitized = _pickle_without_joblib_numpy_array_data(payload)
         scan_payload = sanitized.payload if sanitized is not None else payload
@@ -800,7 +808,14 @@ class JoblibScanner(BaseScanner):
                 len(scan_payload),
                 source=context,
             )
-        result.merge(sub_result)
+        sub_result.metadata["file_hashes"] = {"sha256": hashlib.sha256(payload).hexdigest()}
+        sub_result.metadata["file_size"] = len(payload)
+        sub_result.metadata["file_hashes_complete"] = True
+        sub_result.metadata["file_hashes_bytes_hashed"] = len(payload)
+        if member_identity is None:
+            result.merge(sub_result)
+        else:
+            result.merge_member_result(sub_result, member_identity)
         if has_only_validated_codec_encodes:
             self._remove_validated_dtype_codec_findings(result)
         if raw_array_count and self._numpy_array_wrapper_origin_is_trusted():
@@ -1397,7 +1412,15 @@ class JoblibScanner(BaseScanner):
                     self._record_joblib_operational_error(result, "joblib_decompression_failed")
                     result.finish(success=False)
                     return result
-                self._scan_pickle_payload(decompressed, result, f"{path} (decompressed)")
+                result.metadata["file_hashes"] = {"sha256": hashlib.sha256(data).hexdigest()}
+                result.metadata["file_hashes_complete"] = True
+                result.metadata["file_hashes_bytes_hashed"] = len(data)
+                self._scan_pickle_payload(
+                    decompressed,
+                    result,
+                    f"{path} (decompressed)",
+                    member_identity="decompressed.pkl",
+                )
         except OSError as e:
             mark_inconclusive_scan_result(result, "joblib_read_failed")
             result.add_check(
