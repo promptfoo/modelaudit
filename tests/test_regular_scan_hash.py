@@ -876,19 +876,25 @@ class TestHashGenerationEdgeCases:
         from modelaudit import core
 
         model_path = tmp_path / "model.onnx"
+        later_path = tmp_path / "later.pkl"
         _write_regular_scan_onnx_model(model_path)
+        later_path.write_bytes(pickle.dumps({"safe": True}))
         monkeypatch.setattr(
             core,
             "_calculate_file_hash",
-            lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must not be whole-file hashed"),
+            lambda *_args, **_kwargs: pytest.fail("files beyond the deferred ONNX budget must not be hashed"),
         )
 
         hashes = core._hash_files_by_path(
-            [str(model_path)],
-            config={"onnx_raw_detector_max_bytes": 1},
+            [str(model_path), str(later_path)],
+            config={
+                "max_total_size": model_path.stat().st_size - 1,
+                "onnx_raw_detector_max_bytes": 1,
+            },
         )
 
         assert hashes[str(model_path)].startswith("unhashable_file_backed_onnx_")
+        assert hashes[str(later_path)].startswith("unhashable_max_total_size_")
 
     def test_file_backed_onnx_hash_deferral_uses_bounded_content_routing(
         self,

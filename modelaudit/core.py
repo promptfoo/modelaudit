@@ -2961,6 +2961,8 @@ def _hash_files_by_path(
             continue
         if should_defer_hash_for_file_backed_onnx(routing_path, hash_config):
             content_hashes[file_path] = f"{_FILE_BACKED_ONNX_UNHASHABLE_PREFIX}{id(file_path)}"
+            with suppress(OSError):
+                hashed_bytes += os.path.getsize(file_path)
             continue
         if should_defer_hash_for_pytorch_read_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_pytorch_zip_read_limit_{id(file_path)}"
