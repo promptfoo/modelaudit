@@ -27,6 +27,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlspli
 from ..file.detection import detect_file_format_for_skip_filter
 from ..file.streaming import StreamedSourceByteAccounting
 from ..helpers.disk_space import check_disk_space
+from ..helpers.interrupt_handler import check_interrupted
 from .huggingface_paths import (
     extract_model_id_from_path,
     is_huggingface_cache_path,
@@ -1545,6 +1546,13 @@ def _remote_safetensors_shard_details_by_file(
 class _HuggingFaceStreamingSelection:
     filenames: list[str]
     content_route_formats: dict[str, str] = field(default_factory=dict)
+
+
+def _check_hf_acquisition_interrupted(repo_id: str, deadline: float | None) -> None:
+    """Honor global cancellation and the end-to-end acquisition deadline."""
+    check_interrupted()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
 
 @dataclass(frozen=True)
@@ -3573,27 +3581,49 @@ def _discover_hf_onnx_external_data_files(
     onnx_path: Path,
     onnx_filename: str,
     repo_files: set[str],
+    interrupt_check: Callable[[], None] | None = None,
 ) -> list[str]:
     """Return safe declared ONNX external_data companions present in the repo listing."""
     try:
         import onnx
 
-        from ...scanners.onnx_scanner import _iter_model_external_data_tensor_groups
+        from ...scanners.onnx_scanner import (
+            _iter_model_external_data_tensor_groups,
+            _load_onnx_structure_file_backed,
+            _OnnxStructureParseError,
+        )
     except Exception:
         return []
 
     try:
-        model = onnx.load(str(onnx_path), load_external_data=False)
+        source_stat = os.stat(onnx_path)
+        model, _ = _load_onnx_structure_file_backed(
+            str(onnx_path),
+            source_stat.st_size,
+            interrupt_check,
+            expected_stat=source_stat,
+        )
+    except TimeoutError:
+        raise
+    except _OnnxStructureParseError as exc:
+        raise ValueError(
+            "Hugging Face ONNX external_data coverage incomplete: "
+            f"bounded structural discovery failed for {onnx_filename}: {exc.reason}"
+        ) from exc
     except Exception:
         return []
 
     companions: list[str] = []
     seen: set[str] = set()
-    for tensors in _iter_model_external_data_tensor_groups(model):
+    for tensors in _iter_model_external_data_tensor_groups(model, interrupt_check):
         for tensor in tensors:
             if tensor.data_location != onnx.TensorProto.EXTERNAL:
                 continue
-            info = {entry.key: entry.value for entry in tensor.external_data}
+            info: dict[str, str] = {}
+            for entry in tensor.external_data:
+                if interrupt_check is not None:
+                    interrupt_check()
+                info[entry.key] = entry.value
             location = info.get("location")
             if not isinstance(location, str):
                 continue
@@ -5464,10 +5494,15 @@ def download_model_streaming(
                 filename,
                 content_route_format=content_route_format,
             ):
+
+                def check_onnx_sidecar_discovery_interrupted() -> None:
+                    _check_hf_acquisition_interrupted(repo_id, deadline)
+
                 external_data_files = _discover_hf_onnx_external_data_files(
                     downloaded_file,
                     filename,
                     repo_file_set,
+                    check_onnx_sidecar_discovery_interrupted,
                 )
                 if external_data_files:
                     external_context_files = [

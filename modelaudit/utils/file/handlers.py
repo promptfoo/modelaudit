@@ -24,6 +24,7 @@ from ..helpers.cache_decorator import (
     should_bypass_cache_for_safetensors_header_limit,
     should_bypass_cache_for_unavailable_hdf5_analysis,
     should_bypass_cache_for_zip_entry_preflight,
+    should_defer_hash_for_file_backed_onnx,
 )
 from ..sources._huggingface_cache import _find_hf_cache_root, _path_has_part, _trusted_hf_blobs_root
 
@@ -1876,6 +1877,13 @@ def scan_advanced_large_file(
         allowed_paths=allowed_shard_paths,
         allowed_targets=allowed_shard_targets,
     )
+    if (
+        shard_info is None
+        and getattr(scanner, "name", None) == "onnx"
+        and should_defer_hash_for_file_backed_onnx(file_path, config)
+    ):
+        logger.debug(f"Bypassing advanced-file cache for file-backed ONNX inspection: {file_path}")
+        return scanner.scan(file_path)  # type: ignore[no-any-return]
     if shard_info is not None and not _supports_reliable_shard_cache_identity():
         logger.debug(f"Bypassing advanced-file cache for unreliable shard identities: {file_path}")
         return _scan_advanced_large_file_internal(
