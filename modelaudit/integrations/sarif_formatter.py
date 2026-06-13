@@ -337,10 +337,10 @@ def _redact_catboost_details_for_sarif(value: Any) -> Any:
 
 def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any]]:
     """Create SARIF artifacts from scanned files."""
-    artifacts = []
+    artifacts: list[dict[str, Any]] = []
 
     for asset in audit_result.assets:
-        artifact = {
+        artifact: dict[str, Any] = {
             "location": {"uri": _normalize_path_to_uri(asset.path), "uriBaseId": "%SRCROOT%"},
             "mimeType": _get_mime_type(asset.type),
             "properties": {"type": asset.type},
@@ -364,6 +364,26 @@ def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any
 
                 if hashes:
                     artifact["hashes"] = hashes
+            member_file_hashes = getattr(metadata, "member_file_hashes", None)
+            if member_file_hashes:
+                artifact["properties"]["memberFileHashes"] = _redact_value_for_sarif(
+                    {
+                        member_path: (
+                            record.model_dump(mode="json", exclude_none=True)
+                            if hasattr(record, "model_dump")
+                            else record
+                        )
+                        for member_path, record in member_file_hashes.items()
+                    }
+                )
+            member_file_hash_summary = {
+                "memberFileHashesTotal": getattr(metadata, "member_file_hashes_total", None),
+                "memberFileHashesTruncated": getattr(metadata, "member_file_hashes_truncated", None),
+                "memberFileHashesOmitted": getattr(metadata, "member_file_hashes_omitted", None),
+            }
+            for property_name, property_value in member_file_hash_summary.items():
+                if property_value is not None:
+                    artifact["properties"][property_name] = property_value
 
         artifacts.append(artifact)
 

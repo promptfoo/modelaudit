@@ -307,6 +307,37 @@ def _embed_plausible_hdf5_superblock(payload: bytes, signature_offset: int) -> b
 class TestKerasZipScanner:
     """Test the Keras ZIP scanner functionality."""
 
+    def test_recursive_archive_scan_preserves_outer_metadata_and_nested_member_hashes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outer = ScanResult(scanner_name="keras_zip")
+        outer.metadata.update({"model_class": "OuterModel", "file_hashes": {"sha256": "a" * 64}})
+        nested = ScanResult(scanner_name="zip")
+        nested.metadata["model_class"] = "InnerModel"
+        child = ScanResult(scanner_name="pickle")
+        child.metadata.update({"file_size": 7, "file_hashes": {"sha256": "b" * 64}})
+        nested.merge_member_result(child, "inner.pkl")
+
+        def scan_archive_members(_scanner: object, _path: str, archive: object | None = None) -> ScanResult:
+            del archive
+            return nested
+
+        monkeypatch.setattr(keras_zip_scanner_module.ZipScanner, "scan_archive_members", scan_archive_members)
+
+        KerasZipScanner()._merge_recursive_archive_scan("outer.keras", outer)
+
+        assert outer.metadata["model_class"] == "OuterModel"
+        assert outer.metadata["file_hashes"] == {"sha256": "a" * 64}
+        member_hashes = outer.metadata["member_file_hashes"]
+        assert isinstance(member_hashes, dict)
+        assert any(
+            isinstance(record, dict)
+            and record.get("path_segments") == ["inner.pkl"]
+            and record.get("file_hashes") == {"sha256": "b" * 64}
+            for record in member_hashes.values()
+        )
+
     def test_scanner_available(self):
         """Test that the scanner is available."""
         scanner = KerasZipScanner()

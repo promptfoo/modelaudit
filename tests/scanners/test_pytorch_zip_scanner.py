@@ -36,10 +36,15 @@ from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from modelaudit.scanner_results import (
     ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
+    MEMBER_FILE_HASHES_METADATA_KEY,
+    MEMBER_FILE_HASHES_OMITTED_METADATA_KEY,
+    MEMBER_FILE_HASHES_TOTAL_METADATA_KEY,
+    MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY,
     Check,
     ScanResult,
     mark_inconclusive_scan_result,
 )
+from modelaudit.scanners import pytorch_zip_scanner as pytorch_zip_scanner_module
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
@@ -10277,6 +10282,74 @@ def test_pytorch_zip_nested_raw_detector_failure_survives_parent_metadata_restor
         check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.PASSED
         for check in parent_result.checks
     )
+
+
+def test_pytorch_zip_nested_member_hash_summary_survives_parent_metadata_restore() -> None:
+    parent_result = ScanResult(scanner_name="pytorch_zip")
+    parent_result.metadata["file_hashes"] = {"sha256": "a" * 64}
+    nested_result = ScanResult(scanner_name="zip")
+    member_identity = json.dumps({"occurrence": 1, "path": ["inner.pkl"]}, sort_keys=True, separators=(",", ":"))
+    nested_result.metadata[MEMBER_FILE_HASHES_METADATA_KEY] = {
+        member_identity: {
+            "file_hashes": {"sha256": "b" * 64},
+            "file_size": 5,
+            "hash_complete": True,
+            "hash_status": "complete",
+            "path_segments": ["inner.pkl"],
+            "occurrence": 1,
+        }
+    }
+    nested_result.metadata[MEMBER_FILE_HASHES_TOTAL_METADATA_KEY] = 2
+    nested_result.metadata[MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY] = True
+    nested_result.metadata[MEMBER_FILE_HASHES_OMITTED_METADATA_KEY] = 1
+    nested_result.finish(success=True)
+
+    PyTorchZipScanner._merge_nested_zip_result(parent_result, nested_result, "archive/nested.zip")
+
+    assert parent_result.metadata["file_hashes"]["sha256"] == "a" * 64
+    assert parent_result.metadata[MEMBER_FILE_HASHES_TOTAL_METADATA_KEY] == 2
+    assert parent_result.metadata[MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY] is True
+    assert parent_result.metadata[MEMBER_FILE_HASHES_OMITTED_METADATA_KEY] == 1
+    member_hashes = parent_result.metadata[MEMBER_FILE_HASHES_METADATA_KEY]
+    assert isinstance(member_hashes, dict)
+    records = [
+        record
+        for record in member_hashes.values()
+        if isinstance(record, dict) and record.get("path_segments") == ["archive/nested.zip", "inner.pkl"]
+    ]
+    assert len(records) == 1
+    assert records[0]["file_hashes"]["sha256"] == "b" * 64
+    nested_scan_metadata = parent_result.metadata["nested_zip_scans"][0]["metadata"]
+    assert MEMBER_FILE_HASHES_METADATA_KEY not in nested_scan_metadata
+    assert MEMBER_FILE_HASHES_TOTAL_METADATA_KEY not in nested_scan_metadata
+    assert MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY not in nested_scan_metadata
+    assert MEMBER_FILE_HASHES_OMITTED_METADATA_KEY not in nested_scan_metadata
+
+
+def test_pytorch_zip_nested_merge_does_not_deepcopy_accumulated_member_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_result = ScanResult(scanner_name="pytorch_zip")
+    parent_result.metadata["file_hashes"] = {"sha256": "a" * 64}
+    existing_child = ScanResult(scanner_name="pickle")
+    existing_child.metadata["file_hashes"] = {"sha256": "b" * 64}
+    parent_result.merge_member_result(existing_child, "existing.pkl")
+    accumulated_hashes = parent_result.metadata[MEMBER_FILE_HASHES_METADATA_KEY]
+    nested_result = ScanResult(scanner_name="zip")
+    nested_result.finish(success=True)
+    copied_values: list[object] = []
+    original_deepcopy = pytorch_zip_scanner_module.deepcopy
+
+    def track_deepcopy(value: object) -> object:
+        copied_values.append(value)
+        return original_deepcopy(value)
+
+    monkeypatch.setattr(pytorch_zip_scanner_module, "deepcopy", track_deepcopy)
+
+    PyTorchZipScanner._merge_nested_zip_result(parent_result, nested_result, "archive/nested.zip")
+
+    assert all(value is not accumulated_hashes for value in copied_values)
+    assert parent_result.metadata["file_hashes"] == {"sha256": "a" * 64}
 
 
 def test_pytorch_zip_scanner_checks_timeout_between_nested_archives(
