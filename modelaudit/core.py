@@ -139,7 +139,7 @@ from modelaudit.utils.file.large_file_handler import (
     scan_large_file,
     should_use_large_file_handler,
 )
-from modelaudit.utils.file.streaming import stream_analyze_file, stream_source_path
+from modelaudit.utils.file.streaming import StreamedSourceByteAccounting, stream_analyze_file, stream_source_path
 from modelaudit.utils.helpers.cache_decorator import cached_scan, should_defer_hash_for_pytorch_read_limit
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
@@ -6952,7 +6952,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
 
 def scan_model_streaming(
-    file_generator: Iterator[tuple[Path, bool] | tuple[Path, bool, ScanResult]],
+    file_generator: Iterator[
+        tuple[Path, bool]
+        | tuple[Path, bool, ScanResult]
+        | tuple[Path, bool, ScanResult | None, StreamedSourceByteAccounting]
+    ],
     timeout: int = 3600,
     progress_callback: ProgressCallback | None = None,
     delete_after_scan: bool = True,
@@ -6968,7 +6972,7 @@ def scan_model_streaming(
     deletes to minimize disk usage. Computes aggregate content hash at the end.
 
     Args:
-        file_generator: Generator yielding (file_path, is_last) tuples
+        file_generator: Generator yielding public path tuples or trusted internal scan/accounting tuples
         timeout: Scan timeout in seconds
         progress_callback: Optional callback for progress reporting
         delete_after_scan: Whether to delete files after scanning (default: True)
@@ -7019,6 +7023,8 @@ def scan_model_streaming(
     deferred_openvino_sidecars: dict[Path, Path] = {}
     consumed_openvino_companions: set[Path] = set()
     preserve_shard_reconciliation_errors = False
+    streamed_item_count = 0
+    received_pretransferred_bytes = False
 
     def streaming_repository_inventory_context() -> RepositoryFileInventory:
         nonlocal repository_inventory_context
@@ -7044,6 +7050,30 @@ def scan_model_streaming(
         except Exception as e:
             logger.warning(f"Failed to delete {source_path} {context}: {e}")
             pending_delete_failures[source_path] = e
+
+    def adjusted_streamed_bytes(bytes_scanned: object, source_bytes_preaccounted: int) -> int:
+        """Return an item's new byte contribution after exact-once source accounting."""
+        if not isinstance(bytes_scanned, int) or isinstance(bytes_scanned, bool) or bytes_scanned < 0:
+            raise ValueError("Streamed scan bytes must be a non-negative integer")
+        return max(bytes_scanned - source_bytes_preaccounted, 0)
+
+    def record_max_total_size_failure(location: str) -> bool:
+        """Record the shared streaming size failure after any accounting contribution."""
+        nonlocal aggregate_hash_complete, preserve_shard_reconciliation_errors
+
+        if max_total_size <= 0 or results.bytes_scanned <= max_total_size:
+            return False
+        aggregate_hash_complete = False
+        _add_issue_to_model(
+            results,
+            f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
+            severity=IssueSeverity.INFO.value,
+            location=location,
+            details={"max_total_size": max_total_size, "analysis_incomplete": True},
+        )
+        results.has_errors = True
+        preserve_shard_reconciliation_errors = True
+        return True
 
     def record_shard_pin_failure(source_path: Path, error: _ShardPinUnavailableError) -> None:
         """Record a durable operational failure when a streamed shard cannot be pinned."""
@@ -7282,14 +7312,41 @@ def scan_model_streaming(
                 )
                 break
 
+            streamed_item_count += 1
             precomputed_result: ScanResult | None = None
-            if len(streamed_item) == 3:
+            source_bytes_preaccounted = 0
+            pretransferred_bytes = 0
+            if len(streamed_item) == 4:
+                file_path, _is_last, precomputed_result, byte_accounting = streamed_item
+                if not isinstance(byte_accounting, StreamedSourceByteAccounting):
+                    raise TypeError("Invalid streamed source byte accounting metadata")
+                pretransferred_bytes = byte_accounting.pretransferred_bytes
+                source_bytes_preaccounted = byte_accounting.source_bytes_preaccounted
+            elif len(streamed_item) == 3:
                 file_path, _is_last, precomputed_result = streamed_item
-            else:
+            elif len(streamed_item) == 2:
                 file_path, _is_last = streamed_item
+            else:
+                raise ValueError("Streamed items must contain two, three, or four values")
+            if precomputed_result is not None and not isinstance(precomputed_result, ScanResult):
+                raise TypeError("Invalid precomputed streamed scan result")
             source_path = Path(file_path)
             is_precomputed_streamed_result = precomputed_result is not None
             source_key = Path(os.path.abspath(source_path))
+            if pretransferred_bytes:
+                if received_pretransferred_bytes or streamed_item_count != 1:
+                    raise ValueError("Pretransferred bytes must be reported exactly once on the first streamed item")
+                received_pretransferred_bytes = True
+                results.bytes_scanned += pretransferred_bytes
+            if source_bytes_preaccounted and not received_pretransferred_bytes:
+                raise ValueError("Source bytes cannot be preaccounted before pretransferred bytes are reported")
+            if (
+                pretransferred_bytes
+                and not is_precomputed_streamed_result
+                and record_max_total_size_failure(str(source_path))
+            ):
+                delete_streamed_source(source_path, "after streaming size limit")
+                break
             if not is_precomputed_streamed_result and source_key in consumed_openvino_companions:
                 continue
             scan_path = source_path
@@ -7338,7 +7395,10 @@ def scan_model_streaming(
                         preserve_shard_reconciliation_errors = True
                     aggregate_hash_complete = False
                     scan_result_dict = {
-                        "bytes_scanned": precomputed_result.bytes_scanned,
+                        "bytes_scanned": adjusted_streamed_bytes(
+                            precomputed_result.bytes_scanned,
+                            source_bytes_preaccounted,
+                        ),
                         "files_scanned": 1,
                         "has_errors": operational_scan_failure,
                         "success": precomputed_result.success,
@@ -7362,17 +7422,7 @@ def scan_model_streaming(
                         asset["is_remote_header_only"] = bool(metadata_dict.get("remote_header_only"))
                         results.assets.extend(convert_assets_to_models([asset]))
                     files_processed += 1
-                    if max_total_size > 0 and results.bytes_scanned > max_total_size:
-                        aggregate_hash_complete = False
-                        _add_issue_to_model(
-                            results,
-                            f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
-                            severity=IssueSeverity.INFO.value,
-                            location=report_path,
-                            details={"max_total_size": max_total_size, "analysis_incomplete": True},
-                        )
-                        results.has_errors = True
-                        preserve_shard_reconciliation_errors = True
+                    if record_max_total_size_failure(report_path):
                         break
                     continue
 
@@ -7749,7 +7799,10 @@ def scan_model_streaming(
 
                     # Use dict-based aggregation to avoid import issues
                     scan_result_dict = {
-                        "bytes_scanned": scan_result.bytes_scanned,
+                        "bytes_scanned": adjusted_streamed_bytes(
+                            scan_result.bytes_scanned,
+                            source_bytes_preaccounted,
+                        ),
                         "files_scanned": 1,  # Each scan_result represents one file
                         # Bare success=False results were normalized above so
                         # they fail closed as inconclusive instead of exiting 0.
@@ -7818,17 +7871,7 @@ def scan_model_streaming(
                         results.assets.extend(convert_assets_to_models([asset]))
 
                 files_processed += 1
-                if max_total_size > 0 and results.bytes_scanned > max_total_size:
-                    aggregate_hash_complete = False
-                    _add_issue_to_model(
-                        results,
-                        f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
-                        severity=IssueSeverity.INFO.value,
-                        location=report_path,
-                        details={"max_total_size": max_total_size, "analysis_incomplete": True},
-                    )
-                    results.has_errors = True
-                    preserve_shard_reconciliation_errors = True
+                if record_max_total_size_failure(report_path):
                     break
 
             except Exception as e:

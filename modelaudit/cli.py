@@ -1973,8 +1973,8 @@ class _HuggingFaceStreamInterruptedError(RuntimeError):
 
 
 def _track_huggingface_stream_acquisition(
-    file_generator: Iterator[tuple[Path, bool] | tuple[Path, bool, Any]],
-) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]:
+    file_generator: Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, Any]],
+) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, Any]]:
     """Distinguish pre-yield acquisition failures from interrupted streamed scans."""
     yielded_artifact = False
     try:

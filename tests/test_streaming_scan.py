@@ -37,6 +37,7 @@ from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, CheckStatus, Is
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
+from modelaudit.utils.file.streaming import StreamedSourceByteAccounting
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
@@ -3926,6 +3927,68 @@ def test_scan_model_streaming_does_not_hash_files_over_max_file_size(
     assert result.success is False
     assert determine_exit_code(result) == 2
     assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+
+
+def test_scan_model_streaming_preserves_pretransferred_bytes_across_max_file_size(tmp_path: Path) -> None:
+    """A selected source rejected by max-file-size must retain its earlier transfer accounting."""
+    payload = tmp_path / "selected-index.json"
+    payload.write_bytes(b"X" * 128)
+    accounting = StreamedSourceByteAccounting(
+        pretransferred_bytes=payload.stat().st_size,
+        source_bytes_preaccounted=payload.stat().st_size,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True, None, accounting)]),
+        timeout=30,
+        delete_after_scan=False,
+        max_file_size=64,
+        cache_enabled=False,
+    )
+
+    assert result.bytes_scanned == payload.stat().st_size
+    assert result.files_scanned == 1
+    assert result.success is False
+    assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+
+
+def test_scan_model_streaming_preserves_pretransferred_bytes_for_lfs_pointer(tmp_path: Path) -> None:
+    """A selected Git LFS pointer must not erase bytes transferred before local routing."""
+    payload = tmp_path / "model.safetensors.index.json"
+    payload.write_text(f"version https://git-lfs.github.com/spec/v1\noid sha256:{'a' * 64}\nsize 123456\n")
+    payload_size = payload.stat().st_size
+    accounting = StreamedSourceByteAccounting(
+        pretransferred_bytes=payload_size,
+        source_bytes_preaccounted=payload_size,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True, None, accounting)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert result.bytes_scanned == payload_size
+    assert result.files_scanned == 1
+    assert result.success is True
+    assert determine_exit_code(result) == 1
+    assert any(check.name == "Git LFS Pointer Detection" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    ("pretransferred_bytes", "source_bytes_preaccounted"),
+    [(True, 0), (-1, 0), (0, True), (0, -1)],
+)
+def test_streamed_source_byte_accounting_rejects_invalid_values(
+    pretransferred_bytes: object,
+    source_bytes_preaccounted: object,
+) -> None:
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        StreamedSourceByteAccounting(
+            pretransferred_bytes=cast(Any, pretransferred_bytes),
+            source_bytes_preaccounted=cast(Any, source_bytes_preaccounted),
+        )
 
 
 def test_scan_model_streaming_fails_closed_after_max_total_size(

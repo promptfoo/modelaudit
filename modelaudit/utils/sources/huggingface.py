@@ -25,6 +25,7 @@ from typing import Any, Literal, cast, overload
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from ..file.detection import detect_file_format_for_skip_filter
+from ..file.streaming import StreamedSourceByteAccounting
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
     extract_model_id_from_path,
@@ -1170,7 +1171,7 @@ def _remote_safetensors_index_failure_result(
             "scan_outcome_reason": _HF_SAFETENSORS_INDEX_RECONCILIATION_REASON,
         },
     )
-    result.bytes_scanned = 0
+    result.bytes_scanned = bytes_transferred
     result.finish(success=False)
     return result
 
@@ -5031,7 +5032,7 @@ def download_model_streaming(
     repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
     _include_scan_results: Literal[True],
-) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]:
+) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]]:
     pass
 
 
@@ -5049,7 +5050,7 @@ def download_model_streaming(
     repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
     _include_scan_results: bool = False,
-) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]:
+) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
     This generator yields (file_path, is_last_file) tuples as each file is downloaded.
@@ -5071,8 +5072,8 @@ def download_model_streaming(
 
     Yields:
         Tuple of (Path, bool) for downloaded files. Internal scan callers that pass
-        _include_scan_results may receive (Path, bool, ScanResult) for trusted
-        source-native header scans.
+        _include_scan_results may receive trusted source-native scan results and
+        internal exact-once byte-accounting metadata.
 
     Raises:
         ValueError: If URL is invalid
@@ -5229,6 +5230,11 @@ def download_model_streaming(
         }
         repo_file_set = set(repo_files)
         selected_file_set = set(model_files)
+        preaccounted_acquired_index_bytes = {
+            filename: len(payload)
+            for filename, payload in acquired_index_bytes.items()
+            if filename in selected_file_set and filename not in safetensors_header_files
+        }
         onnx_external_data_enabled = scannable_scanner_ids is None or "onnx" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
@@ -5261,10 +5267,45 @@ def download_model_streaming(
         acquired_index_temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
         accounted_selected_filenames = acquired_index_bytes.keys() & selected_file_set
         consumed_filenames: set[str] = set()
+        pending_pretransferred_bytes = (
+            content_probe_bytes_transferred + remote_index_bytes_transferred if _include_scan_results else 0
+        )
 
-        def emit_file(path: Path, cleanup_paths: list[Path], is_last: bool) -> Iterator[tuple[Path, bool]]:
+        def make_streamed_item(
+            filename: str,
+            path: Path,
+            is_last: bool,
+            precomputed_result: Any | None = None,
+            *,
+            source_bytes_preaccounted: int | None = None,
+        ) -> tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]:
+            nonlocal pending_pretransferred_bytes
+
+            accounting = StreamedSourceByteAccounting(
+                pretransferred_bytes=pending_pretransferred_bytes,
+                source_bytes_preaccounted=(
+                    preaccounted_acquired_index_bytes.get(filename, 0)
+                    if source_bytes_preaccounted is None
+                    else source_bytes_preaccounted
+                ),
+            )
+            pending_pretransferred_bytes = 0
+            if accounting.pretransferred_bytes or accounting.source_bytes_preaccounted:
+                return (path, is_last, precomputed_result, accounting)
+            if precomputed_result is not None:
+                return (path, is_last, precomputed_result)
+            return (path, is_last)
+
+        def emit_file(
+            filename: str,
+            path: Path,
+            cleanup_paths: list[Path],
+            is_last: bool,
+        ) -> Iterator[
+            tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]
+        ]:
             try:
-                yield (path, is_last)
+                yield make_streamed_item(filename, path, is_last)
             finally:
                 for external_path in cleanup_paths:
                     with suppress(OSError):
@@ -5522,7 +5563,13 @@ def download_model_streaming(
                     failure_details,
                 )
                 is_last_failure = failure_index == len(failure_items) - 1 and not has_future_yield(-1)
-                yield (Path(index_filename), is_last_failure, failure_result)
+                yield make_streamed_item(
+                    index_filename,
+                    Path(index_filename),
+                    is_last_failure,
+                    failure_result,
+                    source_bytes_preaccounted=failure_result.bytes_scanned,
+                )
 
             for idx, filename in enumerate(model_files):
                 if filename in consumed_filenames:
@@ -5530,7 +5577,7 @@ def download_model_streaming(
 
                 if filename in safetensors_header_files:
                     scan_result = scan_remote_safetensors(filename)
-                    yield (Path(filename), not has_future_yield(idx), scan_result)
+                    yield make_streamed_item(filename, Path(filename), not has_future_yield(idx), scan_result)
                     continue
 
                 if filename in openvino_xml_by_companion:
@@ -5549,11 +5596,18 @@ def download_model_streaming(
                     else:
                         companion_path, companion_cleanup_paths = prepare_stream_yield(companion)
                         consumed_filenames.add(companion)
-                        yield from emit_file(downloaded_file, cleanup_paths, False)
-                        yield from emit_file(companion_path, companion_cleanup_paths, not has_future_yield(idx))
+                        yield from emit_file(filename, downloaded_file, cleanup_paths, False)
+                        yield from emit_file(
+                            companion,
+                            companion_path,
+                            companion_cleanup_paths,
+                            not has_future_yield(idx),
+                        )
                         continue
 
-                yield from emit_file(downloaded_file, cleanup_paths, not has_future_yield(idx))
+                yield from emit_file(filename, downloaded_file, cleanup_paths, not has_future_yield(idx))
+            if pending_pretransferred_bytes:
+                raise ValueError("Remote pretransfer bytes were not attached to a streamed item")
         finally:
             for external_path in context_cleanup_paths:
                 with suppress(OSError):
