@@ -103,6 +103,27 @@ class _TarSharedScanBudget:
     member_bytes_consumed: int = 0
 
 
+@contextmanager
+def _tar_shared_scan_budget_scope(
+    config: dict[str, Any],
+    *,
+    max_total_uncompressed_size: int,
+) -> Iterator[_TarSharedScanBudget]:
+    """Reuse one aggregate TAR budget across every scanner in an archive tree."""
+    existing_budget = config.get(TAR_SHARED_SCAN_BUDGET_CONFIG_KEY)
+    if isinstance(existing_budget, _TarSharedScanBudget):
+        yield existing_budget
+        return
+
+    budget = _TarSharedScanBudget(max_total_uncompressed_size=max_total_uncompressed_size)
+    config[TAR_SHARED_SCAN_BUDGET_CONFIG_KEY] = budget
+    try:
+        yield budget
+    finally:
+        if config.get(TAR_SHARED_SCAN_BUDGET_CONFIG_KEY) is budget:
+            config.pop(TAR_SHARED_SCAN_BUDGET_CONFIG_KEY, None)
+
+
 class _TarBoundedStream:
     """Read wrapper that bounds TAR stream work before tarfile materializes metadata."""
 
@@ -307,16 +328,11 @@ class TarScanner(BaseScanner):
             except (TypeError, ValueError):
                 archive_depth = 0
 
-            owns_shared_budget = TAR_SHARED_SCAN_BUDGET_CONFIG_KEY not in self.config
-            if owns_shared_budget:
-                self.config[TAR_SHARED_SCAN_BUDGET_CONFIG_KEY] = _TarSharedScanBudget(
-                    max_total_uncompressed_size=self._get_max_total_uncompressed_size()
-                )
-            try:
+            with _tar_shared_scan_budget_scope(
+                self.config,
+                max_total_uncompressed_size=self._get_max_total_uncompressed_size(),
+            ):
                 scan_result = self._scan_tar_file(path, depth=max(archive_depth, 0))
-            finally:
-                if owns_shared_budget:
-                    self.config.pop(TAR_SHARED_SCAN_BUDGET_CONFIG_KEY, None)
             result.merge(scan_result)
         except tarfile.TarError:
             result.add_check(

@@ -6064,6 +6064,11 @@ class _GzipTarProbeLimitExceeded(Exception):
     """Raised when gzip TAR validation exceeds configured work limits."""
 
 
+def _gzip_tar_probe_limit_exception(message: str, _bytes_read: int, _max_bytes: int) -> Exception:
+    """Translate bounded TAR metadata work into the gzip-tail probe outcome."""
+    return _GzipTarProbeLimitExceeded(message)
+
+
 class _GzipTarBoundedReader:
     def __init__(
         self,
@@ -6133,7 +6138,10 @@ def _gzip_tar_trailing_data_status(
                                 bufsize=tarfile.BLOCKSIZE,
                                 tarinfo=cast(
                                     type[tarfile.TarInfo],
-                                    bounded_tar_info_class(_NEMO_ROUTE_MAX_METADATA_BYTES),
+                                    bounded_tar_info_class(
+                                        _NEMO_ROUTE_MAX_METADATA_BYTES,
+                                        exception_factory=_gzip_tar_probe_limit_exception,
+                                    ),
                                 ),
                             )
                         )

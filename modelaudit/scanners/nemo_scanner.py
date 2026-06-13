@@ -37,6 +37,7 @@ from .tar_scanner import (
     TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY,
     TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY,
     TarScanner,
+    _tar_shared_scan_budget_scope,
 )
 
 try:
@@ -1349,6 +1350,14 @@ class NemoScanner(BaseScanner):
         return is_nemo_archive(path)
 
     def scan(self, path: str) -> ScanResult:
+        budget_scanner = TarScanner(config=dict(self.config))
+        with _tar_shared_scan_budget_scope(
+            self.config,
+            max_total_uncompressed_size=budget_scanner._get_max_total_uncompressed_size(),
+        ):
+            return self._scan_with_shared_tar_budget(path)
+
+    def _scan_with_shared_tar_budget(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
