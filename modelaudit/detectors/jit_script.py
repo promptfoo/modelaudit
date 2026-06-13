@@ -286,9 +286,13 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_START_PATTERN = re.compile(
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
+_PASSIVE_PRIORITY_PRINT_ASSIGNMENT_PATTERN = re.compile(
+    rb"([A-Za-z_]\w*)\s*=\s*print\s*\(\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\)"
+)
 _EMBEDDED_PYTHON_ASSIGNMENT_OPERATOR_PATTERN = rb"(?://=|<<=|>>=|\*\*=|[-+*/%@&|^]=|=)"
+# Keep LF excluded so each greedy bounded probe stays on one physical line.
 _EMBEDDED_PYTHON_ASSIGNMENT_VALUE_LINE_PATTERN = (
-    rb"(?=[^\x00-\x08\x0b-\x1f\x7f]{0,"
+    rb"(?=[^\x00-\x08\x0a-\x1f\x7f]{0,"
     + str(_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES).encode("ascii")
     + rb"}(?:\r?\n|$))"
 )
@@ -641,6 +645,8 @@ def _priority_import_sites(bounded: bytes) -> list[tuple[int, int | None]]:
     sites: list[tuple[int, int | None]] = []
     matches = iter(_PRIORITY_EMBEDDED_PYTHON_IMPORT_START_PATTERN.finditer(bounded.lower()))
     match = next(matches, None)
+    if match is None:
+        return sites
     line_start = 0
     multiline_quote: bytes | None = None
     for line in bounded.splitlines(keepends=True):
@@ -660,6 +666,8 @@ def _priority_import_sites(bounded: bytes) -> list[tuple[int, int | None]]:
                     continue
                 sites.append((offset, header_start))
             match = next(matches, None)
+        if match is None:
+            break
         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end
     return sites
@@ -1650,6 +1658,20 @@ def _simple_priority_forwarding_usage(
                 namespace_modules[local_name] = module_name
             line_start = line_end
             continue
+        passive_print_match = _PASSIVE_PRIORITY_PRINT_ASSIGNMENT_PATTERN.fullmatch(structural_line)
+        if passive_print_match is not None:
+            target_name = passive_print_match.group(1).decode("utf-8")
+            namespace_name = passive_print_match.group(2).decode("utf-8")
+            member_name = passive_print_match.group(3).decode("utf-8")
+            module_name = namespace_modules.get(namespace_name)
+            if module_name is None or f"{module_name}.{member_name}" not in rule_codes_by_reference:
+                return None
+            namespace_modules.pop(target_name, None)
+            rule_codes_by_name.pop(target_name, None)
+            line_start = line_end
+            continue
+        if re.search(rb"\bprint\b", structural_line) is not None:
+            return None
         forwarding = _simple_forwarded_alias_assignment(structural_line)
         if forwarding is not None:
             target_name, dependency_name, expression = forwarding
@@ -1686,6 +1708,11 @@ def _simple_priority_forwarding_usage(
                     [(line_start, line_end)],
                     frozenset(rule_code for root_name in matched_roots for rule_code in rule_codes_by_name[root_name]),
                 )
+            if identifiers.isdisjoint(tracked_names) and all(
+                not _python_structural_line_bytes(remaining_line).strip()
+                for remaining_line in candidate[line_end:].splitlines()
+            ):
+                return [], frozenset()
             return None
         elif (
             not identifiers.isdisjoint(tracked_names)
@@ -10638,12 +10665,17 @@ def _append_single_window_prefix_context_windows(
             extraction_windows.append((context + b"\n" + bounded[start:], True))
 
 
+def _deduplicated_extraction_windows(windows: list[tuple[bytes, bool]]) -> list[tuple[bytes, bool]]:
+    """Preserve the first copy of each exact analysis window."""
+    return list(dict.fromkeys(windows))
+
+
 def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
     windows = _embedded_python_scan_windows(data)
     if len(windows) == 1:
         extraction_windows = [(windows[0], False), *_contextual_priority_framed_windows(windows[0])]
         _append_single_window_prefix_context_windows(extraction_windows, windows[0])
-        return extraction_windows
+        return _deduplicated_extraction_windows(extraction_windows)
 
     prefix, tail = windows
     extraction_windows = [(prefix, False), *_contextual_priority_framed_windows(prefix), (tail, False)]
@@ -10717,7 +10749,7 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
         contextual_windows = [] if proved_rule_codes else _contextual_priority_framed_windows(contextual_source)
         fallback_contextual_windows = [] if proved_rule_codes else [*contextual_windows, (contextual_source, True)]
         extraction_windows[0:0] = [*targeted_contextual_windows, *fallback_contextual_windows]
-    return extraction_windows
+    return _deduplicated_extraction_windows(extraction_windows)
 
 
 def _contextual_priority_framed_windows(data: bytes) -> list[tuple[bytes, bool]]:
