@@ -7,11 +7,12 @@ import ntpath
 import numbers
 import os
 import re
+import stat
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar, NoReturn
 
 from ..scanner_results import SUPPRESSED_FAILED_CHECKS_METADATA_KEY, VALIDATED_FORMAT_METADATA_KEY
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
@@ -88,6 +89,7 @@ ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
 ONNX_SCHEMA_INCONCLUSIVE_REASON = "onnx_schema_validation_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
+ONNX_RESULT_REPORTING_INCONCLUSIVE_REASON = "onnx_result_reporting_incomplete"
 ONNX_DEPENDENCY_UNAVAILABLE_REASON = "onnx_dependency_unavailable"
 ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
 ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON = "onnx_tentative_candidate_parse_incomplete"
@@ -128,6 +130,28 @@ _ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT = 5
 _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT = 20
 _ONNX_CUSTOM_OPERATOR_TEXT_LIMIT = 256
 _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
+_ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+_ONNX_STRUCTURE_STRING_MAX_BYTES = 1024 * 1024
+_ONNX_STRUCTURE_MAX_DEPTH = 128
+_ONNX_STRUCTURE_MAX_NODES = 1_000_000
+_ONNX_STRUCTURE_MAX_TENSORS = 1_000_000
+_ONNX_STRUCTURE_MAX_GRAPHS = 100_000
+_ONNX_STRUCTURE_MAX_TENSOR_RANK = 4096
+_ONNX_STRUCTURE_MAX_SEQUENCE_VALUES = 1_000_000
+_ONNX_STRUCTURE_MAX_NODE_ATTRIBUTES = 4096
+_ONNX_STRUCTURE_MAX_EXTERNAL_DATA_ENTRIES = 1024
+_ONNX_STRUCTURE_MAX_STRING_DATA_FIELDS = 100_000
+_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES = 100_000
+_ONNX_STRUCTURE_MAX_FIELD_NUMBER = (1 << 29) - 1
+_ONNX_STRUCTURE_MAX_PARSE_STEPS = 5_000_000
+_ONNX_STRUCTURE_MAX_RETAINED_OBJECTS = 1_000_000
+_ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES = 1_000_000
+_ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES = 64 * 1024 * 1024
+_ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES = 128 * 1024 * 1024
+_ONNX_STRUCTURE_RETAINED_OBJECT_BYTES = 1024
+_ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES = 64
+_ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
+_ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
     {
@@ -204,6 +228,14 @@ _QUANTIZED_WEIGHT_OPERATORS: frozenset[str] = frozenset(
     },
 )
 _RECURRENT_WEIGHT_OPERATORS: frozenset[str] = frozenset({"GRU", "LSTM", "RNN"})
+
+
+def resolve_onnx_raw_detector_max_bytes(config: dict[str, Any] | None = None) -> int:
+    """Resolve the shared ONNX whole-file read and hash threshold."""
+    value = (config or {}).get("onnx_raw_detector_max_bytes")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return _ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES
+    return value
 
 
 def _check_onnx() -> bool:
@@ -562,6 +594,28 @@ class _CustomOperatorAggregate:
         return details
 
 
+@dataclass
+class _OnnxExternalLocationAggregate:
+    occurrence_count: int = 0
+    tensor_samples: list[str] = field(default_factory=list)
+
+    def add(self, tensor_name: str) -> None:
+        self.occurrence_count += 1
+        if len(self.tensor_samples) < 5:
+            self.tensor_samples.append(tensor_name)
+
+
+@dataclass(frozen=True)
+class _OnnxExternalSizeValidation:
+    category: str
+    passed: bool
+    message: str
+    severity: IssueSeverity | None
+    location: str
+    details: dict[str, Any]
+    rule_code: str | None = None
+
+
 def _has_operator_schema(op_type: str, version: int, domain: str) -> bool:
     """Return whether the installed ONNX release registers an operator schema."""
     try:
@@ -627,67 +681,108 @@ def _is_explicit_custom_operator(
     )
 
 
-def _iter_graph_and_subgraphs(graph: Any) -> Any:
+def _check_onnx_traversal_interrupted(interrupt_check: Callable[[], None] | None) -> None:
+    if interrupt_check is not None:
+        interrupt_check()
+
+
+def _iter_graph_and_subgraphs(
+    graph: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield an ONNX graph and every graph nested below node attributes."""
+    _check_onnx_traversal_interrupted(interrupt_check)
     yield graph
     for node in getattr(graph, "node", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         for attribute in getattr(node, "attribute", []):
+            _check_onnx_traversal_interrupted(interrupt_check)
             for subgraph in _iter_attribute_graphs(attribute):
-                yield from _iter_graph_and_subgraphs(subgraph)
+                yield from _iter_graph_and_subgraphs(subgraph, interrupt_check)
 
 
-def _iter_model_initializer_graphs(model: Any) -> Any:
+def _iter_model_initializer_graphs(
+    model: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield every ONNX graph that can carry tensor initializers."""
-    yield from _iter_graph_and_subgraphs(model.graph)
+    yield from _iter_graph_and_subgraphs(model.graph, interrupt_check)
     for function in getattr(model, "functions", []):
-        yield from _iter_graph_and_subgraphs(function)
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield from _iter_graph_and_subgraphs(function, interrupt_check)
         for attribute in getattr(function, "attribute_proto", []):
+            _check_onnx_traversal_interrupted(interrupt_check)
             for subgraph in _iter_attribute_graphs(attribute):
-                yield from _iter_graph_and_subgraphs(subgraph)
+                yield from _iter_graph_and_subgraphs(subgraph, interrupt_check)
     for training_info in getattr(model, "training_info", []):
-        yield from _iter_graph_and_subgraphs(training_info.initialization)
-        yield from _iter_graph_and_subgraphs(training_info.algorithm)
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield from _iter_graph_and_subgraphs(training_info.initialization, interrupt_check)
+        yield from _iter_graph_and_subgraphs(training_info.algorithm, interrupt_check)
 
 
-def _iter_attribute_external_data_tensors(attribute: Any) -> Any:
+def _iter_attribute_external_data_tensors(
+    attribute: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield tensor values declared by an ONNX attribute."""
-    yield from getattr(attribute, "tensors", [])
+    for tensor in getattr(attribute, "tensors", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield tensor
     for sparse_tensor in getattr(attribute, "sparse_tensors", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         yield sparse_tensor.values
         yield sparse_tensor.indices
     try:
         if attribute.HasField("t"):
+            _check_onnx_traversal_interrupted(interrupt_check)
             yield attribute.t
         if attribute.HasField("sparse_tensor"):
+            _check_onnx_traversal_interrupted(interrupt_check)
             yield attribute.sparse_tensor.values
             yield attribute.sparse_tensor.indices
     except (ValueError, AttributeError):  # pragma: no cover - proto edge case
         pass
 
 
-def _iter_graph_external_data_tensors(graph: Any) -> Any:
+def _iter_graph_external_data_tensors(
+    graph: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield graph-owned tensors that can carry external_data references."""
-    yield from getattr(graph, "initializer", [])
+    for tensor in getattr(graph, "initializer", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield tensor
     for sparse_tensor in getattr(graph, "sparse_initializer", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         yield sparse_tensor.values
         yield sparse_tensor.indices
     for node in getattr(graph, "node", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         for attribute in getattr(node, "attribute", []):
-            yield from _iter_attribute_external_data_tensors(attribute)
+            _check_onnx_traversal_interrupted(interrupt_check)
+            yield from _iter_attribute_external_data_tensors(attribute, interrupt_check)
 
 
-def _iter_model_external_data_tensor_groups(model: Any) -> Any:
+def _iter_model_external_data_tensor_groups(
+    model: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> Any:
     """Yield model tensor groups that can declare external_data."""
-    for graph in _iter_model_initializer_graphs(model):
-        yield _iter_graph_external_data_tensors(graph)
+    for graph in _iter_model_initializer_graphs(model, interrupt_check):
+        yield _iter_graph_external_data_tensors(graph, interrupt_check)
     for function in getattr(model, "functions", []):
+        _check_onnx_traversal_interrupted(interrupt_check)
         for attribute in getattr(function, "attribute_proto", []):
-            yield _iter_attribute_external_data_tensors(attribute)
+            _check_onnx_traversal_interrupted(interrupt_check)
+            yield _iter_attribute_external_data_tensors(attribute, interrupt_check)
 
 
-def _model_has_external_data(model: Any) -> bool:
+def _model_has_external_data(
+    model: Any,
+    interrupt_check: Callable[[], None] | None = None,
+) -> bool:
     """Return True when an ONNX model declares tensors stored in external_data."""
-    for tensors in _iter_model_external_data_tensor_groups(model):
+    for tensors in _iter_model_external_data_tensor_groups(model, interrupt_check):
         for tensor in tensors:
             if int(getattr(tensor, "data_location", 0)) == 1:
                 return True
@@ -2742,6 +2837,1245 @@ def _parse_external_data_extent(info: dict[str, str], key: str) -> int | None:
     return parsed
 
 
+class _OnnxStructureParseError(ValueError):
+    """Raised when bounded ONNX structural parsing cannot safely continue."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def _is_onnx_structure_safety_budget_reason(reason: str) -> bool:
+    """Return whether a parser failure is an implementation resource bound."""
+    return reason.endswith(("_limit_exceeded", "_budget_exceeded"))
+
+
+class _OnnxOmittedBytes:
+    """Length-only stand-in for ONNX tensor payload bytes skipped from disk."""
+
+    def __init__(self, length: int):
+        self._length = max(int(length), 0)
+
+    def __len__(self) -> int:
+        return self._length
+
+
+class _OnnxLengthOnlySequence:
+    """Sequence facade used when only a tensor-data count and byte total are needed."""
+
+    def __init__(self, count: int, total_bytes: int = 0):
+        self._count = max(int(count), 0)
+        self._total_bytes = max(int(total_bytes), 0)
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __iter__(self) -> Any:
+        if self._total_bytes <= 0:
+            return iter(())
+        return iter((_OnnxOmittedBytes(self._total_bytes),))
+
+
+@dataclass
+class _OnnxLiteStringEntry:
+    key: str = ""
+    value: str = ""
+
+
+@dataclass
+class _OnnxLiteTensor:
+    name: str = ""
+    data_type: int = 0
+    dims: list[int] = field(default_factory=list)
+    data_location: int = 0
+    external_data: list[_OnnxLiteStringEntry] = field(default_factory=list)
+    raw_data: Any = b""
+    float_data: Any = field(default_factory=lambda: _OnnxLengthOnlySequence(0))
+    int32_data: Any = field(default_factory=lambda: _OnnxLengthOnlySequence(0))
+    int64_data: Any = field(default_factory=lambda: _OnnxLengthOnlySequence(0))
+    double_data: Any = field(default_factory=lambda: _OnnxLengthOnlySequence(0))
+    uint64_data: Any = field(default_factory=lambda: _OnnxLengthOnlySequence(0))
+    string_data: Any = field(default_factory=list)
+
+
+@dataclass
+class _OnnxLiteSparseTensor:
+    values: _OnnxLiteTensor = field(default_factory=_OnnxLiteTensor)
+    indices: _OnnxLiteTensor = field(default_factory=_OnnxLiteTensor)
+    dims: list[int] = field(default_factory=list)
+
+
+@dataclass
+class _OnnxLiteValueInfo:
+    name: str = ""
+
+
+@dataclass
+class _OnnxLiteAttribute:
+    name: str = ""
+    ref_attr_name: str = ""
+    i: int = 0
+    ints: list[int] = field(default_factory=list)
+    t: _OnnxLiteTensor | None = None
+    g: "_OnnxLiteGraph | None" = None
+    sparse_tensor: _OnnxLiteSparseTensor | None = None
+    tensors: list[_OnnxLiteTensor] = field(default_factory=list)
+    graphs: list["_OnnxLiteGraph"] = field(default_factory=list)
+    sparse_tensors: list[_OnnxLiteSparseTensor] = field(default_factory=list)
+
+    def HasField(self, name: str) -> bool:
+        if name in {"t", "g", "sparse_tensor"}:
+            return getattr(self, name) is not None
+        raise ValueError(f"Unknown ONNX attribute field: {name}")
+
+
+@dataclass
+class _OnnxLiteNode:
+    input: list[str] = field(default_factory=list)
+    output: list[str] = field(default_factory=list)
+    name: str = ""
+    op_type: str = ""
+    domain: str = ""
+    overload: str = ""
+    attribute: list[_OnnxLiteAttribute] = field(default_factory=list)
+
+
+@dataclass
+class _OnnxLiteGraph:
+    node: list[_OnnxLiteNode] = field(default_factory=list)
+    name: str = ""
+    initializer: list[_OnnxLiteTensor] = field(default_factory=list)
+    sparse_initializer: list[_OnnxLiteSparseTensor] = field(default_factory=list)
+    input: list[_OnnxLiteValueInfo] = field(default_factory=list)
+    output: list[_OnnxLiteValueInfo] = field(default_factory=list)
+    value_info: list[_OnnxLiteValueInfo] = field(default_factory=list)
+
+
+@dataclass
+class _OnnxLiteOpsetImport:
+    domain: str = ""
+    version: int = 0
+
+
+@dataclass
+class _OnnxLiteFunction:
+    node: list[_OnnxLiteNode] = field(default_factory=list)
+    name: str = ""
+    domain: str = ""
+    overload: str = ""
+    input: list[str] = field(default_factory=list)
+    output: list[str] = field(default_factory=list)
+    attribute: list[str] = field(default_factory=list)
+    opset_import: list[_OnnxLiteOpsetImport] = field(default_factory=list)
+    attribute_proto: list[_OnnxLiteAttribute] = field(default_factory=list)
+    value_info: list[_OnnxLiteValueInfo] = field(default_factory=list)
+
+
+@dataclass
+class _OnnxLiteTrainingInfo:
+    initialization: _OnnxLiteGraph = field(default_factory=_OnnxLiteGraph)
+    algorithm: _OnnxLiteGraph = field(default_factory=_OnnxLiteGraph)
+    initialization_binding: list[_OnnxLiteStringEntry] = field(default_factory=list)
+    update_binding: list[_OnnxLiteStringEntry] = field(default_factory=list)
+
+
+@dataclass
+class _OnnxLiteModel:
+    ir_version: int = 0
+    producer_name: str = ""
+    opset_import: list[_OnnxLiteOpsetImport] = field(default_factory=list)
+    functions: list[_OnnxLiteFunction] = field(default_factory=list)
+    training_info: list[_OnnxLiteTrainingInfo] = field(default_factory=list)
+    _graph: _OnnxLiteGraph | None = None
+
+    @property
+    def graph(self) -> _OnnxLiteGraph:
+        return self._graph if self._graph is not None else _OnnxLiteGraph()
+
+    def HasField(self, name: str) -> bool:
+        if name == "graph":
+            return self._graph is not None
+        raise ValueError(f"Unknown ONNX model field: {name}")
+
+
+@dataclass
+class _OnnxStructureParseState:
+    interrupt_check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    omitted_raw_data_fields: int = 0
+    omitted_raw_data_bytes: int = 0
+    omitted_packed_varint_fields: int = 0
+    omitted_packed_varint_bytes: int = 0
+    node_count: int = 0
+    tensor_count: int = 0
+    graph_count: int = 0
+    retained_object_count: int = 0
+    retained_sequence_entries: int = 0
+    retained_string_bytes: int = 0
+    retained_allocation_bytes: int = 0
+    string_fields_skipped: int = 0
+    fields_seen: int = 0
+    parse_steps: int = 0
+    coverage_gaps: dict[str, int] = field(default_factory=dict)
+
+    def check_interrupted(self) -> None:
+        if self.interrupt_check is not None:
+            self.interrupt_check()
+        if self.parse_steps >= _ONNX_STRUCTURE_MAX_PARSE_STEPS:
+            reason = "protobuf_parse_step_limit_exceeded"
+            self.record_gap(reason)
+            raise _OnnxStructureParseError(
+                reason,
+                f"ONNX structural parser work exceeds limit ({_ONNX_STRUCTURE_MAX_PARSE_STEPS})",
+            )
+        self.parse_steps += 1
+
+    def record_gap(self, reason: str, count: int = 1) -> None:
+        self.coverage_gaps[reason] = self.coverage_gaps.get(reason, 0) + count
+
+    def record_retained_allocation(self, amount: int) -> None:
+        if amount < 0 or amount > _ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES - self.retained_allocation_bytes:
+            reason = "retained_allocation_budget_exceeded"
+            self.record_gap(reason)
+            raise _OnnxStructureParseError(
+                reason,
+                (
+                    "ONNX structural parser retained allocation estimate exceeds limit "
+                    f"({_ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES})"
+                ),
+            )
+        self.retained_allocation_bytes += amount
+
+    def record_retained_object(self, amount: int = 1, reason: str = "retained_object_limit_exceeded") -> None:
+        if amount < 0 or amount > _ONNX_STRUCTURE_MAX_RETAINED_OBJECTS - self.retained_object_count:
+            self.record_gap(reason)
+            raise _OnnxStructureParseError(
+                reason,
+                f"ONNX structural parser retained object count exceeds limit ({_ONNX_STRUCTURE_MAX_RETAINED_OBJECTS})",
+            )
+        self.retained_object_count += amount
+        self.record_retained_allocation(amount * _ONNX_STRUCTURE_RETAINED_OBJECT_BYTES)
+
+    def record_retained_sequence_entry(self, reason: str = "retained_sequence_entries_limit_exceeded") -> None:
+        if self.retained_sequence_entries >= _ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES:
+            self.record_gap(reason)
+            raise _OnnxStructureParseError(
+                reason,
+                (
+                    "ONNX structural parser retained sequence entries exceed aggregate limit "
+                    f"({_ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES})"
+                ),
+            )
+        self.retained_sequence_entries += 1
+        self.record_retained_allocation(_ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES)
+
+    def record_retained_string(self, length: int, field_name: str) -> None:
+        if length < 0 or length > _ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES - self.retained_string_bytes:
+            reason = "retained_string_bytes_limit_exceeded"
+            self.record_gap(reason)
+            raise _OnnxStructureParseError(
+                reason,
+                (
+                    "ONNX structural parser retained string bytes exceed aggregate limit "
+                    f"({_ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES}) at {field_name}"
+                ),
+            )
+        self.retained_string_bytes += length
+        self.record_retained_allocation((2 * length) + _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES)
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "parse_mode": "file_backed_structure",
+            "omitted_raw_data_fields": self.omitted_raw_data_fields,
+            "omitted_raw_data_bytes": self.omitted_raw_data_bytes,
+            "omitted_packed_varint_fields": self.omitted_packed_varint_fields,
+            "omitted_packed_varint_bytes": self.omitted_packed_varint_bytes,
+            "node_count": self.node_count,
+            "tensor_count": self.tensor_count,
+            "graph_count": self.graph_count,
+            "retained_object_count": self.retained_object_count,
+            "retained_sequence_entries": self.retained_sequence_entries,
+            "retained_string_bytes": self.retained_string_bytes,
+            "retained_allocation_bytes": self.retained_allocation_bytes,
+            "string_fields_skipped": self.string_fields_skipped,
+            "fields_seen": self.fields_seen,
+            "parse_steps": self.parse_steps,
+            "coverage_gaps": dict(self.coverage_gaps),
+        }
+
+
+def _decode_int64_varint(value: int) -> int:
+    value &= (1 << 64) - 1
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def _decode_int32_varint(value: int) -> int:
+    value &= (1 << 32) - 1
+    return value - (1 << 32) if value >= (1 << 31) else value
+
+
+def _ensure_onnx_parse_depth(depth: int) -> None:
+    if depth > _ONNX_STRUCTURE_MAX_DEPTH:
+        raise _OnnxStructureParseError(
+            "protobuf_nesting_limit_exceeded",
+            f"ONNX protobuf nesting exceeds limit ({_ONNX_STRUCTURE_MAX_DEPTH})",
+        )
+
+
+def _read_onnx_varint(handle: BinaryIO, end: int) -> int:
+    shift = 0
+    value = 0
+    for _ in range(10):
+        if handle.tell() >= end:
+            raise _OnnxStructureParseError("truncated_varint", "ONNX protobuf varint is truncated")
+        chunk = handle.read(1)
+        if len(chunk) != 1:
+            raise _OnnxStructureParseError("truncated_varint", "ONNX protobuf varint is truncated")
+        byte = chunk[0]
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value
+        shift += 7
+    raise _OnnxStructureParseError("varint_too_long", "ONNX protobuf varint exceeds 10 bytes")
+
+
+def _read_onnx_key(handle: BinaryIO, end: int, state: _OnnxStructureParseState) -> tuple[int, int]:
+    state.check_interrupted()
+    state.fields_seen += 1
+    key = _read_onnx_varint(handle, end)
+    field_number = key >> 3
+    if field_number == 0:
+        raise _OnnxStructureParseError("invalid_field_number_zero", "ONNX protobuf field number 0 is invalid")
+    if field_number > _ONNX_STRUCTURE_MAX_FIELD_NUMBER:
+        raise _OnnxStructureParseError(
+            "field_number_out_of_range",
+            f"ONNX protobuf field number exceeds maximum ({_ONNX_STRUCTURE_MAX_FIELD_NUMBER})",
+        )
+    return field_number, key & 0x07
+
+
+def _read_onnx_exact(handle: BinaryIO, length: int, end: int) -> bytes:
+    if length < 0 or handle.tell() + length > end:
+        raise _OnnxStructureParseError("declared_length_out_of_bounds", "ONNX protobuf field length exceeds input")
+    data = handle.read(length)
+    if len(data) != length:
+        raise _OnnxStructureParseError("truncated_field", "ONNX protobuf field is truncated")
+    return data
+
+
+def _skip_onnx_bytes(handle: BinaryIO, length: int, end: int) -> None:
+    if length < 0 or handle.tell() + length > end:
+        raise _OnnxStructureParseError("declared_length_out_of_bounds", "ONNX protobuf field length exceeds input")
+    handle.seek(length, os.SEEK_CUR)
+
+
+def _read_onnx_length_bounds(handle: BinaryIO, end: int) -> tuple[int, int]:
+    length = _read_onnx_varint(handle, end)
+    payload_end = handle.tell() + length
+    if payload_end > end:
+        raise _OnnxStructureParseError("declared_length_out_of_bounds", "ONNX protobuf field length exceeds input")
+    return length, payload_end
+
+
+def _skip_onnx_unknown_field(handle: BinaryIO, wire_type: int, end: int) -> None:
+    if wire_type == 0:
+        _read_onnx_varint(handle, end)
+    elif wire_type == 1:
+        _skip_onnx_bytes(handle, 8, end)
+    elif wire_type == 2:
+        length, payload_end = _read_onnx_length_bounds(handle, end)
+        _skip_onnx_bytes(handle, length, payload_end)
+    elif wire_type == 5:
+        _skip_onnx_bytes(handle, 4, end)
+    else:
+        raise _OnnxStructureParseError(
+            "unsupported_wire_type",
+            f"ONNX protobuf uses unsupported wire type {wire_type}",
+        )
+
+
+def _read_onnx_string(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    *,
+    field_name: str,
+) -> str:
+    length, payload_end = _read_onnx_length_bounds(handle, end)
+    if length > _ONNX_STRUCTURE_STRING_MAX_BYTES:
+        state.string_fields_skipped += 1
+        state.record_gap(f"{field_name}_string_too_large")
+        handle.seek(payload_end)
+        return ""
+    raw = _read_onnx_exact(handle, length, payload_end)
+    state.record_retained_string(length, field_name)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        state.record_gap(f"{field_name}_invalid_utf8")
+        return raw.decode("utf-8", errors="replace")
+
+
+def _append_onnx_sequence_value(
+    values: list[Any],
+    value: Any,
+    state: _OnnxStructureParseState,
+    *,
+    reason: str,
+    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
+) -> None:
+    _ensure_onnx_sequence_capacity(values, state, reason=reason, limit=limit)
+    values.append(value)
+
+
+def _ensure_onnx_sequence_capacity(
+    values: list[Any],
+    state: _OnnxStructureParseState,
+    *,
+    reason: str,
+    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
+) -> None:
+    if len(values) >= limit:
+        state.record_gap(reason)
+        raise _OnnxStructureParseError(reason, f"ONNX protobuf repeated field exceeds limit ({limit})")
+    state.record_retained_sequence_entry()
+
+
+def _append_onnx_string_value(
+    values: list[str],
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    *,
+    field_name: str,
+    reason: str,
+    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
+) -> None:
+    _ensure_onnx_sequence_capacity(values, state, reason=reason, limit=limit)
+    values.append(_read_onnx_string(handle, end, state, field_name=field_name))
+
+
+def _append_onnx_submessage_value(
+    values: list[Any],
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+    parser: Callable[[BinaryIO, int, _OnnxStructureParseState, int], Any],
+    *,
+    reason: str,
+    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
+) -> None:
+    _ensure_onnx_sequence_capacity(values, state, reason=reason, limit=limit)
+    values.append(_read_onnx_submessage(handle, end, state, depth, parser))
+
+
+def _append_onnx_dimension(values: list[int], value: int, state: _OnnxStructureParseState) -> None:
+    _append_onnx_sequence_value(
+        values,
+        value,
+        state,
+        reason="tensor_rank_limit_exceeded",
+        limit=_ONNX_STRUCTURE_MAX_TENSOR_RANK,
+    )
+
+
+def _raise_duplicate_onnx_singular_message(field_name: str) -> NoReturn:
+    raise _OnnxStructureParseError(
+        "duplicate_singular_message",
+        f"ONNX protobuf singular message field is repeated: {field_name}",
+    )
+
+
+def _increment_onnx_count(
+    current: int,
+    amount: int,
+    *,
+    reason: str,
+    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
+) -> int:
+    if amount < 0 or amount > limit - current:
+        raise _OnnxStructureParseError(reason, f"ONNX protobuf repeated field exceeds limit ({limit})")
+    return current + amount
+
+
+def _read_onnx_packed_varints(
+    handle: BinaryIO,
+    payload_end: int,
+    values: list[int],
+    state: _OnnxStructureParseState,
+    *,
+    signed: bool = False,
+    reason: str = "packed_varint_sequence_limit_exceeded",
+    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
+) -> None:
+    while handle.tell() < payload_end:
+        state.check_interrupted()
+        raw_value = _read_onnx_varint(handle, payload_end)
+        value = _decode_int64_varint(raw_value) if signed else raw_value
+        _append_onnx_sequence_value(values, value, state, reason=reason, limit=limit)
+
+
+def _read_onnx_submessage(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+    parser: Callable[[BinaryIO, int, _OnnxStructureParseState, int], Any],
+) -> Any:
+    _ensure_onnx_parse_depth(depth + 1)
+    _length, payload_end = _read_onnx_length_bounds(handle, end)
+    value = parser(handle, payload_end, state, depth + 1)
+    handle.seek(payload_end)
+    return value
+
+
+def _parse_onnx_string_entry(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteStringEntry:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
+    entry = _OnnxLiteStringEntry()
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 2:
+            entry.key = _read_onnx_string(handle, end, state, field_name="external_data_key")
+        elif field_number == 2 and wire_type == 2:
+            entry.value = _read_onnx_string(handle, end, state, field_name="external_data_value")
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return entry
+
+
+def _parse_onnx_tensor(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteTensor:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
+    state.tensor_count += 1
+    if state.tensor_count > _ONNX_STRUCTURE_MAX_TENSORS:
+        raise _OnnxStructureParseError(
+            "tensor_count_limit_exceeded",
+            f"ONNX tensor count exceeds limit ({_ONNX_STRUCTURE_MAX_TENSORS})",
+        )
+    tensor = _OnnxLiteTensor()
+    counts = {
+        "float_data": 0,
+        "int32_data": 0,
+        "int64_data": 0,
+        "double_data": 0,
+        "uint64_data": 0,
+    }
+    string_data_count = 0
+    string_data_bytes = 0
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1:
+            if wire_type == 0:
+                _append_onnx_dimension(tensor.dims, _decode_int64_varint(_read_onnx_varint(handle, end)), state)
+            elif wire_type == 2:
+                _length, payload_end = _read_onnx_length_bounds(handle, end)
+                while handle.tell() < payload_end:
+                    state.check_interrupted()
+                    _append_onnx_dimension(
+                        tensor.dims,
+                        _decode_int64_varint(_read_onnx_varint(handle, payload_end)),
+                        state,
+                    )
+                handle.seek(payload_end)
+            else:
+                _skip_onnx_unknown_field(handle, wire_type, end)
+        elif field_number == 2 and wire_type == 0:
+            tensor.data_type = _decode_int32_varint(_read_onnx_varint(handle, end))
+        elif field_number == 4:
+            if wire_type == 5:
+                _skip_onnx_bytes(handle, 4, end)
+                counts["float_data"] += 1
+            elif wire_type == 2:
+                length, payload_end = _read_onnx_length_bounds(handle, end)
+                if length % 4:
+                    raise _OnnxStructureParseError("malformed_packed_float_data", "Packed float_data length is invalid")
+                counts["float_data"] += length // 4
+                handle.seek(payload_end)
+            else:
+                _skip_onnx_unknown_field(handle, wire_type, end)
+        elif field_number in {5, 7, 11}:
+            key_name = {5: "int32_data", 7: "int64_data", 11: "uint64_data"}[field_number]
+            if wire_type == 0:
+                _read_onnx_varint(handle, end)
+                counts[key_name] += 1
+            elif wire_type == 2:
+                length, payload_end = _read_onnx_length_bounds(handle, end)
+                # Packed integer values are tensor payload. The serialized byte
+                # length is a conservative upper bound on element count and lets
+                # file-backed scans skip multi-GB payloads in constant work.
+                counts[key_name] += length
+                state.omitted_packed_varint_fields += 1
+                state.omitted_packed_varint_bytes += length
+                handle.seek(payload_end)
+            else:
+                _skip_onnx_unknown_field(handle, wire_type, end)
+        elif field_number == 6 and wire_type == 2:
+            length, payload_end = _read_onnx_length_bounds(handle, end)
+            string_data_count = _increment_onnx_count(
+                string_data_count,
+                1,
+                reason="tensor_string_data_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_STRING_DATA_FIELDS,
+            )
+            string_data_bytes += length
+            handle.seek(payload_end)
+        elif field_number == 8 and wire_type == 2:
+            tensor.name = _read_onnx_string(handle, end, state, field_name="tensor_name")
+        elif field_number == 9 and wire_type == 2:
+            length, payload_end = _read_onnx_length_bounds(handle, end)
+            tensor.raw_data = _OnnxOmittedBytes(length)
+            state.omitted_raw_data_fields += 1
+            state.omitted_raw_data_bytes += length
+            handle.seek(payload_end)
+        elif field_number == 10:
+            if wire_type == 1:
+                _skip_onnx_bytes(handle, 8, end)
+                counts["double_data"] += 1
+            elif wire_type == 2:
+                length, payload_end = _read_onnx_length_bounds(handle, end)
+                if length % 8:
+                    raise _OnnxStructureParseError(
+                        "malformed_packed_double_data",
+                        "Packed double_data length is invalid",
+                    )
+                counts["double_data"] += length // 8
+                handle.seek(payload_end)
+            else:
+                _skip_onnx_unknown_field(handle, wire_type, end)
+        elif field_number == 13 and wire_type == 2:
+            _append_onnx_submessage_value(
+                tensor.external_data,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_string_entry,
+                reason="external_data_entry_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_EXTERNAL_DATA_ENTRIES,
+            )
+        elif field_number == 14 and wire_type == 0:
+            data_location = _decode_int32_varint(_read_onnx_varint(handle, end))
+            # TensorProto.data_location is a proto2 enum. Unknown values are
+            # retained as unknown fields by protobuf and must not overwrite a
+            # previously recognized value.
+            if data_location in {0, 1}:
+                tensor.data_location = data_location
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    tensor.float_data = _OnnxLengthOnlySequence(counts["float_data"])
+    tensor.int32_data = _OnnxLengthOnlySequence(counts["int32_data"])
+    tensor.int64_data = _OnnxLengthOnlySequence(counts["int64_data"])
+    tensor.double_data = _OnnxLengthOnlySequence(counts["double_data"])
+    tensor.uint64_data = _OnnxLengthOnlySequence(counts["uint64_data"])
+    tensor.string_data = _OnnxLengthOnlySequence(string_data_count, string_data_bytes)
+    return tensor
+
+
+def _parse_onnx_sparse_tensor(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteSparseTensor:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object(3)
+    sparse = _OnnxLiteSparseTensor()
+    seen_values = False
+    seen_indices = False
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 2:
+            if seen_values:
+                _raise_duplicate_onnx_singular_message("SparseTensorProto.values")
+            seen_values = True
+            sparse.values = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor)
+        elif field_number == 2 and wire_type == 2:
+            if seen_indices:
+                _raise_duplicate_onnx_singular_message("SparseTensorProto.indices")
+            seen_indices = True
+            sparse.indices = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor)
+        elif field_number == 3:
+            if wire_type == 0:
+                _append_onnx_dimension(sparse.dims, _decode_int64_varint(_read_onnx_varint(handle, end)), state)
+            elif wire_type == 2:
+                _length, payload_end = _read_onnx_length_bounds(handle, end)
+                while handle.tell() < payload_end:
+                    state.check_interrupted()
+                    _append_onnx_dimension(
+                        sparse.dims,
+                        _decode_int64_varint(_read_onnx_varint(handle, payload_end)),
+                        state,
+                    )
+                handle.seek(payload_end)
+            else:
+                _skip_onnx_unknown_field(handle, wire_type, end)
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return sparse
+
+
+def _parse_onnx_attribute(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteAttribute:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
+    attribute = _OnnxLiteAttribute()
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 2:
+            attribute.name = _read_onnx_string(handle, end, state, field_name="attribute_name")
+        elif field_number == 21 and wire_type == 2:
+            attribute.ref_attr_name = _read_onnx_string(handle, end, state, field_name="attribute_ref_name")
+        elif field_number == 3 and wire_type == 0:
+            attribute.i = _decode_int64_varint(_read_onnx_varint(handle, end))
+        elif field_number == 5 and wire_type == 2:
+            if attribute.t is not None:
+                _raise_duplicate_onnx_singular_message("AttributeProto.t")
+            attribute.t = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor)
+        elif field_number == 6 and wire_type == 2:
+            if attribute.g is not None:
+                _raise_duplicate_onnx_singular_message("AttributeProto.g")
+            attribute.g = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+        elif field_number == 8:
+            if wire_type == 0:
+                _append_onnx_sequence_value(
+                    attribute.ints,
+                    _decode_int64_varint(_read_onnx_varint(handle, end)),
+                    state,
+                    reason="attribute_ints_limit_exceeded",
+                )
+            elif wire_type == 2:
+                _length, payload_end = _read_onnx_length_bounds(handle, end)
+                _read_onnx_packed_varints(
+                    handle,
+                    payload_end,
+                    attribute.ints,
+                    state,
+                    signed=True,
+                    reason="attribute_ints_limit_exceeded",
+                )
+                handle.seek(payload_end)
+            else:
+                _skip_onnx_unknown_field(handle, wire_type, end)
+        elif field_number == 10 and wire_type == 2:
+            _append_onnx_submessage_value(
+                attribute.tensors,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_tensor,
+                reason="attribute_tensors_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 11 and wire_type == 2:
+            _append_onnx_submessage_value(
+                attribute.graphs,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_graph,
+                reason="attribute_graphs_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 22 and wire_type == 2:
+            if attribute.sparse_tensor is not None:
+                _raise_duplicate_onnx_singular_message("AttributeProto.sparse_tensor")
+            attribute.sparse_tensor = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_sparse_tensor)
+        elif field_number == 23 and wire_type == 2:
+            _append_onnx_submessage_value(
+                attribute.sparse_tensors,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_sparse_tensor,
+                reason="attribute_sparse_tensors_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return attribute
+
+
+def _parse_onnx_node(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteNode:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
+    state.node_count += 1
+    if state.node_count > _ONNX_STRUCTURE_MAX_NODES:
+        raise _OnnxStructureParseError(
+            "node_count_limit_exceeded",
+            f"ONNX node count exceeds limit ({_ONNX_STRUCTURE_MAX_NODES})",
+        )
+    node = _OnnxLiteNode()
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 2:
+            _append_onnx_string_value(
+                node.input,
+                handle,
+                end,
+                state,
+                field_name="node_input",
+                reason="node_input_limit_exceeded",
+            )
+        elif field_number == 2 and wire_type == 2:
+            _append_onnx_string_value(
+                node.output,
+                handle,
+                end,
+                state,
+                field_name="node_output",
+                reason="node_output_limit_exceeded",
+            )
+        elif field_number == 3 and wire_type == 2:
+            node.name = _read_onnx_string(handle, end, state, field_name="node_name")
+        elif field_number == 4 and wire_type == 2:
+            node.op_type = _read_onnx_string(handle, end, state, field_name="node_op_type")
+        elif field_number == 5 and wire_type == 2:
+            _append_onnx_submessage_value(
+                node.attribute,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_attribute,
+                reason="node_attribute_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_NODE_ATTRIBUTES,
+            )
+        elif field_number == 7 and wire_type == 2:
+            node.domain = _read_onnx_string(handle, end, state, field_name="node_domain")
+        elif field_number == 8 and wire_type == 2:
+            node.overload = _read_onnx_string(handle, end, state, field_name="node_overload")
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return node
+
+
+def _parse_onnx_value_info(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteValueInfo:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
+    value_info = _OnnxLiteValueInfo()
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 2:
+            value_info.name = _read_onnx_string(handle, end, state, field_name="value_info_name")
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return value_info
+
+
+def _parse_onnx_graph(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteGraph:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
+    state.graph_count += 1
+    if state.graph_count > _ONNX_STRUCTURE_MAX_GRAPHS:
+        raise _OnnxStructureParseError(
+            "graph_count_limit_exceeded",
+            f"ONNX graph count exceeds limit ({_ONNX_STRUCTURE_MAX_GRAPHS})",
+        )
+    graph = _OnnxLiteGraph()
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 2:
+            _append_onnx_submessage_value(
+                graph.node,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_node,
+                reason="graph_node_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_NODES,
+            )
+        elif field_number == 2 and wire_type == 2:
+            graph.name = _read_onnx_string(handle, end, state, field_name="graph_name")
+        elif field_number == 5 and wire_type == 2:
+            _append_onnx_submessage_value(
+                graph.initializer,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_tensor,
+                reason="graph_initializer_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_TENSORS,
+            )
+        elif field_number == 15 and wire_type == 2:
+            _append_onnx_submessage_value(
+                graph.sparse_initializer,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_sparse_tensor,
+                reason="graph_sparse_initializer_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_TENSORS,
+            )
+        elif field_number == 11 and wire_type == 2:
+            _append_onnx_submessage_value(
+                graph.input,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_value_info,
+                reason="graph_input_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 12 and wire_type == 2:
+            _append_onnx_submessage_value(
+                graph.output,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_value_info,
+                reason="graph_output_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 13 and wire_type == 2:
+            _append_onnx_submessage_value(
+                graph.value_info,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_value_info,
+                reason="graph_value_info_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return graph
+
+
+def _parse_onnx_opset_import(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteOpsetImport:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
+    opset = _OnnxLiteOpsetImport()
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 2:
+            opset.domain = _read_onnx_string(handle, end, state, field_name="opset_domain")
+        elif field_number == 2 and wire_type == 0:
+            opset.version = _decode_int64_varint(_read_onnx_varint(handle, end))
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return opset
+
+
+def _parse_onnx_function(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteFunction:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
+    function = _OnnxLiteFunction()
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 2:
+            function.name = _read_onnx_string(handle, end, state, field_name="function_name")
+        elif field_number == 4 and wire_type == 2:
+            _append_onnx_string_value(
+                function.input,
+                handle,
+                end,
+                state,
+                field_name="function_input",
+                reason="function_input_limit_exceeded",
+            )
+        elif field_number == 5 and wire_type == 2:
+            _append_onnx_string_value(
+                function.output,
+                handle,
+                end,
+                state,
+                field_name="function_output",
+                reason="function_output_limit_exceeded",
+            )
+        elif field_number == 6 and wire_type == 2:
+            _append_onnx_string_value(
+                function.attribute,
+                handle,
+                end,
+                state,
+                field_name="function_attribute",
+                reason="function_attribute_limit_exceeded",
+            )
+        elif field_number == 7 and wire_type == 2:
+            _append_onnx_submessage_value(
+                function.node,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_node,
+                reason="function_node_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_NODES,
+            )
+        elif field_number == 9 and wire_type == 2:
+            _append_onnx_submessage_value(
+                function.opset_import,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_opset_import,
+                reason="function_opset_import_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 10 and wire_type == 2:
+            function.domain = _read_onnx_string(handle, end, state, field_name="function_domain")
+        elif field_number == 11 and wire_type == 2:
+            _append_onnx_submessage_value(
+                function.attribute_proto,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_attribute,
+                reason="function_attribute_proto_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_NODE_ATTRIBUTES,
+            )
+        elif field_number == 12 and wire_type == 2:
+            _append_onnx_submessage_value(
+                function.value_info,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_value_info,
+                reason="function_value_info_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 13 and wire_type == 2:
+            function.overload = _read_onnx_string(handle, end, state, field_name="function_overload")
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return function
+
+
+def _parse_onnx_training_info(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteTrainingInfo:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object(3)
+    training_info = _OnnxLiteTrainingInfo()
+    seen_initialization = False
+    seen_algorithm = False
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 2:
+            if seen_initialization:
+                _raise_duplicate_onnx_singular_message("TrainingInfoProto.initialization")
+            seen_initialization = True
+            training_info.initialization = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+        elif field_number == 2 and wire_type == 2:
+            if seen_algorithm:
+                _raise_duplicate_onnx_singular_message("TrainingInfoProto.algorithm")
+            seen_algorithm = True
+            training_info.algorithm = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+        elif field_number == 3 and wire_type == 2:
+            _append_onnx_submessage_value(
+                training_info.initialization_binding,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_string_entry,
+                reason="training_initialization_binding_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 4 and wire_type == 2:
+            _append_onnx_submessage_value(
+                training_info.update_binding,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_string_entry,
+                reason="training_update_binding_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return training_info
+
+
+def _parse_onnx_model(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+) -> _OnnxLiteModel:
+    _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
+    model = _OnnxLiteModel()
+    while handle.tell() < end:
+        field_number, wire_type = _read_onnx_key(handle, end, state)
+        if field_number == 1 and wire_type == 0:
+            model.ir_version = _decode_int64_varint(_read_onnx_varint(handle, end))
+        elif field_number == 2 and wire_type == 2:
+            model.producer_name = _read_onnx_string(handle, end, state, field_name="producer_name")
+        elif field_number == 7 and wire_type == 2:
+            if model._graph is not None:
+                _raise_duplicate_onnx_singular_message("ModelProto.graph")
+            model._graph = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+        elif field_number == 8 and wire_type == 2:
+            _append_onnx_submessage_value(
+                model.opset_import,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_opset_import,
+                reason="model_opset_import_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 20 and wire_type == 2:
+            _append_onnx_submessage_value(
+                model.training_info,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_training_info,
+                reason="model_training_info_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 25 and wire_type == 2:
+            _append_onnx_submessage_value(
+                model.functions,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_function,
+                reason="model_functions_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        else:
+            _skip_onnx_unknown_field(handle, wire_type, end)
+    return model
+
+
+def _load_onnx_structure_file_backed(
+    path: str,
+    file_size: int,
+    interrupt_check: Callable[[], None] | None = None,
+    *,
+    expected_stat: os.stat_result | None = None,
+) -> tuple[_OnnxLiteModel, _OnnxStructureParseState]:
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+
+    def identity_matches(left: os.stat_result, right: os.stat_result) -> bool:
+        return all(getattr(left, field_name) == getattr(right, field_name) for field_name in identity_fields)
+
+    state = _OnnxStructureParseState(interrupt_check=interrupt_check)
+    try:
+        path_stat = os.stat(path)
+    except OSError as exc:
+        raise _OnnxStructureParseError(
+            "source_identity_unavailable",
+            f"Unable to stat ONNX source before structural parsing: {exc}",
+        ) from exc
+    expected = expected_stat if expected_stat is not None else path_stat
+    if file_size != expected.st_size or not identity_matches(path_stat, expected):
+        raise _OnnxStructureParseError(
+            "source_changed_before_parse",
+            "ONNX source identity changed before structural parsing",
+        )
+
+    open_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, open_flags)
+    except OSError as exc:
+        raise _OnnxStructureParseError(
+            "source_changed_before_parse",
+            f"Unable to open expected ONNX source for structural parsing: {exc}",
+        ) from exc
+    with os.fdopen(descriptor, "rb") as handle:
+        opened_stat = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened_stat.st_mode) or not identity_matches(opened_stat, expected):
+            raise _OnnxStructureParseError(
+                "source_changed_before_parse",
+                "Opened ONNX source does not match the expected regular file identity",
+            )
+        opened_size = opened_stat.st_size
+
+        def ensure_source_unchanged() -> None:
+            final_descriptor_stat = os.fstat(handle.fileno())
+            try:
+                final_path_stat = os.stat(path)
+            except OSError as exc:
+                raise _OnnxStructureParseError(
+                    "source_changed_during_parse",
+                    f"ONNX source became unavailable during structural parsing: {exc}",
+                ) from exc
+            if not identity_matches(final_descriptor_stat, opened_stat) or not identity_matches(
+                final_path_stat,
+                opened_stat,
+            ):
+                raise _OnnxStructureParseError(
+                    "source_changed_during_parse",
+                    "ONNX source identity changed during structural parsing",
+                )
+
+        try:
+            model = _parse_onnx_model(handle, opened_size, state, 0)
+            if handle.tell() != opened_size:
+                raise _OnnxStructureParseError(
+                    "trailing_parse_mismatch",
+                    "ONNX structural parser did not consume input",
+                )
+        except Exception:
+            ensure_source_unchanged()
+            raise
+        ensure_source_unchanged()
+    return model, state
+
+
 def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
     """Mark the ONNX scan inconclusive when structure validation cannot complete."""
     result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
@@ -2763,7 +4097,10 @@ def _finish_scan_result(result: ScanResult) -> None:
 
 def _onnx_format_integrity_validated(result: ScanResult) -> bool:
     """Return True once ONNX ownership is structurally validated."""
-    if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+    incomplete_reasons = result.metadata.get("scan_outcome_reasons", [])
+    if isinstance(incomplete_reasons, list) and any(
+        reason in {ONNX_STRUCTURE_INCONCLUSIVE_REASON, ONNX_SCHEMA_INCONCLUSIVE_REASON} for reason in incomplete_reasons
+    ):
         return False
     if _suppressed_onnx_format_integrity_failure(result):
         return False
@@ -2805,12 +4142,41 @@ def _mark_onnx_schema_incomplete(
     )
 
 
+def _mark_onnx_result_reporting_incomplete(
+    result: ScanResult,
+    path: str,
+    *,
+    section: str,
+    omitted_count: int,
+) -> None:
+    """Fail closed when bounded result aggregation omits attacker-controlled groups."""
+    if omitted_count <= 0:
+        return
+    _mark_inconclusive_scan_result(result, ONNX_RESULT_REPORTING_INCONCLUSIVE_REASON)
+    result.add_check(
+        name="ONNX Result Reporting Coverage",
+        passed=False,
+        message=f"ONNX {section} results exceeded the bounded reporting budget; analysis incomplete",
+        severity=IssueSeverity.INFO,
+        location=path,
+        rule_code="S902",
+        details={
+            "scan_outcome_reason": ONNX_RESULT_REPORTING_INCONCLUSIVE_REASON,
+            "section": section,
+            "omitted_count": omitted_count,
+            "max_distinct_groups": _ONNX_RESULT_MAX_DISTINCT_GROUPS,
+            "analysis_incomplete": True,
+        },
+    )
+
+
 class OnnxScanner(BaseScanner):
     """Scanner for ONNX model files."""
 
     name = "onnx"
     description = "Scans ONNX models for custom operators and integrity issues"
     supported_extensions: ClassVar[list[str]] = [".onnx"]
+    default_max_file_read_size: ClassVar[int] = 0
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -2824,6 +4190,70 @@ class OnnxScanner(BaseScanner):
             format_validation.get("routed_format") == PROTOBUF_MODEL_CANDIDATE_FORMAT
         )
 
+    def _read_onnx_raw_detector_input(self, path: str, file_size: int, max_bytes: int) -> bytes | None:
+        if file_size > max_bytes:
+            return None
+        with open(path, "rb") as f:
+            data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None
+        return data
+
+    def _add_onnx_file_integrity_check(
+        self,
+        path: str,
+        result: ScanResult,
+        *,
+        file_size: int,
+        max_hash_bytes: int,
+    ) -> None:
+        if file_size <= max_hash_bytes:
+            self.add_file_integrity_check(path, result)
+            return
+
+        hashes: dict[str, str | None] = {"md5": None, "sha256": None, "sha512": None}
+        result.add_check(
+            name="File Integrity Hash",
+            passed=True,
+            message="File integrity hash calculation skipped for oversized ONNX file",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "md5": None,
+                "sha256": None,
+                "sha512": None,
+                "file_size": file_size,
+                "hash_calculation_skipped": True,
+                "max_hash_bytes": max_hash_bytes,
+                "reason": "file_exceeds_onnx_hash_budget",
+            },
+        )
+        result.metadata["file_hashes"] = hashes
+        result.metadata["file_size"] = file_size
+
+    def _mark_structure_parse_coverage_gaps(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        state: _OnnxStructureParseState,
+    ) -> None:
+        if not state.coverage_gaps:
+            return
+        _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="ONNX Structure Parse Coverage",
+            passed=False,
+            message="ONNX structural parser skipped one or more oversized metadata fields",
+            severity=IssueSeverity.INFO,
+            location=path,
+            rule_code="S902",
+            details={
+                "scan_outcome_reason": ONNX_STRUCTURE_INCONCLUSIVE_REASON,
+                **state.metadata(),
+            },
+        )
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -2834,11 +4264,38 @@ class OnnxScanner(BaseScanner):
             return size_check
 
         result = self._create_result()
-        file_size = self.get_file_size(path)
+        try:
+            source_stat = os.stat(path)
+        except OSError as e:
+            _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="ONNX File Stability",
+                passed=False,
+                message=f"Unable to stat ONNX source before scanning; analysis incomplete: {e}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S902",
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": ONNX_STRUCTURE_INCONCLUSIVE_REASON,
+                    "coverage_gap": "source_identity_unavailable",
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                },
+            )
+            _finish_scan_result(result)
+            return result
+        file_size = source_stat.st_size
         result.metadata["file_size"] = file_size
+        raw_detector_max_bytes = resolve_onnx_raw_detector_max_bytes(self.config)
 
         # Add file integrity check for compliance
-        self.add_file_integrity_check(path, result)
+        self._add_onnx_file_integrity_check(
+            path,
+            result,
+            file_size=file_size,
+            max_hash_bytes=raw_detector_max_bytes,
+        )
         self.current_file_path = path
 
         if not _check_onnx():
@@ -2884,37 +4341,69 @@ class OnnxScanner(BaseScanner):
             _finish_scan_result(result)
             return result
 
-        # Read raw bytes first so successful scans can parse and run raw
-        # detectors from the same buffer. If this read fails, fall back to
-        # ONNX's path-based loader so structural analysis still has a chance
-        # to complete while raw detector coverage stays explicitly incomplete.
+        # Read raw bytes only when bounded. Oversized ONNX files are parsed
+        # structurally from the file descriptor so tensor payloads can be
+        # skipped rather than materialized.
         model_data: bytes | None = None
+        check_jit = self._get_bool_config("check_jit_script", True)
+        check_net = self._get_bool_config("check_network_comm", True)
+        raw_detectors_enabled = check_jit or check_net
+        if not check_jit or not check_net:
+            disabled_checks = result.metadata.setdefault("disabled_checks", [])
+            if not check_jit:
+                disabled_checks.append("JIT/Script Code Execution Detection")
+            if not check_net:
+                disabled_checks.append("Network Communication Detection")
         try:
             self.check_interrupted()
-            with open(path, "rb") as f:
-                model_data = f.read()
+            model_data = self._read_onnx_raw_detector_input(path, file_size, raw_detector_max_bytes)
             self.check_interrupted()
+            if model_data is None and raw_detectors_enabled:
+                self._mark_raw_detection_incomplete(
+                    result,
+                    path,
+                    detector="raw_file_read",
+                    reason="raw_detector_budget_exceeded",
+                    message=(
+                        "Raw ONNX detector input exceeds bounded read budget; "
+                        "continuing with file-backed structural analysis"
+                    ),
+                    details={
+                        "file_size": file_size,
+                        "max_raw_detector_bytes": raw_detector_max_bytes,
+                    },
+                )
         except Exception as e:
             logger.warning("Raw ONNX detector input read failed: %s", e)
-            self._mark_raw_detection_incomplete(
-                result,
-                path,
-                detector="raw_file_read",
-                reason="file_read_failed",
-                message=f"Raw ONNX detector input read failed: {e!s}",
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
+            if raw_detectors_enabled:
+                self._mark_raw_detection_incomplete(
+                    result,
+                    path,
+                    detector="raw_file_read",
+                    reason="file_read_failed",
+                    message=f"Raw ONNX detector input read failed: {e!s}",
+                    details={"exception": str(e), "exception_type": type(e).__name__},
+                )
 
         try:
             import onnx
 
             # Check for interrupts before starting the potentially long-running load.
             self.check_interrupted()
-            model = (
-                onnx.load(path, load_external_data=False)
-                if model_data is None
-                else onnx.load_model_from_string(model_data)
-            )
+            file_backed_parse_state: _OnnxStructureParseState | None = None
+            model: Any
+            if model_data is None:
+                model, file_backed_parse_state = _load_onnx_structure_file_backed(
+                    path,
+                    file_size,
+                    self.check_interrupted,
+                    expected_stat=source_stat,
+                )
+                result.metadata["onnx_structure_parse"] = file_backed_parse_state.metadata()
+                self._mark_structure_parse_coverage_gaps(result, path, state=file_backed_parse_state)
+            else:
+                model = onnx.load_model_from_string(model_data)
+                result.metadata["onnx_structure_parse"] = {"parse_mode": "in_memory_model_proto"}
             # Check for interrupts after loading completes.
             self.check_interrupted()
             result.bytes_scanned = file_size
@@ -2923,6 +4412,9 @@ class OnnxScanner(BaseScanner):
             raise
         except Exception as e:  # pragma: no cover - unexpected parse errors
             result.bytes_scanned = file_size
+            parse_error_details = {"exception": str(e), "exception_type": type(e).__name__}
+            if isinstance(e, _OnnxStructureParseError):
+                parse_error_details["coverage_gap"] = e.reason
             if self._is_tentative_protobuf_route():
                 result.scanner_name = "unknown"
                 result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_parse_failed"
@@ -2934,12 +4426,39 @@ class OnnxScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=path,
                     details={
-                        "exception": str(e),
-                        "exception_type": type(e).__name__,
+                        **parse_error_details,
                         "analysis_incomplete": True,
                         "scan_outcome_reason": ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON,
                     },
                     rule_code="S902",
+                )
+                _finish_scan_result(result)
+                return result
+            parse_error_reason = e.reason if isinstance(e, _OnnxStructureParseError) else None
+            safety_budget_exhausted = parse_error_reason is not None and _is_onnx_structure_safety_budget_reason(
+                parse_error_reason
+            )
+            source_identity_incomplete = parse_error_reason in {
+                "source_changed_before_parse",
+                "source_changed_during_parse",
+                "source_identity_unavailable",
+            }
+            if safety_budget_exhausted or source_identity_incomplete:
+                _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
+                result.add_check(
+                    name="ONNX Structure Parse Coverage",
+                    passed=False,
+                    message=f"ONNX structural parsing stopped before completion; analysis incomplete: {e}",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    rule_code="S902",
+                    details={
+                        **parse_error_details,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": ONNX_STRUCTURE_INCONCLUSIVE_REASON,
+                        "safety_budget_exhausted": safety_budget_exhausted,
+                        "source_changed": (parse_error_reason or "").startswith("source_changed_"),
+                    },
                 )
                 _finish_scan_result(result)
                 return result
@@ -2949,7 +4468,7 @@ class OnnxScanner(BaseScanner):
                 message=f"Error parsing ONNX model: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details=parse_error_details,
             )
             result.finish(success=False)
             return result
@@ -2986,7 +4505,20 @@ class OnnxScanner(BaseScanner):
                     message="ONNX schema checker is unavailable; analysis incomplete",
                     details={"checker_available": False},
                 )
-            elif _model_has_external_data(model):
+            elif file_backed_parse_state is not None:
+                _mark_onnx_schema_incomplete(
+                    result,
+                    path,
+                    message="ONNX schema validation unavailable for bounded file-backed structure; analysis incomplete",
+                    details={
+                        "checker_available": True,
+                        "file_backed_structure": True,
+                        "parse_mode": "file_backed_structure",
+                        "external_data_present": _model_has_external_data(model, self.check_interrupted),
+                        "reason": "file_backed_structure_not_full_model_proto",
+                    },
+                )
+            elif _model_has_external_data(model, self.check_interrupted):
                 _mark_onnx_schema_incomplete(
                     result,
                     path,
@@ -3032,7 +4564,6 @@ class OnnxScanner(BaseScanner):
         )
 
         if model_data is not None:
-            check_jit = self._get_bool_config("check_jit_script", True)
             if check_jit:
                 try:
                     jit_findings = self.collect_jit_script_findings(
@@ -3059,10 +4590,7 @@ class OnnxScanner(BaseScanner):
                         model_type="onnx",
                         context=path,
                     )
-            else:
-                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
 
-            check_net = self._get_bool_config("check_network_comm", True)
             if check_net:
                 try:
                     network_findings = self.collect_network_communication_findings(
@@ -3087,15 +4615,30 @@ class OnnxScanner(BaseScanner):
                         result,
                         context=path,
                     )
-            else:
-                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)
         self._check_tensor_sizes(model, path, result)
         if _onnx_format_integrity_validated(result):
             result.metadata[VALIDATED_FORMAT_METADATA_KEY] = self.name
-        self._check_weight_distribution(model, path, result)
+        if model_data is None:
+            self._mark_weight_distribution_incomplete(
+                result,
+                path,
+                reason="file_backed_structural_parse",
+                message="Weight distribution analysis requires tensor materialization and was skipped",
+                details={
+                    "parse_mode": "file_backed_structure",
+                    "omitted_raw_data_fields": result.metadata.get("onnx_structure_parse", {}).get(
+                        "omitted_raw_data_fields",
+                    ),
+                    "omitted_raw_data_bytes": result.metadata.get("onnx_structure_parse", {}).get(
+                        "omitted_raw_data_bytes",
+                    ),
+                },
+            )
+        else:
+            self._check_weight_distribution(model, path, result)
 
         _finish_scan_result(result)
         return result
@@ -3127,10 +4670,11 @@ class OnnxScanner(BaseScanner):
         )
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
-        custom_domains = set()
         local_function_identifiers = _model_local_function_identifiers(model)
         custom_domain_findings: dict[str, _CustomOperatorAggregate] = {}
         explicit_custom_operator_findings: dict[tuple[str, str, str], _CustomOperatorAggregate] = {}
+        python_operator_finding = _CustomOperatorAggregate()
+        omitted_custom_groups = 0
         custom_operators_found = 0
         python_ops_found = False
         safe_nodes = 0
@@ -3155,29 +4699,56 @@ class OnnxScanner(BaseScanner):
                 is_explicit_custom_operator = _is_explicit_custom_operator(node, local_function_identifiers)
                 if is_external_custom_operator or is_explicit_custom_operator:
                     custom_operators_found += 1
+                    retained_group_count = len(custom_domain_findings) + len(explicit_custom_operator_findings)
                     if is_external_custom_operator:
                         domain = str(node.domain or "")
-                        custom_domains.add(domain)
-                        custom_domain_findings.setdefault(domain, _CustomOperatorAggregate()).add_node(node)
+                        finding = custom_domain_findings.get(domain)
+                        if finding is None and retained_group_count < _ONNX_RESULT_MAX_DISTINCT_GROUPS:
+                            finding = _CustomOperatorAggregate()
+                            custom_domain_findings[domain] = finding
+                        if finding is None:
+                            omitted_custom_groups += 1
+                        else:
+                            finding.add_node(node)
                     else:
-                        explicit_custom_operator_findings.setdefault(
-                            _operator_identifier(node),
-                            _CustomOperatorAggregate(),
-                        ).add_node(node)
+                        identifier = _operator_identifier(node)
+                        finding = explicit_custom_operator_findings.get(identifier)
+                        if finding is None and retained_group_count < _ONNX_RESULT_MAX_DISTINCT_GROUPS:
+                            finding = _CustomOperatorAggregate()
+                            explicit_custom_operator_findings[identifier] = finding
+                        if finding is None:
+                            omitted_custom_groups += 1
+                        else:
+                            finding.add_node(node)
 
                 if is_python_operator:
                     python_ops_found = True
-                    result.add_check(
-                        name="Python Operator Detection",
-                        passed=False,
-                        message=f"Model uses Python operator '{node.op_type}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{path} (node: {node.name})",
-                        rule_code="S902",
-                        details={"op_type": node.op_type, "domain": node.domain},
-                    )
+                    python_operator_finding.add_node(node)
                 elif not is_external_custom_operator and not is_explicit_custom_operator:
                     safe_nodes += 1
+
+        if python_ops_found:
+            representative = python_operator_finding.representative_nodes[0]
+            result.add_check(
+                name="Python Operator Detection",
+                passed=False,
+                message=(
+                    f"Model uses Python operator '{representative['op_type']}' "
+                    f"in {python_operator_finding.occurrence_count} node(s)"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                rule_code="S902",
+                details={
+                    "op_type": representative["op_type"],
+                    "domain": representative["domain"],
+                    "occurrence_count": python_operator_finding.occurrence_count,
+                    "representative_nodes": python_operator_finding.representative_nodes,
+                    "representative_nodes_truncated": (
+                        python_operator_finding.occurrence_count > len(python_operator_finding.representative_nodes)
+                    ),
+                },
+            )
 
         # All custom operators are INFO - they're metadata, not executable code.
         # Security risk is in runtime environment (installing malicious operators)
@@ -3268,8 +4839,14 @@ class OnnxScanner(BaseScanner):
                 details={"nodes_checked": nodes_checked},
             )
 
-        if custom_domains:
-            result.metadata["custom_domains"] = sorted(custom_domains)
+        if custom_domain_findings:
+            result.metadata["custom_domains"] = sorted(custom_domain_findings)
+        _mark_onnx_result_reporting_incomplete(
+            result,
+            path,
+            section="custom operator",
+            omitted_count=omitted_custom_groups,
+        )
 
     def _check_external_data(self, model: Any, path: str, result: ScanResult) -> None:
         model_path = Path(path).absolute()
@@ -3282,38 +4859,51 @@ class OnnxScanner(BaseScanner):
 
         # Track per-file status to avoid flooding the result with one check
         # per tensor when many tensors share the same external data file.
-        missing_files: dict[str, list[str]] = {}  # file -> [tensor_names]
-        traversal_files: dict[str, list[str]] = {}  # file -> [tensor_names]
+        missing_files: dict[str, _OnnxExternalLocationAggregate] = {}
+        traversal_files: dict[str, _OnnxExternalLocationAggregate] = {}
+        symlink_traversal_files: dict[str, _OnnxExternalLocationAggregate] = {}
         safe_files: set[str] = set()
+        tracked_locations: set[str] = set()
+        tracked_unsafe_locations: set[str] = set()
+        omitted_external_results = 0
+        external_size_validations: dict[
+            str,
+            tuple[_OnnxExternalSizeValidation, _OnnxExternalLocationAggregate],
+        ] = {}
+        missing_location = _OnnxExternalLocationAggregate()
 
-        for tensors in _iter_model_external_data_tensor_groups(model):
+        def aggregate_location(
+            groups: dict[str, _OnnxExternalLocationAggregate],
+            location: str,
+            tensor_name: str,
+            *,
+            preserve_security_finding: bool = False,
+        ) -> None:
+            nonlocal omitted_external_results
+            aggregate = groups.get(location)
+            if aggregate is None:
+                tracked_group = tracked_unsafe_locations if preserve_security_finding else tracked_locations
+                if location not in tracked_group:
+                    if len(tracked_group) >= _ONNX_RESULT_MAX_DISTINCT_GROUPS:
+                        omitted_external_results += 1
+                        return
+                    tracked_group.add(location)
+                aggregate = _OnnxExternalLocationAggregate()
+                groups[location] = aggregate
+            aggregate.add(tensor_name)
+
+        for tensors in _iter_model_external_data_tensor_groups(model, self.check_interrupted):
             for tensor in tensors:
-                self.check_interrupted()
-
                 if tensor.data_location != onnx.TensorProto.EXTERNAL:
                     continue
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
                 if not location:
-                    result.add_check(
-                        name="External Data Location Check",
-                        passed=False,
-                        message=f"Tensor '{tensor.name}' uses external data without location",
-                        severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"tensor": tensor.name},
-                        rule_code="S703",
-                    )
+                    missing_location.add(tensor.name)
                     continue
                 has_windows_absolute_path = _is_windows_absolute_path(location)
                 lexical_external_path = _resolve_external_location_lexically(model_dir, location)
                 external_path = _resolve_external_location(model_dir, location)
-                # CVE-2024-27318: Detect nested path traversal (e.g.
-                # "subdir/../../etc/passwd") which bypasses naive lstrip
-                # sanitization.  Check the raw location for ".." BEFORE
-                # the existence check so traversal attempts against
-                # non-existent targets are still flagged.
-                has_traversal_raw = ".." in location.replace("\\", "/").split("/")
                 lexical_in_model_dir = not has_windows_absolute_path and _is_contained_in(
                     lexical_external_path, model_dir
                 )
@@ -3335,102 +4925,31 @@ class OnnxScanner(BaseScanner):
                     not trusted_hf_cache_alias and not _is_contained_in(external_path, resolved_model_dir)
                 )
                 if symlink_escapes_model_dir:
-                    result.add_check(
-                        name="CVE-2026-34447: External Data Symlink Traversal",
-                        passed=False,
-                        message=(
-                            "CVE-2026-34447: External data path "
-                            f"'{location}' for tensor '{tensor.name}' resolves through a symlink outside "
-                            "the model directory"
-                        ),
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(lexical_external_path),
-                        details={
-                            "tensor": tensor.name,
-                            "file": location,
-                            "symlink_path": str(lexical_external_path),
-                            "resolved_path": str(external_path),
-                            "cve_id": "CVE-2026-34447",
-                            "cvss": 5.5,
-                            "cwe": "CWE-22",
-                            "description": (
-                                "ONNX external_data loading can follow symlinks that escape the model "
-                                "directory and disclose local files."
-                            ),
-                            "remediation": (
-                                "Reject external_data entries that traverse symlinks outside the model "
-                                "directory and update ONNX to a version containing the symlink traversal fix."
-                            ),
-                        },
-                        why=(
-                            "The external_data location is lexically inside the model directory, but a symlink "
-                            "component resolves outside that directory. Loading external data may read a file "
-                            "the model archive should not be able to reference."
-                        ),
+                    aggregate_location(
+                        symlink_traversal_files,
+                        location,
+                        tensor.name,
+                        preserve_security_finding=True,
                     )
                 elif has_symlink_component and not external_path.exists():
-                    missing_files.setdefault(location, []).append(tensor.name)
+                    aggregate_location(missing_files, location, tensor.name)
                 elif escapes_model_dir:
                     # Track for per-file CVE-2025-51480 (write direction) reporting
-                    traversal_files.setdefault(location, []).append(tensor.name)
-                    # Determine specific CVE attribution
-                    normalized_parts = [p for p in location.replace("\\", "/").split("/") if p]
-                    starts_with_parent = bool(normalized_parts and normalized_parts[0] == "..")
-                    if has_traversal_raw and not starts_with_parent:
-                        # Nested traversal (subdir/../../) - CVE-2024-27318
-                        cve_id = "CVE-2024-27318"
-                        cve_desc = (
-                            "ONNX external_data path contains nested "
-                            "traversal sequences that bypass naive "
-                            "sanitization (lstrip fix for CVE-2022-25882)"
-                        )
-                        cvss = 7.5
-                    else:
-                        # Direct traversal (../../) - CVE-2022-25882
-                        cve_id = "CVE-2022-25882"
-                        cve_desc = (
-                            "ONNX external_data location uses path "
-                            "traversal to access files outside the "
-                            "model directory"
-                        )
-                        cvss = 7.5
-                    result.add_check(
-                        name=f"{cve_id}: External Data Path Traversal",
-                        passed=False,
-                        message=(
-                            f"{cve_id}: External data path traversal "
-                            f"for tensor '{tensor.name}' - path "
-                            f"'{location}' resolves outside model "
-                            f"directory"
-                        ),
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(external_path),
-                        details={
-                            "tensor": tensor.name,
-                            "file": location,
-                            "cve_id": cve_id,
-                            "cvss": cvss,
-                            "cwe": "CWE-22",
-                            "description": cve_desc,
-                            "remediation": (
-                                "Validate that external_data paths do "
-                                "not contain '..' or resolve outside "
-                                "the model directory before loading. "
-                                "Update to ONNX >= 1.16.0."
-                            ),
-                        },
-                        why=(
-                            f"This ONNX model references external data "
-                            f"via path '{location}' which contains "
-                            f"directory traversal sequences. An "
-                            f"attacker can craft an ONNX model that "
-                            f"reads arbitrary files ({cve_id})."
-                        ),
+                    aggregate_location(
+                        traversal_files,
+                        location,
+                        tensor.name,
+                        preserve_security_finding=True,
                     )
                 elif not external_path.exists():
-                    missing_files.setdefault(location, []).append(tensor.name)
+                    aggregate_location(missing_files, location, tensor.name)
                 else:
-                    if location not in safe_files:
+                    if location not in safe_files and location not in tracked_locations:
+                        if len(tracked_locations) >= _ONNX_RESULT_MAX_DISTINCT_GROUPS:
+                            omitted_external_results += 1
+                        else:
+                            tracked_locations.add(location)
+                    if location in tracked_locations and location not in safe_files:
                         safe_files.add(location)
                         result.add_check(
                             name="External Data Reference Check",
@@ -3440,45 +4959,159 @@ class OnnxScanner(BaseScanner):
                             location=str(external_path),
                             details={"file": location},
                         )
-                    self._validate_external_size(tensor, info, external_path, result)
+                    validation = self._validate_external_size(tensor, info, external_path, result)
+                    validation_group = external_size_validations.get(validation.category)
+                    if validation_group is None:
+                        validation_group = (validation, _OnnxExternalLocationAggregate())
+                        external_size_validations[validation.category] = validation_group
+                    validation_group[1].add(tensor.name)
+
+        for validation, aggregate in external_size_validations.values():
+            result.add_check(
+                name="External Data Size Validation",
+                passed=validation.passed,
+                message=validation.message,
+                severity=validation.severity,
+                location=validation.location,
+                rule_code=validation.rule_code,
+                details={
+                    **validation.details,
+                    "affected_tensor_count": aggregate.occurrence_count,
+                    "sample_tensors": aggregate.tensor_samples,
+                },
+            )
+
+        if missing_location.occurrence_count:
+            result.add_check(
+                name="External Data Location Check",
+                passed=False,
+                message=(f"{missing_location.occurrence_count} tensor(s) use external data without a location"),
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={
+                    "affected_tensor_count": missing_location.occurrence_count,
+                    "sample_tensors": missing_location.tensor_samples,
+                },
+                rule_code="S703",
+            )
+
+        for location, aggregate in symlink_traversal_files.items():
+            lexical_external_path = _resolve_external_location_lexically(model_dir, location)
+            external_path = _resolve_external_location(model_dir, location)
+            result.add_check(
+                name="CVE-2026-34447: External Data Symlink Traversal",
+                passed=False,
+                message=(
+                    f"CVE-2026-34447: External data path '{location}' for "
+                    f"{aggregate.occurrence_count} tensor(s) resolves through a symlink outside the model directory"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=str(lexical_external_path),
+                details={
+                    "tensor": aggregate.tensor_samples[0],
+                    "file": location,
+                    "affected_tensor_count": aggregate.occurrence_count,
+                    "sample_tensors": aggregate.tensor_samples,
+                    "symlink_path": str(lexical_external_path),
+                    "resolved_path": str(external_path),
+                    "cve_id": "CVE-2026-34447",
+                    "cvss": 5.5,
+                    "cwe": "CWE-22",
+                    "description": (
+                        "ONNX external_data loading can follow symlinks that escape the model directory "
+                        "and disclose local files."
+                    ),
+                    "remediation": (
+                        "Reject external_data entries that traverse symlinks outside the model directory "
+                        "and update ONNX to a version containing the symlink traversal fix."
+                    ),
+                },
+                why=(
+                    "The external_data location is lexically inside the model directory, but a symlink component "
+                    "resolves outside that directory. Loading external data may read a file the model archive "
+                    "should not be able to reference."
+                ),
+            )
 
         # Report missing files once per file (not per tensor)
-        for location, tensors in missing_files.items():
+        for location, aggregate in missing_files.items():
             external_path = _resolve_external_location(model_dir, location)
             result.add_check(
                 name="External Data Reference Check",
                 passed=False,
                 message=(
                     f"External data reference found (file may not be present): '{location}' "
-                    f"({len(tensors)} tensor{'s' if len(tensors) != 1 else ''} affected)"
+                    f"({aggregate.occurrence_count} tensor"
+                    f"{'s' if aggregate.occurrence_count != 1 else ''} affected)"
                 ),
                 severity=IssueSeverity.WARNING,
                 location=str(external_path),
                 details={
+                    "tensor": aggregate.tensor_samples[0],
                     "file": location,
-                    "affected_tensor_count": len(tensors),
-                    "sample_tensors": tensors[:5],
+                    "affected_tensor_count": aggregate.occurrence_count,
+                    "sample_tensors": aggregate.tensor_samples,
                 },
             )
 
         # Path traversal is a genuine security issue -- keep CRITICAL
-        for location, tensors in traversal_files.items():
+        for location, aggregate in traversal_files.items():
             external_path = _resolve_external_location(model_dir, location)
+            normalized_parts = [part for part in location.replace("\\", "/").split("/") if part]
+            starts_with_parent = bool(normalized_parts and normalized_parts[0] == "..")
+            has_traversal_raw = ".." in normalized_parts
+            if has_traversal_raw and not starts_with_parent:
+                cve_id = "CVE-2024-27318"
+                cve_desc = (
+                    "ONNX external_data path contains nested traversal sequences that bypass naive "
+                    "sanitization (lstrip fix for CVE-2022-25882)"
+                )
+            else:
+                cve_id = "CVE-2022-25882"
+                cve_desc = "ONNX external_data location uses path traversal to access files outside the model directory"
+            result.add_check(
+                name=f"{cve_id}: External Data Path Traversal",
+                passed=False,
+                message=(
+                    f"{cve_id}: External data path traversal '{location}' affects "
+                    f"{aggregate.occurrence_count} tensor(s) and resolves outside the model directory"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=str(external_path),
+                details={
+                    "tensor": aggregate.tensor_samples[0],
+                    "file": location,
+                    "affected_tensor_count": aggregate.occurrence_count,
+                    "sample_tensors": aggregate.tensor_samples,
+                    "cve_id": cve_id,
+                    "cvss": 7.5,
+                    "cwe": "CWE-22",
+                    "description": cve_desc,
+                    "remediation": (
+                        "Validate that external_data paths do not contain '..' or resolve outside the model "
+                        "directory before loading. Update to ONNX >= 1.16.0."
+                    ),
+                },
+                why=(
+                    f"This ONNX model references external data via path '{location}' which escapes the model "
+                    f"directory and can read arbitrary files ({cve_id})."
+                ),
+            )
             result.add_check(
                 name="CVE-2025-51480: External Data Write Path Traversal",
                 passed=False,
                 message=(
                     f"CVE-2025-51480: External data path traversal for "
-                    f"'{location}' ({len(tensors)} tensor"
-                    f"{'s' if len(tensors) != 1 else ''} affected) can enable "
+                    f"'{location}' ({aggregate.occurrence_count} tensor"
+                    f"{'s' if aggregate.occurrence_count != 1 else ''} affected) can enable "
                     "arbitrary file overwrite when saving"
                 ),
                 severity=IssueSeverity.CRITICAL,
                 location=str(external_path),
                 details={
                     "file": location,
-                    "affected_tensor_count": len(tensors),
-                    "sample_tensors": tensors[:5],
+                    "affected_tensor_count": aggregate.occurrence_count,
+                    "sample_tensors": aggregate.tensor_samples,
                     "cve_id": "CVE-2025-51480",
                     "cvss": 8.8,
                     "cwe": "CWE-22",
@@ -3501,19 +5134,26 @@ class OnnxScanner(BaseScanner):
                 ),
             )
 
+        _mark_onnx_result_reporting_incomplete(
+            result,
+            path,
+            section="external data",
+            omitted_count=omitted_external_results,
+        )
+
     def _validate_external_size(
         self,
         tensor: Any,
         info: dict[str, str],
         external_path: Path,
         result: ScanResult,
-    ) -> None:
+    ) -> _OnnxExternalSizeValidation:
         try:
             offset = _parse_external_data_extent(info, "offset") or 0
             declared_length = _parse_external_data_extent(info, "length")
         except ValueError as e:
-            result.add_check(
-                name="External Data Size Validation",
+            return _OnnxExternalSizeValidation(
+                category="invalid_metadata",
                 passed=False,
                 message=f"External data metadata is invalid: {e}",
                 severity=IssueSeverity.CRITICAL,
@@ -3527,7 +5167,6 @@ class OnnxScanner(BaseScanner):
                     "exception_type": type(e).__name__,
                 },
             )
-            return
 
         try:
             dtype = _tensor_data_type_to_np_dtype(tensor.data_type)
@@ -3542,8 +5181,8 @@ class OnnxScanner(BaseScanner):
                 or required_end > actual_size
                 or (declared_length is not None and declared_length < expected_size)
             ):
-                result.add_check(
-                    name="External Data Size Validation",
+                return _OnnxExternalSizeValidation(
+                    category="size_mismatch",
                     passed=False,
                     message="External data file size mismatch",
                     severity=IssueSeverity.CRITICAL,
@@ -3558,23 +5197,23 @@ class OnnxScanner(BaseScanner):
                         "required_end": required_end,
                     },
                 )
-            else:
-                result.add_check(
-                    name="External Data Size Validation",
-                    passed=True,
-                    message="External data file size matches expected",
-                    location=str(external_path),
-                    details={
-                        "tensor": tensor.name,
-                        "size": actual_size,
-                        "offset": offset,
-                        "length": declared_length,
-                    },
-                )
+            return _OnnxExternalSizeValidation(
+                category="size_match",
+                passed=True,
+                message="External data file size matches expected",
+                severity=None,
+                location=str(external_path),
+                details={
+                    "tensor": tensor.name,
+                    "size": actual_size,
+                    "offset": offset,
+                    "length": declared_length,
+                },
+            )
         except Exception as e:
             _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
-            result.add_check(
-                name="External Data Size Validation",
+            return _OnnxExternalSizeValidation(
+                category="validation_incomplete",
                 passed=False,
                 message=f"Failed to validate external data size: {e}",
                 severity=IssueSeverity.INFO,
@@ -3589,6 +5228,12 @@ class OnnxScanner(BaseScanner):
             )
 
     def _check_tensor_sizes(self, model: Any, path: str, result: ScanResult) -> None:
+        valid_count = 0
+        valid_samples: list[dict[str, Any]] = []
+        truncated_count = 0
+        truncated_samples: list[dict[str, Any]] = []
+        failure_count = 0
+        failure_samples: list[dict[str, Any]] = []
         for tensor in model.graph.initializer:
             # Check for interrupts during tensor size validation
             self.check_interrupted()
@@ -3605,45 +5250,72 @@ class OnnxScanner(BaseScanner):
                     expected_size = int(num_elem) * int(dtype.itemsize)
                     actual_size = len(tensor.raw_data)
                     if actual_size < expected_size:
-                        result.add_check(
-                            name="Tensor Size Validation",
-                            passed=False,
-                            message=f"Tensor '{tensor.name}' data appears truncated",
-                            severity=IssueSeverity.INFO,
-                            location=f"{path} (tensor: {tensor.name})",
-                            rule_code="S703",
-                            details={
-                                "expected_size": expected_size,
-                                "actual_size": actual_size,
-                            },
-                        )
+                        truncated_count += 1
+                        if len(truncated_samples) < 5:
+                            truncated_samples.append(
+                                {
+                                    "tensor": tensor.name,
+                                    "expected_size": expected_size,
+                                    "actual_size": actual_size,
+                                }
+                            )
                     else:
-                        result.add_check(
-                            name="Tensor Size Validation",
-                            passed=True,
-                            message=f"Tensor '{tensor.name}' size is valid",
-                            location=f"{path} (tensor: {tensor.name})",
-                            details={
-                                "size": actual_size,
-                            },
-                            rule_code=None,  # Passing check
-                        )
+                        valid_count += 1
+                        if len(valid_samples) < 5:
+                            valid_samples.append({"tensor": tensor.name, "size": actual_size})
                 except Exception as e:
                     _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
-                    result.add_check(
-                        name="Tensor Validation",
-                        passed=False,
-                        message=f"Failed to validate tensor '{tensor.name}': {e}",
-                        severity=IssueSeverity.INFO,
-                        location=path,
-                        rule_code="S703",
-                        details={
-                            "tensor": tensor.name,
-                            "data_type": int(tensor.data_type),
-                            "exception": str(e),
-                            "exception_type": type(e).__name__,
-                        },
-                    )
+                    failure_count += 1
+                    if len(failure_samples) < 5:
+                        failure_samples.append(
+                            {
+                                "tensor": tensor.name,
+                                "data_type": int(tensor.data_type),
+                                "exception": str(e),
+                                "exception_type": type(e).__name__,
+                            }
+                        )
+
+        if truncated_count:
+            result.add_check(
+                name="Tensor Size Validation",
+                passed=False,
+                message=f"{truncated_count} ONNX tensor payload(s) appear truncated",
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S703",
+                details={
+                    "affected_tensor_count": truncated_count,
+                    "sample_tensors": truncated_samples,
+                    "samples_truncated": truncated_count > len(truncated_samples),
+                },
+            )
+        if valid_count:
+            result.add_check(
+                name="Tensor Size Validation",
+                passed=True,
+                message=f"{valid_count} ONNX tensor payload size(s) are valid",
+                location=path,
+                details={
+                    "validated_tensor_count": valid_count,
+                    "sample_tensors": valid_samples,
+                    "samples_truncated": valid_count > len(valid_samples),
+                },
+            )
+        if failure_count:
+            result.add_check(
+                name="Tensor Validation",
+                passed=False,
+                message=f"Failed to validate {failure_count} ONNX tensor(s); analysis incomplete",
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S703",
+                details={
+                    "failed_tensor_count": failure_count,
+                    "sample_failures": failure_samples,
+                    "samples_truncated": failure_count > len(failure_samples),
+                },
+            )
 
     def _check_weight_distribution(self, model: Any, path: str, result: ScanResult) -> None:
         """Run bounded semantic weight analysis over eligible ONNX initializers."""

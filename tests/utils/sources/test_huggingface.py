@@ -43,8 +43,10 @@ from modelaudit.utils.sources.huggingface import (
     _HF_CONTENT_SNIFF_MAX_FILES,
     _HF_SAFETENSORS_INDEX_MAX_FILES,
     _build_huggingface_model_info,
+    _check_hf_acquisition_interrupted,
     _detect_huggingface_content_route_format,
     _detect_huggingface_flax_msgpack_route,
+    _discover_hf_onnx_external_data_files,
     _extract_huggingface_repo_files,
     _get_huggingface_path_sizes,
     _HuggingFaceProbeBudget,
@@ -75,6 +77,26 @@ from tests.helpers import create_mock_coreml, create_mock_onnx
 from tests.helpers.file_creators import malicious_pickle_bytes, valid_jpeg_bytes, valid_png_bytes
 
 _HF_TEST_REVISION = "a" * 40
+_MINIMAL_ONNX_MODEL_PROTO = b"\x08\x08"  # Parseable ModelProto with ir_version=8 and no external data.
+
+
+def test_hf_acquisition_interrupt_check_honors_global_cancel_and_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    interrupt_checks = 0
+
+    def track_interrupt() -> None:
+        nonlocal interrupt_checks
+        interrupt_checks += 1
+
+    monkeypatch.setattr(huggingface_module, "check_interrupted", track_interrupt)
+    monkeypatch.setattr(huggingface_module.time, "monotonic", lambda: 10.0)
+
+    with pytest.raises(TimeoutError, match="acquisition timed out"):
+        _check_hf_acquisition_interrupted("test/model", 10.0)
+    assert interrupt_checks == 1
 
 
 def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
@@ -307,6 +329,76 @@ def _make_external_onnx_payload(tmp_path: Path, external_path: str = "model.onnx
     model_path = tmp_path / "fixture.onnx"
     onnx.save(helper.make_model(graph), str(model_path))
     return model_path.read_bytes()
+
+
+def test_hf_onnx_sidecar_discovery_reports_bounded_parse_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners import onnx_scanner
+
+    onnx_path = tmp_path / "model.onnx"
+    onnx_path.write_bytes(_make_external_onnx_payload(tmp_path))
+
+    def fail_bounded_discovery(*_args: Any, **_kwargs: Any) -> Any:
+        raise onnx_scanner._OnnxStructureParseError(
+            "retained_object_limit_exceeded",
+            "bounded discovery exhausted its retained-object budget",
+        )
+
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", fail_bounded_discovery)
+
+    with pytest.raises(
+        ValueError,
+        match=r"ONNX external_data coverage incomplete.*retained_object_limit_exceeded",
+    ):
+        _discover_hf_onnx_external_data_files(
+            onnx_path,
+            "model.onnx",
+            {"model.onnx", "model.onnx_data"},
+        )
+
+
+def test_hf_onnx_sidecar_discovery_checks_deadline_during_no_tensor_graph_traversal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners import onnx_scanner
+
+    onnx = pytest.importorskip("onnx")
+    onnx_path = tmp_path / "model.onnx"
+    onnx_path.write_bytes(_make_external_onnx_payload(tmp_path))
+    parsed_model = onnx.load_model_from_string(onnx_path.read_bytes())
+    parsed_model.graph.ClearField("initializer")
+    callback_invocations = 0
+
+    def check_deadline() -> None:
+        nonlocal callback_invocations
+        callback_invocations += 1
+        if callback_invocations == 2:
+            raise TimeoutError("enumeration deadline reached")
+
+    def load_without_invoking_callback(
+        _path: str,
+        _file_size: int,
+        interrupt_check: Any,
+        *,
+        expected_stat: os.stat_result,
+    ) -> Any:
+        assert interrupt_check is check_deadline
+        assert expected_stat.st_size == onnx_path.stat().st_size
+        return parsed_model, object()
+
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", load_without_invoking_callback)
+
+    with pytest.raises(TimeoutError, match="enumeration deadline reached"):
+        _discover_hf_onnx_external_data_files(
+            onnx_path,
+            "model.onnx",
+            {"model.onnx", "model.onnx_data"},
+            check_deadline,
+        )
+    assert callback_invocations == 2
 
 
 TEST_COMMIT_SHA = "a" * 40
@@ -854,7 +946,7 @@ class TestModelDownload:
         """An ONNX-only ordinary download must not inspect unrelated SafeTensors inventory."""
         download_path = tmp_path / "download"
         download_path.mkdir()
-        (download_path / "model.onnx").write_bytes(b"onnx")
+        (download_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
         mock_snapshot_download.return_value = str(download_path)
 
         result = download_model(
@@ -880,12 +972,12 @@ class TestModelDownload:
             local_path = Path(local_dir)
             assert local_path != broad_download_path
             assert not (local_path / stale.name).exists()
-            (local_path / "model.onnx").write_bytes(b"onnx")
+            (local_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
             return str(local_path)
 
         def disk_space_side_effect(path: Path, required_size: int) -> tuple[bool, str]:
             assert path != broad_download_path
-            assert required_size == 4
+            assert required_size == len(_MINIMAL_ONNX_MODEL_PROTO)
             return True, ""
 
         with (
@@ -896,7 +988,7 @@ class TestModelDownload:
             patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
             patch(
                 "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
-                return_value=({"model.onnx": 4}, _HF_TEST_REVISION),
+                return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
             ),
             patch("modelaudit.utils.sources.huggingface.check_disk_space", side_effect=disk_space_side_effect),
             patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect),
@@ -964,7 +1056,7 @@ class TestModelDownload:
         def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
             local_path = Path(local_dir)
             assert local_path != stale_snapshot
-            (local_path / "model.onnx").write_bytes(b"onnx")
+            (local_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
             return str(local_path)
 
         with (
@@ -976,7 +1068,7 @@ class TestModelDownload:
             patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
             patch(
                 "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
-                return_value=({"model.onnx": 4}, _HF_TEST_REVISION),
+                return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
             ),
             patch(
                 "modelaudit.utils.sources.huggingface.check_disk_space",
@@ -1005,14 +1097,17 @@ class TestModelDownload:
         assert {path.name for path in result.iterdir()} == {"model.onnx"}
         assert {path.name for path in other_policy_result.iterdir()} == {"model.onnx"}
         assert stale.read_bytes() == b"stale"
-        assert [call.args[1] for call in mock_check_disk_space.call_args_list] == [4, 4]
+        assert [call.args[1] for call in mock_check_disk_space.call_args_list] == [
+            len(_MINIMAL_ONNX_MODEL_PROTO),
+            len(_MINIMAL_ONNX_MODEL_PROTO),
+        ]
 
     def test_download_model_filtered_rejects_stale_selection_files(self, tmp_path: Path) -> None:
         """A reused filtered directory must fail closed if it contains an unselected file."""
 
         def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
             local_path = Path(local_dir)
-            (local_path / "model.onnx").write_bytes(b"onnx")
+            (local_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
             return str(local_path)
 
         with (
@@ -1023,7 +1118,7 @@ class TestModelDownload:
             patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
             patch(
                 "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
-                return_value=({"model.onnx": 4}, _HF_TEST_REVISION),
+                return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
             ),
             patch(
                 "modelaudit.utils.sources.huggingface.check_disk_space",
@@ -1047,7 +1142,10 @@ class TestModelDownload:
                 )
 
         assert all(call.kwargs["force_download"] is True for call in mock_snapshot_download.call_args_list)
-        assert [call.args[1] for call in mock_check_disk_space.call_args_list] == [4, 4]
+        assert [call.args[1] for call in mock_check_disk_space.call_args_list] == [
+            len(_MINIMAL_ONNX_MODEL_PROTO),
+            len(_MINIMAL_ONNX_MODEL_PROTO),
+        ]
 
     def test_download_model_filtered_onnx_includes_external_data(self, tmp_path: Path) -> None:
         """A filtered standard ONNX snapshot must materialize declared external-data companions."""
@@ -5225,10 +5323,26 @@ class TestModelDownloadStreaming:
         _mock_list_repo_files: MagicMock,
         _mock_get_extensions: MagicMock,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Previously yielded selected sidecars should not be downloaded or budgeted twice."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
         payload = _make_external_onnx_payload(tmp_path)
         sidecar_bytes = struct.pack("f", 1.0)
+        interrupt_checks = 0
+
+        def track_interrupt() -> None:
+            nonlocal interrupt_checks
+            interrupt_checks += 1
+
+        monkeypatch.setattr(huggingface_module, "check_interrupted", track_interrupt)
+        onnx = pytest.importorskip("onnx")
+        monkeypatch.setattr(
+            onnx,
+            "load",
+            lambda *_args, **_kwargs: pytest.fail("HF sidecar discovery must not preload ONNX"),
+        )
 
         def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
             assert local_dir is not None
@@ -5264,6 +5378,7 @@ class TestModelDownloadStreaming:
             "onnx/model.onnx_data",
             "onnx/model.onnx",
         ]
+        assert interrupt_checks > 0
         mock_get_paths_info.assert_called_once_with(
             "test/model",
             ["onnx/model.onnx_data", "onnx/model.onnx"],
@@ -8350,7 +8465,7 @@ class TestModelSizeAndDiskSpace:
         repo_files = ["model.onnx", "model-00000-of-00001.safetensors"]
         download_path = tmp_path / "download"
         download_path.mkdir()
-        (download_path / "model.onnx").write_bytes(b"onnx")
+        (download_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
 
         with (
             patch(
