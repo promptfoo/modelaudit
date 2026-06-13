@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- avoid CLI crashes when redirected stdout or stderr use legacy encodings that cannot represent styled separator glyphs
+- suppress canonical PyTorch tensor rebuild warnings only inside validated unloaded-runtime ZIP storage context when paired with the coordinated `modelaudit-picklescan` fix, while older allowed picklescan versions continue to fail closed with the warning
 - keep nested archive and PyTorch ZIP member hashes separate from parent artifact integrity hashes across JSON, cache, SARIF, SBOM, and streaming scans
 - suppress installed source-trusted inert Hugging Face training metadata and safe NumPy RNG-state reconstruction noise while keeping default-install, unresolved, rebound, or shadowed PyTorch ZIP framework metadata suspicious unless trusted source can be inspected
 - contextualize SafeTensors license metadata so ordinary embedded license text does not produce URL or long-value noise while preserving malformed and executable metadata detections
