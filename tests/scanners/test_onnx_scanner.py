@@ -1,3 +1,4 @@
+import json
 import os
 import struct
 import sys
@@ -18,6 +19,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
+from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import (
     ONNX_SCHEMA_INCONCLUSIVE_REASON,
@@ -30,6 +32,8 @@ from modelaudit.scanners.onnx_scanner import (
 )
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from modelaudit.utils.helpers.file_hash import compute_sha256_hash
+from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
 
 def _make_external_tensor(name: str, data_type: int, dims: list[int], external_path: str) -> Any:
@@ -43,6 +47,19 @@ def _make_external_tensor(name: str, data_type: int, dims: list[int], external_p
     entry.value = external_path
     tensor.external_data.append(entry)
     return tensor
+
+
+def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
+    schema_issues = [
+        issue
+        for issue in result.issues
+        if issue.details.get("schema_validation_reason") == ONNX_SCHEMA_INCONCLUSIVE_REASON
+        and issue.details.get("checker_available") is True
+        and issue.details.get("external_data_present") is True
+    ]
+    assert len(schema_issues) == 1
+    assert result.issues == schema_issues
+    assert result.success is False
 
 
 def create_onnx_model(
@@ -2129,6 +2146,85 @@ _PINNED_HF_ONNX_O4_FILENAME = "onnx/model_O4.onnx"
 _PINNED_HF_ONNX_MAX_BYTES = 250 * 1024 * 1024
 
 
+def create_onnx_model_with_custom_nodes(
+    tmp_path: Path,
+    custom_nodes: list[tuple[str, str, str]],
+    *,
+    filename: str = "custom_nodes.onnx",
+    include_custom_opsets: bool = True,
+) -> Path:
+    input_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    output_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    previous_output = "input"
+    nodes = []
+    for index, (domain, op_type, node_name) in enumerate(custom_nodes):
+        next_output = "output" if index == len(custom_nodes) - 1 else f"value_{index}"
+        nodes.append(helper.make_node(op_type, [previous_output], [next_output], domain=domain, name=node_name))
+        previous_output = next_output
+
+    opset_imports = [helper.make_opsetid("", 13)]
+    if include_custom_opsets:
+        opset_imports.extend(
+            helper.make_opsetid(domain, 1)
+            for domain in sorted({domain for domain, _op, _name in custom_nodes if domain})
+        )
+    graph = helper.make_graph(nodes, "custom_nodes", [input_value], [output_value])
+    model = helper.make_model(graph, opset_imports=opset_imports)
+    model.ir_version = 8
+    model_path = tmp_path / filename
+    onnx.save(model, str(model_path))
+    return model_path
+
+
+def create_onnx_model_with_explicit_custom_operator_identities(
+    tmp_path: Path,
+    custom_nodes: list[tuple[str, str, str, str]],
+    *,
+    filename: str = "explicit_custom_operator_identities.onnx",
+) -> Path:
+    input_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    output_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    previous_output = "input"
+    nodes = []
+    for index, (domain, op_type, overload, node_name) in enumerate(custom_nodes):
+        next_output = "output" if index == len(custom_nodes) - 1 else f"value_{index}"
+        node = helper.make_node(op_type, [previous_output], [next_output], domain=domain, name=node_name)
+        node.overload = overload
+        nodes.append(node)
+        previous_output = next_output
+
+    opset_imports = [helper.make_opsetid("", 13)]
+    opset_imports.extend(
+        helper.make_opsetid(domain, 13)
+        for domain in sorted({domain for domain, _op_type, _overload, _node_name in custom_nodes if domain})
+    )
+    graph = helper.make_graph(nodes, "explicit_custom_operator_identities", [input_value], [output_value])
+    model = helper.make_model(graph, opset_imports=opset_imports)
+    model.ir_version = 8
+    model_path = tmp_path / filename
+    onnx.save(model, str(model_path))
+    return model_path
+
+
+def create_onnx_model_with_repeated_custom_domain_and_missing_external_data(tmp_path: Path) -> Path:
+    input_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    output_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    weight = _make_external_tensor("W", TensorProto.FLOAT, [1], "missing-weights.bin")
+    nodes = [
+        helper.make_node("BackdoorOp", ["input", "W"], ["hidden"], domain="com.external", name="backdoor_0"),
+        helper.make_node("BackdoorOp", ["hidden", "W"], ["output"], domain="com.external", name="backdoor_1"),
+    ]
+    graph = helper.make_graph(nodes, "custom_external_data", [input_value], [output_value], initializer=[weight])
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("com.external", 1)],
+    )
+    model.ir_version = 8
+    model_path = tmp_path / "custom_external_data.onnx"
+    onnx.save(model, str(model_path))
+    return model_path
+
+
 def create_onnx_model_with_mixed_custom_domains(tmp_path: Path) -> Path:
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
     Z = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
@@ -2305,6 +2401,64 @@ def test_onnx_scanner_raw_read_failure_falls_back_to_path_parse(
     assert coverage_checks[0].details["coverage_gap"] == "file_read_failed"
 
 
+def test_directory_scan_hashes_external_data_for_content_routed_onnx_bin(tmp_path: Path) -> None:
+    model_path = create_onnx_model(tmp_path, external=True, external_path="model.onnx_data")
+    routed_model_path = tmp_path / "model.bin"
+    model_path.rename(routed_model_path)
+    sidecar_path = tmp_path / "model.onnx_data"
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert_only_onnx_external_schema_validation_skipped(result)
+    assert result.bytes_scanned == routed_model_path.stat().st_size + sidecar_path.stat().st_size
+    assert result.content_hash == compute_aggregate_hash(
+        [
+            compute_sha256_hash(routed_model_path),
+            compute_sha256_hash(sidecar_path),
+        ]
+    )
+    assert not any(check.name == "Format Validation" for check in result.checks)
+
+
+def test_directory_scan_accepts_content_routed_onnx_bin_without_format_validation(tmp_path: Path) -> None:
+    model_path = create_onnx_model(tmp_path)
+    routed_model_path = tmp_path / "model.bin"
+    model_path.rename(routed_model_path)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.success is True
+    assert "onnx" in result.scanner_names
+    assert not any(check.name == "Format Validation" for check in result.checks)
+
+
+def test_directory_scan_does_not_parse_oversized_streamed_onnx_for_sidecar_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_onnx_model(tmp_path, external=True, external_path="model.onnx_data")
+    parsed_paths: list[str] = []
+
+    def tracking_path_loader(path: str, *_args: Any, **_kwargs: Any) -> Any:
+        parsed_paths.append(path)
+        raise AssertionError("oversized ONNX must not be parsed before max_file_size rejection")
+
+    monkeypatch.setattr(onnx, "load", tracking_path_loader)
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        max_file_size=model_path.stat().st_size - 1,
+        cache_scan_results=False,
+    )
+
+    assert parsed_paths == []
+    assert result.success is False
+    assert any(
+        metadata.get("operational_error_reason") == "max_file_size_exceeded"
+        for metadata in result.file_metadata.values()
+    )
+
+
 def test_onnx_scanner_custom_op(tmp_path: Path) -> None:
     model_path = create_onnx_model(tmp_path, custom=True)
     result = OnnxScanner().scan(str(model_path))
@@ -2359,6 +2513,528 @@ def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Pat
     assert "ai.onnx.preview.training" not in metadata_custom_domains
     assert result.success is True
     assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+
+def test_onnx_scanner_repeated_custom_domain_nodes_emit_one_domain_check(tmp_path: Path) -> None:
+    domain = "com.vendor.runtime"
+    custom_nodes = [
+        *[(domain, "Attention", f"attention_{index}") for index in range(4)],
+        (domain, "BiasAttention", "bias_attention"),
+        (domain, "PackedAttention", "packed_attention"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    check = custom_domain_checks[0]
+    assert check.rule_code == "S1111"
+    assert check.severity == IssueSeverity.INFO
+    assert check.location == str(model_path)
+    assert check.details["domain"] == domain
+    assert check.details["occurrence_count"] == len(custom_nodes)
+    assert check.details["operator_samples"] == ["Attention", "BiasAttention", "PackedAttention"]
+    assert len(check.details["representative_nodes"]) == 5
+    assert check.details["representative_nodes_truncated"] is True
+    assert result.metadata["custom_domains"] == [domain]
+    assert metadata_custom_domains == [domain]
+    assert len([issue for issue in result.issues if issue.rule_code == "S1111"]) == 1
+
+
+def test_onnx_scanner_custom_domain_aggregate_reports_distinct_operator_identities(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.vendor", "KernelA", "fast", "kernel_a_fast"),
+        ("com.vendor", "KernelA", "safe", "kernel_a_safe"),
+        ("com.vendor", "KernelB", "fast", "kernel_b_fast"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    details = custom_domain_checks[0].details
+    assert details["domain"] == "com.vendor"
+    assert details["occurrence_count"] == len(custom_nodes)
+    assert details["distinct_operator_identity_count"] == len(custom_nodes)
+    assert [
+        {key: identity[key] for key in ("domain", "op_type", "overload")} for identity in details["operator_identities"]
+    ] == [
+        {"domain": "com.vendor", "op_type": "KernelA", "overload": "fast"},
+        {"domain": "com.vendor", "op_type": "KernelA", "overload": "safe"},
+        {"domain": "com.vendor", "op_type": "KernelB", "overload": "fast"},
+    ]
+    assert len({identity["operator_identity_hash"] for identity in details["operator_identities"]}) == len(custom_nodes)
+    assert details["operator_identities_truncated"] is False
+    assert details["check_consolidation_key"] == f"onnx_custom_operator_domain:{details['domain_hash']}"
+    assert metadata_custom_domains == ["com.vendor"]
+
+
+def test_onnx_scanner_custom_domain_custom_op_overloads_survive_json_and_sarif_serialization(
+    tmp_path: Path,
+) -> None:
+    custom_nodes = [
+        ("com.acme", "custom_op", "float", "acme_float"),
+        ("com.acme", "custom_op", "int", "acme_int"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_identities = [
+        {"domain": "com.acme", "op_type": "custom_op", "overload": "float"},
+        {"domain": "com.acme", "op_type": "custom_op", "overload": "int"},
+    ]
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111" and issue.get("details", {}).get("domain") == "com.acme"
+    ]
+
+    assert len(json_custom_issues) == 1
+    assert [
+        {key: identity[key] for key in ("domain", "op_type", "overload")}
+        for identity in json_custom_issues[0]["details"]["operator_identities"]
+    ] == expected_identities
+    assert len(
+        {identity["operator_identity_hash"] for identity in json_custom_issues[0]["details"]["operator_identities"]}
+    ) == len(expected_identities)
+    assert json_custom_issues[0]["details"]["distinct_operator_identity_count"] == len(expected_identities)
+    assert json_custom_issues[0]["details"]["operator_identities_truncated"] is False
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111" and item.get("properties", {}).get("domain") == "com.acme"
+    ]
+
+    assert len(sarif_results) == 1
+    assert [
+        {key: identity[key] for key in ("domain", "op_type", "overload")}
+        for identity in sarif_results[0]["properties"]["operator_identities"]
+    ] == expected_identities
+    assert sarif_results[0]["properties"]["distinct_operator_identity_count"] == len(expected_identities)
+
+
+def test_onnx_scanner_repeated_custom_domains_emit_one_check_per_domain(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.vendor.alpha", "Attention", "attention_0"),
+        ("com.vendor.alpha", "Attention", "attention_1"),
+        ("com.attacker", "BackdoorOp", "backdoor_0"),
+        ("com.attacker", "BackdoorOp", "backdoor_1"),
+        ("ai.onnx.ml.malicious", "BackdoorOp", "lookalike"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    checks_by_domain = {check.details["domain"]: check for check in custom_domain_checks}
+    assert sorted(checks_by_domain) == ["ai.onnx.ml.malicious", "com.attacker", "com.vendor.alpha"]
+    assert checks_by_domain["com.vendor.alpha"].details["occurrence_count"] == 2
+    assert checks_by_domain["com.attacker"].details["occurrence_count"] == 2
+    assert checks_by_domain["ai.onnx.ml.malicious"].details["occurrence_count"] == 1
+    assert metadata_custom_domains == ["ai.onnx.ml.malicious", "com.attacker", "com.vendor.alpha"]
+
+
+def test_onnx_scanner_custom_domains_survive_core_check_consolidation(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.vendor.alpha", "Attention", "attention_0"),
+        ("com.attacker", "BackdoorOp", "backdoor_0"),
+        ("ai.onnx.ml.malicious", "BackdoorOp", "lookalike"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    custom_checks = [
+        check
+        for check in result.checks
+        if check.name == "Custom Operator Domain Check" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_domain = {check.details["domain"]: check for check in custom_checks}
+
+    assert sorted(checks_by_domain) == ["ai.onnx.ml.malicious", "com.attacker", "com.vendor.alpha"]
+    assert len({check.details["check_consolidation_key"] for check in custom_checks}) == len(custom_nodes)
+    assert all(
+        check.details["check_consolidation_key"] == f"onnx_custom_operator_domain:{check.details['domain_hash']}"
+        for check in custom_checks
+    )
+    assert {
+        issue.details["domain"]
+        for issue in result.issues
+        if issue.rule_code == "S1111" and issue.details.get("type") != "python_operator"
+    } == set(checks_by_domain)
+
+
+def test_onnx_scanner_long_custom_domain_operator_identities_use_raw_hashes(
+    tmp_path: Path,
+) -> None:
+    shared_display_prefix = "Kernel" + ("A" * 280)
+    custom_nodes = [
+        ("com.vendor", f"{shared_display_prefix}_one", "", "long_one"),
+        ("com.vendor", f"{shared_display_prefix}_two", "", "long_two"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111" and issue.get("details", {}).get("domain") == "com.vendor"
+    ]
+
+    assert len(json_custom_issues) == 1
+    identities = json_custom_issues[0]["details"]["operator_identities"]
+    assert json_custom_issues[0]["details"]["distinct_operator_identity_count"] == len(custom_nodes)
+    assert json_custom_issues[0]["details"]["operator_identities_truncated"] is False
+    assert len(identities) == len(custom_nodes)
+    assert len({identity["op_type"] for identity in identities}) == 1
+    assert len({identity["operator_identity_hash"] for identity in identities}) == len(custom_nodes)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111" and item.get("properties", {}).get("domain") == "com.vendor"
+    ]
+
+    assert len(sarif_results) == 1
+    assert sarif_results[0]["properties"]["distinct_operator_identity_count"] == len(custom_nodes)
+    assert len(
+        {identity["operator_identity_hash"] for identity in sarif_results[0]["properties"]["operator_identities"]}
+    ) == len(custom_nodes)
+
+
+def test_onnx_scanner_long_custom_domains_survive_core_check_and_issue_dedup(
+    tmp_path: Path,
+) -> None:
+    shared_domain_prefix = "com." + ("a" * 280)
+    custom_nodes = [
+        (f"{shared_domain_prefix}.one", "KernelA", "long_domain_one"),
+        (f"{shared_domain_prefix}.two", "KernelB", "long_domain_two"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_domains = {domain for domain, _op_type, _node_name in custom_nodes}
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111"
+        and issue.get("details", {}).get("domain", "").startswith(shared_domain_prefix)
+    ]
+    json_custom_checks = [
+        check
+        for check in json_payload["checks"]
+        if check.get("rule_code") == "S1111"
+        and check.get("details", {}).get("domain", "").startswith(shared_domain_prefix)
+    ]
+
+    assert {issue["details"]["domain"] for issue in json_custom_issues} == expected_domains
+    assert {check["details"]["domain"] for check in json_custom_checks} == expected_domains
+    assert len({issue["message"] for issue in json_custom_issues}) == len(expected_domains)
+    assert len({check["details"]["domain_hash"] for check in json_custom_checks}) == len(expected_domains)
+    assert len({check["details"]["check_consolidation_key"] for check in json_custom_checks}) == len(expected_domains)
+    assert all(
+        check["details"]["check_consolidation_key"] == f"onnx_custom_operator_domain:{check['details']['domain_hash']}"
+        for check in json_custom_checks
+    )
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111" and item.get("properties", {}).get("domain", "").startswith(shared_domain_prefix)
+    ]
+
+    assert {item["properties"]["domain"] for item in sarif_results} == expected_domains
+    assert len({item["properties"]["domain_hash"] for item in sarif_results}) == len(expected_domains)
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
+        expected_domains
+    )
+
+
+def test_onnx_scanner_repeated_custom_domain_without_opset_import_still_flagged(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.malformed", "BackdoorOp", "backdoor_0"),
+        ("com.malformed", "BackdoorOp", "backdoor_1"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(
+        tmp_path,
+        custom_nodes,
+        include_custom_opsets=False,
+    )
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].details["domain"] == "com.malformed"
+    assert custom_domain_checks[0].details["occurrence_count"] == 2
+    assert metadata_custom_domains == ["com.malformed"]
+
+
+def test_onnx_scanner_custom_domain_dedup_preserves_external_data_findings(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_repeated_custom_domain_and_missing_external_data(tmp_path)
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].details["domain"] == "com.external"
+    assert custom_domain_checks[0].details["occurrence_count"] == 2
+    assert metadata_custom_domains == ["com.external"]
+    missing_external_checks = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status == CheckStatus.FAILED
+    ]
+    assert missing_external_checks
+
+
+def test_onnx_scanner_custom_domain_dedup_preserves_python_operator_detection(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.attacker", "BackdoorOp", "backdoor_0"),
+        ("com.attacker", "BackdoorOp", "backdoor_1"),
+        ("com.attacker", "PyOp", "evil_pyop"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert result.success is False
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].details["domain"] == "com.attacker"
+    assert custom_domain_checks[0].details["occurrence_count"] == 3
+    assert metadata_custom_domains == ["com.attacker"]
+    python_operator_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Operator Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_operator_checks) == 1
+    assert python_operator_checks[0].severity == IssueSeverity.CRITICAL
+    assert python_operator_checks[0].details["op_type"] == "PyOp"
+
+
+def test_onnx_scanner_custom_domain_dedup_preserves_multi_file_evidence(tmp_path: Path) -> None:
+    create_onnx_model_with_custom_nodes(
+        tmp_path,
+        [("com.shared", "BackdoorOp", "first_0"), ("com.shared", "BackdoorOp", "first_1")],
+        filename="first.onnx",
+    )
+    create_onnx_model_with_custom_nodes(
+        tmp_path,
+        [("com.shared", "BackdoorOp", "second_0"), ("com.shared", "BackdoorOp", "second_1")],
+        filename="second.onnx",
+    )
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        recursive=False,
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    custom_checks = [
+        check
+        for check in result.checks
+        if check.name == "Custom Operator Domain Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("domain") == "com.shared"
+    ]
+    assert len(custom_checks) == 2
+    assert {Path(str(check.location)).name for check in custom_checks} == {"first.onnx", "second.onnx"}
+    assert all(check.details["occurrence_count"] == 2 for check in custom_checks)
+
+
+def test_onnx_scanner_explicit_custom_op_identity_survives_json_and_sarif_serialization(
+    tmp_path: Path,
+) -> None:
+    custom_nodes = [
+        ("", "custom_op", "float", "default_float"),
+        ("", "custom_op", "int", "default_int"),
+        ("ai.onnx", "custom_op", "float", "ai_onnx_float"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_identities = {
+        ("", "custom_op", "float"),
+        ("", "custom_op", "int"),
+        ("ai.onnx", "custom_op", "float"),
+    }
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111"
+        and issue.get("details", {}).get("operator_identity", {}).get("op_type") == "custom_op"
+    ]
+
+    assert len(json_custom_issues) == len(expected_identities)
+    assert {
+        (
+            issue["details"]["operator_identity"]["domain"],
+            issue["details"]["operator_identity"]["op_type"],
+            issue["details"]["operator_identity"]["overload"],
+        )
+        for issue in json_custom_issues
+    } == expected_identities
+    assert len({issue["message"] for issue in json_custom_issues}) == len(expected_identities)
+    assert all(issue["location"] == str(model_path) for issue in json_custom_issues)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [item for item in sarif_payload["runs"][0]["results"] if item["ruleId"] == "S1111"]
+
+    assert len(sarif_results) == len(expected_identities)
+    assert {item["message"]["text"] for item in sarif_results} == {issue["message"] for issue in json_custom_issues}
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
+        expected_identities
+    )
+    assert {
+        (
+            item["properties"]["operator_identity"]["domain"],
+            item["properties"]["operator_identity"]["op_type"],
+            item["properties"]["operator_identity"]["overload"],
+        )
+        for item in sarif_results
+    } == expected_identities
+
+
+def test_onnx_scanner_long_explicit_custom_op_names_survive_json_and_sarif_dedup(
+    tmp_path: Path,
+) -> None:
+    shared_display_prefix = "custom_op_" + ("a" * 280)
+    custom_nodes = [
+        ("", f"{shared_display_prefix}_float", "", "long_float"),
+        ("", f"{shared_display_prefix}_int", "", "long_int"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111"
+        and issue.get("details", {}).get("operator_identity", {}).get("op_type", "").startswith(shared_display_prefix)
+    ]
+
+    assert len(json_custom_issues) == len(custom_nodes)
+    assert {issue["details"]["operator_identity"]["op_type"] for issue in json_custom_issues} == {
+        op_type for _domain, op_type, _overload, _node_name in custom_nodes
+    }
+    assert len({issue["details"]["operator_identity_hash"] for issue in json_custom_issues}) == len(custom_nodes)
+    assert len({issue["message"] for issue in json_custom_issues}) == len(custom_nodes)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111"
+        and item.get("properties", {}).get("operator_identity", {}).get("op_type", "").startswith(shared_display_prefix)
+    ]
+
+    assert len(sarif_results) == len(custom_nodes)
+    assert len({item["properties"]["operator_identity_hash"] for item in sarif_results}) == len(custom_nodes)
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(custom_nodes)
+
+
+def test_onnx_scanner_custom_operator_identity_hash_length_frames_nul_values(
+    tmp_path: Path,
+) -> None:
+    custom_nodes = [
+        ("", "custom_op\0x", "", "nul_in_op_type"),
+        ("", "custom_op", "x\0", "nul_in_overload"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_identities = {
+        ("", "custom_op\0x", ""),
+        ("", "custom_op", "x\0"),
+    }
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111" and "operator_identity_hash" in issue.get("details", {})
+    ]
+
+    assert len(json_custom_issues) == len(expected_identities)
+    assert {
+        (
+            issue["details"]["operator_identity"]["domain"],
+            issue["details"]["operator_identity"]["op_type"],
+            issue["details"]["operator_identity"]["overload"],
+        )
+        for issue in json_custom_issues
+    } == expected_identities
+    assert len({issue["details"]["operator_identity_hash"] for issue in json_custom_issues}) == len(expected_identities)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111" and "operator_identity_hash" in item.get("properties", {})
+    ]
+
+    assert len(sarif_results) == len(expected_identities)
+    assert len({item["properties"]["operator_identity_hash"] for item in sarif_results}) == len(expected_identities)
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
+        expected_identities
+    )
 
 
 @pytest.mark.parametrize("op_type", ["FastGelu", "SkipLayerNormalization"])
@@ -4043,6 +4719,36 @@ class TestCVE202551480SavePathTraversal:
 class TestCVE202634447SymlinkTraversal:
     """Tests for CVE-2026-34447: ONNX external_data symlink traversal."""
 
+    def _create_hf_cache_snapshot_model(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        model_name: str = "model.onnx",
+        sidecar_target: Path | None = None,
+    ) -> Path:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+        blobs_dir.mkdir(parents=True)
+        snapshot_dir.mkdir(parents=True)
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        source_model = create_onnx_model(source_dir, external=True, external_path="model.onnx_data")
+        model_blob = blobs_dir / "model-blob"
+        sidecar_blob = blobs_dir / "sidecar-blob"
+        model_blob.write_bytes(source_model.read_bytes())
+        sidecar_blob.write_bytes((source_dir / "model.onnx_data").read_bytes())
+
+        model_path = snapshot_dir / model_name
+        sidecar_path = snapshot_dir / "model.onnx_data"
+        model_path.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+        sidecar_path.symlink_to(os.path.relpath(sidecar_target or sidecar_blob, snapshot_dir))
+        return model_path
+
     def test_symlink_escape_detected(self, tmp_path: Path, requires_symlinks: None) -> None:
         outside_dir = tmp_path.parent / f"{tmp_path.name}_outside"
         outside_dir.mkdir(parents=True, exist_ok=True)
@@ -4070,6 +4776,275 @@ class TestCVE202634447SymlinkTraversal:
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2022-25882"]
+
+    def test_huggingface_cache_snapshot_sidecar_symlink_to_blob_not_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        model_path = self._create_hf_cache_snapshot_model(tmp_path, monkeypatch)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        missing_checks = [
+            c for c in result.checks if c.name == "External Data Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        resolved_checks = [
+            c
+            for c in result.checks
+            if c.name == "External Data Reference Check"
+            and c.status == CheckStatus.PASSED
+            and c.details.get("file") == "model.onnx_data"
+        ]
+        assert_only_onnx_external_schema_validation_skipped(result)
+        assert missing_checks == []
+        assert len(resolved_checks) == 1
+        assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+
+    def test_huggingface_cache_snapshot_content_routed_onnx_bin_uses_alias_sidecar_context(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        model_path = self._create_hf_cache_snapshot_model(tmp_path, monkeypatch, model_name="model.bin")
+        sidecar_path = model_path.parent / "model.onnx_data"
+
+        result = scan_model_directory_or_file(str(model_path.parent), cache_scan_results=False)
+
+        resolved_checks = [
+            c
+            for c in result.checks
+            if c.name == "External Data Reference Check"
+            and c.status == CheckStatus.PASSED
+            and c.details.get("file") == "model.onnx_data"
+        ]
+        assert len(resolved_checks) == 1
+        assert_only_onnx_external_schema_validation_skipped(result)
+        assert result.bytes_scanned == model_path.stat().st_size + sidecar_path.stat().st_size
+        assert result.content_hash == compute_aggregate_hash(
+            [
+                compute_sha256_hash(model_path),
+                compute_sha256_hash(sidecar_path),
+            ]
+        )
+        assert not any(check.name == "Format Validation" for check in result.checks)
+        assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+
+    def test_huggingface_cache_snapshot_regular_model_with_sidecar_symlink_to_blob_still_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+        blobs_dir.mkdir(parents=True)
+        snapshot_dir.mkdir(parents=True)
+
+        source_dir = tmp_path / "source-regular-model"
+        source_dir.mkdir()
+        source_model = create_onnx_model(source_dir, external=True, external_path="model.onnx_data")
+        sidecar_blob = blobs_dir / "sidecar-blob"
+        sidecar_blob.write_bytes((source_dir / "model.onnx_data").read_bytes())
+        model_path = snapshot_dir / "model.onnx"
+        model_path.write_bytes(source_model.read_bytes())
+        (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+        assert result.success is False
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["resolved_path"] == str(sidecar_blob.resolve())
+
+    def test_huggingface_cache_snapshot_sidecar_symlink_outside_blob_still_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        outside_dir = tmp_path.parent / f"{tmp_path.name}_outside_hf"
+        outside_dir.mkdir(parents=True, exist_ok=True)
+        outside_weights = outside_dir / "weights.bin"
+        outside_weights.write_bytes(struct.pack("f", 1.0))
+        model_path = self._create_hf_cache_snapshot_model(
+            tmp_path,
+            monkeypatch,
+            sidecar_target=outside_weights,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+        assert result.success is False
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["resolved_path"] == str(outside_weights.resolve())
+        assert not [
+            c for c in result.checks if c.name == "External Data Reference Check" and c.status == CheckStatus.FAILED
+        ]
+
+    def test_huggingface_cache_snapshot_directory_symlink_to_blob_still_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+        blobs_dir.mkdir(parents=True)
+        snapshot_dir.mkdir(parents=True)
+
+        source_dir = tmp_path / "source-dir-symlink"
+        source_dir.mkdir()
+        source_model = create_onnx_model(source_dir, external=True, external_path="nested/model.onnx_data")
+        model_blob = blobs_dir / "model-dir-symlink-blob"
+        sidecar_blob = blobs_dir / "model.onnx_data"
+        model_blob.write_bytes(source_model.read_bytes())
+        sidecar_blob.write_bytes((source_dir / "nested" / "model.onnx_data").read_bytes())
+
+        model_path = snapshot_dir / "model.onnx"
+        model_path.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+        (snapshot_dir / "nested").symlink_to(os.path.relpath(blobs_dir, snapshot_dir))
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+        assert result.success is False
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["file"] == "nested/model.onnx_data"
+        assert cve_checks[0].details["resolved_path"] == str(sidecar_blob.resolve())
+
+    def test_huggingface_cache_snapshot_malicious_external_data_traversal_still_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+        blobs_dir.mkdir(parents=True)
+        snapshot_dir.mkdir(parents=True)
+
+        source_dir = tmp_path / "source-malicious"
+        source_dir.mkdir()
+        source_model = create_onnx_model(
+            source_dir,
+            external=True,
+            external_path="../secret.bin",
+            missing_external=True,
+        )
+        model_blob = blobs_dir / "model-traversal-blob"
+        model_blob.write_bytes(source_model.read_bytes())
+        model_path = snapshot_dir / "model.onnx"
+        model_path.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+
+        result = OnnxScanner().scan(str(model_path))
+
+        traversal_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2022-25882"]
+        assert result.success is False
+        assert len(traversal_checks) == 1
+        assert traversal_checks[0].details["file"] == "../secret.bin"
+
+    def test_huggingface_cache_non_snapshot_sidecar_symlink_to_blob_still_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        work_dir = cache_root / "scratch" / "onnx"
+        blobs_dir.mkdir(parents=True)
+        work_dir.mkdir(parents=True)
+
+        source_model = create_onnx_model(work_dir, external=True, external_path="model.onnx_data")
+        sidecar_blob = blobs_dir / "sidecar-blob"
+        sidecar_blob.write_bytes((work_dir / "model.onnx_data").read_bytes())
+        (work_dir / "model.onnx_data").unlink()
+        (work_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, work_dir))
+
+        result = OnnxScanner().scan(str(source_model))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+        assert result.success is False
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["resolved_path"] == str(sidecar_blob.resolve())
+
+    def test_huggingface_cache_nested_fake_snapshot_sidecar_symlink_to_blob_still_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        fake_snapshot_dir = cache_root / "scratch" / cache_root.name / "snapshots" / ("a" * 40) / "onnx"
+        blobs_dir.mkdir(parents=True)
+        fake_snapshot_dir.mkdir(parents=True)
+
+        source_model = create_onnx_model(fake_snapshot_dir, external=True, external_path="model.onnx_data")
+        sidecar_blob = blobs_dir / "sidecar-blob"
+        sidecar_blob.write_bytes((fake_snapshot_dir / "model.onnx_data").read_bytes())
+        (fake_snapshot_dir / "model.onnx_data").unlink()
+        (fake_snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, fake_snapshot_dir))
+
+        result = OnnxScanner().scan(str(source_model))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+        assert result.success is False
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["symlink_path"] == str(fake_snapshot_dir / "model.onnx_data")
+        assert cve_checks[0].details["resolved_path"] == str(sidecar_blob.resolve())
+
+    def test_huggingface_cache_non_snapshot_sidecar_hardlink_to_blob_is_not_symlink_traversal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        work_dir = cache_root / "scratch-hardlink" / "onnx"
+        blobs_dir.mkdir(parents=True)
+        work_dir.mkdir(parents=True)
+
+        source_model = create_onnx_model(work_dir, external=True, external_path="model.onnx_data")
+        sidecar_blob = blobs_dir / "sidecar-blob"
+        sidecar_blob.write_bytes((work_dir / "model.onnx_data").read_bytes())
+        (work_dir / "model.onnx_data").unlink()
+        try:
+            os.link(sidecar_blob, work_dir / "model.onnx_data")
+        except OSError as exc:
+            pytest.skip(f"hardlink creation unavailable: {exc}")
+
+        result = OnnxScanner().scan(str(source_model))
+
+        resolved_checks = [
+            c
+            for c in result.checks
+            if c.name == "External Data Reference Check"
+            and c.status == CheckStatus.PASSED
+            and c.details.get("file") == "model.onnx_data"
+        ]
+        assert_only_onnx_external_schema_validation_skipped(result)
+        assert len(resolved_checks) == 1
+        assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
 
     def test_symlink_inside_model_dir_not_flagged(self, tmp_path: Path, requires_symlinks: None) -> None:
         safe_weights = tmp_path / "safe_payload.bin"

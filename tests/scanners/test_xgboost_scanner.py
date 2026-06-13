@@ -1746,6 +1746,7 @@ class TestXGBoostFailClosedEndToEnd:
             check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in direct.checks
         )
         assert directory.success is True
+        assert "scan_outcome" not in directory.file_metadata[str(model_file)].model_dump(exclude_none=True)
         assert determine_exit_code(directory) == 1
         assert "xgboost" in directory.scanner_names
         assert any("System call in JSON" in str(issue.message) for issue in directory.issues)

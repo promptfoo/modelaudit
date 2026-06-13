@@ -1854,7 +1854,7 @@ def test_manifest_scanner_inconclusive_parse_preserves_security_exit(tmp_path: P
         blacklist_patterns=["unsafe"],
         cache_scan_results=False,
     )
-    assert aggregate.success is True
+    assert aggregate.success is False
     assert determine_exit_code(aggregate) == 1
 
 

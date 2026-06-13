@@ -161,6 +161,31 @@ def scan_result_has_inconclusive_outcome(scan_result: "ScanResult") -> bool:
     return scan_result.metadata.get(SCAN_OUTCOME_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME
 
 
+def _record_field(record: Any, field: str) -> Any:
+    if isinstance(record, Mapping):
+        return record.get(field)
+    return getattr(record, field, None)
+
+
+def _normalized_record_value(value: Any) -> str | None:
+    raw_value = getattr(value, "value", value)
+    if not isinstance(raw_value, str):
+        return None
+    return raw_value.lower().split(".", 1)[-1]
+
+
+def _record_is_failed_security_check(record: Any) -> bool:
+    return _normalized_record_value(_record_field(record, "status")) == "failed" and _normalized_record_value(
+        _record_field(record, "severity")
+    ) in {"warning", "critical"}
+
+
+def _scan_result_has_security_findings(scan_result: "ScanResult") -> bool:
+    if scan_result.has_errors or scan_result.has_warnings:
+        return True
+    return any(_record_is_failed_security_check(check) for check in scan_result.checks)
+
+
 def mark_inconclusive_scan_result(scan_result: "ScanResult", reason: str) -> None:
     """Mark a scan result as inconclusive while preserving existing reasons."""
     scan_result.metadata["analysis_incomplete"] = True
@@ -185,6 +210,8 @@ def normalize_unclassified_scan_failure(scan_result: "ScanResult") -> None:
     if bool(scan_result.metadata.get(OPERATIONAL_ERROR_METADATA_KEY)):
         return
     if scan_result_has_inconclusive_outcome(scan_result):
+        return
+    if _scan_result_has_security_findings(scan_result):
         return
     mark_inconclusive_scan_result(scan_result, UNCLASSIFIED_SCAN_FAILURE_REASON)
 

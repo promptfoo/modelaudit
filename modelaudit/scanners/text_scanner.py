@@ -1,7 +1,7 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
 import ast
-import bisect
+import hashlib
 import io
 import keyword
 import os
@@ -9,9 +9,12 @@ import re
 import token
 import tokenize
 from typing import Any, ClassVar
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
+from modelaudit.detectors.network_comm import redact_url_for_finding
+from modelaudit.detectors.secrets import SecretsDetector
+from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FILENAMES
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
@@ -22,7 +25,6 @@ TEXT_CONTENT_SECURITY_FINDING_LIMIT_REASON = "text_content_security_finding_limi
 TEXT_CONTENT_SECURITY_CLASSIFICATION_LIMIT_REASON = "text_content_security_classification_limit"
 DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
 DEFAULT_TEXT_CONTENT_SECURITY_MAX_FINDINGS = 1024
-DOCUMENTATION_NETWORK_REPORTING_MAX_FINDINGS = 24
 DETECTOR_FINDING_LIMIT_TYPE = "detector_finding_limit"
 FSTRING_MIDDLE_TOKEN_TYPE = getattr(token, "FSTRING_MIDDLE", None)
 DOCUMENTATION_TEXT_FILENAMES = frozenset(
@@ -52,48 +54,43 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
         "url_detected",
     }
 )
-DOCUMENTATION_FENCED_LOOPBACK_API_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
-DOCUMENTATION_FENCED_LOOPBACK_API_PORTS = frozenset({80, 443, 8000, 8080})
-DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_SUFFIXES = (".gif", ".jpeg", ".jpg", ".png", ".webp")
-DOCUMENTATION_LOCAL_FILE_TOKEN_SUFFIXES = (
-    b".aac",
-    b".flac",
-    b".gif",
-    b".jpeg",
-    b".jpg",
-    b".json",
-    b".m4a",
-    b".mp3",
-    b".ogg",
-    b".png",
-    b".txt",
-    b".wav",
-    b".webp",
-)
-DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_HOSTS = frozenset(
-    {
-        "cdn-media.huggingface.co",
-        "images.cocodataset.org",
-        "qianwen-res.oss-cn-beijing.aliyuncs.com",
-    }
-)
-DOCUMENTATION_FENCED_PASSIVE_NETWORK_FINDING_TYPES = PASSIVE_NETWORK_FINDING_TYPES | {
-    "network_function",
-    "network_library",
-    "suspicious_port",
+CORRELATABLE_DOCUMENTATION_NETWORK_FINDING_TYPES = PASSIVE_NETWORK_FINDING_TYPES | frozenset({"network_command"})
+DOCUMENTATION_NETWORK_EVIDENCE_TRAILING_DELIMITERS = ".,;:)]}'\"`>"
+DOCUMENTATION_NETWORK_EVIDENCE_LEADING_DELIMITERS = "<([{'\"`"
+DOCUMENTATION_NETWORK_URL_BOUNDARY_BYTES = b" \t\r\n\"'<>`"
+DOCUMENTATION_NETWORK_URL_MAX_SCHEME_BYTES = 32
+DOCUMENTATION_NETWORK_DESTINATION_TOKEN_PATTERN = re.compile(rb"[^\s;&|#]+")
+DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK = {
+    "DEBUG": 0,
+    "INFO": 1,
+    "LOW": 1,
+    "MEDIUM": 2,
+    "WARNING": 2,
+    "HIGH": 3,
+    "CRITICAL": 3,
 }
-PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
+DOCUMENTATION_NETWORK_FINDING_PRIORITY = {
+    "network_command": 40,
+    "cloud_storage_url": 30,
+    "url_detected": 20,
+    "ipv4_address": 10,
+    "ipv6_address": 10,
+    "domain_name": 0,
+    "domain": 0,
+}
+PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt", "merges.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
-TOKENIZER_VOCABULARY_FILENAMES = frozenset(
-    {
-        "tokenizer.txt",
-        "tokenizer_vocab.txt",
-        "tokenizer-vocab.txt",
-        "tokens.txt",
-        "vocab.txt",
-        "vocabulary.txt",
-    }
+PASSIVE_DATA_SECRET_TYPES = frozenset({"Basic Auth Credentials", "Bearer Token"})
+PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN = re.compile(
+    rb"^[ \t]*basic[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{2,8192}={0,2})[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE,
 )
+PASSIVE_DATA_BEARER_AUTH_LINE_PATTERN = re.compile(
+    rb"^[ \t]*bearer[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{20,8192}={0,2})[ \t]*\r?$",
+    re.IGNORECASE,
+)
+PASSIVE_DATA_BEARER_TOKEN_MARKER_BYTES = b"0123456789._~+/-"
+TOKENIZER_VOCABULARY_FILENAMES = frozenset(TOKENIZER_VOCABULARY_CONTENT_FILENAMES)
 TOKENIZER_VOCABULARY_PREFIXES = ("tokenizer_vocab", "tokenizer-vocab", "vocab")
 TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS = frozenset({"trojan", "zombie"})
 MIN_TOKENIZER_VOCABULARY_LINES = 8
@@ -107,7 +104,6 @@ TOKENIZER_VOCABULARY_SENTINELS = frozenset({b"[PAD]", b"[UNK]", b"[CLS]", b"[SEP
 TOKENIZER_VOCABULARY_SUBWORD_PREFIXES = ("##", "\u0120", "\u2581")
 TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES = ("</w>", "@@")
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
-DOCUMENTATION_FENCED_BARE_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"')\]}>,;]+")
 REQUIREMENTS_RAW_URL_PATTERN = re.compile(rb"https?://\S+", re.IGNORECASE)
 BARE_NETWORK_IPV4_TOKEN_PATTERN = re.compile(
     rb"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
@@ -121,25 +117,63 @@ BARE_NETWORK_TOKEN_PATTERNS = (
     BARE_NETWORK_IPV6_TOKEN_PATTERN,
     BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
 )
-DOCUMENTATION_NETWORK_LIBRARY_NAMES_PATTERN = (
-    rb"socket|urllib|requests|httplib|http\.client|ftplib|telnetlib|smtplib|poplib|imaplib|paramiko|"
-    rb"pycurl|aiohttp|tornado|twisted|httpx|websocket|websockets|grpc|zeromq|paho\.mqtt|redis|"
-    rb"pymongo|psycopg2|mysql\.connector"
-)
-DOCUMENTATION_NETWORK_LIBRARY_IMPORT_PATTERN = re.compile(
-    rb"\b(?P<pattern>(?:import|from)\s+(?P<library>" + DOCUMENTATION_NETWORK_LIBRARY_NAMES_PATTERN + rb"))\b",
-    re.IGNORECASE,
-)
-DOCUMENTATION_NETWORK_LIBRARY_USAGE_PATTERN = re.compile(
-    rb"\b(?P<library>" + DOCUMENTATION_NETWORK_LIBRARY_NAMES_PATTERN + rb")\.(?:connect|request|__init__)\b",
-    re.IGNORECASE,
+DOCUMENTATION_BARE_DOMAIN_TLDS = frozenset(
+    {
+        "ai",
+        "app",
+        "au",
+        "ca",
+        "cc",
+        "cf",
+        "ch",
+        "cn",
+        "co",
+        "com",
+        "de",
+        "dev",
+        "edu",
+        "es",
+        "example",
+        "fr",
+        "ga",
+        "gov",
+        "int",
+        "io",
+        "it",
+        "jp",
+        "mil",
+        "ml",
+        "net",
+        "nl",
+        "no",
+        "org",
+        "pw",
+        "ru",
+        "se",
+        "tk",
+        "to",
+        "uk",
+        "us",
+        "xyz",
+    }
 )
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
+MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
-MAX_DOCUMENTATION_FENCE_MARKERS = 4096
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
+)
+DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"(?=[^\r\n]{0,4096}$)[^\r\n]*[rubfRUBF]*[\"']$"
+)
+DOCUMENTATION_CODE_LITERAL_BLOCK_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"(?=[^\r\n]{0,4096}$)[^\r\n]*[\[{(][ \t]*(?:#.*)?$"
+)
+DOCUMENTATION_CODE_RETURN_STRING_PATTERN = re.compile(
+    rb"(?:^|[\r\n;{[(])[ \t]*(?:return|yield)\s+(?:[\s(\[{]{0,4096})?[rubfRUBF]*[\"']?$"
 )
 DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     rb"<(?:a\b[^<>]{0,4096}\bhref|img\b[^<>]{0,4096}\bsrc)\s*=\s*[\"']?$",
@@ -151,14 +185,52 @@ DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
-DOCUMENTATION_FENCE_LINE_PATTERN = re.compile(
-    rb"^[ \t]{0,3}(?P<marker>`{3,}|~{3,})(?P<suffix>[^\r\n]*)\r?$",
-    re.MULTILINE,
-)
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
+DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
+DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
+DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[,{])\s*(?P<field>[A-Za-z][A-Za-z0-9_-]*)\s*=\s*(?P<delimiter>[{\"']?)[^,\r\n]{0,4096}$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[,{])\s*url\s*=\s*(?P<delimiter>[{\"']?)\s*$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS = frozenset(
+    {
+        b"abstract",
+        b"address",
+        b"archiveprefix",
+        b"author",
+        b"booktitle",
+        b"copyright",
+        b"doi",
+        b"edition",
+        b"editor",
+        b"eprint",
+        b"howpublished",
+        b"institution",
+        b"isbn",
+        b"issn",
+        b"journal",
+        b"license",
+        b"month",
+        b"note",
+        b"number",
+        b"organization",
+        b"pages",
+        b"primaryclass",
+        b"publisher",
+        b"school",
+        b"series",
+        b"title",
+        b"url",
+        b"volume",
+        b"year",
+    }
+)
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
 DOCUMENTATION_CONFIG_NETWORK_KEY = rb"(?:endpoint|callback|webhook)(?:s|[_-][A-Za-z0-9_.-]{1,128}|(?:url|uri)s?)?"
-DOCUMENTATION_CONFIG_NETWORK_KEY_PATTERN = re.compile(rb"\b" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"\b", re.IGNORECASE)
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])(?:[\"']"
     + DOCUMENTATION_CONFIG_NETWORK_KEY
@@ -166,6 +238,27 @@ DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     + DOCUMENTATION_CONFIG_NETWORK_KEY
     + rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$",
     re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_MARKDOWN_MAPPING_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$"
+)
+DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?[\"']?$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_LIST_MAPPING_PATTERN = re.compile(
+    rb"(?:^|(?:\r?\n|\r))[ \t]*[-*+]\s+" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"\s*:\s*(?:\[\s*)?$"
+)
+DOCUMENTATION_CONFIG_MARKDOWN_UNQUOTED_MAPPING_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"\s*:\s*(?:\[\s*)?$"
 )
 DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])[\"']?" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"[\"']?\s*(?:=|:)\s*"
@@ -177,11 +270,42 @@ DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN = re.compile(
-    rb"[ \t]+[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
+    rb"[ \t]*(?:[-*+]\s+)?[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
     re.IGNORECASE,
 )
+DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN = re.compile(
+    rb"[ \t]*[-*+]\s+\S.*",
+    re.IGNORECASE,
+)
+DOCUMENTATION_LIST_ITEM_PREFIX_PATTERN = re.compile(rb"[ \t]*[-*+]\s+")
+DOCUMENTATION_CONFIG_XML_TAG_NAME = (
+    rb"(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:endpoint|callback|webhook)"
+    rb"(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?"
+)
 DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
-    rb"<(?:endpoint|callback|webhook)(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?>\s*$",
+    rb"<" + DOCUMENTATION_CONFIG_XML_TAG_NAME + rb">\s*$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_TAG_START_PATTERN = re.compile(
+    rb"<(?P<closing>/)?\s*(?P<tag>" + DOCUMENTATION_CONFIG_XML_TAG_NAME + rb")(?=[\s>/])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_QUOTED_VALUE_OPEN_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?(?P<quote>[\"'])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_NESTED_CONFIG_OBJECT_QUOTED_VALUE_OPEN_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])[\"']?"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']?\s*(?:=|:)\s*\{[^{}\r\n]{0,4096}[\"']?(?:url|uri)[\"']?\s*:\s*(?P<quote>[\"'])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_NESTED_CONFIG_QUOTED_VALUE_LINE_PATTERN = re.compile(
+    rb"[ \t]*(?:[-*+]\s+)?[\"']?(?:url|uri)[\"']?\s*:\s*(?P<quote>[\"'])",
     re.IGNORECASE,
 )
 DOCUMENTATION_PRIVILEGE_OPTION_WITH_ARGUMENT = (
@@ -399,20 +523,6 @@ DOCUMENTATION_GIT_CLONE_COMMAND_PATTERN = re.compile(
     + rb"(?:\s+[^\s;&|#]{1,4096})?(?=\s*(?:$|[;&|#]))",
     re.IGNORECASE,
 )
-DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN = re.compile(
-    DOCUMENTATION_SHELL_LINE_PREFIX
-    + DOCUMENTATION_NETWORK_COMMAND_LINE_LIMIT
-    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
-    + DOCUMENTATION_COMMAND_PATH_PREFIX
-    + rb"git(?:\.exe)?\s+clone"
-    rb"(?:\s+"
-    + DOCUMENTATION_GIT_CLONE_OPTION
-    + rb"){0,8}\s+(?:--\s+)?(?P<destination>"
-    + DOCUMENTATION_GIT_CLONE_DESTINATION
-    + rb")"
-    + rb"(?:\s+(?P<local_destination>[^\s;&|#]{1,4096}))?(?=\s*(?:$|[;&|#]))",
-    re.IGNORECASE,
-)
 DOCUMENTATION_SSH_OPTION_WITH_ARGUMENT = rb"-(?:B|b|c|D|E|F|I|i|J|L|l|m|O|o|p|Q|R|S|W|w)(?:=|\s+)?[^\s]{1,4096}"
 DOCUMENTATION_SSH_OPTION_WITHOUT_ARGUMENT = rb"-[46AaCfGgKkMNnqsTtVvXxYy]+"
 DOCUMENTATION_SSH_OPTION = (
@@ -502,176 +612,6 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
     re.IGNORECASE,
 )
-DOCUMENTATION_FENCED_PROCESS_SUBSTITUTION_EXECUTION_PATTERN = re.compile(
-    rb"\b(?:(?:(?:/[A-Za-z0-9._-]+)*/)?(?:bash|sh|zsh|python(?:\d+(?:\.\d+)*)?|perl|ruby|node|php)\s+)?"
-    rb"<\(\s*" + DOCUMENTATION_SHELL_WRAPPED_COMMAND + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
-    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN = re.compile(
-    rb"\|&?\s*(?:sudo\s+)?(?:(?:(?:/[A-Za-z0-9._-]+)*/)?env\s+"
-    rb"(?:(?:-[A-Za-z0-9_=-]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)*)?(?:(?:/[A-Za-z0-9._-]+)*/)?"
-    rb"(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh|python(?:\d+(?:\.\d+)*)?|perl|ruby|node|php)\b",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_SESSION_HTTP_CALL_PATTERN = re.compile(
-    rb"\b(?:requests\.)?Session\s*\([^)]*\)\s*\.\s*"
-    rb"(?:get|head|post|put|patch|delete|request)\s*\("
-    rb"|\b[A-Za-z_][A-Za-z0-9_]*session[A-Za-z0-9_]*\s*\.\s*"
-    rb"(?:get|head|post|put|patch|delete|request)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN = re.compile(
-    rb"(?:beacon|c2|cmd|download|evil|exec|exfil|payload|shell)",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s]+)[\"']"
-    rb"(?=[ \t]*(?:#[^\r\n]*)?(?:\r?\n|;|$))",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:urllib\.request\.)?Request\s*\(\s*"
-    rb"[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s)]+)[\"']\s*\)",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_PASSIVE_REQUEST_ARGUMENT_SUFFIX = rb"(?:\s*,\s*stream\s*=\s*True)?\s*\)"
-DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN = re.compile(
-    rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(\s*"
-    rb"(?P<target>[A-Za-z_][A-Za-z0-9_]*)\b" + DOCUMENTATION_FENCED_PASSIVE_REQUEST_ARGUMENT_SUFFIX,
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN = re.compile(
-    rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(\s*[rubfRUBF]*[\"']"
-    rb"(?P<url>https?://[^\"'\s)]+)[\"']" + DOCUMENTATION_FENCED_PASSIVE_REQUEST_ARGUMENT_SUFFIX,
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN = re.compile(
-    rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:requests\.)?Session\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
-    rb"(?:requests\.(?:get|head|post|put|patch|delete|request)|urllib\.request\.urlopen|urlopen)\b(?!\s*\()",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_BOUND_NETWORK_METHOD_ALIAS_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
-    rb"(?P<receiver>(?:requests\.)?Session\s*\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
-    rb"(?:get|head|post|put|patch|delete|request|urlopen|urlretrieve)\b(?!\s*\()",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_VARIABLE_HTTP_CALL_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
-    rb"(?:get|head|post|put|patch|delete|request)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?"
-    rb"\s*(?://=|<<=|>>=|[+\-*/%@&|^]=|=(?!=))",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN = re.compile(
-    rb"\brequests\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN = re.compile(
-    rb"\b(?:urlopen|urlretrieve|socket\.connect|socket\.create_connection|requests\.(?:get|post|put|delete)|"
-    rb"http\.request|ftp\.connect|ssh\.connect|telnet\.open|smtp\.connect|imap\.login|redis\.connect|"
-    rb"mongo\.connect|getaddrinfo|gethostbyname|gethostbyaddr|dns\.resolver)\b",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_NETWORK_MODULE_IMPORT_PATTERN = re.compile(
-    rb"\bimport\s+(?P<imports>[^\r\n#;]+)",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_NETWORK_FUNCTION_IMPORT_PATTERN = re.compile(
-    rb"\bfrom\s+(?:requests|urllib\.request)\s+import\s+(?P<imports>[^\r\n#;]+)",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_MULTILINE_NETWORK_FUNCTION_IMPORT_PATTERN = re.compile(
-    rb"\bfrom\s+(?:requests|urllib\.request)\s+import\s*\((?P<imports>[^)]{1,4096})\)",
-    re.IGNORECASE | re.DOTALL,
-)
-DOCUMENTATION_FENCED_MODULE_ALIAS_NETWORK_CALL_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
-    rb"(?:get|head|post|put|patch|delete|request|urlopen|urlretrieve)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_RESPONSE_EXECUTOR = (
-    rb"(?:exec|eval|compile|os\.system|subprocess\.(?:run|call|check_call|check_output|Popen)|"
-    rb"(?:pickle|cloudpickle|dill|marshal)\.loads?|torch\.load|joblib\.load)"
-)
-DOCUMENTATION_FENCED_RESPONSE_INDEX_ACCESS = rb"(?:\s*\[[^\]\r\n]{1,256}\]){0,8}"
-DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
-    rb"\b"
-    + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR
-    + rb"\s*\([^\r\n]{0,4096}(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_RESPONSE_EXECUTOR_CALL_PATTERN = re.compile(
-    rb"\b" + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR + rb"\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_EXECUTED_IMPORTED_FETCH_PATTERN = re.compile(
-    rb"\b" + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR + rb"\s*\([^\r\n]{0,4096}\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*(?:\(\s*){0,8}"
-    rb"(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_FETCH_RESPONSE_CONTAINER_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*="
-    rb"\s*(?:[\[\(\{]\s*){1,8}(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*(?:\(\s*){0,8}"
-    rb"(?P<fetch>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_CONTAINER_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*="
-    rb"\s*(?:[\[\(\{]\s*){1,8}(?P<fetch>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_IMPORTED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
-    rb"(?P<source>[A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_RESPONSE_CONTENT_ALIAS_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
-    rb"(?P<source>[A-Za-z_][A-Za-z0-9_]*)"
-    + DOCUMENTATION_FENCED_RESPONSE_INDEX_ACCESS
-    + rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN = re.compile(
-    rb"\b" + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR + rb"\s*\(\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)"
-    rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))?",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_EXECUTED_RESPONSE_ARGUMENT_PATTERN = re.compile(
-    rb"\b" + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR + rb"\s*\([^\r\n]{0,4096}\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)"
-    rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_FIELD_PATTERN = re.compile(
-    rb"^\s*(?:url|biburl|bibsource)\s*=\s*\{",
-    re.IGNORECASE,
-)
-DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_HOSTS = frozenset({"arxiv.org", "www.arxiv.org", "dblp.org", "www.dblp.org"})
 DOCUMENTATION_PIP_OPTION_WITH_ARGUMENT = (
     rb"--(?:cache-dir|cert|client-cert|exists-action|keyring-provider|log|proxy|python|retries|"
     rb"resume-retries|root-user-action|timeout|trusted-host|use-deprecated|use-feature)"
@@ -733,10 +673,6 @@ DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
 DOCUMENTATION_PACKAGE_INSTALL_PROSE_TAIL_PATTERN = re.compile(
     rb"(?:\b(?:is|are|was|were)\s+(?:covered|described|documented|explained)\s+(?:at|in|on)"
     rb"|\b(?:docs?|documentation|guide|reference)\s+(?:at|in|on))\s*$",
-    re.IGNORECASE,
-)
-DOCUMENTATION_PACKAGE_INDEX_URL_OPTION_PREFIX_PATTERN = re.compile(
-    rb"(?:^|\s)(?:--(?:extra-index-url|index-url|find-links)(?:=|\s+)|-[if]\s*)$",
     re.IGNORECASE,
 )
 DOCUMENTATION_COMPOUND_IMPORT_PREFIX_PATTERN = re.compile(
@@ -830,7 +766,7 @@ class TextScanner(BaseScanner):
     """Scanner for text-based ML-related files."""
 
     name = "text"
-    supported_extensions: ClassVar[list[str]] = [".txt", ".md", ".markdown", ".rst"]
+    supported_extensions: ClassVar[list[str]] = [".txt", ".md", ".markdown", ".rst", ".env"]
     default_max_file_read_size = DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -857,10 +793,6 @@ class TextScanner(BaseScanner):
         if cls._is_model_card_documentation_filename(filename) or cls._is_readme_documentation_filename(filename):
             return True
 
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
-            return False
-
         # Check for ML-related text files
         ml_text_files = {
             "readme.md",
@@ -871,6 +803,7 @@ class TextScanner(BaseScanner):
             "vocabulary.txt",
             "tokens.txt",
             "tokenizer.txt",
+            "merges.txt",
             "labels.txt",
             "classes.txt",
             "model_card.md",
@@ -881,9 +814,18 @@ class TextScanner(BaseScanner):
             "license.md",
             "license.rst",
             "requirements.txt",
+            ".env",
         }
+        if filename in ml_text_files:
+            return True
 
-        return filename in ml_text_files or any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in cls.supported_extensions:
+            return False
+        if ext == ".env":
+            return True
+
+        return any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
 
     @staticmethod
     def _get_file_size(path: str) -> int:
@@ -909,50 +851,6 @@ class TextScanner(BaseScanner):
             filename in DOCUMENTATION_TEXT_FILENAMES
             or cls._is_readme_documentation_filename(filename)
             or cls._is_model_card_documentation_filename(filename)
-        )
-
-    @staticmethod
-    def _documentation_fence_match_can_open_code(match: re.Match[bytes]) -> bool:
-        marker = match.group("marker")
-        suffix = match.group("suffix")
-        return not (marker.startswith(b"`") and b"`" in suffix)
-
-    @classmethod
-    def _documentation_has_closed_bare_tilde_fence(cls, payload: bytes) -> bool:
-        opening_marker: bytes | None = None
-        opening_end: int | None = None
-        for match in DOCUMENTATION_FENCE_LINE_PATTERN.finditer(payload):
-            marker = match.group("marker")
-            suffix = match.group("suffix")
-            if not marker.startswith(b"~") or suffix.strip():
-                continue
-            if opening_marker is None:
-                previous_line_end = match.start() - 1
-                if previous_line_end >= 0:
-                    previous_line_start = payload.rfind(b"\n", 0, previous_line_end) + 1
-                    if payload[previous_line_start:previous_line_end].strip():
-                        continue
-                opening_marker = marker
-                opening_end = match.end()
-                continue
-            if len(marker) >= len(opening_marker) and opening_end is not None and opening_end < match.start():
-                return True
-        return False
-
-    @classmethod
-    def _documentation_uses_markdown_fences(cls, path: str, payload: bytes) -> bool:
-        filename = os.path.basename(path).lower()
-        extension = os.path.splitext(filename)[1]
-        if extension == ".rst":
-            return False
-        if extension in {".md", ".markdown"}:
-            return True
-        if cls._documentation_has_closed_bare_tilde_fence(payload):
-            return True
-        return any(
-            cls._documentation_fence_match_can_open_code(match)
-            and (match.group("marker").startswith(b"`") or bool(match.group("suffix").strip()))
-            for match in DOCUMENTATION_FENCE_LINE_PATTERN.finditer(payload)
         )
 
     @staticmethod
@@ -1094,12 +992,52 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _documentation_without_closed_inline_code_spans(source: bytes) -> bytes:
+        if b"`" not in source:
+            return source
+
+        result = bytearray()
+        cursor = 0
+        while cursor < len(source):
+            if source[cursor : cursor + 1] != b"`":
+                result.append(source[cursor])
+                cursor += 1
+                continue
+
+            fence_end = cursor
+            while fence_end < len(source) and source[fence_end : fence_end + 1] == b"`":
+                fence_end += 1
+            fence = source[cursor:fence_end]
+            closing_fence = source.find(fence, fence_end)
+            if closing_fence < 0:
+                result.extend(source[cursor:])
+                break
+
+            if result and result[-1] not in b" \t\r\n":
+                result.append(ord(" "))
+            cursor = closing_fence + len(fence)
+            if cursor < len(source) and source[cursor] not in b" \t\r\n|,.;:)":
+                result.append(ord(" "))
+        return bytes(result)
+
+    @staticmethod
+    def _documentation_prefix_is_markdown_table_row(prefix: bytes) -> bool:
+        source = prefix.lstrip()
+        markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
+        if markdown_prefix is not None:
+            source = source[markdown_prefix.end() :].lstrip()
+        return source.startswith(b"|") and b"|" in source[1:]
+
+    @staticmethod
     def _documentation_prefix_has_enclosing_call(prefix: bytes) -> bool:
         """Return whether a bounded Python prefix leaves a function call open at the finding."""
         source = prefix.strip()
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
             source = source[markdown_prefix.end() :].lstrip()
+        source = TextScanner._documentation_without_closed_inline_code_spans(source).strip()
+        if TextScanner._documentation_prefix_is_markdown_table_row(source):
+            return False
         for fence_length in (3, 2, 1):
             fence = b"`" * fence_length
             if source.startswith(fence):
@@ -1189,6 +1127,130 @@ class TextScanner(BaseScanner):
         return any(opening == "(" and is_call for opening, is_call in stack)
 
     @staticmethod
+    def _documentation_passive_markdown_link_match(prefix: bytes) -> re.Match[bytes] | None:
+        return DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN.search(prefix.rstrip())
+
+    @classmethod
+    def _documentation_prefix_is_passive_markdown_link(cls, prefix: bytes) -> bool:
+        return cls._documentation_passive_markdown_link_match(prefix) is not None
+
+    @classmethod
+    def _documentation_markdown_link_is_in_code_context(cls, prefix: bytes, link_start: int) -> bool:
+        code_prefix = prefix[:link_start]
+        return (
+            cls._documentation_assignment_is_actionable(code_prefix)
+            or DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CODE_CALL_PATTERN.search(code_prefix) is not None
+            or cls._documentation_markdown_link_config_is_actionable(code_prefix)
+        )
+
+    @classmethod
+    def _documentation_markdown_link_config_is_actionable(cls, code_prefix: bytes) -> bool:
+        stripped = code_prefix.rstrip()
+        return (
+            cls._documentation_structured_config_value_prefix_is_actionable(code_prefix)
+            or DOCUMENTATION_CONFIG_LIST_MAPPING_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CONFIG_MARKDOWN_UNQUOTED_MAPPING_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CONFIG_MARKDOWN_MAPPING_PATTERN.search(code_prefix) is not None
+            or (
+                stripped.endswith((b'"', b"'")) and DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(code_prefix) is not None
+            )
+            or cls._documentation_nested_config_is_actionable(code_prefix)
+            or DOCUMENTATION_CONFIG_TAG_PATTERN.search(code_prefix) is not None
+        )
+
+    @classmethod
+    def _documentation_markdown_link_context(cls, payload: bytes, position: int) -> tuple[bytes, int] | None:
+        line_start = max(payload.rfind(b"\n", 0, position) + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        line = payload[line_start:line_end]
+        line_position = position - line_start
+        for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
+            if match.start() <= line_position < match.end():
+                prefix = line[: match.start()]
+                markdown_match = cls._documentation_passive_markdown_link_match(prefix)
+                if markdown_match is None:
+                    return None
+                link_start = line_start + markdown_match.start()
+                context_start = max(0, link_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+                if context_start > 0:
+                    next_newline = payload.find(b"\n", context_start, link_start)
+                    if next_newline >= 0:
+                        context_start = next_newline + 1
+                return payload[context_start:link_start], link_start
+        return None
+
+    @classmethod
+    def _documentation_markdown_link_context_prefix(cls, payload: bytes, position: int) -> bytes | None:
+        context = cls._documentation_markdown_link_context(payload, position)
+        return context[0] if context is not None else None
+
+    @classmethod
+    def _documentation_markdown_link_xml_config_context_status(cls, payload: bytes, link_start: int) -> bool | None:
+        line_start = payload.rfind(b"\n", 0, link_start) + 1
+        context_start = max(line_start, link_start - MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES)
+        context_prefix = payload[context_start:link_start]
+        tag_match = None
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(context_prefix):
+            tag_match = match
+            break
+        if tag_match is None:
+            return None if context_start > line_start else False
+        return cls._documentation_config_xml_tag_value_is_open(context_prefix[tag_match.start() :])
+
+    @classmethod
+    def _documentation_markdown_link_has_open_xml_config_context(cls, payload: bytes, link_start: int) -> bool:
+        return cls._documentation_markdown_link_xml_config_context_status(payload, link_start) is True
+
+    @classmethod
+    def _documentation_position_is_in_actionable_markdown_link_context(cls, payload: bytes, position: int) -> bool:
+        context = cls._documentation_markdown_link_context(payload, position)
+        if context is None:
+            return False
+        context_prefix, link_start = context
+        line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
+        if cls._documentation_shell_comment_before_position(line_prefix, len(line_prefix)):
+            return False
+        if cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix):
+            return cls._documentation_markdown_link_config_is_actionable(
+                context_prefix
+            ) or cls._documentation_markdown_link_has_open_xml_config_context(
+                payload,
+                link_start,
+            )
+        return cls._documentation_markdown_link_is_in_code_context(
+            context_prefix,
+            len(context_prefix),
+        ) or cls._documentation_markdown_link_has_open_xml_config_context(
+            payload,
+            link_start,
+        )
+
+    @classmethod
+    def _documentation_position_is_in_passive_markdown_link(cls, payload: bytes, position: int) -> bool:
+        context = cls._documentation_markdown_link_context(payload, position)
+        if context is None:
+            return False
+        context_prefix, link_start = context
+        line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
+        passive_line_markdown_link = cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix)
+        literal_value_prefix = cls._documentation_markdown_link_leading_prefix_is_literal_value(line_prefix)
+        return cls._documentation_markdown_link_xml_config_context_status(payload, link_start) is False and (
+            (passive_line_markdown_link and not cls._documentation_markdown_link_config_is_actionable(context_prefix))
+            or (
+                not literal_value_prefix
+                and not cls._documentation_markdown_link_is_in_code_context(
+                    context_prefix,
+                    len(context_prefix),
+                )
+            )
+        )
+
+    @staticmethod
     def _documentation_comment_contains_position(payload: bytes, position: int) -> bool:
         """Return whether a bounded finding position is inside an HTML or C-style block comment."""
         context_start = max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
@@ -1255,21 +1317,227 @@ class TextScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _documentation_nested_config_is_actionable(prefix: bytes) -> bool:
+    def _documentation_quoted_value_is_open(source: bytes, quote: int, value_start: int) -> bool:
+        escaped = False
+        cursor = value_start
+        while cursor < len(source):
+            value = source[cursor]
+            if escaped:
+                escaped = False
+                cursor += 1
+                continue
+            if value == ord("\\") and quote != ord("'"):
+                escaped = True
+                cursor += 1
+                continue
+            if value in {ord("\r"), ord("\n")}:
+                return False
+            if value == quote:
+                if quote == ord("'") and cursor + 1 < len(source) and source[cursor + 1] == quote:
+                    cursor += 2
+                    continue
+                return False
+            cursor += 1
+        return True
+
+    @staticmethod
+    def _documentation_xml_start_tag_end(prefix: bytes, search_start: int) -> int | None:
+        quote: int | None = None
+        cursor = search_start
+        while cursor < len(prefix):
+            value = prefix[cursor]
+            if quote is not None:
+                if value == quote:
+                    quote = None
+                cursor += 1
+                continue
+            if value in {ord("'"), ord('"')}:
+                quote = value
+            elif value == ord(">"):
+                return cursor
+            elif value == ord("<"):
+                return None
+            cursor += 1
+        return None
+
+    @classmethod
+    def _documentation_config_xml_tag_value_is_open(cls, prefix: bytes) -> bool:
+        open_tags: list[bytes] = []
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(prefix):
+            tag = match.group("tag").lower()
+            tag_end = cls._documentation_xml_start_tag_end(prefix, match.end())
+            if tag_end is None:
+                return True
+            if match.group("closing"):
+                if not open_tags or open_tags[-1] != tag:
+                    return True
+                open_tags.pop()
+                continue
+            tag_body = prefix[match.end() : tag_end].rstrip()
+            if tag_body.endswith(b"/"):
+                continue
+            open_tags.append(tag)
+        return bool(open_tags)
+
+    @classmethod
+    def _documentation_closed_config_xml_suffix_start(cls, prefix: bytes) -> int | None:
+        open_tags: list[bytes] = []
+        last_tag_end: int | None = None
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(prefix):
+            tag = match.group("tag").lower()
+            tag_end = cls._documentation_xml_start_tag_end(prefix, match.end())
+            if tag_end is None:
+                return None
+            last_tag_end = tag_end + 1
+            if match.group("closing"):
+                if not open_tags or open_tags[-1] != tag:
+                    return None
+                open_tags.pop()
+                continue
+            tag_body = prefix[match.end() : tag_end].rstrip()
+            if tag_body.endswith(b"/"):
+                continue
+            open_tags.append(tag)
+        if last_tag_end is None or open_tags:
+            return None
+        return last_tag_end
+
+    @classmethod
+    def _documentation_truncated_prefix_after_closed_xml_config_is_passive(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        context_start = max(line_start, position - MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES)
+        context_prefix = payload[context_start:position]
+        tag_match = None
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(context_prefix):
+            tag_match = match
+            break
+        if tag_match is None:
+            return False
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        tag_context = context_prefix[tag_match.start() :] + payload[position:line_end]
+        tag_context_position = position - (context_start + tag_match.start())
+        suffix_start = cls._documentation_closed_config_xml_suffix_start(tag_context[:tag_context_position])
+        if suffix_start is None:
+            return False
+        suffix_line = tag_context[suffix_start:]
+        suffix_position = tag_context_position - suffix_start
+        return not cls._documentation_line_is_code_shaped(suffix_line, suffix_position)
+
+    @classmethod
+    def _documentation_config_quoted_value_line_is_actionable(cls, line_prefix: bytes) -> bool:
+        for match in DOCUMENTATION_CONFIG_QUOTED_VALUE_OPEN_PATTERN.finditer(line_prefix):
+            quote = match.group("quote")[0]
+            if cls._documentation_quoted_value_is_open(line_prefix, quote, match.end()):
+                return True
+        return False
+
+    @classmethod
+    def _documentation_nested_config_quoted_value_is_actionable(cls, prefix: bytes) -> bool:
+        for object_match in DOCUMENTATION_NESTED_CONFIG_OBJECT_QUOTED_VALUE_OPEN_PATTERN.finditer(prefix):
+            quote = object_match.group("quote")[0]
+            if cls._documentation_quoted_value_is_open(prefix, quote, object_match.end()):
+                return True
+
+        lines = prefix.splitlines()
+        if len(lines) < 2:
+            return False
+        value_line = lines[-1]
+        value_match = DOCUMENTATION_NESTED_CONFIG_QUOTED_VALUE_LINE_PATTERN.match(value_line)
+        if value_match is None:
+            return False
+        quote = value_match.group("quote")[0]
+        if not cls._documentation_quoted_value_is_open(value_line, quote, value_match.end()):
+            return False
+
+        value_indent = cls._documentation_line_indent(value_line)
+        value_is_list_item = DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN.fullmatch(value_line) is not None
+        for line_index in range(len(lines) - 2, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                return False
+            line_indent = cls._documentation_line_indent(line)
+            if line_indent > value_indent or (line_indent == value_indent and not value_is_list_item):
+                continue
+            if DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line) is not None:
+                return True
+            list_item_prefix = DOCUMENTATION_LIST_ITEM_PREFIX_PATTERN.match(line)
+            if list_item_prefix is not None:
+                if value_indent <= line_indent:
+                    return False
+                if (
+                    DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line[list_item_prefix.end() :])
+                    is not None
+                ):
+                    return True
+                for parent_index in range(line_index - 1, -1, -1):
+                    parent_line = lines[parent_index]
+                    if not parent_line.strip():
+                        return False
+                    parent_indent = cls._documentation_line_indent(parent_line)
+                    if parent_indent > line_indent:
+                        continue
+                    return DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is not None
+                return False
+            return False
+        return False
+
+    @classmethod
+    def _documentation_structured_config_value_prefix_is_actionable(cls, prefix: bytes) -> bool:
+        line_prefix = prefix[prefix.rfind(b"\n") + 1 :]
+        return (
+            cls._documentation_config_quoted_value_line_is_actionable(line_prefix)
+            or cls._documentation_nested_config_quoted_value_is_actionable(prefix)
+            or cls._documentation_config_xml_tag_value_is_open(prefix)
+        )
+
+    @staticmethod
+    def _documentation_line_indent(line: bytes) -> int:
+        return len(line) - len(line.lstrip(b" \t"))
+
+    @classmethod
+    def _documentation_nested_config_is_actionable(cls, prefix: bytes) -> bool:
         if DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN.search(prefix) is not None:
             return True
         lines = prefix.splitlines()
         if len(lines) < 2:
             return False
-        parent_line, value_line = lines[-2:]
-        if (
-            DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is None
-            or DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN.fullmatch(value_line) is None
-        ):
+        value_line = lines[-1]
+        if DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN.fullmatch(value_line) is None:
             return False
-        parent_indent = len(parent_line) - len(parent_line.lstrip(b" \t"))
-        value_indent = len(value_line) - len(value_line.lstrip(b" \t"))
-        return value_indent > parent_indent
+        value_indent = cls._documentation_line_indent(value_line)
+        value_is_list_item = DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN.fullmatch(value_line) is not None
+        for line_index in range(len(lines) - 2, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                return False
+            line_indent = cls._documentation_line_indent(line)
+            if line_indent > value_indent or (line_indent == value_indent and not value_is_list_item):
+                continue
+            if DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line) is not None:
+                return True
+            list_item_prefix = DOCUMENTATION_LIST_ITEM_PREFIX_PATTERN.match(line)
+            if list_item_prefix is not None:
+                if value_indent <= line_indent:
+                    return False
+                if (
+                    DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line[list_item_prefix.end() :])
+                    is not None
+                ):
+                    return True
+                for parent_index in range(line_index - 1, -1, -1):
+                    parent_line = lines[parent_index]
+                    if not parent_line.strip():
+                        return False
+                    parent_indent = cls._documentation_line_indent(parent_line)
+                    if parent_indent > line_indent:
+                        continue
+                    return DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is not None
+                return False
+            return False
+        return False
 
     @staticmethod
     def _documentation_assignment_is_actionable(prefix: bytes) -> bool:
@@ -1304,6 +1572,33 @@ class TextScanner(BaseScanner):
             return True
         return (
             DOCUMENTATION_PACKAGE_INSTALL_PROSE_TAIL_PATTERN.search(stripped[match.end() : relative_position]) is None
+        )
+
+    @classmethod
+    def _documentation_package_version_is_informational(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+    ) -> bool:
+        if finding.get("type") != "ipv4_address":
+            return False
+        position = finding.get("position")
+        ip = finding.get("ip")
+        if not isinstance(position, int) or not isinstance(ip, str):
+            return False
+        line_parts = cls._finding_line_parts(payload, finding)
+        if line_parts is None:
+            return False
+        line, line_position = line_parts
+        ip_bytes = ip.encode()
+        return (
+            DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(line.lstrip()) is not None
+            and b"://" not in line
+            and line_position >= 2
+            and line[line_position - 2 : line_position] == b"=="
+            and payload[position : position + len(ip_bytes)] == ip_bytes
+            and payload.find(ip_bytes) == position
+            and payload.find(ip_bytes, position + len(ip_bytes)) == -1
         )
 
     @staticmethod
@@ -1443,6 +1738,14 @@ class TextScanner(BaseScanner):
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
         stripped = line.lstrip()
+        passive_markdown_link_match = cls._documentation_passive_markdown_link_match(prefix)
+        passive_markdown_link = passive_markdown_link_match is not None
+        markdown_table_context = cls._documentation_prefix_is_markdown_table_row(prefix)
+        markdown_link_code_context = (
+            cls._documentation_markdown_link_is_in_code_context(prefix, passive_markdown_link_match.start())
+            if passive_markdown_link_match is not None
+            else False
+        )
         shell_command_is_actionable = (
             cls._documentation_anchored_network_command_is_actionable(stripped)
             or cls._documentation_package_install_is_actionable(line, position)
@@ -1450,7 +1753,6 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_INLINE_POWERSHELL_COMMAND_PATTERN.search(line) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
-            or DOCUMENTATION_FENCED_PROCESS_SUBSTITUTION_EXECUTION_PATTERN.search(prefix) is not None
             or cls._documentation_xargs_downloader_is_actionable(line, position)
         )
         if cls._documentation_shell_comment_before_position(
@@ -1465,11 +1767,21 @@ class TextScanner(BaseScanner):
                 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
                 and cls._documentation_assignment_is_actionable(prefix)
             )
-            or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
-            or cls._documentation_prefix_has_enclosing_call(prefix)
+            or markdown_link_code_context
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            )
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and cls._documentation_prefix_has_enclosing_call(prefix)
+            )
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
+            or cls._documentation_structured_config_value_prefix_is_actionable(prefix)
         ):
             return True
 
@@ -1553,6 +1865,168 @@ class TextScanner(BaseScanner):
             previous_line_end = previous_line_start - 1
         return False
 
+    @staticmethod
+    def _documentation_multiline_return_contains_position(payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+        if current_indent == 0:
+            return False
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end]
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if previous_indent < current_indent:
+                    return DOCUMENTATION_PYTHON_BLOCK_VALUE_PREFIX_PATTERN.fullmatch(stripped) is not None
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @staticmethod
+    def _documentation_markdown_link_leading_prefix_is_passive(prefix: bytes) -> bool:
+        prefix = prefix.lstrip()
+        return (
+            not prefix or prefix.startswith(b"#") or DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.fullmatch(prefix) is not None
+        )
+
+    @staticmethod
+    def _documentation_markdown_link_leading_prefix_is_literal_value(prefix: bytes) -> bool:
+        stripped = prefix.strip()
+        return stripped.startswith((b'"', b"'", b"{", b"[", b"(")) or stripped.endswith((b",", b"{", b"["))
+
+    @classmethod
+    def _documentation_literal_continuation_line_is_passive_markdown_prefix(cls, line: bytes) -> bool:
+        markdown_match = cls._documentation_passive_markdown_link_match(line)
+        if markdown_match is None:
+            return False
+        return cls._documentation_markdown_link_leading_prefix_is_passive(line[: markdown_match.start()])
+
+    @classmethod
+    def _documentation_literal_continuation_line_is_code_shaped(cls, line: bytes) -> bool:
+        stripped = line.strip()
+        if cls._documentation_literal_continuation_line_is_passive_markdown_prefix(line):
+            return False
+        return (
+            stripped.startswith((b'"', b"'", b"{", b"[", b"(", b"-", b"+"))
+            or stripped.endswith((b",", b"{", b"[", b"("))
+            or bool(re.match(rb"\d", stripped))
+        )
+
+    @classmethod
+    def _documentation_zero_indent_multiline_literal_contains_position(
+        cls,
+        payload: bytes,
+        line_start: int,
+        current_line_prefix: bytes,
+        context_start: int,
+    ) -> bool:
+        if not cls._documentation_literal_continuation_line_is_code_shaped(current_line_prefix):
+            return False
+
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end].removesuffix(b"\r")
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                if DOCUMENTATION_CODE_LITERAL_BLOCK_PREFIX_PATTERN.search(previous_line) is not None:
+                    return True
+                if stripped.startswith((b"}", b"]", b")")):
+                    return False
+                if not cls._documentation_literal_continuation_line_is_code_shaped(previous_line):
+                    return False
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @classmethod
+    def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        if cls._documentation_prefix_is_markdown_table_row(current_line_prefix):
+            return False
+        if cls._documentation_shell_comment_before_position(current_line_prefix, len(current_line_prefix)):
+            return False
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end]
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if current_indent == 0 and previous_indent == 0:
+                    if cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:line_start]):
+                        return True
+                    previous_line_end = previous_line_start - 1
+                    continue
+                if previous_indent < current_indent:
+                    return cls._documentation_prefix_has_enclosing_call(previous_line)
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @classmethod
+    def _documentation_multiline_literal_contains_position(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if current_indent == 0:
+            if cls._documentation_position_is_in_passive_markdown_link(payload, position):
+                return False
+            return cls._documentation_zero_indent_multiline_literal_contains_position(
+                payload,
+                line_start,
+                current_line_prefix,
+                context_start,
+            )
+
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end].removesuffix(b"\r")
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if previous_indent < current_indent:
+                    return DOCUMENTATION_CODE_LITERAL_BLOCK_PREFIX_PATTERN.search(previous_line) is not None
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @classmethod
+    def _documentation_nested_config_contains_position(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if context_start > 0:
+            context_start = payload.rfind(b"\n", 0, context_start) + 1
+        return cls._documentation_nested_config_is_actionable(payload[context_start:position])
+
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         position = finding.get("position")
@@ -1560,1489 +2034,51 @@ class TextScanner(BaseScanner):
             return False
         if cls._documentation_comment_contains_position(payload, position):
             return False
-        if cls._finding_line_prefix_is_truncated(payload, finding):
+        if cls._documentation_position_is_in_passive_bibliography_field(payload, position):
+            return False
+        if cls._documentation_multiline_return_contains_position(payload, position):
             return True
+        if cls._documentation_open_call_contains_position(payload, position):
+            return True
+        if cls._documentation_multiline_literal_contains_position(payload, position):
+            return True
+        if cls._documentation_position_is_in_actionable_markdown_link_context(payload, position):
+            return True
+        if cls._documentation_position_is_in_passive_markdown_link(payload, position):
+            return False
+        if cls._finding_line_prefix_is_truncated(payload, finding):
+            return not cls._documentation_truncated_prefix_after_closed_xml_config_is_passive(payload, position)
         line_parts = cls._finding_line_parts(payload, finding)
+        markdown_table_context = False
         if line_parts is not None:
             line, line_position = line_parts
+            markdown_table_context = cls._documentation_prefix_is_markdown_table_row(line[:line_position])
             if cls._documentation_line_is_code_shaped(line, line_position):
                 return True
+            if cls._documentation_shell_comment_before_position(line, line_position):
+                return False
         if cls._documentation_previous_line_continues_command(payload, position):
             return True
         if cls._documentation_python_definition_contains_finding(payload, position):
             return True
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
+        passive_markdown_link = cls._documentation_prefix_is_passive_markdown_link(prefix)
         return (
             cls._documentation_assignment_is_actionable(prefix)
-            or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
-            or cls._documentation_prefix_has_enclosing_call(prefix)
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            )
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and cls._documentation_prefix_has_enclosing_call(prefix)
+            )
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
-        )
-
-    @classmethod
-    def _documentation_fenced_code_ranges(cls, payload: bytes) -> tuple[tuple[tuple[int, int], ...], bool]:
-        fenced_code_ranges: list[tuple[int, int]] = []
-        opening_marker: bytes | None = None
-        opening_end: int | None = None
-        fence_markers_seen = 0
-        for match in DOCUMENTATION_FENCE_LINE_PATTERN.finditer(payload):
-            fence_markers_seen += 1
-            if fence_markers_seen > MAX_DOCUMENTATION_FENCE_MARKERS:
-                return (), True
-            marker = match.group("marker")
-            suffix = match.group("suffix")
-            if opening_marker is None:
-                if not cls._documentation_fence_match_can_open_code(match):
-                    continue
-                opening_marker = marker
-                opening_end = match.end()
-                continue
-            if marker[:1] != opening_marker[:1] or len(marker) < len(opening_marker) or suffix.strip():
-                continue
-            if opening_end is not None and opening_end < match.start():
-                fenced_code_ranges.append((opening_end, match.start()))
-            opening_marker = None
-            opening_end = None
-        if opening_end is not None and opening_end < len(payload):
-            fenced_code_ranges.append((opening_end, len(payload)))
-        return tuple(fenced_code_ranges), False
-
-    @staticmethod
-    def _documentation_position_is_fenced_code(
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-        position: int,
-    ) -> bool:
-        return any(range_start <= position < range_end for range_start, range_end in fenced_code_ranges)
-
-    @classmethod
-    def _documentation_fenced_passive_finding_is_informational(
-        cls,
-        payload: bytes,
-        finding: dict[str, Any],
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-    ) -> bool:
-        line_parts = cls._finding_line_parts(payload, finding)
-        if line_parts is None:
-            return True
-        line, position = line_parts
-        if cls._documentation_fenced_git_clone_reference_is_informational(
-            payload,
-            line,
-            position,
-            finding,
-            fenced_code_ranges,
-        ):
-            return True
-        if cls._documentation_fenced_package_version_is_informational(line, position, finding):
-            return True
-        if cls._documentation_fenced_package_index_url_is_informational(line, position, finding):
-            return True
-        if cls._documentation_fenced_bibliography_url_is_informational(line, finding):
-            return True
-        if cls._documentation_finding_is_actionable(payload, finding):
-            return False
-        if finding.get("type") in {
-            "cloud_storage_url",
-            "url_detected",
-        } and cls._documentation_package_install_is_actionable(
-            line,
-            position,
-        ):
-            return False
-        if DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(line) is not None:
-            return False
-        return not any(
-            pattern.match(line) is not None
-            for pattern in (
-                DOCUMENTATION_SHELL_COMMAND_PATTERN,
-                DOCUMENTATION_COMMAND_ARRAY_PATTERN,
-                DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN,
-                DOCUMENTATION_FIND_EXEC_DOWNLOADER_PATTERN,
-                DOCUMENTATION_DOCKER_ADD_PATTERN,
-                DOCUMENTATION_CERTUTIL_COMMAND_PATTERN,
-                DOCUMENTATION_NETCAT_COMMAND_PATTERN,
-                DOCUMENTATION_SSH_COMMAND_PATTERN,
-                DOCUMENTATION_POWERSHELL_COMMAND_PATTERN,
-            )
-        )
-
-    @classmethod
-    def _documentation_fenced_git_clone_reference_is_informational(
-        cls,
-        payload: bytes,
-        line: bytes,
-        position: int,
-        finding: dict[str, Any],
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-    ) -> bool:
-        match_line = line.rstrip(b"\r")
-        clone_match = DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN.match(match_line)
-        if clone_match is None or not clone_match.start("destination") <= position < clone_match.end("destination"):
-            return False
-        trailing = match_line[clone_match.end() :].strip()
-        if trailing and not trailing.startswith(b"#"):
-            return False
-        if cls._documentation_fenced_git_clone_block_executes_checkout(
-            payload,
-            position,
-            clone_match,
-            fenced_code_ranges,
-        ):
-            return False
-        finding_type = finding.get("type")
-        if finding_type in {"domain", "domain_name"}:
-            domain = finding.get("domain")
-            return isinstance(domain, str) and domain.casefold() == "github.com"
-        if finding_type != "url_detected":
-            return False
-        url = finding.get("url")
-        if not isinstance(url, str):
-            return False
-        try:
-            parsed_url = urlsplit(url)
-            raw_port = parsed_url.port
-        except ValueError:
-            return False
-        hostname = parsed_url.hostname
-        return (
-            parsed_url.scheme.casefold() == "https"
-            and isinstance(hostname, str)
-            and hostname.casefold() == "github.com"
-            and raw_port in {None, 443}
-        )
-
-    @staticmethod
-    def _documentation_git_clone_checkout_path(clone_match: re.Match[bytes]) -> bytes | None:
-        local_destination = clone_match.groupdict().get("local_destination")
-        if local_destination:
-            checkout_path = local_destination.strip().rstrip(b"/")
-        else:
-            destination = clone_match.group("destination").strip().rstrip(b"/")
-            if destination.endswith(b".git"):
-                destination = destination[:-4]
-            checkout_path = destination.rsplit(b"/", maxsplit=1)[-1].rsplit(b":", maxsplit=1)[-1]
-        while checkout_path.startswith(b"./"):
-            checkout_path = checkout_path[2:]
-        if checkout_path in {b"", b".."} or b"\x00" in checkout_path:
-            return None
-        if not (checkout_path == b"." or re.fullmatch(rb"[A-Za-z0-9._/\-]{1,512}", checkout_path) is not None):
-            return None
-        return checkout_path
-
-    @staticmethod
-    def _documentation_fenced_shell_command_prefix_pattern() -> bytes:
-        return rb"^\s*(?:sudo\s+)?"
-
-    @classmethod
-    def _documentation_fenced_line_directory_change(cls, line: bytes) -> tuple[bytes, bytes] | None:
-        stripped = line.strip()
-        if not stripped or stripped.startswith(b"#"):
-            return None
-        match = re.match(
-            cls._documentation_fenced_shell_command_prefix_pattern()
-            + rb"(?P<command>cd|pushd)\s+(?P<target>[^\s;&|]+)\s*(?:$|[;&|])",
-            stripped,
-            flags=re.IGNORECASE,
-        )
-        if match is None:
-            return None
-        command = match.group("command").lower()
-        target = match.group("target").strip().strip(b"'\"").rstrip(b"/")
-        while target.startswith(b"./"):
-            target = target[2:]
-        return command, target or b"."
-
-    @staticmethod
-    def _documentation_fenced_checkout_target_is_within_checkout(checkout_path: bytes, target: bytes) -> bool:
-        if checkout_path == b".":
-            return target == b"."
-        if target == checkout_path:
-            return True
-        checkout_prefix = checkout_path + b"/"
-        if not target.startswith(checkout_prefix):
-            return False
-        return all(part not in {b"", b".."} for part in target[len(checkout_prefix) :].split(b"/"))
-
-    @staticmethod
-    def _documentation_fenced_checkout_path_reference_pattern(checkout_path: bytes) -> bytes:
-        path_reference = rb"(?:\./)?" + re.escape(checkout_path)
-        return path_reference + rb"(?:/[A-Za-z0-9_./\-]{1,4096})?"
-
-    @classmethod
-    def _documentation_fenced_checkout_depth_for_target(cls, checkout_path: bytes, target: bytes) -> int | None:
-        if not cls._documentation_fenced_checkout_target_is_within_checkout(checkout_path, target):
-            return None
-        if checkout_path == b"." or target == checkout_path:
-            return 0
-        suffix = target[len(checkout_path) + 1 :]
-        return sum(1 for part in suffix.split(b"/") if part not in {b"", b"."})
-
-    @classmethod
-    def _documentation_fenced_checkout_depth_after_directory_change(
-        cls,
-        checkout_path: bytes,
-        current_depth: int | None,
-        target: bytes,
-    ) -> int | None:
-        explicit_depth = cls._documentation_fenced_checkout_depth_for_target(checkout_path, target)
-        if explicit_depth is not None:
-            return explicit_depth
-        if target.startswith(b"/") or current_depth is None:
-            return None
-        depth = current_depth
-        for part in target.split(b"/"):
-            if part in {b"", b"."}:
-                continue
-            if part == b"..":
-                if depth == 0:
-                    return None
-                depth -= 1
-                continue
-            depth += 1
-        return depth
-
-    @classmethod
-    def _documentation_fenced_line_pops_directory_stack(cls, line: bytes) -> bool:
-        stripped = line.strip()
-        if not stripped or stripped.startswith(b"#"):
-            return False
-        return (
-            re.match(
-                cls._documentation_fenced_shell_command_prefix_pattern() + rb"popd\s*(?:$|[;&|])",
-                stripped,
-                flags=re.IGNORECASE,
-            )
-            is not None
-        )
-
-    @classmethod
-    def _documentation_fenced_line_executes_relative_checkout_path(cls, line: bytes) -> bool:
-        stripped = line.strip()
-        if not stripped or stripped.startswith(b"#"):
-            return False
-        prefix = cls._documentation_fenced_shell_command_prefix_pattern()
-        return any(
-            re.match(pattern, stripped, flags=re.IGNORECASE) is not None
-            for pattern in (
-                prefix + rb"\./[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
-                prefix
-                + rb"(?:bash|sh|zsh|python(?:[0-9.]+)?|py|node|ruby|perl|source|\.)\s+\./"
-                + rb"[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
-            )
-        )
-
-    @classmethod
-    def _documentation_fenced_line_executes_inside_clone_checkout(cls, line: bytes) -> bool:
-        stripped = line.strip()
-        if not stripped or stripped.startswith(b"#"):
-            return False
-        prefix = cls._documentation_fenced_shell_command_prefix_pattern()
-        return any(
-            re.match(pattern, stripped, flags=re.IGNORECASE) is not None
-            for pattern in (
-                prefix + rb"\./[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
-                prefix
-                + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}"
-                + rb"(?:setup\.py|[A-Za-z0-9_./\-]+\.py)(?:\s|$)",
-                prefix + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}-m\s+[A-Za-z_][A-Za-z0-9_.\-]*\b",
-                prefix + rb"(?:bash|sh|zsh|node|ruby|perl)\s+" + rb"[A-Za-z0-9_./\-]+\.(?:sh|js|rb|pl)(?:\s|$)",
-                prefix + rb"(?:make|cmake|npm|yarn|pnpm|pip(?:[0-9.]+)?|uv)\b",
-            )
-        )
-
-    @classmethod
-    def _documentation_fenced_line_enters_then_executes_clone_checkout(cls, line: bytes, checkout_path: bytes) -> bool:
-        stripped = line.strip()
-        if not stripped or stripped.startswith(b"#") or checkout_path == b".":
-            return False
-        path_reference = cls._documentation_fenced_checkout_path_reference_pattern(checkout_path)
-        match = re.match(
-            cls._documentation_fenced_shell_command_prefix_pattern()
-            + rb"(?:cd|pushd)\s+"
-            + path_reference
-            + rb"\s*(?:&&|;)\s*(?P<tail>.+)$",
-            stripped,
-            flags=re.IGNORECASE,
-        )
-        return match is not None and cls._documentation_fenced_line_executes_inside_clone_checkout(match.group("tail"))
-
-    @classmethod
-    def _documentation_fenced_line_executes_clone_checkout(cls, line: bytes, checkout_path: bytes) -> bool:
-        stripped = line.strip()
-        if not stripped or stripped.startswith(b"#"):
-            return False
-        if checkout_path == b".":
-            return cls._documentation_fenced_line_executes_inside_clone_checkout(stripped)
-        if cls._documentation_fenced_line_enters_then_executes_clone_checkout(stripped, checkout_path):
-            return True
-        path_reference = cls._documentation_fenced_checkout_path_reference_pattern(checkout_path)
-        prefix = cls._documentation_fenced_shell_command_prefix_pattern()
-        return any(
-            re.match(pattern, stripped, flags=re.IGNORECASE) is not None
-            for pattern in (
-                prefix + path_reference + rb"/[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
-                prefix
-                + rb"(?:bash|sh|zsh|python(?:[0-9.]+)?|py|node|ruby|perl|source|\.)\s+"
-                + path_reference
-                + rb"/[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
-                prefix + rb"make\s+-C\s+" + path_reference + rb"(?:\s|$)",
-                prefix
-                + rb"(?:pip(?:[0-9.]+)?|uv\s+pip|(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}-m\s+pip)"
-                + rb"\s+install\b[^\r\n;&|]{0,4096}\s+"
-                + path_reference
-                + rb"(?:\s|$)",
-                prefix
-                + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}-m\s+build\b"
-                + rb"[^\r\n;&|]{0,4096}\s+"
-                + path_reference
-                + rb"(?:\s|$)",
-            )
-        )
-
-    @classmethod
-    def _documentation_fenced_git_clone_block_executes_checkout(
-        cls,
-        payload: bytes,
-        position: int,
-        clone_match: re.Match[bytes],
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-    ) -> bool:
-        checkout_path = cls._documentation_git_clone_checkout_path(clone_match)
-        if checkout_path is None:
-            return False
-        fenced_range = next(
-            (
-                (range_start, range_end)
-                for range_start, range_end in fenced_code_ranges
-                if range_start <= position < range_end
-            ),
-            None,
-        )
-        if fenced_range is None:
-            return False
-        _range_start, range_end = fenced_range
-        line_end = payload.find(b"\n", position, range_end)
-        if line_end == -1:
-            return False
-        checkout_depth: int | None = None
-        directory_stack: list[int | None] = []
-        for raw_line in payload[line_end + 1 : range_end].splitlines():
-            if cls._documentation_fenced_line_executes_clone_checkout(raw_line, checkout_path):
-                return True
-            if cls._documentation_fenced_line_pops_directory_stack(raw_line):
-                if directory_stack:
-                    checkout_depth = directory_stack.pop()
-                continue
-            directory_change = cls._documentation_fenced_line_directory_change(raw_line)
-            if directory_change is not None:
-                command, target = directory_change
-                if command == b"pushd":
-                    directory_stack.append(checkout_depth)
-                checkout_depth = cls._documentation_fenced_checkout_depth_after_directory_change(
-                    checkout_path,
-                    checkout_depth,
-                    target,
-                )
-                continue
-            if checkout_depth is not None and cls._documentation_fenced_line_executes_inside_clone_checkout(raw_line):
-                return True
-        return False
-
-    @staticmethod
-    def _documentation_fenced_package_version_is_informational(
-        line: bytes,
-        position: int,
-        finding: dict[str, Any],
-    ) -> bool:
-        if finding.get("type") != "ipv4_address" or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(line.lstrip()) is None:
-            return False
-        ip = finding.get("ip")
-        if not isinstance(ip, str):
-            return False
-        ip_bytes = ip.encode()
-        return (
-            b"://" not in line
-            and line[position - 2 : position] == b"=="
-            and line[position : position + len(ip_bytes)] == ip_bytes
-        )
-
-    @staticmethod
-    def _trusted_package_index_url_is_informational(url: str) -> bool:
-        try:
-            parsed_url = urlsplit(url)
-            if parsed_url.username is not None or parsed_url.password is not None:
-                return False
-            if any(
-                key.casefold().replace("-", "_") in SENSITIVE_REQUIREMENTS_QUERY_KEYS
-                for key, _value in parse_qsl(parsed_url.query, keep_blank_values=True)
-            ):
-                return False
-            raw_port = parsed_url.port
-        except ValueError:
-            return False
-        return (
-            parsed_url.scheme.casefold() == "https"
-            and parsed_url.hostname is not None
-            and parsed_url.hostname.casefold() in TRUSTED_REQUIREMENTS_HOSTS
-            and raw_port in {None, 443}
-        )
-
-    @classmethod
-    def _documentation_fenced_package_index_url_is_informational(
-        cls,
-        line: bytes,
-        position: int,
-        finding: dict[str, Any],
-    ) -> bool:
-        if finding.get("type") not in {"domain", "domain_name", "url_detected"}:
-            return False
-        if DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(line.lstrip()) is None:
-            return False
-        raw_url_match = next(
-            (match for match in REQUIREMENTS_RAW_URL_PATTERN.finditer(line) if match.start() <= position < match.end()),
-            None,
-        )
-        if raw_url_match is None:
-            return False
-        if DOCUMENTATION_PACKAGE_INDEX_URL_OPTION_PREFIX_PATTERN.search(line[: raw_url_match.start()]) is None:
-            return False
-        return cls._trusted_package_index_url_is_informational(raw_url_match.group().decode("utf-8", errors="ignore"))
-
-    @staticmethod
-    def _documentation_fenced_bibliography_url_is_informational(
-        line: bytes,
-        finding: dict[str, Any],
-    ) -> bool:
-        if (
-            finding.get("type") != "url_detected"
-            or DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_FIELD_PATTERN.match(line) is None
-        ):
-            return False
-        url = finding.get("url")
-        if not isinstance(url, str):
-            return False
-        try:
-            parsed_url = urlsplit(url.rstrip(").,}"))
-            if parsed_url.username is not None or parsed_url.password is not None:
-                return False
-            if any(
-                key.casefold().replace("-", "_") in SENSITIVE_REQUIREMENTS_QUERY_KEYS
-                for key, _value in parse_qsl(parsed_url.query, keep_blank_values=True)
-            ):
-                return False
-        except ValueError:
-            return False
-        hostname = parsed_url.hostname
-        return (
-            parsed_url.scheme.casefold() in {"http", "https"}
-            and isinstance(hostname, str)
-            and hostname.casefold() in DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_HOSTS
-        )
-
-    @staticmethod
-    def _documentation_loopback_api_url_is_informational(url: str) -> bool:
-        try:
-            parsed_url = urlsplit(url)
-            if parsed_url.username is not None or parsed_url.password is not None:
-                return False
-            if any(
-                key.casefold().replace("-", "_") in SENSITIVE_REQUIREMENTS_QUERY_KEYS
-                for key, _value in parse_qsl(parsed_url.query, keep_blank_values=True)
-            ):
-                return False
-            raw_port = parsed_url.port
-        except ValueError:
-            return False
-        hostname = parsed_url.hostname
-        path = parsed_url.path.rstrip("/")
-        return (
-            parsed_url.scheme.casefold() in {"http", "https"}
-            and isinstance(hostname, str)
-            and hostname.casefold() in DOCUMENTATION_FENCED_LOOPBACK_API_HOSTS
-            and (raw_port is None or raw_port in DOCUMENTATION_FENCED_LOOPBACK_API_PORTS)
-            and (path == "/v1" or path.startswith("/v1/"))
-        )
-
-    @staticmethod
-    def _documentation_fenced_passive_media_url_is_informational(url: str) -> bool:
-        try:
-            parsed_url = urlsplit(url)
-            if parsed_url.username is not None or parsed_url.password is not None:
-                return False
-            if any(
-                key.casefold().replace("-", "_") in SENSITIVE_REQUIREMENTS_QUERY_KEYS
-                for key, _value in parse_qsl(parsed_url.query, keep_blank_values=True)
-            ):
-                return False
-            raw_port = parsed_url.port
-        except ValueError:
-            return False
-        scheme = parsed_url.scheme.casefold()
-        return (
-            scheme in {"http", "https"}
-            and parsed_url.hostname is not None
-            and parsed_url.hostname.casefold() in DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_HOSTS
-            and (raw_port is None or (scheme == "http" and raw_port == 80) or (scheme == "https" and raw_port == 443))
-            and DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN.search(url.encode()) is None
-            and parsed_url.path.casefold().endswith(DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_SUFFIXES)
-        )
-
-    @classmethod
-    def _documentation_fenced_passive_assigned_url_is_informational(cls, url: str) -> bool:
-        return cls._documentation_loopback_api_url_is_informational(
-            url
-        ) or cls._documentation_fenced_passive_media_url_is_informational(url)
-
-    @classmethod
-    def _documentation_fenced_bare_url_is_informational(cls, url: str) -> bool:
-        try:
-            parsed_url = urlsplit(url)
-        except ValueError:
-            return False
-        if parsed_url.scheme.casefold() not in {"http", "https"}:
-            return False
-        return cls._documentation_fenced_passive_assigned_url_is_informational(url)
-
-    @classmethod
-    def _documentation_fenced_match_is_line_comment(cls, fenced_code: bytes, position: int) -> bool:
-        line_start = fenced_code.rfind(b"\n", 0, position) + 1
-        line_end = fenced_code.find(b"\n", position)
-        if line_end == -1:
-            line_end = len(fenced_code)
-        return cls._documentation_shell_comment_before_position(
-            fenced_code[line_start:line_end],
-            position - line_start,
-        )
-
-    @staticmethod
-    def _documentation_python_string_absolute_spans(source: bytes) -> tuple[tuple[int, int, str, bool], ...]:
-        text = source.decode("utf-8", errors="replace")
-        text_lines = text.splitlines(keepends=True)
-        byte_line_offsets = [0]
-        cursor = 0
-        for line in source.splitlines(keepends=True):
-            cursor += len(line)
-            byte_line_offsets.append(cursor)
-
-        def byte_position(token_position: tuple[int, int]) -> int:
-            line_number, column = token_position
-            line_index = line_number - 1
-            if line_index < 0:
-                return column
-            if line_index >= len(byte_line_offsets) - 1:
-                return len(source)
-            text_line = text_lines[line_index] if line_index < len(text_lines) else ""
-            byte_column = len(text_line[:column].encode("utf-8", errors="replace"))
-            return min(byte_line_offsets[line_index] + byte_column, byte_line_offsets[line_index + 1])
-
-        spans: list[tuple[int, int, str, bool]] = []
-        try:
-            for current in tokenize.generate_tokens(io.StringIO(text).readline):
-                is_fstring_middle = current.type == FSTRING_MIDDLE_TOKEN_TYPE
-                if current.type != token.STRING and not is_fstring_middle:
-                    continue
-                token_start = byte_position(current.start)
-                token_end = byte_position(current.end)
-                if token_start < token_end:
-                    spans.append((token_start, token_end, current.string, is_fstring_middle))
-        except (IndentationError, tokenize.TokenError):
-            return ()
-        return tuple(spans)
-
-    @staticmethod
-    def _documentation_python_string_spans_contain_absolute_position(
-        source: bytes,
-        position: int,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> bool:
-        if position < 0 or position > len(source) or not string_spans:
-            return False
-        span_index = bisect.bisect_right(string_span_starts, position) - 1
-        if span_index < 0:
-            return False
-        token_start, token_end, token_text, is_fstring_middle = string_spans[span_index]
-        if not (token_start <= position < token_end):
-            return False
-        if is_fstring_middle:
-            return True
-        local_position = len(source[token_start:position].decode("utf-8", errors="replace"))
-        return not TextScanner._documentation_f_string_expression_contains_position(token_text, local_position)
-
-    @classmethod
-    def _documentation_python_string_contains_absolute_position(cls, source: bytes, position: int) -> bool:
-        string_spans = cls._documentation_python_string_absolute_spans(source)
-        string_span_starts = tuple(span[0] for span in string_spans)
-        return cls._documentation_python_string_spans_contain_absolute_position(
-            source,
-            position,
-            string_spans,
-            string_span_starts,
-        )
-
-    @staticmethod
-    def _span_overlaps_any(start: int, end: int, spans: tuple[tuple[int, int], ...]) -> bool:
-        return any(start < span_end and span_start < end for span_start, span_end in spans)
-
-    @staticmethod
-    def _documentation_fenced_import_parts(imports: bytes) -> tuple[bytes, ...]:
-        normalized_imports = imports.replace(b"(", b" ").replace(b")", b" ")
-        return tuple(import_part.strip() for import_part in normalized_imports.split(b",") if import_part.strip())
-
-    @classmethod
-    def _documentation_fenced_has_call_after_assignment(
-        cls,
-        fenced_code: bytes,
-        assignment_pattern: re.Pattern[bytes],
-        call_pattern: re.Pattern[bytes],
-    ) -> bool:
-        assignment_positions: dict[bytes, list[int]] = {}
-        for match in assignment_pattern.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
-                continue
-            assignment_positions.setdefault(match.group("target"), []).append(match.start())
-        return any(
-            any(position < call_match.start() for position in assignment_positions.get(call_match.group("target"), []))
-            for call_match in call_pattern.finditer(fenced_code)
-            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
-        )
-
-    @classmethod
-    def _documentation_fenced_imported_network_targets(
-        cls,
-        fenced_code: bytes,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> dict[bytes, list[tuple[int, bytes]]]:
-        imported_targets: dict[bytes, list[tuple[int, bytes]]] = {}
-        network_names = {b"get", b"head", b"post", b"put", b"patch", b"delete", b"request", b"urlopen", b"urlretrieve"}
-        for pattern in (
-            DOCUMENTATION_FENCED_NETWORK_FUNCTION_IMPORT_PATTERN,
-            DOCUMENTATION_FENCED_MULTILINE_NETWORK_FUNCTION_IMPORT_PATTERN,
-        ):
-            for match in pattern.finditer(fenced_code):
-                if cls._documentation_fenced_match_is_line_comment(
-                    fenced_code,
-                    match.start(),
-                ) or cls._documentation_python_string_spans_contain_absolute_position(
-                    fenced_code,
-                    match.start(),
-                    string_spans,
-                    string_span_starts,
-                ):
-                    continue
-                for name_part in cls._documentation_fenced_import_parts(match.group("imports")):
-                    alias_parts = re.split(rb"\s+as\s+", name_part, maxsplit=1, flags=re.IGNORECASE)
-                    imported_name = alias_parts[0].strip()
-                    if imported_name not in network_names:
-                        continue
-                    target = (alias_parts[-1] if len(alias_parts) == 2 else imported_name).strip()
-                    if re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", target) is not None:
-                        imported_targets.setdefault(target, []).append((match.start(), imported_name.lower()))
-        return imported_targets
-
-    @classmethod
-    def _documentation_fenced_has_imported_network_call(
-        cls,
-        fenced_code: bytes,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> bool:
-        imported_targets = cls._documentation_fenced_imported_network_targets(
-            fenced_code,
-            string_spans,
-            string_span_starts,
-        )
-        for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start()):
-                continue
-            for position, imported_name in imported_targets.get(call_match.group("target"), []):
-                if position >= call_match.start():
-                    continue
-                if cls._documentation_fenced_imported_direct_url_call_is_informational(
-                    fenced_code,
-                    call_match,
-                    imported_name,
-                    string_spans,
-                    string_span_starts,
-                ):
-                    continue
-                return True
-        return False
-
-    @classmethod
-    def _documentation_fenced_imported_direct_url_call_is_informational(
-        cls,
-        fenced_code: bytes,
-        call_match: re.Match[bytes],
-        imported_name: bytes,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> bool:
-        if imported_name not in {b"get", b"head", b"urlopen"}:
-            return False
-        parsed_argument = cls._documentation_fenced_passive_safe_call_argument(
-            fenced_code,
-            call_match.end(),
-            string_spans,
-        )
-        if parsed_argument is None:
-            return False
-        direct_url, variable_target = parsed_argument
-        if direct_url is not None:
-            return cls._documentation_fenced_passive_assigned_url_is_informational(direct_url)
-        if variable_target is None:
-            return False
-        assigned_url = cls._documentation_fenced_preceding_safe_assigned_url(
-            fenced_code,
-            variable_target,
-            call_match.start(),
-            string_spans,
-            string_span_starts,
-        )
-        return assigned_url is not None and cls._documentation_fenced_passive_assigned_url_is_informational(
-            assigned_url
-        )
-
-    @classmethod
-    def _documentation_fenced_has_executed_imported_fetch_response(
-        cls,
-        fenced_code: bytes,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> bool:
-        imported_targets = cls._documentation_fenced_imported_network_targets(
-            fenced_code,
-            string_spans,
-            string_span_starts,
-        )
-        for match in DOCUMENTATION_FENCED_EXECUTED_IMPORTED_FETCH_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            if any(
-                position < match.start() for position, _imported_name in imported_targets.get(match.group("target"), [])
-            ):
-                return True
-        return False
-
-    @classmethod
-    def _documentation_fenced_has_module_alias_network_call(
-        cls,
-        fenced_code: bytes,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> bool:
-        imported_targets = cls._documentation_fenced_network_module_alias_positions(
-            fenced_code,
-            string_spans,
-            string_span_starts,
-        )
-
-        return any(
-            any(position < call_match.start() for position in imported_targets.get(call_match.group("target"), []))
-            for call_match in DOCUMENTATION_FENCED_MODULE_ALIAS_NETWORK_CALL_PATTERN.finditer(fenced_code)
-            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
-        )
-
-    @classmethod
-    def _documentation_fenced_network_module_alias_positions(
-        cls,
-        fenced_code: bytes,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> dict[bytes, list[int]]:
-        imported_targets: dict[bytes, list[int]] = {}
-        network_modules = {b"requests", b"urllib.request"}
-        for match in DOCUMENTATION_FENCED_NETWORK_MODULE_IMPORT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            for name_part in cls._documentation_fenced_import_parts(match.group("imports")):
-                alias_parts = re.split(rb"\s+as\s+", name_part, maxsplit=1, flags=re.IGNORECASE)
-                module_name = alias_parts[0].strip()
-                if len(alias_parts) != 2 or module_name not in network_modules:
-                    continue
-                target = alias_parts[-1].strip()
-                if re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", target) is not None:
-                    imported_targets.setdefault(target, []).append(match.start())
-        return imported_targets
-
-    @classmethod
-    def _documentation_fenced_propagate_variable_alias_positions(
-        cls,
-        fenced_code: bytes,
-        alias_positions: dict[bytes, list[int]],
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> None:
-        changed = True
-        while changed:
-            changed = False
-            for match in DOCUMENTATION_FENCED_IMPORTED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
-                if cls._documentation_fenced_match_is_line_comment(
-                    fenced_code,
-                    match.start(),
-                ) or cls._documentation_python_string_spans_contain_absolute_position(
-                    fenced_code,
-                    match.start(),
-                    string_spans,
-                    string_span_starts,
-                ):
-                    continue
-                if not any(position < match.start() for position in alias_positions.get(match.group("source"), [])):
-                    continue
-                target_positions = alias_positions.setdefault(match.group("target"), [])
-                if match.start() in target_positions:
-                    continue
-                target_positions.append(match.start())
-                changed = True
-
-    @classmethod
-    def _documentation_fenced_has_imported_network_alias_call(
-        cls,
-        fenced_code: bytes,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> bool:
-        imported_targets = cls._documentation_fenced_imported_network_targets(
-            fenced_code,
-            string_spans,
-            string_span_starts,
-        )
-        alias_positions: dict[bytes, list[int]] = {}
-        for match in DOCUMENTATION_FENCED_IMPORTED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            if any(
-                position < match.start() for position, _imported_name in imported_targets.get(match.group("source"), [])
-            ):
-                alias_positions.setdefault(match.group("target"), []).append(match.start())
-
-        cls._documentation_fenced_propagate_variable_alias_positions(
-            fenced_code,
-            alias_positions,
-            string_spans,
-            string_span_starts,
-        )
-        return any(
-            any(position < call_match.start() for position in alias_positions.get(call_match.group("target"), []))
-            for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)
-            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
-        )
-
-    @classmethod
-    def _documentation_fenced_call_argument_end(
-        cls,
-        fenced_code: bytes,
-        argument_start: int,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        max_length: int = 4096,
-    ) -> int:
-        limit = min(len(fenced_code), argument_start + max_length)
-        depth = 1
-        position = argument_start
-        while position < limit:
-            containing_string_span = next(
-                (span for span in string_spans if span[0] <= position < span[1]),
-                None,
-            )
-            if containing_string_span is not None:
-                position = min(containing_string_span[1], limit)
-                continue
-            if cls._documentation_fenced_match_is_line_comment(fenced_code, position):
-                line_end = fenced_code.find(b"\n", position, limit)
-                if line_end == -1:
-                    return limit
-                position = line_end + 1
-                continue
-            char = fenced_code[position]
-            if char in b"([{":
-                depth += 1
-            elif char in b")]}":
-                depth -= 1
-                if depth == 0:
-                    return position
-            position += 1
-        return limit
-
-    @classmethod
-    def _documentation_fenced_passive_safe_call_argument(
-        cls,
-        fenced_code: bytes,
-        argument_start: int,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-    ) -> tuple[str | None, bytes | None] | None:
-        argument_end = cls._documentation_fenced_call_argument_end(fenced_code, argument_start, string_spans)
-        arguments = fenced_code[argument_start:argument_end]
-        direct_url_match = re.fullmatch(
-            rb"\s*[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s)]+)[\"']"
-            rb"\s*(?:,\s*stream\s*=\s*True\s*,?\s*)?",
-            arguments,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if direct_url_match is not None:
-            return direct_url_match.group("url").decode("utf-8", errors="ignore"), None
-        variable_match = re.fullmatch(
-            rb"\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)\b\s*(?:,\s*stream\s*=\s*True\s*,?\s*)?",
-            arguments,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if variable_match is not None:
-            return None, variable_match.group("target")
-        return None
-
-    @classmethod
-    def _documentation_fenced_preceding_safe_assigned_url(
-        cls,
-        fenced_code: bytes,
-        target: bytes,
-        call_position: int,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> str | None:
-        safe_assigned_urls: dict[int, str] = {}
-        for pattern in (
-            DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN,
-            DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN,
-        ):
-            for match in pattern.finditer(fenced_code):
-                if match.group("target") != target or match.start() >= call_position:
-                    continue
-                if cls._documentation_fenced_match_is_line_comment(
-                    fenced_code,
-                    match.start(),
-                ) or cls._documentation_python_string_spans_contain_absolute_position(
-                    fenced_code,
-                    match.start(),
-                    string_spans,
-                    string_span_starts,
-                ):
-                    continue
-                safe_assigned_urls[match.start()] = match.group("url").decode("utf-8", errors="ignore")
-
-        assignment_positions: list[int] = []
-        for match in DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if match.group("target") != target or match.start() >= call_position:
-                continue
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            assignment_positions.append(match.start())
-        if not assignment_positions:
-            return None
-        return safe_assigned_urls.get(max(assignment_positions))
-
-    @classmethod
-    def _documentation_fenced_has_executed_fetch_response(
-        cls,
-        fenced_code: bytes,
-        string_spans: tuple[tuple[int, int, str, bool], ...],
-        string_span_starts: tuple[int, ...],
-    ) -> bool:
-        response_assignments: dict[bytes, list[int]] = {}
-        imported_targets = cls._documentation_fenced_imported_network_targets(
-            fenced_code,
-            string_spans,
-            string_span_starts,
-        )
-        for match in DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            response_assignments.setdefault(match.group("target"), []).append(match.start())
-
-        for match in DOCUMENTATION_FENCED_FETCH_RESPONSE_CONTAINER_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            response_assignments.setdefault(match.group("target"), []).append(match.start())
-
-        for match in DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            if any(
-                position < match.start() for position, _imported_name in imported_targets.get(match.group("fetch"), [])
-            ):
-                response_assignments.setdefault(match.group("target"), []).append(match.start())
-
-        for match in DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_CONTAINER_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            if any(
-                position < match.start() for position, _imported_name in imported_targets.get(match.group("fetch"), [])
-            ):
-                response_assignments.setdefault(match.group("target"), []).append(match.start())
-
-        for match in DOCUMENTATION_FENCED_RESPONSE_CONTENT_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            if any(position < match.start() for position in response_assignments.get(match.group("source"), [])):
-                response_assignments.setdefault(match.group("target"), []).append(match.start())
-
-        cls._documentation_fenced_propagate_variable_alias_positions(
-            fenced_code,
-            response_assignments,
-            string_spans,
-            string_span_starts,
-        )
-        for exec_pattern in (
-            DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN,
-            DOCUMENTATION_FENCED_EXECUTED_RESPONSE_ARGUMENT_PATTERN,
-        ):
-            for exec_match in exec_pattern.finditer(fenced_code):
-                if cls._documentation_fenced_match_is_line_comment(fenced_code, exec_match.start()):
-                    continue
-                if any(
-                    position < exec_match.start()
-                    for position in response_assignments.get(exec_match.group("target"), [])
-                ):
-                    return True
-        for exec_match in DOCUMENTATION_FENCED_RESPONSE_EXECUTOR_CALL_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                exec_match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                exec_match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            argument_start = exec_match.end()
-            argument_end = cls._documentation_fenced_call_argument_end(
-                fenced_code,
-                argument_start,
-                string_spans,
-            )
-            executor_arguments = fenced_code[argument_start:argument_end]
-            for target, positions in response_assignments.items():
-                if not any(position < exec_match.start() for position in positions):
-                    continue
-                target_pattern = re.compile(
-                    rb"\b"
-                    + re.escape(target)
-                    + rb"\b"
-                    + DOCUMENTATION_FENCED_RESPONSE_INDEX_ACCESS
-                    + rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))?",
-                    re.IGNORECASE,
-                )
-                for target_match in target_pattern.finditer(executor_arguments):
-                    absolute_position = argument_start + target_match.start()
-                    if cls._documentation_fenced_match_is_line_comment(
-                        fenced_code,
-                        absolute_position,
-                    ) or cls._documentation_python_string_spans_contain_absolute_position(
-                        fenced_code,
-                        absolute_position,
-                        string_spans,
-                        string_span_starts,
-                    ):
-                        continue
-                    return True
-        return False
-
-    @classmethod
-    def _documentation_fenced_has_bound_session_alias_call(
-        cls,
-        fenced_code: bytes,
-        string_spans: tuple[tuple[int, int, str, bool], ...] | None = None,
-        string_span_starts: tuple[int, ...] | None = None,
-    ) -> bool:
-        if string_spans is None:
-            string_spans = cls._documentation_python_string_absolute_spans(fenced_code)
-        if string_span_starts is None:
-            string_span_starts = tuple(span[0] for span in string_spans)
-        session_assignment_positions: dict[bytes, list[int]] = {}
-        for match in DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
-                continue
-            session_assignment_positions.setdefault(match.group("target"), []).append(match.start())
-
-        module_alias_positions = cls._documentation_fenced_network_module_alias_positions(
-            fenced_code,
-            string_spans,
-            string_span_starts,
-        )
-        alias_positions: dict[bytes, list[int]] = {}
-        for match in DOCUMENTATION_FENCED_BOUND_NETWORK_METHOD_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
-                continue
-            receiver = match.group("receiver")
-            receiver_is_session = re.fullmatch(
-                rb"(?:requests\.)?session\s*\([^)]*\)", receiver, flags=re.IGNORECASE
-            ) is not None or any(
-                position < match.start() for position in session_assignment_positions.get(receiver, [])
-            )
-            receiver_is_module_alias = any(
-                position < match.start() for position in module_alias_positions.get(receiver, [])
-            )
-            if receiver_is_session or receiver_is_module_alias:
-                alias_positions.setdefault(match.group("target"), []).append(match.start())
-
-        cls._documentation_fenced_propagate_variable_alias_positions(
-            fenced_code,
-            alias_positions,
-            string_spans,
-            string_span_starts,
-        )
-        return any(
-            any(position < call_match.start() for position in alias_positions.get(call_match.group("target"), []))
-            for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)
-            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
-        )
-
-    @classmethod
-    def _documentation_fenced_passive_network_example_is_informational(cls, fenced_code: bytes) -> bool:
-        string_spans = cls._documentation_python_string_absolute_spans(fenced_code)
-        string_span_starts = tuple(span[0] for span in string_spans)
-        if (
-            DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code)
-            or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(fenced_code)
-            or DOCUMENTATION_FENCED_PROCESS_SUBSTITUTION_EXECUTION_PATTERN.search(fenced_code)
-            or DOCUMENTATION_FENCED_SESSION_HTTP_CALL_PATTERN.search(fenced_code)
-            or DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN.search(fenced_code)
-            or cls._documentation_fenced_has_executed_imported_fetch_response(
-                fenced_code,
-                string_spans,
-                string_span_starts,
-            )
-            or cls._documentation_fenced_has_imported_network_call(fenced_code, string_spans, string_span_starts)
-            or cls._documentation_fenced_has_module_alias_network_call(fenced_code, string_spans, string_span_starts)
-            or cls._documentation_fenced_has_imported_network_alias_call(fenced_code, string_spans, string_span_starts)
-            or cls._documentation_fenced_has_executed_fetch_response(fenced_code, string_spans, string_span_starts)
-            or cls._documentation_fenced_has_bound_session_alias_call(fenced_code, string_spans, string_span_starts)
-            or cls._documentation_fenced_has_call_after_assignment(
-                fenced_code,
-                DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN,
-                DOCUMENTATION_FENCED_VARIABLE_HTTP_CALL_PATTERN,
-            )
-            or cls._documentation_fenced_has_call_after_assignment(
-                fenced_code,
-                DOCUMENTATION_FENCED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN,
-                DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN,
-            )
-        ):
-            return False
-        if any(
-            match.group("method").lower() not in {b"get", b"head"}
-            for match in DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN.finditer(fenced_code)
-        ):
-            return False
-        direct_call_urls: list[str] = []
-        variable_call_refs: list[tuple[bytes, int]] = []
-        allowed_call_positions: set[int] = set()
-        for match in DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            parsed_argument = cls._documentation_fenced_passive_safe_call_argument(
-                fenced_code,
-                match.end(),
-                string_spans,
-            )
-            if parsed_argument is None:
-                continue
-            direct_url, variable_target = parsed_argument
-            allowed_call_positions.add(match.start())
-            if direct_url is not None:
-                direct_call_urls.append(direct_url)
-            elif variable_target is not None:
-                variable_call_refs.append((variable_target, match.start()))
-
-        imported_targets = cls._documentation_fenced_imported_network_targets(
-            fenced_code,
-            string_spans,
-            string_span_starts,
-        )
-        for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                call_match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                call_match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            imported_safe_call = any(
-                position < call_match.start() and imported_name in {b"get", b"head", b"urlopen"}
-                for position, imported_name in imported_targets.get(call_match.group("target"), [])
-            )
-            if not imported_safe_call:
-                continue
-            parsed_argument = cls._documentation_fenced_passive_safe_call_argument(
-                fenced_code,
-                call_match.end(),
-                string_spans,
-            )
-            if parsed_argument is None:
-                return False
-            direct_url, variable_target = parsed_argument
-            if direct_url is not None:
-                direct_call_urls.append(direct_url)
-            elif variable_target is not None:
-                variable_call_refs.append((variable_target, call_match.start()))
-
-        if any(not cls._documentation_fenced_passive_assigned_url_is_informational(url) for url in direct_call_urls):
-            return False
-        if any(
-            match.start() not in allowed_call_positions
-            for match in DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN.finditer(fenced_code)
-        ):
-            return False
-        if any(
-            match.group().lower() not in {b"requests.get", b"urlopen"}
-            for match in DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN.finditer(fenced_code)
-        ):
-            return False
-        safe_assigned_urls: dict[tuple[bytes, int], str] = {}
-        for pattern in (
-            DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN,
-            DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN,
-        ):
-            for match in pattern.finditer(fenced_code):
-                if cls._documentation_fenced_match_is_line_comment(
-                    fenced_code,
-                    match.start(),
-                ) or cls._documentation_python_string_spans_contain_absolute_position(
-                    fenced_code,
-                    match.start(),
-                    string_spans,
-                    string_span_starts,
-                ):
-                    continue
-                safe_assigned_urls[(match.group("target"), match.start())] = match.group("url").decode(
-                    "utf-8",
-                    errors="ignore",
-                )
-        assignment_positions: dict[bytes, list[int]] = {}
-        for match in DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(
-                fenced_code,
-                match.start(),
-            ) or cls._documentation_python_string_spans_contain_absolute_position(
-                fenced_code,
-                match.start(),
-                string_spans,
-                string_span_starts,
-            ):
-                continue
-            assignment_positions.setdefault(match.group("target"), []).append(match.start())
-        call_target_urls: list[str] = []
-        for target, call_position in variable_call_refs:
-            preceding_assignments = [
-                position for position in assignment_positions.get(target, []) if position < call_position
-            ]
-            if not preceding_assignments:
-                return False
-            assigned_url = safe_assigned_urls.get((target, preceding_assignments[-1]))
-            if assigned_url is None or not cls._documentation_fenced_passive_assigned_url_is_informational(
-                assigned_url
-            ):
-                return False
-            call_target_urls.append(assigned_url)
-        bare_urls = [
-            match.group().decode("utf-8", errors="ignore").rstrip("`.")
-            for match in DOCUMENTATION_FENCED_BARE_URL_TOKEN_PATTERN.finditer(fenced_code)
-        ]
-        if any(not cls._documentation_fenced_bare_url_is_informational(url) for url in bare_urls):
-            return False
-        vetted_call_urls = (*call_target_urls, *direct_call_urls)
-        if any(cls._documentation_loopback_api_url_is_informational(url) for url in bare_urls):
-            if vetted_call_urls:
-                return all(cls._documentation_loopback_api_url_is_informational(url) for url in vetted_call_urls)
-            return re.search(rb"\b(?:getattr|requests|urllib|urlopen)\b", fenced_code, flags=re.IGNORECASE) is None
-        return bool(vetted_call_urls) and all(
-            cls._documentation_fenced_passive_media_url_is_informational(url) for url in vetted_call_urls
-        )
-
-    @classmethod
-    def _documentation_fenced_passive_network_example_ranges(
-        cls,
-        payload: bytes,
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-    ) -> tuple[tuple[int, int], ...]:
-        return tuple(
-            (range_start, range_end)
-            for range_start, range_end in fenced_code_ranges
-            if cls._documentation_fenced_passive_network_example_is_informational(payload[range_start:range_end])
-        )
-
-    @classmethod
-    def _documentation_fenced_passive_network_example_contains_finding(
-        cls,
-        payload: bytes,
-        finding: dict[str, Any],
-        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
-    ) -> bool:
-        finding_position = finding.get("position")
-        return (
-            finding.get("type") in DOCUMENTATION_FENCED_PASSIVE_NETWORK_FINDING_TYPES
-            and isinstance(finding_position, int)
-            and cls._documentation_position_is_fenced_code(fenced_passive_network_example_ranges, finding_position)
-            and cls._documentation_fenced_passive_finding_matches_vetted_example(payload, finding)
-        )
-
-    @classmethod
-    def _documentation_fenced_passive_finding_matches_vetted_example(
-        cls,
-        payload: bytes,
-        finding: dict[str, Any],
-    ) -> bool:
-        finding_type = finding.get("type")
-        if finding_type == "network_function":
-            return finding.get("function") in {"requests.get", "urlopen"}
-        if finding_type == "network_library":
-            return finding.get("library") in {"requests", "urllib"}
-        if finding_type not in PASSIVE_NETWORK_FINDING_TYPES | {"suspicious_port"}:
-            return False
-        line_parts = cls._finding_line_parts(payload, finding)
-        if line_parts is None:
-            return False
-        line, position = line_parts
-        return any(
-            match.start() <= position < match.end()
-            and cls._documentation_fenced_bare_url_is_informational(
-                match.group().decode("utf-8", errors="ignore").rstrip("`.")
-            )
-            for match in DOCUMENTATION_FENCED_BARE_URL_TOKEN_PATTERN.finditer(line)
-        )
-
-    @classmethod
-    def _documentation_fenced_network_command_is_informational(
-        cls,
-        payload: bytes,
-        finding: dict[str, Any],
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-    ) -> bool:
-        if finding.get("command_type") != "git_clone":
-            return False
-        destination = finding.get("destination")
-        if not isinstance(destination, str) or not destination.casefold().startswith(
-            ("git@github.com:", "https://github.com/")
-        ):
-            return False
-        line_parts = cls._finding_line_parts(payload, finding)
-        if line_parts is None:
-            return False
-        line, position = line_parts
-        match_line = line.rstrip(b"\r")
-        clone_match = DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN.match(match_line)
-        if clone_match is None:
-            return False
-        trailing = match_line[clone_match.end() :].strip()
-        if trailing and not trailing.startswith(b"#"):
-            return False
-        return not cls._documentation_fenced_git_clone_block_executes_checkout(
-            payload,
-            position,
-            clone_match,
-            fenced_code_ranges,
-        )
-
-    @classmethod
-    def _documentation_fenced_finding_is_informational(
-        cls,
-        payload: bytes,
-        finding: dict[str, Any],
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
-    ) -> bool:
-        if cls._documentation_fenced_passive_network_example_contains_finding(
-            payload,
-            finding,
-            fenced_passive_network_example_ranges,
-        ):
-            return True
-        finding_type = finding.get("type")
-        if finding_type == "network_command":
-            return cls._documentation_fenced_network_command_is_informational(payload, finding, fenced_code_ranges)
-        if finding_type in PASSIVE_NETWORK_FINDING_TYPES:
-            return cls._documentation_fenced_passive_finding_is_informational(payload, finding, fenced_code_ranges)
-        return finding_type in {
-            "cc_pattern",
-            "suspicious_port",
-        } and not cls._documentation_finding_is_actionable(
-            payload,
-            finding,
+            or cls._documentation_structured_config_value_prefix_is_actionable(prefix)
         )
 
     @staticmethod
@@ -3087,8 +2123,6 @@ class TextScanner(BaseScanner):
         payload: bytes,
         lowered_payload: bytes,
         finding: dict[str, Any],
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
         remaining_occurrences: int,
         allow_exhaustion_probe: bool,
     ) -> tuple[dict[str, Any], bool, int]:
@@ -3126,16 +2160,7 @@ class TextScanner(BaseScanner):
             candidate = {**finding, "position": position}
             if finding_type == "network_library":
                 candidate["pattern"] = token_bytes.decode()
-            if cls._documentation_comment_contains_position(payload, position) or (
-                fenced_code_ranges
-                and cls._documentation_position_is_fenced_code(fenced_code_ranges, position)
-                and cls._documentation_fenced_finding_is_informational(
-                    payload,
-                    candidate,
-                    fenced_code_ranges,
-                    fenced_passive_network_example_ranges,
-                )
-            ):
+            if cls._documentation_comment_contains_position(payload, position):
                 actionable = False
             elif finding_type == "network_function":
                 actionable = not cls._documentation_network_function_is_prose(payload, candidate)
@@ -3322,6 +2347,125 @@ class TextScanner(BaseScanner):
         return any(isinstance(value, str) and line_text == value.casefold() for value in candidates)
 
     @classmethod
+    def _is_bare_data_secret_token(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        if finding.get("secret_type") not in PASSIVE_DATA_SECRET_TYPES:
+            return False
+        line_parts = cls._finding_line_parts(payload, finding)
+        if line_parts is None:
+            return False
+        line, position = line_parts
+        length = finding.get("length")
+        if not isinstance(length, int) or length <= 0 or position + length > len(line):
+            return False
+        stripped = line.strip()
+        if not stripped or b"@" in stripped or b":" in stripped or b"=" in stripped:
+            return False
+        return line[position : position + length].strip() == stripped
+
+    @staticmethod
+    def _passive_data_basic_token_decodes_to_credentials(token: bytes) -> bool:
+        return SecretsDetector._basic_auth_token_decodes_to_credentials(token.decode("ascii"))
+
+    @staticmethod
+    def _passive_data_bearer_token_is_credential_like(token: bytes) -> bool:
+        unpadded_token = token.rstrip(b"=")
+        return any(byte in PASSIVE_DATA_BEARER_TOKEN_MARKER_BYTES for byte in unpadded_token)
+
+    @classmethod
+    def _passive_data_bare_secret_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        line = cls._finding_line(payload, finding)
+        if line is None:
+            return False
+
+        secret_type = finding.get("secret_type")
+        if secret_type == "Basic Auth Credentials":
+            match = PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN.match(line)
+            return match is not None and cls._passive_data_basic_token_decodes_to_credentials(match.group("token"))
+        if secret_type == "Bearer Token":
+            match = PASSIVE_DATA_BEARER_AUTH_LINE_PATTERN.match(line)
+            return match is not None and cls._passive_data_bearer_token_is_credential_like(match.group("token"))
+        return True
+
+    @classmethod
+    def _passive_data_auth_line_has_existing_finding(
+        cls,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        *,
+        line_start: int,
+        line_end: int,
+        secret_type: str,
+    ) -> bool:
+        for finding in findings:
+            if finding.get("secret_type") != secret_type:
+                continue
+            position = finding.get("position")
+            if isinstance(position, int) and line_start <= position <= line_end:
+                return True
+            line = cls._finding_line(payload, finding)
+            if line is not None and payload[line_start:line_end].strip() == line:
+                return True
+        return False
+
+    @classmethod
+    def _passive_data_auth_line_secret_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        *,
+        max_findings: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        if not cls._is_passive_data_sidecar(path):
+            return [], None
+
+        passive_findings: list[dict[str, Any]] = []
+        for match in PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN.finditer(payload):
+            token = match.group("token")
+            if not cls._passive_data_basic_token_decodes_to_credentials(token):
+                continue
+
+            secret_type = "Basic Auth Credentials"
+            line_start, line_end, _line_number = cls._documentation_line_bounds(payload, match.start())
+            if cls._passive_data_auth_line_has_existing_finding(
+                payload,
+                findings + passive_findings,
+                line_start=line_start,
+                line_end=line_end,
+                secret_type=secret_type,
+            ):
+                continue
+
+            token_position = match.start("token")
+            if len(findings) + len(passive_findings) >= max_findings:
+                return passive_findings, {
+                    "type": DETECTOR_FINDING_LIMIT_TYPE,
+                    "detector": "secrets",
+                    "severity": "INFO",
+                    "message": "Embedded secret findings exceeded the configured reporting limit",
+                    "max_findings": max_findings,
+                    "analysis_incomplete": True,
+                    "context": path,
+                }
+            passive_findings.append(
+                {
+                    "type": "embedded_secret",
+                    "severity": "CRITICAL",
+                    "secret_type": secret_type,
+                    "position": token_position,
+                    "length": len(token),
+                    "confidence": 0.8,
+                    "pattern": "passive_data_auth_line",
+                    "redacted_value": "Basic <redacted>",
+                    "message": f"{secret_type} detected in passive data sidecar (confidence: 80%)",
+                    "context": f"{path} pos:{token_position}",
+                    "recommendation": f"Remove {secret_type} from model data immediately",
+                    "passive_data_sidecar": True,
+                }
+            )
+        return passive_findings, None
+
+    @classmethod
     def _is_isolated_tokenizer_vocabulary_cc_finding(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         if finding.get("type") != "cc_pattern":
             return False
@@ -3395,44 +2539,151 @@ class TextScanner(BaseScanner):
         return True
 
     @staticmethod
-    def _documentation_network_token_value(match: re.Match[bytes]) -> str:
-        return match.group().rstrip(b"`.,;:!?)\"'>]}").decode("utf-8", errors="ignore")
-
-    @classmethod
-    def _documentation_bare_network_token_candidate_is_relevant(cls, line: bytes, position: int) -> bool:
-        return (
-            not cls._documentation_line_is_code_shaped(line, position)
-            or DOCUMENTATION_CONFIG_NETWORK_KEY_PATTERN.search(line) is not None
-            or DOCUMENTATION_CONFIG_TAG_PATTERN.search(line) is not None
-        )
+    def _documentation_position_is_in_bibliography_entry(
+        payload: bytes,
+        line_start: int,
+        position: int | None = None,
+    ) -> bool:
+        context_end = line_start if position is None else min(max(position, 0), len(payload))
+        context_start = max(0, context_end - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context = payload[context_start:context_end]
+        entry_start = None
+        for match in DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN.finditer(context):
+            entry_start = match.start()
+        if entry_start is None:
+            return False
+        entry_context = context[entry_start:]
+        return entry_context.count(b"{") > entry_context.count(b"}")
 
     @staticmethod
-    def _documentation_bare_token_is_local_file_reference(token: bytes) -> bool:
-        normalized = token.rstrip(b"`.,;:!?)\"'>]}").lower()
-        return (
-            normalized.count(b".") == 1
-            and b"/" not in normalized
-            and b"\\" not in normalized
-            and b"@" not in normalized
-            and normalized.endswith(DOCUMENTATION_LOCAL_FILE_TOKEN_SUFFIXES)
+    def _documentation_bibliography_entry_closes_after_position(payload: bytes, position: int) -> bool:
+        position = min(max(position, 0), len(payload))
+        context_start = max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context_end = min(len(payload), position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context = payload[context_start:context_end]
+        relative_position = position - context_start
+        entry_start = None
+        for match in DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN.finditer(context[:relative_position]):
+            entry_start = match.start()
+        if entry_start is None:
+            return False
+        entry_context = context[entry_start:]
+        return entry_context.count(b"{") <= entry_context.count(b"}")
+
+    @classmethod
+    def _documentation_position_is_in_passive_bibliography_field(cls, payload: bytes, position: int) -> bool:
+        position = min(max(position, 0), len(payload))
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        if not cls._documentation_position_is_in_bibliography_entry(payload, line_start, position):
+            return False
+        line = payload[line_start:line_end]
+        line_position = position - line_start
+        field_match = DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN.search(line[:line_position])
+        if field_match is None:
+            return False
+        field = field_match.group("field").lower()
+        if field == b"url":
+            delimiter = field_match.group("delimiter")
+            return delimiter not in {b'"', b"'"} or cls._documentation_bibliography_entry_closes_after_position(
+                payload,
+                position,
+            )
+        return field in DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS
+
+    @classmethod
+    def _documentation_bibliography_url_field_is_passive(
+        cls,
+        payload: bytes,
+        line_start: int,
+        line: bytes,
+        position: int,
+    ) -> bool:
+        url_match = DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN.search(line[:position])
+        if url_match is None or not cls._documentation_position_is_in_bibliography_entry(
+            payload,
+            line_start,
+            line_start + position,
+        ):
+            return False
+        delimiter = url_match.group("delimiter")
+        return delimiter not in {b'"', b"'"} or cls._documentation_bibliography_entry_closes_after_position(
+            payload,
+            line_start + position,
         )
 
     @classmethod
-    def _documentation_code_bare_network_token_requires_classification(cls, line: bytes, position: int) -> bool:
-        token_match = next(
-            (
-                match
-                for match in BARE_NETWORK_DOMAIN_TOKEN_PATTERN.finditer(line)
-                if match.start() <= position < match.end()
-            ),
-            None,
-        )
-        if token_match is not None and cls._documentation_bare_token_is_local_file_reference(token_match.group()):
-            return False
-        return cls._documentation_python_string_contains_position(
-            line,
-            position,
-        ) and cls._documentation_assignment_is_actionable(line[:position])
+    def _documentation_network_token_lines_are_passive(cls, payload: bytes) -> bool:
+        line_start = 0
+        while line_start <= len(payload):
+            line_end = payload.find(b"\n", line_start)
+            if line_end < 0:
+                line_end = len(payload)
+            line = payload[line_start:line_end]
+            url_spans: list[tuple[int, int]] = []
+            for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
+                url_spans.append((match.start(), match.end()))
+                if cls._documentation_bibliography_url_field_is_passive(payload, line_start, line, match.start()):
+                    continue
+                absolute_position = line_start + match.start()
+                if (
+                    cls._documentation_line_is_code_shaped(
+                        line,
+                        match.start(),
+                    )
+                    or cls._documentation_multiline_return_contains_position(
+                        payload,
+                        absolute_position,
+                    )
+                    or cls._documentation_open_call_contains_position(payload, absolute_position)
+                    or cls._documentation_multiline_literal_contains_position(payload, absolute_position)
+                    or cls._documentation_nested_config_contains_position(payload, absolute_position)
+                ):
+                    return False
+            for pattern in (
+                BARE_NETWORK_IPV4_TOKEN_PATTERN,
+                BARE_NETWORK_IPV6_TOKEN_PATTERN,
+                BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
+            ):
+                for match in pattern.finditer(line):
+                    if any(start <= match.start() < end for start, end in url_spans):
+                        continue
+                    if pattern is BARE_NETWORK_DOMAIN_TOKEN_PATTERN:
+                        if cls._documentation_position_is_in_passive_bibliography_field(
+                            payload,
+                            line_start + match.start(),
+                        ):
+                            continue
+                        before = line[match.start() - 1 : match.start()] if match.start() > 0 else b""
+                        after = line[match.end() : match.end() + 1]
+                        if before in {b".", b"_"} or after in {b".", b"_"}:
+                            continue
+                        tld = match.group().rsplit(b".", 1)[-1].decode("utf-8", errors="ignore").casefold()
+                        if tld not in DOCUMENTATION_BARE_DOMAIN_TLDS:
+                            if DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN.search(line[: match.start()]) is not None:
+                                return False
+                            continue
+                    absolute_position = line_start + match.start()
+                    if (
+                        cls._documentation_line_is_code_shaped(
+                            line,
+                            match.start(),
+                        )
+                        or cls._documentation_multiline_return_contains_position(
+                            payload,
+                            absolute_position,
+                        )
+                        or cls._documentation_open_call_contains_position(payload, absolute_position)
+                        or cls._documentation_multiline_literal_contains_position(payload, absolute_position)
+                        or cls._documentation_nested_config_contains_position(payload, absolute_position)
+                    ):
+                        return False
+            if line_end == len(payload):
+                break
+            line_start = line_end + 1
+        return True
 
     @staticmethod
     def _split_detector_finding_limit(
@@ -3448,155 +2699,6 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _documentation_network_candidates_are_informational(
-        cls,
-        path: str,
-        payload: bytes,
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
-    ) -> bool:
-        offset = 0
-        for raw_line in payload.splitlines(keepends=True):
-            line = raw_line.rstrip(b"\r\n")
-            url_matches = tuple(BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line))
-            url_spans = tuple((match.start(), match.end()) for match in url_matches)
-            for match in url_matches:
-                position = offset + match.start()
-                if cls._documentation_position_is_fenced_code(fenced_code_ranges, position) and (
-                    cls._documentation_fenced_network_command_is_informational(
-                        payload,
-                        {
-                            "type": "network_command",
-                            "command_type": "git_clone",
-                            "destination": cls._documentation_network_token_value(match),
-                            "position": position,
-                        },
-                        fenced_code_ranges,
-                    )
-                ):
-                    continue
-                finding = {
-                    "type": "url_detected",
-                    "url": cls._documentation_network_token_value(match),
-                    "position": position,
-                }
-                if not cls._sidecar_network_finding_is_informational(
-                    path,
-                    payload,
-                    finding,
-                    fenced_code_ranges,
-                    fenced_passive_network_example_ranges,
-                ):
-                    return False
-            for pattern, finding_type, value_key in (
-                (BARE_NETWORK_IPV4_TOKEN_PATTERN, "ipv4_address", "ip"),
-                (BARE_NETWORK_IPV6_TOKEN_PATTERN, "ipv6_address", "ip"),
-                (BARE_NETWORK_DOMAIN_TOKEN_PATTERN, "domain", "domain"),
-            ):
-                for match in pattern.finditer(line):
-                    if cls._span_overlaps_any(match.start(), match.end(), url_spans):
-                        continue
-                    if not cls._documentation_bare_network_token_candidate_is_relevant(line, match.start()):
-                        if cls._documentation_code_bare_network_token_requires_classification(line, match.start()):
-                            return False
-                        continue
-                    finding = {
-                        "type": finding_type,
-                        value_key: cls._documentation_network_token_value(match),
-                        "position": offset + match.start(),
-                    }
-                    if not cls._sidecar_network_finding_is_informational(
-                        path,
-                        payload,
-                        finding,
-                        fenced_code_ranges,
-                        fenced_passive_network_example_ranges,
-                    ):
-                        return False
-            for match in DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN.finditer(line):
-                function = match.group().decode("utf-8", errors="ignore")
-                finding = {"type": "network_function", "function": function, "position": offset + match.start()}
-                if not cls._sidecar_network_finding_is_informational(
-                    path,
-                    payload,
-                    finding,
-                    fenced_code_ranges,
-                    fenced_passive_network_example_ranges,
-                ):
-                    return False
-            for match in DOCUMENTATION_NETWORK_LIBRARY_IMPORT_PATTERN.finditer(line):
-                library = match.group("library").decode("utf-8", errors="ignore")
-                import_pattern = match.group("pattern").decode("utf-8", errors="ignore")
-                finding = {
-                    "type": "network_library",
-                    "library": library,
-                    "pattern": import_pattern,
-                    "position": offset + match.start("pattern"),
-                }
-                if not cls._sidecar_network_finding_is_informational(
-                    path,
-                    payload,
-                    finding,
-                    fenced_code_ranges,
-                    fenced_passive_network_example_ranges,
-                ):
-                    return False
-            for match in DOCUMENTATION_NETWORK_LIBRARY_USAGE_PATTERN.finditer(line):
-                library = match.group("library").decode("utf-8", errors="ignore")
-                finding = {
-                    "type": "network_library",
-                    "library": library,
-                    "pattern": match.group().decode("utf-8", errors="ignore"),
-                    "position": offset + match.start(),
-                }
-                if not cls._sidecar_network_finding_is_informational(
-                    path,
-                    payload,
-                    finding,
-                    fenced_code_ranges,
-                    fenced_passive_network_example_ranges,
-                ):
-                    return False
-            offset += len(raw_line)
-        return True
-
-    @classmethod
-    def _documentation_passive_network_reporting_limit(
-        cls,
-        path: str,
-        payload: bytes,
-        findings: list[dict[str, Any]],
-        finding_limit: dict[str, Any],
-    ) -> bool:
-        truncated_finding_type = finding_limit.get("truncated_finding_type")
-        if truncated_finding_type not in PASSIVE_NETWORK_FINDING_TYPES:
-            return False
-        if not cls._is_documentation_sidecar(path) or any(finding.get("severity") != "INFO" for finding in findings):
-            return False
-        fenced_code_ranges, fence_classification_incomplete = cls._documentation_fenced_code_ranges(payload)
-        if fence_classification_incomplete:
-            return False
-        fenced_passive_network_example_ranges = cls._documentation_fenced_passive_network_example_ranges(
-            payload,
-            fenced_code_ranges,
-        )
-        truncated_finding = finding_limit.get("truncated_finding")
-        if isinstance(truncated_finding, dict) and not cls._sidecar_network_finding_is_informational(
-            path,
-            payload,
-            truncated_finding,
-            fenced_code_ranges,
-            fenced_passive_network_example_ranges,
-        ):
-            return False
-        return cls._documentation_network_candidates_are_informational(
-            path,
-            payload,
-            fenced_code_ranges,
-            fenced_passive_network_example_ranges,
-        )
-
-    @classmethod
     def _passive_network_reporting_limit(
         cls,
         path: str,
@@ -3604,11 +2706,15 @@ class TextScanner(BaseScanner):
         findings: list[dict[str, Any]],
         finding_limit: dict[str, Any],
     ) -> bool:
-        truncated_finding = finding_limit.get("truncated_finding")
-        if cls._documentation_passive_network_reporting_limit(path, payload, findings, finding_limit):
-            return True
+        if finding_limit.get(
+            "truncated_finding_type"
+        ) == "endpoint_redaction_classification" and cls._is_documentation_sidecar(path):
+            return all(
+                cls._sidecar_network_finding_is_informational(path, payload, finding) for finding in findings
+            ) and cls._documentation_network_token_lines_are_passive(payload)
         if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
+        truncated_finding = finding_limit.get("truncated_finding")
         return (
             cls._is_passive_data_sidecar(path)
             and all(finding.get("severity") == "INFO" for finding in findings)
@@ -3623,25 +2729,16 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         finding: dict[str, Any],
-        fenced_code_ranges: tuple[tuple[int, int], ...] = (),
-        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...] = (),
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
             position = finding.get("position")
             if isinstance(position, int) and cls._documentation_comment_contains_position(payload, position):
                 return True
+            filename = os.path.basename(path).lower()
             if (
-                isinstance(position, int)
-                and fenced_code_ranges
-                and cls._documentation_position_is_fenced_code(fenced_code_ranges, position)
-                and cls._documentation_fenced_finding_is_informational(
-                    payload,
-                    finding,
-                    fenced_code_ranges,
-                    fenced_passive_network_example_ranges,
-                )
-            ):
+                cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename)
+            ) and cls._documentation_package_version_is_informational(payload, finding):
                 return True
             return (
                 (
@@ -3666,6 +2763,467 @@ class TextScanner(BaseScanner):
             finding,
         )
 
+    @staticmethod
+    def _documentation_line_bounds_lookup(
+        payload: bytes,
+        positions: list[int],
+    ) -> dict[int, tuple[int, int, int]]:
+        normalized_positions = sorted({min(max(position, 0), len(payload)) for position in positions})
+        lookup: dict[int, tuple[int, int, int]] = {}
+        if not normalized_positions:
+            return lookup
+
+        line_start = 0
+        line_number = 1
+        position_index = 0
+        while position_index < len(normalized_positions):
+            line_end = payload.find(b"\n", line_start)
+            if line_end < 0:
+                line_end = len(payload)
+            while position_index < len(normalized_positions) and normalized_positions[position_index] <= line_end:
+                lookup[normalized_positions[position_index]] = (line_start, line_end, line_number)
+                position_index += 1
+            if line_end == len(payload):
+                break
+            line_start = line_end + 1
+            line_number += 1
+        return lookup
+
+    @staticmethod
+    def _documentation_line_bounds(
+        payload: bytes,
+        position: int,
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
+    ) -> tuple[int, int, int]:
+        position = min(max(position, 0), len(payload))
+        if line_lookup is not None and (line_bounds := line_lookup.get(position)) is not None:
+            return line_bounds
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        return line_start, line_end, payload.count(b"\n", 0, line_start) + 1
+
+    @staticmethod
+    def _normalize_documentation_network_evidence_value(value: str) -> str:
+        normalized = value.strip().lstrip(DOCUMENTATION_NETWORK_EVIDENCE_LEADING_DELIMITERS)
+        normalized = normalized.rstrip(DOCUMENTATION_NETWORK_EVIDENCE_TRAILING_DELIMITERS)
+        if "://" in normalized:
+            normalized = redact_url_for_finding(normalized)
+        try:
+            parsed = urlsplit(normalized)
+        except ValueError:
+            return normalized.casefold()
+        if parsed.scheme and parsed.netloc:
+            return urlunsplit(
+                (
+                    parsed.scheme.casefold(),
+                    parsed.netloc.casefold(),
+                    parsed.path,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        return normalized.casefold()
+
+    @classmethod
+    def _documentation_network_evidence_from_span(
+        cls,
+        payload: bytes,
+        span_start: int,
+        span_end: int,
+        *,
+        kind: str,
+        value: str,
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
+    ) -> dict[str, Any]:
+        line_start, _line_end, line_number = cls._documentation_line_bounds(payload, span_start, line_lookup)
+        column = len(payload[line_start:span_start].decode("utf-8", errors="replace")) + 1
+        return {
+            "kind": kind,
+            "value": cls._normalize_documentation_network_evidence_value(value),
+            "line": line_number,
+            "column": column,
+            "span_start": span_start,
+            "span_end": span_end,
+        }
+
+    @staticmethod
+    def _documentation_url_scheme_byte_is_valid(value: int, *, first: bool = False) -> bool:
+        return (
+            (65 <= value <= 90)
+            or (97 <= value <= 122)
+            or (not first and ((48 <= value <= 57) or value in {ord("+"), ord("."), ord("-")}))
+        )
+
+    @classmethod
+    def _documentation_url_scheme_is_valid(cls, scheme: bytes) -> bool:
+        return (
+            bool(scheme)
+            and cls._documentation_url_scheme_byte_is_valid(scheme[0], first=True)
+            and all(cls._documentation_url_scheme_byte_is_valid(value) for value in scheme[1:])
+        )
+
+    @staticmethod
+    def _documentation_url_candidate_end(payload: bytes, span_start: int, line_end: int) -> int | None:
+        scan_end = min(line_end, span_start + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        span_end = span_start
+        while span_end < scan_end and payload[span_end] not in DOCUMENTATION_NETWORK_URL_BOUNDARY_BYTES:
+            span_end += 1
+        if (
+            span_end == scan_end
+            and span_end < line_end
+            and payload[span_end] not in DOCUMENTATION_NETWORK_URL_BOUNDARY_BYTES
+        ):
+            return None
+        return span_end
+
+    @classmethod
+    def _documentation_bare_url_span_at_position(
+        cls,
+        payload: bytes,
+        position: int,
+        line_start: int,
+        line_end: int,
+    ) -> tuple[int, int] | None:
+        if line_start >= line_end:
+            return None
+        position = min(max(position, line_start), line_end - 1)
+        separator_start = max(line_start, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        separator_end = min(
+            line_end,
+            position + DOCUMENTATION_NETWORK_URL_MAX_SCHEME_BYTES + len(b"://"),
+        )
+        matching_spans: list[tuple[int, int]] = []
+        seen_starts: set[int] = set()
+        separator = payload.find(b"://", separator_start, separator_end)
+        while separator >= 0:
+            candidate_starts: list[int] = []
+            if position <= separator and cls._documentation_url_scheme_is_valid(payload[position:separator]):
+                candidate_starts.append(position)
+
+            scheme_start = separator - 1
+            minimum_scheme_start = max(line_start, separator - DOCUMENTATION_NETWORK_URL_MAX_SCHEME_BYTES)
+            while scheme_start > minimum_scheme_start and cls._documentation_url_scheme_byte_is_valid(
+                payload[scheme_start - 1]
+            ):
+                scheme_start -= 1
+            if cls._documentation_url_scheme_is_valid(payload[scheme_start:separator]):
+                candidate_starts.append(scheme_start)
+
+            for candidate_start in candidate_starts:
+                if candidate_start in seen_starts:
+                    continue
+                seen_starts.add(candidate_start)
+                candidate_end = cls._documentation_url_candidate_end(payload, candidate_start, line_end)
+                if (
+                    candidate_end is not None
+                    and candidate_start <= position < candidate_end
+                    and BARE_NETWORK_URL_TOKEN_PATTERN.fullmatch(payload[candidate_start:candidate_end]) is not None
+                ):
+                    matching_spans.append((candidate_start, candidate_end))
+            separator = payload.find(b"://", separator + len(b"://"), separator_end)
+        if not matching_spans:
+            return None
+        return min(matching_spans, key=lambda span: (span[1] - span[0], -span[0]))
+
+    @classmethod
+    def _documentation_url_evidence_at_position(
+        cls,
+        payload: bytes,
+        position: int,
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
+    ) -> dict[str, Any] | None:
+        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position, line_lookup)
+        span = cls._documentation_bare_url_span_at_position(payload, position, line_start, line_end)
+        if span is not None:
+            span_start, span_end = span
+            raw_value = payload[span_start:span_end].decode("utf-8", errors="ignore")
+            return cls._documentation_network_evidence_from_span(
+                payload,
+                span_start,
+                span_end,
+                kind="url",
+                value=redact_url_for_finding(raw_value),
+                line_lookup=line_lookup,
+            )
+        return None
+
+    @classmethod
+    def _documentation_network_command_evidence(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
+    ) -> dict[str, Any] | None:
+        position = finding.get("position")
+        destination = finding.get("destination")
+        if not isinstance(position, int) or not isinstance(destination, str) or not destination:
+            return None
+
+        url_evidence = cls._documentation_url_evidence_at_position(payload, position, line_lookup)
+        if url_evidence is not None:
+            return url_evidence
+
+        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position, line_lookup)
+        line_position = position - line_start
+        destination_match = DOCUMENTATION_NETWORK_DESTINATION_TOKEN_PATTERN.match(
+            payload[line_start:line_end], line_position
+        )
+        if destination_match is None:
+            return None
+        return cls._documentation_network_evidence_from_span(
+            payload,
+            line_start + destination_match.start(),
+            line_start + destination_match.end(),
+            kind="destination",
+            value=destination,
+            line_lookup=line_lookup,
+        )
+
+    @staticmethod
+    def _documentation_network_command_is_correlatable(finding: dict[str, Any]) -> bool:
+        return finding.get("type") == "network_command" and finding.get("command_type") == "git_clone"
+
+    @classmethod
+    def _documentation_network_command_evidences(
+        cls,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        line_lookup: dict[int, tuple[int, int, int]],
+    ) -> list[dict[str, Any]]:
+        return [
+            evidence
+            for finding in findings
+            if cls._documentation_network_command_is_correlatable(finding)
+            if (evidence := cls._documentation_network_command_evidence(payload, finding, line_lookup)) is not None
+        ]
+
+    @staticmethod
+    def _documentation_network_evidence_at_position(
+        evidences: list[dict[str, Any]],
+        position: int,
+    ) -> dict[str, Any] | None:
+        matching_evidences = [
+            evidence for evidence in evidences if int(evidence["span_start"]) <= position < int(evidence["span_end"])
+        ]
+        if not matching_evidences:
+            return None
+        return min(matching_evidences, key=lambda evidence: int(evidence["span_end"]) - int(evidence["span_start"]))
+
+    @classmethod
+    def _documentation_network_finding_evidence(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+        command_evidences: list[dict[str, Any]],
+        line_lookup: dict[int, tuple[int, int, int]],
+    ) -> dict[str, Any] | None:
+        finding_type = finding.get("type")
+        position = finding.get("position")
+        if finding_type not in CORRELATABLE_DOCUMENTATION_NETWORK_FINDING_TYPES or not isinstance(position, int):
+            return None
+        if finding_type == "network_command" and not cls._documentation_network_command_is_correlatable(finding):
+            return None
+
+        url_evidence = cls._documentation_url_evidence_at_position(payload, position, line_lookup)
+        if url_evidence is not None:
+            if finding_type in {"cloud_storage_url", "url_detected"}:
+                finding_url = finding.get("url")
+                if isinstance(finding_url, str) and finding_url:
+                    normalized_finding_url = cls._normalize_documentation_network_evidence_value(finding_url)
+                    if str(url_evidence["value"]) != normalized_finding_url:
+                        return cls._documentation_network_evidence_from_span(
+                            payload,
+                            position,
+                            position + len(finding_url.encode("utf-8", errors="ignore")),
+                            kind="url",
+                            value=finding_url,
+                            line_lookup=line_lookup,
+                        )
+            return url_evidence
+
+        command_evidence = cls._documentation_network_evidence_at_position(command_evidences, position)
+        if command_evidence is not None:
+            return command_evidence
+
+        if finding_type == "network_command":
+            return cls._documentation_network_command_evidence(payload, finding, line_lookup)
+
+        if finding_type in {"domain", "domain_name"}:
+            value = finding.get("domain")
+            kind = "host"
+        elif finding_type in {"ipv4_address", "ipv6_address"}:
+            value = finding.get("ip")
+            kind = "ip"
+        elif finding_type in {"cloud_storage_url", "url_detected"}:
+            value = finding.get("url")
+            kind = "url"
+        else:
+            return None
+
+        if not isinstance(value, str) or not value:
+            return None
+        return cls._documentation_network_evidence_from_span(
+            payload,
+            position,
+            position + len(value.encode("utf-8", errors="ignore")),
+            kind=kind,
+            value=value,
+            line_lookup=line_lookup,
+        )
+
+    @staticmethod
+    def _documentation_network_finding_sort_key(finding: dict[str, Any], original_index: int) -> tuple[int, int, int]:
+        severity = str(finding.get("severity", "WARNING")).upper()
+        finding_type = str(finding.get("type", ""))
+        return (
+            DOCUMENTATION_NETWORK_FINDING_PRIORITY.get(finding_type, 0),
+            DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK.get(
+                severity,
+                DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK["WARNING"],
+            ),
+            -original_index,
+        )
+
+    @staticmethod
+    def _highest_documentation_network_severity(findings: list[dict[str, Any]]) -> str:
+        return max(
+            (str(finding.get("severity", "WARNING")).upper() for finding in findings),
+            key=lambda severity: DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK.get(
+                severity,
+                DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK["WARNING"],
+            ),
+        )
+
+    @staticmethod
+    def _documentation_network_evidence_fingerprint(evidence: dict[str, Any]) -> str:
+        material = "|".join(
+            (
+                "text-documentation-network-v1",
+                str(evidence["line"]),
+                str(evidence["column"]),
+                str(evidence["kind"]),
+                str(evidence["value"]),
+            )
+        )
+        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+        return f"text-doc-network:{digest}"
+
+    @staticmethod
+    def _documentation_network_related_finding(finding: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: finding[key]
+            for key in (
+                "type",
+                "severity",
+                "message",
+                "position",
+                "url",
+                "domain",
+                "ip",
+                "destination",
+                "command_type",
+                "provider",
+            )
+            if key in finding
+        }
+
+    @classmethod
+    def _annotate_documentation_network_finding(
+        cls,
+        finding: dict[str, Any],
+        evidence: dict[str, Any],
+        related_findings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        fingerprint = cls._documentation_network_evidence_fingerprint(evidence)
+        annotated = {
+            **finding,
+            "line": evidence["line"],
+            "column": evidence["column"],
+            "evidence_fingerprint": fingerprint,
+            "evidence_location": {
+                "line": evidence["line"],
+                "column": evidence["column"],
+                "span_start": evidence["span_start"],
+                "span_end": evidence["span_end"],
+            },
+            "normalized_evidence": {
+                "kind": evidence["kind"],
+                "value": evidence["value"],
+            },
+        }
+        if related_findings:
+            annotated["deduplicated_related_findings"] = related_findings
+            annotated["deduplicated_related_count"] = len(related_findings)
+        return annotated
+
+    @classmethod
+    def _deduplicate_documentation_network_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not cls._is_documentation_sidecar(path):
+            return findings
+
+        finding_positions = [position for finding in findings if isinstance((position := finding.get("position")), int)]
+        line_lookup = cls._documentation_line_bounds_lookup(payload, finding_positions)
+        command_evidences = cls._documentation_network_command_evidences(payload, findings, line_lookup)
+        grouped: dict[tuple[int, int, str, str], list[tuple[int, dict[str, Any], dict[str, Any]]]] = {}
+        ordered_items: list[tuple[str, int | tuple[int, int, str, str]]] = []
+        standalone: dict[int, dict[str, Any]] = {}
+        for index, finding in enumerate(findings):
+            evidence = cls._documentation_network_finding_evidence(payload, finding, command_evidences, line_lookup)
+            if evidence is None:
+                ordered_items.append(("standalone", index))
+                standalone[index] = finding
+                continue
+            key = (
+                int(evidence["line"]),
+                int(evidence["column"]),
+                str(evidence["kind"]),
+                str(evidence["value"]),
+            )
+            if key not in grouped:
+                ordered_items.append(("group", key))
+            grouped.setdefault(key, []).append((index, finding, evidence))
+
+        deduplicated: list[dict[str, Any]] = []
+        emitted_keys: set[tuple[int, int, str, str]] = set()
+        for item_type, item_value in ordered_items:
+            if item_type == "standalone":
+                assert isinstance(item_value, int)
+                deduplicated.append(standalone[item_value])
+                continue
+            assert not isinstance(item_value, int)
+            key = item_value
+            if key in emitted_keys:
+                continue
+            emitted_keys.add(key)
+            entries = grouped[key]
+            representative_index, representative, representative_evidence = max(
+                entries,
+                key=lambda entry: cls._documentation_network_finding_sort_key(entry[1], entry[0]),
+            )
+            severity = cls._highest_documentation_network_severity([entry[1] for entry in entries])
+            if str(representative.get("severity", "WARNING")).upper() != severity:
+                representative = {**representative, "severity": severity}
+            related_findings = [
+                cls._documentation_network_related_finding(related)
+                for related_index, related, _evidence in entries
+                if related_index != representative_index
+            ]
+            deduplicated.append(
+                cls._annotate_documentation_network_finding(
+                    representative,
+                    representative_evidence,
+                    related_findings,
+                )
+            )
+        return deduplicated
+
     @classmethod
     def _downgrade_sidecar_network_findings(
         cls,
@@ -3673,25 +3231,12 @@ class TextScanner(BaseScanner):
         payload: bytes,
         findings: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], bool, set[str]]:
-        if not findings:
-            return findings, False, set()
-
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
         classification_limit_sources: set[str] = set()
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
-        markdown_fences = documentation_sidecar and cls._documentation_uses_markdown_fences(path, payload)
-        fenced_code_ranges: tuple[tuple[int, int], ...] = ()
-        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...] = ()
-        if markdown_fences:
-            fenced_code_ranges, fence_classification_incomplete = cls._documentation_fenced_code_ranges(payload)
-            classification_incomplete = classification_incomplete or fence_classification_incomplete
-            fenced_passive_network_example_ranges = cls._documentation_fenced_passive_network_example_ranges(
-                payload,
-                fenced_code_ranges,
-            )
         tokenizer_vocabulary_sidecar = cls._has_line_oriented_tokenizer_vocabulary_evidence(path, payload)
         last_retargetable_index = max(
             (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
@@ -3704,8 +3249,6 @@ class TextScanner(BaseScanner):
                     payload,
                     lowered_payload,
                     finding,
-                    fenced_code_ranges,
-                    fenced_passive_network_example_ranges,
                     remaining_occurrences,
                     index == last_retargetable_index,
                 )
@@ -3723,16 +3266,37 @@ class TextScanner(BaseScanner):
                 if retargeted_finding is None:
                     continue
                 finding = retargeted_finding
-            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(
-                path,
-                payload,
-                finding,
-                fenced_code_ranges,
-                fenced_passive_network_example_ranges,
-            ):
+            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(path, payload, finding):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
         return classified_findings, classification_incomplete, classification_limit_sources
+
+    @classmethod
+    def _downgrade_sidecar_secret_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        *,
+        max_findings: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        if not cls._is_passive_data_sidecar(path):
+            return findings, None
+
+        findings = [
+            finding
+            for finding in findings
+            if not cls._is_bare_data_secret_token(payload, finding)
+            or cls._passive_data_bare_secret_finding_is_actionable(payload, finding)
+        ]
+        # Whole-line Basic/Bearer matches in passive sidecars can be real credentials.
+        passive_findings, finding_limit = cls._passive_data_auth_line_secret_findings(
+            path,
+            payload,
+            findings,
+            max_findings=max_findings,
+        )
+        return findings + passive_findings, finding_limit
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
@@ -3826,6 +3390,14 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 secret_findings, finding_limit = self._split_detector_finding_limit(secret_findings)
+                secret_findings, passive_finding_limit = self._downgrade_sidecar_secret_findings(
+                    path,
+                    inspected_payload,
+                    secret_findings,
+                    max_findings=max_findings,
+                )
+                if finding_limit is None:
+                    finding_limit = passive_finding_limit
                 if secret_findings or not truncated:
                     self.add_embedded_secret_findings(secret_findings, result, context=path)
                 if finding_limit is not None:
@@ -3854,16 +3426,11 @@ class TextScanner(BaseScanner):
 
         if check_network:
             try:
-                network_max_findings = (
-                    min(max_findings, DOCUMENTATION_NETWORK_REPORTING_MAX_FINDINGS)
-                    if self._is_documentation_sidecar(path)
-                    else max_findings
-                )
                 network_findings = self.collect_network_communication_findings(
                     inspected_payload,
                     path,
                     raise_on_error=True,
-                    max_findings=network_max_findings,
+                    max_findings=max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
                 network_findings, classification_incomplete, classification_limit_sources = (
@@ -3872,6 +3439,11 @@ class TextScanner(BaseScanner):
                         inspected_payload,
                         network_findings,
                     )
+                )
+                network_findings = self._deduplicate_documentation_network_findings(
+                    path,
+                    inspected_payload,
+                    network_findings,
                 )
                 if network_findings or not truncated:
                     self.add_network_communication_findings(network_findings, result, context=path)
@@ -4031,7 +3603,7 @@ class TextScanner(BaseScanner):
                     details={"file_type": "documentation"},
                     rule_code=None,  # Passing check
                 )
-            elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt"]:
+            elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt", "merges.txt"]:
                 result.add_check(
                     name="File Type Identification",
                     passed=True,

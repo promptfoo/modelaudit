@@ -118,6 +118,38 @@ def _identity_kwargs(cache: ScanResultsCache, file_path: str) -> dict[str, Any]:
     }
 
 
+def _wait_for_ancestor_identity_to_settle(cache: ScanResultsCache, file_path: Path) -> None:
+    previous = cache._capture_ancestor_identity(str(file_path))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        time.sleep(0.02)
+        current = cache._capture_ancestor_identity(str(file_path))
+        if ScanResultsCache._ancestor_identity_matches(previous, current):
+            return
+        previous = current
+    pytest.fail(f"ancestor identity did not settle for {file_path}")
+
+
+def _scope_cache_ancestor_identity_to_tree(
+    cache: ScanResultsCache,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_capture = cache._capture_ancestor_identity
+    root_path = Path(os.path.abspath(root))
+
+    def capture_ancestor_identity(file_path: str) -> AncestorIdentity:
+        identity = original_capture(file_path)
+        entries = tuple(
+            entry
+            for entry in identity
+            if (entry_path := Path(entry[0])) == root_path or root_path in entry_path.parents
+        )
+        return AncestorIdentity(entries)
+
+    monkeypatch.setattr(cache, "_capture_ancestor_identity", capture_ancestor_identity)
+
+
 def test_cache_config_hash_preserves_128_bits(tmp_path: Path) -> None:
     """Attacker-influenced scan context must not collapse to a short cache identity."""
     cache = ScanResultsCache(str(tmp_path / "cache"))
@@ -1067,7 +1099,10 @@ def test_batch_prefetch_bypasses_symlink_before_key_generation(
     batch_ops.prefetch_cache_metadata([str(symlink_path)])
 
 
-def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_path: Path) -> None:
+def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     trees_root = tmp_path / "trees"
     live_root = trees_root / "live"
     decoy_root = trees_root / "decoy"
@@ -1082,6 +1117,8 @@ def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_pa
     held_root = trees_root / "held"
 
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    _scope_cache_ancestor_identity_to_tree(cache_manager.cache, trees_root, monkeypatch)
     version_context = build_cache_version_context({"timeout": 30})
     calls = {"count": 0}
     swap_blocked = {"value": False}
@@ -1113,6 +1150,7 @@ def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_pa
     else:
         assert swap_blocked["value"] is False
         assert cache_manager.get_stats()["total_entries"] == 0
+    _wait_for_ancestor_identity_to_settle(cache_manager.cache, malicious_path)
     second = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
 
     assert first["payload_prefix"] == ("evil!:" if os.name == "nt" else "clean:")
@@ -1139,6 +1177,8 @@ def test_unmonitored_platform_does_not_cache_higher_ancestor_swap(
     held_root = trees_root / "held"
 
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    _scope_cache_ancestor_identity_to_tree(cache_manager.cache, trees_root, monkeypatch)
     version_context = build_cache_version_context({"timeout": 30})
     calls = {"count": 0}
     monkeypatch.setattr(sys, "platform", "darwin")
@@ -1155,9 +1195,11 @@ def test_unmonitored_platform_does_not_cache_higher_ancestor_swap(
         return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
 
     first = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
+    assert first["payload_prefix"] == "clean:"
+    assert cache_manager.get_stats()["total_entries"] == 0
+    _wait_for_ancestor_identity_to_settle(cache_manager.cache, malicious_path)
     second = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
 
-    assert first["payload_prefix"] == "clean:"
     assert second["payload_prefix"] == "evil!:"
     assert calls["count"] == 2
     assert cache_manager.get_stats()["total_entries"] == 1
@@ -2488,6 +2530,8 @@ def test_cached_scan_skips_persisting_operational_failures_from_checks(tmp_path:
     [
         {"scan_outcome": INCONCLUSIVE_SCAN_OUTCOME},
         {"analysis_incomplete": True},
+        {"scan_outcome_reason": "bounded_probe_exhausted"},
+        {"scan_outcome_reasons": ["bounded_probe_exhausted"]},
         {"operational_error": True},
     ],
 )
@@ -2517,6 +2561,242 @@ def test_cached_scan_skips_persisting_incomplete_metadata(
     assert second["scan_count"] == 2
     assert calls["count"] == 2
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+@pytest.mark.parametrize("collection_name", ["issues", "checks"])
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"scan_outcome": INCONCLUSIVE_SCAN_OUTCOME},
+        {"scan_outcome_reason": "bounded_probe_exhausted"},
+        {"scan_outcome_reasons": ["bounded_probe_exhausted"]},
+        {"operational_error": True},
+        {
+            "component_count": 2,
+            "findings": [{"analysis_incomplete": True, "scan_outcome_reason": "bounded_probe_exhausted"}],
+        },
+        {
+            "component_count": 2,
+            "findings": [{"details": {"analysis_incomplete": True, "scan_outcome_reason": "bounded_probe_exhausted"}}],
+        },
+    ],
+)
+def test_cached_scan_skips_persisting_incomplete_record_details(
+    tmp_path: Path,
+    collection_name: str,
+    details: dict[str, Any],
+) -> None:
+    """Issue/check-only incomplete coverage must be rescanned instead of replayed."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        record = {
+            "message": "Incomplete coverage retained only in record details",
+            "status": "failed",
+            "details": details,
+        }
+        result: dict[str, Any] = {
+            "checks": [],
+            "issues": [],
+            "success": True,
+            "scan_count": calls["count"],
+        }
+        result[collection_name] = [record]
+        return result
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+@pytest.mark.parametrize("collection_name", ["issues", "checks"])
+def test_cached_scan_skips_persisting_skipped_bare_analysis_incomplete_record_details(
+    tmp_path: Path,
+    collection_name: str,
+) -> None:
+    """Skipped bare incomplete coverage records must be rescanned unless they are runtime skips."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        record = {
+            "message": "Scanner skipped before completing coverage",
+            "status": "skipped",
+            "details": {"analysis_incomplete": True},
+        }
+        result: dict[str, Any] = {
+            "checks": [],
+            "issues": [],
+            "success": True,
+            "scan_count": calls["count"],
+        }
+        result[collection_name] = [record]
+        return result
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_persists_clean_runtime_version_skipped_check(tmp_path: Path) -> None:
+    """Clean runtime-version applicability skipped checks are stable enough to cache."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [
+                {
+                    "message": "PyTorch runtime version not available; CVE applicability unknown",
+                    "status": "skipped",
+                    "details": {
+                        "analysis_incomplete": True,
+                        "runtime_version_known": False,
+                        "runtime_cve_applicability": "unknown",
+                        "runtime_cve_version_gate": "local_environment_only",
+                    },
+                }
+            ],
+            "issues": [],
+            "metadata": {},
+            "scan_count": calls["count"],
+            "success": True,
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 1
+    assert calls["count"] == 1
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+
+
+def test_cached_scan_skips_issue_with_runtime_version_skip_details(tmp_path: Path) -> None:
+    """Runtime-version skip metadata only exempts skipped checks, not issue records."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [
+                {
+                    "message": "PyTorch runtime version not available; CVE applicability unknown",
+                    "status": "skipped",
+                    "details": {
+                        "analysis_incomplete": True,
+                        "runtime_version_known": False,
+                        "runtime_cve_applicability": "unknown",
+                        "runtime_cve_version_gate": "local_environment_only",
+                    },
+                }
+            ],
+            "metadata": {},
+            "scan_count": calls["count"],
+            "success": True,
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_skips_skipped_check_with_explicit_incomplete_reason(tmp_path: Path) -> None:
+    """Skipped checks with explicit outcome markers must still bypass cache."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [
+                {
+                    "message": "PyTorch runtime version is unknown",
+                    "status": "skipped",
+                    "details": {
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "pytorch_runtime_version_unknown",
+                    },
+                }
+            ],
+            "issues": [],
+            "metadata": {},
+            "scan_count": calls["count"],
+            "success": True,
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_persists_clean_result_with_benign_details(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [
+                {
+                    "message": "Synthetic clean coverage check",
+                    "status": "passed",
+                    "details": {"scan_outcome_reason": "", "scan_outcome_reasons": []},
+                }
+            ],
+            "issues": [],
+            "metadata": {},
+            "scan_count": calls["count"],
+            "success": True,
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second == first
+    assert calls["count"] == 1
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
 
 
 def test_cached_scan_skips_persisting_bare_unsuccessful_results(tmp_path: Path) -> None:
@@ -2579,6 +2859,12 @@ def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
     cache_manager = get_cache_manager(str(cache_dir), enabled=True)
     assert cache_manager.cache is not None
+    pre_scan_identity = cache_manager.cache.capture_file_identity(str(file_path))
+
+    def get_cached_result_with_identity(*_args: Any, **_kwargs: Any) -> tuple[dict[str, Any] | None, Any]:
+        return None, pre_scan_identity
+
+    monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", get_cached_result_with_identity)
     release_calls = 0
     original_release = cache_manager.cache.release_ancestor_identity
 
@@ -2617,6 +2903,12 @@ def test_cached_scan_skips_persisting_scan_timed_out_messages(
     calls = {"count": 0}
     cache_manager = get_cache_manager(str(cache_dir), enabled=True)
     assert cache_manager.cache is not None
+    pre_scan_identities = [cache_manager.cache.capture_file_identity(str(file_path)) for _ in range(2)]
+
+    def get_cached_result_with_identity(*_args: Any, **_kwargs: Any) -> tuple[dict[str, Any] | None, Any]:
+        return None, pre_scan_identities.pop(0)
+
+    monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", get_cached_result_with_identity)
     release_calls = 0
     original_release = cache_manager.cache.release_ancestor_identity
 
@@ -2642,6 +2934,7 @@ def test_cached_scan_skips_persisting_scan_timed_out_messages(
     assert first["timeout_count"] == 1
     assert second["timeout_count"] == 2
     assert calls["count"] == 2
+    assert pre_scan_identities == []
     assert cache_manager.get_stats()["total_entries"] == 0
     assert release_calls == 2
 

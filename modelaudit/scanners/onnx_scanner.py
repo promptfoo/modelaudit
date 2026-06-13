@@ -1,5 +1,6 @@
 """Scanner for ONNX model files (.onnx)."""
 
+import hashlib
 import logging
 import math
 import ntpath
@@ -123,6 +124,9 @@ _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
 _ONNX_WEIGHT_METADATA_TEXT_LIMIT = 256
 _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT = 64
+_ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT = 5
+_ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT = 20
+_ONNX_CUSTOM_OPERATOR_TEXT_LIMIT = 256
 _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -450,6 +454,114 @@ def _operator_identifier(node: Any) -> tuple[str, str, str]:
     return (node.domain or "", node.op_type or "", getattr(node, "overload", "") or "")
 
 
+def _bounded_custom_operator_value(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= _ONNX_CUSTOM_OPERATOR_TEXT_LIMIT:
+        return text
+    return f"{text[:_ONNX_CUSTOM_OPERATOR_TEXT_LIMIT]}..."
+
+
+def _custom_operator_identity_display(value: str) -> str:
+    return _bounded_custom_operator_value(value) if value else "<default>"
+
+
+def _custom_operator_values_hash(*values: str) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        encoded = value.encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _custom_operator_domain_hash(domain: str) -> str:
+    return _custom_operator_values_hash(domain)
+
+
+def _custom_operator_identity_hash(domain: str, op_type: str, overload: str) -> str:
+    return _custom_operator_values_hash(domain, op_type, overload)
+
+
+@dataclass
+class _CustomOperatorAggregate:
+    occurrence_count: int = 0
+    operator_samples: list[str] = field(default_factory=list)
+    operator_identities: list[dict[str, str]] = field(default_factory=list)
+    representative_nodes: list[dict[str, str]] = field(default_factory=list)
+    operator_samples_truncated: bool = False
+    operator_identities_truncated: bool = False
+    _operator_sample_seen: set[str] = field(default_factory=set)
+    _operator_identity_seen: set[tuple[str, str, str]] = field(default_factory=set)
+
+    def add_node(self, node: Any) -> None:
+        self.occurrence_count += 1
+        raw_op_type = str(getattr(node, "op_type", "") or "")
+        raw_domain = str(getattr(node, "domain", "") or "")
+        raw_overload = str(getattr(node, "overload", "") or "")
+        op_type = _bounded_custom_operator_value(raw_op_type)
+        domain = _bounded_custom_operator_value(raw_domain)
+        overload = _bounded_custom_operator_value(raw_overload)
+        if op_type not in self._operator_sample_seen:
+            if len(self.operator_samples) < _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT:
+                self.operator_samples.append(op_type)
+                self._operator_sample_seen.add(op_type)
+            else:
+                self.operator_samples_truncated = True
+
+        operator_identity = (raw_domain, raw_op_type, raw_overload)
+        if operator_identity not in self._operator_identity_seen:
+            if len(self.operator_identities) < _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT:
+                self._operator_identity_seen.add(operator_identity)
+                self.operator_identities.append(
+                    {
+                        "domain": domain,
+                        "op_type": op_type,
+                        "overload": overload,
+                        "operator_identity_hash": _custom_operator_identity_hash(
+                            raw_domain,
+                            raw_op_type,
+                            raw_overload,
+                        ),
+                    }
+                )
+            else:
+                self.operator_identities_truncated = True
+
+        if len(self.representative_nodes) >= _ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT:
+            return
+
+        node_summary = {
+            "op_type": op_type,
+            "domain": domain,
+        }
+        node_name = _bounded_custom_operator_value(getattr(node, "name", ""))
+        if node_name:
+            node_summary["name"] = node_name
+        if overload:
+            node_summary["overload"] = overload
+        self.representative_nodes.append(node_summary)
+
+    def details(self, *, domain: str, security_note: str, check_consolidation_key: str | None = None) -> dict[str, Any]:
+        details: dict[str, Any] = {
+            "domain": domain,
+            "occurrence_count": self.occurrence_count,
+            "operator_samples": self.operator_samples,
+            "operator_samples_truncated": self.operator_samples_truncated,
+            "operator_identities": self.operator_identities,
+            "operator_identities_truncated": self.operator_identities_truncated,
+            "distinct_operator_identity_count": len(self._operator_identity_seen),
+            "distinct_operator_identity_count_truncated": self.operator_identities_truncated,
+            "representative_nodes": self.representative_nodes,
+            "representative_nodes_truncated": self.occurrence_count > len(self.representative_nodes),
+            "security_note": security_note,
+        }
+        if check_consolidation_key:
+            details["check_consolidation_key"] = check_consolidation_key
+        if self.operator_samples:
+            details["op_type"] = self.operator_samples[0]
+        return details
+
+
 def _has_operator_schema(op_type: str, version: int, domain: str) -> bool:
     """Return whether the installed ONNX release registers an operator schema."""
     try:
@@ -680,6 +792,51 @@ def _has_symlink_component(path: Path, root: Path) -> bool:
         if current.is_symlink():
             return True
     return False
+
+
+def _is_trusted_huggingface_cache_external_alias(
+    model_path: Path,
+    lexical_external_path: Path,
+    external_path: Path,
+) -> bool:
+    """Return True for Hugging Face snapshot symlinks that resolve to the model cache blobs directory."""
+    try:
+        from ..utils.sources._huggingface_cache import (
+            _find_hf_cache_root,
+            _hf_cache_snapshot_revision,
+            _trusted_hf_blobs_root,
+        )
+    except Exception:
+        return False
+
+    model_cache_root = _find_hf_cache_root(model_path)
+    if model_cache_root is None or _find_hf_cache_root(lexical_external_path) != model_cache_root:
+        return False
+    model_revision = _hf_cache_snapshot_revision(model_path, model_cache_root)
+    external_revision = _hf_cache_snapshot_revision(lexical_external_path, model_cache_root)
+    if model_revision is None or external_revision != model_revision:
+        return False
+    if (
+        not model_path.is_symlink()
+        or not lexical_external_path.is_symlink()
+        or _has_symlink_component(
+            lexical_external_path.parent,
+            model_path.parent,
+        )
+    ):
+        return False
+    blobs_root = _trusted_hf_blobs_root(model_cache_root)
+    if blobs_root is None:
+        return False
+    try:
+        model_path.resolve(strict=True).relative_to(blobs_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    try:
+        external_path.relative_to(blobs_root)
+    except ValueError:
+        return False
+    return True
 
 
 def _tensor_data_type_to_np_dtype(data_type: int) -> Any:
@@ -2972,10 +3129,17 @@ class OnnxScanner(BaseScanner):
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
         custom_domains = set()
         local_function_identifiers = _model_local_function_identifiers(model)
+        custom_domain_findings: dict[str, _CustomOperatorAggregate] = {}
+        explicit_custom_operator_findings: dict[tuple[str, str, str], _CustomOperatorAggregate] = {}
         custom_operators_found = 0
         python_ops_found = False
         safe_nodes = 0
         nodes_checked = 0
+        custom_operator_security_note = (
+            "Custom operators may depend on external operator implementations. "
+            "ONNX files cannot execute code - risk is in runtime environment if malicious "
+            "operators are installed. Verify operator packages before installation."
+        )
 
         for graph, opset_versions in _iter_model_graphs_with_opsets(model):
             for node in _iter_graph_nodes(graph):
@@ -2992,37 +3156,14 @@ class OnnxScanner(BaseScanner):
                 if is_external_custom_operator or is_explicit_custom_operator:
                     custom_operators_found += 1
                     if is_external_custom_operator:
-                        custom_domains.add(node.domain)
-                        message = (
-                            f"Model references custom operator domain '{node.domain}'. "
-                            "This is metadata only - ensure operators are from trusted sources before installation."
-                        )
+                        domain = str(node.domain or "")
+                        custom_domains.add(domain)
+                        custom_domain_findings.setdefault(domain, _CustomOperatorAggregate()).add_node(node)
                     else:
-                        message = (
-                            f"Model references custom operator '{node.op_type}' in the standard ONNX domain. "
-                            "Ensure its implementation is from a trusted source before installation."
-                        )
-
-                    # All custom operators are INFO - they're metadata, not executable code
-                    # Security risk is in runtime environment (installing malicious operators)
-                    # not in the ONNX file itself
-                    result.add_check(
-                        name="Custom Operator Domain Check",
-                        passed=False,
-                        message=message,
-                        severity=IssueSeverity.INFO,
-                        location=f"{path} (node: {node.name})",
-                        rule_code="S1111",
-                        details={
-                            "op_type": node.op_type,
-                            "domain": node.domain,
-                            "security_note": (
-                                "Custom operators may depend on external operator implementations. "
-                                "ONNX files cannot execute code - risk is in runtime environment if malicious "
-                                "operators are installed. Verify operator packages before installation."
-                            ),
-                        },
-                    )
+                        explicit_custom_operator_findings.setdefault(
+                            _operator_identifier(node),
+                            _CustomOperatorAggregate(),
+                        ).add_node(node)
 
                 if is_python_operator:
                     python_ops_found = True
@@ -3037,6 +3178,72 @@ class OnnxScanner(BaseScanner):
                     )
                 elif not is_external_custom_operator and not is_explicit_custom_operator:
                     safe_nodes += 1
+
+        # All custom operators are INFO - they're metadata, not executable code.
+        # Security risk is in runtime environment (installing malicious operators)
+        # not in the ONNX file itself. Emit one bounded aggregate per domain/file.
+        for domain, finding in sorted(custom_domain_findings.items()):
+            domain_display = _bounded_custom_operator_value(domain)
+            domain_hash = _custom_operator_domain_hash(domain)
+            check_consolidation_key = f"onnx_custom_operator_domain:{domain_hash}"
+            details = finding.details(
+                domain=domain,
+                security_note=custom_operator_security_note,
+                check_consolidation_key=check_consolidation_key,
+            )
+            details["domain_hash"] = domain_hash
+            result.add_check(
+                name="Custom Operator Domain Check",
+                passed=False,
+                message=(
+                    f"Model references custom operator domain '{domain_display}' "
+                    f"(domain identity {domain_hash}) in "
+                    f"{finding.occurrence_count} node(s). This is metadata only - ensure operators are "
+                    "from trusted sources before installation."
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S1111",
+                details=details,
+            )
+
+        for (domain, op_type, overload), finding in sorted(explicit_custom_operator_findings.items()):
+            domain_display = _custom_operator_identity_display(domain)
+            op_type_display = _bounded_custom_operator_value(op_type)
+            overload_display = _custom_operator_identity_display(overload)
+            identity_hash = _custom_operator_identity_hash(domain, op_type, overload)
+            check_consolidation_key = f"onnx_custom_operator_identity:{identity_hash}"
+            details = finding.details(
+                domain=domain,
+                security_note=custom_operator_security_note,
+                check_consolidation_key=check_consolidation_key,
+            )
+            details.update(
+                {
+                    "op_type": op_type,
+                    "overload": overload,
+                    "operator_identity_hash": identity_hash,
+                    "operator_identity": {
+                        "domain": domain,
+                        "op_type": op_type,
+                        "overload": overload,
+                    },
+                }
+            )
+            result.add_check(
+                name="Custom Operator Domain Check",
+                passed=False,
+                message=(
+                    f"Model references custom operator '{op_type_display}' in ONNX domain '{domain_display}' "
+                    f"with overload '{overload_display}' (identity {identity_hash}) in "
+                    f"{finding.occurrence_count} node(s). Ensure its implementation is from a trusted source "
+                    "before installation."
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S1111",
+                details=details,
+            )
 
         # Record successful checks for safe operators
         if safe_nodes > 0 and custom_operators_found == 0:
@@ -3065,7 +3272,12 @@ class OnnxScanner(BaseScanner):
             result.metadata["custom_domains"] = sorted(custom_domains)
 
     def _check_external_data(self, model: Any, path: str, result: ScanResult) -> None:
-        model_dir = Path(path).resolve().parent
+        model_path = Path(path).absolute()
+        model_dir = model_path.parent
+        try:
+            resolved_model_dir = model_dir.resolve()
+        except (OSError, RuntimeError):
+            resolved_model_dir = model_dir
         import onnx
 
         # Track per-file status to avoid flooding the result with one check
@@ -3109,8 +3321,19 @@ class OnnxScanner(BaseScanner):
                     lexical_external_path,
                     model_dir,
                 )
-                symlink_escapes_model_dir = has_symlink_component and not _is_contained_in(external_path, model_dir)
-                escapes_model_dir = has_windows_absolute_path or not _is_contained_in(external_path, model_dir)
+                trusted_hf_cache_alias = has_symlink_component and _is_trusted_huggingface_cache_external_alias(
+                    model_path,
+                    lexical_external_path,
+                    external_path,
+                )
+                symlink_escapes_model_dir = (
+                    has_symlink_component
+                    and not trusted_hf_cache_alias
+                    and not _is_contained_in(external_path, resolved_model_dir)
+                )
+                escapes_model_dir = has_windows_absolute_path or (
+                    not trusted_hf_cache_alias and not _is_contained_in(external_path, resolved_model_dir)
+                )
                 if symlink_escapes_model_dir:
                     result.add_check(
                         name="CVE-2026-34447: External Data Symlink Traversal",

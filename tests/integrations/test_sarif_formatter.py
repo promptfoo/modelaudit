@@ -2,13 +2,15 @@
 
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import modelaudit.integrations.sarif_formatter as sarif_formatter
+from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
-from modelaudit.scanners.base import Issue, IssueSeverity
+from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity
 
 _create_artifacts = sarif_formatter._create_artifacts
 _create_results = sarif_formatter._create_results
@@ -519,6 +521,164 @@ class TestCreateRun:
         assert props["filesScanned"] == 5
         assert props["bytesScanned"] == 1000
         assert props["scanners"] == ["PickleScanner"]
+        assert props["processCompleted"] is True
+        assert props["securityCoverageComplete"] is True
+        assert props["incompleteCoverage"] is False
+        assert props["operationalErrors"] is False
+
+    def test_invocation_properties_treat_dry_run_as_successful_invocation(self) -> None:
+        """Dry-run previews should be successful invocations even without scanned files."""
+        result = create_initial_audit_result().model_copy(update={"dry_run": True})
+        result.files_scanned = 0
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 0
+        assert invocation["executionSuccessful"] is True
+        assert invocation["properties"]["processCompleted"] is True
+        assert invocation["properties"]["securityCoverageComplete"] is True
+        assert invocation["properties"]["incompleteCoverage"] is False
+
+    def test_invocation_properties_mark_incomplete_coverage_without_findings(self) -> None:
+        """Incomplete coverage without findings should be an unsuccessful SARIF invocation."""
+        result = create_initial_audit_result()
+        result.files_scanned = 1
+        result.success = False
+        result.file_metadata["model.bin"] = FileMetadataModel(
+            analysis_incomplete=True,
+            scan_outcome_reasons=["bounded_probe_exhausted"],
+        )
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 2
+        assert invocation["exitCodeDescription"] == "Scan outcome was inconclusive"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["processCompleted"] is True
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+        assert invocation["properties"]["operationalErrors"] is False
+
+    def test_invocation_properties_mark_issue_only_incomplete_coverage_without_findings(self) -> None:
+        """Issue-only coverage gaps should be unsuccessful SARIF invocations."""
+        result = create_initial_audit_result()
+        result.files_scanned = 1
+        result.issues = [
+            Issue(
+                message="DVC output limit exceeded - not all declared outputs were scanned",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "reason": "dvc_output_limit_exceeded",
+                },
+                type="dvc_output_limit_exceeded",
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 2
+        assert invocation["exitCodeDescription"] == "Scan outcome was inconclusive"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+
+    def test_invocation_properties_mark_check_only_incomplete_coverage_without_findings(self) -> None:
+        """Check-only coverage gaps should be unsuccessful SARIF invocations."""
+        result = create_initial_audit_result()
+        result.files_scanned = 1
+        result.checks = [
+            Check(
+                name="DVC Output Resolution",
+                status=CheckStatus.FAILED,
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 2
+        assert invocation["exitCodeDescription"] == "Scan outcome was inconclusive"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+
+    def test_invocation_properties_mark_incomplete_coverage_with_security_findings(self) -> None:
+        """Security exit 1 should not hide incomplete coverage in SARIF."""
+        result = create_initial_audit_result()
+        result.files_scanned = 1
+        result.success = False
+        result.file_metadata["model.pkl"] = FileMetadataModel(scan_outcome="inconclusive")
+        result.issues = [
+            Issue(
+                message="Dangerous pickle global",
+                severity=IssueSeverity.WARNING,
+                location="/test/model.pkl",
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 1
+        assert invocation["exitCodeDescription"] == "Security issues detected; scan coverage incomplete"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["processCompleted"] is True
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+        assert invocation["properties"]["operationalErrors"] is False
+        assert run["results"][0]["message"]["text"] == "Dangerous pickle global"
+
+    def test_invocation_properties_mark_issue_only_incomplete_coverage_with_security_findings(self) -> None:
+        """Security findings should keep exit 1 while issue-only coverage remains visible."""
+        result = create_initial_audit_result()
+        result.files_scanned = 2
+        result.issues = [
+            Issue(
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+                timestamp=time.time(),
+            ),
+            Issue(
+                message="Dangerous pickle global",
+                severity=IssueSeverity.WARNING,
+                location="/test/payload.pkl",
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 1
+        assert invocation["exitCodeDescription"] == "Security issues detected; scan coverage incomplete"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+        assert [item["message"]["text"] for item in run["results"]] == [
+            "DVC output resolution incomplete",
+            "Dangerous pickle global",
+        ]
 
 
 class TestCreateRules:
@@ -665,6 +825,70 @@ class TestCreateResults:
         assert "partialFingerprints" in results[0]
         assert "primaryLocationLineHash" in results[0]["partialFingerprints"]
 
+    def test_result_uses_evidence_fingerprint_when_present(self) -> None:
+        issue = Issue(
+            message="Duplicate documentation indicators",
+            severity=IssueSeverity.WARNING,
+            location="/models/a/model_card.md",
+            details={"evidence_fingerprint": "text-doc-network:stable"},
+            timestamp=time.time(),
+        )
+
+        results = _create_results([issue])
+        fingerprint = results[0]["partialFingerprints"]["primaryLocationLineHash"]
+
+        assert isinstance(fingerprint, str)
+        assert len(fingerprint) == 16
+        assert fingerprint == _create_results([issue])[0]["partialFingerprints"]["primaryLocationLineHash"]
+        assert results[0]["properties"]["evidence_fingerprint"] == "text-doc-network:stable"
+
+    def test_result_scopes_evidence_fingerprint_by_artifact_location(self) -> None:
+        first_issue = Issue(
+            message="Duplicate documentation indicators",
+            severity=IssueSeverity.WARNING,
+            location="/models/a/model_card.md",
+            details={"evidence_fingerprint": "text-doc-network:stable"},
+            timestamp=time.time(),
+        )
+        second_issue = Issue(
+            message="Duplicate documentation indicators",
+            severity=IssueSeverity.WARNING,
+            location="/models/b/model_card.md",
+            details={"evidence_fingerprint": "text-doc-network:stable"},
+            timestamp=time.time(),
+        )
+
+        first_result, second_result = _create_results([first_issue, second_issue])
+
+        assert (
+            first_result["partialFingerprints"]["primaryLocationLineHash"]
+            != second_result["partialFingerprints"]["primaryLocationLineHash"]
+        )
+
+    def test_result_preserves_model_card_evidence_fingerprint_and_region(self, tmp_path: Path) -> None:
+        text_path = tmp_path / "model_card.md"
+        text_path.write_text("git clone https://evil.example/repo.git\n", encoding="utf-8")
+
+        result = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+        output = format_sarif_output(result, [str(text_path)])
+        sarif_result = json.loads(output)["runs"][0]["results"][0]
+
+        assert sarif_result["message"]["text"] == "Git clone network command detected: https://evil.example/repo.git"
+        assert len(sarif_result["partialFingerprints"]["primaryLocationLineHash"]) == 16
+        assert (
+            sarif_result["partialFingerprints"]["primaryLocationLineHash"]
+            != sarif_result["properties"]["evidence_fingerprint"]
+        )
+        assert sarif_result["properties"]["evidence_fingerprint"].startswith("text-doc-network:")
+        assert sarif_result["properties"]["normalized_evidence"] == {
+            "kind": "url",
+            "value": "https://evil.example/repo.git",
+        }
+        assert sarif_result["locations"][0]["physicalLocation"]["region"] == {
+            "startLine": 1,
+            "startColumn": len("git clone ") + 1,
+        }
+
     def test_result_kind_by_severity(self):
         """Test result kind based on severity."""
         critical = Issue(message="Critical", severity=IssueSeverity.CRITICAL, timestamp=time.time())
@@ -741,6 +965,16 @@ class TestCreateArtifacts:
         assert "hashes" in artifacts[0]
         assert "sha-256" in artifacts[0]["hashes"]
         assert "md5" in artifacts[0]["hashes"]
+
+    def test_artifact_omits_partial_sha256_prefix_hash(self) -> None:
+        """Partial prefix hashes must not be emitted as complete SARIF hashes."""
+        result = create_initial_audit_result()
+        result.assets = [AssetModel(path="/test/model.pt", type="pickle")]
+        result.file_metadata["/test/model.pt"] = FileMetadataModel(file_hashes=FileHashesModel(sha256_prefix="c" * 64))
+
+        artifacts = _create_artifacts(result)
+
+        assert "hashes" not in artifacts[0]
 
 
 class TestHelperFunctions:

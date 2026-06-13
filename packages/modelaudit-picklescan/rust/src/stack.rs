@@ -12,6 +12,8 @@ pub(crate) struct GlobalRef {
     pub(crate) name: String,
     pub(crate) position: usize,
     pub(crate) malformed: bool,
+    pub(crate) memo_index: Option<i64>,
+    pub(crate) memo_read: bool,
 }
 
 impl GlobalRef {
@@ -36,10 +38,14 @@ pub(crate) struct FutureCallbacks {
 #[derive(Clone)]
 pub(crate) enum StackValue {
     Mark,
-    Text(String),
+    Text {
+        value: String,
+        memo_read: bool,
+    },
     TextSpan {
         start: usize,
         end: usize,
+        memo_read: bool,
     },
     Bytes {
         start: usize,
@@ -97,8 +103,8 @@ pub(crate) enum StackValue {
 
 pub(crate) fn resolve_global_operand(value: Option<&StackValue>, payload: &[u8]) -> Option<String> {
     match value {
-        Some(StackValue::Text(value)) => Some(value.clone()),
-        Some(StackValue::TextSpan { start, end }) if start <= end && *end <= payload.len() => {
+        Some(StackValue::Text { value, .. }) => Some(value.clone()),
+        Some(StackValue::TextSpan { start, end, .. }) if start <= end && *end <= payload.len() => {
             Some(String::from_utf8_lossy(&payload[*start..*end]).to_string())
         }
         _ => None,
@@ -189,7 +195,7 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
                 .memo_index
                 .map_or_else(|| "none".to_string(), |index| index.to_string())
         ),
-        Some(StackValue::TextSpan { start, end }) => {
+        Some(StackValue::TextSpan { start, end, .. }) => {
             format!("str_span(len={})", end.saturating_sub(*start))
         }
         Some(StackValue::Bytes { start, end }) => {
@@ -197,7 +203,7 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         }
         Some(StackValue::ExternalBuffer) => "external_buffer".to_string(),
         Some(StackValue::Mark) => "MARK".to_string(),
-        Some(StackValue::Text(value)) => format!("str:{:?}", value),
+        Some(StackValue::Text { value, .. }) => format!("str:{:?}", value),
         Some(StackValue::Tuple(values)) => format!("tuple(len={})", values.len()),
         Some(StackValue::Primitive { type_name, repr }) => format!("{type_name}:{repr}"),
         Some(StackValue::Other) => "object".to_string(),
@@ -237,8 +243,8 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
 
     match value {
         StackValue::Mark => "MARK".to_string(),
-        StackValue::Text(value) => format!("str:{:?}", value),
-        StackValue::TextSpan { start, end } => {
+        StackValue::Text { value, .. } => format!("str:{:?}", value),
+        StackValue::TextSpan { start, end, .. } => {
             format!("str_span(len={})", end.saturating_sub(*start))
         }
         StackValue::Bytes { start, end } => format!("bytes(len={})", end.saturating_sub(*start)),
@@ -348,36 +354,22 @@ pub(crate) fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<S
 }
 
 pub(crate) fn pytorch_storage_key(value: &StackValue, payload: &[u8]) -> Option<String> {
-    let StackValue::Tuple(items) = value else {
-        return None;
-    };
-    if items.len() < 4 || stack_value_text(&items[0], payload).as_deref() != Some("storage") {
-        return None;
-    }
-    if !is_pytorch_storage_descriptor(&items[1], payload) {
-        return None;
-    }
-    stack_value_string(&items[2], payload)
+    pytorch_storage_persistent_id_items(value, payload)
+        .and_then(|items| stack_value_string(&items[2], payload))
 }
 
 pub(crate) fn pytorch_storage_descriptor_ref<'a>(
     value: &'a StackValue,
     payload: &[u8],
 ) -> Option<&'a GlobalRef> {
+    pytorch_storage_persistent_id_items(value, payload)?;
     let StackValue::Tuple(items) = value else {
         return None;
     };
-    if items.len() < 4 || stack_value_text(&items[0], payload).as_deref() != Some("storage") {
-        return None;
-    }
     let StackValue::Global(reference) = &items[1] else {
         return None;
     };
-    if is_pytorch_storage_descriptor(&items[1], payload) {
-        Some(reference)
-    } else {
-        None
-    }
+    Some(reference)
 }
 
 pub(crate) fn stack_value_from_integer_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
@@ -411,18 +403,23 @@ pub(crate) fn stack_value_from_integer_arg(arg: &ArgValue, payload: &[u8]) -> St
 
 pub(crate) fn stack_value_from_text_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
     match arg {
-        ArgValue::Text(value) | ArgValue::DecodedString { text: value, .. } => {
-            StackValue::Text(value.clone())
-        }
+        ArgValue::Text(value) | ArgValue::DecodedString { text: value, .. } => StackValue::Text {
+            value: value.clone(),
+            memo_read: false,
+        },
         ArgValue::TextSpan { start, end } | ArgValue::Bytes { start, end }
             if start <= end && *end <= payload.len() =>
         {
             StackValue::TextSpan {
                 start: *start,
                 end: *end,
+                memo_read: false,
             }
         }
-        _ => StackValue::Text(arg.coerce_text(payload)),
+        _ => StackValue::Text {
+            value: arg.coerce_text(payload),
+            memo_read: false,
+        },
     }
 }
 
@@ -431,8 +428,8 @@ fn stack_value_text<'payload>(
     payload: &'payload [u8],
 ) -> Option<Cow<'payload, str>> {
     match value {
-        StackValue::Text(text) => Some(Cow::Borrowed(text)),
-        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
+        StackValue::Text { value, .. } => Some(Cow::Borrowed(value)),
+        StackValue::TextSpan { start, end, .. } if start <= end && *end <= payload.len() => {
             Some(String::from_utf8_lossy(&payload[*start..*end]))
         }
         StackValue::Primitive { repr, .. } => Some(Cow::Borrowed(repr)),
@@ -449,15 +446,72 @@ fn stack_value_text<'payload>(
     }
 }
 
+fn pytorch_storage_persistent_id_items<'a>(
+    value: &'a StackValue,
+    payload: &[u8],
+) -> Option<&'a Vec<StackValue>> {
+    let StackValue::Tuple(items) = value else {
+        return None;
+    };
+    if items.len() != 5 || stack_value_text(&items[0], payload).as_deref() != Some("storage") {
+        return None;
+    }
+    if !is_pytorch_storage_descriptor(&items[1], payload) {
+        return None;
+    }
+    stack_value_text(&items[2], payload)?;
+    stack_value_text(&items[3], payload)?;
+    match &items[4] {
+        StackValue::Primitive { type_name, repr }
+            if *type_name == "int" && repr.parse::<u64>().is_ok() => {}
+        _ => return None,
+    }
+    Some(items)
+}
+
+fn is_known_pytorch_storage_name(name: &str) -> bool {
+    matches!(
+        name,
+        "BFloat16Storage"
+            | "BoolStorage"
+            | "ByteStorage"
+            | "CharStorage"
+            | "ComplexDoubleStorage"
+            | "ComplexFloatStorage"
+            | "DoubleStorage"
+            | "FloatStorage"
+            | "HalfStorage"
+            | "IntStorage"
+            | "LongStorage"
+            | "QInt32Storage"
+            | "QInt8Storage"
+            | "QUInt8Storage"
+            | "QUInt4x2Storage"
+            | "QUInt2x4Storage"
+            | "ShortStorage"
+            | "UntypedStorage"
+    )
+}
+
+pub(crate) fn is_known_pytorch_storage_global(module: &str, name: &str) -> bool {
+    matches!(module, "torch" | "torch.storage") && is_known_pytorch_storage_name(name)
+}
+
+fn is_known_pytorch_storage_reference_text(text: &str) -> bool {
+    text.strip_prefix("torch.storage.")
+        .or_else(|| text.strip_prefix("torch."))
+        .is_some_and(is_known_pytorch_storage_name)
+}
+
 fn is_pytorch_storage_descriptor(value: &StackValue, payload: &[u8]) -> bool {
     match value {
         StackValue::Global(reference) => {
-            reference.module == "torch" && reference.name.ends_with("Storage")
+            is_known_pytorch_storage_global(&reference.module, &reference.name)
         }
-        StackValue::Text(text) => text.starts_with("torch.") && text.ends_with("Storage"),
-        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
+        StackValue::Text { value, .. } => is_known_pytorch_storage_reference_text(value),
+        StackValue::TextSpan { start, end, .. } if start <= end && *end <= payload.len() => {
             let text = String::from_utf8_lossy(&payload[*start..*end]);
-            text.starts_with("torch.") && text.ends_with("Storage")
+            is_known_pytorch_storage_reference_text(&text)
         }
         _ => false,
     }
