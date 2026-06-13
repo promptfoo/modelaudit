@@ -15,6 +15,7 @@ import onnx
 from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
+import modelaudit.core as modelaudit_core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.detectors.jit_script import JITScriptDetector
@@ -1591,7 +1592,9 @@ def create_matmul_integer_scale_chain_model(
     widen_after_scale: bool = False,
     post_scale_bias_add: bool = False,
     narrow_after_scale: bool = False,
+    integer_op_boundary: str = "direct",
 ) -> Path:
+    assert integer_op_boundary in {"direct", "function", "if_subgraph"}
     weight_shape = (10, 100) if weight_on_left else (100, 10)
     weights = np.full(
         weight_shape,
@@ -1633,7 +1636,45 @@ def create_matmul_integer_scale_chain_model(
         if weight_on_left
         else ["X", "W_quantized", "X_zero_point", "W_zero_point"]
     )
-    nodes = [helper.make_node("MatMulInteger", matmul_inputs, ["Y_int"])]
+    functions: list[Any] = []
+    if integer_op_boundary == "function":
+        domain = "modelaudit.test"
+        function_inputs = [f"function_input_{index}" for index in range(len(matmul_inputs))]
+        functions.append(
+            helper.make_function(
+                domain,
+                "IntegerMatMul",
+                function_inputs,
+                ["function_output"],
+                [helper.make_node("MatMulInteger", function_inputs, ["function_output"])],
+                [helper.make_opsetid("", 13)],
+            )
+        )
+        nodes = [helper.make_node("IntegerMatMul", matmul_inputs, ["Y_int"], domain=domain)]
+    elif integer_op_boundary == "if_subgraph":
+        inputs.append(helper.make_tensor_value_info("condition", TensorProto.BOOL, []))
+
+        def make_integer_branch(name: str) -> Any:
+            output_name = f"{name}_output"
+            output = helper.make_tensor_value_info(output_name, TensorProto.INT32, None)
+            return helper.make_graph(
+                [helper.make_node("MatMulInteger", matmul_inputs, [output_name])],
+                name,
+                [],
+                [output],
+            )
+
+        nodes = [
+            helper.make_node(
+                "If",
+                ["condition"],
+                ["Y_int"],
+                then_branch=make_integer_branch("then"),
+                else_branch=make_integer_branch("else"),
+            )
+        ]
+    else:
+        nodes = [helper.make_node("MatMulInteger", matmul_inputs, ["Y_int"])]
     cast_input = "Y_int"
     if bias_add:
         initializers.append(onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int32), name="bias"))
@@ -1712,10 +1753,80 @@ def create_matmul_integer_scale_chain_model(
         outputs,
         initializer=initializers,
     )
+    opset_imports = [helper.make_opsetid("", 13)]
+    if integer_op_boundary == "function":
+        opset_imports.append(helper.make_opsetid("modelaudit.test", 1))
+    model = helper.make_model(graph, functions=functions, opset_imports=opset_imports)
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"matmul-integer-scale-chain-{integer_op_boundary}-{'left' if weight_on_left else 'right'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_dynamic_matmul_integer_bias_model(tmp_path: Path, *, malicious: bool) -> Path:
+    weights = np.ones((100, 10), dtype=np.int8)
+    weight_scale = np.ones(10, dtype=np.float32)
+    if malicious:
+        weight_scale[3] = 100.0
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "DynamicQuantizeLinear",
+                ["X"],
+                ["X_quantized", "X_scale", "X_zero_point"],
+            ),
+            helper.make_node(
+                "MatMulInteger",
+                ["X_quantized", "W_quantized", "X_zero_point", "W_zero_point"],
+                ["Y_integer"],
+            ),
+            helper.make_node("Cast", ["Y_integer"], ["Y_cast"], to=TensorProto.FLOAT),
+            helper.make_node("Mul", ["X_scale", "W_scale"], ["combined_scale"]),
+            helper.make_node("Mul", ["Y_cast", "combined_scale"], ["Y_scaled"]),
+            helper.make_node("Add", ["Y_scaled", "bias"], ["Y"]),
+            helper.make_node("Shape", ["Y"], ["Y_shape"]),
+        ],
+        "dynamic_matmul_integer_bias",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [
+            helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10]),
+            helper.make_tensor_value_info("Y_shape", TensorProto.INT64, [2]),
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(weights, name="W_quantized"),
+            onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="W_zero_point"),
+            onnx.numpy_helper.from_array(weight_scale, name="W_scale"),
+            onnx.numpy_helper.from_array(np.zeros(10, dtype=np.float32), name="bias"),
+        ],
+    )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / f"matmul-integer-scale-chain-{'left' if weight_on_left else 'right'}.onnx"
+    path = tmp_path / f"dynamic-matmul-integer-bias-{'malicious' if malicious else 'benign'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_declared_shape_metadata_model(tmp_path: Path) -> Path:
+    graph = helper.make_graph(
+        [
+            helper.make_node("Shape", ["W"], ["weight_shape"]),
+            helper.make_node("Gather", ["weight_shape", "index"], ["Y"]),
+        ],
+        "declared_shape_metadata",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.INT64, [])],
+        initializer=[
+            onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="W"),
+            onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int64), name="index"),
+        ],
+        value_info=[helper.make_tensor_value_info("weight_shape", TensorProto.INT64, [2])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "declared-shape-metadata.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -2116,22 +2227,25 @@ def create_oversized_packed_zero_point_model(tmp_path: Path) -> Path:
     return path
 
 
-def create_concat_weight_lineage_model(tmp_path: Path) -> Path:
+def create_concat_weight_lineage_model(tmp_path: Path, *, dynamic_right: bool = False) -> Path:
     left = np.zeros((50, 10), dtype=np.float32)
     right = np.zeros((50, 10), dtype=np.float32)
     right[:5, 3] = 100
+    graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])]
+    initializers = [onnx.numpy_helper.from_array(left, name="W_left")]
+    if dynamic_right:
+        graph_inputs.append(helper.make_tensor_value_info("W_right", TensorProto.FLOAT, [50, 10]))
+    else:
+        initializers.append(onnx.numpy_helper.from_array(right, name="W_right"))
     graph = helper.make_graph(
         [
             helper.make_node("Concat", ["W_left", "W_right"], ["W"], axis=0),
             helper.make_node("MatMul", ["X", "W"], ["Y"]),
         ],
         "concat_weight_lineage",
-        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        graph_inputs,
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
-        initializer=[
-            onnx.numpy_helper.from_array(left, name="W_left"),
-            onnx.numpy_helper.from_array(right, name="W_right"),
-        ],
+        initializer=initializers,
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
@@ -7584,6 +7698,15 @@ class TestWeightDistributionSemantics:
         }
         assert {sample["consumer_op"] for sample in semantics["unresolved_lineage_samples"]} == {"MatMul"}
 
+    def test_dynamic_concat_weight_lineage_fails_closed(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(create_concat_weight_lineage_model(tmp_path, dynamic_right=True)))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert {sample["reason"] for sample in semantics["unresolved_lineage_samples"]} == {"dynamic_input_lineage"}
+
     def test_matmul_integer_dead_scale_branch_cannot_suppress_anomaly(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_weight_model(
             tmp_path,
@@ -7650,6 +7773,42 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 1
         assert semantics["eligible"][0]["quantization_scale"] == "W_scale_0"
 
+    @pytest.mark.parametrize("integer_op_boundary", ["direct", "function", "if_subgraph"])
+    @pytest.mark.parametrize("anomalous_vector_scale", [False, True])
+    def test_matmul_integer_scale_chain_fails_closed_at_non_root_graph_boundary(
+        self,
+        tmp_path: Path,
+        integer_op_boundary: str,
+        anomalous_vector_scale: bool,
+    ) -> None:
+        model_path = create_matmul_integer_scale_chain_model(
+            tmp_path,
+            anomalous_vector_scale=anomalous_vector_scale,
+            integer_op_boundary=integer_op_boundary,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+
+        if integer_op_boundary != "direct":
+            assert result.success is False
+            coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+            assert len(coverage) == 1
+            assert semantics["eligible_initializer_count"] == 1
+            assert semantics["analyzed_initializer_count"] == 0
+            assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+        else:
+            assert result.success is True
+            checks = [
+                check
+                for check in result.checks
+                if check.name == "Weight Distribution Anomaly Detection"
+                and "abnormal weight magnitudes" in check.message
+            ]
+            assert len(checks) == int(anomalous_vector_scale)
+            assert semantics["analyzed_initializer_count"] == 1
+            assert semantics["eligible"][0]["quantization_scale_factor_names"] == ["X_scale", "W_scale_0"]
+
     def test_matmul_integer_resolves_scale_chain_past_integer_bias(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_scale_chain_model(tmp_path, bias_add=True)
 
@@ -7681,6 +7840,36 @@ class TestWeightDistributionSemantics:
         assert checks[0].details["outlier_neurons"] == [3]
         context = result.metadata["onnx_weight_distribution_semantics"]["eligible"][0]
         assert context["quantization_scale_factor_names"] == ["X_scale", "W_scale_0"]
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_dynamic_matmul_integer_scale_chain_stops_after_complete_bias_path(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        result = OnnxScanner().scan(str(create_dynamic_matmul_integer_bias_model(tmp_path, malicious=malicious)))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert result.success is True
+        assert len(checks) == int(malicious)
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible"][0]["quantization_scale_factor_names"] == ["W_scale"]
+
+    def test_declared_low_rank_standard_output_does_not_become_weight_lineage(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(create_declared_shape_metadata_model(tmp_path)))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is True
+        assert semantics["eligible_initializer_count"] == 0
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {}
 
     def test_matmul_integer_non_unit_add_scale_chain_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_scale_chain_model(tmp_path, duplicate_add_input=True)
@@ -8607,6 +8796,47 @@ class TestWeightDistributionSemantics:
         assert len(onnx_weight_issues) == 4
         assert {issue.details["consumer_op"] for issue in onnx_weight_issues} == {"MatMul", "Gather"}
         assert sum(1 for issue in onnx_weight_issues if issue.details["consumer_op"] == "Gather") == 2
+
+    def test_aggregate_bounds_duplicate_export_provenance_before_building_it(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        first = create_onnx_weight_model(tmp_path, weights, op_type="MatMul", filename="duplicate-00.onnx")
+        payload = first.read_bytes()
+        for index in range(1, 21):
+            (tmp_path / f"duplicate-{index:02d}.onnx").write_bytes(payload)
+
+        provenance_call_count = 0
+        original_provenance = modelaudit_core._onnx_weight_anomaly_provenance
+
+        def recording_provenance(results: Any, issue: Any) -> dict[str, Any]:
+            nonlocal provenance_call_count
+            provenance_call_count += 1
+            return original_provenance(results, issue)
+
+        monkeypatch.setattr(modelaudit_core, "_onnx_weight_anomaly_provenance", recording_provenance)
+
+        aggregate = scan_model_directory_or_file(
+            str(tmp_path),
+            recursive=False,
+            scanners=["onnx"],
+            cache_enabled=False,
+        )
+
+        clustered = [issue for issue in aggregate.issues if issue.details.get("clustered_onnx_weight_anomaly") is True]
+        assert len(clustered) == 2
+        assert provenance_call_count == 2 * 20
+        for issue in clustered:
+            assert issue.details["cluster_size"] == 21
+            assert len(issue.details["export_provenance"]) == 20
+            assert issue.details["export_provenance_truncated"] is True
+            group = issue.details["byte_identical_export_groups"][0]
+            assert group["export_count"] == 21
+            assert len(group["files"]) == 20
+            assert group["files_truncated"] is True
 
     def test_aggregate_does_not_cluster_distinct_file_hashes_with_same_signature(self, tmp_path: Path) -> None:
         positive_weights = np.zeros((100, 10), dtype=np.float32)

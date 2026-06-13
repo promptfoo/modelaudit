@@ -9,7 +9,7 @@ import os
 import re
 from collections.abc import Callable, Iterable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -1564,6 +1564,8 @@ def _build_onnx_weight_analysis_plan(
         producers_by_value: dict[str, Any],
         live_values: set[str],
         graph_output_names: set[str],
+        *,
+        graph_outputs_are_authoritative: bool,
     ) -> tuple[_OnnxWeightQuantization | None, str | None]:
         if lineage.quantization is not None:
             return lineage.quantization, None
@@ -1583,13 +1585,13 @@ def _build_onnx_weight_analysis_plan(
             *,
             depth: int = 0,
             visited: frozenset[str] = frozenset(),
-        ) -> tuple[str, ...] | None:
+        ) -> tuple[tuple[str, ...], bool] | None:
             if not value_name or value_name in visited or depth > _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT:
                 return None
             if value_name in constants:
                 tensor = constants[value_name]
                 try:
-                    return (value_name,) if int(tensor.data_type) in floating_types else None
+                    return ((value_name,), False) if int(tensor.data_type) in floating_types else None
                 except (AttributeError, TypeError, ValueError):
                     return None
             producer = producers_by_value.get(value_name)
@@ -1600,7 +1602,7 @@ def _build_onnx_weight_analysis_plan(
                 and len(producer.output) > 1
                 and str(producer.output[1]) == value_name
             ):
-                return ()
+                return (), True
             if (
                 producer is None
                 or getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
@@ -1609,20 +1611,23 @@ def _build_onnx_weight_analysis_plan(
                 return None
             discovered: list[str] = []
             discovered_by_source: list[tuple[str, ...]] = []
+            has_dynamic_quantize_scale = False
             next_visited = frozenset((*visited, value_name))
             for source_name in (str(source) for source in getattr(producer, "input", ()) if source):
-                source_names = scale_initializer_names_in_expression(
+                source_scale = scale_initializer_names_in_expression(
                     source_name,
                     depth=depth + 1,
                     visited=next_visited,
                 )
-                if source_names is None:
+                if source_scale is None:
                     return None
+                source_names, source_has_dynamic_quantize_scale = source_scale
                 discovered_by_source.append(source_names)
                 discovered.extend(source_names)
+                has_dynamic_quantize_scale |= source_has_dynamic_quantize_scale
             if producer.op_type == "Mul" and sum(bool(names) for names in discovered_by_source) != 1:
                 return None
-            return tuple(discovered)
+            return tuple(discovered), has_dynamic_quantize_scale
 
         def infer_authoritative_integer_scale_name() -> tuple[str | None, str | None]:
             nonlocal output_data_type, scale_factor_names
@@ -1631,7 +1636,7 @@ def _build_onnx_weight_analysis_plan(
                 for output_name in getattr(node, "output", ())
                 if output_name and str(output_name) in live_values
             ]
-            if not live_outputs or all(not consumers_by_value.get(output_name) for output_name in live_outputs):
+            if not live_outputs:
                 return None, None
             queue = [(output_name, 0) for output_name in live_outputs]
             visited_values: set[str] = set()
@@ -1640,6 +1645,7 @@ def _build_onnx_weight_analysis_plan(
             reached_terminal = False
             current_data_type = int(onnx.TensorProto.FLOAT)
             scale_data_type: int | None = None
+            has_dynamic_quantize_scale = False
             while queue:
                 value_name, depth = queue.pop(0)
                 if not value_name or value_name in visited_values:
@@ -1653,7 +1659,7 @@ def _build_onnx_weight_analysis_plan(
                     if any(str(output_name) in live_values for output_name in consumer.output if output_name)
                 ]
                 if value_name in graph_output_names:
-                    if live_consumers:
+                    if live_consumers or not graph_outputs_are_authoritative:
                         return None, "unresolved_quantized_weight_scale"
                     reached_terminal = True
                     continue
@@ -1687,6 +1693,11 @@ def _build_onnx_weight_analysis_plan(
                             or int(constants[bias_names[0]].data_type) != expected_bias_type
                         ):
                             return None, "unresolved_quantized_weight_scale"
+                        # A dynamic activation scale plus a static scale completes the
+                        # canonical integer dequantization path before the typed bias.
+                        if scale_data_type is not None and has_dynamic_quantize_scale and scale_names:
+                            reached_terminal = True
+                            continue
                     elif consumer.op_type == "Cast":
                         cast_data_type = _onnx_int_attribute(consumer, "to", -1)
                         if cast_data_type not in floating_types:
@@ -1711,10 +1722,12 @@ def _build_onnx_weight_analysis_plan(
                 scale_data_type = current_data_type
                 output_data_type = current_data_type
                 for source_name in (str(source) for source in consumer.input if source and str(source) != value_name):
-                    source_scale_names = scale_initializer_names_in_expression(source_name)
-                    if source_scale_names is None:
+                    source_scale = scale_initializer_names_in_expression(source_name)
+                    if source_scale is None:
                         return None, "unresolved_quantized_weight_scale"
+                    source_scale_names, source_has_dynamic_quantize_scale = source_scale
                     scale_names.extend(source_scale_names)
+                    has_dynamic_quantize_scale |= source_has_dynamic_quantize_scale
                 queue.extend((output_name, depth + 1) for output_name in next_values)
 
             if not reached_terminal:
@@ -1875,13 +1888,10 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
     ) -> _OnnxWeightLineage:
         if any(getattr(attribute, "ref_attr_name", "") for attribute in getattr(node, "attribute", ())):
-            return _OnnxWeightLineage(
-                initializer_index=lineage.initializer_index,
+            return replace(
+                lineage,
                 shape=None,
-                data_type=lineage.data_type,
-                transforms=lineage.transforms,
                 unresolved_reason=lineage.unresolved_reason or "referenced_function_attribute",
-                quantization=lineage.quantization,
             )
         if node.op_type == "Identity":
             return lineage
@@ -1889,31 +1899,21 @@ def _build_onnx_weight_analysis_plan(
             target_data_type = _onnx_int_attribute(node, "to", -1)
             if target_data_type == lineage.data_type:
                 return lineage
-            return _OnnxWeightLineage(
-                initializer_index=lineage.initializer_index,
-                shape=lineage.shape,
+            return replace(
+                lineage,
                 data_type=target_data_type if target_data_type >= 0 else None,
-                transforms=lineage.transforms,
                 unresolved_reason=lineage.unresolved_reason or "dtype_changing_cast_lineage",
-                quantization=lineage.quantization,
             )
         if len(lineage.transforms) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
-            return _OnnxWeightLineage(
-                initializer_index=lineage.initializer_index,
+            return replace(
+                lineage,
                 shape=None,
-                data_type=lineage.data_type,
-                transforms=lineage.transforms,
                 unresolved_reason=lineage.unresolved_reason or "lineage_transform_depth_limit",
-                quantization=lineage.quantization,
             )
         if lineage.shape is None:
-            return _OnnxWeightLineage(
-                initializer_index=lineage.initializer_index,
-                shape=None,
-                data_type=lineage.data_type,
-                transforms=lineage.transforms,
+            return replace(
+                lineage,
                 unresolved_reason=lineage.unresolved_reason or "lineage_shape_unavailable",
-                quantization=lineage.quantization,
             )
 
         output_shape: tuple[int, ...]
@@ -1924,53 +1924,33 @@ def _build_onnx_weight_analysis_plan(
             scale_name = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
             zero_point_name = str(node.input[2]) if len(node.input) > 2 and node.input[2] else None
             if not scale_name or scale_name not in constants:
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
-                    shape=lineage.shape,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
+                return replace(
+                    lineage,
                     unresolved_reason=lineage.unresolved_reason or "missing_dequantize_scale",
-                    quantization=lineage.quantization,
                 )
             scale_initializer_index = initializer_object_indexes.get(id(constants[scale_name]))
             if scale_initializer_index is None:
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
-                    shape=lineage.shape,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
+                return replace(
+                    lineage,
                     unresolved_reason=lineage.unresolved_reason or "missing_dequantize_scale",
-                    quantization=lineage.quantization,
                 )
             zero_point_initializer_index: int | None = None
             if zero_point_name is not None and zero_point_name not in constants:
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
-                    shape=lineage.shape,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
+                return replace(
+                    lineage,
                     unresolved_reason=lineage.unresolved_reason or "missing_dequantize_zero_point",
-                    quantization=lineage.quantization,
                 )
             if zero_point_name is not None:
                 zero_point_initializer_index = initializer_object_indexes.get(id(constants[zero_point_name]))
                 if zero_point_initializer_index is None:
-                    return _OnnxWeightLineage(
-                        initializer_index=lineage.initializer_index,
-                        shape=lineage.shape,
-                        data_type=lineage.data_type,
-                        transforms=lineage.transforms,
+                    return replace(
+                        lineage,
                         unresolved_reason=lineage.unresolved_reason or "missing_dequantize_zero_point",
-                        quantization=lineage.quantization,
                     )
             if _onnx_int_attribute(node, "block_size", 0):
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
-                    shape=lineage.shape,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
+                return replace(
+                    lineage,
                     unresolved_reason=lineage.unresolved_reason or "blocked_dequantize_lineage_unsupported",
-                    quantization=lineage.quantization,
                 )
             scale_is_scalar = math.prod(int(dimension) for dimension in constants[scale_name].dims) == 1
             zero_point_is_scalar = zero_point_name is None or (
@@ -1981,25 +1961,17 @@ def _build_onnx_weight_analysis_plan(
                 axis = _onnx_int_attribute(node, "axis", 1)
                 axis = axis if axis >= 0 else len(lineage.shape) + axis
                 if axis < 0 or axis >= len(lineage.shape):
-                    return _OnnxWeightLineage(
-                        initializer_index=lineage.initializer_index,
-                        shape=lineage.shape,
-                        data_type=lineage.data_type,
-                        transforms=lineage.transforms,
+                    return replace(
+                        lineage,
                         unresolved_reason=lineage.unresolved_reason or "invalid_dequantize_axis",
-                        quantization=lineage.quantization,
                     )
             output_shape = lineage.shape
             transform = _OnnxWeightTransform("DequantizeLinear", () if axis is None else (axis,))
             output_data_type = _onnx_int_attribute(node, "output_dtype", 0) or int(constants[scale_name].data_type)
             if output_data_type not in floating_types:
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
-                    shape=lineage.shape,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
+                return replace(
+                    lineage,
                     unresolved_reason=lineage.unresolved_reason or "unsupported_dequantize_output_dtype",
-                    quantization=lineage.quantization,
                 )
             quantization = _OnnxWeightQuantization(
                 kind="DequantizeLinear",
@@ -2012,43 +1984,34 @@ def _build_onnx_weight_analysis_plan(
                 output_data_type=output_data_type,
             )
         elif node.op_type in {"DynamicQuantizeLinear", "QuantizeLinear"}:
-            return _OnnxWeightLineage(
-                initializer_index=lineage.initializer_index,
-                shape=lineage.shape,
+            return replace(
+                lineage,
                 data_type=None,
-                transforms=lineage.transforms,
                 unresolved_reason=lineage.unresolved_reason
                 or (
                     "dynamic_quantize_linear_lineage_unsupported"
                     if node.op_type == "DynamicQuantizeLinear"
                     else "quantize_linear_lineage_unsupported"
                 ),
-                quantization=lineage.quantization,
             )
         elif node.op_type == "Flatten":
             axis = _onnx_int_attribute(node, "axis", 1)
             axis = axis if axis >= 0 else len(lineage.shape) + axis
             if axis < 0 or axis > len(lineage.shape):
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
+                return replace(
+                    lineage,
                     shape=None,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "invalid_flatten_lineage",
-                    quantization=lineage.quantization,
                 )
             output_shape = (math.prod(lineage.shape[:axis]), math.prod(lineage.shape[axis:]))
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type in {"Squeeze", "Unsqueeze"}:
             axes = _resolve_onnx_axes(node, constants, onnx=onnx)
             if axes is None:
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
+                return replace(
+                    lineage,
                     shape=None,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or f"unresolved_{node.op_type.lower()}_lineage",
-                    quantization=lineage.quantization,
                 )
             if node.op_type == "Squeeze":
                 normalized_axes = tuple(axis if axis >= 0 else len(lineage.shape) + axis for axis in axes)
@@ -2059,13 +2022,10 @@ def _build_onnx_weight_analysis_plan(
                     or any(axis < 0 or axis >= len(lineage.shape) for axis in normalized_axes)
                     or any(lineage.shape[axis] != 1 for axis in normalized_axes)
                 ):
-                    return _OnnxWeightLineage(
-                        initializer_index=lineage.initializer_index,
+                    return replace(
+                        lineage,
                         shape=None,
-                        data_type=lineage.data_type,
-                        transforms=lineage.transforms,
                         unresolved_reason=lineage.unresolved_reason or "invalid_squeeze_lineage",
-                        quantization=lineage.quantization,
                     )
                 output_shape = tuple(
                     dimension for index, dimension in enumerate(lineage.shape) if index not in normalized_axes
@@ -2078,13 +2038,10 @@ def _build_onnx_weight_analysis_plan(
                     or len(set(normalized_axes)) != len(normalized_axes)
                     or any(axis < 0 or axis >= output_rank for axis in normalized_axes)
                 ):
-                    return _OnnxWeightLineage(
-                        initializer_index=lineage.initializer_index,
+                    return replace(
+                        lineage,
                         shape=None,
-                        data_type=lineage.data_type,
-                        transforms=lineage.transforms,
                         unresolved_reason=lineage.unresolved_reason or "invalid_unsqueeze_lineage",
-                        quantization=lineage.quantization,
                     )
                 source_dimensions = iter(lineage.shape)
                 output_shape = tuple(
@@ -2100,13 +2057,10 @@ def _build_onnx_weight_analysis_plan(
                 )
             )
             if sorted(permutation) != list(range(len(lineage.shape))):
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
+                return replace(
+                    lineage,
                     shape=None,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "invalid_transpose_lineage",
-                    quantization=lineage.quantization,
                 )
             if permutation == tuple(range(len(lineage.shape))):
                 return lineage
@@ -2126,13 +2080,10 @@ def _build_onnx_weight_analysis_plan(
                 else None
             )
             if resolved_shape is None:
-                return _OnnxWeightLineage(
-                    initializer_index=lineage.initializer_index,
+                return replace(
+                    lineage,
                     shape=None,
-                    data_type=lineage.data_type,
-                    transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "unresolved_reshape_lineage",
-                    quantization=lineage.quantization,
                 )
             output_shape = resolved_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
@@ -2144,12 +2095,11 @@ def _build_onnx_weight_analysis_plan(
         ):
             return lineage
 
-        return _OnnxWeightLineage(
-            initializer_index=lineage.initializer_index,
+        return replace(
+            lineage,
             shape=output_shape,
             data_type=output_data_type,
             transforms=(*lineage.transforms, transform),
-            unresolved_reason=lineage.unresolved_reason,
             quantization=quantization,
         )
 
@@ -2570,6 +2520,7 @@ def _build_onnx_weight_analysis_plan(
                         producers_by_value,
                         live_values,
                         graph_output_names,
+                        graph_outputs_are_authoritative=source_scope == ("root_graph",),
                     )
                     if quantization_gap is not None:
                         record_unresolved_lineage(
@@ -2794,9 +2745,21 @@ def _build_onnx_weight_analysis_plan(
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                     and node.op_type in _WEIGHT_COMPUTING_LINEAGE_OPERATORS
                 )
-                unmodeled_standard_operator_lineage = (
+                concat_output_shapes = (
+                    {known_value_shapes.get(str(output_name)) for output_name in node.output if output_name}
+                    if node.op_type == "Concat"
+                    else set()
+                )
+                concat_output_shape = (
+                    next(iter(concat_output_shapes))
+                    if len(concat_output_shapes) == 1 and None not in concat_output_shapes
+                    else None
+                )
+                concat_lineage = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and node.op_type == "Concat"
+                    and any(shape is None or len(shape) >= 2 for shape in concat_output_shapes)
                     and not (
                         same_type_elementwise
                         or same_type_unary_elementwise
@@ -2818,7 +2781,7 @@ def _build_onnx_weight_analysis_plan(
                     or prelu_data_is_activation
                     or weight_computing_lineage
                     or unknown_operator_lineage
-                    or unmodeled_standard_operator_lineage
+                    or concat_lineage
                 )
                 if propagates_lineage:
                     elementwise_output_shape = (
@@ -2826,6 +2789,8 @@ def _build_onnx_weight_analysis_plan(
                         if same_type_elementwise or same_type_unary_elementwise or pow_operator
                         else known_value_shapes.get(input_names[0])
                         if clip_operator and input_names
+                        else concat_output_shape
+                        if concat_lineage
                         else None
                     )
                     carries_dynamic_activation = bool(terminal_weight_lineages) and has_dynamic_input

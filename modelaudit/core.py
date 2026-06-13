@@ -1957,15 +1957,18 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
         emitted.add(key)
 
         representative = cluster[0]
-        provenance = [_onnx_weight_anomaly_provenance(results, clustered) for clustered in cluster]
+        provenance = [
+            _onnx_weight_anomaly_provenance(results, clustered)
+            for clustered in cluster[:_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT]
+        ]
         content_hash = _file_content_hash(results, representative.location)
         files = [item.get("file") for item in provenance]
         byte_identical_groups = [
             {
                 "content_hash": content_hash,
-                "export_count": len(files),
-                "files": files[:_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT],
-                "files_truncated": len(files) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
+                "export_count": len(cluster),
+                "files": files,
+                "files_truncated": len(cluster) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
             }
         ]
 
@@ -1975,8 +1978,8 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
                 "clustered_onnx_weight_anomaly": True,
                 "cluster_size": len(cluster),
                 "representative_file": representative.location,
-                "export_provenance": provenance[:_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT],
-                "export_provenance_truncated": len(provenance) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
+                "export_provenance": provenance,
+                "export_provenance_truncated": len(cluster) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
                 "byte_identical_export_groups": byte_identical_groups,
                 "byte_identical_export_groups_truncated": False,
             }
