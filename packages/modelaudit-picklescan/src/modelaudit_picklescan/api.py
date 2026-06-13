@@ -22,15 +22,19 @@ from .call_graph import (
     _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
     _ensure_shared_source_snapshot_stable,
+    _is_skippable_pytorch_storage_persistent_id_reference,
     class_static_attribute_lookup_is_proven_source_backed,
     find_analyzed_callable_call_graph_global_positions,
     find_dangerous_call_graphs,
     find_startup_hook_write_call_graphs,
     find_unanalyzed_callable_call_graph_references,
     has_unanalyzed_call_graph_import_references,
+    import_only_module_load_is_proven_safe_for_invocation,
     import_only_module_requires_origin_review,
     import_only_reference_is_proven_trusted,
+    import_only_reference_is_proven_trusted_for_pickle_invocation,
     module_initialization_is_proven_inert,
+    module_is_loaded_without_import_hooks,
     shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
 )
@@ -103,6 +107,8 @@ _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
 _PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS = 10_000
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 _MAX_INERT_INITIALIZATION_MODULES = 32
+_SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
+_SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES = 100_000
 _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
 _PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
     {
@@ -129,13 +135,108 @@ _PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
 _PYTORCH_STORAGE_GLOBALS = frozenset(
     (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
 )
-_TRUSTED_REDUCE_REFERENCES = frozenset(
+_TRUSTED_FRAMEWORK_REDUCE_REFERENCES = frozenset(
     {
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("torch", "device"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+    }
+)
+_SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES = frozenset(
+    {
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+        ("numpy", "dtype"),
+        ("numpy", "ndarray"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy._core.multiarray", "scalar"),
+        ("numpy.core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "scalar"),
+        ("torch", "BFloat16Storage"),
+        ("torch", "BoolStorage"),
+        ("torch", "ByteStorage"),
+        ("torch", "CharStorage"),
+        ("torch", "ComplexDoubleStorage"),
+        ("torch", "ComplexFloatStorage"),
+        ("torch", "DoubleStorage"),
+        ("torch", "FloatStorage"),
+        ("torch", "HalfStorage"),
+        ("torch", "IntStorage"),
+        ("torch", "LongStorage"),
+        ("torch", "QInt32Storage"),
+        ("torch", "QInt8Storage"),
+        ("torch", "QUInt2x4Storage"),
+        ("torch", "QUInt4x2Storage"),
+        ("torch", "QUInt8Storage"),
+        ("torch", "ShortStorage"),
+        ("torch", "Size"),
+        ("torch", "Storage"),
+        ("torch", "UntypedStorage"),
+        ("torch", "_rebuild_tensor"),
+        ("torch", "_rebuild_tensor_v2"),
+        ("torch", "bfloat16"),
+        ("torch", "device"),
+        ("torch._tensor", "_rebuild_from_type_v2"),
+        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
+        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
+        ("torch._utils", "_rebuild_nested_tensor"),
+        ("torch._utils", "_rebuild_parameter"),
+        ("torch._utils", "_rebuild_parameter_with_state"),
+        ("torch._utils", "_rebuild_qtensor"),
+        ("torch._utils", "_rebuild_sparse_tensor"),
+        ("torch._utils", "_rebuild_tensor"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch._utils", "_rebuild_tensor_v3"),
+        ("torch._utils", "_rebuild_wrapper_subclass"),
+        ("torch.serialization", "_get_layout"),
+        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+        ("transformers.training_args", "TrainingArguments"),
+    }
+)
+_TRUSTED_REDUCE_REFERENCES = (
+    frozenset(
+        {
+            ("string", "Formatter"),
+            ("weakref", "proxy"),
+            ("weakref", "ref"),
+        }
+    )
+    | _TRUSTED_FRAMEWORK_REDUCE_REFERENCES
+)
+_TRUSTED_RECONSTRUCTION_WITHOUT_SOURCE_ANALYSIS_REFERENCES = frozenset(
+    {
+        ("_frozen_importlib", "ModuleSpec"),
         ("string", "Formatter"),
         ("weakref", "proxy"),
         ("weakref", "ref"),
     }
 )
+_TRUSTED_REDUCE_WITHOUT_SOURCE_ANALYSIS_REFERENCES = _TRUSTED_REDUCE_REFERENCES - _TRUSTED_FRAMEWORK_REDUCE_REFERENCES
+_NUMPY_RECONSTRUCT_REFERENCES = frozenset(
+    {
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "_reconstruct"),
+    }
+)
+_NUMPY_NDARRAY_REFERENCES = frozenset({("numpy", "ndarray")})
+_NUMPY_DTYPE_REFERENCES = frozenset({("numpy", "dtype")})
+_NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES = (
+    _NUMPY_RECONSTRUCT_REFERENCES | _NUMPY_NDARRAY_REFERENCES | _NUMPY_DTYPE_REFERENCES
+)
+_CODECS_ENCODE_REFERENCES = frozenset({("_codecs", "encode")})
 _TRUSTED_STATIC_GETATTR_RECONSTRUCTIONS = frozenset(
     {
         ("ultralytics.nn.modules.head", "Detect", "forward"),
@@ -150,6 +251,26 @@ _ZIP64_EOCD_LOCATOR_SIZE = 20
 _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
 _ZIP64_EOCD_MIN_SIZE = 56
 _ZIP64_SENTINEL_ENTRY_COUNT = 0xFFFF
+
+
+def _source_backed_invocation_requires_loaded_identity(
+    reference: tuple[str, str],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
+) -> bool:
+    if suppress_safe_numpy_reconstruct and reference in _NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES:
+        return False
+    return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
+
+
+def _source_backed_import_requires_initialization_proof(
+    reference: tuple[str, str],
+    *,
+    suppress_safe_numpy_reconstruct: bool = False,
+) -> bool:
+    if suppress_safe_numpy_reconstruct and reference in _NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES:
+        return False
+    return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
 
 
 class _StreamShortReadError(ValueError):
@@ -172,13 +293,51 @@ class _PytorchZipDeadlineExceeded(TimeoutError):
 class _PickleGlobalRef:
     module: str
     name: str
+    position: int
+
+
+@dataclass(frozen=True)
+class _AbstractGlobal:
+    module: str
+    name: str
+
+
+@dataclass(frozen=True)
+class _AbstractBytes:
+    pass
+
+
+@dataclass(frozen=True)
+class _AbstractNumpyDType:
+    pass
+
+
+@dataclass(frozen=True)
+class _AbstractNumpyArraySeed:
+    pass
+
+
+@dataclass(frozen=True)
+class _AbstractNumpyArray:
+    pass
+
+
+@dataclass(frozen=True)
+class _AbstractCallResult:
+    function: object
+    args: object
 
 
 @dataclass(frozen=True)
 class _PytorchStorageReferenceParse:
     referenced_keys: set[str]
+    storage_global_positions: set[int]
     parse_complete: bool
     all_persistent_ids_are_pytorch_storage: bool
+
+
+_ABSTRACT_MARK = object()
+_ABSTRACT_UNKNOWN = object()
 
 
 class PickleScanner:
@@ -1313,11 +1472,13 @@ def _pytorch_storage_keys_from_pickle_bytes(
     *,
     opcode_budget_remaining: list[int] | None = None,
     deadline: float | None = None,
+    position_offset: int = 0,
 ) -> _PytorchStorageReferenceParse:
     marker = object()
     memo: dict[int, Any] = {}
     stack: list[Any] = []
     referenced_keys: set[str] = set()
+    storage_global_positions: set[int] = set()
     all_persistent_ids_are_pytorch_storage = True
 
     def pop_marked_tuple() -> tuple[Any, ...] | None:
@@ -1356,13 +1517,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
         ):
             return None
         storage_key = _coerce_pickle_string_arg(pid[2])
-        if storage_key is None or not _is_ascii_decimal_digits(storage_key):
+        if storage_key is None or storage_key == "":
             return None
         if _coerce_pickle_string_arg(pid[3]) is None:
             return None
         storage_size = pid[4]
         if not isinstance(storage_size, int) or isinstance(storage_size, bool) or storage_size < 0:
             return None
+        storage_global_positions.add(storage_type.position)
         return storage_key
 
     try:
@@ -1371,10 +1533,11 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 _check_pytorch_zip_deadline(deadline)
             if opcode_budget_remaining is not None:
                 if opcode_budget_remaining[0] <= 0:
-                    return _PytorchStorageReferenceParse(set(), False, False)
+                    return _PytorchStorageReferenceParse(set(), set(), False, False)
                 opcode_budget_remaining[0] -= 1
             if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
-                return _PytorchStorageReferenceParse(set(), False, False)
+                return _PytorchStorageReferenceParse(set(), set(), False, False)
+            position = position_offset + (_pos if type(_pos) is int else 0)
             opcode_name = opcode.name
             if opcode_name in {"PROTO", "FRAME", "STOP"}:
                 continue
@@ -1396,14 +1559,16 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     stack.append(None)
                 else:
                     parts = global_name.split()
-                    stack.append(_PickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else None)
+                    stack.append(_PickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else None)
             elif opcode_name == "STACK_GLOBAL":
                 if len(stack) < 2:
                     stack.clear()
                     continue
                 name = _coerce_pickle_string_arg(stack.pop())
                 module = _coerce_pickle_string_arg(stack.pop())
-                stack.append(_PickleGlobalRef(module, name) if module is not None and name is not None else None)
+                stack.append(
+                    _PickleGlobalRef(module, name, position) if module is not None and name is not None else None
+                )
             elif opcode_name == "EMPTY_TUPLE":
                 stack.append(())
             elif opcode_name == "TUPLE":
@@ -1464,11 +1629,12 @@ def _pytorch_storage_keys_from_pickle_bytes(
             else:
                 stack.clear()
             if not within_limits():
-                return _PytorchStorageReferenceParse(set(), False, False)
+                return _PytorchStorageReferenceParse(set(), set(), False, False)
     except Exception:
-        return _PytorchStorageReferenceParse(set(), False, False)
+        return _PytorchStorageReferenceParse(set(), set(), False, False)
     return _PytorchStorageReferenceParse(
         referenced_keys=referenced_keys,
+        storage_global_positions=storage_global_positions,
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
     )
@@ -2131,7 +2297,11 @@ def _scan_pickle_payload_native(
         )
         if not isinstance(raw_report, Mapping):
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
-        report = _report_from_native_dict(raw_report)
+        report = _with_canonical_pytorch_storage_persistent_id_metadata(
+            _report_from_native_dict(raw_report),
+            payload,
+            position_offset=native_position_offset,
+        )
         if enrich_call_graph:
             if _call_graph_enrichment_is_redundant(report):
                 if _call_graph_has_no_source_inputs(report):
@@ -2142,7 +2312,7 @@ def _scan_pickle_payload_native(
                 with shared_source_sensitive_caches():
                     source_fingerprints = shared_source_fingerprint_metadata()
                 return _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
-            return _with_call_graph_findings(report)
+            return _with_call_graph_findings(report, payload=payload)
         return _with_import_origin_findings(report)
     except Exception as error:
         return _engine_error_report(
@@ -2182,6 +2352,130 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
         metadata=dict(_mapping(raw_report.get("metadata", {}))),
         private_metadata=dict(_mapping(raw_report.get("private_metadata", {}))),
         duration_s=float(raw_report.get("duration_s", 0.0)),
+    )
+
+
+def _with_canonical_pytorch_storage_persistent_id_metadata(
+    report: PickleReport,
+    payload: bytes,
+    *,
+    position_offset: int = 0,
+) -> PickleReport:
+    if not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings):
+        return report
+    try:
+        storage_reference_parse = _pytorch_storage_keys_from_pickle_bytes(payload, position_offset=position_offset)
+    except Exception:
+        storage_reference_parse = _PytorchStorageReferenceParse(set(), set(), False, False)
+    trusted_storage_keys = storage_reference_parse.referenced_keys
+    proven_canonical_storage_ids = (
+        storage_reference_parse.parse_complete
+        and storage_reference_parse.all_persistent_ids_are_pytorch_storage
+        and bool(trusted_storage_keys)
+    )
+    rust_canonical_storage_ids = _rust_pytorch_storage_persistent_id_flags_are_canonical(report)
+    single_storage_key = next(iter(trusted_storage_keys)) if len(trusted_storage_keys) == 1 else None
+
+    findings = tuple(
+        _finding_with_details(
+            finding,
+            _canonical_pytorch_storage_persistent_id_details(
+                finding.details,
+                proven_canonical_storage_ids=proven_canonical_storage_ids,
+                rust_canonical_storage_ids=rust_canonical_storage_ids,
+                single_storage_key=single_storage_key,
+            ),
+        )
+        for finding in report.findings
+    )
+    metadata = report.to_dict()["metadata"]
+    import_references = metadata.get("import_references")
+    if isinstance(import_references, list):
+        metadata["import_references"] = [
+            _canonical_pytorch_storage_import_reference(
+                _mapping(reference),
+                proven_canonical_storage_ids=proven_canonical_storage_ids,
+                storage_global_positions=storage_reference_parse.storage_global_positions,
+            )
+            for reference in import_references
+        ]
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=report.verdict,
+        findings=findings,
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=metadata,
+        private_metadata=report.private_metadata,
+        duration_s=report.duration_s,
+    )
+
+
+def _rust_pytorch_storage_persistent_id_flags_are_canonical(report: PickleReport) -> bool:
+    flagged_reference_found = False
+    for raw_reference in _sequence(report.metadata.get("import_references")):
+        reference = _mapping(raw_reference)
+        if reference.get("pytorch_storage_persistent_id") is not True:
+            continue
+        flagged_reference_found = True
+        module = reference.get("module")
+        name = reference.get("name")
+        if type(module) is not str or type(name) is not str or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
+            return False
+    return flagged_reference_found
+
+
+def _canonical_pytorch_storage_import_reference(
+    reference: Mapping[str, Any],
+    *,
+    proven_canonical_storage_ids: bool,
+    storage_global_positions: set[int],
+) -> dict[str, Any]:
+    normalized = dict(reference)
+    module = normalized.get("module")
+    name = normalized.get("name")
+    if type(module) is str and type(name) is str and (module, name) in _PYTORCH_STORAGE_GLOBALS:
+        if proven_canonical_storage_ids and _optional_int(normalized.get("position")) in storage_global_positions:
+            normalized["pytorch_storage_persistent_id"] = True
+        else:
+            normalized.pop("pytorch_storage_persistent_id", None)
+        return normalized
+    normalized.pop("pytorch_storage_persistent_id", None)
+    return normalized
+
+
+def _canonical_pytorch_storage_persistent_id_details(
+    details: Mapping[str, Any],
+    *,
+    proven_canonical_storage_ids: bool,
+    rust_canonical_storage_ids: bool,
+    single_storage_key: str | None,
+) -> dict[str, Any]:
+    normalized = dict(details)
+    if normalized.get("opcode") not in {"BINPERSID", "PERSID"}:
+        return normalized
+    if proven_canonical_storage_ids:
+        normalized["pytorch_storage_persistent_id"] = True
+        if single_storage_key is not None:
+            normalized["pytorch_storage_key"] = single_storage_key
+        return normalized
+    if rust_canonical_storage_ids and normalized.get("pytorch_storage_persistent_id") is True:
+        return normalized
+    normalized.pop("pytorch_storage_persistent_id", None)
+    normalized.pop("pytorch_storage_key", None)
+    return normalized
+
+
+def _finding_with_details(finding: Finding, details: Mapping[str, Any]) -> Finding:
+    return Finding(
+        message=finding.message,
+        severity=finding.severity,
+        location=finding.location,
+        rule_code=finding.rule_code,
+        details=details,
+        why=finding.why,
     )
 
 
@@ -2246,15 +2540,18 @@ def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str
     return dict(metadata) == _source_independent_call_graph_fingerprint_metadata()
 
 
-def _with_call_graph_findings(report: PickleReport) -> PickleReport:
+def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = None) -> PickleReport:
     import_references = report.metadata.get("import_references")
     callable_invocations = report.metadata.get("callable_invocations", ())
+    suppress_safe_numpy_reconstruct = _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
     enrichment_errors: list[tuple[str, Exception]] = []
     source_fingerprints: Mapping[str, Any] | None = None
     inert_initialization_modules: frozenset[str] = frozenset()
     trusted_import_references: frozenset[tuple[str, str]] = frozenset()
+    trusted_invocation_global_positions: frozenset[int] = frozenset()
     analyzed_invocation_global_positions: frozenset[int] = frozenset()
     analyzed_invocation_references: frozenset[tuple[str, str]] = frozenset()
+    invocation_load_safe_modules: frozenset[str] = frozenset()
     safe_getattr_reconstruction_keys: frozenset[tuple[int, int]] = frozenset()
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
@@ -2273,6 +2570,13 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             _trusted_reconstruction_global_positions(callable_invocations),
             _trusted_reconstruction_references(callable_invocations),
         )
+        if not suppress_safe_numpy_reconstruct:
+            numpy_reconstruct_positions = _numpy_reconstruct_global_positions(callable_invocations)
+            invocation_classification = (
+                invocation_classification[0],
+                invocation_classification[1] - numpy_reconstruct_positions,
+                invocation_classification[2] - _NUMPY_RECONSTRUCT_REFERENCES,
+            )
     except Exception as error:
         invocation_classification = None
         callable_invocations_complete = False
@@ -2320,6 +2624,30 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         except Exception as error:
             enrichment_errors.append(("python_import_invocation_analysis", error))
         try:
+            trusted_invocation_global_positions = _proven_trusted_invocation_global_positions(callable_invocations)
+        except Exception as error:
+            enrichment_errors.append(("python_import_invocation_loaded_identity", error))
+        try:
+            invocation_load_safe_modules = _invocation_load_safe_modules(
+                callable_invocations,
+                invocation_classification[0] if invocation_classification is not None else frozenset(),
+            )
+        except Exception as error:
+            enrichment_errors.append(("python_import_invocation_initialization", error))
+        try:
+            report = _with_untrusted_invoked_allowlisted_import_findings(
+                report,
+                import_references,
+                invocation_classification[0] if invocation_classification is not None else frozenset(),
+                analyzed_invocation_global_positions,
+                invocation_load_safe_modules,
+                invocation_classification[1] if invocation_classification is not None else frozenset(),
+                trusted_invocation_global_positions,
+                suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+            )
+        except Exception as error:
+            enrichment_errors.append(("python_import_allowlist_loaded_identity", error))
+        try:
             if callable_invocations_complete:
                 safe_getattr_reconstruction_keys = _proven_safe_getattr_reconstruction_keys(callable_invocations)
         except Exception as error:
@@ -2350,7 +2678,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         and callable_invocations_complete
         and non_allowlisted_global_imports_complete
         and invocation_classification is not None
-        and (inert_initialization_modules or trusted_import_references)
+        and (inert_initialization_modules or trusted_import_references or trusted_invocation_global_positions)
     ):
         (
             invoked_global_positions,
@@ -2364,8 +2692,11 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             invoked_global_positions,
             analyzed_invocation_global_positions,
             analyzed_invocation_references,
+            invocation_load_safe_modules,
             trusted_reconstruction_global_positions,
             trusted_reconstruction_references,
+            trusted_invocation_global_positions,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
         )
     updated_report = _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
     updated_report = (
@@ -2390,6 +2721,10 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         _call_graph_finding_to_report_finding(updated_report, finding)
         for finding in call_graph_findings
         if (finding.module, finding.name) not in existing_critical_globals
+        and not _call_graph_finding_is_safe_numpy_reconstruction_noise(
+            finding,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+        )
     )
     startup_findings = tuple(
         _startup_hook_write_finding_to_report_finding(updated_report, finding)
@@ -2532,10 +2867,18 @@ def _without_proven_safe_getattr_reconstruction_findings(
     report: PickleReport,
     safe_getattr_reconstruction_keys: frozenset[tuple[int, int]],
 ) -> PickleReport:
+    fallback_global_positions = _safe_getattr_global_position_fallbacks(
+        report.findings,
+        safe_getattr_reconstruction_keys,
+    )
     findings = tuple(
         finding
         for finding in report.findings
-        if _dangerous_getattr_call_key(finding) not in safe_getattr_reconstruction_keys
+        if not _dangerous_getattr_call_is_proven_safe(
+            finding,
+            safe_getattr_reconstruction_keys,
+            fallback_global_positions,
+        )
     )
     if len(findings) == len(report.findings):
         return report
@@ -2553,14 +2896,53 @@ def _without_proven_safe_getattr_reconstruction_findings(
     )
 
 
-def _dangerous_getattr_call_key(finding: Finding) -> tuple[int, int] | None:
+def _safe_getattr_global_position_fallbacks(
+    findings: tuple[Finding, ...],
+    safe_getattr_reconstruction_keys: frozenset[tuple[int, int]],
+) -> frozenset[int]:
+    safe_counts: dict[int, int] = {}
+    missing_opcode_counts: dict[int, int] = {}
+    for global_position, _opcode_position in safe_getattr_reconstruction_keys:
+        safe_counts[global_position] = safe_counts.get(global_position, 0) + 1
+    for finding in findings:
+        if _optional_int(finding.details.get("opcode_position")) is not None:
+            continue
+        missing_opcode_global_position = _dangerous_getattr_call_global_position(finding)
+        if missing_opcode_global_position is not None:
+            missing_opcode_counts[missing_opcode_global_position] = (
+                missing_opcode_counts.get(missing_opcode_global_position, 0) + 1
+            )
+    return frozenset(
+        global_position
+        for global_position, count in missing_opcode_counts.items()
+        if count == 1 and safe_counts.get(global_position) == 1
+    )
+
+
+def _dangerous_getattr_call_is_proven_safe(
+    finding: Finding,
+    safe_getattr_reconstruction_keys: frozenset[tuple[int, int]],
+    fallback_global_positions: frozenset[int],
+) -> bool:
+    key = _dangerous_getattr_call_key(finding)
+    if key is not None:
+        return key in safe_getattr_reconstruction_keys
+    global_position = _dangerous_getattr_call_global_position(finding)
+    return global_position is not None and global_position in fallback_global_positions
+
+
+def _dangerous_getattr_call_global_position(finding: Finding) -> int | None:
     if finding.rule_code != "DANGEROUS_CALL" or str(finding.details.get("opcode", "")) != "REDUCE":
         return None
     module = str(finding.details.get("module", ""))
     name = str(finding.details.get("name", ""))
     if module not in {"builtins", "__builtin__", "__builtins__"} or name != "getattr":
         return None
-    global_position = _optional_int(finding.details.get("global_position"))
+    return _optional_int(finding.details.get("global_position"))
+
+
+def _dangerous_getattr_call_key(finding: Finding) -> tuple[int, int] | None:
+    global_position = _dangerous_getattr_call_global_position(finding)
     opcode_position = _optional_int(finding.details.get("opcode_position"))
     if global_position is None or opcode_position is None:
         return None
@@ -2611,6 +2993,11 @@ def _with_untrusted_allowlisted_import_findings(
         raw_position = reference.get("position")
         position = raw_position if type(raw_position) is int else None
         key = (import_reference, position)
+        source_backed_import_initialization_untrusted = (
+            _source_backed_import_requires_initialization_proof((module, name))
+            and not module_is_loaded_without_import_hooks(module)
+            and not module_initialization_is_proven_inert(module)
+        )
         if (
             not module
             or not name
@@ -2618,12 +3005,31 @@ def _with_untrusted_allowlisted_import_findings(
             or bool(reference.get("is_dangerous"))
             or not bool(reference.get("requires_origin_verification"))
             or key in existing_references
-            or not _allowlisted_import_requires_origin_finding(module, name)
+            or _is_skippable_pytorch_storage_persistent_id_reference(reference)
+            or (
+                not _allowlisted_import_requires_origin_finding(module, name)
+                and not source_backed_import_initialization_untrusted
+            )
         ):
             continue
+        if source_backed_import_initialization_untrusted:
+            message = (
+                f"Found source-backed allowlisted global without inert import initialization proof: {import_reference}"
+            )
+            why = (
+                "Source-backed framework metadata can execute module-level code when pickle resolves an unloaded "
+                "GLOBAL; suppress it only when the module is already loaded or import-time initialization is "
+                "proven inert."
+            )
+        else:
+            message = f"Found allowlisted global reference from an untrusted module origin: {import_reference}"
+            why = (
+                "Allowlisted modules are safe only when they resolve from the standard library or installed "
+                "site-packages; a project-local shadow module can execute arbitrary import-time code."
+            )
         additional_findings.append(
             Finding(
-                message=f"Found allowlisted global reference from an untrusted module origin: {import_reference}",
+                message=message,
                 severity=Severity.WARNING,
                 location=f"{report.source} (pos {position})" if position is not None else report.source,
                 rule_code="NON_ALLOWLISTED_GLOBAL",
@@ -2633,10 +3039,94 @@ def _with_untrusted_allowlisted_import_findings(
                     "name": name,
                     "import_reference": import_reference,
                     "position": position,
+                    "source_backed_import_initialization_untrusted": source_backed_import_initialization_untrusted,
+                },
+                why=why,
+            )
+        )
+        existing_references.add(key)
+    if not additional_findings:
+        return report
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.SUSPICIOUS,
+        findings=(*report.findings, *additional_findings),
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        duration_s=report.duration_s,
+    )
+
+
+def _with_untrusted_invoked_allowlisted_import_findings(
+    report: PickleReport,
+    import_references: object,
+    invoked_global_positions: frozenset[int],
+    analyzed_invocation_global_positions: frozenset[int],
+    invocation_load_safe_modules: frozenset[str],
+    trusted_reconstruction_global_positions: frozenset[int],
+    trusted_invocation_global_positions: frozenset[int],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
+) -> PickleReport:
+    if not invoked_global_positions:
+        return report
+    existing_references = {
+        (
+            str(finding.details.get("import_reference", "")),
+            finding.details.get("position"),
+        )
+        for finding in report.findings
+    }
+    additional_findings: list[Finding] = []
+    for raw_reference in _sequence(import_references):
+        reference = _mapping(raw_reference)
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        import_reference = str(reference.get("import_reference", ""))
+        position = _optional_int(reference.get("position"))
+        key = (import_reference, position)
+        if (
+            not module
+            or not name
+            or not import_reference
+            or position is None
+            or position not in invoked_global_positions
+            or bool(reference.get("is_dangerous"))
+            or not bool(reference.get("requires_origin_verification"))
+            or (module, name) not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
+            or key in existing_references
+            or _invoked_allowlisted_import_reference_is_proven_safe(
+                module,
+                name,
+                position,
+                analyzed_invocation_global_positions,
+                invocation_load_safe_modules,
+                trusted_reconstruction_global_positions,
+                trusted_invocation_global_positions,
+                suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+            )
+        ):
+            continue
+        additional_findings.append(
+            Finding(
+                message=f"Found invoked allowlisted global without trusted loaded implementation: {import_reference}",
+                severity=Severity.WARNING,
+                location=f"{report.source} (pos {position})",
+                rule_code="NON_ALLOWLISTED_GLOBAL",
+                details={
+                    "opcode": str(reference.get("opcode", "")),
+                    "module": module,
+                    "name": name,
+                    "import_reference": import_reference,
+                    "position": position,
+                    "invoked": True,
                 },
                 why=(
-                    "Allowlisted modules are safe only when they resolve from the standard library or installed "
-                    "site-packages; a project-local shadow module can execute arbitrary import-time code."
+                    "Allowlisted callable globals are suppressible only when the loaded implementation can be "
+                    "tied back to trusted inspected source or an approved extension owner."
                 ),
             )
         )
@@ -2654,6 +3144,75 @@ def _with_untrusted_allowlisted_import_findings(
         metadata=report.to_dict()["metadata"],
         duration_s=report.duration_s,
     )
+
+
+def _invoked_allowlisted_import_reference_is_proven_safe(
+    module: str,
+    name: str,
+    position: int,
+    analyzed_invocation_global_positions: frozenset[int],
+    invocation_load_safe_modules: frozenset[str],
+    trusted_reconstruction_global_positions: frozenset[int],
+    trusted_invocation_global_positions: frozenset[int],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
+) -> bool:
+    reference = (module, name)
+    if (
+        not import_only_reference_is_proven_trusted(module, name)
+        and position not in trusted_invocation_global_positions
+    ):
+        return False
+    if (module, name) in _NUMPY_RECONSTRUCT_REFERENCES and not suppress_safe_numpy_reconstruct:
+        return False
+    if position in trusted_reconstruction_global_positions:
+        return True
+    if position in trusted_invocation_global_positions:
+        return module in invocation_load_safe_modules
+    if _source_backed_invocation_requires_loaded_identity(
+        reference,
+        suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+    ):
+        return False
+    return position in analyzed_invocation_global_positions and module in invocation_load_safe_modules
+
+
+def _source_backed_framework_identity_requires_contextual_invocation(module: str, name: str) -> bool:
+    reference = (module, name)
+    return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES and not (
+        module == "numpy" or module.startswith("numpy.")
+    )
+
+
+def _proven_trusted_invocation_global_positions(callable_invocations: object) -> frozenset[int]:
+    grouped: dict[int, list[Mapping[str, object]]] = {}
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        position = _optional_int(invocation.get("global_position"))
+        module = str(invocation.get("module", ""))
+        name = str(invocation.get("name", ""))
+        if position is None or not module or not name:
+            continue
+        if module == "numpy" or module.startswith("numpy."):
+            continue
+        if (module, name) not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES:
+            continue
+        grouped.setdefault(position, []).append(invocation)
+    trusted_positions: list[int] = []
+    for position, invocations in grouped.items():
+        if all(
+            module_is_loaded_without_import_hooks(str(invocation.get("module", "")))
+            and import_only_reference_is_proven_trusted_for_pickle_invocation(
+                str(invocation.get("module", "")),
+                str(invocation.get("name", "")),
+                invocation,
+            )
+            for invocation in invocations
+        ):
+            trusted_positions.append(position)
+            if len(trusted_positions) >= _MAX_INERT_INITIALIZATION_MODULES:
+                break
+    return frozenset(trusted_positions)
 
 
 def _allowlisted_import_requires_origin_finding(module: str, name: str) -> bool:
@@ -2693,8 +3252,12 @@ def _without_proven_safe_import_findings(
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
     analyzed_invocation_references: frozenset[tuple[str, str]],
+    invocation_load_safe_modules: frozenset[str],
     trusted_reconstruction_global_positions: frozenset[int],
     trusted_reconstruction_references: frozenset[tuple[str, str]],
+    trusted_invocation_global_positions: frozenset[int],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
 ) -> PickleReport:
     findings = tuple(
         finding
@@ -2707,8 +3270,11 @@ def _without_proven_safe_import_findings(
             invoked_global_positions,
             analyzed_invocation_global_positions,
             analyzed_invocation_references,
+            invocation_load_safe_modules,
             trusted_reconstruction_global_positions,
             trusted_reconstruction_references,
+            trusted_invocation_global_positions,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
         )
     )
     if len(findings) == len(report.findings):
@@ -2741,8 +3307,12 @@ def _non_allowlisted_import_finding_is_proven_safe(
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
     analyzed_invocation_references: frozenset[tuple[str, str]],
+    invocation_load_safe_modules: frozenset[str],
     trusted_reconstruction_global_positions: frozenset[int],
     trusted_reconstruction_references: frozenset[tuple[str, str]],
+    trusted_invocation_global_positions: frozenset[int] = frozenset(),
+    *,
+    suppress_safe_numpy_reconstruct: bool = False,
 ) -> bool:
     module = str(finding.details.get("module", ""))
     name = str(finding.details.get("name", ""))
@@ -2764,11 +3334,52 @@ def _non_allowlisted_import_finding_is_proven_safe(
         if position is not None
         else reference in trusted_reconstruction_references
     )
-    inert_reference_is_proven_safe = position is not None and not finding_is_invoked
-    trusted_reference_is_proven_safe = position is not None and (
-        not finding_is_invoked or invocation_is_analyzed or invocation_is_trusted_reconstruction
+    invocation_identity_is_trusted = (
+        position in trusted_invocation_global_positions and module in invocation_load_safe_modules
+        if position is not None
+        else False
     )
-    return (trusted_reference_is_proven_safe and (module, name) in trusted_import_references) or (
+    requires_loaded_identity = finding_is_invoked and _source_backed_invocation_requires_loaded_identity(
+        reference,
+        suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+    )
+    requires_import_initialization_proof = (
+        not finding_is_invoked
+        and _source_backed_import_requires_initialization_proof(
+            reference,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+        )
+    )
+    import_initialization_is_proven_safe = (
+        not requires_import_initialization_proof
+        or module in inert_initialization_modules
+        or module_is_loaded_without_import_hooks(module)
+    )
+    inert_reference_is_proven_safe = (
+        position is not None and not finding_is_invoked and import_initialization_is_proven_safe
+    )
+    trusted_reference_is_proven_safe = position is not None and (
+        (not finding_is_invoked and import_initialization_is_proven_safe)
+        or invocation_is_trusted_reconstruction
+        or invocation_identity_is_trusted
+        or (
+            not requires_loaded_identity
+            and invocation_is_analyzed
+            and (
+                not _source_backed_framework_identity_requires_contextual_invocation(module, name)
+                and (
+                    reference not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
+                    or module in invocation_load_safe_modules
+                )
+            )
+        )
+    )
+    trusted_origin_is_proven = (
+        invocation_identity_is_trusted
+        if requires_loaded_identity
+        else (module, name) in trusted_import_references or invocation_identity_is_trusted
+    )
+    return (trusted_reference_is_proven_safe and trusted_origin_is_proven) or (
         inert_reference_is_proven_safe and module in inert_initialization_modules
     )
 
@@ -2791,6 +3402,18 @@ def _invoked_global_positions(callable_invocations: object) -> frozenset[int]:
     return frozenset(positions)
 
 
+def _numpy_reconstruct_global_positions(callable_invocations: object) -> frozenset[int]:
+    positions: set[int] = set()
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        position = _optional_int(invocation.get("global_position"))
+        module = str(invocation.get("module", ""))
+        name = str(invocation.get("name", ""))
+        if position is not None and (module, name) in _NUMPY_RECONSTRUCT_REFERENCES:
+            positions.add(position)
+    return frozenset(positions)
+
+
 def _invocation_references_for_positions(
     callable_invocations: object,
     positions: frozenset[int],
@@ -2804,6 +3427,27 @@ def _invocation_references_for_positions(
         if position in positions and module and name:
             references.add((module, name))
     return frozenset(references)
+
+
+def _invocation_load_safe_modules(
+    callable_invocations: object,
+    invoked_global_positions: frozenset[int],
+) -> frozenset[str]:
+    modules: set[str] = set()
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        position = _optional_int(invocation.get("global_position"))
+        module = str(invocation.get("module", ""))
+        if (
+            position is not None
+            and position in invoked_global_positions
+            and module
+            and import_only_module_load_is_proven_safe_for_invocation(module)
+        ):
+            modules.add(module)
+            if len(modules) >= _MAX_INERT_INITIALIZATION_MODULES:
+                break
+    return frozenset(modules)
 
 
 def _trusted_reconstruction_global_positions(callable_invocations: object) -> frozenset[int]:
@@ -2824,11 +3468,15 @@ def _trusted_reconstruction_global_positions(callable_invocations: object) -> fr
         for position, opcodes in opcodes_by_position.items()
         if opcodes
         and (
-            opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+            (
+                opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+                and references_by_position.get(position)
+                and references_by_position[position] <= _TRUSTED_RECONSTRUCTION_WITHOUT_SOURCE_ANALYSIS_REFERENCES
+            )
             or (
                 opcodes <= {"REDUCE"}
                 and references_by_position.get(position)
-                and references_by_position[position] <= _TRUSTED_REDUCE_REFERENCES
+                and references_by_position[position] <= _TRUSTED_REDUCE_WITHOUT_SOURCE_ANALYSIS_REFERENCES
             )
         )
     )
@@ -2848,10 +3496,327 @@ def _trusted_reconstruction_references(callable_invocations: object) -> frozense
         for reference, opcodes in opcodes_by_reference.items()
         if opcodes
         and (
-            opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
-            or (opcodes <= {"REDUCE"} and reference in _TRUSTED_REDUCE_REFERENCES)
+            (
+                opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+                and reference in _TRUSTED_RECONSTRUCTION_WITHOUT_SOURCE_ANALYSIS_REFERENCES
+            )
+            or (opcodes <= {"REDUCE"} and reference in _TRUSTED_REDUCE_WITHOUT_SOURCE_ANALYSIS_REFERENCES)
         )
     )
+
+
+def _call_graph_finding_is_safe_numpy_reconstruction_noise(
+    finding: CallGraphFinding,
+    *,
+    suppress_safe_numpy_reconstruct: bool,
+) -> bool:
+    return (
+        suppress_safe_numpy_reconstruct
+        and (finding.module, finding.name) in _NUMPY_RECONSTRUCT_REFERENCES
+        and import_only_reference_is_proven_trusted(finding.module, finding.name)
+        and finding.sink == "builtins.__import__"
+        and finding.invocation_opcode in {None, "BUILD", "REDUCE"}
+        and (
+            not finding.call_path
+            or finding.call_path[0]
+            in {
+                "numpy._core.multiarray.__getattr__",
+                "numpy.core.multiarray.__getattr__",
+            }
+        )
+    )
+
+
+def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | None) -> bool:
+    if not payload:
+        return False
+    if len(payload) > _SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES:
+        return False
+
+    saw_numpy_reconstruct = False
+    unsafe_numpy_reconstruct = False
+    stack: list[object] = []
+    memo: dict[int, object] = {}
+
+    def pop_value() -> object:
+        return stack.pop() if stack else _ABSTRACT_UNKNOWN
+
+    def memo_key(value: object) -> int | None:
+        if type(value) is int:
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
+
+    def pop_marked_items() -> list[object] | None:
+        items: list[object] = []
+        while stack:
+            item = stack.pop()
+            if item is _ABSTRACT_MARK:
+                return list(reversed(items))
+            items.append(item)
+        return None
+
+    try:
+        offset = 0
+        opcode_count = 0
+        while offset < len(payload):
+            stack = []
+            stream_saw_stop = False
+            for opcode, arg, pos in pickletools.genops(payload[offset:]):
+                opcode_count += 1
+                if opcode_count > _SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES:
+                    return False
+                opcode_name = opcode.name
+                if opcode_name in {"EXT1", "EXT2", "EXT4", "NEXT_BUFFER", "READONLY_BUFFER"}:
+                    return False
+                if opcode_name in {"PROTO", "FRAME"}:
+                    continue
+                if opcode_name == "STOP":
+                    if pos is None:
+                        return False
+                    offset += pos + 1
+                    stream_saw_stop = True
+                    break
+                if opcode_name == "MARK":
+                    stack.append(_ABSTRACT_MARK)
+                elif opcode_name == "GLOBAL":
+                    module, name = _pickle_global_arg_parts(arg)
+                    stack.append(_AbstractGlobal(module, name) if module and name else _ABSTRACT_UNKNOWN)
+                elif opcode_name == "STACK_GLOBAL":
+                    stack_name = pop_value()
+                    stack_module = pop_value()
+                    stack.append(
+                        _AbstractGlobal(stack_module, stack_name)
+                        if isinstance(stack_module, str) and isinstance(stack_name, str)
+                        else _ABSTRACT_UNKNOWN
+                    )
+                elif opcode_name in {
+                    "BINUNICODE",
+                    "SHORT_BINUNICODE",
+                    "BINUNICODE8",
+                    "UNICODE",
+                    "STRING",
+                    "BINSTRING",
+                    "SHORT_BINSTRING",
+                }:
+                    stack.append(str(arg))
+                elif opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"}:
+                    stack.append(_AbstractBytes())
+                elif opcode_name in {
+                    "BININT",
+                    "BININT1",
+                    "BININT2",
+                    "LONG",
+                    "LONG1",
+                    "LONG4",
+                    "INT",
+                    "FLOAT",
+                    "BINFLOAT",
+                }:
+                    stack.append(arg)
+                elif opcode_name == "NONE":
+                    stack.append(None)
+                elif opcode_name == "NEWTRUE":
+                    stack.append(True)
+                elif opcode_name == "NEWFALSE":
+                    stack.append(False)
+                elif opcode_name == "EMPTY_TUPLE":
+                    stack.append(())
+                elif opcode_name == "EMPTY_LIST":
+                    stack.append([])
+                elif opcode_name == "EMPTY_DICT":
+                    stack.append({})
+                elif opcode_name == "TUPLE":
+                    items = pop_marked_items()
+                    stack.append(tuple(items) if items is not None else _ABSTRACT_UNKNOWN)
+                elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                    tuple_size = int(opcode_name[-1])
+                    if len(stack) < tuple_size:
+                        stack.append(_ABSTRACT_UNKNOWN)
+                        continue
+                    items = stack[-tuple_size:]
+                    del stack[-tuple_size:]
+                    stack.append(tuple(items))
+                elif opcode_name == "LIST":
+                    items = pop_marked_items()
+                    stack.append(items if items is not None else _ABSTRACT_UNKNOWN)
+                elif opcode_name == "APPEND":
+                    value = pop_value()
+                    if stack and isinstance(stack[-1], list):
+                        stack[-1].append(value)
+                    else:
+                        stack.append(_ABSTRACT_UNKNOWN)
+                elif opcode_name == "APPENDS":
+                    items = pop_marked_items()
+                    if items is not None and stack and isinstance(stack[-1], list):
+                        stack[-1].extend(items)
+                    else:
+                        stack.append(_ABSTRACT_UNKNOWN)
+                elif opcode_name == "DICT":
+                    items = pop_marked_items()
+                    stack.append(_abstract_dict_from_items(items) if items is not None else _ABSTRACT_UNKNOWN)
+                elif opcode_name == "SETITEM":
+                    value = pop_value()
+                    key = pop_value()
+                    if stack and isinstance(stack[-1], dict):
+                        stack[-1][key] = value
+                    else:
+                        stack.append(_ABSTRACT_UNKNOWN)
+                elif opcode_name == "SETITEMS":
+                    items = pop_marked_items()
+                    if items is not None and stack and isinstance(stack[-1], dict):
+                        stack[-1].update(_abstract_dict_from_items(items))
+                    else:
+                        stack.append(_ABSTRACT_UNKNOWN)
+                elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                    key = memo_key(arg)
+                    if key is not None and stack:
+                        memo[key] = stack[-1]
+                elif opcode_name == "MEMOIZE":
+                    if stack:
+                        memo[len(memo)] = stack[-1]
+                elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
+                    key = memo_key(arg)
+                    stack.append(memo.get(key, _ABSTRACT_UNKNOWN) if key is not None else _ABSTRACT_UNKNOWN)
+                elif opcode_name == "REDUCE":
+                    args = pop_value()
+                    function = pop_value()
+                    if _abstract_global_is(function, _CODECS_ENCODE_REFERENCES):
+                        stack.append(
+                            _AbstractBytes()
+                            if _codecs_encode_args_are_safe(args)
+                            else _AbstractCallResult(function, args)
+                        )
+                    elif _abstract_global_is(function, _NUMPY_DTYPE_REFERENCES):
+                        stack.append(
+                            _AbstractNumpyDType()
+                            if _numpy_dtype_reduce_args_are_safe(args)
+                            else _AbstractCallResult(function, args)
+                        )
+                    elif _abstract_global_is(function, _NUMPY_RECONSTRUCT_REFERENCES):
+                        saw_numpy_reconstruct = True
+                        if _numpy_reconstruct_args_are_safe(args):
+                            stack.append(_AbstractNumpyArraySeed())
+                        else:
+                            unsafe_numpy_reconstruct = True
+                            stack.append(_AbstractCallResult(function, args))
+                    else:
+                        stack.append(_AbstractCallResult(function, args))
+                elif opcode_name == "BUILD":
+                    state = pop_value()
+                    obj = pop_value()
+                    if isinstance(obj, _AbstractNumpyArraySeed):
+                        if _numpy_ndarray_build_state_is_safe(state):
+                            stack.append(_AbstractNumpyArray())
+                        else:
+                            unsafe_numpy_reconstruct = True
+                            stack.append(_ABSTRACT_UNKNOWN)
+                    elif isinstance(obj, _AbstractNumpyDType):
+                        stack.append(obj if _numpy_dtype_build_state_is_safe(state) else _ABSTRACT_UNKNOWN)
+                    else:
+                        stack.append(obj)
+                elif opcode_name == "POP":
+                    if stack:
+                        stack.pop()
+                elif opcode_name == "POP_MARK":
+                    pop_marked_items()
+                elif opcode_name == "DUP":
+                    stack.append(stack[-1] if stack else _ABSTRACT_UNKNOWN)
+                elif opcode_name in {"PERSID", "BINPERSID"}:
+                    stack.append(_ABSTRACT_UNKNOWN)
+                else:
+                    stack.append(_ABSTRACT_UNKNOWN)
+            if not stream_saw_stop:
+                return False
+    except Exception:
+        return False
+
+    return saw_numpy_reconstruct and not unsafe_numpy_reconstruct
+
+
+def _pickle_global_arg_parts(arg: object) -> tuple[str, str]:
+    if isinstance(arg, str):
+        parts = arg.replace("\n", " ").split()
+        if len(parts) == 2:
+            return parts[0], parts[1]
+    return "", ""
+
+
+def _abstract_global_is(value: object, references: frozenset[tuple[str, str]]) -> bool:
+    return isinstance(value, _AbstractGlobal) and (value.module, value.name) in references
+
+
+def _abstract_dict_from_items(items: list[object]) -> dict[object, object]:
+    return {items[index]: items[index + 1] for index in range(0, len(items) - 1, 2)}
+
+
+def _codecs_encode_args_are_safe(args: object) -> bool:
+    return isinstance(args, tuple) and len(args) == 2 and isinstance(args[0], str) and args[1] in {"latin1", "latin-1"}
+
+
+def _numpy_dtype_reduce_args_are_safe(args: object) -> bool:
+    return (
+        isinstance(args, tuple)
+        and len(args) == 3
+        and isinstance(args[0], str)
+        and isinstance(args[1], bool)
+        and isinstance(args[2], bool)
+    )
+
+
+def _numpy_reconstruct_args_are_safe(args: object) -> bool:
+    return (
+        isinstance(args, tuple)
+        and len(args) == 3
+        and _abstract_global_is(args[0], _NUMPY_NDARRAY_REFERENCES)
+        and _abstract_int_tuple_is_safe(args[1])
+        and _abstract_bytes_value_is_safe(args[2])
+    )
+
+
+def _numpy_dtype_build_state_is_safe(state: object) -> bool:
+    return _abstract_value_is_inert(state)
+
+
+def _numpy_ndarray_build_state_is_safe(state: object) -> bool:
+    return (
+        isinstance(state, tuple)
+        and len(state) == 5
+        and isinstance(state[0], int)
+        and not isinstance(state[0], bool)
+        and _abstract_int_tuple_is_safe(state[1])
+        and isinstance(state[2], _AbstractNumpyDType)
+        and isinstance(state[3], bool)
+        and (_abstract_bytes_value_is_safe(state[4]) or _abstract_value_is_inert(state[4]))
+    )
+
+
+def _abstract_int_tuple_is_safe(value: object) -> bool:
+    return isinstance(value, tuple) and all(isinstance(item, int) and not isinstance(item, bool) for item in value)
+
+
+def _abstract_bytes_value_is_safe(value: object) -> bool:
+    return isinstance(value, (str, bytes, bytearray, _AbstractBytes))
+
+
+def _abstract_value_is_inert(value: object) -> bool:
+    if value is _ABSTRACT_UNKNOWN or value is _ABSTRACT_MARK:
+        return False
+    if isinstance(value, (_AbstractGlobal, _AbstractCallResult, _AbstractNumpyArraySeed)):
+        return False
+    if isinstance(value, (_AbstractBytes, _AbstractNumpyDType, _AbstractNumpyArray)):
+        return True
+    if value is None or isinstance(value, (str, bytes, bytearray, int, float, bool)):
+        return True
+    if isinstance(value, (tuple, list)):
+        return all(_abstract_value_is_inert(item) for item in value)
+    if isinstance(value, dict):
+        return all(_abstract_value_is_inert(key) and _abstract_value_is_inert(item) for key, item in value.items())
+    return False
 
 
 def _with_call_graph_enrichment_errors(

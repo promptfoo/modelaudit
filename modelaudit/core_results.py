@@ -465,11 +465,39 @@ def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
     return records_have_incomplete_coverage(results.checks, allow_skipped_check_exemption=True)
 
 
+def _record_has_security_severity(record: Any) -> bool:
+    severity = _metadata_value(record, "severity")
+    raw_severity = getattr(severity, "value", severity)
+    if not isinstance(raw_severity, str):
+        return False
+    return raw_severity.lower().split(".", 1)[-1] in {
+        IssueSeverity.WARNING.value,
+        IssueSeverity.CRITICAL.value,
+    }
+
+
+def _record_has_critical_severity(record: Any) -> bool:
+    severity = _metadata_value(record, "severity")
+    raw_severity = getattr(severity, "value", severity)
+    if not isinstance(raw_severity, str):
+        return False
+    return raw_severity.lower().split(".", 1)[-1] == IssueSeverity.CRITICAL.value
+
+
+def _record_is_failed_security_check(record: Any) -> bool:
+    status = _metadata_value(record, "status")
+    raw_status = getattr(status, "value", status)
+    return (
+        isinstance(raw_status, str)
+        and raw_status.lower().split(".", 1)[-1] == "failed"
+        and _record_has_security_severity(record)
+    )
+
+
 def results_have_security_findings(results: ModelAuditResultModel) -> bool:
-    """Return True when WARNING/CRITICAL issues were reported."""
-    return any(
-        hasattr(issue, "severity") and issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
-        for issue in (results.issues or [])
+    """Return True when WARNING/CRITICAL issues or failed checks were reported."""
+    return any(_record_has_security_severity(issue) for issue in (results.issues or [])) or any(
+        _record_is_failed_security_check(check) for check in (results.checks or [])
     )
 
 
@@ -478,7 +506,12 @@ def results_should_be_unsuccessful(results: ModelAuditResultModel) -> bool:
     if results_have_operational_error(results):
         return True
 
-    return results_have_inconclusive_outcome(results)
+    if results_have_inconclusive_outcome(results):
+        return True
+
+    has_failed_security_check = any(_record_is_failed_security_check(check) for check in (results.checks or []))
+    has_critical_issue = any(_record_has_critical_severity(issue) for issue in (results.issues or []))
+    return has_failed_security_check and not has_critical_issue
 
 
 def to_telemetry_severity(severity: Any) -> str:

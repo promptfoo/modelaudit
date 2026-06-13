@@ -8,6 +8,7 @@ import pickletools
 from pathlib import Path
 from typing import Any
 
+import modelaudit_picklescan.api as picklescan_api
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
@@ -18,6 +19,7 @@ from modelaudit.models import create_initial_audit_result
 from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners import pickle_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.joblib_scanner import JoblibScanner
 from modelaudit.scanners.pickle_scanner import (
     _BINARY_TAIL_SCAN_BYTES,
     ALWAYS_DANGEROUS_FUNCTIONS,
@@ -129,6 +131,106 @@ def _short_binunicode(data: bytes) -> bytes:
 
 def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def _joblib_test_binunicode(value: str) -> bytes:
+    return _binunicode(value.encode("utf-8"))
+
+
+def _joblib_test_numpy_wrapper_control(*, shape: int = 4, dtype: str = "i8") -> bytes:
+    return (
+        b"cjoblib.numpy_pickle\nNumpyArrayWrapper\n)\x81}("
+        + _joblib_test_binunicode("subclass")
+        + b"cnumpy\nndarray\n"
+        + _joblib_test_binunicode("shape")
+        + b"K"
+        + bytes([shape])
+        + b"\x85"
+        + _joblib_test_binunicode("order")
+        + _joblib_test_binunicode("C")
+        + _joblib_test_binunicode("dtype")
+        + b"cnumpy\ndtype\n"
+        + _joblib_test_binunicode(dtype)
+        + b"\x89\x88\x87R"
+        + _joblib_test_binunicode("allow_mmap")
+        + b"\x88"
+        + _joblib_test_binunicode("numpy_array_alignment_bytes")
+        + b"K\x10ub"
+    )
+
+
+def _joblib_test_numpy_raw_segment(prefix_length: int, raw_data: bytes) -> bytes:
+    padding_length = 16 - ((prefix_length + 1) % 16)
+    return bytes([padding_length]) + (b"\xff" * padding_length) + raw_data
+
+
+def _joblib_test_numpy_array_payload() -> bytes:
+    prefix = b"\x80\x02](" + _joblib_test_numpy_wrapper_control()
+    return prefix + _joblib_test_numpy_raw_segment(len(prefix), b"\x00" * 32) + b"e."
+
+
+_JOBLIB_TEST_TRUSTED_REFERENCES = frozenset(
+    {
+        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+        ("numpy", "ndarray"),
+        ("numpy", "dtype"),
+    }
+)
+
+
+def _joblib_test_reference_is_trusted(
+    module: str,
+    name: str,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
+    del pickle_entrypoint_methods, pickle_invokes_metaclass_call
+    return (module, name) in _JOBLIB_TEST_TRUSTED_REFERENCES
+
+
+def _joblib_test_invocation_is_trusted(module: str, name: str, reference: dict[str, object]) -> bool:
+    del reference
+    return _joblib_test_reference_is_trusted(module, name)
+
+
+def _joblib_test_requires_origin_review(module: str, name: str) -> bool:
+    return not _joblib_test_reference_is_trusted(module, name)
+
+
+def _trust_joblib_test_references(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        _joblib_test_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+        _joblib_test_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        _joblib_test_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted",
+        _joblib_test_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted_for_pickle_invocation",
+        _joblib_test_invocation_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted_for_pickle_invocation",
+        _joblib_test_invocation_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_module_requires_origin_review",
+        _joblib_test_requires_origin_review,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_module_requires_origin_review",
+        _joblib_test_requires_origin_review,
+    )
 
 
 def _binary_opcode_os_system_reduce_payload() -> bytes:
@@ -1880,6 +1982,8 @@ def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
     assert result.metadata["legacy_pytorch_storage_payload_skipped"] is True
     assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "legacy_pytorch_storage_payload_skipped"
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
@@ -2065,6 +2169,275 @@ def test_legacy_pytorch_storage_pid_downgrades_parser_layout_storage_import_posi
     assert result.issues == []
     assert result.metadata["pickle_verdict"] == "clean"
     assert any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+
+
+def test_legacy_pytorch_storage_pid_downgrades_unpositioned_import_metadata_by_finding_location() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
+    storage_import_position = payload.index(b"ctorch\nByteStorage\n")
+    assert layout is not None
+
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage"}],
+            "pickle_verdict": "malicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location=f"legacy.pt (pos {storage_import_position})",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+    assert _private_actionable_failed_checks(serialized_result) == []
+
+
+def test_legacy_pytorch_storage_pid_keeps_unpositioned_import_metadata_without_finding_location_match() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
+    storage_import_position = payload.index(b"ctorch\nByteStorage\n")
+    assert layout is not None
+
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage"}],
+            "pickle_verdict": "suspicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Pickle global 'torch.ByteStorage' reaches dangerous Python primitive",
+        severity=IssueSeverity.CRITICAL,
+        location=f"legacy.pt (pos {storage_import_position + 1})",
+        details={
+            "analysis": "python_call_graph",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "DANGEROUS_CALL_GRAPH",
+        },
+        rule_code="DANGEROUS_CALL_GRAPH",
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
+    assert any(
+        check.rule_code == "DANGEROUS_CALL_GRAPH" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert not any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+
+
+def test_legacy_pytorch_storage_pid_downgrades_origin_finding_by_parser_layout_position() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
+    storage_import_position = payload.index(b"ctorch\nByteStorage\n")
+    assert layout is not None
+
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage"}],
+            "pickle_verdict": "suspicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Found allowlisted global reference from an untrusted module origin: torch.ByteStorage",
+        severity=IssueSeverity.WARNING,
+        location="legacy.pt",
+        details={
+            "opcode": "GLOBAL",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "pickle_rule_code": "NON_ALLOWLISTED_GLOBAL",
+            "position": storage_import_position,
+        },
+        rule_code="S205",
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert result.issues == []
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+    assert _private_actionable_failed_checks(serialized_result) == []
+
+
+def test_legacy_pytorch_storage_pid_keeps_nonallowlisted_global_without_position_match() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
+    storage_import_position = payload.index(b"ctorch\nByteStorage\n")
+    assert layout is not None
+
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage", "position": storage_import_position}],
+            "pickle_verdict": "malicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Non-allowlisted pickle global 'torch.ByteStorage' detected",
+        severity=IssueSeverity.WARNING,
+        location=f"legacy.pt (pos {storage_import_position + 1})",
+        details={
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "opcode": "GLOBAL",
+            "pickle_rule_code": "NON_ALLOWLISTED_GLOBAL",
+            "position": storage_import_position + 1,
+        },
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    assert result.metadata["pickle_verdict"] == "malicious"
+    assert any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+    assert any(
+        check.rule_code == "NON_ALLOWLISTED_GLOBAL" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert not any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
+
+
+def test_legacy_pytorch_storage_pid_keeps_origin_finding_without_parser_layout_position_match() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    layout = pickle_scanner._legacy_pytorch_stream_layout(payload)
+    storage_import_position = payload.index(b"ctorch\nByteStorage\n")
+    assert layout is not None
+
+    result = ScanResult("pickle")
+    result.metadata.update(
+        {
+            "import_references": [{"import_reference": "torch.ByteStorage"}],
+            "pickle_verdict": "suspicious",
+        }
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Persistent ID usage detected",
+        severity=IssueSeverity.CRITICAL,
+        location="legacy.pt (pos 0)",
+        details={
+            "opcode": "BINPERSID",
+            "pickle_rule_code": "PERSISTENT_ID",
+            "pytorch_storage_key": "0",
+            "pytorch_storage_persistent_id": True,
+        },
+        rule_code="S212",
+    )
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Found allowlisted global reference from an untrusted module origin: torch.ByteStorage",
+        severity=IssueSeverity.WARNING,
+        location="legacy.pt",
+        details={
+            "opcode": "GLOBAL",
+            "import_reference": "torch.ByteStorage",
+            "module": "torch",
+            "name": "ByteStorage",
+            "pickle_rule_code": "NON_ALLOWLISTED_GLOBAL",
+            "position": storage_import_position + 1,
+        },
+        rule_code="S205",
+    )
+
+    PickleScanner._downgrade_legacy_pytorch_storage_persistent_ids(result, layout)
+
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert any(issue.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+    assert any(
+        check.details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(check.details.get("pytorch_storage_import_reference") is True for check in result.checks)
 
 
 def test_legacy_pytorch_storage_pid_downgrades_wrapped_parser_layout_storage_import_position() -> None:
@@ -2530,6 +2903,8 @@ def test_regular_scan_defers_oversized_raw_legacy_pytorch_content_hash(
     assert metadata["file_hashes"]["sha256"] is None
     assert isinstance(metadata["file_hashes"]["sha256_prefix"], str)
     assert metadata["legacy_pytorch_bounded_analysis"] is True
+    assert metadata["operational_error"] is True
+    assert metadata["operational_error_reason"] == "legacy_pytorch_storage_payload_skipped"
     assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "legacy_pytorch_storage_payload_skipped" in metadata["scan_outcome_reasons"]
     assert determine_exit_code(result) == 2
@@ -4145,17 +4520,81 @@ def test_policy_compatibility_exports_cover_required_dangerous_symbols() -> None
     assert is_suspicious_global("json", "loads") is False
 
 
-def test_legitimate_serialization_file_uses_rust_scan(tmp_path: Path) -> None:
-    safe_path = tmp_path / "safe.joblib"
-    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+def test_legitimate_serialization_file_rejects_bare_joblib_wrapper_without_span_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bare_path = tmp_path / "bare.joblib"
+    bare_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00not-joblib-raw-tail")
     malicious_path = tmp_path / "evil.joblib"
     malicious_path.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
     text_path = tmp_path / "not-pickle.joblib"
     text_path.write_text("not a pickle", encoding="utf-8")
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+    )
 
-    assert _is_legitimate_serialization_file(str(safe_path)) is True
+    assert _is_legitimate_serialization_file(str(bare_path)) is False
     assert _is_legitimate_serialization_file(str(malicious_path)) is False
     assert _is_legitimate_serialization_file(str(text_path)) is False
+
+
+def test_legitimate_serialization_file_accepts_validated_joblib_raw_span(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
+    _trust_joblib_test_references(monkeypatch)
+
+    assert _is_legitimate_serialization_file(str(safe_path)) is True
+
+
+def test_joblib_validated_raw_span_clears_private_actionable_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
+    _trust_joblib_test_references(monkeypatch)
+
+    result = JoblibScanner().scan(str(safe_path))
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert result.success is True
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert _private_actionable_failed_checks(serialized_result) == []
+    assert should_cache_scan_result(serialized_result) is True
+
+
+def test_legitimate_serialization_file_keeps_untrusted_wrapper_origin_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
+    original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
+
+    def requires_origin_review(module: str, name: str) -> bool:
+        if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
+            return True
+        return original_requires_origin_review(module, name)
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        lambda _module, _name: False,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        lambda _module, _name: False,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_module_requires_origin_review",
+        requires_origin_review,
+    )
+
+    assert _is_legitimate_serialization_file(str(safe_path)) is False
 
 
 def test_legitimate_serialization_file_skips_call_graph_enrichment(
@@ -4163,12 +4602,13 @@ def test_legitimate_serialization_file_skips_call_graph_enrichment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     safe_path = tmp_path / "safe.joblib"
-    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
 
     def fail_call_graph_enrichment(_report: object) -> object:
         raise AssertionError("validation helper should use native Rust findings only")
 
     monkeypatch.setattr("modelaudit_picklescan.api._with_call_graph_findings", fail_call_graph_enrichment)
+    _trust_joblib_test_references(monkeypatch)
 
     assert _is_legitimate_serialization_file(str(safe_path)) is True
 
@@ -4178,12 +4618,13 @@ def test_legitimate_serialization_file_keeps_bounded_file_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     safe_path = tmp_path / "safe.joblib"
-    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
 
     def fail_read_bytes(_path: Path) -> bytes:
         raise AssertionError("validation helper should preserve bounded scanner reads")
 
     monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    _trust_joblib_test_references(monkeypatch)
 
     assert _is_legitimate_serialization_file(str(safe_path)) is True
 

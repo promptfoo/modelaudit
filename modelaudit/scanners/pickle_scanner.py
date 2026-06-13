@@ -8,13 +8,14 @@ import hashlib
 import io
 import pickletools
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar, TextIO, cast
 
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
+from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
@@ -39,6 +40,11 @@ _MIN_JAX_PICKLE_SCAN_LIMIT_BYTES = 1024
 _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES = 1 * 1024 * 1024
 _MAX_METADATA_PICKLE_READ_BYTES = 10 * 1024 * 1024
 _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
+_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE = "joblib.numpy_pickle"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME = "NumpyArrayWrapper"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE = f"{_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE}.{_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME}"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_PICKLE_MARKER = b"joblib.numpy_pickle\nNumpyArrayWrapper"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES = 10 * 1024 * 1024
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
 _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
 _HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
@@ -2069,12 +2075,87 @@ def _is_legitimate_serialization_file(path: str) -> bool:
         return False
     try:
         with path_obj.open("rb") as handle:
-            if not _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)):
+            prefix = handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)
+            if not _looks_like_pickle(prefix):
                 return False
         report = StandalonePickleScanner().scan_file(path_obj, enrich_call_graph=False)
     except Exception:
         return False
-    return not report.has_security_findings and report.status.value != "error"
+    joblib_wrapper_reference_requires_span_proof = (
+        path_obj.suffix.lower() == ".joblib" and _JOBLIB_NUMPY_ARRAY_WRAPPER_PICKLE_MARKER in prefix
+    )
+    validated_joblib_control_references = (
+        _joblib_numpy_array_validated_raw_span_control_references(path_obj)
+        if joblib_wrapper_reference_requires_span_proof
+        else frozenset()
+    )
+    if (
+        joblib_wrapper_reference_requires_span_proof
+        and _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE not in validated_joblib_control_references
+    ):
+        return False
+
+    def validated_joblib_control_finding_is_trusted(finding: Any) -> bool:
+        details = getattr(finding, "details", {})
+        if not isinstance(details, Mapping):
+            return False
+        import_reference = str(details.get("import_reference", ""))
+        if import_reference not in validated_joblib_control_references:
+            return False
+        module = details.get("module")
+        name = details.get("name")
+        if not isinstance(module, str) or not isinstance(name, str):
+            return False
+        try:
+            return import_only_reference_is_proven_trusted(module, name)
+        except Exception:
+            return False
+
+    security_findings = tuple(
+        finding
+        for finding in report.findings
+        if not (finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and validated_joblib_control_finding_is_trusted(finding))
+    )
+    if security_findings:
+        return False
+    if report.status.value != "error":
+        return True
+    return joblib_wrapper_reference_requires_span_proof and bool(validated_joblib_control_references)
+
+
+def _joblib_numpy_array_validated_raw_span_control_references(path_obj: Path) -> frozenset[str]:
+    try:
+        if path_obj.suffix.lower() != ".joblib":
+            return frozenset()
+        file_size = path_obj.stat().st_size
+        if file_size <= 0 or file_size > _JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES:
+            return frozenset()
+        with path_obj.open("rb") as handle:
+            payload = handle.read(_JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES + 1)
+        if len(payload) != file_size:
+            return frozenset()
+        from .joblib_scanner import _pickle_without_joblib_numpy_array_data
+
+        sanitized = _pickle_without_joblib_numpy_array_data(payload)
+    except Exception:
+        return frozenset()
+    if sanitized is None:
+        return frozenset()
+    return frozenset(sanitized.validated_control_occurrences)
+
+
+def _joblib_numpy_array_wrapper_has_validated_raw_span(path_obj: Path) -> bool:
+    return _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE in _joblib_numpy_array_validated_raw_span_control_references(path_obj)
+
+
+def _joblib_numpy_array_wrapper_origin_is_trusted() -> bool:
+    try:
+        return import_only_reference_is_proven_trusted(
+            _JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE,
+            _JOBLIB_NUMPY_ARRAY_WRAPPER_NAME,
+        )
+    except Exception:
+        return False
 
 
 def _path_prefix_looks_like_pickle(path: str) -> bool:
@@ -2628,15 +2709,12 @@ class PickleScanner(BaseScanner):
         return f"{record.storage_type_module}.{record.storage_type_name}"
 
     @classmethod
-    def _trusted_legacy_pytorch_storage_import_references(
+    def _trusted_legacy_pytorch_storage_import_positions(
         cls,
-        result: ScanResult,
         layout: _LegacyPyTorchStreamLayout,
         *,
         position_offset: int = 0,
-    ) -> set[str]:
-        if result.metadata.get("import_references_truncated") is True:
-            return set()
+    ) -> dict[str, set[int]]:
         storage_records = layout.storage_records or ()
         trusted_import_positions: dict[str, set[int]] = {}
         for record in storage_records:
@@ -2645,6 +2723,15 @@ class PickleScanner(BaseScanner):
             trusted_import_positions.setdefault(cls._legacy_pytorch_storage_import_reference(record), set()).add(
                 position_offset + record.storage_type_position
             )
+        return trusted_import_positions
+
+    @staticmethod
+    def _trusted_legacy_pytorch_storage_import_references(
+        result: ScanResult,
+        trusted_import_positions: Mapping[str, set[int]],
+    ) -> set[str]:
+        if result.metadata.get("import_references_truncated") is True:
+            return set()
         if not trusted_import_positions:
             return set()
 
@@ -2674,21 +2761,71 @@ class PickleScanner(BaseScanner):
             and observed_positions <= trusted_positions
         }
 
-    @staticmethod
+    @classmethod
     def _is_legacy_pytorch_storage_import_call_graph_finding(
+        cls,
         details: dict[str, Any],
         trusted_import_references: set[str],
+        trusted_import_positions: Mapping[str, set[int]],
+        location: str | None,
     ) -> bool:
         import_reference = details.get("import_reference")
         opcode = details.get("opcode")
-        return (
+        if not (
             details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
             and details.get("analysis") == "python_call_graph"
             and "invocation_import_reference" not in details
             and (opcode is None or opcode in {"GLOBAL", "STACK_GLOBAL"})
             and isinstance(import_reference, str)
-            and import_reference in trusted_import_references
+        ):
+            return False
+        if import_reference in trusted_import_references:
+            return True
+        return cls._legacy_pytorch_storage_import_position_matches(
+            import_reference,
+            details,
+            trusted_import_positions,
+            location,
         )
+
+    @classmethod
+    def _is_legacy_pytorch_storage_import_origin_finding(
+        cls,
+        details: dict[str, Any],
+        trusted_import_positions: Mapping[str, set[int]],
+        location: str | None,
+    ) -> bool:
+        import_reference = details.get("import_reference")
+        opcode = details.get("opcode")
+        if not (
+            details.get("pickle_rule_code") == "NON_ALLOWLISTED_GLOBAL"
+            and "invocation_import_reference" not in details
+            and details.get("invoked") is not True
+            and (opcode is None or opcode in {"GLOBAL", "STACK_GLOBAL"})
+            and isinstance(import_reference, str)
+        ):
+            return False
+        return cls._legacy_pytorch_storage_import_position_matches(
+            import_reference,
+            details,
+            trusted_import_positions,
+            location,
+        )
+
+    @staticmethod
+    def _legacy_pytorch_storage_import_position_matches(
+        import_reference: str,
+        details: dict[str, Any],
+        trusted_import_positions: Mapping[str, set[int]],
+        location: str | None,
+    ) -> bool:
+        positions = trusted_import_positions.get(import_reference, set())
+        if not positions:
+            return False
+        detail_position = details.get("position")
+        if type(detail_position) is int and detail_position in positions:
+            return True
+        return PickleScanner._pickle_location_position(location) in positions
 
     @staticmethod
     def _annotate_legacy_pytorch_storage_persistent_id_record(
@@ -2813,17 +2950,32 @@ class PickleScanner(BaseScanner):
             for issue in result.issues
             if not cls._is_legacy_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
         ]
-        trusted_storage_import_references = cls._trusted_legacy_pytorch_storage_import_references(
-            result,
+        trusted_storage_import_positions = cls._trusted_legacy_pytorch_storage_import_positions(
             layout,
             position_offset=position_offset,
         )
+        if result.metadata.get("import_references_truncated") is True:
+            trusted_storage_import_positions = {}
+        trusted_storage_import_references = cls._trusted_legacy_pytorch_storage_import_references(
+            result,
+            trusted_storage_import_positions,
+        )
+
+        def is_trusted_storage_import_finding(check_or_issue: Check | Issue) -> bool:
+            return cls._is_legacy_pytorch_storage_import_call_graph_finding(
+                check_or_issue.details,
+                trusted_storage_import_references,
+                trusted_storage_import_positions,
+                check_or_issue.location,
+            ) or cls._is_legacy_pytorch_storage_import_origin_finding(
+                check_or_issue.details,
+                trusted_storage_import_positions,
+                check_or_issue.location,
+            )
+
         downgraded_import_count = 0
         for check in result.checks:
-            if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
-                check.details,
-                trusted_storage_import_references,
-            ):
+            if not is_trusted_storage_import_finding(check):
                 continue
             if check.rule_code is not None:
                 downgraded_private_entries.append({"name": check.name, "rule_code": check.rule_code})
@@ -2836,14 +2988,7 @@ class PickleScanner(BaseScanner):
 
         if downgraded_import_count:
             result.metadata["legacy_pytorch_trusted_storage_import_count"] = downgraded_import_count
-            result.issues = [
-                issue
-                for issue in result.issues
-                if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
-                    issue.details,
-                    trusted_storage_import_references,
-                )
-            ]
+            result.issues = [issue for issue in result.issues if not is_trusted_storage_import_finding(issue)]
 
         if downgraded_count:
             result.metadata["legacy_pytorch_trusted_storage_persistent_id_count"] = downgraded_count
@@ -2942,7 +3087,7 @@ class PickleScanner(BaseScanner):
         if layout.storage_key_count <= 0 or layout.storage_end is None:
             return
         reason = "legacy_pytorch_storage_payload_skipped"
-        mark_inconclusive_scan_result(result, reason)
+        self._mark_operational_incomplete(result, reason)
         result.metadata["legacy_pytorch_storage_payload_incomplete"] = True
         result.add_check(
             name="Legacy PyTorch Storage Payload Coverage",
@@ -2957,6 +3102,7 @@ class PickleScanner(BaseScanner):
                 "storage_end": position_offset + layout.storage_end,
                 "max_file_read_size": self.max_file_read_size,
                 "tensor_storage_materialized": False,
+                "operational_error": True,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": reason,
             },
@@ -3082,9 +3228,85 @@ class PickleScanner(BaseScanner):
 
     def _finish_after_wrapper_analysis(self, result: ScanResult, *, base_success: bool) -> None:
         success = base_success
-        if result.metadata.get("operational_error") or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        if result.metadata.get("trusted_incomplete_tail") is True:
+            success = True
+        elif (
+            result.metadata.get("operational_error") or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        ):
             success = False
         result.finish(success=success)
+
+    def _apply_legitimate_joblib_like_pickle_cleanup(self, result: ScanResult, path: str) -> None:
+        if Path(path).suffix.lower() != ".joblib":
+            return
+        if result.metadata.get("scan_outcome_reasons") != ["pickle_analysis_incomplete"]:
+            return
+        for key in ("trusted_incomplete_tail", "trusted_incomplete_tail_reason", "joblib_numpy_array_payload_count"):
+            result.metadata.pop(key, None)
+        try:
+            from .joblib_scanner import JoblibScanner, _pickle_without_joblib_numpy_array_data
+
+            sanitized = _pickle_without_joblib_numpy_array_data(self._read_file_safely(path))
+        except Exception:
+            return
+        if sanitized is None or sanitized.raw_array_count < 1:
+            return
+
+        if _joblib_numpy_array_wrapper_origin_is_trusted():
+            JoblibScanner._remove_validated_numpy_array_wrapper_findings(
+                result,
+                sanitized.validated_control_occurrences,
+            )
+        self._downgrade_pickle_parse_error_findings(result)
+        if self._has_warning_or_critical_findings(result):
+            result.finish(success=False)
+            return
+
+        for key in (
+            "analysis_incomplete",
+            "failure_reason",
+            "parsing_failed",
+            "scan_outcome",
+            "scan_outcome_message",
+            "scan_outcome_reasons",
+        ):
+            result.metadata.pop(key, None)
+        if result.metadata.get("pickle_report_status") == "inconclusive":
+            result.metadata["pickle_report_status"] = "complete"
+        if result.metadata.get("pickle_verdict") in {"suspicious", "unknown"}:
+            result.metadata["pickle_verdict"] = "clean"
+        result.trust_merged_child_failures()
+        result.metadata["trusted_incomplete_tail"] = True
+        result.metadata["trusted_incomplete_tail_reason"] = "joblib_pickle_tail"
+
+    @staticmethod
+    def _remove_trusted_joblib_numpy_array_wrapper_findings(result: ScanResult) -> None:
+        def is_trusted_wrapper_finding(finding: Any) -> bool:
+            details = getattr(finding, "details", {})
+            return (
+                getattr(finding, "rule_code", None) == "NON_ALLOWLISTED_GLOBAL"
+                and isinstance(details, dict)
+                and details.get("import_reference") == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
+            )
+
+        result.issues = [issue for issue in result.issues if not is_trusted_wrapper_finding(issue)]
+        result.checks = [check for check in result.checks if not is_trusted_wrapper_finding(check)]
+
+    @staticmethod
+    def _downgrade_pickle_parse_error_findings(result: ScanResult) -> None:
+        for issue in result.issues:
+            if issue.rule_code == "S901" and issue.details.get("category") == "parse_error":
+                issue.severity = IssueSeverity.INFO
+        for check in result.checks:
+            if check.rule_code == "S901" and check.details.get("category") == "parse_error":
+                check.severity = IssueSeverity.INFO
+
+    @staticmethod
+    def _has_warning_or_critical_findings(result: ScanResult) -> bool:
+        return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues) or any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        )
 
     @staticmethod
     def _mark_operational_incomplete(result: ScanResult, reason: str) -> None:
@@ -4959,6 +5181,7 @@ class PickleScanner(BaseScanner):
             except OSError as error:
                 self._record_file_read_failure(result, path, error)
                 return result
+        self._apply_legitimate_joblib_like_pickle_cleanup(result, path)
         self._finish_after_wrapper_analysis(result, base_success=scan_result.success)
         return result
 
