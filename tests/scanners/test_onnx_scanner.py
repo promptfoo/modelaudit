@@ -1773,6 +1773,7 @@ def create_dynamic_matmul_integer_bias_model(
     *,
     malicious: bool,
     metadata_sink_domain: str = "",
+    metadata_sink_from_bias_output: bool = False,
     post_bias_scale: bool = False,
 ) -> Path:
     weights = np.ones((100, 10), dtype=np.int8)
@@ -1800,7 +1801,8 @@ def create_dynamic_matmul_integer_bias_model(
     ]
     if post_bias_scale:
         nodes.append(helper.make_node("Mul", [bias_output, "W_scale_1"], ["Y"]))
-    nodes.append(helper.make_node("Shape", ["Y"], ["Y_shape"], domain=metadata_sink_domain))
+    metadata_sink_input = bias_output if metadata_sink_from_bias_output else "Y"
+    nodes.append(helper.make_node("Shape", [metadata_sink_input], ["Y_shape"], domain=metadata_sink_domain))
     graph = helper.make_graph(
         nodes,
         "dynamic_matmul_integer_bias",
@@ -1848,6 +1850,31 @@ def create_declared_shape_metadata_model(tmp_path: Path) -> Path:
     model.ir_version = 8
     onnx.checker.check_model(model)
     path = tmp_path / "declared-shape-metadata.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_constant_of_shape_weight_model(tmp_path: Path) -> Path:
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "ConstantOfShape",
+                ["shape"],
+                ["W"],
+                value=helper.make_tensor("fill", TensorProto.FLOAT, [1], [0.0]),
+            ),
+            helper.make_node("MatMul", ["X", "W"], ["Y"]),
+        ],
+        "constant_of_shape_weight",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="shape")],
+        value_info=[helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "constant-of-shape-weight.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -7961,16 +7988,23 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible"][0]["quantization_scale_factor_names"] == ["W_scale"]
 
     @pytest.mark.parametrize("malicious", [False, True])
+    @pytest.mark.parametrize(
+        "metadata_sink_from_bias_output",
+        [False, True],
+        ids=["terminal-shape", "bias-sibling-shape"],
+    )
     def test_dynamic_matmul_integer_scale_chain_continues_past_live_bias_output(
         self,
         tmp_path: Path,
         malicious: bool,
+        metadata_sink_from_bias_output: bool,
     ) -> None:
         result = OnnxScanner().scan(
             str(
                 create_dynamic_matmul_integer_bias_model(
                     tmp_path,
                     malicious=malicious,
+                    metadata_sink_from_bias_output=metadata_sink_from_bias_output,
                     post_bias_scale=True,
                 )
             )
@@ -8032,6 +8066,15 @@ class TestWeightDistributionSemantics:
 
     def test_declared_low_rank_standard_output_does_not_become_weight_lineage(self, tmp_path: Path) -> None:
         result = OnnxScanner().scan(str(create_declared_shape_metadata_model(tmp_path)))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is True
+        assert semantics["eligible_initializer_count"] == 0
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {}
+
+    def test_constant_of_shape_dimensions_do_not_become_weight_lineage(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(create_constant_of_shape_weight_model(tmp_path)))
 
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert result.success is True

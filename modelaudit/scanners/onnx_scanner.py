@@ -254,9 +254,20 @@ _WEIGHT_COMPUTING_LINEAGE_OPERATORS: frozenset[str] = frozenset(
     }
 )
 _METADATA_ONLY_LINEAGE_OPERATORS: frozenset[str] = frozenset({"Shape", "Size"})
-_PRIMARY_DATA_LINEAGE_OPERATORS: frozenset[str] = frozenset(
-    {"Compress", "CumSum", "Expand", "Pad", "Resize", "Slice", "Split", "Tile", "TopK"}
-)
+_STANDARD_DATA_LINEAGE_INPUT_INDEXES: dict[str, frozenset[int]] = {
+    "Clip": frozenset({0}),
+    "Compress": frozenset({0}),
+    "ConstantOfShape": frozenset(),
+    "CumSum": frozenset({0}),
+    "Expand": frozenset({0}),
+    "Pad": frozenset({0}),
+    "Resize": frozenset({0}),
+    "Slice": frozenset({0}),
+    "Split": frozenset({0}),
+    "Tile": frozenset({0}),
+    "TopK": frozenset({0}),
+    "Where": frozenset({1, 2}),
+}
 
 
 def resolve_onnx_raw_detector_max_bytes(config: dict[str, Any] | None = None) -> int:
@@ -1765,13 +1776,9 @@ def _build_onnx_weight_analysis_plan(
                 visited_values.add(value_name)
                 if depth > _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT:
                     return None, "unresolved_quantized_weight_scale"
-                live_consumers = [
-                    consumer
-                    for consumer in consumers_by_value.get(value_name, [])
-                    if any(str(output_name) in live_values for output_name in consumer.output if output_name)
-                ]
+                live_consumers = semantically_live_consumers((value_name,))
                 if value_name in graph_output_names:
-                    if semantically_live_consumers((value_name,)) or not graph_outputs_are_authoritative:
+                    if live_consumers or not graph_outputs_are_authoritative:
                         return None, "unresolved_quantized_weight_scale"
                     reached_terminal = True
                     continue
@@ -2519,11 +2526,9 @@ def _build_onnx_weight_analysis_plan(
                 is_non_data_standard_input = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and (
-                        (node.op_type == "Clip" and input_index > 0)
-                        or (node.op_type == "Where" and input_index == 0)
-                        or (node.op_type in _PRIMARY_DATA_LINEAGE_OPERATORS and input_index > 0)
-                    )
+                    and not is_model_local_function
+                    and node.op_type in _STANDARD_DATA_LINEAGE_INPUT_INDEXES
+                    and input_index not in _STANDARD_DATA_LINEAGE_INPUT_INDEXES[node.op_type]
                 )
                 if not is_array_feature_selector and not is_non_data_standard_input:
                     merge_lineages(
