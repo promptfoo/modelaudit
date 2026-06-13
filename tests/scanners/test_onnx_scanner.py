@@ -1593,19 +1593,24 @@ def create_matmul_integer_scale_chain_model(
     repeat_weight_scale: bool = False,
     nested_static_scale_expression: bool = False,
     cast_scale_expression: bool = False,
+    widen_before_scale: bool = False,
     widen_after_scale: bool = False,
     post_scale_bias_add: bool = False,
     narrow_after_scale: bool = False,
+    terminal_activation: str | None = None,
     integer_op_boundary: str = "direct",
 ) -> Path:
     assert integer_op_boundary in {"direct", "function", "if_subgraph"}
+    assert terminal_activation in {None, "Relu"}
     weight_shape = (10, 100) if weight_on_left else (100, 10)
     weights = np.full(
         weight_shape,
         2 if overflow_scale or scalar_overflow or repeat_weight_scale else 1,
         dtype=np.int8,
     )
-    scale_dtype = np.float16 if cast_data_type == TensorProto.FLOAT16 else np.float32
+    scale_dtype = (
+        np.float32 if widen_before_scale else np.float16 if cast_data_type == TensorProto.FLOAT16 else np.float32
+    )
     vector_scale = np.full(
         (10, 1) if weight_on_left else 10,
         200 if repeat_weight_scale else 40_000 if overflow_scale else 1,
@@ -1694,9 +1699,10 @@ def create_matmul_integer_scale_chain_model(
         )
         nodes.append(helper.make_node("Reshape", [cast_input, "live_shape"], ["Y_reshaped"]))
         cast_input = "Y_reshaped"
-    nodes.extend(
-        [helper.make_node("Cast", [cast_input], ["Y_cast"], to=cast_data_type)],
-    )
+    cast_output = "Y_narrow" if widen_before_scale else "Y_cast"
+    nodes.append(helper.make_node("Cast", [cast_input], [cast_output], to=cast_data_type))
+    if widen_before_scale:
+        nodes.append(helper.make_node("Cast", [cast_output], ["Y_cast"], to=TensorProto.FLOAT))
     activation_scale_input = "Y_cast"
     if unsupported_live_op == "Relu":
         nodes.append(helper.make_node("Relu", ["Y_cast"], ["Y_relu"]))
@@ -1732,7 +1738,13 @@ def create_matmul_integer_scale_chain_model(
     if repeat_weight_scale:
         nodes.append(helper.make_node("Mul", [scale_chain_input, "W_scale_0"], ["Y_repeated_scale"]))
         scale_chain_input = "Y_repeated_scale"
-    scale_chain_output = "Y_before_output_cast" if widen_after_scale or narrow_after_scale else "Y"
+    scale_chain_output = (
+        "Y_before_output_cast"
+        if widen_after_scale or narrow_after_scale
+        else "Y_before_terminal_activation"
+        if terminal_activation is not None
+        else "Y"
+    )
     if scalar_only_scale:
         nodes.append(helper.make_node("Identity", [scale_chain_input], [scale_chain_output]))
     elif vector_scale_count == 1:
@@ -1743,9 +1755,15 @@ def create_matmul_integer_scale_chain_model(
         nodes.append(helper.make_node("Cast", [scale_chain_output], ["Y"], to=TensorProto.FLOAT))
     elif narrow_after_scale:
         nodes.append(helper.make_node("Cast", [scale_chain_output], ["Y"], to=TensorProto.FLOAT16))
+    elif terminal_activation is not None:
+        nodes.append(helper.make_node(terminal_activation, [scale_chain_output], ["Y"]))
     output_shape = [10, 1] if weight_on_left else [1, 10]
     output_data_type = (
-        TensorProto.FLOAT if widen_after_scale else TensorProto.FLOAT16 if narrow_after_scale else cast_data_type
+        TensorProto.FLOAT
+        if widen_after_scale or widen_before_scale
+        else TensorProto.FLOAT16
+        if narrow_after_scale
+        else cast_data_type
     )
     outputs = [helper.make_tensor_value_info("Y", output_data_type, output_shape)]
     if expose_raw_output:
@@ -1775,38 +1793,124 @@ def create_dynamic_matmul_integer_bias_model(
     metadata_sink_domain: str = "",
     metadata_sink_from_bias_output: bool = False,
     post_bias_scale: bool = False,
+    integer_op_boundary: str = "direct",
 ) -> Path:
+    assert integer_op_boundary in {"direct", "function", "if_subgraph"}
     weights = np.ones((100, 10), dtype=np.int8)
     weight_scale = np.ones(10, dtype=np.float32)
     if malicious:
         weight_scale[3] = 100.0
     initial_scale_name = "W_scale_0" if post_bias_scale else "W_scale"
     initial_scale = np.asarray(1.0, dtype=np.float32) if post_bias_scale else weight_scale
-    bias_output = "Y_biased" if post_bias_scale else "Y"
-    nodes = [
-        helper.make_node(
-            "DynamicQuantizeLinear",
-            ["X"],
-            ["X_quantized", "X_scale", "X_zero_point"],
-        ),
-        helper.make_node(
-            "MatMulInteger",
-            ["X_quantized", "W_quantized", "X_zero_point", "W_zero_point"],
-            ["Y_integer"],
-        ),
-        helper.make_node("Cast", ["Y_integer"], ["Y_cast"], to=TensorProto.FLOAT),
-        helper.make_node("Mul", ["X_scale", initial_scale_name], ["combined_scale"]),
-        helper.make_node("Mul", ["Y_cast", "combined_scale"], ["Y_scaled"]),
-        helper.make_node("Add", ["Y_scaled", "bias"], [bias_output]),
-    ]
+
+    def make_bias_nodes(
+        *,
+        prefix: str,
+        x_name: str,
+        weight_name: str,
+        zero_point_name: str,
+        scale_name: str,
+        bias_name: str,
+        output_name: str,
+    ) -> list[Any]:
+        return [
+            helper.make_node(
+                "DynamicQuantizeLinear",
+                [x_name],
+                [f"{prefix}X_quantized", f"{prefix}X_scale", f"{prefix}X_zero_point"],
+            ),
+            helper.make_node(
+                "MatMulInteger",
+                [f"{prefix}X_quantized", weight_name, f"{prefix}X_zero_point", zero_point_name],
+                [f"{prefix}Y_integer"],
+            ),
+            helper.make_node("Cast", [f"{prefix}Y_integer"], [f"{prefix}Y_cast"], to=TensorProto.FLOAT),
+            helper.make_node("Mul", [f"{prefix}X_scale", scale_name], [f"{prefix}combined_scale"]),
+            helper.make_node("Mul", [f"{prefix}Y_cast", f"{prefix}combined_scale"], [f"{prefix}Y_scaled"]),
+            helper.make_node("Add", [f"{prefix}Y_scaled", bias_name], [output_name]),
+        ]
+
+    bias_output = "Y_biased" if post_bias_scale or integer_op_boundary != "direct" else "Y"
+    functions: list[Any] = []
+    inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])]
+    if integer_op_boundary == "function":
+        function_domain = "modelaudit.test.function"
+        function_inputs = ["function_X", "function_W", "function_W_zero_point", "function_scale", "function_bias"]
+        functions.append(
+            helper.make_function(
+                function_domain,
+                "DynamicIntegerBias",
+                function_inputs,
+                ["function_output"],
+                make_bias_nodes(
+                    prefix="function_",
+                    x_name=function_inputs[0],
+                    weight_name=function_inputs[1],
+                    zero_point_name=function_inputs[2],
+                    scale_name=function_inputs[3],
+                    bias_name=function_inputs[4],
+                    output_name="function_output",
+                ),
+                [helper.make_opsetid("", 13)],
+            )
+        )
+        nodes = [
+            helper.make_node(
+                "DynamicIntegerBias",
+                ["X", "W_quantized", "W_zero_point", initial_scale_name, "bias"],
+                [bias_output],
+                domain=function_domain,
+            )
+        ]
+    elif integer_op_boundary == "if_subgraph":
+        inputs.append(helper.make_tensor_value_info("condition", TensorProto.BOOL, []))
+
+        def make_bias_branch(name: str) -> Any:
+            output_name = f"{name}_output"
+            return helper.make_graph(
+                make_bias_nodes(
+                    prefix=f"{name}_",
+                    x_name="X",
+                    weight_name="W_quantized",
+                    zero_point_name="W_zero_point",
+                    scale_name=initial_scale_name,
+                    bias_name="bias",
+                    output_name=output_name,
+                ),
+                name,
+                [],
+                [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, [1, 10])],
+            )
+
+        nodes = [
+            helper.make_node(
+                "If",
+                ["condition"],
+                [bias_output],
+                then_branch=make_bias_branch("then"),
+                else_branch=make_bias_branch("else"),
+            )
+        ]
+    else:
+        nodes = make_bias_nodes(
+            prefix="",
+            x_name="X",
+            weight_name="W_quantized",
+            zero_point_name="W_zero_point",
+            scale_name=initial_scale_name,
+            bias_name="bias",
+            output_name=bias_output,
+        )
     if post_bias_scale:
         nodes.append(helper.make_node("Mul", [bias_output, "W_scale_1"], ["Y"]))
+    elif integer_op_boundary != "direct":
+        nodes.append(helper.make_node("Identity", [bias_output], ["Y"]))
     metadata_sink_input = bias_output if metadata_sink_from_bias_output else "Y"
     nodes.append(helper.make_node("Shape", [metadata_sink_input], ["Y_shape"], domain=metadata_sink_domain))
     graph = helper.make_graph(
         nodes,
         "dynamic_matmul_integer_bias",
-        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        inputs,
         [
             helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10]),
             helper.make_tensor_value_info("Y_shape", TensorProto.INT64, [2]),
@@ -1820,13 +1924,17 @@ def create_dynamic_matmul_integer_bias_model(
         ],
     )
     opset_imports = [helper.make_opsetid("", 13)]
-    if metadata_sink_domain:
-        opset_imports.append(helper.make_opsetid(metadata_sink_domain, 1))
-    model = helper.make_model(graph, opset_imports=opset_imports)
+    custom_domains = {metadata_sink_domain} if metadata_sink_domain else set()
+    if integer_op_boundary == "function":
+        custom_domains.add("modelaudit.test.function")
+    opset_imports.extend(helper.make_opsetid(domain, 1) for domain in sorted(custom_domains))
+    model = helper.make_model(graph, functions=functions, opset_imports=opset_imports)
     model.ir_version = 8
     onnx.checker.check_model(model)
     suffix = "post-bias-scale" if post_bias_scale else "terminal-bias"
-    path = tmp_path / f"dynamic-matmul-integer-{suffix}-{'malicious' if malicious else 'benign'}.onnx"
+    path = tmp_path / (
+        f"dynamic-matmul-integer-{suffix}-{integer_op_boundary}-{'malicious' if malicious else 'benign'}.onnx"
+    )
     onnx.save(model, str(path))
     return path
 
@@ -1854,27 +1962,47 @@ def create_declared_shape_metadata_model(tmp_path: Path) -> Path:
     return path
 
 
-def create_constant_of_shape_weight_model(tmp_path: Path, *, fill_value: float = 0.0) -> Path:
+def create_constant_of_shape_weight_model(
+    tmp_path: Path,
+    *,
+    fill_value: float = 0.0,
+    pad_to_ten_columns: bool = False,
+) -> Path:
+    generated_shape = [100, 1] if pad_to_ten_columns else [100, 10]
+    generated_output = "generated_weight" if pad_to_ten_columns else "W"
+    nodes = [
+        helper.make_node(
+            "ConstantOfShape",
+            ["shape"],
+            [generated_output],
+            value=helper.make_tensor("fill", TensorProto.FLOAT, [1], [fill_value]),
+        )
+    ]
+    initializers = [onnx.numpy_helper.from_array(np.asarray(generated_shape, dtype=np.int64), name="shape")]
+    value_info = [helper.make_tensor_value_info(generated_output, TensorProto.FLOAT, generated_shape)]
+    if pad_to_ten_columns:
+        nodes.append(helper.make_node("Pad", [generated_output, "pads", "pad_value"], ["W"]))
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.asarray([0, 0, 0, 9], dtype=np.int64), name="pads"),
+                onnx.numpy_helper.from_array(np.asarray(0.0, dtype=np.float32), name="pad_value"),
+            ]
+        )
+        value_info.append(helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10]))
+    nodes.append(helper.make_node("MatMul", ["X", "W"], ["Y"]))
     graph = helper.make_graph(
-        [
-            helper.make_node(
-                "ConstantOfShape",
-                ["shape"],
-                ["W"],
-                value=helper.make_tensor("fill", TensorProto.FLOAT, [1], [fill_value]),
-            ),
-            helper.make_node("MatMul", ["X", "W"], ["Y"]),
-        ],
+        nodes,
         "constant_of_shape_weight",
         [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
-        initializer=[onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="shape")],
-        value_info=[helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10])],
+        initializer=initializers,
+        value_info=value_info,
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / f"constant-of-shape-weight-{fill_value}.onnx"
+    suffix = "-padded" if pad_to_ten_columns else ""
+    path = tmp_path / f"constant-of-shape-weight-{fill_value}{suffix}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -8023,6 +8151,35 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert semantics["eligible"][0]["quantization_scale_factor_names"] == ["W_scale_0", "W_scale_1"]
 
+    @pytest.mark.parametrize("integer_op_boundary", ["function", "if_subgraph"])
+    def test_dynamic_matmul_integer_typed_bias_fails_closed_at_non_root_boundary(
+        self,
+        tmp_path: Path,
+        integer_op_boundary: str,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(
+                create_dynamic_matmul_integer_bias_model(
+                    tmp_path,
+                    malicious=True,
+                    post_bias_scale=True,
+                    integer_op_boundary=integer_op_boundary,
+                )
+            )
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        expected_unresolved = 2 if integer_op_boundary == "if_subgraph" else 1
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": expected_unresolved}
+        assert {sample["reason"] for sample in semantics["unresolved_lineage_samples"]} == {
+            "unresolved_quantized_weight_scale"
+        }
+
     def test_custom_shape_name_does_not_terminate_dynamic_integer_scale_lineage(self, tmp_path: Path) -> None:
         result = OnnxScanner().scan(
             str(
@@ -8093,6 +8250,37 @@ class TestWeightDistributionSemantics:
         assert semantics["unresolved_lineage_samples"][0]["initializer"] == "W"
         assert semantics["unresolved_lineage_samples"][0]["reason"] == "generated_constant_of_shape_lineage"
 
+    @pytest.mark.parametrize("fill_value", [0.0, 100.0])
+    def test_padded_constant_of_shape_weight_preserves_generated_lineage_without_promoting_metadata(
+        self,
+        tmp_path: Path,
+        fill_value: float,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(
+                create_constant_of_shape_weight_model(
+                    tmp_path,
+                    fill_value=fill_value,
+                    pad_to_ten_columns=True,
+                )
+            )
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if fill_value == 0.0:
+            assert result.success is True
+            assert semantics["eligible_initializer_count"] == 0
+            assert semantics["analyzed_initializer_count"] == 0
+            assert semantics["coverage_gaps"] == {}
+        else:
+            assert result.success is False
+            assert semantics["eligible_initializer_count"] == 1
+            assert semantics["analyzed_initializer_count"] == 0
+            assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+            sample = semantics["unresolved_lineage_samples"][0]
+            assert sample["initializer"] == "generated_weight"
+            assert sample["reason"] == "generated_constant_of_shape_lineage"
+
     def test_matmul_integer_non_unit_add_scale_chain_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_scale_chain_model(tmp_path, duplicate_add_input=True)
 
@@ -8127,6 +8315,32 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["analyzed_initializer_count"] == 0
         assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+
+    @pytest.mark.parametrize("anomalous_vector_scale", [False, True])
+    def test_matmul_integer_accepts_terminal_activation_after_complete_scale_chain(
+        self,
+        tmp_path: Path,
+        anomalous_vector_scale: bool,
+    ) -> None:
+        model_path = create_matmul_integer_scale_chain_model(
+            tmp_path,
+            anomalous_vector_scale=anomalous_vector_scale,
+            terminal_activation="Relu",
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert len(checks) == int(anomalous_vector_scale)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {}
 
     def test_matmul_integer_self_multiply_scale_path_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_weight_model(tmp_path, self_multiply_output=True)
@@ -8178,6 +8392,22 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible"][0]["quantization_output_data_type"] == TensorProto.FLOAT16
         expected_scale_names = ["X_scale"] if scalar_only_scale else ["X_scale", "W_scale_0"]
         assert semantics["eligible"][0]["quantization_scale_factor_names"] == expected_scale_names
+
+    def test_matmul_integer_scale_chain_preserves_pre_scale_narrowing_cast(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_scale_chain_model(
+            tmp_path,
+            cast_data_type=TensorProto.FLOAT16,
+            overflow_scale=True,
+            widen_before_scale=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["num_nonfinite_weights"] == 1000
+        context = result.metadata["onnx_weight_distribution_semantics"]["eligible"][0]
+        assert context["quantization_output_data_type"] == TensorProto.FLOAT16
 
     def test_matmul_integer_scale_chain_preserves_repeated_factors(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_scale_chain_model(

@@ -1755,7 +1755,26 @@ def _build_onnx_weight_analysis_plan(
             reached_terminal = False
             current_data_type = int(onnx.TensorProto.FLOAT)
             scale_data_type: int | None = None
+            narrowest_output_data_type: int | None = None
             has_dynamic_quantize_scale = False
+
+            def retain_narrowest_output_data_type(candidate_data_type: int) -> bool:
+                nonlocal narrowest_output_data_type, output_data_type
+                if narrowest_output_data_type is None:
+                    narrowest_output_data_type = candidate_data_type
+                    output_data_type = candidate_data_type
+                    return True
+                try:
+                    candidate_itemsize = int(_tensor_data_type_to_np_dtype(candidate_data_type).itemsize)
+                    output_itemsize = int(_tensor_data_type_to_np_dtype(narrowest_output_data_type).itemsize)
+                except (KeyError, TypeError, ValueError):
+                    return False
+                if candidate_itemsize < output_itemsize:
+                    narrowest_output_data_type = candidate_data_type
+                    output_data_type = candidate_data_type
+                elif candidate_itemsize == output_itemsize and candidate_data_type != narrowest_output_data_type:
+                    return False
+                return True
 
             def semantically_live_consumers(value_names: Iterable[str]) -> list[Any]:
                 return [
@@ -1815,7 +1834,8 @@ def _build_onnx_weight_analysis_plan(
                         # A dynamic activation scale plus a static scale completes the
                         # canonical integer dequantization path before the typed bias.
                         if (
-                            scale_data_type is not None
+                            graph_outputs_are_authoritative
+                            and scale_data_type is not None
                             and has_dynamic_quantize_scale
                             and scale_names
                             and not semantically_live_consumers(next_values)
@@ -1827,24 +1847,26 @@ def _build_onnx_weight_analysis_plan(
                         if cast_data_type not in floating_types:
                             return None, "unresolved_quantized_weight_scale"
                         current_data_type = cast_data_type
-                        if scale_data_type is not None:
-                            try:
-                                current_itemsize = int(_tensor_data_type_to_np_dtype(current_data_type).itemsize)
-                                output_itemsize = int(_tensor_data_type_to_np_dtype(output_data_type).itemsize)
-                            except (KeyError, TypeError, ValueError):
-                                return None, "unresolved_quantized_weight_scale"
-                            if current_itemsize < output_itemsize:
-                                output_data_type = current_data_type
-                            elif current_itemsize == output_itemsize and current_data_type != output_data_type:
-                                return None, "unresolved_quantized_weight_scale"
+                        if not retain_narrowest_output_data_type(current_data_type):
+                            return None, "unresolved_quantized_weight_scale"
                     queue.extend((output_name, depth + 1) for output_name in next_values)
+                    continue
+                if (
+                    consumer.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                    and scale_data_type is not None
+                    and graph_outputs_are_authoritative
+                    and all(output_name in graph_output_names for output_name in next_values)
+                    and not semantically_live_consumers(next_values)
+                ):
+                    reached_terminal = True
                     continue
                 if consumer.op_type != "Mul":
                     return None, "unresolved_quantized_weight_scale"
                 if scale_data_type is not None and scale_data_type != current_data_type:
                     return None, "unresolved_quantized_weight_scale"
                 scale_data_type = current_data_type
-                output_data_type = current_data_type
+                if not retain_narrowest_output_data_type(current_data_type):
+                    return None, "unresolved_quantized_weight_scale"
                 for source_name in (str(source) for source in consumer.input if source and str(source) != value_name):
                     source_scale = scale_initializer_names_in_expression(source_name)
                     if source_scale is None:
