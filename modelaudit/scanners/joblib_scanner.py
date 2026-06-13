@@ -821,6 +821,8 @@ class JoblibScanner(BaseScanner):
             result.metadata["trusted_incomplete_tail"] = True
             result.metadata["trusted_incomplete_tail_reason"] = "joblib_numpy_array_payload"
             result.metadata["joblib_numpy_array_payload_count"] = raw_array_count
+            if result.metadata.get("pickle_verdict") in {"suspicious", "unknown"}:
+                result.metadata["pickle_verdict"] = "clean"
         else:
             self._downgrade_embedded_pickle_parse_errors(result)
         result.bytes_scanned = len(payload)
@@ -985,7 +987,18 @@ class JoblibScanner(BaseScanner):
             ) and reference_origin_is_trusted(finding):
                 validated_finding_ids.add(builtins.id(finding))
 
-        removed = bool(validated_finding_ids) or origin_review_references_are_validated()
+        origin_review_validated = origin_review_references_are_validated()
+        if origin_review_validated:
+            for _position, _sequence, _import_reference, finding in candidates:
+                details = getattr(finding, "details", {})
+                if (
+                    isinstance(details, dict)
+                    and details.get("notice_code") == "call_graph_source_unavailable"
+                    and reference_origin_is_trusted(finding)
+                ):
+                    validated_finding_ids.add(builtins.id(finding))
+
+        removed = bool(validated_finding_ids) or origin_review_validated
         if not removed:
             return
 

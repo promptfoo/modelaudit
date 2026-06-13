@@ -969,6 +969,11 @@ def test_numpy_object_dtype_benign_direct_scan_success_after_reconstruction_clea
     assert not result.has_errors
     assert not any(check.rule_code == "NON_ALLOWLISTED_GLOBAL" for check in result.checks)
     assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+    serialized_result = result.to_dict(include_private_metadata=True)
+    private_metadata = serialized_result.get("_private_metadata", {})
+    assert isinstance(private_metadata, dict)
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in private_metadata
+    assert should_cache_scan_result(serialized_result) is True
 
 
 def test_numpy_object_dtype_direct_scan_preserves_retained_embedded_failure_after_cleanup(

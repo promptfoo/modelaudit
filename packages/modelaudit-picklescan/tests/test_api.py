@@ -2857,6 +2857,35 @@ def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() 
     assert all(reference.get("pytorch_storage_persistent_id") is True for reference in storage_references)
 
 
+def test_scan_bytes_marks_only_matched_pytorch_storage_persistent_id_import_reference() -> None:
+    payload = _pytorch_storage_persistent_id_payload("0")
+    first_storage_position = payload.index(b"\x93")
+    payload = payload[:-1] + b"0" + _short_binunicode(b"torch") + _short_binunicode(b"FloatStorage") + b"\x93."
+    extra_storage_position = payload.rindex(b"\x93")
+
+    report = scan_bytes(payload, source="mixed-pytorch-storage-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    storage_references = [
+        reference
+        for reference in report.metadata["import_references"]
+        if reference.get("import_reference") == "torch.FloatStorage"
+    ]
+    assert len(storage_references) == 2
+    storage_flags_by_position = {
+        reference.get("position"): reference.get("pytorch_storage_persistent_id") for reference in storage_references
+    }
+    flagged_positions = [
+        reference.get("position")
+        for reference in storage_references
+        if reference.get("pytorch_storage_persistent_id") is True
+    ]
+    assert flagged_positions == [first_storage_position]
+    assert storage_flags_by_position[first_storage_position] is True
+    assert storage_flags_by_position.get(extra_storage_position) is not True
+
+
 def test_scan_bytes_does_not_mark_synthetic_torch_storage_name_as_storage_persistent_id() -> None:
     payload = _pytorch_storage_persistent_id_payload("0", storage_name="SyntheticStorage")
 

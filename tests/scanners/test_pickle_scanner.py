@@ -19,6 +19,7 @@ from modelaudit.models import create_initial_audit_result
 from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners import pickle_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.joblib_scanner import JoblibScanner
 from modelaudit.scanners.pickle_scanner import (
     _BINARY_TAIL_SCAN_BYTES,
     ALWAYS_DANGEROUS_FUNCTIONS,
@@ -200,6 +201,10 @@ def _joblib_test_requires_origin_review(module: str, name: str) -> bool:
 def _trust_joblib_test_references(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        _joblib_test_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
         _joblib_test_reference_is_trusted,
     )
     monkeypatch.setattr(
@@ -4544,6 +4549,23 @@ def test_legitimate_serialization_file_accepts_validated_joblib_raw_span(
     _trust_joblib_test_references(monkeypatch)
 
     assert _is_legitimate_serialization_file(str(safe_path)) is True
+
+
+def test_joblib_validated_raw_span_clears_private_actionable_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
+    _trust_joblib_test_references(monkeypatch)
+
+    result = JoblibScanner().scan(str(safe_path))
+
+    serialized_result = result.to_dict(include_private_metadata=True)
+    assert result.success is True
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert _private_actionable_failed_checks(serialized_result) == []
+    assert should_cache_scan_result(serialized_result) is True
 
 
 def test_legitimate_serialization_file_keeps_untrusted_wrapper_origin_review(
