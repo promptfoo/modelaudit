@@ -5019,6 +5019,8 @@ def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
         "https://example.invalid/%E2%98%83/%00/reference/subprocess.run(args)",
         "prefix\x00https://example.invalid/reference/requests.get(url)\x1fsuffix",
         "https://github.com/example/project/blob/main/loader.py",
+        "s3://bucket/docs/os.system(cmd)",
+        "ftp://example.invalid/docs/subprocess.run(args)",
     ],
 )
 @pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))

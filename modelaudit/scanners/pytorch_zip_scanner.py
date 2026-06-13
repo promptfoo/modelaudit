@@ -50,6 +50,7 @@ from .archive_member_security import (
 from .base import BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import (
     PickleScanner,
+    _pickle_literal_url_records,
     _pickle_literal_url_stripped_scan_view,
     executable_pickle_literal_network_findings,
     extend_unique_network_findings,
@@ -2958,19 +2959,29 @@ class PyTorchZipScanner(BaseScanner):
                         )
                         all_jit_findings.extend(jit_findings)
                     if check_net:
+                        literal_records = _pickle_literal_url_records(file_data)
                         network_file_data = _pickle_literal_url_stripped_scan_view(
                             file_data,
                             network_functions_only=True,
+                            literal_records=literal_records,
                         )
                         network_findings = self.collect_network_communication_findings(
                             network_file_data,
                             context=f"{path}:{name}",
                             result=result,
                         )
-                        network_findings = filter_inert_pickle_literal_network_findings(network_findings, file_data)
+                        network_findings = filter_inert_pickle_literal_network_findings(
+                            network_findings,
+                            file_data,
+                            literal_records=literal_records,
+                        )
                         extend_unique_network_findings(
                             network_findings,
-                            executable_pickle_literal_network_findings(file_data, context=f"{path}:{name}"),
+                            executable_pickle_literal_network_findings(
+                                file_data,
+                                context=f"{path}:{name}",
+                                literal_records=literal_records,
+                            ),
                         )
                         all_network_findings.extend(network_findings)
 

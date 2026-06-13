@@ -67,7 +67,7 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let plain_value = strip_http_url_spans(value);
+    let plain_value = strip_url_spans(value);
     let has_plain_seed = has_suspicious_ascii_seed(plain_value.as_bytes());
     let has_encoded_seed = has_base64_dangerous_seed(plain_value.as_ref());
     if !has_plain_seed && !has_encoded_seed {
@@ -151,14 +151,32 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     matches
 }
 
-fn strip_http_url_spans(value: &str) -> Cow<'_, str> {
+const URL_SCHEMES: &[&[u8]] = &[
+    b"http://",
+    b"https://",
+    b"ftp://",
+    b"ftps://",
+    b"ssh://",
+    b"telnet://",
+    b"ws://",
+    b"wss://",
+    b"s3://",
+    b"gs://",
+    b"az://",
+    b"wasb://",
+    b"wasbs://",
+    b"abfs://",
+    b"abfss://",
+];
+
+fn strip_url_spans(value: &str) -> Cow<'_, str> {
     let bytes = value.as_bytes();
     let mut output: Option<String> = None;
     let mut cursor = 0;
 
-    while let Some(relative_start) = find_http_url_start(&bytes[cursor..]) {
+    while let Some(relative_start) = find_url_start(&bytes[cursor..]) {
         let start = cursor + relative_start;
-        let end = http_url_end(bytes, start);
+        let end = url_end(bytes, start);
         if end <= start {
             cursor = start + 1;
             continue;
@@ -178,18 +196,17 @@ fn strip_http_url_spans(value: &str) -> Cow<'_, str> {
     }
 }
 
-fn find_http_url_start(bytes: &[u8]) -> Option<usize> {
+fn find_url_start(bytes: &[u8]) -> Option<usize> {
     (0..bytes.len()).find(|index| {
-        bytes
-            .get(*index..index + 7)
-            .is_some_and(|candidate| ascii_eq_ignore_case(candidate, b"http://"))
-            || bytes
-                .get(*index..index + 8)
-                .is_some_and(|candidate| ascii_eq_ignore_case(candidate, b"https://"))
+        URL_SCHEMES.iter().any(|scheme| {
+            bytes
+                .get(*index..index + scheme.len())
+                .is_some_and(|candidate| ascii_eq_ignore_case(candidate, scheme))
+        })
     })
 }
 
-fn http_url_end(bytes: &[u8], start: usize) -> usize {
+fn url_end(bytes: &[u8], start: usize) -> usize {
     let mut end = start;
     while end < bytes.len() {
         if is_http_url_byte(bytes[end]) {
@@ -1470,6 +1487,10 @@ mod tests {
         )
         .is_empty());
         assert!(suspicious_string_matches("https://example.invalid/a'b/os.system(cmd)").is_empty());
+        assert!(suspicious_string_matches("s3://bucket/docs/os.system(cmd)").is_empty());
+        assert!(
+            suspicious_string_matches("ftp://example.invalid/docs/subprocess.run(args)").is_empty()
+        );
         assert!(suspicious_string_matches("__reduce__ is a pickle protocol hook").is_empty());
     }
 

