@@ -8,7 +8,9 @@ import pickle
 import signal
 import struct
 import subprocess
+import sys
 import tarfile
+import textwrap
 import time
 import zipfile
 import zlib
@@ -43,6 +45,10 @@ from modelaudit.utils.sources._huggingface_download_worker import _run_operation
 from modelaudit.utils.sources.huggingface import (
     _HF_CONTENT_SNIFF_BYTES,
     _HF_CONTENT_SNIFF_MAX_FILES,
+    _HF_SAFETENSORS_RESULT_BUDGET_REASON,
+    _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
+    _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
+    _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
     _build_huggingface_model_info,
     _check_hf_acquisition_interrupted,
     _combine_remote_safetensors_shard_details,
@@ -52,6 +58,7 @@ from modelaudit.utils.sources.huggingface import (
     _extract_huggingface_repo_files,
     _get_huggingface_path_sizes,
     _HuggingFaceProbeBudget,
+    _HuggingFaceSafeTensorsRetentionBudget,
     _list_huggingface_repo_files_at_revision,
     _list_repo_files_with_timeout,
     _loads_json_without_duplicate_keys,
@@ -7526,6 +7533,109 @@ class TestModelDownloadStreaming:
             f"bytes=0-{7 + header_len}",
         ]
 
+    @pytest.mark.parametrize("filename", ["weights." + ("x" * 241), "weights.invalid:name?*"])
+    def test_remote_safetensors_uses_private_temp_suffix_for_untrusted_filename(
+        self,
+        filename: str,
+    ) -> None:
+        """Remote names must not control the platform-specific temporary suffix."""
+        import tempfile as stdlib_tempfile
+
+        frame, header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}},
+            b"\x00",
+        )
+        with (
+            patch("huggingface_hub.utils.build_hf_headers", return_value={}),
+            patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/file"),
+            patch(
+                "requests.get",
+                side_effect=[
+                    _strict_range_response(frame[:8], len(frame)),
+                    _strict_range_response(frame[: 8 + header_len], len(frame)),
+                ],
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface.tempfile.NamedTemporaryFile",
+                wraps=stdlib_tempfile.NamedTemporaryFile,
+            ) as mock_named_temp,
+        ):
+            result = _scan_remote_huggingface_safetensors_header(
+                "test/model",
+                filename,
+                _HF_TEST_REVISION,
+                declared_size=len(frame),
+                deadline=None,
+                active_scanner_ids={"safetensors"},
+            )
+
+        assert result.success is True
+        mock_named_temp.assert_called_once()
+        assert mock_named_temp.call_args.kwargs["suffix"] == ".safetensors"
+
+    @pytest.mark.parametrize("complete", [False, True], ids=["missing", "complete"])
+    def test_download_model_streaming_reconciles_custom_stem_shard_family(
+        self,
+        complete: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = "adapter_model-00001-of-00002.safetensors"
+        second = "adapter_model-00002-of-00002.safetensors"
+        repo_files = [first, second] if complete else [first]
+        frame, header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}},
+            b"\x00",
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: (repo_files, _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (dict.fromkeys(repo_files, len(frame)), _HF_TEST_REVISION),
+        )
+
+        responses = []
+        for _filename in repo_files:
+            responses.extend(
+                [
+                    _strict_range_response(frame[:8], len(frame)),
+                    _strict_range_response(frame[: 8 + header_len], len(frame)),
+                ]
+            )
+        with (
+            patch("huggingface_hub.utils.build_hf_headers", return_value={}),
+            patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/file"),
+            patch("requests.get", side_effect=responses),
+            patch("huggingface_hub.hf_hub_download") as mock_download,
+        ):
+            streamed = list(
+                download_model_streaming(
+                    f"hf://test/model?revision={_HF_TEST_REVISION}",
+                    max_size=4096,
+                    scannable_extensions={".safetensors"},
+                    scannable_scanner_ids={"safetensors"},
+                    _include_scan_results=True,
+                )
+            )
+
+        for item in streamed:
+            _path, _is_last, scan_result, _accounting = _unpack_internal_stream_item(item)
+            family = scan_result.metadata["remote_shard_family"]
+            assert family["complete"] is complete
+            assert family["missing_shard_indices"] == ([] if complete else [2])
+        aggregate = scan_model_streaming(
+            iter(streamed),
+            timeout=30,
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["safetensors"],
+            skip_file_types=False,
+        )
+        assert aggregate.success is complete
+        assert determine_exit_code(aggregate) == (0 if complete else 2)
+        mock_download.assert_not_called()
+
     @patch("huggingface_hub.hf_hub_download")
     @patch("huggingface_hub.utils.build_hf_headers", return_value={})
     @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
@@ -8052,6 +8162,310 @@ class TestModelDownloadStreaming:
         assert details["missing_shard_count"] == 999999999998
         assert details["missing_shard_indices"] == list(range(2, 22))
         assert details["missing_shard_indices_truncated"] is True
+
+    @pytest.mark.parametrize(
+        ("repo_files", "expected_complete", "expected_missing"),
+        [
+            (["adapter_model-00001-of-00002.safetensors"], False, [2]),
+            (
+                [
+                    "adapter_model-00001-of-00002.safetensors",
+                    "adapter_model-00002-of-00002.safetensors",
+                ],
+                True,
+                [],
+            ),
+        ],
+        ids=["missing-custom-stem-shard", "complete-custom-stem-family"],
+    )
+    def test_remote_safetensors_custom_stem_filename_coverage(
+        self,
+        repo_files: list[str],
+        expected_complete: bool,
+        expected_missing: list[int],
+    ) -> None:
+        details = _remote_safetensors_filename_shard_details_by_file(repo_files, repo_files)
+
+        assert set(details) == set(repo_files)
+        assert all(detail["complete"] is expected_complete for detail in details.values())
+        assert all(detail["missing_shard_indices"] == expected_missing for detail in details.values())
+
+    @pytest.mark.parametrize(
+        ("dimension", "constant_name", "constant_value", "metadata"),
+        [
+            ("result_count", "_MAX_HF_SAFETENSORS_RETAINED_RESULTS", 1, {}),
+            ("tensor_name_count", "_MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES", 1, {"tensors": ["a", "b"]}),
+            (
+                "result_bytes",
+                "_MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES",
+                64 * 1024,
+                {"padding": "x" * 128},
+            ),
+        ],
+    )
+    def test_remote_safetensors_retention_budget_covers_each_dimension(
+        self,
+        dimension: str,
+        constant_name: str,
+        constant_value: int,
+        metadata: dict[str, object],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit.scanner_results import ScanResult
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        monkeypatch.setattr(huggingface_module, constant_name, constant_value)
+        result = ScanResult(scanner_name="safetensors")
+        result.metadata.update(metadata)
+        result.finish(success=True)
+
+        rejection = _HuggingFaceSafeTensorsRetentionBudget().retain(result)
+
+        assert rejection is not None
+        assert rejection["exceeded"] == [dimension]
+
+    @pytest.mark.parametrize(
+        "candidate_security_finding",
+        [False, True],
+        ids=["clean-candidate", "security-finding-precedence"],
+    )
+    def test_download_model_streaming_retention_budget_fails_closed(
+        self,
+        candidate_security_finding: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit.scanners.base import IssueSeverity
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        filenames = [f"model-{index:05d}-of-00003.safetensors" for index in range(1, 4)]
+        monkeypatch.setattr(
+            huggingface_module,
+            "_list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: (filenames, _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            huggingface_module,
+            "_get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (dict.fromkeys(filenames, 500), _HF_TEST_REVISION),
+        )
+        monkeypatch.setattr(huggingface_module, "_MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES", 3)
+
+        def fake_scan(_repo_id: str, filename: str, _revision: str, **_kwargs: object) -> Any:
+            result = _fake_remote_safetensors_scan(filename)
+            result.metadata["tensors"] = ["first", "second"]
+            result.metadata["tensor_count"] = 4096
+            if candidate_security_finding and filename == filenames[1]:
+                result.add_check(
+                    name="Candidate Security Finding",
+                    passed=False,
+                    message="candidate security finding",
+                    severity=IssueSeverity.CRITICAL,
+                )
+                result.finish(success=False)
+            return result
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._scan_remote_huggingface_safetensors_header",
+                side_effect=fake_scan,
+            ) as mock_scan,
+            patch("huggingface_hub.hf_hub_download") as mock_download,
+        ):
+            streamed = list(
+                download_model_streaming(
+                    f"hf://test/model?revision={_HF_TEST_REVISION}",
+                    scannable_extensions={".safetensors"},
+                    scannable_scanner_ids={"safetensors"},
+                    _include_scan_results=True,
+                )
+            )
+
+        assert len(streamed) == 2
+        _first_path, first_is_last, first_result, _first_accounting = _unpack_internal_stream_item(streamed[0])
+        _failure_path, failure_is_last, failure_result, _failure_accounting = _unpack_internal_stream_item(streamed[1])
+        assert first_is_last is False
+        assert first_result.success is True
+        assert failure_is_last is True
+        assert failure_result.success is False
+        assert _HF_SAFETENSORS_RESULT_BUDGET_REASON in failure_result.metadata["scan_outcome_reasons"]
+        budget = failure_result.metadata["remote_result_retention_budget"]
+        assert budget["exceeded"] == ["tensor_name_count"]
+        assert budget["retained_tensor_names"] == 2
+        assert bool(budget["candidate_security_record_count"]) is candidate_security_finding
+        budget_checks = [
+            check for check in failure_result.checks if check.name == "Hugging Face SafeTensors Retained Result Budget"
+        ]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].status.value == "failed"
+        assert "exceeded its bounded budget" in budget_checks[0].message
+        assert (
+            any(check.name == "SafeTensors Candidate Security Finding Summary" for check in failure_result.checks)
+            is candidate_security_finding
+        )
+        assert mock_scan.call_count == 2
+        mock_download.assert_not_called()
+
+        with patch("modelaudit.cache.scan_results_cache.ScanResultsCache.store_result") as mock_cache_store:
+            aggregate = scan_model_streaming(
+                iter(streamed),
+                timeout=30,
+                delete_after_scan=False,
+                cache_enabled=True,
+                scanners=["safetensors"],
+                skip_file_types=False,
+            )
+
+        assert aggregate.files_scanned == 2
+        assert aggregate.bytes_scanned == 128
+        assert aggregate.success is False
+        assert determine_exit_code(aggregate) == 2
+        assert sum(len(asset.tensors or []) for asset in aggregate.assets) == 2
+        mock_cache_store.assert_not_called()
+
+    @pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
+    def test_remote_safetensors_max_cardinality_repository_retention_is_measured_and_bounded(self) -> None:
+        """One hundred maximum-cardinality headers must stop at the aggregate retention cap."""
+        repo_root = Path(__file__).resolve().parents[3]
+        script = textwrap.dedent(
+            """
+            import json
+            import os
+            import resource
+            import struct
+            import sys
+            from unittest.mock import patch
+
+            from modelaudit.core import determine_exit_code, scan_model_streaming
+            from modelaudit.utils.sources.huggingface import download_model_streaming
+
+            revision = "a" * 40
+            filenames = [f"model-{index:05d}-of-00100.safetensors" for index in range(1, 101)]
+            header = {
+                f"tensor_{index:04d}": {"dtype": "U8", "shape": [1], "data_offsets": [index, index + 1]}
+                for index in range(4096)
+            }
+            header_bytes = json.dumps(header, separators=(",", ":")).encode()
+            frame = struct.pack("<Q", len(header_bytes)) + header_bytes + (b"\\x00" * 4096)
+
+            class Response:
+                def __init__(self, payload, start):
+                    self.payload = payload
+                    self.status_code = 206
+                    self.url = "https://huggingface.co/test/model/resolve/" + revision + "/file"
+                    self.headers = {
+                        "Content-Range": f"bytes {start}-{start + len(payload) - 1}/{len(frame)}",
+                        "Content-Length": str(len(payload)),
+                        "ETag": '"stable"',
+                    }
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+                def raise_for_status(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def iter_content(self, chunk_size):
+                    for start in range(0, len(self.payload), chunk_size):
+                        yield self.payload[start : start + chunk_size]
+
+            def range_response(_url, *, headers, **_kwargs):
+                start_text, end_text = headers["Range"].removeprefix("bytes=").split("-", 1)
+                start = int(start_text)
+                end = min(int(end_text), len(frame) - 1)
+                return Response(frame[start : end + 1], start)
+
+            with (
+                patch(
+                    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                    return_value=(filenames, revision, None),
+                ),
+                patch(
+                    "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                    return_value=(dict.fromkeys(filenames, len(frame)), revision),
+                ),
+                patch(
+                    "huggingface_hub.utils.build_hf_headers",
+                    side_effect=lambda *, token=None, headers=None: headers or {},
+                ),
+                patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/file"),
+                patch("huggingface_hub.hf_hub_download") as mock_download,
+                patch("requests.get", side_effect=range_response),
+            ):
+                before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                result = scan_model_streaming(
+                    download_model_streaming(
+                        f"hf://test/model?revision={revision}",
+                        max_size=64 * 1024 * 1024,
+                        scannable_extensions={".safetensors"},
+                        scannable_scanner_ids={"safetensors"},
+                        _include_scan_results=True,
+                    ),
+                    timeout=60,
+                    delete_after_scan=False,
+                    cache_enabled=False,
+                    scanners=["safetensors"],
+                    skip_file_types=False,
+                )
+                after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+            dumped = result.model_dump(mode="json")
+            budget = next(
+                (
+                    metadata["remote_result_retention_budget"]
+                    for metadata in dumped["file_metadata"].values()
+                    if "remote_result_retention_budget" in metadata
+                ),
+                None,
+            )
+            scale = 1 if sys.platform == "darwin" else 1024
+            print(
+                json.dumps(
+                    {
+                        "files_scanned": result.files_scanned,
+                        "download_calls": mock_download.call_count,
+                        "success": result.success,
+                        "exit_code": determine_exit_code(result),
+                        "retained_tensor_names": sum(
+                            len(asset.get("tensors") or []) for asset in dumped["assets"]
+                        ),
+                        "serialized_bytes": len(result.model_dump_json().encode()),
+                        "peak_delta_bytes": (after - before) * scale,
+                        "header_bytes": len(header_bytes),
+                        "budget": budget,
+                    }
+                )
+            )
+            """
+        )
+        env = {**os.environ, "PYTHONPATH": str(repo_root), "PROMPTFOO_DISABLE_TELEMETRY": "1"}
+
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            env=env,
+            text=True,
+            timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
+        metrics = json.loads(completed.stdout.strip().splitlines()[-1])
+
+        assert metrics["files_scanned"] == 65
+        assert metrics["download_calls"] == 0
+        assert metrics["success"] is False
+        assert metrics["exit_code"] == 2
+        assert metrics["retained_tensor_names"] == _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES
+        assert metrics["serialized_bytes"] < _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES
+        assert metrics["peak_delta_bytes"] < 64 * 1024 * 1024
+        assert metrics["header_bytes"] > 250_000
+        assert metrics["budget"]["exceeded"] == ["tensor_name_count"]
+        assert metrics["budget"]["retained_results"] < _MAX_HF_SAFETENSORS_RETAINED_RESULTS
 
     def test_remote_safetensors_zero_based_index_is_authoritative(self) -> None:
         first = "model-00000-of-00002.safetensors"

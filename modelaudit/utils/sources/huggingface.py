@@ -60,6 +60,11 @@ _MAX_HF_SAFETENSORS_INDEX_JSON_TOKENS = (2 * _MAX_HF_SAFETENSORS_INDEX_TENSORS) 
 _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS = 20
 _HF_SAFETENSORS_INDEX_RECONCILIATION_REASON = "remote_safetensors_index_reconciliation_incomplete"
 _HF_SAFETENSORS_REMOTE_OVERLAP_REASON = "remote_safetensors_overlap_coverage_incomplete"
+_MAX_HF_SAFETENSORS_RETAINED_RESULTS = 512
+_MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES = 65_536
+_MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES = 32 * 1024 * 1024
+_HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES = 64 * 1024
+_HF_SAFETENSORS_RESULT_BUDGET_REASON = "remote_safetensors_result_budget_exceeded"
 _MAX_HF_STREAMING_ONNX_EXTERNAL_DATA_FILES = 256
 _MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES = 128
 _MAX_HF_REPOSITORY_INVENTORY_FILES = 8192
@@ -76,7 +81,7 @@ _HF_SAFETENSORS_SHARD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _HF_SAFETENSORS_SHARD_SHAPE_PATTERN = re.compile(
-    r".+-\d+-of-\d+\.safetensors",
+    r"(?P<stem>.+)-(?P<index>\d+)-of-(?P<total>\d+)\.safetensors",
     re.IGNORECASE,
 )
 _HF_REPO_BOOKKEEPING_FILENAMES = frozenset({".gitattributes"})
@@ -143,6 +148,67 @@ class _HuggingFaceProbeBudget:
                 f"Hugging Face selective filtering incomplete: inconsistent skipped file size for {repo_id}/{filename}"
             )
         self.file_sizes[filename] = file_size
+
+
+@dataclass
+class _HuggingFaceSafeTensorsRetentionBudget:
+    retained_results: int = 0
+    retained_tensor_names: int = 0
+    retained_result_bytes: int = 0
+
+    def retain(self, result: Any) -> dict[str, Any] | None:
+        """Charge one source-native result or describe the exceeded repository budget."""
+        raw_names = result.metadata.get("tensors") if isinstance(result.metadata, dict) else None
+        tensor_name_count = sum(1 for name in raw_names if isinstance(name, str)) if isinstance(raw_names, list) else 0
+        serialization_failed = False
+        try:
+            result_bytes = len(
+                json.dumps(
+                    result.to_dict(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            )
+        except (OverflowError, RecursionError, TypeError, ValueError):
+            result_bytes = _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES + 1
+            serialization_failed = True
+
+        projected_results = self.retained_results + 1
+        projected_tensor_names = self.retained_tensor_names + tensor_name_count
+        projected_result_bytes = self.retained_result_bytes + result_bytes
+        result_byte_limit = max(
+            _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES - _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES,
+            0,
+        )
+        exceeded = []
+        if projected_results >= _MAX_HF_SAFETENSORS_RETAINED_RESULTS:
+            exceeded.append("result_count")
+        if projected_tensor_names > _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES:
+            exceeded.append("tensor_name_count")
+        if projected_result_bytes > result_byte_limit:
+            exceeded.append("result_bytes")
+        if exceeded:
+            return {
+                "exceeded": exceeded,
+                "retained_results": self.retained_results,
+                "retained_tensor_names": self.retained_tensor_names,
+                "retained_result_bytes": self.retained_result_bytes,
+                "candidate_tensor_names": tensor_name_count,
+                "candidate_result_bytes": result_bytes,
+                "projected_results": projected_results,
+                "projected_tensor_names": projected_tensor_names,
+                "projected_result_bytes": projected_result_bytes,
+                "max_retained_results": _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
+                "max_retained_tensor_names": _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
+                "max_retained_result_bytes": _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
+                "candidate_serialization_failed": serialization_failed,
+            }
+
+        self.retained_results = projected_results
+        self.retained_tensor_names = projected_tensor_names
+        self.retained_result_bytes = projected_result_bytes
+        return None
 
 
 class _SparseRangeReader:
@@ -523,6 +589,73 @@ def _remote_safetensors_failure_result(
     return result
 
 
+def _remote_safetensors_result_budget_failure_result(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    candidate_result: Any,
+    budget_details: dict[str, Any],
+) -> Any:
+    """Replace an over-budget result with one bounded operational failure."""
+    from ...scanners.base import IssueSeverity
+
+    declared_size = candidate_result.metadata.get("remote_declared_size")
+    bytes_transferred = candidate_result.metadata.get("remote_bytes_transferred", candidate_result.bytes_scanned)
+    security_severities = [
+        getattr(getattr(record, "severity", None), "value", None)
+        for record in [*candidate_result.issues, *candidate_result.checks]
+        if getattr(getattr(record, "status", None), "value", "failed") == "failed"
+        and getattr(getattr(record, "severity", None), "value", None) in {"warning", "critical"}
+    ]
+    result = _remote_safetensors_failure_result(
+        repo_id,
+        filename,
+        revision,
+        declared_size=(
+            declared_size
+            if isinstance(declared_size, int) and not isinstance(declared_size, bool) and declared_size >= 0
+            else None
+        ),
+        bytes_transferred=bytes_transferred,
+        reason=_HF_SAFETENSORS_RESULT_BUDGET_REASON,
+        error=ValueError("repository retained SafeTensors result budget exceeded"),
+    )
+    budget_details = {
+        **budget_details,
+        "candidate_issue_count": len(candidate_result.issues),
+        "candidate_failed_check_count": sum(
+            getattr(getattr(check, "status", None), "value", None) == "failed" for check in candidate_result.checks
+        ),
+        "candidate_had_security_errors": bool(candidate_result.has_errors),
+        "candidate_security_record_count": len(security_severities),
+    }
+    result.metadata["remote_result_retention_budget"] = budget_details
+    budget_check = result.checks[-1]
+    budget_check.name = "Hugging Face SafeTensors Retained Result Budget"
+    budget_check.message = "Remote SafeTensors repository result retention exceeded its bounded budget"
+    budget_check.details = {
+        **budget_details,
+        "analysis_incomplete": True,
+        "scan_outcome_reason": _HF_SAFETENSORS_RESULT_BUDGET_REASON,
+    }
+    if security_severities:
+        summary_severity = IssueSeverity.CRITICAL if "critical" in security_severities else IssueSeverity.WARNING
+        result.add_check(
+            name="SafeTensors Candidate Security Finding Summary",
+            passed=False,
+            message="Security findings were preserved as a bounded summary after result-budget exhaustion",
+            severity=summary_severity,
+            location=_remote_safetensors_source_path(repo_id, revision, filename),
+            details={
+                "candidate_security_record_count": len(security_severities),
+                "candidate_max_security_severity": summary_severity.value,
+                "finding_details_omitted_by_result_budget": True,
+            },
+        )
+    result.finish(success=False)
+    return result
+
+
 def _remote_safetensors_gzip_overlap_state(prefix: bytes, *, sample_is_prefix: bool) -> bool | None:
     """Classify a bounded gzip candidate without accepting magic alone."""
     if len(prefix) < 4 or prefix[:3] != b"\x1f\x8b\x08" or prefix[3] & 0xE0:
@@ -798,10 +931,9 @@ def _scan_remote_huggingface_safetensors_header(
                     overlap_scanner_ids = sorted({*overlap_scanner_ids, *structural_overlap_scanner_ids})
 
             bytes_transferred = total_bytes_transferred + attempt_bytes_transferred
-            suffix = ".safetensors" if not Path(filename).suffix else Path(filename).suffix
             with tempfile.NamedTemporaryFile(
                 prefix="modelaudit_hf_safetensors_",
-                suffix=suffix,
+                suffix=".safetensors",
                 delete=False,
             ) as temp_file:
                 temp_path = temp_file.name
@@ -958,30 +1090,22 @@ def _remote_safetensors_filename_shard_details_by_file(
     model_files: list[str], repo_files: list[str]
 ) -> dict[str, dict[str, Any]]:
     """Return per-shard filename coverage details derived from the immutable repository listing."""
-    from modelaudit.utils.file.handlers import ShardedModelDetector, _summarize_missing_shard_indices
+    from modelaudit.utils.file.handlers import _summarize_missing_shard_indices
 
-    grouped: dict[tuple[str, str, int], dict[int, list[str]]] = {}
+    grouped: dict[tuple[str, int], dict[int, list[str]]] = {}
     selected = set(model_files)
     for filename in repo_files:
-        match = ShardedModelDetector.match_shard_filename(PurePosixPath(filename).name)
-        if match is None:
+        parsed = _parse_hf_safetensors_shard(filename) or _parse_hf_safetensors_shard_shape(filename)
+        if parsed is None:
             continue
-        expected_total = match.get("expected_total_shards")
-        shard_index = match.get("current_shard_index")
-        pattern = match.get("pattern")
-        if (
-            not isinstance(expected_total, int)
-            or not isinstance(shard_index, int)
-            or not isinstance(pattern, str)
-            or expected_total <= 0
-        ):
+        stem, shard_index, expected_total = parsed
+        if expected_total <= 0:
             continue
-        parent = PurePosixPath(filename).parent.as_posix()
-        key = (parent, pattern, expected_total)
+        key = (stem, expected_total)
         grouped.setdefault(key, {}).setdefault(shard_index, []).append(filename)
 
     details_by_file: dict[str, dict[str, Any]] = {}
-    for (_parent, pattern, expected_total), by_index in grouped.items():
+    for (_stem, expected_total), by_index in grouped.items():
         missing_indices, missing_count, missing_truncated = _summarize_missing_shard_indices(
             set(by_index), expected_total
         )
@@ -1006,7 +1130,7 @@ def _remote_safetensors_filename_shard_details_by_file(
             "filename_pattern_complete": complete,
             "filename_pattern_authoritative": filename_pattern_authoritative,
             "message": message,
-            "pattern": pattern,
+            "pattern": _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.pattern,
             "expected_total_shards": expected_total,
             "present_total_shards": len(present_filenames),
             "missing_shard_count": missing_count,
@@ -3236,8 +3360,15 @@ def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
     return match.group("stem"), index, total
 
 
+def _parse_hf_safetensors_shard_shape(filename: str) -> tuple[str, int, int] | None:
+    match = _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename)
+    if match is None:
+        return None
+    return match.group("stem"), int(match.group("index")), int(match.group("total"))
+
+
 def _has_hf_safetensors_shard_shape(filename: str) -> bool:
-    return _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename) is not None
+    return _parse_hf_safetensors_shard_shape(filename) is not None
 
 
 def _complete_hf_safetensors_shard_files(repo_files: Collection[str]) -> frozenset[str]:
@@ -5300,6 +5431,7 @@ def download_model_streaming(
         pending_pretransferred_bytes = (
             content_probe_bytes_transferred + remote_index_bytes_transferred if _include_scan_results else 0
         )
+        safetensors_retention_budget = _HuggingFaceSafeTensorsRetentionBudget()
 
         def make_streamed_item(
             filename: str,
@@ -5612,6 +5744,17 @@ def download_model_streaming(
 
                 if filename in safetensors_header_files:
                     scan_result = scan_remote_safetensors(filename)
+                    budget_failure = safetensors_retention_budget.retain(scan_result)
+                    if budget_failure is not None:
+                        scan_result = _remote_safetensors_result_budget_failure_result(
+                            repo_id,
+                            filename,
+                            download_revision,
+                            scan_result,
+                            budget_failure,
+                        )
+                        yield make_streamed_item(filename, Path(filename), True, scan_result)
+                        return
                     yield make_streamed_item(filename, Path(filename), not has_future_yield(idx), scan_result)
                     continue
 
