@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - stream Hugging Face SafeTensors shard headers with bounded range reads instead of downloading tensor payload bodies
+- bound embedded Python assignment-line probes, deduplicate exact extraction windows, and fast-path proven passive priority references without weakening incomplete-analysis reporting
 - avoid CLI crashes when redirected stdout or stderr use legacy encodings that cannot represent styled separator glyphs
 - suppress canonical PyTorch tensor rebuild warnings only inside validated unloaded-runtime ZIP storage context when paired with the coordinated `modelaudit-picklescan` fix, while older allowed picklescan versions continue to fail closed with the warning
 - keep nested archive and PyTorch ZIP member hashes separate from parent artifact integrity hashes across JSON, cache, SARIF, SBOM, and streaming scans
