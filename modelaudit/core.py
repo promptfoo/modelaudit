@@ -4491,11 +4491,12 @@ def scan_model_directory_or_file(
                             with suppress(OSError):
                                 hash_budget_bytes += os.path.getsize(hash_source)
                     representative_hash_source = hash_source_by_path.get(representative_file)
-                    if (
-                        scanner_selection.allows("onnx")
-                        and representative_hash_source is not None
-                        and not _should_defer_hash_for_max_file_size(representative_hash_source, config)
-                    ):
+                    if not scanner_selection.allows("onnx") or representative_hash_source is None:
+                        continue
+                    if should_defer_hash_for_file_backed_onnx(representative_hash_source, config):
+                        aggregate_hash_complete = False
+                        continue
+                    if not _should_defer_hash_for_max_file_size(representative_hash_source, config):
                         representative_external_sources: list[str] = []
                         representative_external_bytes = 0
                         discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(

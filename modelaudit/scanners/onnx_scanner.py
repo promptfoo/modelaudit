@@ -605,6 +605,17 @@ class _OnnxExternalLocationAggregate:
             self.tensor_samples.append(tensor_name)
 
 
+@dataclass(frozen=True)
+class _OnnxExternalSizeValidation:
+    category: str
+    passed: bool
+    message: str
+    severity: IssueSeverity | None
+    location: str
+    details: dict[str, Any]
+    rule_code: str | None = None
+
+
 def _has_operator_schema(op_type: str, version: int, domain: str) -> bool:
     """Return whether the installed ONNX release registers an operator schema."""
     try:
@@ -4855,7 +4866,10 @@ class OnnxScanner(BaseScanner):
         tracked_locations: set[str] = set()
         tracked_unsafe_locations: set[str] = set()
         omitted_external_results = 0
-        external_size_validations = 0
+        external_size_validations: dict[
+            str,
+            tuple[_OnnxExternalSizeValidation, _OnnxExternalLocationAggregate],
+        ] = {}
         missing_location = _OnnxExternalLocationAggregate()
 
         def aggregate_location(
@@ -4933,9 +4947,9 @@ class OnnxScanner(BaseScanner):
                     if location not in safe_files and location not in tracked_locations:
                         if len(tracked_locations) >= _ONNX_RESULT_MAX_DISTINCT_GROUPS:
                             omitted_external_results += 1
-                            continue
-                        tracked_locations.add(location)
-                    if location not in safe_files:
+                        else:
+                            tracked_locations.add(location)
+                    if location in tracked_locations and location not in safe_files:
                         safe_files.add(location)
                         result.add_check(
                             name="External Data Reference Check",
@@ -4945,11 +4959,27 @@ class OnnxScanner(BaseScanner):
                             location=str(external_path),
                             details={"file": location},
                         )
-                    if external_size_validations < _ONNX_RESULT_MAX_DISTINCT_GROUPS:
-                        self._validate_external_size(tensor, info, external_path, result)
-                        external_size_validations += 1
-                    else:
-                        omitted_external_results += 1
+                    validation = self._validate_external_size(tensor, info, external_path, result)
+                    validation_group = external_size_validations.get(validation.category)
+                    if validation_group is None:
+                        validation_group = (validation, _OnnxExternalLocationAggregate())
+                        external_size_validations[validation.category] = validation_group
+                    validation_group[1].add(tensor.name)
+
+        for validation, aggregate in external_size_validations.values():
+            result.add_check(
+                name="External Data Size Validation",
+                passed=validation.passed,
+                message=validation.message,
+                severity=validation.severity,
+                location=validation.location,
+                rule_code=validation.rule_code,
+                details={
+                    **validation.details,
+                    "affected_tensor_count": aggregate.occurrence_count,
+                    "sample_tensors": aggregate.tensor_samples,
+                },
+            )
 
         if missing_location.occurrence_count:
             result.add_check(
@@ -5117,13 +5147,13 @@ class OnnxScanner(BaseScanner):
         info: dict[str, str],
         external_path: Path,
         result: ScanResult,
-    ) -> None:
+    ) -> _OnnxExternalSizeValidation:
         try:
             offset = _parse_external_data_extent(info, "offset") or 0
             declared_length = _parse_external_data_extent(info, "length")
         except ValueError as e:
-            result.add_check(
-                name="External Data Size Validation",
+            return _OnnxExternalSizeValidation(
+                category="invalid_metadata",
                 passed=False,
                 message=f"External data metadata is invalid: {e}",
                 severity=IssueSeverity.CRITICAL,
@@ -5137,7 +5167,6 @@ class OnnxScanner(BaseScanner):
                     "exception_type": type(e).__name__,
                 },
             )
-            return
 
         try:
             dtype = _tensor_data_type_to_np_dtype(tensor.data_type)
@@ -5152,8 +5181,8 @@ class OnnxScanner(BaseScanner):
                 or required_end > actual_size
                 or (declared_length is not None and declared_length < expected_size)
             ):
-                result.add_check(
-                    name="External Data Size Validation",
+                return _OnnxExternalSizeValidation(
+                    category="size_mismatch",
                     passed=False,
                     message="External data file size mismatch",
                     severity=IssueSeverity.CRITICAL,
@@ -5168,23 +5197,23 @@ class OnnxScanner(BaseScanner):
                         "required_end": required_end,
                     },
                 )
-            else:
-                result.add_check(
-                    name="External Data Size Validation",
-                    passed=True,
-                    message="External data file size matches expected",
-                    location=str(external_path),
-                    details={
-                        "tensor": tensor.name,
-                        "size": actual_size,
-                        "offset": offset,
-                        "length": declared_length,
-                    },
-                )
+            return _OnnxExternalSizeValidation(
+                category="size_match",
+                passed=True,
+                message="External data file size matches expected",
+                severity=None,
+                location=str(external_path),
+                details={
+                    "tensor": tensor.name,
+                    "size": actual_size,
+                    "offset": offset,
+                    "length": declared_length,
+                },
+            )
         except Exception as e:
             _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
-            result.add_check(
-                name="External Data Size Validation",
+            return _OnnxExternalSizeValidation(
+                category="validation_incomplete",
                 passed=False,
                 message=f"Failed to validate external data size: {e}",
                 severity=IssueSeverity.INFO,

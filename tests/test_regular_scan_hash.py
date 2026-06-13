@@ -979,16 +979,23 @@ class TestHashGenerationEdgeCases:
         from modelaudit import core
 
         model_path = tmp_path / "model.onnx"
+        sidecar = tmp_path / "weights.data"
         safe_path = tmp_path / "safe.pkl"
-        _write_regular_scan_onnx_model(model_path)
+        sidecar.write_bytes(b"W" * 4096)
+        _write_regular_scan_onnx_model(
+            model_path,
+            external_location=sidecar.name,
+            external_size=sidecar.stat().st_size,
+        )
+        _skip_path_during_directory_prefilter(monkeypatch, sidecar)
         safe_path.write_bytes(pickle.dumps({"safe": True}))
         original_hash = core._calculate_file_hash
         hashed: list[Path] = []
 
         def track_hash(path: str, *, deadline: float | None = None) -> str:
             hashed.append(Path(path))
-            if Path(path) == model_path:
-                pytest.fail("file-backed ONNX must not be directory aggregate-hashed")
+            if Path(path) in {model_path, sidecar}:
+                pytest.fail("file-backed ONNX owners and context sidecars must not be aggregate-hashed")
             return original_hash(path, deadline=deadline)
 
         monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
@@ -1001,6 +1008,7 @@ class TestHashGenerationEdgeCases:
 
         assert safe_path in hashed
         assert model_path not in hashed
+        assert sidecar not in hashed
         assert result.content_hash is None
 
     def test_hash_files_by_path_defers_oversized_pytorch_zip_ckpt_read_limit(

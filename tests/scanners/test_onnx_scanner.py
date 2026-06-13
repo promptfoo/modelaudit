@@ -7185,7 +7185,12 @@ def _write_result_growth_onnx(tmp_path: Path, *, kind: str, count: int = 10) -> 
     return path
 
 
-def _write_safe_external_data_then_traversal_onnx(tmp_path: Path, *, safe_count: int = 3) -> Path:
+def _write_safe_external_data_then_failure_onnx(
+    tmp_path: Path,
+    *,
+    failure: str,
+    safe_count: int = 3,
+) -> Path:
     graph = _proto_bytes(2, b"graph")
     for index in range(safe_count):
         location = f"safe-{index}.bin"
@@ -7200,18 +7205,38 @@ def _write_safe_external_data_then_traversal_onnx(tmp_path: Path, *, safe_count:
         )
         graph += _proto_bytes(5, tensor)
 
-    traversal_entry = _proto_bytes(1, b"location") + _proto_bytes(2, b"../escape.bin")
-    traversal_tensor = (
+    if failure == "traversal":
+        failure_name = "traversal"
+        failure_type = TensorProto.UINT8
+        failure_entries = _proto_bytes(
+            13,
+            _proto_bytes(1, b"location") + _proto_bytes(2, b"../escape.bin"),
+        )
+    elif failure == "size_mismatch":
+        failure_name = "size-mismatch"
+        failure_type = TensorProto.FLOAT
+        (tmp_path / "size-mismatch.bin").write_bytes(b"xxxx")
+        failure_entries = _proto_bytes(
+            13,
+            _proto_bytes(1, b"location") + _proto_bytes(2, b"size-mismatch.bin"),
+        ) + _proto_bytes(
+            13,
+            _proto_bytes(1, b"length") + _proto_bytes(2, b"1"),
+        )
+    else:  # pragma: no cover - test helper contract
+        raise ValueError(f"unknown external data failure: {failure}")
+
+    failure_tensor = (
         _proto_varint(1, 1)
-        + _proto_varint(2, int(TensorProto.UINT8))
-        + _proto_bytes(8, b"traversal")
-        + _proto_bytes(13, traversal_entry)
+        + _proto_varint(2, int(failure_type))
+        + _proto_bytes(8, failure_name.encode())
+        + failure_entries
         + _proto_varint(14, int(TensorProto.EXTERNAL))
     )
-    graph += _proto_bytes(5, traversal_tensor)
+    graph += _proto_bytes(5, failure_tensor)
     return _write_onnx_payload(
         tmp_path,
-        "safe-external-data-then-traversal.onnx",
+        f"safe-external-data-then-{failure}.onnx",
         _proto_varint(1, 8) + _proto_bytes(7, graph),
     )
 
@@ -7911,7 +7936,7 @@ class TestLargeOnnxFileBackedInspection:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_RESULT_MAX_DISTINCT_GROUPS", 2)
-        model_path = _write_safe_external_data_then_traversal_onnx(tmp_path)
+        model_path = _write_safe_external_data_then_failure_onnx(tmp_path, failure="traversal")
 
         result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
 
@@ -7919,6 +7944,44 @@ class TestLargeOnnxFileBackedInspection:
         assert self._checks(result, "ONNX Result Reporting Coverage")[-1].details["omitted_count"] == 1
         cves = {check.details.get("cve_id") for check in result.checks}
         assert {"CVE-2022-25882", "CVE-2025-51480"}.issubset(cves)
+
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            recursive=False,
+            onnx_raw_detector_max_bytes=1,
+        )
+        assert determine_exit_code(aggregate) == 1
+
+    def test_external_size_failures_are_not_starved_by_safe_result_groups(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_RESULT_MAX_DISTINCT_GROUPS", 2)
+        model_path = _write_safe_external_data_then_failure_onnx(
+            tmp_path,
+            failure="size_mismatch",
+            safe_count=2,
+        )
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        size_failures = [
+            check
+            for check in self._checks(result, "External Data Size Validation")
+            if check.status == CheckStatus.FAILED and check.severity == IssueSeverity.CRITICAL
+        ]
+        size_passes = [
+            check
+            for check in self._checks(result, "External Data Size Validation")
+            if check.status == CheckStatus.PASSED
+        ]
+        assert len(self._checks(result, "External Data Reference Check")) == 2
+        assert len(size_passes) == 1
+        assert size_passes[0].details["affected_tensor_count"] == 2
+        assert size_failures
+        assert size_failures[0].details["tensor"] == "size-mismatch"
+        assert size_failures[0].details["affected_tensor_count"] == 1
 
         aggregate = scan_model_directory_or_file(
             str(model_path),
