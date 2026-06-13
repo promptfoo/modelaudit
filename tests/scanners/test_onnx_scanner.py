@@ -1493,10 +1493,13 @@ def create_matmul_integer_weight_model(
     weight_on_left: bool = False,
     dead_scale_branch: bool = False,
     terminal_bias_add: bool = False,
+    self_multiply_output: bool = False,
     filename: str = "matmul-integer-weight.onnx",
 ) -> Path:
     if dead_scale_branch:
         bind_scale = False
+    if self_multiply_output:
+        bind_scale = True
     weights = np.zeros((10, 100) if weight_on_left else (100, 10), dtype=np.int8)
     if malicious:
         if weight_on_left:
@@ -1534,7 +1537,12 @@ def create_matmul_integer_weight_model(
                 helper.make_node(
                     "Cast", [matmul_output], ["Y_cast"], name="quantized_linear_cast", to=TensorProto.FLOAT
                 ),
-                helper.make_node("Mul", ["Y_cast", "W_scale"], ["Y"], name="quantized_linear_scale"),
+                helper.make_node(
+                    "Mul",
+                    ["Y_cast", "Y_cast" if self_multiply_output else "W_scale"],
+                    ["Y"],
+                    name="quantized_linear_scale",
+                ),
             ],
         )
     elif dead_scale_branch:
@@ -1564,6 +1572,8 @@ def create_matmul_integer_scale_chain_model(
     dynamic_scale_expression: bool = False,
     bias_add: bool = False,
     duplicate_add_input: bool = False,
+    unsupported_live_op: str | None = None,
+    anomalous_vector_scale: bool = True,
     weight_on_left: bool = False,
     expose_raw_output: bool = False,
     cast_data_type: int = TensorProto.FLOAT,
@@ -1587,7 +1597,7 @@ def create_matmul_integer_scale_chain_model(
         200 if repeat_weight_scale else 40_000 if overflow_scale else 1,
         dtype=scale_dtype,
     )
-    if not overflow_scale and not scalar_overflow and not repeat_weight_scale:
+    if anomalous_vector_scale and not overflow_scale and not scalar_overflow and not repeat_weight_scale:
         vector_scale[3] = 100
     initializers = [
         onnx.numpy_helper.from_array(weights, name="W_quantized"),
@@ -1625,12 +1635,21 @@ def create_matmul_integer_scale_chain_model(
     elif duplicate_add_input:
         nodes.append(helper.make_node("Add", ["Y_int", "Y_int"], ["Y_biased"]))
         cast_input = "Y_biased"
+    if unsupported_live_op == "Reshape":
+        output_shape = [10, 1] if weight_on_left else [1, 10]
+        initializers.append(
+            onnx.numpy_helper.from_array(np.asarray(output_shape, dtype=np.int64), name="live_shape"),
+        )
+        nodes.append(helper.make_node("Reshape", [cast_input, "live_shape"], ["Y_reshaped"]))
+        cast_input = "Y_reshaped"
     nodes.extend(
-        [
-            helper.make_node("Cast", [cast_input], ["Y_cast"], to=cast_data_type),
-            helper.make_node("Mul", ["Y_cast", "X_scale"], ["Y_activation_scaled"]),
-        ],
+        [helper.make_node("Cast", [cast_input], ["Y_cast"], to=cast_data_type)],
     )
+    activation_scale_input = "Y_cast"
+    if unsupported_live_op == "Relu":
+        nodes.append(helper.make_node("Relu", ["Y_cast"], ["Y_relu"]))
+        activation_scale_input = "Y_relu"
+    nodes.append(helper.make_node("Mul", [activation_scale_input, "X_scale"], ["Y_activation_scaled"]))
     scale_name = "W_scale_0"
     if dynamic_scale_expression:
         inputs.append(helper.make_tensor_value_info("scale_gate", cast_data_type, list(vector_scale.shape)))
@@ -1719,11 +1738,15 @@ def create_quantized_conv_weight_model(
     op_type: str,
     malicious: bool,
     per_channel: bool,
+    full_rank_scale: bool = False,
 ) -> Path:
     weights = np.zeros((10, 4, 3, 3), dtype=np.int8)
     if malicious:
         weights[3, 0, :2, :3] = 100
-    weight_scale = np.full(10, 0.1, dtype=np.float32) if per_channel else np.asarray(0.1, dtype=np.float32)
+    if per_channel and op_type == "ConvInteger":
+        weight_scale = np.full((1, 10, 1, 1) if full_rank_scale else (10, 1, 1), 0.1, dtype=np.float32)
+    else:
+        weight_scale = np.full(10, 0.1, dtype=np.float32) if per_channel else np.asarray(0.1, dtype=np.float32)
     weight_zero_point = np.zeros(10, dtype=np.int8) if per_channel else np.asarray(0, dtype=np.int8)
     initializers = [
         onnx.numpy_helper.from_array(weights, name="W_quantized"),
@@ -1776,7 +1799,7 @@ def create_quantized_conv_weight_model(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
+    onnx.checker.check_model(model, full_check=True)
     path = tmp_path / f"{op_type.lower()}-{'channel' if per_channel else 'scalar'}-{malicious}.onnx"
     onnx.save(model, str(path))
     return path
@@ -2006,6 +2029,40 @@ def create_qdq_4bit_weight_model(tmp_path: Path, data_type: int, *, malicious: b
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
     model.ir_version = 10
     path = tmp_path / f"qdq-weight-{TensorProto.DataType.Name(data_type).lower()}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_packed_low_bit_initializer_model(
+    tmp_path: Path,
+    data_type: int,
+    *,
+    truncate: bool = False,
+) -> Path:
+    bits_per_element = 2 if data_type in {TensorProto.INT2, TensorProto.UINT2} else 4
+    num_elements = 1001
+    storage_size = (num_elements * bits_per_element + 7) // 8
+    tensor = helper.make_tensor(
+        "packed",
+        data_type,
+        [num_elements],
+        bytes(storage_size),
+        raw=True,
+    )
+    if truncate:
+        tensor.raw_data = tensor.raw_data[:-1]
+    graph = helper.make_graph(
+        [],
+        "packed_low_bit_initializer",
+        [],
+        [helper.make_tensor_value_info("packed", data_type, [num_elements])],
+        initializer=[tensor],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    if not truncate:
+        onnx.checker.check_model(model, full_check=True)
+    path = tmp_path / f"packed-{TensorProto.DataType.Name(data_type).lower()}-{truncate}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -6342,6 +6399,30 @@ class TestExternalDataSizeValidation:
         assert len(size_checks) > 0
         assert size_checks[0].status == CheckStatus.PASSED
 
+    @pytest.mark.parametrize(
+        "data_type",
+        [TensorProto.INT2, TensorProto.UINT2, TensorProto.INT4, TensorProto.UINT4],
+    )
+    def test_external_packed_low_bit_size_validation(self, tmp_path: Path, data_type: int) -> None:
+        bits_per_element = 2 if data_type in {TensorProto.INT2, TensorProto.UINT2} else 4
+        num_elements = 1001
+        storage_size = (num_elements * bits_per_element + 7) // 8
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights.bin",
+            external_file_bytes=bytes(storage_size),
+            tensor_shape=(num_elements,),
+        )
+        self._set_initializer_data_type(model_path, data_type)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        size_checks = [check for check in result.checks if check.name == "External Data Size Validation"]
+        assert len(size_checks) == 1
+        assert size_checks[0].status == CheckStatus.PASSED
+        assert size_checks[0].details["size"] == storage_size
+
     def test_unknown_external_data_dtype_is_inconclusive(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
         self._set_initializer_data_type(model_path, 9999)
@@ -7269,8 +7350,14 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 1
 
     @pytest.mark.parametrize(
-        ("op_type", "per_channel"),
-        [("ConvInteger", False), ("QLinearConv", False), ("QLinearConv", True)],
+        ("op_type", "per_channel", "full_rank_scale"),
+        [
+            ("ConvInteger", False, False),
+            ("ConvInteger", True, False),
+            ("ConvInteger", True, True),
+            ("QLinearConv", False, False),
+            ("QLinearConv", True, False),
+        ],
     )
     @pytest.mark.parametrize("malicious", [False, True])
     def test_quantized_conv_weight_path_is_analyzed(
@@ -7278,6 +7365,7 @@ class TestWeightDistributionSemantics:
         tmp_path: Path,
         op_type: str,
         per_channel: bool,
+        full_rank_scale: bool,
         malicious: bool,
     ) -> None:
         model_path = create_quantized_conv_weight_model(
@@ -7285,6 +7373,7 @@ class TestWeightDistributionSemantics:
             op_type=op_type,
             malicious=malicious,
             per_channel=per_channel,
+            full_rank_scale=full_rank_scale,
         )
 
         result = OnnxScanner().scan(str(model_path))
@@ -7298,6 +7387,10 @@ class TestWeightDistributionSemantics:
         context = semantics["eligible"][0]
         assert context["consumer_op"] == op_type
         assert context["quantization_kind"] == op_type
+        if op_type == "ConvInteger" and per_channel:
+            assert context["analysis_shape"] == [36, 10]
+            assert context["output_axes"] == [0]
+            assert context["quantization_scale"] == "W_scale"
         if malicious:
             assert checks[0].details["affected_neurons"] == [3]
 
@@ -7466,6 +7559,41 @@ class TestWeightDistributionSemantics:
 
     def test_matmul_integer_non_unit_add_scale_chain_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_scale_chain_model(tmp_path, duplicate_add_input=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+
+    @pytest.mark.parametrize("unsupported_live_op", ["Reshape", "Relu"])
+    @pytest.mark.parametrize("anomalous_vector_scale", [False, True])
+    def test_matmul_integer_unsupported_live_scale_path_fails_closed(
+        self,
+        tmp_path: Path,
+        unsupported_live_op: str,
+        anomalous_vector_scale: bool,
+    ) -> None:
+        model_path = create_matmul_integer_scale_chain_model(
+            tmp_path,
+            unsupported_live_op=unsupported_live_op,
+            anomalous_vector_scale=anomalous_vector_scale,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+
+    def test_matmul_integer_self_multiply_scale_path_fails_closed(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_weight_model(tmp_path, self_multiply_output=True)
 
         result = OnnxScanner().scan(str(model_path))
 
@@ -7659,6 +7787,36 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_initializer_count"] == 1
         assert semantics["eligible"][0]["quantization_kind"] == "DequantizeLinear"
+
+    @pytest.mark.parametrize(
+        "data_type",
+        [TensorProto.INT2, TensorProto.UINT2, TensorProto.INT4, TensorProto.UINT4],
+    )
+    def test_packed_low_bit_initializer_storage_size_is_valid(self, tmp_path: Path, data_type: int) -> None:
+        model_path = create_packed_low_bit_initializer_model(tmp_path, data_type)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        size_checks = [check for check in result.checks if check.name == "Tensor Size Validation"]
+        assert len(size_checks) == 1
+        assert size_checks[0].status == CheckStatus.PASSED
+        assert result.metadata["validated_format"] == "onnx"
+
+    @pytest.mark.parametrize("data_type", [TensorProto.INT2, TensorProto.INT4])
+    def test_truncated_packed_low_bit_initializer_fails_size_validation(
+        self,
+        tmp_path: Path,
+        data_type: int,
+    ) -> None:
+        model_path = create_packed_low_bit_initializer_model(tmp_path, data_type, truncate=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        size_checks = [check for check in result.checks if check.name == "Tensor Size Validation"]
+        assert len(size_checks) == 1
+        assert size_checks[0].status == CheckStatus.FAILED
+        assert size_checks[0].rule_code == "S703"
+        assert "validated_format" not in result.metadata
 
     @pytest.mark.parametrize("data_type", [TensorProto.INT2, TensorProto.UINT2])
     def test_qdq_2bit_weight_path_fails_closed_when_decoder_cannot_materialize(

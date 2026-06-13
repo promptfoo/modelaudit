@@ -909,6 +909,25 @@ def _tensor_data_type_to_np_dtype(data_type: int) -> Any:
     raise ValueError(f"Unsupported ONNX tensor dtype mapping API for data_type={data_type}")
 
 
+def _onnx_tensor_expected_storage_nbytes(tensor: Any, *, onnx: Any) -> int:
+    num_elements = math.prod(int(dimension) for dimension in tensor.dims)
+    data_type = int(tensor.data_type)
+    packed_bits = {
+        int(getattr(onnx.TensorProto, name)): bits
+        for name, bits in (
+            ("INT2", 2),
+            ("UINT2", 2),
+            ("INT4", 4),
+            ("UINT4", 4),
+            ("FLOAT4E2M1", 4),
+        )
+        if hasattr(onnx.TensorProto, name)
+    }.get(data_type)
+    if packed_bits is not None:
+        return (num_elements * packed_bits + 7) // 8
+    return num_elements * int(_tensor_data_type_to_np_dtype(data_type).itemsize)
+
+
 @dataclass(frozen=True)
 class _OnnxWeightTransform:
     kind: str
@@ -1676,8 +1695,7 @@ def _build_onnx_weight_analysis_plan(
                     queue.extend((output_name, depth + 1) for output_name in next_values)
                     continue
                 if consumer.op_type != "Mul":
-                    reached_terminal = True
-                    continue
+                    return None, "unresolved_quantized_weight_scale"
                 if scale_data_type is not None and scale_data_type != current_data_type:
                     return None, "unresolved_quantized_weight_scale"
                 scale_data_type = current_data_type
@@ -1705,9 +1723,20 @@ def _build_onnx_weight_analysis_plan(
                     return None, "unresolved_quantized_weight_scale"
                 if math.prod(shape) == 1:
                     continue
-                if node.op_type != "MatMulInteger":
-                    return None, "unresolved_quantized_weight_scale"
                 if lineage.shape is None or axis is None or not 0 <= axis < len(lineage.shape):
+                    return None, "unresolved_quantized_weight_scale"
+                if node.op_type == "ConvInteger":
+                    channel_count = int(lineage.shape[0])
+                    spatial_rank = max(len(lineage.shape) - 2, 0)
+                    valid_shapes = {
+                        (channel_count, *([1] * spatial_rank)),
+                        (1, channel_count, *([1] * spatial_rank)),
+                    }
+                    if tuple(shape) in valid_shapes:
+                        non_scalar_names.append(candidate_name)
+                        continue
+                    return None, "unresolved_quantized_weight_scale"
+                if node.op_type != "MatMulInteger":
                     return None, "unresolved_quantized_weight_scale"
                 expected_shape = list(lineage.shape)
                 contraction_axis = len(expected_shape) - 1 if input_index == 0 else len(expected_shape) - 2
@@ -3215,6 +3244,19 @@ def _build_onnx_weight_analysis_plan(
             load_quantization_parameter(initializer_index, name=name, role="scale")
             for name, initializer_index in scale_factor_pairs
         ]
+        if quantization.kind == "ConvInteger":
+            channel_count = int(target_shape[0])
+            spatial_rank = max(len(target_shape) - 2, 0)
+            valid_scale_shapes = {
+                (channel_count, *([1] * spatial_rank)),
+                (1, channel_count, *([1] * spatial_rank)),
+            }
+            raw_scales = [
+                np.asarray(raw_scale).reshape((channel_count,))
+                if np.asarray(raw_scale).shape in valid_scale_shapes
+                else raw_scale
+                for raw_scale in raw_scales
+            ]
         raw_zero_point = (
             load_quantization_parameter(
                 quantization.zero_point_initializer_index,
@@ -4318,11 +4360,9 @@ class OnnxScanner(BaseScanner):
             return
 
         try:
-            dtype = _tensor_data_type_to_np_dtype(tensor.data_type)
-            num_elem = 1
-            for d in tensor.dims:
-                num_elem *= d
-            expected_size = int(num_elem) * int(dtype.itemsize)
+            import onnx
+
+            expected_size = _onnx_tensor_expected_storage_nbytes(tensor, onnx=onnx)
             required_end = offset + (declared_length if declared_length is not None else expected_size)
             actual_size = external_path.stat().st_size
             if (
@@ -4386,11 +4426,7 @@ class OnnxScanner(BaseScanner):
                 continue
             if tensor.raw_data:
                 try:
-                    dtype = _tensor_data_type_to_np_dtype(tensor.data_type)
-                    num_elem = 1
-                    for d in tensor.dims:
-                        num_elem *= d
-                    expected_size = int(num_elem) * int(dtype.itemsize)
+                    expected_size = _onnx_tensor_expected_storage_nbytes(tensor, onnx=onnx)
                     actual_size = len(tensor.raw_data)
                     if actual_size < expected_size:
                         result.add_check(
