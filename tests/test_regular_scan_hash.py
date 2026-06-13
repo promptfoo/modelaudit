@@ -1009,6 +1009,7 @@ class TestHashGenerationEdgeCases:
         assert safe_path in hashed
         assert model_path not in hashed
         assert sidecar not in hashed
+        assert result.bytes_scanned == sum(path.stat().st_size for path in (model_path, sidecar, safe_path))
         assert result.content_hash is None
 
     def test_hash_files_by_path_defers_oversized_pytorch_zip_ckpt_read_limit(
@@ -1677,10 +1678,12 @@ class TestOnnxExternalDataContentHash:
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
         assert result.content_hash is None
 
+    @pytest.mark.parametrize("defer_owner_hash", [False, True])
     def test_directory_hash_omits_hash_when_onnx_sidecar_exceeds_max_total_size(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        defer_owner_hash: bool,
     ) -> None:
         """Sidecar bytes should participate in max_total_size accounting."""
         from modelaudit import core
@@ -1704,6 +1707,7 @@ class TestOnnxExternalDataContentHash:
             cache_enabled=False,
             scanners=["onnx"],
             max_total_size=model_path.stat().st_size,
+            onnx_raw_detector_max_bytes=1 if defer_owner_hash else 512 * 1024 * 1024,
         )
 
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size

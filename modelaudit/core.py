@@ -4493,9 +4493,12 @@ def scan_model_directory_or_file(
                     representative_hash_source = hash_source_by_path.get(representative_file)
                     if not scanner_selection.allows("onnx") or representative_hash_source is None:
                         continue
-                    if should_defer_hash_for_file_backed_onnx(representative_hash_source, config):
+                    representative_hash_deferred = should_defer_hash_for_file_backed_onnx(
+                        representative_hash_source,
+                        config,
+                    )
+                    if representative_hash_deferred:
                         aggregate_hash_complete = False
-                        continue
                     if not _should_defer_hash_for_max_file_size(representative_hash_source, config):
                         representative_external_sources: list[str] = []
                         representative_external_bytes = 0
@@ -4533,11 +4536,13 @@ def scan_model_directory_or_file(
                                 else external_data_path
                             )
                             if external_data_source not in seen_hash_sources:
-                                hash_sources.append(external_data_source)
-                                seen_hash_sources.add(external_data_source)
                                 hash_budget_bytes += external_data_size
+                                seen_hash_sources.add(external_data_source)
+                                if not representative_hash_deferred:
+                                    hash_sources.append(external_data_source)
+                            if not representative_hash_deferred:
+                                onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
                             representative_external_sources.append(external_data_source)
-                            onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
                             if external_data_target_key is not None:
                                 scan_entry_target_keys.add(external_data_target_key)
                         if representative_external_sources:
