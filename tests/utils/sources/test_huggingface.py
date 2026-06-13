@@ -67,6 +67,7 @@ from modelaudit.utils.sources.huggingface import (
     parse_huggingface_file_url,
     parse_huggingface_url,
     parse_huggingface_url_with_revision,
+    plan_huggingface_model_download,
     redact_huggingface_url_for_display,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
@@ -3789,9 +3790,9 @@ class TestModelDownloadStreaming:
         ]
         assert [is_last for _path, is_last in results] == [False, False, True]
         assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "nested/adapter/model.safetensors.index.json",
             "nested/adapter/model-00000-of-00002.safetensors",
             "nested/adapter/model-00001-of-00002.safetensors",
-            "nested/adapter/model.safetensors.index.json",
         ]
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
@@ -4008,6 +4009,58 @@ class TestModelDownloadStreaming:
         ]
         mock_requests_get.assert_not_called()
 
+    def test_model_plan_metadata_only_skips_excluded_safetensors_candidates(self) -> None:
+        """A filtered metadata-only plan must mirror real SafeTensors exclusions."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "model-00000-of-00001.safetensors",
+            "model.ubj",
+        ]
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.ubj": 40}, _HF_TEST_REVISION),
+            ) as mock_get_sizes,
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect,
+            patch("requests.get") as mock_requests_get,
+        ):
+            plan = plan_huggingface_model_download(
+                "https://huggingface.co/test/model",
+                allow_content_probes=False,
+                scannable_extensions={".ubj"},
+                scannable_scanner_ids={"xgboost"},
+            )
+
+        assert plan.selected_files == ["model.ubj"]
+        mock_get_sizes.assert_not_called()
+        mock_detect.assert_not_called()
+        mock_requests_get.assert_not_called()
+
+    def test_model_plan_metadata_only_refuses_onnx_sidecar_ambiguity(self) -> None:
+        """A standard dry-run cannot prove ONNX external_data companions without parsing the model."""
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._get_huggingface_path_sizes") as mock_get_sizes,
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect,
+            pytest.raises(ValueError, match="ONNX files may declare external_data companions"),
+        ):
+            plan_huggingface_model_download(
+                "https://huggingface.co/test/model",
+                allow_content_probes=False,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        mock_get_sizes.assert_not_called()
+        mock_detect.assert_not_called()
+
     def test_remote_safetensors_index_inspection_count_is_bounded(self) -> None:
         """Remote inventory validation must fail before request limit plus one."""
         repo_files: list[str] = []
@@ -4041,7 +4094,10 @@ class TestModelDownloadStreaming:
             "model-00000-of-00001.safetensors",
             "adapter/model-00000-of-00001.safetensors",
         ]
-        selected_files = ["adapter/model-00000-of-00001.safetensors"]
+        selected_files = [
+            "model.safetensors.index.json",
+            "adapter/model-00000-of-00001.safetensors",
+        ]
         budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
         payload = json.dumps({"weight_map": {"root_tensor": "model-00000-of-00001.safetensors"}}).encode()
 
@@ -4055,6 +4111,50 @@ class TestModelDownloadStreaming:
             )
 
         assert result == selected_files
+
+    def test_remote_safetensors_validation_ignores_malformed_unrelated_ancestor_index(self) -> None:
+        """An unscoped malformed root index must not reject a selected nested family."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "adapter/model-00000-of-00001.safetensors",
+        ]
+        selected_files = [
+            "model.safetensors.index.json",
+            "adapter/model-00000-of-00001.safetensors",
+        ]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        with patch("requests.get", return_value=_FakeRangeResponse(b"{malformed")):
+            result = _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                selected_files,
+                budget,
+            )
+
+        assert result == selected_files
+
+    def test_remote_safetensors_validation_rejects_malformed_same_directory_index(self) -> None:
+        """A malformed index beside the selected family remains authoritative and fail-closed."""
+        repo_files = [
+            "adapter/model.safetensors.index.json",
+            "adapter/model-00000-of-00001.safetensors",
+        ]
+        selected_files = ["adapter/model-00000-of-00001.safetensors"]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(b"{malformed")),
+            pytest.raises(ValueError, match="is malformed"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                selected_files,
+                budget,
+            )
 
     def test_remote_safetensors_validation_metadata_only_refuses_index_reads(self) -> None:
         """Metadata-only planning must not range-read SafeTensors index content."""

@@ -2274,8 +2274,8 @@ def _allowed_hf_shard_alias_paths(base_dir: Path, hf_cache_root: Path) -> list[s
     """Return snapshot shards resolving inside the scan root or its trusted blobs directory."""
     allowed_paths: list[str] = []
     blobs_root = _trusted_hf_blobs_root(hf_cache_root)
-    for candidate_path in base_dir.rglob("*.safetensors"):
-        if ShardedModelDetector.match_safetensors_shard_filename(candidate_path.name) is None:
+    for candidate_path in base_dir.rglob("*"):
+        if ShardedModelDetector.match_shard_filename(candidate_path.name) is None:
             continue
         with suppress(OSError, RuntimeError):
             resolved_candidate = candidate_path.resolve(strict=True)
@@ -7583,6 +7583,7 @@ def scan_model_streaming(
             scan_path = source_path
             report_path = str(source_path)
             pinned_scan_context: Any | None = None
+            pinned_scan: Any | None = None
             preserve_source_after_scan = False
             openvino_scan_companion_path: Path | None = None
             openvino_scan_companion_key: Path | None = None
@@ -8030,6 +8031,7 @@ def scan_model_streaming(
                     if pinned_scan_context is not None:
                         pinned_scan_context.__exit__(None, None, None)
                         pinned_scan_context = None
+                    pinned_target_changed = bool(pinned_scan is not None and pinned_scan.changed_during_scan)
                     final_shard_target = _snapshot_validated_shard_target(
                         str(source_path),
                         resolved_path=selected_resolved_path,
@@ -8040,7 +8042,7 @@ def scan_model_streaming(
                         authoritative_shard_index_path=authoritative_shard_index_path,
                     )
                     stable_after_unpinning = False
-                    if initial_shard_target and final_shard_target:
+                    if not pinned_target_changed and initial_shard_target and final_shard_target:
                         initial_target = next(iter(initial_shard_target.values()))
                         final_target = next(iter(final_shard_target.values()))
                         stable_after_unpinning = all(
@@ -8051,6 +8053,7 @@ def scan_model_streaming(
                                 "inode",
                                 "size",
                                 "mtime_ns",
+                                "ctime_ns",
                                 "nlink",
                                 "family_group",
                             )

@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 _HF_CONTENT_SNIFF_BYTES = 8 * 1024
 _HF_CONTENT_SNIFF_MAX_FILES = 256
 _HF_SAFETENSORS_INDEX_MAX_FILES = 256
+_HF_SAFETENSORS_INDEX_FILENAME = "model.safetensors.index.json"
 _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
@@ -136,6 +137,7 @@ class _HuggingFaceProbeBudget:
 class _HuggingFaceStreamingSelection:
     filenames: list[str]
     content_route_formats: dict[str, str] = field(default_factory=dict)
+    safetensors_index_files: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -151,6 +153,7 @@ class HuggingFaceDownloadPlan:
     selected_sizes: dict[str, int]
     download_revision: str
     content_route_formats: dict[str, str] = field(default_factory=dict)
+    safetensors_index_files: tuple[str, ...] = ()
 
 
 def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_bytes: int) -> int | None:
@@ -1447,6 +1450,22 @@ def _detect_huggingface_content_route_format(
     return _detect_huggingface_flax_msgpack_route(repo_id, filename, revision, budget, prefix)
 
 
+def _skip_hf_safetensors_probe_candidate(
+    filename: str,
+    *,
+    allow_index_expansion: bool,
+    selected_route_scanner_ids: set[str] | None,
+) -> bool:
+    """Mirror filtered SafeTensors exclusions in content and metadata-only plans."""
+    if allow_index_expansion:
+        return False
+    if PurePosixPath(filename).name == _HF_SAFETENSORS_INDEX_FILENAME:
+        return True
+    return filename.endswith(".safetensors") and (
+        selected_route_scanner_ids is None or "pickle" not in selected_route_scanner_ids
+    )
+
+
 def _select_huggingface_model_files(
     repo_id: str,
     repo_files: list[str],
@@ -1469,11 +1488,19 @@ def _select_huggingface_model_files(
     )
     if not allow_content_probes:
         selected_safetensors_indexes = [
-            filename for filename in model_files if PurePosixPath(filename).name == "model.safetensors.index.json"
+            filename for filename in model_files if PurePosixPath(filename).name == _HF_SAFETENSORS_INDEX_FILENAME
         ]
         if allow_safetensors_index_expansion and selected_safetensors_indexes:
             _raise_metadata_only_hf_selection_incomplete(repo_id, selected_safetensors_indexes)
-        candidate_files = _metadata_only_hf_content_probe_candidates(repo_files, model_files)
+        candidate_files = [
+            filename
+            for filename in _metadata_only_hf_content_probe_candidates(repo_files, model_files)
+            if not _skip_hf_safetensors_probe_candidate(
+                filename,
+                allow_index_expansion=allow_safetensors_index_expansion,
+                selected_route_scanner_ids=selected_route_scanner_ids,
+            )
+        ]
         if candidate_files:
             _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
         return model_files
@@ -1490,12 +1517,10 @@ def _select_huggingface_model_files(
             continue
         if _is_huggingface_repo_bookkeeping_file(filename):
             continue
-        if not allow_safetensors_index_expansion and PurePosixPath(filename).name == "model.safetensors.index.json":
-            continue
-        if (
-            not allow_safetensors_index_expansion
-            and filename.endswith(".safetensors")
-            and (selected_route_scanner_ids is None or "pickle" not in selected_route_scanner_ids)
+        if _skip_hf_safetensors_probe_candidate(
+            filename,
+            allow_index_expansion=allow_safetensors_index_expansion,
+            selected_route_scanner_ids=selected_route_scanner_ids,
         ):
             continue
         if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
@@ -1582,6 +1607,29 @@ def _raise_metadata_only_hf_selection_incomplete(repo_id: str, candidate_files: 
     )
 
 
+def _refuse_metadata_only_hf_onnx_sidecar_ambiguity(
+    repo_id: str,
+    selected_files: Collection[str],
+    scannable_scanner_ids: Collection[str] | None,
+) -> None:
+    """Refuse previews that cannot prove the absence of ONNX external data."""
+    if scannable_scanner_ids is not None and "onnx" not in {
+        str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+    }:
+        return
+    onnx_files = [filename for filename in selected_files if PurePosixPath(filename).suffix.lower() == ".onnx"]
+    if not onnx_files:
+        return
+    preview = ", ".join(onnx_files[:3])
+    if len(onnx_files) > 3:
+        preview = f"{preview}, ..."
+    raise ValueError(
+        "Hugging Face metadata-only dry-run selection incomplete: "
+        f"dry-run refuses for {repo_id} because selected ONNX files may declare external_data companions "
+        f"that cannot be proven without artifact content probing: {preview}"
+    )
+
+
 def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
     """Escape repository filenames before passing them to the Hub glob filter."""
     return [escape_glob(filename) for filename in filenames]
@@ -1628,6 +1676,7 @@ def _validate_remote_safetensors_indexes(
     *,
     allow_index_expansion: bool = True,
     allow_content_probes: bool = True,
+    validated_index_files: list[str] | None = None,
 ) -> list[str]:
     """Validate and expand selected SafeTensors shard inventories when enabled."""
     from modelaudit.utils.file.handlers import (
@@ -1657,7 +1706,7 @@ def _validate_remote_safetensors_indexes(
         if PurePosixPath(index_file).name != SAFETENSORS_INDEX_NAME:
             continue
         index_parent = PurePosixPath(index_file).parent
-        strongly_relevant = index_file in selected_files or index_parent in selected_safetensors_parents
+        strongly_relevant = index_parent in selected_safetensors_parents
         if strongly_relevant or index_parent.as_posix() in selected_safetensors_ancestor_dirs:
             relevant_index_files.append(index_file)
             if strongly_relevant:
@@ -1673,6 +1722,7 @@ def _validate_remote_safetensors_indexes(
     for index_file in relevant_index_files:
         probe_budget.check_deadline(repo_id)
         index_selected = index_file in selected_files
+        strongly_relevant = index_file in strongly_relevant_index_files
 
         index_prefix = _read_huggingface_prefix(
             repo_id,
@@ -1687,6 +1737,8 @@ def _validate_remote_safetensors_indexes(
             or len(index_prefix) > MAX_SAFETENSORS_SHARD_INDEX_BYTES
             or (index_size is None and len(index_prefix) == MAX_SAFETENSORS_SHARD_INDEX_BYTES + 1)
         ):
+            if not strongly_relevant:
+                continue
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
                 f"SafeTensors index {repo_id}/{index_file} exceeds bounded parse limit"
@@ -1694,16 +1746,38 @@ def _validate_remote_safetensors_indexes(
         try:
             index_doc = json.loads(index_prefix.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if not strongly_relevant:
+                continue
             raise ValueError(
                 f"Hugging Face selective filtering incomplete: SafeTensors index {repo_id}/{index_file} is malformed"
             ) from exc
         if not isinstance(index_doc, dict) or not isinstance(index_doc.get("weight_map"), dict):
+            if not strongly_relevant:
+                continue
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
                 f"SafeTensors index {repo_id}/{index_file} has no valid weight_map"
             )
 
         raw_targets = list(index_doc["weight_map"].values())
+        if not strongly_relevant:
+            scoped_target_families: set[tuple[str, int]] = set()
+            for raw_target in raw_targets:
+                if not isinstance(raw_target, str):
+                    continue
+                try:
+                    scoped_target = _safe_remote_safetensors_index_target(index_file, raw_target)
+                except ValueError:
+                    continue
+                scoped_target_path = PurePosixPath(scoped_target)
+                scoped_match = ShardedModelDetector.match_safetensors_shard_filename(scoped_target_path.name)
+                if scoped_match is None:
+                    continue
+                scoped_total = scoped_match.get("expected_total_shards")
+                if isinstance(scoped_total, int) and scoped_total > 0:
+                    scoped_target_families.add((scoped_target_path.parent.as_posix(), scoped_total))
+            if selected_family_keys.isdisjoint(scoped_target_families):
+                continue
         if not all(isinstance(target, str) for target in raw_targets):
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
@@ -1740,9 +1814,6 @@ def _validate_remote_safetensors_indexes(
                 )
             target_indices.add(shard_index)
             target_families.setdefault((target_path.parent.as_posix(), shard_total), set()).add(target_file)
-
-        if index_file not in strongly_relevant_index_files and selected_family_keys.isdisjoint(target_families):
-            continue
 
         if not index_selected:
             updated_model_files.append(index_file)
@@ -1785,6 +1856,8 @@ def _validate_remote_safetensors_indexes(
             if target_file not in selected_files:
                 updated_model_files.append(target_file)
                 selected_files.add(target_file)
+        if validated_index_files is not None and index_file not in validated_index_files:
+            validated_index_files.append(index_file)
         probe_budget.check_deadline(repo_id)
 
     return updated_model_files
@@ -2374,6 +2447,7 @@ def _select_streamable_hf_files(
         scannable_scanner_ids,
         include_all_files=include_all_files,
     )
+    validated_safetensors_indexes: list[str] = []
     model_files = _validate_remote_safetensors_indexes(
         repo_id,
         repo_files,
@@ -2382,8 +2456,13 @@ def _select_streamable_hf_files(
         probe_budget,
         allow_index_expansion=allow_safetensors_index_expansion,
         allow_content_probes=allow_content_probes,
+        validated_index_files=validated_safetensors_indexes,
     )
-    return _HuggingFaceStreamingSelection(model_files, content_route_formats)
+    return _HuggingFaceStreamingSelection(
+        model_files,
+        content_route_formats,
+        safetensors_index_files=validated_safetensors_indexes,
+    )
 
 
 def _is_hf_streaming_onnx_candidate(filename: str, *, content_route_format: str | None = None) -> bool:
@@ -3856,6 +3935,8 @@ def plan_huggingface_model_download(
         ),
         deadline=deadline,
     )
+    if not allow_content_probes:
+        _refuse_metadata_only_hf_onnx_sidecar_ambiguity(repo_id, model_files, scannable_scanner_ids)
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
     if not model_files:
@@ -3946,6 +4027,8 @@ def plan_huggingface_streaming_download(
         include_openvino_companions=openvino_companion_suppression_enabled,
         deadline=deadline,
     )
+    if not allow_content_probes:
+        _refuse_metadata_only_hf_onnx_sidecar_ambiguity(repo_id, model_files, scannable_scanner_ids)
     revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
         repo_id,
         model_files,
@@ -3965,6 +4048,7 @@ def plan_huggingface_streaming_download(
         selected_sizes=selected_sizes,
         download_revision=revision or repo_revision,
         content_route_formats=selection.content_route_formats,
+        safetensors_index_files=tuple(selection.safetensors_index_files),
     )
 
 
@@ -4043,6 +4127,18 @@ def download_model_streaming(
         deadline = plan.deadline
         size_limit = plan.size_limit
         model_files = plan.selected_files
+        safetensors_index_expansion_enabled = _allows_safetensors_index_expansion(
+            scannable_extensions,
+            scannable_scanner_ids,
+            include_all_files=include_all_files,
+        )
+        selected_safetensors_indexes = list(plan.safetensors_index_files) if safetensors_index_expansion_enabled else []
+        if selected_safetensors_indexes:
+            selected_safetensors_index_set = set(selected_safetensors_indexes)
+            model_files = [
+                *[filename for filename in model_files if filename not in selected_safetensors_index_set],
+                *selected_safetensors_indexes,
+            ]
         selected_sizes = plan.selected_sizes
         download_revision = plan.download_revision
         selection = _HuggingFaceStreamingSelection(model_files, dict(plan.content_route_formats))
@@ -4281,6 +4377,9 @@ def download_model_streaming(
                             context_cleanup_paths.add(external_path)
 
             return downloaded_file, onnx_external_data_cleanup_paths
+
+        for filename in selected_safetensors_indexes:
+            download_selected_file(filename)
 
         try:
             for idx, filename in enumerate(model_files):

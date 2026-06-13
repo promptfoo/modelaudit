@@ -5827,6 +5827,30 @@ def test_scan_huggingface_standard_dry_run_refuses_safetensors_index_content_rea
     mock_scan_local.assert_not_called()
 
 
+def test_scan_huggingface_standard_dry_run_refuses_onnx_sidecar_ambiguity() -> None:
+    """A metadata-only standard preview cannot prove ONNX external_data coverage."""
+    with (
+        patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+        ),
+        patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--dry-run", "--scanners", "onnx", "--format", "json", "hf://test/model"],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2
+    assert "ONNX files may declare external_data companions" in result.output
+    mock_get_model_info.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan_local.assert_not_called()
+
+
 @patch(
     "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
     return_value=(["notes.txt"], _HF_TEST_REVISION, None),

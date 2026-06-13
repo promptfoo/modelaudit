@@ -3010,9 +3010,15 @@ def test_orbax_owner_dispatches_trusted_hf_snapshot_alias_when_strict_resolve_fa
 
 
 @pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.parametrize(
+    "shard_template",
+    ["model-{index:05d}-of-00002.safetensors", "pytorch_model-{index:05d}-of-00002.bin"],
+    ids=["safetensors", "pytorch-bin"],
+)
 def test_directory_scan_groups_hf_cache_sharded_symlinks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    shard_template: str,
 ) -> None:
     hf_home = tmp_path / "hf-home"
     monkeypatch.setenv("HF_HOME", str(hf_home))
@@ -3027,7 +3033,7 @@ def test_directory_scan_groups_hf_cache_sharded_symlinks(
     for shard_index in range(1, 3):
         blob_path = blobs_dir / f"blob-{shard_index}"
         blob_path.write_bytes(f"hf-shard-{shard_index}".encode())
-        shard_link = snapshots_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_link = snapshots_dir / shard_template.format(index=shard_index)
         shard_link.symlink_to(Path("../../blobs") / blob_path.name)
         blob_paths.append(blob_path.resolve())
         shard_links.append(shard_link)

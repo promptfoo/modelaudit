@@ -40,6 +40,7 @@ from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import PICKLE_ROUTING_INCONCLUSIVE_FORMAT, SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+from modelaudit.utils.file.handlers import _pinned_shard_scan_path
 from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
@@ -1636,6 +1637,75 @@ def test_scan_model_streaming_total_one_source_change_after_pinning_fails_closed
         return result
 
     monkeypatch.setattr("modelaudit.core.scan_file", replace_source_after_scan)
+
+    result = scan_model_streaming(
+        file_generator=iter([(shard, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        shard_family_group="trusted-stream:model-a",
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
+def test_scan_model_streaming_total_one_ctime_change_after_pinning_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-target ctime change after unpinning must invalidate reconciliation."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    real_snapshot = _snapshot_validated_shard_target
+    source_snapshot_calls = 0
+
+    def snapshot_with_final_ctime_change(path: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal source_snapshot_calls
+        snapshot = real_snapshot(path, *args, **kwargs)
+        if Path(path) == shard:
+            source_snapshot_calls += 1
+            if source_snapshot_calls == 4 and snapshot:
+                target = next(iter(snapshot.values()))
+                ctime_ns = target.get("ctime_ns")
+                assert isinstance(ctime_ns, int)
+                target["ctime_ns"] = ctime_ns + 1
+        return snapshot
+
+    monkeypatch.setattr("modelaudit.core._snapshot_validated_shard_target", snapshot_with_final_ctime_change)
+
+    result = scan_model_streaming(
+        file_generator=iter([(shard, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        shard_family_group="trusted-stream:model-a",
+        cache_enabled=False,
+    )
+
+    assert source_snapshot_calls >= 4
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
+def test_scan_model_streaming_total_one_pinned_descriptor_change_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A descriptor-observed content change must invalidate an otherwise stable source path."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+
+    @contextmanager
+    def changed_pinned_path(resolved_path: str, target: dict[str, int | str]) -> Iterator[Any]:
+        with _pinned_shard_scan_path(resolved_path, target) as pinned_scan:
+            yield pinned_scan
+        pinned_scan.changed_during_scan = True
+
+    monkeypatch.setattr("modelaudit.core._pinned_shard_scan_path", changed_pinned_path)
 
     result = scan_model_streaming(
         file_generator=iter([(shard, True)]),
