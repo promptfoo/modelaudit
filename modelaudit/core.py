@@ -33,7 +33,12 @@ from modelaudit.integrations.license_checker import (
     check_commercial_use_warnings,
     collect_license_metadata,
 )
-from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
+from modelaudit.models import (
+    ModelAuditResultModel,
+    ScanConfigModel,
+    _onnx_weight_issue_context_key,
+    create_initial_audit_result,
+)
 from modelaudit.scanner_results import (
     ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
@@ -1860,14 +1865,6 @@ def _reconcile_cross_directory_shard_coverage(
 _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT = 20
 
 
-def _stable_cluster_value(value: Any) -> Any:
-    if isinstance(value, list | tuple):
-        return tuple(_stable_cluster_value(item) for item in value)
-    if isinstance(value, dict):
-        return tuple(sorted((str(key), _stable_cluster_value(item)) for key, item in value.items()))
-    return value
-
-
 def _onnx_weight_anomaly_cluster_key(
     issue: Issue,
     *,
@@ -1878,47 +1875,16 @@ def _onnx_weight_anomaly_cluster_key(
     if not content_hash:
         return None
     details = issue.details if isinstance(issue.details, dict) else {}
-    required_fields = ("initializer", "consumer_op", "analysis_shape")
-    if not all(field in details for field in required_fields):
+    if not all(field in details for field in ("initializer", "consumer_op", "analysis_shape")):
         return None
-    anomaly_neurons = details.get("affected_neurons", details.get("outlier_neurons"))
-    if anomaly_neurons is None:
+    context_key = _onnx_weight_issue_context_key(issue)
+    if context_key is None:
         return None
     return (
         issue.message,
         issue.severity,
         content_hash,
-        _stable_cluster_value(details.get("analysis_id")),
-        _stable_cluster_value(details.get("analysis_method")),
-        _stable_cluster_value(details.get("initializer")),
-        _stable_cluster_value(details.get("initializer_graph_index")),
-        _stable_cluster_value(details.get("stored_shape")),
-        _stable_cluster_value(details.get("consumer_domain")),
-        _stable_cluster_value(details.get("consumer_op")),
-        _stable_cluster_value(details.get("consumer_node")),
-        _stable_cluster_value(details.get("consumer_node_index")),
-        _stable_cluster_value(details.get("consumer_input_index")),
-        _stable_cluster_value(details.get("output_axes")),
-        _stable_cluster_value(details.get("conceptual_output_axes")),
-        _stable_cluster_value(details.get("analysis_kind")),
-        _stable_cluster_value(details.get("group")),
-        _stable_cluster_value(details.get("lineage")),
-        _stable_cluster_value(details.get("quantized_weight")),
-        _stable_cluster_value(details.get("quantization_kind")),
-        _stable_cluster_value(details.get("quantization_scale")),
-        _stable_cluster_value(details.get("quantization_scale_factor_names")),
-        _stable_cluster_value(details.get("quantization_zero_point")),
-        _stable_cluster_value(details.get("quantization_axis")),
-        _stable_cluster_value(details.get("quantization_scale_initializer_index")),
-        _stable_cluster_value(details.get("quantization_scale_factor_initializer_indexes")),
-        _stable_cluster_value(details.get("quantization_zero_point_initializer_index")),
-        _stable_cluster_value(details.get("quantization_output_data_type")),
-        _stable_cluster_value(details.get("analysis_shape")),
-        _stable_cluster_value(anomaly_neurons),
-        _stable_cluster_value(details.get("num_extreme_weights")),
-        _stable_cluster_value(details.get("max_extreme_weights_per_output")),
-        _stable_cluster_value(details.get("total_outliers")),
-        _stable_cluster_value(details.get("outlier_percentage")),
+        *context_key,
     )
 
 

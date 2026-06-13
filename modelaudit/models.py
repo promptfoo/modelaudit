@@ -618,6 +618,59 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
     # Dictionary-like access provided by DictCompatMixin
 
 
+def _stable_onnx_weight_context_value(value: Any) -> Any:
+    if isinstance(value, list | tuple):
+        return tuple(_stable_onnx_weight_context_value(item) for item in value)
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), _stable_onnx_weight_context_value(item)) for key, item in value.items()))
+    return value
+
+
+def _onnx_weight_issue_context_key(issue: Issue) -> tuple[Any, ...] | None:
+    if getattr(issue, "type", None) != "onnx_check":
+        return None
+    details = issue.details if isinstance(issue.details, dict) else {}
+    anomaly_neurons = details.get("affected_neurons", details.get("outlier_neurons"))
+    if anomaly_neurons is None or "initializer" not in details:
+        return None
+    fields = (
+        "analysis_id",
+        "analysis_method",
+        "initializer",
+        "initializer_graph_index",
+        "stored_shape",
+        "consumer_domain",
+        "consumer_op",
+        "consumer_node",
+        "consumer_node_index",
+        "consumer_input_index",
+        "output_axes",
+        "conceptual_output_axes",
+        "analysis_kind",
+        "group",
+        "lineage",
+        "quantized_weight",
+        "quantization_kind",
+        "quantization_scale",
+        "quantization_scale_factor_names",
+        "quantization_zero_point",
+        "quantization_axis",
+        "quantization_scale_initializer_index",
+        "quantization_scale_factor_initializer_indexes",
+        "quantization_zero_point_initializer_index",
+        "quantization_output_data_type",
+        "analysis_shape",
+    )
+    return (
+        *(_stable_onnx_weight_context_value(details.get(field)) for field in fields),
+        _stable_onnx_weight_context_value(anomaly_neurons),
+        _stable_onnx_weight_context_value(details.get("num_extreme_weights")),
+        _stable_onnx_weight_context_value(details.get("max_extreme_weights_per_output")),
+        _stable_onnx_weight_context_value(details.get("total_outliers")),
+        _stable_onnx_weight_context_value(details.get("outlier_percentage")),
+    )
+
+
 class ModelAuditResultModel(BaseModel, DictCompatMixin):
     """Pydantic model matching the exact current ModelAudit JSON output format"""
 
@@ -867,65 +920,18 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     def deduplicate_issues(self) -> None:
         """Remove duplicate issues while preserving distinct analyzer context."""
 
-        def stable_value(value: Any) -> Any:
-            if isinstance(value, list | tuple):
-                return tuple(stable_value(item) for item in value)
-            if isinstance(value, dict):
-                return tuple(sorted((str(key), stable_value(item)) for key, item in value.items()))
-            return value
-
-        def onnx_weight_context_key(issue: Issue) -> tuple[Any, ...] | None:
-            if getattr(issue, "type", None) != "onnx_check":
-                return None
-            details = issue.details if isinstance(issue.details, dict) else {}
-            anomaly_neurons = details.get("affected_neurons", details.get("outlier_neurons"))
-            if anomaly_neurons is None or "initializer" not in details:
-                return None
-            return (
-                stable_value(details.get("clustered_onnx_weight_anomaly")),
-                stable_value(details.get("cluster_size")),
-                stable_value(details.get("analysis_id")),
-                stable_value(details.get("analysis_method")),
-                stable_value(details.get("initializer")),
-                stable_value(details.get("initializer_graph_index")),
-                stable_value(details.get("stored_shape")),
-                stable_value(details.get("consumer_domain")),
-                stable_value(details.get("consumer_op")),
-                stable_value(details.get("consumer_node")),
-                stable_value(details.get("consumer_node_index")),
-                stable_value(details.get("consumer_input_index")),
-                stable_value(details.get("output_axes")),
-                stable_value(details.get("conceptual_output_axes")),
-                stable_value(details.get("analysis_kind")),
-                stable_value(details.get("group")),
-                stable_value(details.get("lineage")),
-                stable_value(details.get("quantized_weight")),
-                stable_value(details.get("quantization_kind")),
-                stable_value(details.get("quantization_scale")),
-                stable_value(details.get("quantization_scale_factor_names")),
-                stable_value(details.get("quantization_zero_point")),
-                stable_value(details.get("quantization_axis")),
-                stable_value(details.get("quantization_scale_initializer_index")),
-                stable_value(details.get("quantization_scale_factor_initializer_indexes")),
-                stable_value(details.get("quantization_zero_point_initializer_index")),
-                stable_value(details.get("quantization_output_data_type")),
-                stable_value(details.get("analysis_shape")),
-                stable_value(anomaly_neurons),
-                stable_value(details.get("num_extreme_weights")),
-                stable_value(details.get("max_extreme_weights_per_output")),
-                stable_value(details.get("total_outliers")),
-                stable_value(details.get("outlier_percentage")),
-            )
-
         seen_issues = set()
         deduplicated_issues = []
         for issue in self.issues:
             # Include location in the deduplication key to avoid hiding issues in different files
+            issue_details = issue.details if isinstance(issue.details, dict) else {}
             issue_key = (
                 issue.message,
                 issue.severity,
                 issue.location or "",
-                onnx_weight_context_key(issue),
+                _stable_onnx_weight_context_value(issue_details.get("clustered_onnx_weight_anomaly")),
+                _stable_onnx_weight_context_value(issue_details.get("cluster_size")),
+                _onnx_weight_issue_context_key(issue),
             )
             if issue_key not in seen_issues:
                 seen_issues.add(issue_key)

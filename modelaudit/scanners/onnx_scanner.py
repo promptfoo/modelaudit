@@ -1675,16 +1675,16 @@ def _build_onnx_weight_analysis_plan(
                     return None, "unresolved_quantized_weight_scale"
                 if consumer.op_type in {"Add", "Cast", "Identity"}:
                     if consumer.op_type == "Add":
-                        if scale_data_type is not None:
-                            reached_terminal = True
-                            continue
                         add_inputs = [str(source) for source in consumer.input if source]
                         bias_names = [source for source in add_inputs if source != value_name]
+                        expected_bias_type = (
+                            int(onnx.TensorProto.INT32) if scale_data_type is None else current_data_type
+                        )
                         if (
                             add_inputs.count(value_name) != 1
                             or len(bias_names) != 1
                             or bias_names[0] not in constants
-                            or int(constants[bias_names[0]].data_type) != int(onnx.TensorProto.INT32)
+                            or int(constants[bias_names[0]].data_type) != expected_bias_type
                         ):
                             return None, "unresolved_quantized_weight_scale"
                     elif consumer.op_type == "Cast":
@@ -1692,6 +1692,16 @@ def _build_onnx_weight_analysis_plan(
                         if cast_data_type not in floating_types:
                             return None, "unresolved_quantized_weight_scale"
                         current_data_type = cast_data_type
+                        if scale_data_type is not None:
+                            try:
+                                current_itemsize = int(_tensor_data_type_to_np_dtype(current_data_type).itemsize)
+                                output_itemsize = int(_tensor_data_type_to_np_dtype(output_data_type).itemsize)
+                            except (KeyError, TypeError, ValueError):
+                                return None, "unresolved_quantized_weight_scale"
+                            if current_itemsize < output_itemsize:
+                                output_data_type = current_data_type
+                            elif current_itemsize == output_itemsize and current_data_type != output_data_type:
+                                return None, "unresolved_quantized_weight_scale"
                     queue.extend((output_name, depth + 1) for output_name in next_values)
                     continue
                 if consumer.op_type != "Mul":
@@ -2778,6 +2788,18 @@ def _build_onnx_weight_analysis_plan(
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                     and node.op_type in _WEIGHT_COMPUTING_LINEAGE_OPERATORS
                 )
+                unmodeled_standard_operator_lineage = (
+                    is_registered_standard_operator
+                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and not (
+                        same_type_elementwise
+                        or same_type_unary_elementwise
+                        or clip_operator
+                        or pow_operator
+                        or prelu_data_is_activation
+                        or weight_computing_lineage
+                    )
+                )
                 unknown_operator_lineage = (
                     not is_registered_standard_operator
                     or getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
@@ -2790,6 +2812,7 @@ def _build_onnx_weight_analysis_plan(
                     or prelu_data_is_activation
                     or weight_computing_lineage
                     or unknown_operator_lineage
+                    or unmodeled_standard_operator_lineage
                 )
                 if propagates_lineage:
                     elementwise_output_shape = (
@@ -3184,10 +3207,13 @@ def _build_onnx_weight_analysis_plan(
         itemsize = int(_tensor_data_type_to_np_dtype(parameter.data_type).itemsize)
         estimated_bytes = numel * itemsize
         bounded_name, _, _ = _bounded_onnx_metadata_text(plan, name or parameter.name)
-        if pre_materialization_check is not None and not pre_materialization_check(
-            parameter,
-            bounded_name,
-            estimated_bytes,
+        if (
+            estimated_bytes < 0
+            or (max_array_size is not None and max_array_size > 0 and estimated_bytes > max_array_size)
+            or (
+                pre_materialization_check is not None
+                and not pre_materialization_check(parameter, bounded_name, estimated_bytes)
+            )
         ):
             raise ValueError(f"Quantized weight {role} initializer exceeds analysis budget")
         return onnx.numpy_helper.to_array(parameter)
@@ -4487,8 +4513,15 @@ class OnnxScanner(BaseScanner):
         configured_max_array_size = self.config.get("max_array_size", _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE)
         max_array_size = _configured_onnx_weight_array_limit(configured_max_array_size)
 
-        def inline_storage_fits_budget(initializer: Any, _name: str, _estimated_bytes: int) -> bool:
-            return max_array_size is None or _onnx_inline_storage_nbytes(initializer) <= max_array_size
+        def inline_storage_fits_budget(initializer: Any, _name: str, estimated_bytes: int) -> bool:
+            return (
+                max_array_size is None
+                or max(
+                    _onnx_inline_storage_nbytes(initializer),
+                    estimated_bytes,
+                )
+                <= max_array_size
+            )
 
         retained_array_budget = (
             None if max_array_size is None else max_array_size * _ONNX_WEIGHT_RETAINED_ARRAY_BUDGET_MULTIPLIER

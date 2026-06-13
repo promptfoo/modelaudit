@@ -1584,6 +1584,8 @@ def create_matmul_integer_scale_chain_model(
     nested_static_scale_expression: bool = False,
     cast_scale_expression: bool = False,
     widen_after_scale: bool = False,
+    post_scale_bias_add: bool = False,
+    narrow_after_scale: bool = False,
 ) -> Path:
     weight_shape = (10, 100) if weight_on_left else (100, 10)
     weights = np.full(
@@ -1650,6 +1652,11 @@ def create_matmul_integer_scale_chain_model(
         nodes.append(helper.make_node("Relu", ["Y_cast"], ["Y_relu"]))
         activation_scale_input = "Y_relu"
     nodes.append(helper.make_node("Mul", [activation_scale_input, "X_scale"], ["Y_activation_scaled"]))
+    scale_chain_input = "Y_activation_scaled"
+    if post_scale_bias_add:
+        initializers.append(onnx.numpy_helper.from_array(np.asarray(0, dtype=scale_dtype), name="float_bias"))
+        nodes.append(helper.make_node("Add", [scale_chain_input, "float_bias"], ["Y_post_scale_bias"]))
+        scale_chain_input = "Y_post_scale_bias"
     scale_name = "W_scale_0"
     if dynamic_scale_expression:
         inputs.append(helper.make_tensor_value_info("scale_gate", cast_data_type, list(vector_scale.shape)))
@@ -1672,21 +1679,24 @@ def create_matmul_integer_scale_chain_model(
         scale_name = f"W_scale_{index}"
         nodes.append(helper.make_node("Mul", [output_name, scale_name], [f"Y_stage_{index}"]))
         scale_name = f"Y_stage_{index}"
-    scale_chain_input = "Y_activation_scaled"
     if repeat_weight_scale:
         nodes.append(helper.make_node("Mul", [scale_chain_input, "W_scale_0"], ["Y_repeated_scale"]))
         scale_chain_input = "Y_repeated_scale"
-    scale_chain_output = "Y_narrow" if widen_after_scale else "Y"
+    scale_chain_output = "Y_before_output_cast" if widen_after_scale or narrow_after_scale else "Y"
     if scalar_only_scale:
-        nodes.append(helper.make_node("Identity", ["Y_activation_scaled"], [scale_chain_output]))
+        nodes.append(helper.make_node("Identity", [scale_chain_input], [scale_chain_output]))
     elif vector_scale_count == 1:
         nodes.append(helper.make_node("Mul", [scale_chain_input, scale_name], [scale_chain_output]))
     else:
         nodes.append(helper.make_node("Identity", [scale_name], [scale_chain_output]))
     if widen_after_scale:
         nodes.append(helper.make_node("Cast", [scale_chain_output], ["Y"], to=TensorProto.FLOAT))
+    elif narrow_after_scale:
+        nodes.append(helper.make_node("Cast", [scale_chain_output], ["Y"], to=TensorProto.FLOAT16))
     output_shape = [10, 1] if weight_on_left else [1, 10]
-    output_data_type = TensorProto.FLOAT if widen_after_scale else cast_data_type
+    output_data_type = (
+        TensorProto.FLOAT if widen_after_scale else TensorProto.FLOAT16 if narrow_after_scale else cast_data_type
+    )
     outputs = [helper.make_tensor_value_info("Y", output_data_type, output_shape)]
     if expose_raw_output:
         outputs.append(helper.make_tensor_value_info("Y_int", TensorProto.INT32, output_shape))
@@ -2063,6 +2073,65 @@ def create_packed_low_bit_initializer_model(
     if not truncate:
         onnx.checker.check_model(model, full_check=True)
     path = tmp_path / f"packed-{TensorProto.DataType.Name(data_type).lower()}-{truncate}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_oversized_packed_zero_point_model(tmp_path: Path) -> Path:
+    weights = helper.make_tensor(
+        "W",
+        TensorProto.INT4,
+        [100, 10],
+        bytes(500),
+        raw=True,
+    )
+    scale = onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="scale")
+    zero_point_elements = 4_002
+    zero_point = helper.make_tensor(
+        "zero_point",
+        TensorProto.INT4,
+        [zero_point_elements],
+        bytes((zero_point_elements + 1) // 2),
+        raw=True,
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("DequantizeLinear", ["W", "scale", "zero_point"], ["dequantized_weight"]),
+            helper.make_node("MatMul", ["X", "dequantized_weight"], ["Y"]),
+        ],
+        "oversized_packed_zero_point",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[weights, scale, zero_point],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    path = tmp_path / "oversized-packed-zero-point.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_concat_weight_lineage_model(tmp_path: Path) -> Path:
+    left = np.zeros((50, 10), dtype=np.float32)
+    right = np.zeros((50, 10), dtype=np.float32)
+    right[:5, 3] = 100
+    graph = helper.make_graph(
+        [
+            helper.make_node("Concat", ["W_left", "W_right"], ["W"], axis=0),
+            helper.make_node("MatMul", ["X", "W"], ["Y"]),
+        ],
+        "concat_weight_lineage",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[
+            onnx.numpy_helper.from_array(left, name="W_left"),
+            onnx.numpy_helper.from_array(right, name="W_right"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "concat-weight-lineage.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -7475,6 +7544,22 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 0
         assert semantics["unresolved_lineage_samples"][0]["reason"] == "unsupported_lineage_operator"
 
+    def test_registered_standard_transform_preserves_unresolved_weight_lineage(self, tmp_path: Path) -> None:
+        model_path = create_concat_weight_lineage_model(tmp_path)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 2
+        assert semantics["analyzed_initializer_count"] == 0
+        assert {sample["reason"] for sample in semantics["unresolved_lineage_samples"]} == {
+            "unsupported_lineage_operator"
+        }
+        assert {sample["consumer_op"] for sample in semantics["unresolved_lineage_samples"]} == {"MatMul"}
+
     def test_matmul_integer_dead_scale_branch_cannot_suppress_anomaly(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_weight_model(
             tmp_path,
@@ -7556,6 +7641,22 @@ class TestWeightDistributionSemantics:
         assert checks[0].details["outlier_neurons"] == [3]
         context = result.metadata["onnx_weight_distribution_semantics"]["eligible"][0]
         assert context["quantization_scale"] == "W_scale_0"
+
+    def test_matmul_integer_resolves_scale_chain_past_float_bias(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_scale_chain_model(tmp_path, post_scale_bias_add=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert len(checks) == 1
+        assert checks[0].details["outlier_neurons"] == [3]
+        context = result.metadata["onnx_weight_distribution_semantics"]["eligible"][0]
+        assert context["quantization_scale_factor_names"] == ["X_scale", "W_scale_0"]
 
     def test_matmul_integer_non_unit_add_scale_chain_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_scale_chain_model(tmp_path, duplicate_add_input=True)
@@ -7657,6 +7758,22 @@ class TestWeightDistributionSemantics:
         assert checks[0].details["num_nonfinite_weights"] == 1000
         context = result.metadata["onnx_weight_distribution_semantics"]["eligible"][0]
         assert context["quantization_scale_factor_names"] == ["X_scale", "W_scale_0", "W_scale_0"]
+
+    def test_matmul_integer_scale_chain_preserves_narrowing_output_cast(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_scale_chain_model(
+            tmp_path,
+            scalar_overflow=True,
+            scalar_only_scale=True,
+            narrow_after_scale=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["num_nonfinite_weights"] == 1000
+        context = result.metadata["onnx_weight_distribution_semantics"]["eligible"][0]
+        assert context["quantization_output_data_type"] == TensorProto.FLOAT16
 
     @pytest.mark.parametrize(
         (
@@ -7835,6 +7952,29 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_initializer_count"] == 0
+
+    def test_packed_quantization_parameter_is_bounded_by_decoded_size(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_oversized_packed_zero_point_model(tmp_path)
+        decoded_names: list[str] = []
+        original_to_array = onnx.numpy_helper.to_array
+
+        def recording_to_array(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            decoded_names.append(str(tensor.name))
+            return original_to_array(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", recording_to_array)
+
+        result = OnnxScanner({"max_array_size": 4_001}).scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["extraction_failures"] == 1
+        assert "zero_point" not in decoded_names
 
     def test_qdq_transpose_materializes_before_axis_changes(self, tmp_path: Path) -> None:
         model_path = create_qdq_transposed_weight_model(tmp_path, malicious=True)
