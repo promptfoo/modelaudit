@@ -98,6 +98,26 @@ def _write_delayed_flax_cntk_overlap(path: Path) -> None:
 class TestOciLayerScanner:
     """Comprehensive tests for OCI Layer Scanner."""
 
+    def test_merge_nested_result_preserves_parent_hash_and_records_child_hash(self) -> None:
+        parent = ScanResult(scanner_name="oci_layer")
+        parent.metadata.update({"file_size": 42, "file_hashes": {"sha256": "a" * 64}})
+        child = ScanResult(scanner_name="pickle")
+        child.metadata.update({"file_size": 7, "file_hashes": {"sha256": "b" * 64}})
+
+        OciLayerScanner._merge_nested_result(parent, child, "layer.tar.gz", "payload.pkl")
+
+        assert parent.metadata["file_size"] == 42
+        assert parent.metadata["file_hashes"] == {"sha256": "a" * 64}
+        member_hashes = parent.metadata["member_file_hashes"]
+        assert isinstance(member_hashes, dict)
+        records = [
+            record
+            for record in member_hashes.values()
+            if isinstance(record, dict) and record.get("path_segments") == ["layer.tar.gz", "payload.pkl"]
+        ]
+        assert len(records) == 1
+        assert records[0]["file_hashes"] == {"sha256": "b" * 64}
+
     @pytest.mark.parametrize("invalid_ratio", [float("nan"), float("inf"), float("-inf")])
     def test_invalid_decompression_ratio_uses_safe_default(self, invalid_ratio: float) -> None:
         scanner = OciLayerScanner({"compressed_max_decompression_ratio": invalid_ratio})
