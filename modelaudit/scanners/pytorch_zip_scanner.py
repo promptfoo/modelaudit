@@ -16,7 +16,7 @@ import tempfile
 import zipfile
 from collections.abc import Callable
 from contextlib import suppress
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -25,6 +25,10 @@ from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from ..scanner_results import (
     ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
+    MEMBER_FILE_HASHES_METADATA_KEY,
+    MEMBER_FILE_HASHES_OMITTED_METADATA_KEY,
+    MEMBER_FILE_HASHES_TOTAL_METADATA_KEY,
+    MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY,
     RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY,
     RAW_DETECTOR_FAILURES_METADATA_KEY,
     mark_inconclusive_scan_result,
@@ -1690,10 +1694,26 @@ class PyTorchZipScanner(BaseScanner):
     def _merge_nested_zip_result(result: ScanResult, nested_result: ScanResult, member_name: str) -> None:
         """Merge nested findings while preserving the parent archive metadata."""
         parent_metadata = dict(result.metadata)
-        result.merge(nested_result)
+        for key in ("file_hashes", "file_size", "file_hashes_complete", "file_hashes_bytes_hashed"):
+            if key in parent_metadata:
+                parent_metadata[key] = deepcopy(parent_metadata[key])
+        result.merge_member_result(nested_result, member_name)
         raw_detector_failures = result.metadata.get(RAW_DETECTOR_FAILURES_METADATA_KEY)
         raw_detector_failed_detectors = result.metadata.get(RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY)
+        member_file_hashes = result.metadata.get(MEMBER_FILE_HASHES_METADATA_KEY)
+        member_file_hash_summary = {
+            key: result.metadata[key]
+            for key in (
+                MEMBER_FILE_HASHES_TOTAL_METADATA_KEY,
+                MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY,
+                MEMBER_FILE_HASHES_OMITTED_METADATA_KEY,
+            )
+            if key in result.metadata
+        }
         result.metadata = parent_metadata
+        if isinstance(member_file_hashes, dict) and member_file_hashes:
+            result.metadata[MEMBER_FILE_HASHES_METADATA_KEY] = member_file_hashes
+        result.metadata.update(member_file_hash_summary)
         if isinstance(raw_detector_failures, list):
             result.metadata[RAW_DETECTOR_FAILURES_METADATA_KEY] = list(raw_detector_failures)
         if isinstance(raw_detector_failed_detectors, list):
@@ -1708,12 +1728,23 @@ class PyTorchZipScanner(BaseScanner):
                 mark_inconclusive_scan_result(result, "pytorch_zip_nested_archive_scan_incomplete")
         nested_scans = result.metadata.setdefault("nested_zip_scans", [])
         if isinstance(nested_scans, list):
+            nested_metadata = {
+                key: value
+                for key, value in nested_result.metadata.items()
+                if key
+                not in {
+                    MEMBER_FILE_HASHES_METADATA_KEY,
+                    MEMBER_FILE_HASHES_TOTAL_METADATA_KEY,
+                    MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY,
+                    MEMBER_FILE_HASHES_OMITTED_METADATA_KEY,
+                }
+            }
             nested_scans.append(
                 {
                     "zip_entry": member_name,
                     "scanner_name": nested_result.scanner_name,
                     "success": nested_result.success,
-                    "metadata": dict(nested_result.metadata),
+                    "metadata": nested_metadata,
                 }
             )
         result.remove_failed_raw_detector_clean_checks()
@@ -2102,18 +2133,7 @@ class PyTorchZipScanner(BaseScanner):
 
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
-            parent_file_hashes = result.metadata.get("file_hashes")
-            parent_file_hashes_copy = dict(parent_file_hashes) if isinstance(parent_file_hashes, dict) else None
-            parent_file_size = result.metadata.get("file_size")
-            result.merge(sub_result)
-            if parent_file_hashes_copy is not None:
-                result.metadata["file_hashes"] = parent_file_hashes_copy
-            else:
-                result.metadata.pop("file_hashes", None)
-            if parent_file_size is not None:
-                result.metadata["file_size"] = parent_file_size
-            else:
-                result.metadata.pop("file_size", None)
+            result.merge_member_result(sub_result, name)
             self._record_pickle_member_outcome(result, name, sub_result, location=pickle_source)
 
         return bytes_scanned

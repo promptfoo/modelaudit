@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
+import zipfile
 from collections.abc import Iterator
 from contextlib import ExitStack
 from pathlib import Path
@@ -40,7 +41,32 @@ from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from modelaudit.utils.sources.huggingface import download_model_streaming
-from tests.helpers import create_malicious_pickle, create_mock_pytorch_zip
+from tests.helpers import create_malicious_pickle, create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
+
+
+class _StreamingMaliciousPicklePayload:
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return (eval, ("__import__('os').system('echo modelaudit-stream-test')",))
+
+
+def _create_streaming_pytorch_zip(path: Path, members: dict[str, bytes]) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        write_mock_pytorch_zip_metadata(archive)
+        for member_name, payload in members.items():
+            archive.writestr(member_name, payload)
+    return path
+
+
+def _streaming_member_record(metadata: dict[str, Any], path_segments: list[str]) -> dict[str, Any]:
+    member_hashes = metadata.get("member_file_hashes")
+    assert isinstance(member_hashes, dict)
+    records = [
+        record
+        for record in member_hashes.values()
+        if isinstance(record, dict) and record.get("path_segments") == path_segments
+    ]
+    assert len(records) == 1
+    return records[0]
 
 
 @pytest.fixture
@@ -4029,6 +4055,40 @@ def test_scan_model_streaming_content_hash_deterministic():
         for file_path in files1 + files2:
             if file_path.exists():
                 file_path.unlink()
+
+
+def test_scan_model_streaming_keeps_member_hashes_separate_from_parent(tmp_path: Path) -> None:
+    benign_payload = pickle.dumps({"safe": "stream"})
+    malicious_payload = pickle.dumps(_StreamingMaliciousPicklePayload())
+    model_path = _create_streaming_pytorch_zip(
+        tmp_path / "streamed.pt",
+        {
+            "data.pkl": benign_payload,
+            "evil.pkl": malicious_payload,
+        },
+    )
+    outer_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    malicious_hash = hashlib.sha256(malicious_payload).hexdigest()
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
+    assert result.content_hash == compute_aggregate_hash([outer_hash])
+    assert metadata["file_hashes"]["sha256"] == outer_hash
+    malicious_record = _streaming_member_record(metadata, ["evil.pkl"])
+    assert malicious_record["file_hashes"]["sha256"] == malicious_hash
+    assert malicious_record["file_hashes"]["sha256"] != outer_hash
+    assert any(
+        issue.location is not None
+        and ":evil.pkl" in issue.location
+        and issue.details.get("pickle_filename") == "evil.pkl"
+        for issue in result.issues
+    )
 
 
 def test_scan_model_streaming_empty_generator():
