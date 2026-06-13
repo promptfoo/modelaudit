@@ -17,6 +17,7 @@ from modelaudit.cache.scan_results_cache import _source_resolution_context
 from modelaudit.scanners import keras_h5_scanner, safetensors_scanner
 from modelaudit.scanners.base import ScanResult
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
+from modelaudit.scanners.onnx_scanner import OnnxScanner
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES, SafeTensorsScanner
 from modelaudit.utils.file import handlers as advanced_handlers
 from modelaudit.utils.file import large_file_handler
@@ -114,6 +115,38 @@ def test_large_handler_cache_bypasses_oversized_safetensors_hashing(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_large_handler_cache_bypasses_file_backed_onnx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    model_path = tmp_path / "model.onnx"
+    graph = helper.make_graph(
+        [helper.make_node("Relu", ["input"], ["output"])],
+        "graph",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
+    )
+    onnx.save(helper.make_model(graph), str(model_path))
+    scanner = OnnxScanner(
+        config={
+            "cache_enabled": True,
+            "cache_dir": str(tmp_path / "cache"),
+            "onnx_raw_detector_max_bytes": 1,
+        }
+    )
+    monkeypatch.setattr(
+        "modelaudit.cache.get_cache_manager",
+        lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must bypass the large-file cache"),
+    )
+
+    result = large_file_handler.scan_large_file(str(model_path), scanner)
+
+    assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
 
 
 @pytest.mark.parametrize(

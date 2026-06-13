@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import pickletools
 import re
 import stat
 from collections.abc import Iterator
@@ -17,7 +18,12 @@ from google.protobuf.message import DecodeError, Message
 
 from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
-from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, _looks_like_proto0_or_1_pickle
+from modelaudit.utils.file.detection import (
+    PROTO0_1_MAX_PROBE_BYTES,
+    PROTO0_1_MAX_PROBE_OPCODES,
+    PROTO0_1_TRIVIAL_LEADING_OPCODES,
+    _looks_like_proto0_or_1_pickle,
+)
 from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
@@ -151,7 +157,9 @@ _ASSET_MACHO_HEADERS = (
 _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
+_ASSET_TRIVIAL_PADDING_COMPLETE_BYTES = 2 * _ASSET_PROBE_BYTES
 _MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
+_MAX_SAVEDMODEL_TEXT_SCAN_BYTES = 10 * 1024 * 1024
 _MAX_SAVEDMODEL_META_GRAPHS = 64
 _MAX_SAVEDMODEL_GRAPH_NODES = 200_000
 _MAX_SAVEDMODEL_FUNCTIONS = 50_000
@@ -177,6 +185,80 @@ _ASSET_PYTHON_PATTERN = re.compile(
     r"|class\s+[A-Za-z_]\w*\s*[:(]"
     r"))"
 )
+
+
+def _regular_file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        _stat_mode(file_stat),
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _stat_mode(file_stat: os.stat_result) -> int:
+    return int(getattr(file_stat, "st_mode", 0) or 0)
+
+
+def _is_regular_file(file_stat: os.stat_result) -> bool:
+    return stat.S_ISREG(_stat_mode(file_stat))
+
+
+def _is_directory(file_stat: os.stat_result) -> bool:
+    return stat.S_ISDIR(_stat_mode(file_stat))
+
+
+def _is_link_like(file_stat: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(file_stat, "st_file_attributes", 0) or 0
+    return stat.S_ISLNK(_stat_mode(file_stat)) or bool(reparse_flag and file_attributes & reparse_flag)
+
+
+@contextlib.contextmanager
+def _open_bound_regular_file(path: Path, expected_stat: os.stat_result) -> Iterator[Any]:
+    """Open a regular file without reading through a changed lexical entry."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened_stat = os.fstat(descriptor)
+        if (
+            _is_link_like(expected_stat)
+            or not _is_regular_file(expected_stat)
+            or not _is_regular_file(opened_stat)
+            or _regular_file_identity(opened_stat) != _regular_file_identity(expected_stat)
+        ):
+            raise OSError("file identity changed before bounded read")
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            yield stream
+            if _regular_file_identity(os.fstat(stream.fileno())) != _regular_file_identity(expected_stat):
+                raise OSError("file identity changed during bounded read")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _is_trivial_proto0_padding_prefix(sample: bytes) -> bool:
+    """Return whether a bounded prefix is entirely harmless protocol-0 padding."""
+    opcode_count = 0
+    try:
+        for opcode, _argument, _position in pickletools.genops(sample):
+            opcode_count += 1
+            if opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                return False
+            if opcode_count > PROTO0_1_MAX_PROBE_OPCODES:
+                return False
+    except ValueError as error:
+        return opcode_count >= 2 and str(error).startswith("pickle exhausted before seeing STOP")
+    except Exception:
+        return False
+    return False
+
+
 _PYFUNC_DANGEROUS_REFERENCE_TOKENS = frozenset(
     {
         "__builtin__",
@@ -405,6 +487,27 @@ class TensorFlowSavedModelScanner(BaseScanner):
     name = "tf_savedmodel"
     description = "Scans TensorFlow SavedModel for suspicious operations"
     supported_extensions: ClassVar[list[str]] = [".pb", ""]  # Empty string for directories
+
+    @classmethod
+    def directory_owner_source_in_scope(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Bind files whose contents can be read by SavedModel directory analysis."""
+        if not relative_parts:
+            return False
+        root_name = relative_parts[0]
+        if root_name in _CORE_ROOT_ASSET_DIRS:
+            return True
+        if root_name == "variables":
+            return (
+                relative_parts[-1].lower().endswith((".txt", ".md", ".json", ".yaml", ".yml", ".py", ".cfg", ".conf"))
+            )
+        if root_name in _CORE_ROOT_MODEL_FILES:
+            return len(relative_parts) == 1 and root_name in {"saved_model.pb", "keras_metadata.pb"}
+        return root_name not in _CORE_ROOT_MODEL_DIRS
+
+    @classmethod
+    def directory_owner_source_counts_toward_limits(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Charge every owner-readable source against owner scan budgets."""
+        return cls.directory_owner_source_in_scope(relative_parts)
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -731,7 +834,14 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_saved_model_file(self, path: str) -> ScanResult:
         """Scan a single SavedModel protobuf file"""
         result = self._create_result()
-        file_size = self.get_file_size(path)
+        path_obj = Path(path)
+        try:
+            expected_stat = path_obj.lstat()
+        except OSError as error:
+            return self._finish_read_failure(result, path, error)
+        if _is_link_like(expected_stat) or not _is_regular_file(expected_stat):
+            return self._finish_read_failure(result, path, OSError("SavedModel source is not a regular file"))
+        file_size = expected_stat.st_size
         result.metadata["file_size"] = file_size
         result.metadata["scan_byte_limit"] = _MAX_PROTOBUF_PARSE_BYTES
 
@@ -754,9 +864,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
             )
             return result
 
-        # Add file integrity check for compliance
-        self.add_file_integrity_check(path, result)
-
         try:
             # Import vendored protos module (sets up sys.path for tensorflow.* imports)
             # Order matters: modelaudit.protos must be imported first to set up sys.path
@@ -764,7 +871,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
-            with open(path, "rb") as f:
+            with _open_bound_regular_file(path_obj, expected_stat) as f:
                 content = f.read(_MAX_PROTOBUF_PARSE_BYTES + 1)
                 result.bytes_scanned = min(len(content), _MAX_PROTOBUF_PARSE_BYTES)
 
@@ -781,6 +888,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     )
                     result.finish(success=False)
                     return result
+
+                self._add_bounded_file_integrity_check(path, result, content)
 
                 saved_model = SavedModel()
                 saved_model.ParseFromString(content)
@@ -899,35 +1008,63 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 ".conf",
                             ),
                         ):
-                            with Path(file_path).open(
-                                encoding="utf-8",
+                            text_path = Path(file_path)
+                            text_stat = text_path.lstat()
+                            if _is_link_like(text_stat) or not _is_regular_file(text_stat):
+                                raise OSError("blacklist source is not a regular file")
+                            with _open_bound_regular_file(text_path, text_stat) as f:
+                                content_sample = f.read(_MAX_SAVEDMODEL_TEXT_SCAN_BYTES + 1)
+                            content = content_sample[:_MAX_SAVEDMODEL_TEXT_SCAN_BYTES].decode(
+                                "utf-8",
                                 errors="ignore",
-                            ) as f:
-                                content = f.read()
-                                for pattern in self.blacklist_patterns:
-                                    if pattern in content:
-                                        result.add_check(
-                                            name="Blacklist Pattern Check",
-                                            passed=False,
-                                            message=f"Blacklisted pattern '{pattern}' found in file {redacted_file}",
-                                            severity=IssueSeverity.CRITICAL,
-                                            location=redacted_location,
-                                            rule_code="S902",
-                                            details={"pattern": pattern, "file": redacted_file},
-                                        )
+                            )
+                            for pattern in self.blacklist_patterns:
+                                if pattern in content:
+                                    result.add_check(
+                                        name="Blacklist Pattern Check",
+                                        passed=False,
+                                        message=f"Blacklisted pattern '{pattern}' found in file {redacted_file}",
+                                        severity=IssueSeverity.CRITICAL,
+                                        location=redacted_location,
+                                        rule_code="S902",
+                                        details={"pattern": pattern, "file": redacted_file},
+                                    )
+                            if len(content_sample) > _MAX_SAVEDMODEL_TEXT_SCAN_BYTES:
+                                reason = "savedmodel_blacklist_scan_size_limit"
+                                mark_inconclusive_scan_result(result, reason)
+                                mark_operational_scan_error(result, reason)
+                                result.add_check(
+                                    name="SavedModel Blacklist Scan Size Limit",
+                                    passed=False,
+                                    message=f"Text file exceeds bounded blacklist scan window: {redacted_file}",
+                                    severity=IssueSeverity.INFO,
+                                    location=redacted_location,
+                                    rule_code="S902",
+                                    details={
+                                        "file": redacted_file,
+                                        "max_scan_bytes": _MAX_SAVEDMODEL_TEXT_SCAN_BYTES,
+                                        "analysis_incomplete": True,
+                                        "scan_outcome_reason": reason,
+                                    },
+                                )
                     except Exception as e:
                         redacted_error = redact_untrusted_error_message(e)
+                        reason = "savedmodel_blacklist_file_read_failed"
+                        mark_inconclusive_scan_result(result, reason)
+                        mark_operational_scan_error(result, reason)
                         result.add_check(
                             name="File Read Check",
                             passed=False,
                             message=f"Error reading file {redacted_file}: {redacted_error}",
-                            severity=IssueSeverity.DEBUG,
+                            severity=IssueSeverity.INFO,
                             location=redacted_location,
                             rule_code="S902",
                             details={
                                 "file": redacted_file,
                                 "exception": redacted_error,
                                 "exception_type": type(e).__name__,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": reason,
                             },
                         )
 
@@ -966,7 +1103,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 )
                 continue
 
-            if stat.S_ISLNK(assets_dir_stat.st_mode):
+            if _is_link_like(assets_dir_stat):
                 result.add_check(
                     name="SavedModel Assets Security Check",
                     passed=False,
@@ -982,7 +1119,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 )
                 continue
 
-            if not stat.S_ISDIR(assets_dir_stat.st_mode):
+            if not _is_directory(assets_dir_stat):
                 continue
 
             for root, dir_names, files in os.walk(assets_dir):
@@ -1016,7 +1153,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         )
                         continue
 
-                    if stat.S_ISLNK(child_stat.st_mode):
+                    if _is_link_like(child_stat):
                         result.add_check(
                             name="SavedModel Assets Security Check",
                             passed=False,
@@ -1035,7 +1172,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         )
                         continue
 
-                    if stat.S_ISDIR(child_stat.st_mode):
+                    if _is_directory(child_stat):
                         retained_dirs.append(dir_name)
 
                 dir_names[:] = retained_dirs
@@ -1092,15 +1229,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 )
                 continue
 
-            if child_path.name in _CORE_ROOT_MODEL_FILES and stat.S_ISREG(child_stat.st_mode):
+            if child_path.name in _CORE_ROOT_MODEL_FILES and _is_regular_file(child_stat):
                 continue
-            if child_path.name in _CORE_ROOT_ASSET_DIRS and (
-                stat.S_ISDIR(child_stat.st_mode) or stat.S_ISLNK(child_stat.st_mode)
-            ):
+            if child_path.name in _CORE_ROOT_ASSET_DIRS and (_is_directory(child_stat) or _is_link_like(child_stat)):
                 continue
-            if child_path.name in _CORE_ROOT_MODEL_DIRS and stat.S_ISDIR(child_stat.st_mode):
+            if child_path.name in _CORE_ROOT_MODEL_DIRS and _is_directory(child_stat):
                 continue
-            if stat.S_ISDIR(child_stat.st_mode):
+            if _is_directory(child_stat):
                 self._scan_saved_model_supplemental_directory(model_root, child_path, result)
                 continue
 
@@ -1144,7 +1279,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     )
                     continue
 
-                if stat.S_ISLNK(child_stat.st_mode):
+                if _is_link_like(child_stat):
                     result.add_check(
                         name="SavedModel Supplemental Directory Security Check",
                         passed=False,
@@ -1163,7 +1298,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     )
                     continue
 
-                if stat.S_ISDIR(child_stat.st_mode):
+                if _is_directory(child_stat):
                     retained_dirs.append(dir_name)
 
             dir_names[:] = retained_dirs
@@ -1222,6 +1357,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
             file_stat = file_path.lstat()
         except OSError as exc:
             redacted_error = redact_untrusted_error_message(exc)
+            reason = "savedmodel_asset_read_failed"
+            mark_inconclusive_scan_result(result, reason)
+            mark_operational_scan_error(result, reason)
             result.add_check(
                 name=check_name,
                 passed=False,
@@ -1234,11 +1372,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     "asset_kind": "stat_error",
                     "exception": redacted_error,
                     "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
                 },
                 rule_code="S902",
             )
             return []
-        if stat.S_ISLNK(file_stat.st_mode):
+        if _is_link_like(file_stat):
             result.add_check(
                 name=check_name,
                 passed=False,
@@ -1254,7 +1394,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 rule_code="S902",
             )
             return []
-        if not stat.S_ISREG(file_stat.st_mode):
+        if not _is_regular_file(file_stat):
             result.add_check(
                 name=check_name,
                 passed=False,
@@ -1271,11 +1411,75 @@ class TensorFlowSavedModelScanner(BaseScanner):
             )
             return []
 
+        source_changed = False
         try:
-            with file_path.open("rb") as file_obj:
-                content_head = file_obj.read(_ASSET_PROBE_BYTES)
+            with _open_bound_regular_file(file_path, file_stat) as file_obj:
+                opened_stat = os.fstat(file_obj.fileno())
+                content_sample = file_obj.read(_ASSET_PROBE_BYTES + 1)
+                content_head = content_sample[:_ASSET_PROBE_BYTES]
+                if (
+                    opened_stat.st_size > len(content_head)
+                    and opened_stat.st_size <= _ASSET_TRIVIAL_PADDING_COMPLETE_BYTES
+                    and _is_trivial_proto0_padding_prefix(content_head)
+                ):
+                    # Resolve the narrow boundary case where a harmless opcode
+                    # prefix crosses the normal probe limit. This read remains
+                    # bounded and also exposes a payload immediately after the
+                    # otherwise-trivial padding.
+                    file_obj.seek(0)
+                    content_sample = file_obj.read(_ASSET_TRIVIAL_PADDING_COMPLETE_BYTES + 1)
+                    content_head = content_sample[:_ASSET_TRIVIAL_PADDING_COMPLETE_BYTES]
+                final_stat = os.fstat(file_obj.fileno())
+                final_file_size = final_stat.st_size
+                initial_identity = (
+                    file_stat.st_dev,
+                    file_stat.st_ino,
+                    file_stat.st_size,
+                    file_stat.st_mtime_ns,
+                    file_stat.st_ctime_ns,
+                )
+                opened_identity = (
+                    opened_stat.st_dev,
+                    opened_stat.st_ino,
+                    opened_stat.st_size,
+                    opened_stat.st_mtime_ns,
+                    opened_stat.st_ctime_ns,
+                )
+                final_identity = (
+                    final_stat.st_dev,
+                    final_stat.st_ino,
+                    final_stat.st_size,
+                    final_stat.st_mtime_ns,
+                    final_stat.st_ctime_ns,
+                )
+                source_changed = initial_identity != opened_identity or opened_identity != final_identity
         except OSError as exc:
+            if "identity changed" in str(exc):
+                try:
+                    changed_size = file_path.lstat().st_size
+                except OSError:
+                    changed_size = file_stat.st_size
+                mark_inconclusive_scan_result(result, "savedmodel_asset_source_changed")
+                mark_operational_scan_error(result, "savedmodel_asset_source_changed")
+                result.add_check(
+                    name="SavedModel Asset Source Stability",
+                    passed=False,
+                    message=f"Asset changed during bounded security analysis: {redacted_file_name}",
+                    severity=IssueSeverity.INFO,
+                    location=redacted_location,
+                    details={
+                        "file_name": redacted_file_name,
+                        "initial_size": file_stat.st_size,
+                        "final_size": changed_size,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "savedmodel_asset_source_changed",
+                    },
+                )
+                return []
             redacted_error = redact_untrusted_error_message(exc)
+            reason = "savedmodel_asset_read_failed"
+            mark_inconclusive_scan_result(result, reason)
+            mark_operational_scan_error(result, reason)
             result.add_check(
                 name=check_name,
                 passed=False,
@@ -1289,11 +1493,31 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     "size": file_stat.st_size,
                     "exception": redacted_error,
                     "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
                 },
                 rule_code="S902",
             )
             return []
-        content_head_is_prefix = file_stat.st_size > len(content_head)
+        if source_changed:
+            mark_inconclusive_scan_result(result, "savedmodel_asset_source_changed")
+            mark_operational_scan_error(result, "savedmodel_asset_source_changed")
+            result.add_check(
+                name="SavedModel Asset Source Stability",
+                passed=False,
+                message=f"Asset changed during bounded security analysis: {redacted_file_name}",
+                severity=IssueSeverity.INFO,
+                location=redacted_location,
+                details={
+                    "file_name": redacted_file_name,
+                    "initial_size": file_stat.st_size,
+                    "final_size": final_file_size,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "savedmodel_asset_source_changed",
+                },
+            )
+            return []
+        content_head_is_prefix = len(content_sample) > len(content_head) or final_file_size > len(content_head)
 
         detected_types: list[str] = []
 
@@ -1315,11 +1539,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if _looks_like_proto0_or_1_pickle(
             content_head,
             sample_is_prefix=content_head_is_prefix,
+            max_probe_opcodes=len(content_head) + 1,
         ) or (
             proto0_probe
             and _looks_like_proto0_or_1_pickle(
                 proto0_probe,
                 sample_is_prefix=content_head_is_prefix,
+                max_probe_opcodes=len(proto0_probe) + 1,
             )
         ):
             _record_detected_type("pickle_payload")
@@ -1338,8 +1564,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 location=redacted_location,
                 details={
                     "file_name": redacted_file_name,
-                    "asset_size": file_stat.st_size,
-                    "probe_bytes": _ASSET_PROBE_BYTES,
+                    "asset_size": final_file_size,
+                    "probe_bytes": len(content_head),
                     "analysis_incomplete": True,
                 },
             )
@@ -1767,7 +1993,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_keras_metadata(self, path: str, result: ScanResult, *, add_integrity_check: bool = False) -> None:
         """Scan keras_metadata.pb for Lambda layers and unsafe patterns"""
         try:
-            with open(path, "rb") as f:
+            path_obj = Path(path)
+            expected_stat = path_obj.lstat()
+            if _is_link_like(expected_stat) or not _is_regular_file(expected_stat):
+                raise OSError("Keras metadata source is not a regular file")
+            with _open_bound_regular_file(path_obj, expected_stat) as f:
                 content = f.read(_MAX_KERAS_METADATA_PARSE_BYTES + 1)
                 result.bytes_scanned += min(len(content), _MAX_KERAS_METADATA_PARSE_BYTES)
                 if len(content) > _MAX_KERAS_METADATA_PARSE_BYTES:
