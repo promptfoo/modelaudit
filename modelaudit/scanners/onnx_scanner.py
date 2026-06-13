@@ -1654,8 +1654,21 @@ def _build_onnx_weight_analysis_plan(
                 ]
                 if not next_values:
                     return None, "unresolved_quantized_weight_scale"
-                if consumer.op_type in {"Cast", "Identity"}:
-                    if consumer.op_type == "Cast":
+                if consumer.op_type in {"Add", "Cast", "Identity"}:
+                    if consumer.op_type == "Add":
+                        if scale_data_type is not None:
+                            reached_terminal = True
+                            continue
+                        add_inputs = [str(source) for source in consumer.input if source]
+                        bias_names = [source for source in add_inputs if source != value_name]
+                        if (
+                            add_inputs.count(value_name) != 1
+                            or len(bias_names) != 1
+                            or bias_names[0] not in constants
+                            or int(constants[bias_names[0]].data_type) != int(onnx.TensorProto.INT32)
+                        ):
+                            return None, "unresolved_quantized_weight_scale"
+                    elif consumer.op_type == "Cast":
                         cast_data_type = _onnx_int_attribute(consumer, "to", -1)
                         if cast_data_type not in floating_types:
                             return None, "unresolved_quantized_weight_scale"
@@ -1953,13 +1966,18 @@ def _build_onnx_weight_analysis_plan(
                 zero_point_initializer_index=zero_point_initializer_index,
                 output_data_type=output_data_type,
             )
-        elif node.op_type == "QuantizeLinear":
+        elif node.op_type in {"DynamicQuantizeLinear", "QuantizeLinear"}:
             return _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
                 shape=lineage.shape,
                 data_type=None,
                 transforms=lineage.transforms,
-                unresolved_reason=lineage.unresolved_reason or "quantize_linear_lineage_unsupported",
+                unresolved_reason=lineage.unresolved_reason
+                or (
+                    "dynamic_quantize_linear_lineage_unsupported"
+                    if node.op_type == "DynamicQuantizeLinear"
+                    else "quantize_linear_lineage_unsupported"
+                ),
                 quantization=lineage.quantization,
             )
         elif node.op_type == "Flatten":
@@ -2324,6 +2342,7 @@ def _build_onnx_weight_analysis_plan(
             supported_transform = getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type in {
                 "Cast",
                 "DequantizeLinear",
+                "DynamicQuantizeLinear",
                 "Flatten",
                 "Identity",
                 "QuantizeLinear",
@@ -2898,7 +2917,11 @@ def _build_onnx_weight_analysis_plan(
                 if not output_name:
                     continue
                 name = str(output_name)
-                per_output_lineages = dict(output_lineages)
+                per_output_lineages = (
+                    {}
+                    if supported_transform and node.op_type == "DynamicQuantizeLinear" and output_index != 0
+                    else dict(output_lineages)
+                )
                 merge_lineages(
                     per_output_lineages,
                     constant_output_lineages.get(name, {}),

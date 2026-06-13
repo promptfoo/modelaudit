@@ -1492,6 +1492,7 @@ def create_matmul_integer_weight_model(
     zero_scale: bool = False,
     weight_on_left: bool = False,
     dead_scale_branch: bool = False,
+    terminal_bias_add: bool = False,
     filename: str = "matmul-integer-weight.onnx",
 ) -> Path:
     if dead_scale_branch:
@@ -1513,7 +1514,7 @@ def create_matmul_integer_weight_model(
     X = helper.make_tensor_value_info("X", TensorProto.INT8, [100, 1] if weight_on_left else [1, 100])
     output_type = TensorProto.FLOAT if bind_scale else TensorProto.INT32
     Y = helper.make_tensor_value_info("Y", output_type, [10, 1] if weight_on_left else [1, 10])
-    matmul_output = "Y_int" if bind_scale else "Y"
+    matmul_output = "Y_int" if bind_scale or terminal_bias_add else "Y"
     matmul_inputs = (
         ["W_quantized", "X", "W_zero_point", "X_zero_point"]
         if weight_on_left
@@ -1543,6 +1544,9 @@ def create_matmul_integer_weight_model(
                 helper.make_node("Mul", ["dead_cast", "W_scale"], ["dead_scaled"]),
             ]
         )
+    elif terminal_bias_add:
+        initializers.append(onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int32), name="bias"))
+        nodes.append(helper.make_node("Add", [matmul_output, "bias"], ["Y"]))
     graph = helper.make_graph(nodes, "matmul_integer_weight_graph", [X], [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
@@ -1558,6 +1562,8 @@ def create_matmul_integer_scale_chain_model(
     *,
     vector_scale_count: int = 1,
     dynamic_scale_expression: bool = False,
+    bias_add: bool = False,
+    duplicate_add_input: bool = False,
     weight_on_left: bool = False,
     expose_raw_output: bool = False,
     cast_data_type: int = TensorProto.FLOAT,
@@ -1610,15 +1616,21 @@ def create_matmul_integer_scale_chain_model(
         if weight_on_left
         else ["X", "W_quantized", "X_zero_point", "W_zero_point"]
     )
-    nodes = [
-        helper.make_node(
-            "MatMulInteger",
-            matmul_inputs,
-            ["Y_int"],
-        ),
-        helper.make_node("Cast", ["Y_int"], ["Y_cast"], to=cast_data_type),
-        helper.make_node("Mul", ["Y_cast", "X_scale"], ["Y_activation_scaled"]),
-    ]
+    nodes = [helper.make_node("MatMulInteger", matmul_inputs, ["Y_int"])]
+    cast_input = "Y_int"
+    if bias_add:
+        initializers.append(onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int32), name="bias"))
+        nodes.append(helper.make_node("Add", ["Y_int", "bias"], ["Y_biased"]))
+        cast_input = "Y_biased"
+    elif duplicate_add_input:
+        nodes.append(helper.make_node("Add", ["Y_int", "Y_int"], ["Y_biased"]))
+        cast_input = "Y_biased"
+    nodes.extend(
+        [
+            helper.make_node("Cast", [cast_input], ["Y_cast"], to=cast_data_type),
+            helper.make_node("Mul", ["Y_cast", "X_scale"], ["Y_activation_scaled"]),
+        ],
+    )
     scale_name = "W_scale_0"
     if dynamic_scale_expression:
         inputs.append(helper.make_tensor_value_info("scale_gate", cast_data_type, list(vector_scale.shape)))
@@ -1775,6 +1787,7 @@ def create_quantize_linear_qlinear_weight_model(
     *,
     op_type: str,
     malicious: bool,
+    dynamic_quantization: bool = False,
 ) -> Path:
     if op_type == "QLinearMatMul":
         weights = np.zeros((100, 10), dtype=np.float32)
@@ -1791,14 +1804,37 @@ def create_quantize_linear_qlinear_weight_model(
 
     initializers = [
         onnx.numpy_helper.from_array(weights, name="W_float"),
-        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="W_scale"),
-        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="W_zero_point"),
         onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="X_scale"),
         onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="X_zero_point"),
         onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="Y_scale"),
         onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="Y_zero_point"),
     ]
-    nodes = [helper.make_node("QuantizeLinear", ["W_float", "W_scale", "W_zero_point"], ["W_quantized"])]
+    if dynamic_quantization:
+        weight_scale_name = "W_dynamic_scale"
+        weight_zero_point_name = "W_dynamic_zero_point"
+        nodes = [
+            helper.make_node(
+                "DynamicQuantizeLinear",
+                ["W_float"],
+                ["W_quantized", weight_scale_name, weight_zero_point_name],
+            ),
+        ]
+    else:
+        weight_scale_name = "W_scale"
+        weight_zero_point_name = "W_zero_point"
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name=weight_scale_name),
+                onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name=weight_zero_point_name),
+            ],
+        )
+        nodes = [
+            helper.make_node(
+                "QuantizeLinear",
+                ["W_float", weight_scale_name, weight_zero_point_name],
+                ["W_quantized"],
+            ),
+        ]
     if op_type == "QLinearMatMul":
         nodes.append(
             helper.make_node(
@@ -1808,8 +1844,8 @@ def create_quantize_linear_qlinear_weight_model(
                     "X_scale",
                     "X_zero_point",
                     "W_quantized",
-                    "W_scale",
-                    "W_zero_point",
+                    weight_scale_name,
+                    weight_zero_point_name,
                     "Y_scale",
                     "Y_zero_point",
                 ],
@@ -1825,8 +1861,8 @@ def create_quantize_linear_qlinear_weight_model(
                     "X_scale",
                     "X_zero_point",
                     "W_quantized",
-                    "W_scale",
-                    "W_zero_point",
+                    weight_scale_name,
+                    weight_zero_point_name,
                     "Y_scale",
                     "Y_zero_point",
                 ],
@@ -1843,7 +1879,69 @@ def create_quantize_linear_qlinear_weight_model(
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     onnx.checker.check_model(model, full_check=True)
-    path = tmp_path / f"quantize-linear-{op_type.lower()}-{'malicious' if malicious else 'benign'}.onnx"
+    quantizer_name = "dynamic-quantize-linear" if dynamic_quantization else "quantize-linear"
+    path = tmp_path / f"{quantizer_name}-{op_type.lower()}-{'malicious' if malicious else 'benign'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_dynamic_quantize_gather_weight_model(tmp_path: Path) -> Path:
+    weights = np.zeros((100, 10), dtype=np.float32)
+    weights[50:55, 3] = 25.5
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W_float"),
+        onnx.numpy_helper.from_array(np.asarray([0], dtype=np.int64), name="indices"),
+    ]
+    nodes = [
+        helper.make_node(
+            "DynamicQuantizeLinear",
+            ["W_float"],
+            ["W_quantized", "W_scale", "W_zero_point"],
+        ),
+        helper.make_node("Gather", ["W_quantized", "indices"], ["Y"], axis=0),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "dynamic_quantize_gather_weight",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.UINT8, [1, 10])],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model, full_check=True)
+    path = tmp_path / "dynamic-quantize-gather-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_custom_dynamic_quantize_name_collision_model(tmp_path: Path) -> Path:
+    weights = np.zeros((100, 10), dtype=np.float32)
+    weights[50:55, 3] = 10.0
+    nodes = [
+        helper.make_node(
+            "DynamicQuantizeLinear",
+            ["W"],
+            ["unused_0", "custom_weight", "unused_2"],
+            domain="com.test",
+        ),
+        helper.make_node("MatMul", ["X", "custom_weight"], ["Y"]),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "custom_dynamic_quantize_name_collision",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[onnx.numpy_helper.from_array(weights, name="W")],
+        value_info=[helper.make_tensor_value_info("custom_weight", TensorProto.FLOAT, [100, 10])],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("com.test", 1)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "custom-dynamic-quantize-name-collision.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -7227,6 +7325,63 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 0
         assert semantics["unresolved_lineage_samples"][0]["reason"] == "quantize_linear_lineage_unsupported"
 
+    @pytest.mark.parametrize("op_type", ["QLinearMatMul", "QLinearConv"])
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_dynamic_quantize_linear_weight_lineage_fails_closed(
+        self,
+        tmp_path: Path,
+        op_type: str,
+        malicious: bool,
+    ) -> None:
+        model_path = create_quantize_linear_qlinear_weight_model(
+            tmp_path,
+            op_type=op_type,
+            malicious=malicious,
+            dynamic_quantization=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert len(semantics["unresolved_lineage_samples"]) == 1
+        unresolved = semantics["unresolved_lineage_samples"][0]
+        assert unresolved["reason"] == "dynamic_quantize_linear_lineage_unsupported"
+        assert unresolved["consumer_input_index"] == 3
+        assert "unresolved_lineage_consumer" not in semantics["exclusion_counts"]
+
+    def test_dynamic_quantize_linear_gather_weight_fails_closed(self, tmp_path: Path) -> None:
+        model_path = create_dynamic_quantize_gather_weight_model(tmp_path)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        unresolved = semantics["unresolved_lineage_samples"][0]
+        assert unresolved["reason"] == "dynamic_quantize_linear_lineage_unsupported"
+        assert unresolved["consumer_op"] == "Gather"
+
+    def test_custom_dynamic_quantize_name_does_not_drop_weight_lineage(self, tmp_path: Path) -> None:
+        model_path = create_custom_dynamic_quantize_name_collision_model(tmp_path)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unsupported_lineage_operator"
+
     def test_matmul_integer_dead_scale_branch_cannot_suppress_anomaly(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_weight_model(
             tmp_path,
@@ -7241,6 +7396,22 @@ class TestWeightDistributionSemantics:
         checks = self._extreme_checks(result)
         assert len(checks) == 1
         assert checks[0].details["affected_neurons"] == [3]
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["eligible"][0]["quantization_scale"] is None
+
+    def test_matmul_integer_terminal_integer_bias_uses_centered_weights(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_weight_model(
+            tmp_path,
+            bind_scale=False,
+            terminal_bias_add=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 1
@@ -7276,6 +7447,34 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["analyzed_initializer_count"] == 1
         assert semantics["eligible"][0]["quantization_scale"] == "W_scale_0"
+
+    def test_matmul_integer_resolves_scale_chain_past_integer_bias(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_scale_chain_model(tmp_path, bias_add=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert len(checks) == 1
+        assert checks[0].details["outlier_neurons"] == [3]
+        context = result.metadata["onnx_weight_distribution_semantics"]["eligible"][0]
+        assert context["quantization_scale"] == "W_scale_0"
+
+    def test_matmul_integer_non_unit_add_scale_chain_fails_closed(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_scale_chain_model(tmp_path, duplicate_add_input=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
 
     @pytest.mark.parametrize(
         ("overflow_scale", "scalar_overflow", "scalar_only_scale", "widen_after_scale"),
