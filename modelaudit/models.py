@@ -830,7 +830,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         self.failed_checks = sum(1 for c in security_checks if c.status == CheckStatus.FAILED)
 
     def deduplicate_issues(self) -> None:
-        """Remove duplicate issues based on message, severity, and location."""
+        """Remove duplicate issues while preserving distinct analyzer context."""
 
         def stable_value(value: Any) -> Any:
             if isinstance(value, list | tuple):
@@ -849,11 +849,15 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             return (
                 stable_value(details.get("clustered_onnx_weight_anomaly")),
                 stable_value(details.get("cluster_size")),
+                stable_value(details.get("analysis_id")),
                 stable_value(details.get("analysis_method")),
                 stable_value(details.get("initializer")),
                 stable_value(details.get("initializer_graph_index")),
+                stable_value(details.get("stored_shape")),
                 stable_value(details.get("consumer_domain")),
                 stable_value(details.get("consumer_op")),
+                stable_value(details.get("consumer_node")),
+                stable_value(details.get("consumer_node_index")),
                 stable_value(details.get("consumer_input_index")),
                 stable_value(details.get("output_axes")),
                 stable_value(details.get("conceptual_output_axes")),
@@ -862,6 +866,14 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                 stable_value(details.get("lineage")),
                 stable_value(details.get("quantized_weight")),
                 stable_value(details.get("quantization_kind")),
+                stable_value(details.get("quantization_scale")),
+                stable_value(details.get("quantization_scale_factor_names")),
+                stable_value(details.get("quantization_zero_point")),
+                stable_value(details.get("quantization_axis")),
+                stable_value(details.get("quantization_scale_initializer_index")),
+                stable_value(details.get("quantization_scale_factor_initializer_indexes")),
+                stable_value(details.get("quantization_zero_point_initializer_index")),
+                stable_value(details.get("quantization_output_data_type")),
                 stable_value(details.get("analysis_shape")),
                 stable_value(anomaly_neurons),
                 stable_value(details.get("num_extreme_weights")),

@@ -1342,6 +1342,28 @@ def test_onnx_external_and_unknown_initializers_fail_closed_before_materializati
     ]
 
 
+def test_onnx_model_size_limit_metadata_reports_zero_analyzed_initializers(tmp_path: Path) -> None:
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    graph = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Y"])],
+        "oversized_semantic_plan",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model_path = tmp_path / "oversized-plan.onnx"
+    onnx.save(helper.make_model(graph), str(model_path))
+    scanner = WeightDistributionScanner({"max_weight_distribution_total_bytes": 1})
+
+    plan = scanner._extract_semantic_onnx_weight_plan(str(model_path))
+
+    assert plan.metadata["eligible_initializer_count"] == 0
+    assert plan.metadata["analyzed_initializer_count"] == 0
+    assert plan.metadata["analyzed_layer_count"] == 0
+    assert plan.metadata["coverage_gaps"] == {"onnx_model_size_limit": 1}
+
+
 def test_onnx_inline_storage_is_bounded_before_materialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

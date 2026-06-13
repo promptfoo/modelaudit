@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - keep strongly identified SentencePiece tokenizer `.model` artifacts, including custom-unknown models with disabled special tokens, out of XGBoost routing while preserving fail-closed `.model` ambiguity for malformed tails.
 - tolerate picklescan reports that omit private metadata
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds
-- preserve bounded ONNX quantized weight lineage coverage across QDQ and integer operator exports, fail closed on ambiguous quantization evidence or retained-copy budget exhaustion, and cluster duplicate ONNX weight anomalies only when export equivalence is proven
+- preserve bounded ONNX quantized weight lineage coverage across QDQ and integer operators, honor declared dequantization precision, fail closed on malformed quantization evidence or retained-copy budget exhaustion, and cluster duplicate weight anomalies only across byte-identical exports
 - skip PyTorch ZIP tensor storage members referenced by `data.pkl` during hidden-pickle discovery while preserving fail-closed coverage for ambiguous storage layouts
 - stream bounded PyTorch ZIP and legacy pickle metadata analysis for oversized legacy `.pt` and `.bin` shards instead of stopping at the generic read-size cap
 - distinguish PyTorch checkpoint producer-version metadata from active runtime CVE applicability, resolve runtime torch metadata only from trusted install roots, report unknown runtime applicability explicitly, carry same-revision repository SafeTensors inventory into PyTorch pickle applicability details, and preserve artifact-level pickle and tensor-structure findings

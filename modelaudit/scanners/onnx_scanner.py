@@ -208,11 +208,13 @@ _QUANTIZED_WEIGHT_OPERATORS: frozenset[str] = frozenset(
         "QuantizeLinear",
     },
 )
-_QUANTIZED_WEIGHT_CONSUMER_INPUTS: dict[str, frozenset[int]] = {
-    "ConvInteger": frozenset({1}),
-    "MatMulInteger": frozenset({1}),
-    "QLinearConv": frozenset({3}),
-    "QLinearMatMul": frozenset({3}),
+_QUANTIZED_WEIGHT_INPUT_METADATA: dict[tuple[str, int], tuple[int | None, int | None]] = {
+    ("ConvInteger", 1): (None, 3),
+    ("MatMulInteger", 0): (None, 2),
+    ("MatMulInteger", 1): (None, 3),
+    ("QLinearConv", 3): (4, 5),
+    ("QLinearMatMul", 0): (1, 2),
+    ("QLinearMatMul", 3): (4, 5),
 }
 _RECURRENT_WEIGHT_OPERATORS: frozenset[str] = frozenset({"GRU", "LSTM", "RNN"})
 _WEIGHT_COMPUTING_LINEAGE_OPERATORS: frozenset[str] = frozenset(
@@ -290,31 +292,7 @@ def _onnx_gather_axis(node: Any, rank: int) -> int | None:
 def _onnx_quantized_weight_input(node: Any, input_index: int) -> bool:
     if getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
         return False
-    return input_index in _QUANTIZED_WEIGHT_CONSUMER_INPUTS.get(str(getattr(node, "op_type", "")), frozenset())
-
-
-def _onnx_quantized_weight_scale_input_index(node: Any, input_index: int) -> int | None:
-    if node.op_type == "MatMulInteger" and input_index == 1:
-        return None
-    if node.op_type == "ConvInteger" and input_index == 1:
-        return None
-    if node.op_type == "QLinearMatMul" and input_index == 3:
-        return 4
-    if node.op_type == "QLinearConv" and input_index == 3:
-        return 4
-    return None
-
-
-def _onnx_quantized_weight_zero_point_input_index(node: Any, input_index: int) -> int | None:
-    if node.op_type == "MatMulInteger" and input_index == 1:
-        return 3
-    if node.op_type == "ConvInteger" and input_index == 1:
-        return 3
-    if node.op_type == "QLinearMatMul" and input_index == 3:
-        return 5
-    if node.op_type == "QLinearConv" and input_index == 3:
-        return 5
-    return None
+    return (str(getattr(node, "op_type", "")), input_index) in _QUANTIZED_WEIGHT_INPUT_METADATA
 
 
 def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tuple[int, ...] | None, str]:
@@ -349,6 +327,8 @@ def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tu
         if rank < 2:
             return None, "unsupported_weight_rank"
         batch_axes = tuple(range(rank - 2))
+        if input_index == 0:
+            return (*batch_axes, rank - 2), f"eligible_{op_type.lower()}_left_weight"
         return (*batch_axes, rank - 1), f"eligible_{op_type.lower()}_weight"
 
     if op_type == "Conv":
@@ -938,11 +918,15 @@ class _OnnxWeightTransform:
 @dataclass(frozen=True)
 class _OnnxWeightQuantization:
     kind: str
+    input_data_type: int | None = None
     scale_name: str | None = None
     zero_point_name: str | None = None
     axis: int | None = None
     scale_initializer_index: int | None = None
     zero_point_initializer_index: int | None = None
+    output_data_type: int | None = None
+    scale_factor_names: tuple[str, ...] = ()
+    scale_factor_initializer_indexes: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1559,11 +1543,21 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         consumers_by_value: dict[str, list[Any]],
         producers_by_value: dict[str, Any],
+        live_values: set[str],
+        graph_output_names: set[str],
     ) -> tuple[_OnnxWeightQuantization | None, str | None]:
         if lineage.quantization is not None:
             return lineage.quantization, None
         if not _onnx_quantized_weight_input(node, input_index):
             return None, None
+
+        scale_index, zero_point_index = _QUANTIZED_WEIGHT_INPUT_METADATA[(str(node.op_type), input_index)]
+        scale_name: str | None = None
+        zero_point_name: str | None = None
+        scale_initializer_index: int | None = None
+        scale_factor_names: tuple[str, ...] = ()
+        scale_factor_initializer_indexes: tuple[int, ...] = ()
+        output_data_type = int(onnx.TensorProto.FLOAT)
 
         def scale_initializer_names_in_expression(
             value_name: str,
@@ -1571,124 +1565,179 @@ def _build_onnx_weight_analysis_plan(
             depth: int = 0,
             visited: frozenset[str] = frozenset(),
         ) -> tuple[str, ...] | None:
-            if not value_name or value_name in visited:
-                return ()
-            if depth > _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT:
+            if not value_name or value_name in visited or depth > _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT:
                 return None
             if value_name in constants:
                 tensor = constants[value_name]
                 try:
-                    return (value_name,) if int(tensor.data_type) in floating_types else ()
+                    return (value_name,) if int(tensor.data_type) in floating_types else None
                 except (AttributeError, TypeError, ValueError):
-                    return ()
-
+                    return None
             producer = producers_by_value.get(value_name)
-            if producer is None:
+            if (
+                producer is not None
+                and getattr(producer, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and producer.op_type == "DynamicQuantizeLinear"
+                and len(producer.output) > 1
+                and str(producer.output[1]) == value_name
+            ):
                 return ()
-            if getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
-                return ()
-            if producer.op_type not in {"Cast", "Identity", "Mul"}:
-                return ()
-
+            if (
+                producer is None
+                or getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
+                or producer.op_type not in {"Identity", "Mul"}
+            ):
+                return None
             discovered: list[str] = []
+            discovered_by_source: list[tuple[str, ...]] = []
             next_visited = frozenset((*visited, value_name))
             for source_name in (str(source) for source in getattr(producer, "input", ()) if source):
-                source_discovered = scale_initializer_names_in_expression(
+                source_names = scale_initializer_names_in_expression(
                     source_name,
                     depth=depth + 1,
                     visited=next_visited,
                 )
-                if source_discovered is None:
+                if source_names is None:
                     return None
-                discovered.extend(source_discovered)
-            return tuple(dict.fromkeys(discovered))
+                discovered_by_source.append(source_names)
+                discovered.extend(source_names)
+            if producer.op_type == "Mul" and sum(bool(names) for names in discovered_by_source) != 1:
+                return None
+            return tuple(discovered)
 
-        def compatible_integer_scale_names(candidate_names: Iterable[str]) -> list[str]:
-            compatible: list[str] = []
-            target_shape = lineage.shape
+        def infer_authoritative_integer_scale_name() -> tuple[str | None, str | None]:
+            nonlocal output_data_type, scale_factor_names
+            live_outputs = [
+                str(output_name)
+                for output_name in getattr(node, "output", ())
+                if output_name and str(output_name) in live_values
+            ]
+            if not live_outputs or all(not consumers_by_value.get(output_name) for output_name in live_outputs):
+                return None, None
+            queue = [(output_name, 0) for output_name in live_outputs]
+            visited_values: set[str] = set()
+            visited_nodes = 0
+            scale_names: list[str] = []
+            reached_terminal = False
+            current_data_type = int(onnx.TensorProto.FLOAT)
+            scale_data_type: int | None = None
+            while queue:
+                value_name, depth = queue.pop(0)
+                if not value_name or value_name in visited_values:
+                    return None, "unresolved_quantized_weight_scale"
+                visited_values.add(value_name)
+                if depth > _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT:
+                    return None, "unresolved_quantized_weight_scale"
+                live_consumers = [
+                    consumer
+                    for consumer in consumers_by_value.get(value_name, [])
+                    if any(str(output_name) in live_values for output_name in consumer.output if output_name)
+                ]
+                if value_name in graph_output_names:
+                    if live_consumers:
+                        return None, "unresolved_quantized_weight_scale"
+                    reached_terminal = True
+                    continue
+                if len(live_consumers) != 1:
+                    return None, "unresolved_quantized_weight_scale"
+                consumer = live_consumers[0]
+                visited_nodes += 1
+                if (
+                    visited_nodes > _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT
+                    or getattr(consumer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
+                ):
+                    return None, "unresolved_quantized_weight_scale"
+                next_values = [
+                    str(output_name)
+                    for output_name in consumer.output
+                    if output_name and str(output_name) in live_values
+                ]
+                if not next_values:
+                    return None, "unresolved_quantized_weight_scale"
+                if consumer.op_type in {"Cast", "Identity"}:
+                    if consumer.op_type == "Cast":
+                        cast_data_type = _onnx_int_attribute(consumer, "to", -1)
+                        if cast_data_type not in floating_types:
+                            return None, "unresolved_quantized_weight_scale"
+                        current_data_type = cast_data_type
+                    queue.extend((output_name, depth + 1) for output_name in next_values)
+                    continue
+                if consumer.op_type != "Mul":
+                    reached_terminal = True
+                    continue
+                if scale_data_type is not None and scale_data_type != current_data_type:
+                    return None, "unresolved_quantized_weight_scale"
+                scale_data_type = current_data_type
+                output_data_type = current_data_type
+                for source_name in (str(source) for source in consumer.input if source and str(source) != value_name):
+                    source_scale_names = scale_initializer_names_in_expression(source_name)
+                    if source_scale_names is None:
+                        return None, "unresolved_quantized_weight_scale"
+                    scale_names.extend(source_scale_names)
+                queue.extend((output_name, depth + 1) for output_name in next_values)
+
+            if not reached_terminal:
+                return None, "unresolved_quantized_weight_scale"
+
             axis = output_axes[-1] if output_axes else None
-            for candidate_name in candidate_names:
+            non_scalar_names: list[str] = []
+            scale_factor_names = tuple(scale_names)
+            for candidate_name in scale_factor_names:
                 tensor = constants.get(candidate_name)
                 if tensor is None:
                     continue
                 try:
                     shape = tuple(int(dimension) for dimension in tensor.dims)
                 except (AttributeError, TypeError, ValueError):
+                    return None, "unresolved_quantized_weight_scale"
+                if math.prod(shape) == 1:
                     continue
-                if not shape or math.prod(shape) == 1:
-                    compatible.append(candidate_name)
+                if node.op_type != "MatMulInteger":
+                    return None, "unresolved_quantized_weight_scale"
+                if lineage.shape is None or axis is None or not 0 <= axis < len(lineage.shape):
+                    return None, "unresolved_quantized_weight_scale"
+                expected_shape = list(lineage.shape)
+                contraction_axis = len(expected_shape) - 1 if input_index == 0 else len(expected_shape) - 2
+                expected_shape[contraction_axis] = 1
+                if tuple(shape) == tuple(expected_shape) or (
+                    input_index == 1 and len(shape) == 1 and int(shape[0]) == int(lineage.shape[axis])
+                ):
+                    non_scalar_names.append(candidate_name)
                     continue
-                if target_shape is None or axis is None or axis < 0 or axis >= len(target_shape):
-                    continue
-                if len(shape) == 1 and int(shape[0]) == int(target_shape[axis]):
-                    compatible.append(candidate_name)
-            return compatible
-
-        def infer_integer_output_scale_name() -> tuple[str | None, str | None]:
-            queue = [(str(output_name), 0) for output_name in getattr(node, "output", ()) if output_name]
-            visited_values: set[str] = set()
-            visited_nodes = 0
-            scale_names: list[str] = []
-            while queue:
-                value_name, depth = queue.pop(0)
-                if not value_name or value_name in visited_values:
-                    continue
-                visited_values.add(value_name)
-                if depth > _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT:
-                    continue
-                for consumer in consumers_by_value.get(value_name, []):
-                    visited_nodes += 1
-                    if visited_nodes > _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT:
-                        return None, "integer_quantized_weight_scale_trace_limit"
-                    if getattr(consumer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
-                        continue
-                    if consumer.op_type in {"Cast", "Identity"}:
-                        queue.extend((str(output_name), depth + 1) for output_name in consumer.output if output_name)
-                        continue
-                    if consumer.op_type != "Mul":
-                        continue
-                    for source_name in (
-                        str(source) for source in consumer.input if source and str(source) != value_name
-                    ):
-                        source_scale_names = scale_initializer_names_in_expression(source_name)
-                        if source_scale_names is None:
-                            return None, "unsupported_integer_quantized_weight_scale"
-                        scale_names.extend(source_scale_names)
-
-            compatible_names = compatible_integer_scale_names(dict.fromkeys(scale_names))
-            non_scalar_names = [
-                name
-                for name in compatible_names
-                if constants.get(name) is not None
-                and math.prod(int(dimension) for dimension in constants[name].dims) > 1
-            ]
-            if len(non_scalar_names) == 1:
-                return non_scalar_names[0], None
-            if len(non_scalar_names) > 1:
-                return None, "ambiguous_integer_quantized_weight_scale"
-            if compatible_names:
-                return compatible_names[0], None
-            return None, "missing_quantized_weight_scale"
-
-        scale_index = _onnx_quantized_weight_scale_input_index(node, input_index)
-        zero_point_index = _onnx_quantized_weight_zero_point_input_index(node, input_index)
-        scale_name: str | None = None
-        zero_point_name: str | None = None
+                return None, "unresolved_quantized_weight_scale"
+            unique_non_scalar_names = tuple(dict.fromkeys(non_scalar_names))
+            if len(unique_non_scalar_names) > 1:
+                return None, "unresolved_quantized_weight_scale"
+            return (unique_non_scalar_names[0] if unique_non_scalar_names else None), None
 
         if scale_index is not None:
             if scale_index >= len(node.input) or not node.input[scale_index]:
                 return None, "missing_quantized_weight_scale"
             scale_name = str(node.input[scale_index])
+            if scale_name not in constants:
+                return None, "missing_quantized_weight_scale"
+            scale_initializer = constants[scale_name]
+            scale_initializer_index = initializer_object_indexes.get(id(scale_initializer))
+            if scale_initializer_index is None:
+                return None, "missing_quantized_weight_scale"
+            output_data_type = int(onnx.TensorProto.FLOAT)
         else:
-            scale_name, scale_gap = infer_integer_output_scale_name()
-            if scale_name is None:
-                return None, scale_gap or "missing_quantized_weight_scale"
-
-        if scale_name not in constants:
-            return None, "missing_quantized_weight_scale"
-        scale_initializer_index = initializer_object_indexes.get(id(constants[scale_name]))
-        if scale_initializer_index is None:
-            return None, "missing_quantized_weight_scale"
+            scale_name, scale_gap = infer_authoritative_integer_scale_name()
+            if scale_gap is not None:
+                return None, scale_gap
+            resolved_scale_factor_indexes: list[int] = []
+            for factor_name in scale_factor_names:
+                factor = constants.get(factor_name)
+                factor_index = initializer_object_indexes.get(id(factor)) if factor is not None else None
+                if factor_index is None:
+                    return None, "missing_quantized_weight_scale"
+                resolved_scale_factor_indexes.append(factor_index)
+            scale_factor_initializer_indexes = tuple(resolved_scale_factor_indexes)
+            if scale_name is not None:
+                scale_initializer = constants[scale_name]
+                scale_initializer_index = initializer_object_indexes.get(id(scale_initializer))
+                if scale_initializer_index is None:
+                    return None, "missing_quantized_weight_scale"
 
         zero_point_initializer_index: int | None = None
         if zero_point_index is not None and zero_point_index < len(node.input) and node.input[zero_point_index]:
@@ -1703,11 +1752,15 @@ def _build_onnx_weight_analysis_plan(
         return (
             _OnnxWeightQuantization(
                 kind=node.op_type,
+                input_data_type=lineage.data_type,
                 scale_name=scale_name,
                 zero_point_name=zero_point_name,
                 axis=axis,
                 scale_initializer_index=scale_initializer_index,
                 zero_point_initializer_index=zero_point_initializer_index,
+                output_data_type=output_data_type,
+                scale_factor_names=scale_factor_names,
+                scale_factor_initializer_indexes=scale_factor_initializer_indexes,
             ),
             None,
         )
@@ -1880,14 +1933,25 @@ def _build_onnx_weight_analysis_plan(
                 )
             output_shape = lineage.shape
             transform = _OnnxWeightTransform("DequantizeLinear", (axis,))
-            output_data_type = int(onnx.TensorProto.FLOAT)
+            output_data_type = _onnx_int_attribute(node, "output_dtype", 0) or int(constants[scale_name].data_type)
+            if output_data_type not in floating_types:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=lineage.shape,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unsupported_dequantize_output_dtype",
+                    quantization=lineage.quantization,
+                )
             quantization = _OnnxWeightQuantization(
                 kind="DequantizeLinear",
+                input_data_type=lineage.data_type,
                 scale_name=scale_name,
                 zero_point_name=zero_point_name,
                 axis=axis,
                 scale_initializer_index=scale_initializer_index,
                 zero_point_initializer_index=zero_point_initializer_index,
+                output_data_type=output_data_type,
             )
         elif node.op_type == "QuantizeLinear":
             return _OnnxWeightLineage(
@@ -2154,15 +2218,39 @@ def _build_onnx_weight_analysis_plan(
                 known_value_shapes[name] = tuple(int(dimension) for dimension in constant.dims)
             except (AttributeError, TypeError, ValueError):
                 continue
+        graph_nodes = tuple(getattr(current_graph, "node", ()))
+        if len(graph_nodes) > _ONNX_WEIGHT_NODE_VISIT_LIMIT - node_counter:
+            plan.record_coverage_gap("node_visit_limit")
+            return [], []
         consumers_by_value: dict[str, list[Any]] = {}
         producers_by_value: dict[str, Any] = {}
-        for graph_node in getattr(current_graph, "node", ()):
+        indexed_edge_count = 0
+        for graph_node in graph_nodes:
+            indexed_edge_count += sum(1 for input_name in graph_node.input if input_name)
+            indexed_edge_count += sum(1 for output_name in graph_node.output if output_name)
+            if indexed_edge_count > _ONNX_WEIGHT_EDGE_VISIT_LIMIT - edge_counter:
+                plan.record_coverage_gap("edge_visit_limit")
+                return [], []
             for input_name in graph_node.input:
                 if input_name:
                     consumers_by_value.setdefault(str(input_name), []).append(graph_node)
             for output_name in graph_node.output:
                 if output_name:
                     producers_by_value[str(output_name)] = graph_node
+        graph_output_names = {
+            name for output in getattr(current_graph, "output", ()) if (name := _onnx_value_name(output))
+        }
+        live_values = set(graph_output_names)
+        live_queue = list(graph_output_names)
+        while live_queue:
+            live_value = live_queue.pop()
+            producer = producers_by_value.get(live_value)
+            if producer is None:
+                continue
+            for input_name in (str(input_name) for input_name in producer.input if input_name):
+                if input_name not in live_values:
+                    live_values.add(input_name)
+                    live_queue.append(input_name)
 
         def resolve_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
@@ -2212,7 +2300,7 @@ def _build_onnx_weight_analysis_plan(
             if name and name not in value_lineages and name not in constants:
                 dynamic_values.add(name)
 
-        for local_node_index, node in enumerate(getattr(current_graph, "node", ())):
+        for local_node_index, node in enumerate(graph_nodes):
             if node_counter >= _ONNX_WEIGHT_NODE_VISIT_LIMIT:
                 plan.record_coverage_gap("node_visit_limit")
                 break
@@ -2416,6 +2504,8 @@ def _build_onnx_weight_analysis_plan(
                         constants,
                         consumers_by_value,
                         producers_by_value,
+                        live_values,
+                        graph_output_names,
                     )
                     if quantization_gap is not None:
                         record_unresolved_lineage(
@@ -3056,8 +3146,10 @@ def _build_onnx_weight_analysis_plan(
         axis: int | None,
         target_shape: tuple[int, ...],
         role: str,
+        analysis_dtype: Any,
+        allow_multidirectional_broadcast: bool,
     ) -> Any:
-        parameter = np.asarray(parameter, dtype=np.float32)
+        parameter = np.asarray(parameter, dtype=analysis_dtype)
         if role == "scale" and (not np.all(np.isfinite(parameter)) or bool(np.any(parameter <= 0))):
             raise ValueError("Quantized weight scale must be finite and positive")
         if parameter.size == 1:
@@ -3065,10 +3157,16 @@ def _build_onnx_weight_analysis_plan(
         if axis is None or axis < 0 or axis >= len(target_shape):
             raise ValueError(f"Quantized weight {role} axis is invalid")
         if parameter.ndim > 1:
-            try:
-                return np.broadcast_to(parameter, target_shape)
-            except ValueError as exc:
-                raise ValueError(f"Quantized weight {role} shape is incompatible with weight shape") from exc
+            if not allow_multidirectional_broadcast:
+                raise ValueError(f"Quantized weight {role} must be scalar or one-dimensional")
+            if parameter.ndim != len(target_shape) or axis not in {len(target_shape) - 2, len(target_shape) - 1}:
+                raise ValueError(f"Quantized weight {role} shape is incompatible with weight shape")
+            contraction_axis = len(target_shape) - 1 if axis == len(target_shape) - 2 else len(target_shape) - 2
+            expected_shape = list(target_shape)
+            expected_shape[contraction_axis] = 1
+            if tuple(int(dimension) for dimension in parameter.shape) != tuple(expected_shape):
+                raise ValueError(f"Quantized weight {role} shape is incompatible with weight shape")
+            return parameter
         if parameter.ndim != 1 or int(parameter.shape[0]) != int(target_shape[axis]):
             raise ValueError(f"Quantized weight {role} shape is incompatible with weight axis")
         broadcast_shape = [1] * len(target_shape)
@@ -3076,33 +3174,75 @@ def _build_onnx_weight_analysis_plan(
         return parameter.reshape(tuple(broadcast_shape))
 
     def materialize_quantized_weights(weights: Any, quantization: _OnnxWeightQuantization) -> Any:
-        if quantization.scale_name is None:
+        if quantization.scale_name is None and quantization.kind not in {"ConvInteger", "MatMulInteger"}:
             raise ValueError("Quantized weight scale initializer is unavailable")
         target_shape = tuple(int(dimension) for dimension in weights.shape)
-        scale = reshape_quantization_parameter(
-            load_quantization_parameter(
-                quantization.scale_initializer_index,
-                name=quantization.scale_name,
-                role="scale",
-            ),
-            axis=quantization.axis,
-            target_shape=target_shape,
-            role="scale",
+        analysis_dtype = np.dtype(
+            _tensor_data_type_to_np_dtype(quantization.output_data_type or int(onnx.TensorProto.FLOAT))
         )
-        dequantized = weights.astype(np.float32, copy=True)
-        if quantization.zero_point_name is not None:
+        allow_multidirectional_broadcast = quantization.kind in {"MatMulInteger", "QLinearMatMul"}
+        scale_factor_pairs = (
+            list(zip(quantization.scale_factor_names, quantization.scale_factor_initializer_indexes, strict=True))
+            if quantization.scale_factor_names
+            else [(quantization.scale_name, quantization.scale_initializer_index)]
+            if quantization.scale_name is not None
+            else []
+        )
+        raw_scales = [
+            load_quantization_parameter(initializer_index, name=name, role="scale")
+            for name, initializer_index in scale_factor_pairs
+        ]
+        raw_zero_point = (
+            load_quantization_parameter(
+                quantization.zero_point_initializer_index,
+                name=quantization.zero_point_name,
+                role="zero_point",
+            )
+            if quantization.zero_point_name is not None
+            else None
+        )
+        for _, scale_initializer_index in scale_factor_pairs:
+            if scale_initializer_index is None:
+                raise ValueError("Quantized weight scale initializer is unavailable")
+            scale_initializer = initializers[scale_initializer_index]
+            if int(scale_initializer.data_type) not in floating_types:
+                raise ValueError("Quantized weight scale must use a floating-point data type")
+        if quantization.zero_point_initializer_index is not None and quantization.input_data_type is not None:
+            zero_point_initializer = initializers[quantization.zero_point_initializer_index]
+            if int(zero_point_initializer.data_type) != int(quantization.input_data_type):
+                raise ValueError("Quantized weight zero point must match the weight data type")
+        if (
+            quantization.kind in {"DequantizeLinear", "QLinearConv", "QLinearMatMul"}
+            and raw_scales
+            and raw_zero_point is not None
+            and np.asarray(raw_scales[0]).shape != np.asarray(raw_zero_point).shape
+        ):
+            raise ValueError("Quantized weight scale and zero point must have matching shapes")
+        scales = [
+            reshape_quantization_parameter(
+                raw_scale,
+                axis=quantization.axis,
+                target_shape=target_shape,
+                role="scale",
+                analysis_dtype=analysis_dtype,
+                allow_multidirectional_broadcast=allow_multidirectional_broadcast,
+            )
+            for raw_scale in raw_scales
+        ]
+        dequantized = weights.astype(analysis_dtype, copy=True)
+        if raw_zero_point is not None:
             zero_point = reshape_quantization_parameter(
-                load_quantization_parameter(
-                    quantization.zero_point_initializer_index,
-                    name=quantization.zero_point_name,
-                    role="zero_point",
-                ),
+                raw_zero_point,
                 axis=quantization.axis,
                 target_shape=target_shape,
                 role="zero_point",
+                analysis_dtype=analysis_dtype,
+                allow_multidirectional_broadcast=allow_multidirectional_broadcast,
             )
-            dequantized -= zero_point
-        dequantized *= scale
+            np.subtract(dequantized, zero_point, out=dequantized, casting="unsafe")
+        for scale in scales:
+            with np.errstate(over="ignore", invalid="ignore"):
+                np.multiply(dequantized, scale, out=dequantized, casting="unsafe")
         return dequantized
 
     analyzed_initializer_indexes: set[int] = set()
@@ -3120,10 +3260,18 @@ def _build_onnx_weight_analysis_plan(
         try:
             numel = math.prod(int(dimension) for dimension in initializer.dims)
             itemsize = int(_tensor_data_type_to_np_dtype(initializer.data_type).itemsize)
-            requires_quantized_materialization = any(
-                consumer_group.quantization is not None for consumer_group in initializer_groups.values()
-            )
-            analysis_itemsize = int(np.dtype(np.float32).itemsize) if requires_quantized_materialization else itemsize
+            quantized_item_sizes = [
+                int(
+                    np.dtype(
+                        _tensor_data_type_to_np_dtype(
+                            consumer_group.quantization.output_data_type or int(onnx.TensorProto.FLOAT)
+                        )
+                    ).itemsize
+                )
+                for consumer_group in initializer_groups.values()
+                if consumer_group.quantization is not None
+            ]
+            analysis_itemsize = max([itemsize, *quantized_item_sizes])
             estimated_bytes = numel * analysis_itemsize
             if estimated_bytes < 0 or (
                 max_array_size is not None and max_array_size > 0 and estimated_bytes > max_array_size
@@ -3242,9 +3390,14 @@ def _build_onnx_weight_analysis_plan(
                         "quantization_zero_point": consumer_group.quantization.zero_point_name,
                         "quantization_axis": consumer_group.quantization.axis,
                         "quantization_scale_initializer_index": consumer_group.quantization.scale_initializer_index,
+                        "quantization_scale_factor_names": list(consumer_group.quantization.scale_factor_names),
+                        "quantization_scale_factor_initializer_indexes": list(
+                            consumer_group.quantization.scale_factor_initializer_indexes
+                        ),
                         "quantization_zero_point_initializer_index": (
                             consumer_group.quantization.zero_point_initializer_index
                         ),
+                        "quantization_output_data_type": consumer_group.quantization.output_data_type,
                     }
                     if consumer_group.quantization is not None
                     else {}

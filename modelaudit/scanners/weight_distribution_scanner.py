@@ -1564,6 +1564,7 @@ class WeightDistributionScanner(BaseScanner):
             plan.record_coverage_gap("onnx_model_size_limit")
             plan.metadata = {
                 "eligible_initializer_count": 0,
+                "analyzed_initializer_count": 0,
                 "analyzed_layer_count": 0,
                 "eligible": [],
                 "eligible_metadata_truncated": False,

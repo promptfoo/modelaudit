@@ -16,7 +16,7 @@ from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.integrations.sarif_formatter import format_sarif_output
@@ -1398,14 +1398,25 @@ def create_einsum_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
     return path
 
 
-def create_qdq_weight_model(tmp_path: Path, *, malicious: bool = False, malformed_scale: bool = False) -> Path:
+def create_qdq_weight_model(
+    tmp_path: Path,
+    *,
+    malicious: bool = False,
+    malformed_scale: bool = False,
+    full_shape_parameters: bool = False,
+) -> Path:
     weights = np.zeros((100, 10), dtype=np.int8)
     if malicious:
         weights[50:55, 3] = 100
     quantized_weight = onnx.numpy_helper.from_array(weights, name="W")
-    scale_value = np.asarray([0.1, 0.2], dtype=np.float32) if malformed_scale else np.asarray(0.1, dtype=np.float32)
+    if full_shape_parameters:
+        scale_value = np.ones(weights.shape, dtype=np.float32)
+        zero_point_value = weights.copy()
+    else:
+        scale_value = np.asarray([0.1, 0.2], dtype=np.float32) if malformed_scale else np.asarray(0.1, dtype=np.float32)
+        zero_point_value = np.asarray(0, dtype=np.int8)
     scale = onnx.numpy_helper.from_array(scale_value, name="scale")
-    zero_point = onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="zero_point")
+    zero_point = onnx.numpy_helper.from_array(zero_point_value, name="zero_point")
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
     nodes = [
@@ -1415,9 +1426,59 @@ def create_qdq_weight_model(tmp_path: Path, *, malicious: bool = False, malforme
     graph = helper.make_graph(nodes, "qdq_weight_graph", [X], [Y], initializer=[quantized_weight, scale, zero_point])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    if not malformed_scale:
+    if not (malformed_scale or full_shape_parameters):
         onnx.checker.check_model(model)
-    path = tmp_path / f"qdq-weight-{'malformed' if malformed_scale else 'malicious' if malicious else 'clean'}.onnx"
+    suffix = (
+        "full-shape"
+        if full_shape_parameters
+        else "malformed"
+        if malformed_scale
+        else "malicious"
+        if malicious
+        else "clean"
+    )
+    path = tmp_path / f"qdq-weight-{suffix}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_qdq_float16_overflow_model(tmp_path: Path, *, output_dtype: int | None) -> Path:
+    weights = np.full((100, 10), 2, dtype=np.int8)
+    scale_dtype = np.float32 if output_dtype == TensorProto.FLOAT16 else np.float16
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W"),
+        onnx.numpy_helper.from_array(np.asarray(40_000, dtype=scale_dtype), name="scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="zero_point"),
+    ]
+    dequantize_node = (
+        helper.make_node(
+            "DequantizeLinear",
+            ["W", "scale", "zero_point"],
+            ["dequantized_weight"],
+        )
+        if output_dtype is None
+        else helper.make_node(
+            "DequantizeLinear",
+            ["W", "scale", "zero_point"],
+            ["dequantized_weight"],
+            output_dtype=output_dtype,
+        )
+    )
+    nodes = [
+        dequantize_node,
+        helper.make_node("MatMul", ["X", "dequantized_weight"], ["Y"]),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "qdq_float16_overflow",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT16, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT16, [1, 10])],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 23)])
+    model.ir_version = 10
+    onnx.checker.check_model(model, full_check=True)
+    path = tmp_path / f"qdq-float16-{output_dtype if output_dtype is not None else 'inferred'}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -1429,11 +1490,18 @@ def create_matmul_integer_weight_model(
     omit_scale: bool = False,
     bind_scale: bool = True,
     zero_scale: bool = False,
+    weight_on_left: bool = False,
+    dead_scale_branch: bool = False,
     filename: str = "matmul-integer-weight.onnx",
 ) -> Path:
-    weights = np.zeros((100, 10), dtype=np.int8)
+    if dead_scale_branch:
+        bind_scale = False
+    weights = np.zeros((10, 100) if weight_on_left else (100, 10), dtype=np.int8)
     if malicious:
-        weights[50:55, 3] = 100
+        if weight_on_left:
+            weights[3, 50:55] = 100
+        else:
+            weights[50:55, 3] = 100
     initializers = [
         onnx.numpy_helper.from_array(weights, name="W_quantized"),
         onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="X_zero_point"),
@@ -1442,14 +1510,19 @@ def create_matmul_integer_weight_model(
     if not omit_scale:
         scale_value = 0.0 if zero_scale else 0.1
         initializers.append(onnx.numpy_helper.from_array(np.asarray(scale_value, dtype=np.float32), name="W_scale"))
-    X = helper.make_tensor_value_info("X", TensorProto.INT8, [1, 100])
+    X = helper.make_tensor_value_info("X", TensorProto.INT8, [100, 1] if weight_on_left else [1, 100])
     output_type = TensorProto.FLOAT if bind_scale else TensorProto.INT32
-    Y = helper.make_tensor_value_info("Y", output_type, [1, 10])
+    Y = helper.make_tensor_value_info("Y", output_type, [10, 1] if weight_on_left else [1, 10])
     matmul_output = "Y_int" if bind_scale else "Y"
+    matmul_inputs = (
+        ["W_quantized", "X", "W_zero_point", "X_zero_point"]
+        if weight_on_left
+        else ["X", "W_quantized", "X_zero_point", "W_zero_point"]
+    )
     nodes = [
         helper.make_node(
             "MatMulInteger",
-            ["X", "W_quantized", "X_zero_point", "W_zero_point"],
+            matmul_inputs,
             [matmul_output],
             name="quantized_linear",
         ),
@@ -1463,12 +1536,269 @@ def create_matmul_integer_weight_model(
                 helper.make_node("Mul", ["Y_cast", "W_scale"], ["Y"], name="quantized_linear_scale"),
             ],
         )
+    elif dead_scale_branch:
+        nodes.extend(
+            [
+                helper.make_node("Cast", ["Y"], ["dead_cast"], to=TensorProto.FLOAT),
+                helper.make_node("Mul", ["dead_cast", "W_scale"], ["dead_scaled"]),
+            ]
+        )
     graph = helper.make_graph(nodes, "matmul_integer_weight_graph", [X], [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     if not (bind_scale and omit_scale):
         onnx.checker.check_model(model)
     path = tmp_path / filename
+    onnx.save(model, str(path))
+    return path
+
+
+def create_matmul_integer_scale_chain_model(
+    tmp_path: Path,
+    *,
+    vector_scale_count: int = 1,
+    dynamic_scale_expression: bool = False,
+    weight_on_left: bool = False,
+    expose_raw_output: bool = False,
+    cast_data_type: int = TensorProto.FLOAT,
+    overflow_scale: bool = False,
+    scalar_overflow: bool = False,
+    scalar_only_scale: bool = False,
+    repeat_weight_scale: bool = False,
+    nested_static_scale_expression: bool = False,
+    cast_scale_expression: bool = False,
+    widen_after_scale: bool = False,
+) -> Path:
+    weight_shape = (10, 100) if weight_on_left else (100, 10)
+    weights = np.full(
+        weight_shape,
+        2 if overflow_scale or scalar_overflow or repeat_weight_scale else 1,
+        dtype=np.int8,
+    )
+    scale_dtype = np.float16 if cast_data_type == TensorProto.FLOAT16 else np.float32
+    vector_scale = np.full(
+        (10, 1) if weight_on_left else 10,
+        200 if repeat_weight_scale else 40_000 if overflow_scale else 1,
+        dtype=scale_dtype,
+    )
+    if not overflow_scale and not scalar_overflow and not repeat_weight_scale:
+        vector_scale[3] = 100
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W_quantized"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="W_zero_point"),
+        onnx.numpy_helper.from_array(
+            np.asarray(
+                40_000 if scalar_overflow else 1 if overflow_scale or repeat_weight_scale else 0.1,
+                dtype=scale_dtype,
+            ),
+            name="X_scale",
+        ),
+    ]
+    if not scalar_only_scale:
+        for index in range(vector_scale_count):
+            initializers.append(
+                onnx.numpy_helper.from_array(vector_scale, name=f"W_scale_{index}"),
+            )
+    if nested_static_scale_expression:
+        initializers.append(
+            onnx.numpy_helper.from_array(np.asarray(0.5, dtype=scale_dtype), name="nested_scale"),
+        )
+    inputs = [helper.make_tensor_value_info("X", TensorProto.INT8, [100, 1] if weight_on_left else [1, 100])]
+    matmul_inputs = (
+        ["W_quantized", "X", "W_zero_point", "X_zero_point"]
+        if weight_on_left
+        else ["X", "W_quantized", "X_zero_point", "W_zero_point"]
+    )
+    nodes = [
+        helper.make_node(
+            "MatMulInteger",
+            matmul_inputs,
+            ["Y_int"],
+        ),
+        helper.make_node("Cast", ["Y_int"], ["Y_cast"], to=cast_data_type),
+        helper.make_node("Mul", ["Y_cast", "X_scale"], ["Y_activation_scaled"]),
+    ]
+    scale_name = "W_scale_0"
+    if dynamic_scale_expression:
+        inputs.append(helper.make_tensor_value_info("scale_gate", cast_data_type, list(vector_scale.shape)))
+        nodes.append(helper.make_node("Mul", [scale_name, "scale_gate"], ["dynamic_weight_scale"]))
+        scale_name = "dynamic_weight_scale"
+    elif nested_static_scale_expression:
+        nodes.append(helper.make_node("Mul", [scale_name, "nested_scale"], ["nested_weight_scale"]))
+        scale_name = "nested_weight_scale"
+    elif cast_scale_expression:
+        nodes.extend(
+            [
+                helper.make_node("Cast", [scale_name], ["narrow_weight_scale"], to=TensorProto.FLOAT16),
+                helper.make_node("Cast", ["narrow_weight_scale"], ["wide_weight_scale"], to=TensorProto.FLOAT),
+            ]
+        )
+        scale_name = "wide_weight_scale"
+    for index in range(1, vector_scale_count if not scalar_only_scale else 1):
+        output_name = f"Y_weight_scaled_{index}"
+        nodes.append(helper.make_node("Mul", ["Y_activation_scaled", scale_name], [output_name]))
+        scale_name = f"W_scale_{index}"
+        nodes.append(helper.make_node("Mul", [output_name, scale_name], [f"Y_stage_{index}"]))
+        scale_name = f"Y_stage_{index}"
+    scale_chain_input = "Y_activation_scaled"
+    if repeat_weight_scale:
+        nodes.append(helper.make_node("Mul", [scale_chain_input, "W_scale_0"], ["Y_repeated_scale"]))
+        scale_chain_input = "Y_repeated_scale"
+    scale_chain_output = "Y_narrow" if widen_after_scale else "Y"
+    if scalar_only_scale:
+        nodes.append(helper.make_node("Identity", ["Y_activation_scaled"], [scale_chain_output]))
+    elif vector_scale_count == 1:
+        nodes.append(helper.make_node("Mul", [scale_chain_input, scale_name], [scale_chain_output]))
+    else:
+        nodes.append(helper.make_node("Identity", [scale_name], [scale_chain_output]))
+    if widen_after_scale:
+        nodes.append(helper.make_node("Cast", [scale_chain_output], ["Y"], to=TensorProto.FLOAT))
+    output_shape = [10, 1] if weight_on_left else [1, 10]
+    output_data_type = TensorProto.FLOAT if widen_after_scale else cast_data_type
+    outputs = [helper.make_tensor_value_info("Y", output_data_type, output_shape)]
+    if expose_raw_output:
+        outputs.append(helper.make_tensor_value_info("Y_int", TensorProto.INT32, output_shape))
+    graph = helper.make_graph(
+        nodes,
+        "matmul_integer_scale_chain",
+        inputs,
+        outputs,
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"matmul-integer-scale-chain-{'left' if weight_on_left else 'right'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_batched_matmul_integer_weight_model(tmp_path: Path) -> Path:
+    initializers = [
+        onnx.numpy_helper.from_array(np.zeros((2, 100, 10), dtype=np.int8), name="W_quantized"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(np.zeros((2, 1, 10), dtype=np.int8), name="W_zero_point"),
+    ]
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "MatMulInteger",
+                ["X", "W_quantized", "X_zero_point", "W_zero_point"],
+                ["Y"],
+            ),
+        ],
+        "batched_matmul_integer_weight",
+        [helper.make_tensor_value_info("X", TensorProto.INT8, [2, 1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.INT32, [2, 1, 10])],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "batched-matmul-integer-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_quantized_conv_weight_model(
+    tmp_path: Path,
+    *,
+    op_type: str,
+    malicious: bool,
+    per_channel: bool,
+) -> Path:
+    weights = np.zeros((10, 4, 3, 3), dtype=np.int8)
+    if malicious:
+        weights[3, 0, :2, :3] = 100
+    weight_scale = np.full(10, 0.1, dtype=np.float32) if per_channel else np.asarray(0.1, dtype=np.float32)
+    weight_zero_point = np.zeros(10, dtype=np.int8) if per_channel else np.asarray(0, dtype=np.int8)
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W_quantized"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(weight_zero_point, name="W_zero_point"),
+        onnx.numpy_helper.from_array(weight_scale, name="W_scale"),
+    ]
+    if op_type == "ConvInteger":
+        nodes = [
+            helper.make_node(
+                "ConvInteger",
+                ["X", "W_quantized", "X_zero_point", "W_zero_point"],
+                ["Y_int"],
+            ),
+            helper.make_node("Cast", ["Y_int"], ["Y_cast"], to=TensorProto.FLOAT),
+            helper.make_node("Mul", ["Y_cast", "W_scale"], ["Y"]),
+        ]
+        output_data_type = TensorProto.FLOAT
+    else:
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="X_scale"),
+                onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="Y_scale"),
+                onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="Y_zero_point"),
+            ]
+        )
+        nodes = [
+            helper.make_node(
+                "QLinearConv",
+                [
+                    "X",
+                    "X_scale",
+                    "X_zero_point",
+                    "W_quantized",
+                    "W_scale",
+                    "W_zero_point",
+                    "Y_scale",
+                    "Y_zero_point",
+                ],
+                ["Y"],
+            ),
+        ]
+        output_data_type = TensorProto.INT8
+    graph = helper.make_graph(
+        nodes,
+        f"{op_type.lower()}_weight",
+        [helper.make_tensor_value_info("X", TensorProto.INT8, [1, 4, 8, 8])],
+        [helper.make_tensor_value_info("Y", output_data_type, [1, 10, 6, 6])],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"{op_type.lower()}-{'channel' if per_channel else 'scalar'}-{malicious}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_qlinear_matmul_left_weight_model(tmp_path: Path, *, malicious: bool) -> Path:
+    weights = np.zeros((10, 100), dtype=np.uint8)
+    if malicious:
+        weights[3, 50:55] = 255
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W"),
+        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="W_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="W_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="X_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="Y_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="Y_zero_point"),
+    ]
+    node = helper.make_node(
+        "QLinearMatMul",
+        ["W", "W_scale", "W_zero_point", "X", "X_scale", "X_zero_point", "Y_scale", "Y_zero_point"],
+        ["Y"],
+    )
+    graph = helper.make_graph(
+        [node],
+        "qlinear_matmul_left_weight",
+        [helper.make_tensor_value_info("X", TensorProto.UINT8, [100, 1])],
+        [helper.make_tensor_value_info("Y", TensorProto.UINT8, [10, 1])],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    path = tmp_path / f"qlinear-matmul-left-{'malicious' if malicious else 'benign'}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -1510,7 +1840,7 @@ def create_qdq_transposed_weight_model(tmp_path: Path, *, malicious: bool = Fals
         weights[3, 50:55] = 100
     quantized_weight = onnx.numpy_helper.from_array(weights, name="W")
     scale = onnx.numpy_helper.from_array(np.linspace(0.1, 1.0, 10, dtype=np.float32), name="scale")
-    zero_point = onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="zero_point")
+    zero_point = onnx.numpy_helper.from_array(np.zeros(10, dtype=np.int8), name="zero_point")
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
     nodes = [
@@ -1537,8 +1867,8 @@ def create_qlinear_matmul_nd_scale_model(tmp_path: Path, *, malicious: bool = Fa
         onnx.numpy_helper.from_array(weights, name="W"),
         onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="X_scale"),
         onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="X_zero_point"),
-        onnx.numpy_helper.from_array(np.ones((1, 10), dtype=np.float32), name="W_scale"),
-        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="W_zero_point"),
+        onnx.numpy_helper.from_array(np.ones(10, dtype=np.float32), name="W_scale"),
+        onnx.numpy_helper.from_array(np.zeros(10, dtype=np.uint8), name="W_zero_point"),
         onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="Y_scale"),
         onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="Y_zero_point"),
     ]
@@ -1555,6 +1885,78 @@ def create_qlinear_matmul_nd_scale_model(tmp_path: Path, *, malicious: bool = Fa
     model.ir_version = 10
     onnx.checker.check_model(model)
     path = tmp_path / "qlinear-matmul-nd-scale.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_qlinear_matmul_invalid_parameter_model(tmp_path: Path, invalid_kind: str) -> Path:
+    weights = np.zeros((100, 10), dtype=np.uint8)
+    weights[50:55, 3] = 255
+    scale_value = (
+        np.ones(weights.shape, dtype=np.float32) if invalid_kind == "full_shape" else np.asarray(0.1, dtype=np.float32)
+    )
+    zero_point_value = (
+        weights
+        if invalid_kind == "full_shape"
+        else np.asarray(0, dtype=np.float32 if invalid_kind == "zero_point_dtype" else np.uint8)
+    )
+    if invalid_kind == "scale_dtype":
+        scale_value = np.asarray(1, dtype=np.uint8)
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W"),
+        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="X_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(scale_value, name="W_scale"),
+        onnx.numpy_helper.from_array(zero_point_value, name="W_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="Y_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="Y_zero_point"),
+    ]
+    node = helper.make_node(
+        "QLinearMatMul",
+        ["X", "X_scale", "X_zero_point", "W", "W_scale", "W_zero_point", "Y_scale", "Y_zero_point"],
+        ["Y"],
+    )
+    graph = helper.make_graph(
+        [node],
+        "qlinear_matmul_invalid_parameter",
+        [helper.make_tensor_value_info("X", TensorProto.UINT8, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.UINT8, [1, 10])],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    path = tmp_path / f"qlinear-matmul-invalid-{invalid_kind}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_qlinear_matmul_float16_scale_model(tmp_path: Path) -> Path:
+    weights = np.full((100, 10), 2, dtype=np.uint8)
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W"),
+        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float16), name="X_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(40_000, dtype=np.float16), name="W_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="W_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float16), name="Y_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="Y_zero_point"),
+    ]
+    node = helper.make_node(
+        "QLinearMatMul",
+        ["X", "X_scale", "X_zero_point", "W", "W_scale", "W_zero_point", "Y_scale", "Y_zero_point"],
+        ["Y"],
+    )
+    graph = helper.make_graph(
+        [node],
+        "qlinear_matmul_float16_scale",
+        [helper.make_tensor_value_info("X", TensorProto.UINT8, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.UINT8, [1, 10])],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.checker.check_model(model, full_check=True)
+    path = tmp_path / "qlinear-matmul-float16-scale.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -6616,13 +7018,20 @@ class TestWeightDistributionSemantics:
             assert checks[0].details["affected_neurons"] == [3]
             assert checks[0].details["lineage"] == ["DequantizeLinear"]
 
+    @pytest.mark.parametrize("weight_on_left", [False, True])
     @pytest.mark.parametrize("malicious", [False, True])
-    def test_matmul_integer_weight_path_is_analyzed_with_graph_bound_scale(
+    def test_matmul_integer_weight_path_uses_centered_integer_weights(
         self,
         tmp_path: Path,
         malicious: bool,
+        weight_on_left: bool,
     ) -> None:
-        model_path = create_matmul_integer_weight_model(tmp_path, malicious=malicious)
+        model_path = create_matmul_integer_weight_model(
+            tmp_path,
+            malicious=malicious,
+            bind_scale=False,
+            weight_on_left=weight_on_left,
+        )
 
         result = OnnxScanner().scan(str(model_path))
 
@@ -6636,38 +7045,223 @@ class TestWeightDistributionSemantics:
         context = semantics["eligible"][0]
         assert context["consumer_op"] == "MatMulInteger"
         assert context["quantization_kind"] == "MatMulInteger"
-        assert context["quantization_scale"] == "W_scale"
+        assert context["quantization_scale"] is None
         assert context["quantization_zero_point"] == "W_zero_point"
+        assert context["output_axis"] == int(not weight_on_left)
         assert context["analysis_materialization"] == "bounded_quantized_dequantize_copy"
         if malicious:
             assert checks[0].details["affected_neurons"] == [3]
 
-    def test_matmul_integer_loose_named_scale_fails_closed(self, tmp_path: Path) -> None:
-        model_path = create_matmul_integer_weight_model(tmp_path, bind_scale=False)
+    def test_batched_matmul_integer_per_column_zero_point_is_analyzed(self, tmp_path: Path) -> None:
+        model_path = create_batched_matmul_integer_weight_model(tmp_path)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+
+    @pytest.mark.parametrize(
+        ("op_type", "per_channel"),
+        [("ConvInteger", False), ("QLinearConv", False), ("QLinearConv", True)],
+    )
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_quantized_conv_weight_path_is_analyzed(
+        self,
+        tmp_path: Path,
+        op_type: str,
+        per_channel: bool,
+        malicious: bool,
+    ) -> None:
+        model_path = create_quantized_conv_weight_model(
+            tmp_path,
+            op_type=op_type,
+            malicious=malicious,
+            per_channel=per_channel,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        context = semantics["eligible"][0]
+        assert context["consumer_op"] == op_type
+        assert context["quantization_kind"] == op_type
+        if malicious:
+            assert checks[0].details["affected_neurons"] == [3]
+
+    def test_matmul_integer_dead_scale_branch_cannot_suppress_anomaly(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_weight_model(
+            tmp_path,
+            malicious=True,
+            dead_scale_branch=True,
+            zero_scale=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["affected_neurons"] == [3]
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["eligible"][0]["quantization_scale"] is None
+
+    @pytest.mark.parametrize(
+        ("weight_on_left", "expose_raw_output"),
+        [(False, False), (True, False)],
+    )
+    def test_matmul_integer_resolves_complete_live_scale_chain(
+        self,
+        tmp_path: Path,
+        weight_on_left: bool,
+        expose_raw_output: bool,
+    ) -> None:
+        model_path = create_matmul_integer_scale_chain_model(
+            tmp_path,
+            weight_on_left=weight_on_left,
+            expose_raw_output=expose_raw_output,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert len(checks) == 1
+        assert checks[0].details["outlier_neurons"] == [3]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["eligible"][0]["quantization_scale"] == "W_scale_0"
+
+    @pytest.mark.parametrize(
+        ("overflow_scale", "scalar_overflow", "scalar_only_scale", "widen_after_scale"),
+        [
+            (True, False, False, False),
+            (True, False, False, True),
+            (False, True, False, False),
+            (False, True, False, True),
+            (False, True, True, False),
+            (False, True, True, True),
+        ],
+    )
+    def test_matmul_integer_scale_chain_preserves_cast_precision(
+        self,
+        tmp_path: Path,
+        overflow_scale: bool,
+        scalar_overflow: bool,
+        scalar_only_scale: bool,
+        widen_after_scale: bool,
+    ) -> None:
+        model_path = create_matmul_integer_scale_chain_model(
+            tmp_path,
+            cast_data_type=TensorProto.FLOAT16,
+            overflow_scale=overflow_scale,
+            scalar_overflow=scalar_overflow,
+            scalar_only_scale=scalar_only_scale,
+            widen_after_scale=widen_after_scale,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["num_nonfinite_weights"] == 1000
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["eligible"][0]["quantization_output_data_type"] == TensorProto.FLOAT16
+        expected_scale_names = ["X_scale"] if scalar_only_scale else ["X_scale", "W_scale_0"]
+        assert semantics["eligible"][0]["quantization_scale_factor_names"] == expected_scale_names
+
+    def test_matmul_integer_scale_chain_preserves_repeated_factors(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_scale_chain_model(
+            tmp_path,
+            cast_data_type=TensorProto.FLOAT16,
+            repeat_weight_scale=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["num_nonfinite_weights"] == 1000
+        context = result.metadata["onnx_weight_distribution_semantics"]["eligible"][0]
+        assert context["quantization_scale_factor_names"] == ["X_scale", "W_scale_0", "W_scale_0"]
+
+    @pytest.mark.parametrize(
+        (
+            "vector_scale_count",
+            "dynamic_scale_expression",
+            "nested_static_scale_expression",
+            "cast_scale_expression",
+            "expose_raw_output",
+        ),
+        [
+            (2, False, False, False, False),
+            (1, True, False, False, False),
+            (1, False, True, False, False),
+            (1, False, False, True, False),
+            (1, False, False, False, True),
+        ],
+    )
+    def test_matmul_integer_unresolved_live_scale_chain_fails_closed(
+        self,
+        tmp_path: Path,
+        vector_scale_count: int,
+        dynamic_scale_expression: bool,
+        nested_static_scale_expression: bool,
+        cast_scale_expression: bool,
+        expose_raw_output: bool,
+    ) -> None:
+        model_path = create_matmul_integer_scale_chain_model(
+            tmp_path,
+            vector_scale_count=vector_scale_count,
+            dynamic_scale_expression=dynamic_scale_expression,
+            nested_static_scale_expression=nested_static_scale_expression,
+            cast_scale_expression=cast_scale_expression,
+            expose_raw_output=expose_raw_output,
+        )
 
         result = OnnxScanner().scan(str(model_path))
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         assert result.success is False
         assert len(coverage) == 1
-        assert coverage[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
         semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_initializer_count"] == 0
-        assert semantics["unresolved_lineage_samples"][0]["reason"] == "missing_quantized_weight_scale"
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
 
-    def test_matmul_integer_zero_graph_bound_scale_fails_closed(self, tmp_path: Path) -> None:
-        model_path = create_matmul_integer_weight_model(tmp_path, malicious=True, zero_scale=True)
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_qlinear_matmul_left_weight_is_analyzed(self, tmp_path: Path, malicious: bool) -> None:
+        model_path = create_qlinear_matmul_left_weight_model(tmp_path, malicious=malicious)
 
         result = OnnxScanner().scan(str(model_path))
 
-        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
-        assert result.success is False
-        assert len(coverage) == 1
-        assert coverage[0].details["extraction_failures"] == 1
+        assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 1
-        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["analyzed_initializer_count"] == 1
+        context = semantics["eligible"][0]
+        assert context["consumer_op"] == "QLinearMatMul"
+        assert context["consumer_input_index"] == 0
+        assert context["output_axis"] == 0
+        assert context["quantization_scale"] == "W_scale"
+        if malicious:
+            assert checks[0].details["affected_neurons"] == [3]
 
     def test_qdq_malformed_scale_shape_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_qdq_weight_model(tmp_path, malformed_scale=True)
@@ -6681,6 +7275,40 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_initializer_count"] == 0
+
+    def test_qdq_full_shape_parameters_fail_closed(self, tmp_path: Path) -> None:
+        model_path = create_qdq_weight_model(tmp_path, malicious=True, full_shape_parameters=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["extraction_failures"] == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+
+    @pytest.mark.parametrize("output_dtype", [None, TensorProto.FLOAT16, 0])
+    def test_qdq_float16_precision_preserves_nonfinite_weights(
+        self,
+        tmp_path: Path,
+        output_dtype: int | None,
+    ) -> None:
+        model_path = create_qdq_float16_overflow_model(
+            tmp_path,
+            output_dtype=output_dtype,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["num_nonfinite_weights"] == 1000
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["eligible"][0]["quantization_output_data_type"] == TensorProto.FLOAT16
 
     @pytest.mark.parametrize("data_type", [TensorProto.INT4, TensorProto.UINT4])
     @pytest.mark.parametrize("malicious", [False, True])
@@ -6754,6 +7382,30 @@ class TestWeightDistributionSemantics:
         context = semantics["eligible"][0]
         assert context["consumer_op"] == "QLinearMatMul"
         assert context["quantization_scale"] == "W_scale"
+
+    @pytest.mark.parametrize("invalid_kind", ["full_shape", "zero_point_dtype", "scale_dtype"])
+    def test_qlinear_matmul_invalid_parameters_fail_closed(self, tmp_path: Path, invalid_kind: str) -> None:
+        model_path = create_qlinear_matmul_invalid_parameter_model(tmp_path, invalid_kind)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["extraction_failures"] == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 0
+
+    def test_qlinear_matmul_float16_scale_uses_float32_analysis(self, tmp_path: Path) -> None:
+        model_path = create_qlinear_matmul_float16_scale_model(tmp_path)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["eligible"][0]["quantization_output_data_type"] == TensorProto.FLOAT
 
     def test_quantized_lineage_self_overwrite_cycle_is_bounded(self, tmp_path: Path) -> None:
         weights = np.zeros((100, 10), dtype=np.int8)
@@ -7300,6 +7952,59 @@ class TestWeightDistributionSemantics:
 
         clustered = [issue for issue in aggregate.issues if issue.details.get("clustered_onnx_weight_anomaly") is True]
         assert clustered == []
+
+    def test_streaming_does_not_cluster_distinct_file_hashes_with_same_signature(self, tmp_path: Path) -> None:
+        positive_weights = np.zeros((100, 10), dtype=np.float32)
+        positive_weights[50:55, 3] = 10.0
+        negative_weights = np.zeros((100, 10), dtype=np.float32)
+        negative_weights[10:15, 3] = -10.0
+        positive = create_onnx_weight_model(
+            tmp_path,
+            positive_weights,
+            op_type="MatMul",
+            filename="stream-positive.onnx",
+        )
+        negative = create_onnx_weight_model(
+            tmp_path,
+            negative_weights,
+            op_type="MatMul",
+            filename="stream-negative.onnx",
+        )
+
+        aggregate = scan_model_streaming(
+            iter([(positive, False), (negative, True)]),
+            delete_after_scan=False,
+            scanners=["onnx"],
+            cache_enabled=False,
+        )
+
+        clustered = [issue for issue in aggregate.issues if issue.details.get("clustered_onnx_weight_anomaly") is True]
+        assert clustered == []
+        assert {
+            metadata.file_hashes.sha256
+            for metadata in aggregate.file_metadata.values()
+            if metadata.file_hashes is not None
+        } == {compute_sha256_hash(positive), compute_sha256_hash(negative)}
+
+    def test_aggregate_preserves_distinct_analysis_groups_within_one_file(self, tmp_path: Path) -> None:
+        model_path = create_qlinear_matmul_group_fanout_model(tmp_path, consumer_count=2)
+
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["onnx"],
+            cache_enabled=False,
+        )
+
+        clustered = [issue for issue in aggregate.issues if issue.details.get("clustered_onnx_weight_anomaly") is True]
+        assert clustered == []
+        weight_issues = [
+            issue
+            for issue in aggregate.issues
+            if issue.type == "onnx_check"
+            and ("affected_neurons" in issue.details or "outlier_neurons" in issue.details)
+        ]
+        assert len(weight_issues) == 4
+        assert {issue.details["quantization_scale"] for issue in weight_issues} == {"W_scale_0", "W_scale_1"}
 
     @pytest.mark.integration
     def test_hf_minilm_pinned_quantized_export_has_bounded_lineage_coverage(self, tmp_path: Path) -> None:

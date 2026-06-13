@@ -1858,7 +1858,6 @@ def _reconcile_cross_directory_shard_coverage(
 
 
 _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT = 20
-_ONNX_WEIGHT_CLUSTER_HASH_GROUP_LIMIT = 20
 
 
 def _stable_cluster_value(value: Any) -> Any:
@@ -1876,6 +1875,8 @@ def _onnx_weight_anomaly_cluster_key(
 ) -> tuple[Any, ...] | None:
     if getattr(issue, "type", None) != "onnx_check":
         return None
+    if not content_hash:
+        return None
     details = issue.details if isinstance(issue.details, dict) else {}
     required_fields = ("initializer", "consumer_op", "analysis_shape")
     if not all(field in details for field in required_fields):
@@ -1887,12 +1888,15 @@ def _onnx_weight_anomaly_cluster_key(
         issue.message,
         issue.severity,
         content_hash,
+        _stable_cluster_value(details.get("analysis_id")),
         _stable_cluster_value(details.get("analysis_method")),
         _stable_cluster_value(details.get("initializer")),
         _stable_cluster_value(details.get("initializer_graph_index")),
         _stable_cluster_value(details.get("stored_shape")),
         _stable_cluster_value(details.get("consumer_domain")),
         _stable_cluster_value(details.get("consumer_op")),
+        _stable_cluster_value(details.get("consumer_node")),
+        _stable_cluster_value(details.get("consumer_node_index")),
         _stable_cluster_value(details.get("consumer_input_index")),
         _stable_cluster_value(details.get("output_axes")),
         _stable_cluster_value(details.get("conceptual_output_axes")),
@@ -1901,6 +1905,14 @@ def _onnx_weight_anomaly_cluster_key(
         _stable_cluster_value(details.get("lineage")),
         _stable_cluster_value(details.get("quantized_weight")),
         _stable_cluster_value(details.get("quantization_kind")),
+        _stable_cluster_value(details.get("quantization_scale")),
+        _stable_cluster_value(details.get("quantization_scale_factor_names")),
+        _stable_cluster_value(details.get("quantization_zero_point")),
+        _stable_cluster_value(details.get("quantization_axis")),
+        _stable_cluster_value(details.get("quantization_scale_initializer_index")),
+        _stable_cluster_value(details.get("quantization_scale_factor_initializer_indexes")),
+        _stable_cluster_value(details.get("quantization_zero_point_initializer_index")),
+        _stable_cluster_value(details.get("quantization_output_data_type")),
         _stable_cluster_value(details.get("analysis_shape")),
         _stable_cluster_value(anomaly_neurons),
         _stable_cluster_value(details.get("num_extreme_weights")),
@@ -1918,7 +1930,13 @@ def _file_content_hash(results: ModelAuditResultModel, location: str | None) -> 
         return None
     metadata_dict = metadata.model_dump(mode="python") if hasattr(metadata, "model_dump") else dict(metadata)
     content_hash = metadata_dict.get("content_hash")
-    return content_hash if isinstance(content_hash, str) else None
+    if isinstance(content_hash, str) and content_hash:
+        return content_hash
+    file_hashes = metadata_dict.get("file_hashes")
+    if isinstance(file_hashes, dict):
+        sha256 = file_hashes.get("sha256")
+        return sha256 if isinstance(sha256, str) and sha256 else None
+    return None
 
 
 def _onnx_weight_anomaly_provenance(results: ModelAuditResultModel, issue: Issue) -> dict[str, Any]:
@@ -1936,6 +1954,11 @@ def _onnx_weight_anomaly_provenance(results: ModelAuditResultModel, issue: Issue
         "output_axes": details.get("output_axes"),
         "analysis_id": details.get("analysis_id"),
         "quantization_kind": details.get("quantization_kind"),
+        "quantization_scale": details.get("quantization_scale"),
+        "quantization_scale_factor_names": details.get("quantization_scale_factor_names"),
+        "quantization_scale_factor_initializer_indexes": details.get("quantization_scale_factor_initializer_indexes"),
+        "quantization_zero_point": details.get("quantization_zero_point"),
+        "quantization_axis": details.get("quantization_axis"),
     }
 
 
@@ -1946,7 +1969,10 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
         if key is not None:
             clusters.setdefault(key, []).append(issue)
 
-    if not any(len(cluster) > 1 for cluster in clusters.values()):
+    def is_export_cluster(cluster: list[Issue]) -> bool:
+        return len({issue.location for issue in cluster if issue.location}) > 1
+
+    if not any(is_export_cluster(cluster) for cluster in clusters.values()):
         return
 
     emitted: set[tuple[Any, ...]] = set()
@@ -1957,7 +1983,7 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
             retained_issues.append(issue)
             continue
         cluster = clusters[key]
-        if len(cluster) == 1:
+        if not is_export_cluster(cluster):
             retained_issues.append(issue)
             continue
         if key in emitted:
@@ -1966,11 +1992,8 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
 
         representative = cluster[0]
         provenance = [_onnx_weight_anomaly_provenance(results, clustered) for clustered in cluster]
-        hash_groups: dict[str, list[str | None]] = {}
-        for item in provenance:
-            content_hash = item.get("content_hash")
-            if isinstance(content_hash, str):
-                hash_groups.setdefault(content_hash, []).append(item.get("file"))
+        content_hash = _file_content_hash(results, representative.location)
+        files = [item.get("file") for item in provenance]
         byte_identical_groups = [
             {
                 "content_hash": content_hash,
@@ -1978,8 +2001,6 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
                 "files": files[:_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT],
                 "files_truncated": len(files) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
             }
-            for content_hash, files in sorted(hash_groups.items())
-            if len(files) > 1
         ]
 
         details = dict(representative.details)
@@ -1990,14 +2011,13 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
                 "representative_file": representative.location,
                 "export_provenance": provenance[:_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT],
                 "export_provenance_truncated": len(provenance) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
-                "byte_identical_export_groups": byte_identical_groups[:_ONNX_WEIGHT_CLUSTER_HASH_GROUP_LIMIT],
-                "byte_identical_export_groups_truncated": len(byte_identical_groups)
-                > _ONNX_WEIGHT_CLUSTER_HASH_GROUP_LIMIT,
+                "byte_identical_export_groups": byte_identical_groups,
+                "byte_identical_export_groups_truncated": False,
             }
         )
         retained_issues.append(
             Issue(
-                message=f"{representative.message} (clustered across {len(cluster)} equivalent ONNX exports)",
+                message=f"{representative.message} (clustered across {len(cluster)} byte-identical ONNX exports)",
                 severity=representative.severity,
                 location=representative.location,
                 details=details,
