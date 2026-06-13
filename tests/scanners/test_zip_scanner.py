@@ -10909,13 +10909,23 @@ class TestZipScanner:
             f"Expected critical os/posix.system issue, got: {critical_messages}"
         )
 
-    def test_scan_zip_routes_legal_text_member_to_text_scanner(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(
+                b"MIT License\n\nCopyright (c) 2026 Example\nPermission is hereby granted.\n",
+                id="standard-license",
+            ),
+            pytest.param(
+                b"Copyright notice.\nMIT License\nPermission is hereby granted.\n",
+                id="ordinary-copyright-notice",
+            ),
+        ],
+    )
+    def test_scan_zip_routes_legal_text_member_to_text_scanner(self, tmp_path: Path, payload: bytes) -> None:
         archive_path = tmp_path / "legal_text_member.zip"
         with zipfile.ZipFile(archive_path, "w") as z:
-            z.writestr(
-                "LICENSE",
-                "MIT License\n\nCopyright (c) 2026 Example\nPermission is hereby granted.\n",
-            )
+            z.writestr("LICENSE", payload)
 
         result = self.scanner.scan(str(archive_path))
 
@@ -11276,14 +11286,39 @@ class TestZipScanner:
             issue.rule_code == "S201" and issue.details.get("zip_entry") == member_name for issue in result.issues
         )
 
-    def test_scan_zip_reports_import_only_global_in_backslash_license_member(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("payload", "expected_import_reference"),
+        [
+            pytest.param(
+                b"(cmystery_module\nthing\nS'MIT License'\nl.",
+                "mystery_module.thing",
+                id="complete-stream",
+            ),
+            pytest.param(
+                b"cmystery_module\nthing\n.MIT License\nCopyright Example\n",
+                "mystery_module.thing",
+                id="complete-prefix-with-trailing-prose",
+            ),
+            pytest.param(
+                b"copyright\nnotice\n.\nMIT License\n",
+                "opyright.notice",
+                id="legal-looking-GLOBAL-operands",
+            ),
+        ],
+    )
+    def test_scan_zip_reports_import_only_global_in_backslash_license_member(
+        self,
+        tmp_path: Path,
+        payload: bytes,
+        expected_import_reference: str,
+    ) -> None:
         archive_path = tmp_path / "import_only_global.zip"
         member_name = r"docs\LICENSE"
         with zipfile.ZipFile(archive_path, "w") as archive:
             _writestr_preserving_member_name(
                 archive,
                 member_name,
-                b"(cmystery_module\nthing\nS'MIT License'\nl.",
+                payload,
             )
 
         result = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
@@ -11293,7 +11328,7 @@ class TestZipScanner:
             issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
             and issue.location == f"{archive_path}:{member_name}"
             and issue.details.get("zip_entry") == member_name
-            and issue.details.get("import_reference") == "mystery_module.thing"
+            and issue.details.get("import_reference") == expected_import_reference
             for issue in result.issues
         )
 

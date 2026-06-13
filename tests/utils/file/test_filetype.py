@@ -7,7 +7,9 @@ import json
 import lzma
 import pickle
 import struct
+import sys
 import tarfile
+import types
 import zipfile
 import zlib
 from collections.abc import Callable
@@ -3655,7 +3657,7 @@ def test_oversized_nonlegal_name_does_not_trigger_legal_fail_closed(tmp_path: Pa
 def test_detect_file_format_keeps_global_shaped_non_pickle_prose_on_text_route(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     path.write_bytes(
-        b"copyright\nnotice\n.\n"
+        b"Copyright notice.\n"
         b"MIT License\nPermission is hereby granted.\n"
         b"The documentation may mention cwebbrowser\nopen\nas prose without containing a complete pickle stream.\n"
     )
@@ -3665,10 +3667,28 @@ def test_detect_file_format_keeps_global_shaped_non_pickle_prose_on_text_route(t
     assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
+def test_legal_text_global_collision_is_a_valid_pickle(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = b"copyright\nnotice\n.\nMIT License\n"
+    module = types.ModuleType("opyright")
+    sentinel = object()
+    module.__dict__["notice"] = sentinel
+    monkeypatch.setitem(sys.modules, "opyright", module)
+
+    assert pickle.loads(payload) is sentinel
+
+
 @pytest.mark.parametrize(
     "payload",
     [
         pytest.param(b"(cmystery_module\nthing\nS'MIT License'\nl.", id="GLOBAL-nonallowlisted"),
+        pytest.param(
+            b"cmystery_module\nthing\n.MIT License\nCopyright Example\n",
+            id="GLOBAL-nonallowlisted-trailing-prose",
+        ),
+        pytest.param(
+            b"copyright\nnotice\n.\nMIT License\n",
+            id="GLOBAL-legal-looking-operands",
+        ),
         pytest.param(b"(VMIT License\nimystery_module\nthing\n.", id="INST-nonallowlisted"),
         pytest.param(b"(cbuiltins\nset\nS'MIT License'\nl.", id="GLOBAL-allowlisted"),
     ],

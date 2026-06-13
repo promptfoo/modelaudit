@@ -683,16 +683,51 @@ def test_scan_file_keeps_malicious_pickle_named_license_on_pickle_route(tmp_path
     assert _has_pickle_execution_finding(result)
 
 
-def test_scan_file_reports_import_only_global_in_protocol0_license(tmp_path: Path) -> None:
+def test_scan_file_keeps_ordinary_copyright_notice_on_text_route(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
-    path.write_bytes(b"(cmystery_module\nthing\nS'MIT License'\nl.")
+    path.write_bytes(b"Copyright notice.\nMIT License\nPermission is hereby granted.\n")
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.scanner_names == ["text"]
+    assert determine_exit_code(result) == 0
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_import_reference"),
+    [
+        pytest.param(
+            b"(cmystery_module\nthing\nS'MIT License'\nl.",
+            "mystery_module.thing",
+            id="complete-stream",
+        ),
+        pytest.param(
+            b"cmystery_module\nthing\n.MIT License\nCopyright Example\n",
+            "mystery_module.thing",
+            id="complete-prefix-with-trailing-prose",
+        ),
+        pytest.param(
+            b"copyright\nnotice\n.\nMIT License\n",
+            "opyright.notice",
+            id="legal-looking-GLOBAL-operands",
+        ),
+    ],
+)
+def test_scan_file_reports_import_only_global_in_protocol0_license(
+    tmp_path: Path,
+    payload: bytes,
+    expected_import_reference: str,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
 
     result = scan_model_directory_or_file(str(path), cache_enabled=False)
 
     assert result.scanner_names == ["pickle"]
     assert determine_exit_code(result) == 1
     assert any(
-        issue.rule_code == "NON_ALLOWLISTED_GLOBAL" and issue.details.get("import_reference") == "mystery_module.thing"
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == expected_import_reference
         for issue in result.issues
     )
 

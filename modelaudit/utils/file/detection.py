@@ -5759,13 +5759,12 @@ def _legal_text_pickle_prefix_route(
         trailing_opcode = _PICKLE_OPCODE_BY_BYTE.get(trailing[0])
         if trailing_opcode is not None and trailing_opcode.name in _BINARY_PICKLE_SECURITY_OPCODES:
             return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    has_complete_global_reference = bool(global_arguments) and not trailing
-    has_suspicious_global = any(_is_suspicious_pickle_global(module, name) for module, name in global_arguments)
+    has_import_reference = bool(global_arguments)
     has_invocation = bool(opcodes & _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES.difference({"GLOBAL"}))
     has_non_global_nontrivial_opcode = any(
         opcode != "STOP" and opcode != "GLOBAL" and opcode not in PROTO0_1_TRIVIAL_LEADING_OPCODES for opcode in opcodes
     )
-    if has_invocation or has_complete_global_reference or has_suspicious_global or has_non_global_nontrivial_opcode:
+    if has_import_reference or has_invocation or has_non_global_nontrivial_opcode:
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if embedded else "pickle"
     return None
 
