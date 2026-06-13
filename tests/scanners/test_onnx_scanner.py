@@ -2255,6 +2255,31 @@ def create_concat_weight_lineage_model(tmp_path: Path, *, dynamic_right: bool = 
     return path
 
 
+def create_flat_concat_weight_lineage_model(tmp_path: Path) -> Path:
+    graph = helper.make_graph(
+        [
+            helper.make_node("Concat", ["W_left", "W_right"], ["W_flat"], axis=0),
+            helper.make_node("Reshape", ["W_flat", "W_shape"], ["W"]),
+            helper.make_node("MatMul", ["X", "W"], ["Y"]),
+        ],
+        "flat_concat_weight_lineage",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[
+            onnx.numpy_helper.from_array(np.zeros(500, dtype=np.float32), name="W_left"),
+            onnx.numpy_helper.from_array(np.zeros(500, dtype=np.float32), name="W_right"),
+            onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="W_shape"),
+        ],
+        value_info=[helper.make_tensor_value_info("W_flat", TensorProto.FLOAT, [1000])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "flat-concat-weight-lineage.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
 def create_qdq_transposed_weight_model(tmp_path: Path, *, malicious: bool = False) -> Path:
     weights = np.zeros((10, 100), dtype=np.int8)
     if malicious:
@@ -7706,6 +7731,18 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_initializer_count"] == 0
         assert {sample["reason"] for sample in semantics["unresolved_lineage_samples"]} == {"dynamic_input_lineage"}
+
+    def test_flat_concat_weight_lineage_survives_reshape_and_fails_closed(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(create_flat_concat_weight_lineage_model(tmp_path)))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] == 2
+        assert semantics["analyzed_initializer_count"] == 0
+        assert {sample["reason"] for sample in semantics["unresolved_lineage_samples"]} == {
+            "unsupported_lineage_operator"
+        }
+        assert {sample["consumer_op"] for sample in semantics["unresolved_lineage_samples"]} == {"MatMul"}
 
     def test_matmul_integer_dead_scale_branch_cannot_suppress_anomaly(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_weight_model(

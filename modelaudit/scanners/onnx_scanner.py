@@ -2759,7 +2759,6 @@ def _build_onnx_weight_analysis_plan(
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                     and node.op_type == "Concat"
-                    and any(shape is None or len(shape) >= 2 for shape in concat_output_shapes)
                     and not (
                         same_type_elementwise
                         or same_type_unary_elementwise
