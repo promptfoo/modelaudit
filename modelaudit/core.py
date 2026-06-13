@@ -6423,8 +6423,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     should_validate_gzip_tar_tail = (
         format_probe_error is None
         and ext == ".nemo"
-        and (header_format == "gzip" or magic_format == "gzip")
-        and header_format in {"gzip", "nemo", "tar"}
+        and (header_format in {"gzip", "nemo", "tar"} or magic_format in {"gzip", "nemo", "tar"})
     )
     gzip_tar_trailing_status = (
         _gzip_tar_trailing_status_for_config(path, config) if should_validate_gzip_tar_tail else None

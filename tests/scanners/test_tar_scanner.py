@@ -154,6 +154,12 @@ class TestTarScanner:
             os.unlink(tmp_path_bz2)
             os.unlink(tmp_path_gzip_pickle)
 
+    def test_can_handle_corrupt_gzip_returns_false(self, tmp_path: Path) -> None:
+        path = tmp_path / "corrupt.tar.gz"
+        path.write_bytes(b"\x1f\x8b\x08\x00corrupt-deflate")
+
+        assert TarScanner.can_handle(str(path)) is False
+
     def test_scan_simple_tar(self):
         """Test scanning a simple TAR file with text files"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:

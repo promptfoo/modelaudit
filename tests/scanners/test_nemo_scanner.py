@@ -553,16 +553,19 @@ class TestNemoScannerBasic:
         finally:
             reset_cache_manager()
 
-    def test_truncated_gzip_nemo_keeps_nemo_ownership_when_header_stays_gzip(
+    @pytest.mark.parametrize("route_format", ["gzip", "nemo"])
+    def test_truncated_gzip_nemo_keeps_nemo_ownership_for_content_routes(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        route_format: Literal["gzip", "nemo"],
     ) -> None:
-        """Retained gzip headers with invalid TAR tails still fail closed as NeMo-owned scans."""
-        path = tmp_path / "truncated-retained-gzip.nemo"
+        """Recognized content routes with invalid gzip tails fail closed as NeMo-owned scans."""
+        path = tmp_path / f"truncated-{route_format}-route.nemo"
         payload = _build_nemo_tar_bytes(b"model:\n  _target_: nemo.Model\n")
         path.write_bytes(payload[:-1])
-        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: "gzip")
+        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: route_format)
+        monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", lambda _path: route_format)
 
         direct_result = scan_file(str(path), config={"cache_scan_results": False})
         aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
@@ -577,6 +580,7 @@ class TestNemoScannerBasic:
         assert integrity_checks
         assert integrity_checks[0].rule_code == "S902"
         assert "could not be fully validated" in integrity_checks[0].message
+        assert integrity_checks[0].details["stream_tail_status"] == "invalid"
         assert aggregate_result.scanner_names == ["nemo"]
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) == 2

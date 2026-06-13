@@ -12,6 +12,7 @@ import os
 import re
 import tarfile
 import tempfile
+import zlib
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -801,7 +802,7 @@ class TarScanner(BaseScanner):
                 if compression_codec == "xz":
                     with lzma.LZMAFile(raw, mode="rb") as stream:
                         return stream.read(_TAR_HEADER_PROBE_BYTES)
-        except (EOFError, OSError, lzma.LZMAError):
+        except (EOFError, OSError, lzma.LZMAError, zlib.error):
             return None
         return None
 
