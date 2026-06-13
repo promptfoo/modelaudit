@@ -1854,14 +1854,14 @@ def create_declared_shape_metadata_model(tmp_path: Path) -> Path:
     return path
 
 
-def create_constant_of_shape_weight_model(tmp_path: Path) -> Path:
+def create_constant_of_shape_weight_model(tmp_path: Path, *, fill_value: float = 0.0) -> Path:
     graph = helper.make_graph(
         [
             helper.make_node(
                 "ConstantOfShape",
                 ["shape"],
                 ["W"],
-                value=helper.make_tensor("fill", TensorProto.FLOAT, [1], [0.0]),
+                value=helper.make_tensor("fill", TensorProto.FLOAT, [1], [fill_value]),
             ),
             helper.make_node("MatMul", ["X", "W"], ["Y"]),
         ],
@@ -1874,7 +1874,7 @@ def create_constant_of_shape_weight_model(tmp_path: Path) -> Path:
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / "constant-of-shape-weight.onnx"
+    path = tmp_path / f"constant-of-shape-weight-{fill_value}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -8081,6 +8081,17 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible_initializer_count"] == 0
         assert semantics["analyzed_initializer_count"] == 0
         assert semantics["coverage_gaps"] == {}
+
+    def test_nonzero_constant_of_shape_weight_fails_closed_without_promoting_dimensions(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(create_constant_of_shape_weight_model(tmp_path, fill_value=100.0)))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        assert semantics["unresolved_lineage_samples"][0]["initializer"] == "W"
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "generated_constant_of_shape_lineage"
 
     def test_matmul_integer_non_unit_add_scale_chain_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_scale_chain_model(tmp_path, duplicate_add_input=True)

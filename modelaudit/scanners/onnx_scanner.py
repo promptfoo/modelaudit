@@ -2932,6 +2932,52 @@ def _build_onnx_weight_analysis_plan(
                             unresolved_reason=unresolved_reason,
                         )
 
+            if (
+                is_registered_standard_operator
+                and not is_model_local_function
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type == "ConstantOfShape"
+            ):
+                value_attributes = [attribute for attribute in node.attribute if attribute.name == "value"]
+                fill_is_zero = not value_attributes
+                if len(value_attributes) == 1:
+                    resolved_value = resolve_attribute(value_attributes[0])
+                    if resolved_value is not None:
+                        try:
+                            fill_tensor = resolved_value.t
+                            fill_is_zero = (
+                                resolved_value.HasField("t")
+                                and math.prod(int(dimension) for dimension in fill_tensor.dims) == 1
+                                and not _onnx_tensor_uses_external_storage(fill_tensor, onnx=onnx)
+                                and _onnx_inline_storage_nbytes(fill_tensor)
+                                <= _onnx_tensor_expected_storage_nbytes(fill_tensor, onnx=onnx)
+                                and bool(onnx.numpy_helper.to_array(fill_tensor).reshape(-1)[0] == 0)
+                            )
+                        except Exception:
+                            fill_is_zero = False
+                if not fill_is_zero:
+                    output_names = [str(output_name) for output_name in node.output if output_name]
+                    generated_tensor = onnx.TensorProto()
+                    generated_tensor.name = output_names[0] if output_names else "ConstantOfShape"
+                    generated_tensor.data_type = int(onnx.TensorProto.FLOAT)
+                    registered_lineage = register_initializer(
+                        generated_tensor,
+                        current_graph_index,
+                        source_key=(*source_scope, "node", local_node_index, "constant_of_shape"),
+                    )
+                    declared_shapes = {known_value_shapes.get(output_name) for output_name in output_names}
+                    generated_shape = (
+                        next(iter(declared_shapes))
+                        if len(declared_shapes) == 1 and None not in declared_shapes
+                        else None
+                    )
+                    output_lineages[registered_lineage.initializer_index] = replace(
+                        registered_lineage,
+                        shape=generated_shape,
+                        data_type=None,
+                        unresolved_reason="generated_constant_of_shape_lineage",
+                    )
+
             output_lineages = bounded_lineages(output_lineages)
             constant_output_names: set[str] = set()
             constant_output_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
