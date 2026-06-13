@@ -86,6 +86,36 @@ class TestSBOMURLFixes:
         for leaked in ("AKIASECRET", "deadbeef", "secret-token", "X-Amz-Signature"):
             assert leaked not in sbom_json
 
+    @pytest.mark.parametrize("legacy", [False, True], ids=["pydantic", "legacy"])
+    def test_sbom_redacts_member_hash_paths(self, tmp_path: Path, legacy: bool) -> None:
+        model_path = tmp_path / "model.pt"
+        model_path.write_bytes(b"outer")
+        secret_path = "https://user:password@storage.example/payload.pkl?token=member-secret"
+        member_identity = json.dumps({"occurrence": 1, "path": [secret_path]}, sort_keys=True, separators=(",", ":"))
+        scan_result = create_mock_scan_result(
+            assets=[AssetModel(path=str(model_path), type="pytorch", size=model_path.stat().st_size)]
+        )
+        scan_result.file_metadata[str(model_path)] = FileMetadataModel(
+            file_size=model_path.stat().st_size,
+            member_file_hashes={
+                member_identity: {
+                    "file_hashes": {"sha256": "a" * 64},
+                    "path_segments": [secret_path],
+                    "logical_path": secret_path,
+                    "occurrence": 1,
+                }
+            },
+        )
+
+        if legacy:
+            sbom_json = generate_sbom([str(model_path)], scan_result.model_dump(mode="python"))
+        else:
+            sbom_json = generate_sbom_pydantic([str(model_path)], scan_result)
+
+        assert "password" not in sbom_json
+        assert "member-secret" not in sbom_json
+        assert "token=" not in sbom_json
+
     def test_legacy_sbom_redacts_stream_source_component_identity(self) -> None:
         raw_url = (
             "stream://https://user:password@storage.googleapis.com/bucket/model.bin?"

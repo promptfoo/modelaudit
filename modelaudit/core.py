@@ -7743,7 +7743,7 @@ def scan_model_streaming(
                     if file_hash is not None:
                         existing_hashes = metadata_dict.get("file_hashes")
                         if isinstance(existing_hashes, dict):
-                            existing_hashes.setdefault("sha256", file_hash)
+                            metadata_dict["file_hashes"] = {**existing_hashes, "sha256": file_hash}
                         else:
                             metadata_dict["file_hashes"] = {"sha256": file_hash}
 
