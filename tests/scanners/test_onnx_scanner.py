@@ -1,7 +1,10 @@
+import hashlib
 import json
 import os
 import struct
 import sys
+import time
+import tracemalloc
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +23,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.integrations.sarif_formatter import format_sarif_output
+from modelaudit.scanners import onnx_scanner as onnx_scanner_module
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import (
     ONNX_SCHEMA_INCONCLUSIVE_REASON,
@@ -2365,13 +2369,12 @@ def test_onnx_scanner_reuses_raw_bytes_for_model_parse(
     assert parsed_payloads == [model_path.read_bytes()]
 
 
-def test_onnx_scanner_raw_read_failure_falls_back_to_path_parse(
+def test_onnx_scanner_raw_read_failure_falls_back_to_file_backed_parse(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Raw-detector read failures should keep structural parsing but fail closed."""
     model_path = create_onnx_model(tmp_path)
-    real_load = onnx.load
     raw_read_attempts = 0
     path_loads: list[str] = []
 
@@ -2384,18 +2387,19 @@ def test_onnx_scanner_raw_read_failure_falls_back_to_path_parse(
 
     def tracking_path_loader(path: str, *, load_external_data: bool) -> Any:
         path_loads.append(path)
-        return real_load(path, load_external_data=load_external_data)
+        raise AssertionError("raw-read fallback should use bounded file-backed structural parsing")
 
     monkeypatch.setattr("modelaudit.scanners.onnx_scanner.open", fail_first_raw_read, raising=False)
     monkeypatch.setattr(onnx, "load", tracking_path_loader)
 
-    result = OnnxScanner({"check_jit_script": False, "check_network_comm": False}).scan(str(model_path))
+    result = OnnxScanner().scan(str(model_path))
     coverage_checks = [check for check in result.checks if check.name == "Raw Detector Analysis Coverage"]
 
-    assert path_loads == [str(model_path)]
+    assert path_loads == []
     assert result.success is False
     assert result.bytes_scanned > 0
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
     assert len(coverage_checks) == 1
     assert coverage_checks[0].details["detector"] == "raw_file_read"
     assert coverage_checks[0].details["coverage_gap"] == "file_read_failed"
@@ -5301,12 +5305,14 @@ class TestCVE202427318NestedPathTraversal:
             ("sparse", "indices", "default_indices"),
         ],
     )
+    @pytest.mark.parametrize("file_backed", [False, True], ids=["in-memory", "file-backed"])
     def test_function_default_tensor_attribute_traversal_detected(
         self,
         tmp_path: Path,
         attribute_kind: str,
         external_tensor: str,
         tensor_name: str,
+        file_backed: bool,
     ) -> None:
         model_path = create_onnx_model_with_function_default_external_tensor_attribute(
             tmp_path,
@@ -5316,9 +5322,13 @@ class TestCVE202427318NestedPathTraversal:
             missing_external=True,
         )
 
-        result = OnnxScanner().scan(str(model_path))
+        config = {"onnx_raw_detector_max_bytes": 1} if file_backed else None
+        result = OnnxScanner(config=config).scan(str(model_path))
 
         assert result.success is False
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == (
+            "file_backed_structure" if file_backed else "in_memory_model_proto"
+        )
         cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
         assert len(cve_checks) > 0
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
@@ -6806,6 +6816,1310 @@ class TestWeightDistributionSemantics:
         semantics = standalone.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_layer_count"] == 2
+
+
+def _encode_proto_varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("test protobuf helper only encodes non-negative integers")
+    encoded = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            encoded.append(byte | 0x80)
+        else:
+            encoded.append(byte)
+            return bytes(encoded)
+
+
+def _proto_key(field_number: int, wire_type: int) -> bytes:
+    return _encode_proto_varint((field_number << 3) | wire_type)
+
+
+def _proto_varint(field_number: int, value: int) -> bytes:
+    return _proto_key(field_number, 0) + _encode_proto_varint(value)
+
+
+def _proto_bytes(field_number: int, payload: bytes) -> bytes:
+    return _proto_key(field_number, 2) + _encode_proto_varint(len(payload)) + payload
+
+
+def _write_onnx_payload(tmp_path: Path, filename: str, payload: bytes) -> Path:
+    path = tmp_path / filename
+    path.write_bytes(payload)
+    return path
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_sparse_raw_onnx_model(
+    tmp_path: Path,
+    *,
+    raw_data_size: int,
+    op_type: str = "Relu",
+    domain: str = "",
+    filename: str = "large.onnx",
+) -> Path:
+    node_payload = b"".join(
+        [
+            _proto_bytes(1, b"input"),
+            _proto_bytes(2, b"output"),
+            _proto_bytes(3, b"node"),
+            _proto_bytes(4, op_type.encode()),
+            _proto_bytes(7, domain.encode()) if domain else b"",
+        ],
+    )
+    tensor_prefix = b"".join(
+        [
+            _proto_varint(1, max(raw_data_size // 4, 1)),
+            _proto_varint(2, int(TensorProto.FLOAT)),
+            _proto_bytes(8, b"W"),
+        ],
+    )
+    raw_header = _proto_key(9, 2) + _encode_proto_varint(raw_data_size)
+    tensor_len = len(tensor_prefix) + len(raw_header) + raw_data_size
+    initializer_header = _proto_key(5, 2) + _encode_proto_varint(tensor_len)
+    graph_prefix = b"".join(
+        [
+            _proto_bytes(1, node_payload),
+            _proto_bytes(2, b"graph"),
+            _proto_bytes(11, _proto_bytes(1, b"input")),
+            _proto_bytes(12, _proto_bytes(1, b"output")),
+        ],
+    )
+    graph_len = len(graph_prefix) + len(initializer_header) + tensor_len
+    opset_payload = _proto_bytes(1, b"") + _proto_varint(2, 13)
+    prefix = b"".join(
+        [
+            _proto_varint(1, 8),
+            _proto_bytes(2, b"modelaudit-test"),
+            _proto_bytes(8, opset_payload),
+            _proto_key(7, 2),
+            _encode_proto_varint(graph_len),
+            graph_prefix,
+            initializer_header,
+            tensor_prefix,
+            raw_header,
+        ],
+    )
+    path = tmp_path / filename
+    with path.open("wb") as handle:
+        handle.write(prefix)
+        handle.truncate(len(prefix) + raw_data_size)
+    return path
+
+
+def _write_malformed_declared_length_onnx(tmp_path: Path) -> Path:
+    path = tmp_path / "declared-too-long.onnx"
+    path.write_bytes(_proto_key(7, 2) + _encode_proto_varint(64) + b"\x08")
+    return path
+
+
+def _nested_graph_payload(depth: int) -> bytes:
+    if depth <= 0:
+        return _proto_bytes(1, _proto_bytes(4, b"Relu")) + _proto_bytes(2, b"leaf")
+    attribute_payload = _proto_bytes(1, b"body") + _proto_bytes(6, _nested_graph_payload(depth - 1))
+    node_payload = _proto_bytes(4, b"If") + _proto_bytes(5, attribute_payload)
+    return _proto_bytes(1, node_payload) + _proto_bytes(2, b"nested")
+
+
+def _write_deeply_nested_onnx(tmp_path: Path) -> Path:
+    graph_payload = _nested_graph_payload(140)
+    model_payload = _proto_varint(1, 8) + _proto_bytes(7, graph_payload)
+    return _write_onnx_payload(tmp_path, "deep.onnx", model_payload)
+
+
+def _write_tensor_rank_bomb_onnx(tmp_path: Path) -> Path:
+    dims = b"".join(_proto_varint(1, 1) for _ in range(4097))
+    tensor = dims + _proto_varint(2, int(TensorProto.FLOAT)) + _proto_bytes(8, b"W")
+    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"rank-bomb")
+    model = _proto_varint(1, 8) + _proto_bytes(7, graph)
+    return _write_onnx_payload(tmp_path, "rank-bomb.onnx", model)
+
+
+def _write_duplicate_graph_onnx(tmp_path: Path) -> Path:
+    malicious_graph = _proto_bytes(1, _proto_bytes(4, b"PythonOp")) + _proto_bytes(2, b"malicious")
+    benign_graph = _proto_bytes(1, _proto_bytes(4, b"Relu")) + _proto_bytes(2, b"benign")
+    model = _proto_varint(1, 8) + _proto_bytes(7, malicious_graph) + _proto_bytes(7, benign_graph)
+    return _write_onnx_payload(tmp_path, "duplicate-graph.onnx", model)
+
+
+def _write_many_node_attributes_onnx(tmp_path: Path) -> Path:
+    attributes = b"".join(_proto_bytes(5, _proto_bytes(1, b"a")) for _ in range(4097))
+    graph = _proto_bytes(1, _proto_bytes(4, b"Relu") + attributes) + _proto_bytes(2, b"attr-bomb")
+    model = _proto_varint(1, 8) + _proto_bytes(7, graph)
+    return _write_onnx_payload(tmp_path, "attribute-bomb.onnx", model)
+
+
+def _write_many_external_data_entries_onnx(tmp_path: Path) -> Path:
+    entries = b"".join(_proto_bytes(13, _proto_bytes(1, b"location") + _proto_bytes(2, b"w.bin")) for _ in range(1025))
+    tensor = _proto_varint(2, int(TensorProto.FLOAT)) + _proto_bytes(8, b"W") + entries
+    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"external-data-bomb")
+    model = _proto_varint(1, 8) + _proto_bytes(7, graph)
+    return _write_onnx_payload(tmp_path, "external-data-bomb.onnx", model)
+
+
+def _write_many_string_data_entries_onnx(tmp_path: Path) -> Path:
+    string_data = b"".join(_proto_bytes(6, b"x") for _ in range(100_001))
+    tensor = _proto_varint(2, int(TensorProto.STRING)) + _proto_bytes(8, b"S") + string_data
+    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"string-data-bomb")
+    model = _proto_varint(1, 8) + _proto_bytes(7, graph)
+    return _write_onnx_payload(tmp_path, "string-data-bomb.onnx", model)
+
+
+def _write_large_string_data_payload_onnx(tmp_path: Path, *, payload_size: int = 1_000_001) -> Path:
+    tensor = _proto_varint(2, int(TensorProto.STRING)) + _proto_bytes(8, b"S") + _proto_bytes(6, b"x" * payload_size)
+    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"large-string-data")
+    path = tmp_path / "large-string-data.onnx"
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph))
+    return path
+
+
+def _write_packed_float_tensor_payload_onnx(tmp_path: Path, *, count: int = 1_000_001) -> Path:
+    tensor = (
+        _proto_varint(1, count)
+        + _proto_varint(2, int(TensorProto.FLOAT))
+        + _proto_bytes(8, b"W")
+        + _proto_bytes(4, b"\x00\x00\x00\x00" * count)
+    )
+    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"packed-float")
+    model = _proto_varint(1, 8) + _proto_bytes(7, graph)
+    return _write_onnx_payload(tmp_path, "packed-float.onnx", model)
+
+
+def _write_invalid_field_zero_onnx(tmp_path: Path) -> Path:
+    return _write_onnx_payload(tmp_path, "field-zero.onnx", _proto_varint(1, 8) + b"\x00")
+
+
+def _write_out_of_range_field_onnx(tmp_path: Path) -> Path:
+    path = tmp_path / "field-out-of-range.onnx"
+    path.write_bytes(_proto_varint(1, 8) + _encode_proto_varint((1 << 29) << 3))
+    return path
+
+
+def _write_invalid_wire_type_onnx(tmp_path: Path) -> Path:
+    return _write_onnx_payload(tmp_path, "invalid-wire-type.onnx", _proto_varint(1, 8) + _proto_key(7, 6))
+
+
+def _write_terminal_varint_onnx(tmp_path: Path) -> Path:
+    return _write_onnx_payload(tmp_path, "terminal-varint.onnx", _proto_varint(1, 8) + b"\x80")
+
+
+def _write_packed_integer_tensor_payload_onnx(
+    tmp_path: Path,
+    *,
+    field_number: int,
+    data_type: int,
+    count: int = 100,
+) -> Path:
+    packed_values = b"".join(_encode_proto_varint(128) for _ in range(count))
+    tensor = (
+        _proto_varint(1, count)
+        + _proto_varint(2, data_type)
+        + _proto_bytes(field_number, packed_values)
+        + _proto_bytes(8, b"W")
+    )
+    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"packed-integer-payload")
+    path = tmp_path / f"packed-integer-{field_number}.onnx"
+    opset = _proto_varint(2, 18)
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph) + _proto_bytes(8, opset))
+    return path
+
+
+def _write_unknown_field_parse_work_bomb_onnx(tmp_path: Path) -> Path:
+    unknown_fields = b"".join(_proto_varint(27, 0) for _ in range(100))
+    path = tmp_path / "unknown-field-work-bomb.onnx"
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, _proto_bytes(2, b"graph")) + unknown_fields)
+    return path
+
+
+def _write_function_value_info_bomb_onnx(tmp_path: Path, *, count: int = 3) -> Path:
+    function = (
+        _proto_bytes(1, b"Fn")
+        + _proto_bytes(4, b"input")
+        + _proto_bytes(5, b"output")
+        + _proto_bytes(9, _proto_bytes(1, b"") + _proto_varint(2, 13))
+        + b"".join(_proto_bytes(12, _proto_bytes(1, f"value-{index}".encode())) for index in range(count))
+    )
+    graph = _proto_bytes(1, _proto_bytes(4, b"Fn") + _proto_bytes(7, b"test.domain")) + _proto_bytes(2, b"graph")
+    model = (
+        _proto_varint(1, 8)
+        + _proto_bytes(8, _proto_bytes(1, b"") + _proto_varint(2, 13))
+        + _proto_bytes(8, _proto_bytes(1, b"test.domain") + _proto_varint(2, 1))
+        + _proto_bytes(7, graph)
+        + _proto_bytes(25, function)
+    )
+    return _write_onnx_payload(tmp_path, "function-value-info-bomb.onnx", model)
+
+
+def _write_function_schema_near_match_onnx(tmp_path: Path) -> Path:
+    external_entry = _proto_bytes(1, b"location") + _proto_bytes(2, b"../escape.bin")
+    tensor = (
+        _proto_varint(1, 1)
+        + _proto_varint(2, int(TensorProto.FLOAT))
+        + _proto_bytes(8, b"not-a-function-initializer")
+        + _proto_bytes(13, external_entry)
+        + _proto_varint(14, int(TensorProto.EXTERNAL))
+    )
+    metadata = _proto_bytes(1, b"owner") + _proto_bytes(2, b"modelaudit")
+    function = _proto_bytes(1, b"Fn") + _proto_bytes(14, metadata) + _proto_bytes(15, tensor) + _proto_bytes(16, tensor)
+    graph = _proto_bytes(2, b"graph")
+    model = _proto_varint(1, 8) + _proto_bytes(7, graph) + _proto_bytes(25, function)
+    return _write_onnx_payload(tmp_path, "function-schema-near-match.onnx", model)
+
+
+def _write_training_binding_bomb_onnx(tmp_path: Path, *, count: int = 3) -> Path:
+    binding = _proto_bytes(1, b"old") + _proto_bytes(2, b"new")
+    training_info = _proto_bytes(1, _proto_bytes(2, b"init")) + b"".join(_proto_bytes(3, binding) for _ in range(count))
+    model = _proto_varint(1, 8) + _proto_bytes(7, _proto_bytes(2, b"graph")) + _proto_bytes(20, training_info)
+    return _write_onnx_payload(tmp_path, "training-binding-bomb.onnx", model)
+
+
+def _write_aggregate_object_bomb_onnx(tmp_path: Path) -> Path:
+    graph = _proto_bytes(2, b"graph") + b"".join(
+        _proto_bytes(13, _proto_bytes(1, f"value-{index}".encode())) for index in range(3)
+    )
+    path = tmp_path / "aggregate-object-bomb.onnx"
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph))
+    return path
+
+
+def _write_aggregate_string_bomb_onnx(tmp_path: Path) -> Path:
+    graph = _proto_bytes(2, b"graph")
+    path = tmp_path / "aggregate-string-bomb.onnx"
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(2, b"12345678") + _proto_bytes(7, graph))
+    return path
+
+
+def _write_aggregate_sequence_entry_bomb_onnx(tmp_path: Path) -> Path:
+    node = b"".join(_proto_bytes(1, b"") for _ in range(5)) + _proto_bytes(4, b"Relu")
+    graph = _proto_bytes(1, node) + _proto_bytes(2, b"sequence-bomb")
+    path = tmp_path / "aggregate-sequence-bomb.onnx"
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph))
+    return path
+
+
+def _write_empty_repeated_models(tmp_path: Path, *, kind: str, count: int = 4) -> Path:
+    if kind == "tensor":
+        graph = _proto_bytes(2, b"graph") + b"".join(_proto_bytes(5, b"") for _ in range(count))
+        payload = _proto_varint(1, 8) + _proto_bytes(7, graph)
+    elif kind == "sparse":
+        graph = _proto_bytes(2, b"graph") + b"".join(_proto_bytes(15, b"") for _ in range(count))
+        payload = _proto_varint(1, 8) + _proto_bytes(7, graph)
+    elif kind == "training":
+        payload = (
+            _proto_varint(1, 8)
+            + _proto_bytes(7, _proto_bytes(2, b"graph"))
+            + b"".join(_proto_bytes(20, b"") for _ in range(count))
+        )
+    else:  # pragma: no cover - test helper contract
+        raise ValueError(f"unknown empty ONNX fixture kind: {kind}")
+    return _write_onnx_payload(tmp_path, f"empty-{kind}.onnx", payload)
+
+
+def _write_wire_semantics_onnx(
+    tmp_path: Path,
+    *,
+    data_locations: tuple[int, ...] = (),
+    external_location: str | None = None,
+) -> Path:
+    tensor = _proto_varint(2, (1 << 64) - 1) + _proto_bytes(8, b"W")
+    if external_location is not None:
+        entry = _proto_bytes(1, b"location") + _proto_bytes(2, external_location.encode())
+        tensor += _proto_bytes(13, entry)
+    tensor += b"".join(_proto_varint(14, value) for value in data_locations)
+    graph = _proto_bytes(2, b"graph") + _proto_bytes(5, tensor)
+    path = tmp_path / "wire-semantics.onnx"
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph))
+    return path
+
+
+def _write_result_growth_onnx(tmp_path: Path, *, kind: str, count: int = 10) -> Path:
+    graph = _proto_bytes(2, b"graph")
+    if kind == "python":
+        graph += b"".join(
+            _proto_bytes(1, _proto_bytes(3, f"node-{index}".encode()) + _proto_bytes(4, b"PythonOp"))
+            for index in range(count)
+        )
+    elif kind in {"custom", "custom_python"}:
+        graph += b"".join(
+            _proto_bytes(
+                1,
+                _proto_bytes(3, f"node-{index}".encode())
+                + _proto_bytes(4, b"Custom")
+                + _proto_bytes(7, f"example.domain.{index}".encode()),
+            )
+            for index in range(count)
+        )
+        if kind == "custom_python":
+            graph += _proto_bytes(1, _proto_bytes(3, b"python") + _proto_bytes(4, b"PythonOp"))
+    elif kind == "external":
+        for index in range(count):
+            entry = _proto_bytes(1, b"location") + _proto_bytes(2, f"missing-{index}.bin".encode())
+            tensor = (
+                _proto_varint(2, int(TensorProto.UINT8))
+                + _proto_bytes(8, f"W{index}".encode())
+                + _proto_bytes(13, entry)
+                + _proto_varint(14, int(TensorProto.EXTERNAL))
+            )
+            graph += _proto_bytes(5, tensor)
+    elif kind == "tensor":
+        for index in range(count):
+            tensor = (
+                _proto_varint(1, 1)
+                + _proto_varint(2, int(TensorProto.UINT8))
+                + _proto_bytes(8, f"W{index}".encode())
+                + _proto_bytes(9, b"x")
+            )
+            graph += _proto_bytes(5, tensor)
+    else:  # pragma: no cover - test helper contract
+        raise ValueError(f"unknown ONNX result growth fixture: {kind}")
+    path = tmp_path / f"result-growth-{kind}.onnx"
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph))
+    return path
+
+
+def _write_safe_external_data_then_failure_onnx(
+    tmp_path: Path,
+    *,
+    failure: str,
+    safe_count: int = 3,
+) -> Path:
+    graph = _proto_bytes(2, b"graph")
+    for index in range(safe_count):
+        location = f"safe-{index}.bin"
+        (tmp_path / location).write_bytes(b"x")
+        entry = _proto_bytes(1, b"location") + _proto_bytes(2, location.encode())
+        tensor = (
+            _proto_varint(1, 1)
+            + _proto_varint(2, int(TensorProto.UINT8))
+            + _proto_bytes(8, f"safe-{index}".encode())
+            + _proto_bytes(13, entry)
+            + _proto_varint(14, int(TensorProto.EXTERNAL))
+        )
+        graph += _proto_bytes(5, tensor)
+
+    if failure == "traversal":
+        failure_name = "traversal"
+        failure_type = TensorProto.UINT8
+        failure_entries = _proto_bytes(
+            13,
+            _proto_bytes(1, b"location") + _proto_bytes(2, b"../escape.bin"),
+        )
+    elif failure == "size_mismatch":
+        failure_name = "size-mismatch"
+        failure_type = TensorProto.FLOAT
+        (tmp_path / "size-mismatch.bin").write_bytes(b"xxxx")
+        failure_entries = _proto_bytes(
+            13,
+            _proto_bytes(1, b"location") + _proto_bytes(2, b"size-mismatch.bin"),
+        ) + _proto_bytes(
+            13,
+            _proto_bytes(1, b"length") + _proto_bytes(2, b"1"),
+        )
+    else:  # pragma: no cover - test helper contract
+        raise ValueError(f"unknown external data failure: {failure}")
+
+    failure_tensor = (
+        _proto_varint(1, 1)
+        + _proto_varint(2, int(failure_type))
+        + _proto_bytes(8, failure_name.encode())
+        + failure_entries
+        + _proto_varint(14, int(TensorProto.EXTERNAL))
+    )
+    graph += _proto_bytes(5, failure_tensor)
+    return _write_onnx_payload(
+        tmp_path,
+        f"safe-external-data-then-{failure}.onnx",
+        _proto_varint(1, 8) + _proto_bytes(7, graph),
+    )
+
+
+class TestLargeOnnxFileBackedInspection:
+    """Regression coverage for bounded file-backed ONNX structural scans."""
+
+    @staticmethod
+    def _checks(result: Any, name: str) -> list[Any]:
+        return [check for check in result.checks if check.name == name]
+
+    def _assert_safety_budget_result(self, result: Any, reason: str) -> None:
+        coverage = self._checks(result, "ONNX Structure Parse Coverage")
+        assert result.success is False
+        assert result.has_errors is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.INFO
+            and check.details["coverage_gap"] == reason
+            and check.details["safety_budget_exhausted"] is True
+            for check in coverage
+        )
+        assert not self._checks(result, "ONNX Model Parsing")
+
+    def test_large_onnx_uses_file_backed_structure_without_max_read_rejection(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = _write_sparse_raw_onnx_model(tmp_path, raw_data_size=2 * 1024 * 1024)
+
+        def _fail_string_parse(_data: bytes) -> Any:
+            raise AssertionError("large ONNX scan should not parse from a full bytes buffer")
+
+        monkeypatch.setattr(onnx, "load_model_from_string", _fail_string_parse)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1024}).scan(str(model_path))
+
+        assert result.bytes_scanned == model_path.stat().st_size
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert result.metadata["onnx_structure_parse"]["omitted_raw_data_bytes"] == 2 * 1024 * 1024
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "onnx_raw_detection_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "onnx_weight_distribution_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert self._checks(result, "Custom Operator Domain Check")[-1].status == CheckStatus.PASSED
+        assert self._checks(result, "Python Operator Detection")[-1].status == CheckStatus.PASSED
+        assert self._checks(result, "Tensor Size Validation")[-1].status == CheckStatus.PASSED
+
+    def test_explicit_onnx_max_file_read_size_still_fails_closed(self, tmp_path: Path) -> None:
+        model_path = _write_sparse_raw_onnx_model(tmp_path, raw_data_size=4096)
+
+        result = OnnxScanner(config={"max_file_read_size": 1024}).scan(str(model_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["scan_outcome_reasons"] == ["max_file_read_size_exceeded"]
+        assert any(check.name == "File Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    def test_file_backed_large_onnx_still_flags_python_operator(self, tmp_path: Path) -> None:
+        model_path = _write_sparse_raw_onnx_model(
+            tmp_path,
+            raw_data_size=2 * 1024 * 1024,
+            op_type="PythonOp",
+            filename="python-op.onnx",
+        )
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1024}).scan(str(model_path))
+
+        python_checks = self._checks(result, "Python Operator Detection")
+        assert any(
+            check.status == CheckStatus.FAILED and check.severity == IssueSeverity.CRITICAL for check in python_checks
+        )
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_file_backed_large_onnx_skips_unbounded_integrity_hash(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = _write_sparse_raw_onnx_model(tmp_path, raw_data_size=2 * 1024 * 1024)
+
+        def _fail_hash(_scanner: OnnxScanner, _path: str) -> dict[str, str | None]:
+            raise AssertionError("file-backed ONNX scan should not hash beyond the bounded pre-parse budget")
+
+        monkeypatch.setattr(OnnxScanner, "calculate_file_hashes", _fail_hash)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1024}).scan(str(model_path))
+
+        integrity_checks = self._checks(result, "File Integrity Hash")
+        assert integrity_checks[-1].status == CheckStatus.PASSED
+        assert integrity_checks[-1].details["hash_calculation_skipped"] is True
+        assert integrity_checks[-1].details["max_hash_bytes"] == 1024
+        assert result.metadata["file_hashes"] == {"md5": None, "sha256": None, "sha512": None}
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+
+    def test_file_backed_raw_detector_budget_is_not_incomplete_when_detectors_disabled(self, tmp_path: Path) -> None:
+        model_path = _write_sparse_raw_onnx_model(tmp_path, raw_data_size=2 * 1024 * 1024)
+
+        result = OnnxScanner(
+            config={
+                "onnx_raw_detector_max_bytes": 1024,
+                "check_jit_script": False,
+                "check_network_comm": False,
+            },
+        ).scan(str(model_path))
+
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert result.metadata["disabled_checks"] == [
+            "JIT/Script Code Execution Detection",
+            "Network Communication Detection",
+        ]
+        assert "onnx_raw_detection_analysis_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+        assert not self._checks(result, "Raw Detector Analysis Coverage")
+        assert "onnx_weight_distribution_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    def test_file_backed_external_data_controls_preserved(self, tmp_path: Path) -> None:
+        traversal = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="../escape.bin",
+            missing_external=True,
+        )
+        traversal_result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(traversal))
+        assert traversal_result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert any("External Data Path Traversal" in check.name for check in traversal_result.checks)
+
+        declared_length = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights.bin",
+            external_metadata={"length": "1"},
+            external_file_bytes=b"\x00" * 8,
+            tensor_shape=(2,),
+        )
+        declared_length_result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(declared_length))
+        size_checks = self._checks(declared_length_result, "External Data Size Validation")
+        assert any(
+            check.status == CheckStatus.FAILED and check.severity == IssueSeverity.CRITICAL for check in size_checks
+        )
+
+    @pytest.mark.parametrize(
+        ("writer", "reason"),
+        [
+            (_write_malformed_declared_length_onnx, "declared_length_out_of_bounds"),
+            (_write_duplicate_graph_onnx, "duplicate_singular_message"),
+            (_write_invalid_field_zero_onnx, "invalid_field_number_zero"),
+            (_write_out_of_range_field_onnx, "field_number_out_of_range"),
+            (_write_invalid_wire_type_onnx, "unsupported_wire_type"),
+            (_write_terminal_varint_onnx, "truncated_varint"),
+        ],
+    )
+    def test_file_backed_malformed_or_bomb_onnx_fails_closed(
+        self,
+        tmp_path: Path,
+        writer: Any,
+        reason: str,
+    ) -> None:
+        model_path = writer(tmp_path)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        parse_checks = self._checks(result, "ONNX Model Parsing")
+        assert result.success is False
+        assert any(check.status == CheckStatus.FAILED and reason in str(check.details) for check in parse_checks)
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    @pytest.mark.parametrize(
+        ("writer", "reason"),
+        [
+            (_write_deeply_nested_onnx, "protobuf_nesting_limit_exceeded"),
+            (_write_tensor_rank_bomb_onnx, "tensor_rank_limit_exceeded"),
+        ],
+    )
+    def test_file_backed_structure_budgets_are_inconclusive(
+        self,
+        tmp_path: Path,
+        writer: Any,
+        reason: str,
+    ) -> None:
+        model_path = writer(tmp_path)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        self._assert_safety_budget_result(result, reason)
+
+    def test_file_backed_packed_tensor_payload_counts_are_not_metadata_bombs(self, tmp_path: Path) -> None:
+        model_path = _write_packed_float_tensor_payload_onnx(tmp_path)
+
+        model, state = onnx_scanner_module._load_onnx_structure_file_backed(
+            str(model_path),
+            model_path.stat().st_size,
+        )
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        assert len(model.graph.initializer[0].float_data) == 1_000_001
+        assert state.coverage_gaps == {}
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert not any(
+            check.name == "ONNX Model Parsing"
+            and check.status == CheckStatus.FAILED
+            and "tensor_data_sequence_limit_exceeded" in str(check.details)
+            for check in result.checks
+        )
+
+    def test_file_backed_large_string_data_payload_matches_native_parser(self, tmp_path: Path) -> None:
+        payload_size = 1_000_001
+        model_path = _write_large_string_data_payload_onnx(tmp_path, payload_size=payload_size)
+
+        native = onnx.load_model_from_string(model_path.read_bytes())
+        lite, state = onnx_scanner_module._load_onnx_structure_file_backed(
+            str(model_path),
+            model_path.stat().st_size,
+        )
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        assert len(native.graph.initializer[0].string_data) == len(lite.graph.initializer[0].string_data) == 1
+        assert len(native.graph.initializer[0].string_data[0]) == payload_size
+        assert sum(len(value) for value in lite.graph.initializer[0].string_data) == payload_size
+        assert state.coverage_gaps == {}
+        assert not any(
+            check.name == "ONNX Model Parsing" and "tensor_string_data_bytes_limit_exceeded" in str(check.details)
+            for check in result.checks
+        )
+
+    def test_file_backed_wire_format_matches_in_memory_operator_detection(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(
+            tmp_path,
+            custom=True,
+            custom_domain="",
+            custom_op_type="PythonOp",
+            include_initializer=False,
+        )
+
+        in_memory = OnnxScanner(
+            config={"check_jit_script": False, "check_network_comm": False},
+        ).scan(str(model_path))
+        file_backed = OnnxScanner(
+            config={
+                "onnx_raw_detector_max_bytes": 1,
+                "check_jit_script": False,
+                "check_network_comm": False,
+            },
+        ).scan(str(model_path))
+
+        assert in_memory.metadata["onnx_structure_parse"]["parse_mode"] == "in_memory_model_proto"
+        assert file_backed.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert any(
+            check.name == "Python Operator Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details["op_type"] == "PythonOp"
+            for check in in_memory.checks
+        )
+        assert any(
+            check.name == "Python Operator Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details["op_type"] == "PythonOp"
+            for check in file_backed.checks
+        )
+
+    def test_function_proto_unknown_tensor_field_matches_onnx_1_21_schema(self, tmp_path: Path) -> None:
+        model_path = _write_function_schema_near_match_onnx(tmp_path)
+
+        fields_by_number = {field.number: field for field in onnx.FunctionProto.DESCRIPTOR.fields}
+        native = onnx.load_model_from_string(model_path.read_bytes())
+        lite, state = onnx_scanner_module._load_onnx_structure_file_backed(
+            str(model_path),
+            model_path.stat().st_size,
+        )
+
+        native_tensors = [
+            tensor
+            for tensors in onnx_scanner_module._iter_model_external_data_tensor_groups(native)
+            for tensor in tensors
+        ]
+        lite_tensors = [
+            tensor
+            for tensors in onnx_scanner_module._iter_model_external_data_tensor_groups(lite)
+            for tensor in tensors
+        ]
+
+        assert fields_by_number[14].name == "metadata_props"
+        assert {15, 16}.isdisjoint(fields_by_number)
+        assert native.functions[0].metadata_props[0].key == "owner"
+        assert native.functions[0].metadata_props[0].value == "modelaudit"
+        assert native_tensors == lite_tensors == []
+        assert state.coverage_gaps == {}
+
+    def test_forced_file_backed_schema_does_not_reopen_path_or_validate_format(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path)
+        monkeypatch.setattr(
+            onnx.checker,
+            "check_model",
+            lambda _model_or_path: pytest.fail("file-backed ONNX must not reopen a path for schema validation"),
+        )
+
+        result = OnnxScanner(
+            config={
+                "onnx_raw_detector_max_bytes": 1,
+                "check_jit_script": False,
+                "check_network_comm": False,
+            }
+        ).scan(str(model_path))
+
+        schema_check = self._checks(result, "ONNX Schema Validation")[-1]
+        assert schema_check.status == CheckStatus.FAILED
+        assert schema_check.details["reason"] == "file_backed_structure_not_full_model_proto"
+        assert schema_check.details["parse_mode"] == "file_backed_structure"
+        assert schema_check.details["file_backed_structure"] is True
+        assert result.metadata.get("validated_format") is None
+
+    @pytest.mark.parametrize(
+        ("data_locations", "expected"),
+        [
+            ((int(TensorProto.EXTERNAL), 2), int(TensorProto.EXTERNAL)),
+            ((2, int(TensorProto.EXTERNAL)), int(TensorProto.EXTERNAL)),
+            ((2,), int(TensorProto.DEFAULT)),
+        ],
+    )
+    def test_file_backed_varints_and_proto2_enum_match_native_parser(
+        self,
+        tmp_path: Path,
+        data_locations: tuple[int, ...],
+        expected: int,
+    ) -> None:
+        model_path = _write_wire_semantics_onnx(tmp_path, data_locations=data_locations)
+        native = onnx.load_model_from_string(model_path.read_bytes())
+        lite, _state = onnx_scanner_module._load_onnx_structure_file_backed(
+            str(model_path),
+            model_path.stat().st_size,
+        )
+
+        assert native.graph.initializer[0].data_type == lite.graph.initializer[0].data_type == -1
+        assert native.graph.initializer[0].data_location == lite.graph.initializer[0].data_location == expected
+
+    def test_file_backed_unknown_enum_does_not_hide_external_traversal_cves(self, tmp_path: Path) -> None:
+        model_path = _write_wire_semantics_onnx(
+            tmp_path,
+            data_locations=(int(TensorProto.EXTERNAL), 2),
+            external_location="../escape.bin",
+        )
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        cves = {check.details.get("cve_id") for check in result.checks}
+        assert {"CVE-2022-25882", "CVE-2025-51480"}.issubset(cves)
+
+    def test_disabled_raw_detector_metadata_matches_in_memory_and_file_backed(self, tmp_path: Path) -> None:
+        model_path = _write_sparse_raw_onnx_model(tmp_path, raw_data_size=4096)
+        config = {"check_jit_script": False, "check_network_comm": False}
+
+        in_memory = OnnxScanner(config=config).scan(str(model_path))
+        file_backed = OnnxScanner(config={**config, "onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        assert in_memory.metadata["disabled_checks"] == file_backed.metadata["disabled_checks"]
+        assert in_memory.metadata["disabled_checks"] == [
+            "JIT/Script Code Execution Detection",
+            "Network Communication Detection",
+        ]
+        assert "onnx_raw_detection_analysis_incomplete" not in in_memory.metadata.get("scan_outcome_reasons", [])
+        assert "onnx_raw_detection_analysis_incomplete" not in file_backed.metadata.get("scan_outcome_reasons", [])
+        assert not self._checks(in_memory, "Raw Detector Analysis Coverage")
+        assert not self._checks(file_backed, "Raw Detector Analysis Coverage")
+
+    @pytest.mark.parametrize(
+        ("writer", "reason"),
+        [
+            (_write_many_node_attributes_onnx, "node_attribute_limit_exceeded"),
+            (_write_many_external_data_entries_onnx, "external_data_entry_limit_exceeded"),
+            (_write_many_string_data_entries_onnx, "tensor_string_data_limit_exceeded"),
+        ],
+    )
+    def test_file_backed_repeated_field_bombs_fail_closed(
+        self,
+        tmp_path: Path,
+        writer: Any,
+        reason: str,
+    ) -> None:
+        model_path = writer(tmp_path)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        self._assert_safety_budget_result(result, reason)
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    @pytest.mark.parametrize(
+        ("writer", "reason"),
+        [
+            (_write_function_value_info_bomb_onnx, "function_value_info_limit_exceeded"),
+            (_write_training_binding_bomb_onnx, "training_initialization_binding_limit_exceeded"),
+        ],
+    )
+    def test_file_backed_function_and_training_repeated_fields_are_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        writer: Any,
+        reason: str,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES", 2)
+        model_path = writer(tmp_path)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        self._assert_safety_budget_result(result, reason)
+
+    @pytest.mark.parametrize(
+        ("writer", "constant_name", "constant_value", "reason"),
+        [
+            (
+                _write_aggregate_object_bomb_onnx,
+                "_ONNX_STRUCTURE_MAX_RETAINED_OBJECTS",
+                4,
+                "retained_object_limit_exceeded",
+            ),
+            (
+                _write_aggregate_string_bomb_onnx,
+                "_ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES",
+                8,
+                "retained_string_bytes_limit_exceeded",
+            ),
+            (
+                _write_aggregate_sequence_entry_bomb_onnx,
+                "_ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES",
+                4,
+                "retained_sequence_entries_limit_exceeded",
+            ),
+        ],
+    )
+    def test_file_backed_aggregate_object_and_string_budgets_fail_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        writer: Any,
+        constant_name: str,
+        constant_value: int,
+        reason: str,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, constant_name, constant_value)
+        model_path = writer(tmp_path)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        self._assert_safety_budget_result(result, reason)
+
+    @pytest.mark.parametrize(
+        ("writer", "constant_name", "constant_value", "reason"),
+        [
+            (_write_tensor_rank_bomb_onnx, None, None, "tensor_rank_limit_exceeded"),
+            (
+                _write_aggregate_object_bomb_onnx,
+                "_ONNX_STRUCTURE_MAX_RETAINED_OBJECTS",
+                4,
+                "retained_object_limit_exceeded",
+            ),
+        ],
+    )
+    def test_structure_safety_budgets_are_uncached_exit_2(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        writer: Any,
+        constant_name: str | None,
+        constant_value: int | None,
+        reason: str,
+    ) -> None:
+        if constant_name is not None:
+            monkeypatch.setattr(onnx_scanner_module, constant_name, constant_value)
+        model_path = writer(tmp_path)
+        cache_dir = tmp_path / "safety-budget-cache"
+        reset_cache_manager()
+        try:
+            result = scan_model_directory_or_file(
+                str(model_path),
+                cache_scan_results=True,
+                cache_dir=str(cache_dir),
+                onnx_raw_detector_max_bytes=1,
+            )
+
+            assert result.success is False
+            assert determine_exit_code(result) == 2
+            assert result.content_hash is None
+            assert any(
+                check.name == "ONNX Structure Parse Coverage"
+                and check.severity == IssueSeverity.INFO
+                and check.details.get("coverage_gap") == reason
+                for check in result.checks
+            )
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize("kind", ["tensor", "sparse", "training"])
+    def test_file_backed_retained_allocation_budget_covers_eager_children(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        kind: str,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES", 4096)
+        model_path = _write_empty_repeated_models(tmp_path, kind=kind)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        coverage = self._checks(result, "ONNX Structure Parse Coverage")
+        assert result.success is False
+        assert result.has_errors is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert coverage[-1].severity == IssueSeverity.INFO
+        assert coverage[-1].details["coverage_gap"] == "retained_allocation_budget_exceeded"
+        assert coverage[-1].details["safety_budget_exhausted"] is True
+        assert not self._checks(result, "ONNX Model Parsing")
+
+    def test_file_backed_parse_checks_for_cancellation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = _write_aggregate_object_bomb_onnx(tmp_path)
+        calls = 0
+        loader_invoked = False
+        original_loader = onnx_scanner_module._load_onnx_structure_file_backed
+
+        def interrupt_during_parse(_scanner: OnnxScanner) -> None:
+            nonlocal calls
+            if loader_invoked:
+                calls += 1
+                raise KeyboardInterrupt
+
+        def tracking_loader(*args: Any, **kwargs: Any) -> Any:
+            nonlocal loader_invoked
+            loader_invoked = True
+            return original_loader(*args, **kwargs)
+
+        monkeypatch.setattr(OnnxScanner, "check_interrupted", interrupt_during_parse)
+        monkeypatch.setattr(onnx_scanner_module, "_load_onnx_structure_file_backed", tracking_loader)
+
+        with pytest.raises(KeyboardInterrupt):
+            OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+        assert loader_invoked is True
+        assert calls == 1
+
+    def test_parse_cancellation_wins_at_work_budget_boundary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_MAX_PARSE_STEPS", 1)
+        calls = 0
+
+        def cancel() -> None:
+            nonlocal calls
+            calls += 1
+            raise KeyboardInterrupt
+
+        state = onnx_scanner_module._OnnxStructureParseState(interrupt_check=cancel, parse_steps=1)
+
+        with pytest.raises(KeyboardInterrupt):
+            state.check_interrupted()
+        assert calls == 1
+
+    def test_file_backed_unknown_field_parse_work_is_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_MAX_PARSE_STEPS", 20)
+        model_path = _write_unknown_field_parse_work_bomb_onnx(tmp_path)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        self._assert_safety_budget_result(result, "protobuf_parse_step_limit_exceeded")
+
+        cache_dir = tmp_path / "parse-work-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(model_path),
+                cache_scan_results=True,
+                cache_dir=str(cache_dir),
+                onnx_raw_detector_max_bytes=1,
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+            assert aggregate.content_hash is None
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        ("field_number", "data_type", "field_name"),
+        [
+            (5, int(TensorProto.INT32), "int32_data"),
+            (7, int(TensorProto.INT64), "int64_data"),
+            (11, int(TensorProto.UINT64), "uint64_data"),
+        ],
+    )
+    def test_file_backed_packed_integer_payloads_skip_per_element_parse_work(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        field_number: int,
+        data_type: int,
+        field_name: str,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_STRUCTURE_MAX_PARSE_STEPS", 20)
+        model_path = _write_packed_integer_tensor_payload_onnx(
+            tmp_path,
+            field_number=field_number,
+            data_type=data_type,
+        )
+
+        native = onnx.load_model_from_string(model_path.read_bytes())
+        onnx.checker.check_model(native)
+        lite, state = onnx_scanner_module._load_onnx_structure_file_backed(
+            str(model_path),
+            model_path.stat().st_size,
+        )
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        native_values = getattr(native.graph.initializer[0], field_name)
+        lite_values = getattr(lite.graph.initializer[0], field_name)
+        assert len(native_values) == 100
+        assert len(lite_values) >= len(native_values)
+        assert state.parse_steps == state.fields_seen
+        assert state.omitted_packed_varint_fields == 1
+        assert state.omitted_packed_varint_bytes == 200
+        assert result.metadata["onnx_structure_parse"]["omitted_packed_varint_bytes"] == 200
+        assert not any("protobuf_parse_step_limit_exceeded" in str(check.details) for check in result.checks)
+
+    def test_file_backed_loader_detects_same_size_source_mutation(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path)
+        source_stat = model_path.stat()
+        mutated = False
+
+        def mutate_timestamp() -> None:
+            nonlocal mutated
+            if mutated:
+                return
+            mutated = True
+            os.utime(
+                model_path,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 1_000_000_000),
+            )
+
+        with pytest.raises(onnx_scanner_module._OnnxStructureParseError) as exc_info:
+            onnx_scanner_module._load_onnx_structure_file_backed(
+                str(model_path),
+                source_stat.st_size,
+                mutate_timestamp,
+                expected_stat=source_stat,
+            )
+
+        assert mutated is True
+        assert exc_info.value.reason == "source_changed_during_parse"
+
+    def test_file_backed_python_operator_results_are_aggregated(self, tmp_path: Path) -> None:
+        model_path = _write_result_growth_onnx(tmp_path, kind="python", count=100)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        python_checks = [
+            check for check in self._checks(result, "Python Operator Detection") if check.status == CheckStatus.FAILED
+        ]
+        assert len(python_checks) == 1
+        assert python_checks[0].severity == IssueSeverity.CRITICAL
+        assert python_checks[0].details["occurrence_count"] == 100
+        assert len(python_checks[0].details["representative_nodes"]) <= 5
+
+    @pytest.mark.parametrize("kind", ["custom", "external"])
+    def test_file_backed_distinct_result_groups_are_bounded_and_fail_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        kind: str,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_RESULT_MAX_DISTINCT_GROUPS", 2)
+        model_path = _write_result_growth_onnx(tmp_path, kind=kind, count=10)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        coverage = self._checks(result, "ONNX Result Reporting Coverage")
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "onnx_result_reporting_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert coverage[-1].details["omitted_count"] == 8
+        if kind == "custom":
+            assert len(self._checks(result, "Custom Operator Domain Check")) == 2
+            assert len(result.metadata["custom_domains"]) == 2
+        else:
+            assert len(self._checks(result, "External Data Reference Check")) == 2
+
+    def test_external_traversal_findings_are_not_starved_by_safe_result_groups(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_RESULT_MAX_DISTINCT_GROUPS", 2)
+        model_path = _write_safe_external_data_then_failure_onnx(tmp_path, failure="traversal")
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        assert len(self._checks(result, "External Data Reference Check")) == 2
+        assert self._checks(result, "ONNX Result Reporting Coverage")[-1].details["omitted_count"] == 1
+        cves = {check.details.get("cve_id") for check in result.checks}
+        assert {"CVE-2022-25882", "CVE-2025-51480"}.issubset(cves)
+
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            recursive=False,
+            onnx_raw_detector_max_bytes=1,
+        )
+        assert determine_exit_code(aggregate) == 1
+
+    def test_external_size_failures_are_not_starved_by_safe_result_groups(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_RESULT_MAX_DISTINCT_GROUPS", 2)
+        model_path = _write_safe_external_data_then_failure_onnx(
+            tmp_path,
+            failure="size_mismatch",
+            safe_count=2,
+        )
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        size_failures = [
+            check
+            for check in self._checks(result, "External Data Size Validation")
+            if check.status == CheckStatus.FAILED and check.severity == IssueSeverity.CRITICAL
+        ]
+        size_passes = [
+            check
+            for check in self._checks(result, "External Data Size Validation")
+            if check.status == CheckStatus.PASSED
+        ]
+        assert len(self._checks(result, "External Data Reference Check")) == 2
+        assert len(size_passes) == 1
+        assert size_passes[0].details["affected_tensor_count"] == 2
+        assert size_failures
+        assert size_failures[0].details["tensor"] == "size-mismatch"
+        assert size_failures[0].details["affected_tensor_count"] == 1
+
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            recursive=False,
+            onnx_raw_detector_max_bytes=1,
+        )
+        assert determine_exit_code(aggregate) == 1
+
+    def test_file_backed_tensor_size_results_are_aggregated(self, tmp_path: Path) -> None:
+        model_path = _write_result_growth_onnx(tmp_path, kind="tensor", count=100)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        tensor_checks = self._checks(result, "Tensor Size Validation")
+        assert len(tensor_checks) == 1
+        assert tensor_checks[0].status == CheckStatus.PASSED
+        assert tensor_checks[0].details["validated_tensor_count"] == 100
+        assert len(tensor_checks[0].details["sample_tensors"]) == 5
+
+    @pytest.mark.parametrize(("kind", "expected_exit_code"), [("custom", 2), ("custom_python", 1)])
+    def test_result_reporting_overflow_has_explicit_exit_and_cache_semantics(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        kind: str,
+        expected_exit_code: int,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_RESULT_MAX_DISTINCT_GROUPS", 2)
+        model_path = _write_result_growth_onnx(tmp_path, kind=kind, count=10)
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            result = scan_model_directory_or_file(
+                str(model_path),
+                cache_scan_results=True,
+                cache_dir=str(cache_dir),
+                onnx_raw_detector_max_bytes=1,
+            )
+
+            assert result.success is False
+            assert determine_exit_code(result) == expected_exit_code
+            assert result.content_hash is None
+            metadata = result.file_metadata[str(model_path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "onnx_result_reporting_incomplete" in metadata["scan_outcome_reasons"]
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("repo_id", "revision", "expected_size", "expected_sha256"),
+        [
+            (
+                "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+                "4328cf26390c98c5e3c738b4460a05b95f4911f5",
+                1_110_068_629,
+                "253e00bb467fcdcac714a7b2443330c28ffbecb6d1f791c92caaf2af468bfbaa",
+            ),
+            (
+                "BAAI/bge-reranker-base",
+                "2cfc18c9415c912f9d8155881c133215df768a70",
+                1_112_459_588,
+                "15b9a8c3da82eddf263df571281166e00e9308fe19d077084b642ebfcaf06d2b",
+            ),
+        ],
+    )
+    def test_pinned_huggingface_large_onnx_reaches_file_backed_terminal_scan(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        repo_id: str,
+        revision: str,
+        expected_size: int,
+        expected_sha256: str,
+    ) -> None:
+        from huggingface_hub import hf_hub_download
+
+        def _fail_string_parse(_data: bytes) -> Any:
+            raise AssertionError("pinned large ONNX scan should not parse from a full bytes buffer")
+
+        original_raw_input = OnnxScanner._read_onnx_raw_detector_input
+        raw_detector_reads: list[tuple[int, int, bool]] = []
+
+        def _tracking_raw_input(scanner: OnnxScanner, raw_path: str, file_size: int, max_bytes: int) -> bytes | None:
+            data = original_raw_input(scanner, raw_path, file_size, max_bytes)
+            raw_detector_reads.append((file_size, max_bytes, data is None))
+            return data
+
+        monkeypatch.setattr(onnx, "load_model_from_string", _fail_string_parse)
+        monkeypatch.setattr(OnnxScanner, "_read_onnx_raw_detector_input", _tracking_raw_input)
+
+        path = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                revision=revision,
+                filename="onnx/model.onnx",
+            ),
+        )
+
+        assert path.stat().st_size == expected_size
+        assert _sha256_file(path) == expected_sha256
+
+        tracemalloc.start()
+        start = time.monotonic()
+        result = OnnxScanner().scan(str(path))
+        _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+        elapsed_seconds = time.monotonic() - start
+        tracemalloc.stop()
+
+        assert path.stat().st_size == expected_size
+        assert result.bytes_scanned == path.stat().st_size
+        assert result.success is False
+        assert result.has_errors is False
+        assert set(result.metadata["scan_outcome_reasons"]) == {
+            "onnx_raw_detection_analysis_incomplete",
+            "onnx_schema_validation_failed",
+            "onnx_weight_distribution_analysis_incomplete",
+        }
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert result.metadata["onnx_structure_parse"]["omitted_raw_data_bytes"] > 1_000_000_000
+        assert result.metadata["onnx_structure_parse"]["retained_object_count"] > 0
+        assert result.metadata["onnx_structure_parse"]["retained_string_bytes"] < 64 * 1024 * 1024
+        assert result.metadata["onnx_structure_parse"]["retained_allocation_bytes"] < 128 * 1024 * 1024
+        assert result.metadata["onnx_structure_parse"]["fields_seen"] > 0
+        assert result.metadata["onnx_structure_parse"]["coverage_gaps"] == {}
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+        assert raw_detector_reads == [(expected_size, 512 * 1024 * 1024, True)]
+        assert elapsed_seconds < 180
+        assert peak_bytes < 256 * 1024 * 1024
+        assert any(
+            check.name == "Python Operator Detection" and check.status == CheckStatus.PASSED for check in result.checks
+        )
+        assert not any(
+            "External Data" in check.name
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            for check in result.checks
+        )
 
 
 class TestRawDetectorCoverage:
