@@ -1017,13 +1017,14 @@ class CompressedScanner(BaseScanner):
                 details={"inner_scanner": inner_result.scanner_name, "provenance": provenance},
             )
 
-            result.merge(inner_result)
+            result.merge_member_result(inner_result, inner_display)
             if len(member_temp_paths) > 1:
                 for member_index, member_temp_path in enumerate(member_temp_paths, start=1):
                     member_result = core.scan_file(member_temp_path, nested_config)
                     if self._is_transport_fragment_member(inner_result, member_result):
                         continue
                     member_provenance = f"{provenance}#member-{member_index}"
+                    member_identity = f"{inner_display}#member-{member_index}"
                     self._rewrite_inner_locations(member_result, member_temp_path, member_provenance)
                     result.add_check(
                         name="Compressed Wrapper Member Scanner Routing",
@@ -1036,7 +1037,7 @@ class CompressedScanner(BaseScanner):
                             "provenance": member_provenance,
                         },
                     )
-                    result.merge(member_result)
+                    result.merge_member_result(member_result, member_identity)
             result.bytes_scanned += self.get_file_size(path)
         except _MissingOptionalDependencyError as exc:
             mark_inconclusive_scan_result(result, self._OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON)

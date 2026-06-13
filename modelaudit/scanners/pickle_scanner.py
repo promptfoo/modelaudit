@@ -20,7 +20,14 @@ from modelaudit_picklescan.call_graph import import_only_reference_is_proven_tru
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
-from ..scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, Check, Issue, mark_inconclusive_scan_result
+from ..scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+    FILE_HASHES_BYTES_HASHED_METADATA_KEY,
+    FILE_HASHES_COMPLETE_METADATA_KEY,
+    Check,
+    Issue,
+    mark_inconclusive_scan_result,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
@@ -3596,6 +3603,8 @@ class PickleScanner(BaseScanner):
         sha256 = hashlib.sha256(payload).hexdigest()
         hash_key = "sha256" if hash_complete else "sha256_prefix"
         result.metadata.setdefault("file_hashes", {})[hash_key] = sha256
+        result.metadata[FILE_HASHES_COMPLETE_METADATA_KEY] = hash_complete
+        result.metadata[FILE_HASHES_BYTES_HASHED_METADATA_KEY] = len(payload)
         details: dict[str, Any] = {
             hash_key: sha256,
             "bytes_hashed": len(payload),
@@ -3618,6 +3627,8 @@ class PickleScanner(BaseScanner):
     ) -> None:
         sha256 = hashlib.sha256(payload).hexdigest()
         result.metadata.setdefault("file_hashes", {})["sha256_prefix"] = sha256
+        result.metadata[FILE_HASHES_COMPLETE_METADATA_KEY] = False
+        result.metadata[FILE_HASHES_BYTES_HASHED_METADATA_KEY] = len(payload)
         result.add_check(
             name="File Integrity Check",
             passed=True,
@@ -3669,6 +3680,8 @@ class PickleScanner(BaseScanner):
         sha256 = hasher.hexdigest()
         hash_key = "sha256" if hash_complete else "sha256_prefix"
         result.metadata.setdefault("file_hashes", {})[hash_key] = sha256
+        result.metadata[FILE_HASHES_COMPLETE_METADATA_KEY] = hash_complete
+        result.metadata[FILE_HASHES_BYTES_HASHED_METADATA_KEY] = bytes_hashed
         details: dict[str, Any] = {
             hash_key: sha256,
             "bytes_hashed": bytes_hashed,

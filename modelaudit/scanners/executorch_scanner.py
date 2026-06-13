@@ -1461,7 +1461,7 @@ class ExecuTorchScanner(BaseScanner):
                         continue
                     bytes_scanned += member_info.file_size
                     apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
-                    result.merge(sub_result)
+                    result.merge_member_result(sub_result, name)
 
                 if pickle_member_failure_count:
                     mark_inconclusive_scan_result(result, self.ZIP_PICKLE_MEMBER_READ_INCONCLUSIVE_REASON)
