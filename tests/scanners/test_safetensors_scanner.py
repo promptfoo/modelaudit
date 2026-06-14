@@ -1,8 +1,12 @@
 import base64
 import builtins
+import hashlib
 import json
 import os
 import struct
+import subprocess
+import sys
+import textwrap
 import zipfile
 from pathlib import Path
 from types import TracebackType
@@ -20,11 +24,22 @@ from safetensors.numpy import load_file, save_file
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import (
+    DEFAULT_MAX_FILE_READ_SIZE,
+    FORMAT_VALIDATION_CONFIG_KEY,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    CheckStatus,
+    IssueSeverity,
+)
 from modelaudit.scanners.safetensors_scanner import (
     _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO,
+    _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY,
+    _REMOTE_HEADER_INTEGRITY_CONFIG_KEY,
+    _REMOTE_HEADER_ONLY_CONFIG_KEY,
+    _SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES,
     SAFETENSORS_READ_INCONCLUSIVE_REASON,
     SafeTensorsScanner,
+    _safetensors_name_preview,
 )
 
 CYRILLIC_SMALL_A = chr(0x0430)
@@ -202,6 +217,362 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
     assert header_limit_check is not None
     assert header_limit_check.status.value == "passed"
+
+
+def test_duplicate_safetensors_header_keys_are_inconclusive(tmp_path: Path) -> None:
+    file_path = tmp_path / "duplicate-key.safetensors"
+    header = (
+        b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},'
+        b'"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    )
+    write_raw_safetensors_header(file_path, header, b"\x00")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "safetensors_header_validation_failed" in result.metadata["scan_outcome_reasons"]
+    duplicate_check = next(check for check in result.checks if check.name == "SafeTensors Duplicate Key Detection")
+    assert duplicate_check.status == CheckStatus.FAILED
+    assert duplicate_check.details["duplicate_keys"] == ["tensor"]
+
+
+def test_safetensors_name_preview_is_utf8_bounded_and_stable() -> None:
+    name = "界" * 1000
+
+    preview, original_utf8_bytes, truncated = _safetensors_name_preview(name)
+    repeated_preview, repeated_utf8_bytes, repeated_truncated = _safetensors_name_preview(name)
+
+    assert len(preview.encode("utf-8")) <= _SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES
+    assert original_utf8_bytes == len(name.encode("utf-8"))
+    assert truncated is True
+    assert (preview, original_utf8_bytes, truncated) == (
+        repeated_preview,
+        repeated_utf8_bytes,
+        repeated_truncated,
+    )
+    assert name not in preview
+    assert preview.endswith(f"...#{hashlib.sha256(name.encode()).hexdigest()[:12]}")
+
+
+def test_remote_invalid_header_length_does_not_hash_sparse_stub(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "invalid-remote-header.safetensors"
+    file_path.write_bytes(struct.pack("<Q", 1024))
+
+    def fail_integrity_hash(_scanner: SafeTensorsScanner, _path: str, _result: Any) -> None:
+        raise AssertionError("remote header-only scans must not hash sparse stubs")
+
+    monkeypatch.setattr(SafeTensorsScanner, "add_file_integrity_check", fail_integrity_hash)
+    result = SafeTensorsScanner(
+        config={
+            _REMOTE_HEADER_ONLY_CONFIG_KEY: True,
+            _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY: 8,
+            _REMOTE_HEADER_INTEGRITY_CONFIG_KEY: {"range_semantics": "strict_206_content_range"},
+        }
+    ).scan(str(file_path))
+
+    assert result.success is False
+    assert result.bytes_scanned == 8
+    assert result.metadata["remote_header_only"] is True
+    integrity_check = next(check for check in result.checks if check.name == "Remote SafeTensors Header Integrity")
+    assert integrity_check.status == CheckStatus.PASSED
+
+
+def test_tensor_cardinality_limit_bounds_result_amplification(tmp_path: Path) -> None:
+    file_path = tmp_path / "many-tensors.safetensors"
+    header = {f"tensor_{index}": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]} for index in range(5000)}
+    write_raw_safetensors(file_path, header, b"")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["tensor_count"] == 5000
+    assert result.metadata["tensor_count_reported"] == 1024
+    assert result.metadata["tensor_metadata_truncated"] is True
+    assert len(result.metadata["tensors"]) == 1024
+    assert "tensor_names_digest" not in result.metadata
+    cardinality_check = next(check for check in result.checks if check.name == "SafeTensors Tensor Cardinality Limit")
+    assert cardinality_check.status == CheckStatus.FAILED
+    assert len(result.checks) < 20
+
+
+@pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
+def test_max_token_tensor_cardinality_failure_is_memory_and_output_bounded() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    script = textwrap.dedent(
+        """
+        import gc
+        import json
+        import resource
+        import struct
+        import sys
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from modelaudit.scanners import safetensors_scanner as safetensors_module
+
+        tensor_count = 14_000
+        header = {
+            f"tensor_{index:05d}_" + ("界" * 362): {
+                "dtype": "U8",
+                "shape": [0],
+                "data_offsets": [0, 0],
+            }
+            for index in range(tensor_count)
+        }
+        assert tensor_count * 7 <= safetensors_module._MAX_SAFETENSORS_JSON_TOKENS
+        assert safetensors_module._MAX_SAFETENSORS_JSON_TOKENS - (tensor_count * 7) < 4096
+        header_bytes = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode()
+        header_size = len(header_bytes)
+        expected_name_bytes = sum(len(name.encode()) for name in header)
+        expected_max_name_bytes = max(len(name.encode()) for name in header)
+        preview_calls = 0
+        original_name_preview = safetensors_module._safetensors_name_preview
+
+        def count_name_preview(name):
+            global preview_calls
+            preview_calls += 1
+            return original_name_preview(name)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "max-token-cardinality.safetensors"
+            path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes)
+            del header
+            del header_bytes
+            gc.collect()
+            before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            with patch.object(
+                safetensors_module,
+                "_safetensors_name_preview",
+                side_effect=count_name_preview,
+            ):
+                result = safetensors_module.SafeTensorsScanner().scan(str(path))
+            after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+        serialized = json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":"), default=str)
+        scale = 1 if sys.platform == "darwin" else 1024
+        print(
+            json.dumps(
+                {
+                    "success": result.success,
+                    "header_size": header_size,
+                    "header_limit": safetensors_module.MAX_HEADER_BYTES,
+                    "tensor_count": result.metadata.get("tensor_count"),
+                    "reported_tensor_count": len(result.metadata.get("tensors", [])),
+                    "tensor_name_utf8_bytes": result.metadata.get("tensor_name_utf8_bytes"),
+                    "expected_name_bytes": expected_name_bytes,
+                    "max_tensor_name_utf8_bytes": result.metadata.get("max_tensor_name_utf8_bytes"),
+                    "expected_max_name_bytes": expected_max_name_bytes,
+                    "preview_truncated_count": result.metadata.get("tensor_name_preview_truncated_count"),
+                    "has_tensor_names_digest": "tensor_names_digest" in result.metadata,
+                    "preview_calls": preview_calls,
+                    "cardinality_checks": sum(
+                        check.name == "SafeTensors Tensor Cardinality Limit" for check in result.checks
+                    ),
+                    "serialized_bytes": len(serialized.encode()),
+                    "peak_delta_bytes": (after - before) * scale,
+                }
+            )
+        )
+        """
+    )
+    env = {**os.environ, "PYTHONPATH": str(repo_root), "PROMPTFOO_DISABLE_TELEMETRY": "1"}
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    metrics = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert metrics["success"] is False
+    assert metrics["header_size"] > 15 * 1024 * 1024
+    assert metrics["header_size"] < metrics["header_limit"]
+    assert metrics["tensor_count"] == 14_000
+    assert metrics["reported_tensor_count"] == 1024
+    assert metrics["tensor_name_utf8_bytes"] == metrics["expected_name_bytes"]
+    assert metrics["max_tensor_name_utf8_bytes"] == metrics["expected_max_name_bytes"]
+    assert metrics["preview_truncated_count"] == metrics["tensor_count"]
+    assert metrics["has_tensor_names_digest"] is False
+    assert metrics["preview_calls"] == 1024
+    assert metrics["cardinality_checks"] == 1
+    assert metrics["serialized_bytes"] < 32 * 1024 * 1024
+    assert metrics["peak_delta_bytes"] < 64 * 1024 * 1024
+
+
+def test_tensor_cardinality_limit_still_reports_custom_metadata_attacks(tmp_path: Path) -> None:
+    """Padding tensors cannot suppress bounded custom-metadata security checks."""
+    file_path = tmp_path / "many-tensors-malicious-metadata.safetensors"
+    header = {f"tensor_{index}": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]} for index in range(4097)}
+    header["__metadata__"] = {
+        "html": "<script>alert(1)</script>",
+        "code": "eval(payload)",
+        "credential": "api_key=SECRET_METADATA_TOKEN",
+        "url": "https://evil.example/payload",
+    }
+    write_raw_safetensors(file_path, header, b"")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["tensor_count"] == 4097
+    assert {
+        "xss_html_injection",
+        "code_injection",
+        "credential_exposure",
+        "suspicious_pattern",
+    }.issubset(result.metadata["custom_metadata_security_flags"])
+    assert {
+        "SafeTensors XSS/HTML Injection Detection",
+        "SafeTensors Code Injection Detection",
+        "SafeTensors Embedded Credentials Detection",
+        "Metadata Pattern Check",
+    }.issubset({check.name for check in result.checks if check.status == CheckStatus.FAILED})
+    assert "tensor_name_injection_count" not in result.metadata
+    assert any(
+        check.name == "SafeTensors Tensor Cardinality Limit" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_tensor_cardinality_limit_keeps_benign_custom_metadata_clean(tmp_path: Path) -> None:
+    """Benign metadata remains clean when tensor validation stops at the cap."""
+    file_path = tmp_path / "many-tensors-benign-metadata.safetensors"
+    header = {f"tensor_{index}": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]} for index in range(4097)}
+    header["__metadata__"] = {"description": "ordinary model training notes"}
+    write_raw_safetensors(file_path, header, b"")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert any(
+        check.name == "SafeTensors Tensor Cardinality Limit" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not [
+        check
+        for check in result.checks
+        if check.name
+        in {
+            "SafeTensors XSS/HTML Injection Detection",
+            "SafeTensors Code Injection Detection",
+            "SafeTensors Embedded Credentials Detection",
+            "Metadata Pattern Check",
+        }
+        and check.status == CheckStatus.FAILED
+    ]
+
+
+def test_custom_metadata_value_findings_are_bounded_and_counted(tmp_path: Path) -> None:
+    """Per-value metadata findings count all matches without amplifying output."""
+    file_path = tmp_path / "many-metadata-findings.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]},
+            "__metadata__": {f"entry_{index}": "import os" for index in range(2000)},
+        },
+        b"",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    code_checks = [check for check in result.checks if check.name == "Metadata Code Pattern Check"]
+    assert len(code_checks) == 20
+    assert result.metadata["custom_metadata_code_pattern_finding_count"] == 2000
+    assert result.metadata["custom_metadata_code_pattern_findings_truncated"] is True
+    assert result.metadata["custom_metadata_security_record_counts"]["Metadata Code Pattern Check"] == {
+        "failed": 2000,
+        "reported": 20,
+    }
+    assert len([issue for issue in result.issues if issue.why and "code-like patterns" in issue.why]) == 20
+    assert all(
+        len([check for check in result.checks if check.name == check_name]) <= 20
+        for check_name in ("Metadata Length Check", "Metadata Code Pattern Check", "Metadata Pattern Check")
+    )
+
+
+def test_tensor_validation_records_are_bounded_at_cardinality_limit(tmp_path: Path) -> None:
+    file_path = tmp_path / "bounded-tensor-findings.safetensors"
+    header = {
+        f"tensor_{index}": {
+            "dtype": "U8",
+            "shape": [0],
+            "data_offsets": [0, 0],
+            "unexpected": index,
+        }
+        for index in range(4096)
+    }
+    write_raw_safetensors(file_path, header, b"")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.metadata["tensor_count"] == 4096
+    assert result.metadata["tensor_metadata_injection_count"] == 4096
+    assert result.metadata["tensor_metadata_injection_findings_truncated"] is True
+    assert result.metadata["tensor_validation_record_counts"]["Tensor Offset Validation"]["passed"] == 4096
+    assert result.metadata["tensor_validation_record_counts"]["Tensor Size Consistency Check"]["passed"] == 4096
+    assert len(result.checks) < 100
+    assert len(result.issues) == 20
+
+
+def test_container_heavy_header_is_rejected_before_json_materialization(tmp_path: Path) -> None:
+    file_path = tmp_path / "container-heavy.safetensors"
+    header_bytes = b'{"__metadata__":[' + (b"null," * 100_000) + b"null]}"
+    file_path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    parse_check = next(check for check in result.checks if check.name == "SafeTensors JSON Parse")
+    assert result.success is False
+    assert parse_check.status == CheckStatus.FAILED
+    assert "JSON object/value limit" in parse_check.message
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+
+def test_json_member_like_text_inside_metadata_string_is_not_counted(tmp_path: Path) -> None:
+    file_path = tmp_path / "metadata-member-text.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "__metadata__": {"note": '":' * 100_001},
+            "tensor": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]},
+        },
+        b"",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert not any("JSON object/value limit" in check.message for check in result.checks)
+
+
+def test_local_safetensors_keeps_file_type_validation_warning(tmp_path: Path) -> None:
+    file_path = tmp_path / "local.safetensors"
+    write_raw_safetensors(file_path, {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"\0")
+    format_validation = {
+        "path": os.path.abspath(file_path),
+        "file_type_valid": False,
+        "header_format": "pickle_routing_inconclusive",
+        "extension_format": "safetensors",
+    }
+
+    result = SafeTensorsScanner(config={FORMAT_VALIDATION_CONFIG_KEY: format_validation}).scan(str(file_path))
+
+    assert result.success is True
+    assert any(
+        isinstance(issue.details, dict) and issue.details.get("security_check") == "file_type_validation"
+        for issue in result.issues
+    )
 
 
 @pytest.mark.parametrize(

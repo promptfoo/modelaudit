@@ -2,6 +2,7 @@
 
 import inspect
 import io
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeGuard
 from urllib.parse import unquote, urlparse
@@ -21,6 +22,25 @@ from .detection import _has_zip_magic
 
 _MAX_STREAM_SOURCE_PATH_DECODE_PASSES = 4
 STREAMING_ANALYSIS_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class StreamedSourceByteAccounting:
+    """Internal exact-once byte accounting for trusted streamed scan items."""
+
+    pretransferred_bytes: int = 0
+    source_bytes_preaccounted: int = 0
+    source_path: str | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("pretransferred_bytes", self.pretransferred_bytes),
+            ("source_bytes_preaccounted", self.source_bytes_preaccounted),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.source_path is not None and (not isinstance(self.source_path, str) or not self.source_path):
+            raise ValueError("source_path must be a non-empty string when provided")
 
 
 def resolve_streaming_max_bytes(max_bytes: object = None) -> int:

@@ -85,6 +85,56 @@ from tests.helpers.file_creators import valid_jpeg_bytes, valid_png_bytes
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
 
+def test_streaming_precomputed_remote_safetensors_result_skips_local_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_hash(_path: Path) -> str:
+        raise AssertionError("precomputed remote result should not be hashed")
+
+    monkeypatch.setattr("modelaudit.utils.helpers.file_hash.compute_sha256_hash", fail_hash)
+    scan_result = ScanResult(scanner_name="safetensors")
+    source_path = "hf://test/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model-00001-of-00001.safetensors"
+    scan_result.metadata.update(
+        {
+            "source_path": source_path,
+            "remote_header_only": True,
+            "remote_declared_size": 5_000_000_000,
+            "remote_bytes_transferred": 64,
+            "tensor_payload_bytes_downloaded": 0,
+        }
+    )
+    scan_result.bytes_scanned = 64
+    scan_result.finish(success=True)
+
+    aggregate = scan_model_streaming(
+        iter([(Path("model-00001-of-00001.safetensors"), True, scan_result)]),
+        max_file_size=1,
+        max_total_size=128,
+    )
+
+    assert aggregate.success is True
+    assert aggregate.files_scanned == 1
+    assert aggregate.bytes_scanned == 64
+    assert aggregate.content_hash is None
+    assert aggregate.file_metadata[source_path].get("remote_header_only") is True
+
+
+def test_streaming_non_iterable_source_records_operational_error() -> None:
+    class CloseableNonIterable:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = CloseableNonIterable()
+    result = scan_model_streaming(cast(Iterator[tuple[Path, bool]], source))
+
+    assert source.closed is True
+    assert result.success is False
+    assert result.has_errors is True
+    assert any("not iterable" in issue.message for issue in result.issues)
+
+
 def _stat_result_with(
     source: os.stat_result,
     *,
