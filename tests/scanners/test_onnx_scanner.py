@@ -11481,10 +11481,10 @@ class TestWeightDistributionSemantics:
         onnx.save(model, str(model_path))
         sidecar = model_path.parent / "weights.bin"
         replacement_sidecar = model_path.parent / "replacement.bin"
+        replacement_sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
         if symlink_sidecar:
             original_sidecar = model_path.parent / "original.bin"
             original_sidecar.write_bytes(sidecar.read_bytes())
-            replacement_sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
             sidecar.unlink()
             sidecar.symlink_to(original_sidecar.name)
         original_scan_file = modelaudit_core.scan_file
@@ -11497,7 +11497,7 @@ class TestWeightDistributionSemantics:
                     sidecar.unlink()
                     sidecar.symlink_to(replacement_sidecar.name)
                 else:
-                    sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
+                    replacement_sidecar.replace(sidecar)
                 mutated = True
             return original_scan_file(path, config)
 
@@ -11528,6 +11528,75 @@ class TestWeightDistributionSemantics:
         assert len(checks) == 1
         assert checks[0].status == CheckStatus.FAILED
         assert checks[0].details["scan_outcome_reason"] == "onnx_external_data_changed_during_scan"
+
+    @pytest.mark.parametrize("retarget_during_hash", [False, True], ids=["stable", "retargeted"])
+    def test_streaming_rechecks_sidecar_identity_immediately_after_hash(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+        retarget_during_hash: bool,
+    ) -> None:
+        reset_cache_manager()
+        model_path = create_external_onnx_weight_package(
+            tmp_path / "hash-race",
+            np.zeros((100, 10), dtype=np.float32),
+        )
+        sidecar = model_path.parent / "weights.bin"
+        original_sidecar = model_path.parent / "original.bin"
+        replacement_sidecar = model_path.parent / "replacement.bin"
+        original_sidecar.write_bytes(sidecar.read_bytes())
+        replacement_sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
+        sidecar.unlink()
+        sidecar.symlink_to(original_sidecar.name)
+        original_compute_sha256_hash = compute_sha256_hash
+        original_scan_file = modelaudit_core.scan_file
+        retargeted = False
+        restored = False
+
+        def retarget_sidecar_while_hashing(path: str | Path) -> str:
+            nonlocal retargeted
+            if retarget_during_hash and Path(path) == sidecar:
+                sidecar.unlink()
+                sidecar.symlink_to(replacement_sidecar.name)
+                retargeted = True
+            return original_compute_sha256_hash(path)
+
+        def restore_sidecar_before_scan(path: str, config: dict[str, Any]) -> Any:
+            nonlocal restored
+            if path == str(model_path) and retargeted:
+                sidecar.unlink()
+                sidecar.symlink_to(original_sidecar.name)
+                restored = True
+            return original_scan_file(path, config)
+
+        monkeypatch.setattr(
+            "modelaudit.utils.helpers.file_hash.compute_sha256_hash",
+            retarget_sidecar_while_hashing,
+        )
+        monkeypatch.setattr(modelaudit_core, "scan_file", restore_sidecar_before_scan)
+        result = scan_model_streaming(
+            iter([(model_path, True)]),
+            delete_after_scan=False,
+            scanners=["onnx"],
+            cache_enabled=False,
+            cache_dir=str(tmp_path / "cache"),
+        )
+        reset_cache_manager()
+
+        assert retargeted is retarget_during_hash
+        assert restored is retarget_during_hash
+        metadata = result.file_metadata[str(model_path)]
+        checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+        if retarget_during_hash:
+            assert determine_exit_code(result) == 2
+            assert getattr(metadata, "onnx_package_hash_complete", None) is False
+            assert len(checks) == 1
+            assert checks[0].status == CheckStatus.FAILED
+            assert checks[0].details["scan_outcome_reason"] == "onnx_external_data_changed_during_scan"
+        else:
+            assert getattr(metadata, "onnx_package_hash_complete", None) is True
+            assert checks == []
 
     @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
     def test_incomplete_external_data_discovery_disables_onnx_clustering(

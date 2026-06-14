@@ -7568,6 +7568,9 @@ def scan_model_streaming(
         with suppress(OSError):
             top_level_hashed_bytes += scan_path.stat().st_size
         file_hash = compute_sha256_hash(scan_path)
+        if _snapshot_file_identity(scan_path) != scan_path_identity:
+            aggregate_hash_complete = False
+            return None
         file_hashes.append(file_hash)
         if scan_path_identity is not None:
             hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
@@ -7718,6 +7721,7 @@ def scan_model_streaming(
             openvino_companion_pre_scan_identity: _FileIdentitySnapshot | None = None
             openvino_companion_bytes_scanned = 0
             onnx_external_data_pre_scan_identities: dict[Path, _FileIdentitySnapshot] = {}
+            onnx_external_data_hash_unstable: set[Path] = set()
             onnx_external_data_bytes_scanned = 0
             onnx_external_data_hashes: list[tuple[str, str]] = []
             onnx_package_hash_complete: bool | None = None
@@ -8071,6 +8075,11 @@ def scan_model_streaming(
                                 skip_if_stream_source_seen=True,
                                 skip_if_stream_target_seen=True,
                             )
+                            if _snapshot_file_identity(onnx_external_data_path) != external_data_identity:
+                                onnx_external_data_hash_unstable.add(onnx_external_data_path)
+                                aggregate_hash_complete = False
+                                onnx_package_hash_complete = False
+                                external_data_hash = None
                         if external_data_hash is None:
                             onnx_package_hash_complete = False
                         else:
@@ -8119,11 +8128,12 @@ def scan_model_streaming(
                     )
                     preserve_shard_reconciliation_errors = True
                     aggregate_hash_complete = False
-                changed_onnx_sidecars = [
+                changed_onnx_sidecars = {
                     onnx_external_data_path
                     for onnx_external_data_path, pre_scan_identity in onnx_external_data_pre_scan_identities.items()
                     if _snapshot_file_identity(onnx_external_data_path) != pre_scan_identity
-                ]
+                }
+                changed_onnx_sidecars.update(onnx_external_data_hash_unstable)
                 if changed_onnx_sidecars:
                     aggregate_hash_complete = False
                     onnx_package_hash_complete = False
