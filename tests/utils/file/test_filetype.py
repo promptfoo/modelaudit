@@ -3849,6 +3849,7 @@ def test_embedded_global_with_stack_valid_or_truncated_continuation_fails_closed
     "pickle_stream",
     [
         pytest.param(b"]cposix\nsystem\na.", id="EMPTY_LIST-APPEND"),
+        pytest.param(b"]cmystery_module\nthing\na.", id="EMPTY_LIST-APPEND-nonallowlisted"),
         pytest.param(b"(cposix\nsystem\nt.", id="MARK-TUPLE"),
         pytest.param(b"(S'key'\ncposix\nsystem\nd.", id="MARK-STRING-DICT"),
     ],
@@ -4054,8 +4055,6 @@ def test_legal_named_pickle_with_protocol0_continuation_fails_closed(
         ("NOTICE", b"cwebbrowser\nopen\n(S'http://example.com'\ntR."),
         ("LICENSE", b"crequests\nget\n(S'http://example.com'\ntR."),
         ("LICENSE", pickle.dumps({"safe": True}, protocol=0) + b'cposix\nsystem\n(S"echo pwned"\ntR.'),
-        ("NOTICE", base64.b64encode(b"os.system('id')")),
-        ("LICENSE", b"os.system('id')".hex().encode("ascii")),
     ],
 )
 def test_detect_file_format_keeps_malicious_legal_names_on_pickle_route(
@@ -4068,6 +4067,44 @@ def test_detect_file_format_keeps_malicious_legal_names_on_pickle_route(
 
     assert detect_file_format(str(path)) == "pickle"
     assert detect_file_format_from_magic(str(path)) == "pickle"
+
+
+@pytest.mark.parametrize(
+    "encoder",
+    [
+        pytest.param(base64.b64encode, id="base64"),
+        pytest.param(binascii.hexlify, id="hex"),
+    ],
+)
+def test_detect_file_format_fails_closed_for_encoded_execution_syntax(
+    tmp_path: Path,
+    encoder: Callable[[bytes], bytes],
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(encoder(b"os.system('id')"))
+
+    assert detect_file_format(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
+@pytest.mark.parametrize(
+    "encoder",
+    [
+        pytest.param(base64.b64encode, id="base64"),
+        pytest.param(binascii.hexlify, id="hex"),
+    ],
+)
+def test_detect_file_format_keeps_benign_encoded_execution_word_on_text_route(
+    tmp_path: Path,
+    encoder: Callable[[bytes], bytes],
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"MIT License\n" + encoder(b"hello subprocess world") + b"\n")
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
 @pytest.mark.parametrize("protocol", [0, 1, 2, 3, 4, 5])
@@ -4089,6 +4126,29 @@ def test_detect_file_format_fails_closed_for_binary_pickle_embedded_in_legal_tex
 
     assert detect_file_format(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     assert detect_file_format_from_magic(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_for_protocolless_binary_pickle_embedded_in_legal_text(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "LICENSE"
+    protocol_less_pickle = b"\x8c\x0emystery_module\x8c\x05thing\x93)R."
+    path.write_bytes(b"MIT License\nCopyright Example\n" + protocol_less_pickle)
+
+    assert detect_file_format(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_keeps_unicode_legal_prose_with_stack_global_byte_on_text_route(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    payload = "MIT License\nCopyright Example 😓\n".encode()
+    assert b"\x93" in payload
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
 def test_detect_file_format_fails_closed_for_urlsafe_base64_encoded_pickle(tmp_path: Path) -> None:

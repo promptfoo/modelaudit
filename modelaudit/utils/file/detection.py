@@ -461,12 +461,13 @@ _LEGAL_TEXT_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]
 _LEGAL_TEXT_HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
 _LEGAL_TEXT_MAX_ENCODED_TOKENS = 64
 _LEGAL_TEXT_MAX_DECODED_BYTES = 1024 * 1024
-_LEGAL_TEXT_ENCODED_EXECUTION_PATTERNS = (
-    b"eval(",
-    b"exec(",
-    b"os.system",
-    b"subprocess",
-    b"__import__",
+_LEGAL_TEXT_ENCODED_EXECUTION_RE = re.compile(
+    rb"(?:"
+    rb"\b(?:eval|exec|__import__)\s*\(|"
+    rb"\bos\s*\.\s*system\s*\(|"
+    rb"\bsubprocess\s*\.\s*(?:call|check_call|check_output|getoutput|getstatusoutput|popen|run)\s*\("
+    rb")",
+    re.IGNORECASE,
 )
 _LEGAL_TEXT_PROTO0_GLOBAL_RE = re.compile(rb"(?=#?[ci][A-Za-z_][A-Za-z0-9_.]{0,127}\n[A-Za-z_][A-Za-z0-9_.]{0,127}\n)")
 _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES = 4096
@@ -2662,6 +2663,22 @@ _PROTOCOLLESS_BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES = _BINARY_PICKLE_PRE_STOP_
     {"EXT1", "EXT2", "EXT4"}
 )
 _PICKLE_OPCODE_BY_BYTE = {ord(opcode.code): opcode for opcode in pickletools.opcodes}
+_STACK_GLOBAL_OPCODE_BYTE = ord(next(opcode.code for opcode in pickletools.opcodes if opcode.name == "STACK_GLOBAL"))
+_PROTOCOLLESS_BINARY_IMPORT_VALUE_START_BYTES = frozenset(
+    ord(opcode.code)
+    for opcode in pickletools.opcodes
+    if opcode.name
+    in {
+        "BINBYTES",
+        "BINBYTES8",
+        "BINSTRING",
+        "BINUNICODE",
+        "BINUNICODE8",
+        "SHORT_BINBYTES",
+        "SHORT_BINSTRING",
+        "SHORT_BINUNICODE",
+    }
+)
 _PICKLE_LINE_PAIR_OPCODES: frozenset[str] = frozenset({"GLOBAL", "INST"})
 _PICKLE_VARIABLE_LENGTH_HEADER_BYTES: dict[int, int] = {-2: 1, -3: 4, -4: 4, -5: 8}
 
@@ -5329,12 +5346,14 @@ def _classify_pickle_security_payload(payload: bytes) -> str | None:
 
 
 def _decoded_token_pickle_route(decoded: bytes) -> str | None:
-    lowered = decoded.lower()
-    if any(pattern in lowered for pattern in _LEGAL_TEXT_ENCODED_EXECUTION_PATTERNS):
-        return "pickle"
     if _looks_like_binary_pickle_protocol(decoded[:4]):
         return _classify_pickle_security_payload(decoded)
-    return _structural_legal_text_pickle_route(decoded)
+    structural_route = _structural_legal_text_pickle_route(decoded)
+    if structural_route is not None:
+        return structural_route
+    if _LEGAL_TEXT_ENCODED_EXECUTION_RE.search(decoded) is not None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return None
 
 
 def _decode_base64_route_token(token: bytes) -> bytes:
@@ -5400,10 +5419,10 @@ def _embedded_proto0_global_continuation_has_stack_evidence(candidate: bytes) ->
             memo,
             hashability_cache,
         )
-    except ValueError as exc:
-        return "opcode" not in str(exc)
     except (StopIteration, UnicodeError):
         return True
+    except ValueError as exc:
+        return "opcode" not in str(exc)
     except (MemoryError, RecursionError):
         return True
     except Exception:
@@ -5782,12 +5801,45 @@ def _encoded_pickle_route(payload: bytes) -> str | None:
     return None
 
 
+def _embedded_protocolless_binary_pickle_route(payload: bytes) -> str | None:
+    """Boundedly probe binary import streams that omit the PROTO opcode."""
+    if _STACK_GLOBAL_OPCODE_BYTE not in payload:
+        return None
+    if _decode_complete_utf8_plain_text(payload) is not None:
+        return None
+
+    remaining_candidates = _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES
+    work_budget = _PickleProbeWorkBudget()
+    for offset, value in enumerate(payload):
+        if value not in _PROTOCOLLESS_BINARY_IMPORT_VALUE_START_BYTES:
+            continue
+        if remaining_candidates <= 0:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        remaining_candidates -= 1
+        candidate_end = min(len(payload), offset + PROTO0_1_MAX_PROBE_BYTES)
+        state = _classify_initial_pickle_security_signal(
+            payload[offset:candidate_end],
+            sample_is_prefix=candidate_end < len(payload),
+            available_stream_length=len(payload) - offset,
+            _work_budget=work_budget,
+        )
+        if state is True:
+            return "pickle" if offset == 0 else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        if state is None:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return None
+
+
 def _embedded_raw_pickle_route(payload: bytes) -> str | None:
     binary_offset = payload.find(b"\x80")
     while binary_offset != -1:
         if _looks_like_binary_pickle_protocol(payload[binary_offset : binary_offset + 4]):
             return "pickle" if binary_offset == 0 else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
         binary_offset = payload.find(b"\x80", binary_offset + 1)
+
+    protocol_less_route = _embedded_protocolless_binary_pickle_route(payload)
+    if protocol_less_route is not None:
+        return protocol_less_route
 
     return _structural_legal_text_pickle_route(payload)
 

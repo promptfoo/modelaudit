@@ -11184,6 +11184,18 @@ class TestZipScanner:
 
         _assert_inconclusive_pickle_member(result, archive_path, member_name)
 
+    def test_scan_zip_fails_closed_for_protocolless_binary_pickle_in_legal_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "protocolless_binary_pickle.zip"
+        member_name = r"docs\LICENSE"
+        protocol_less_pickle = b"\x8c\x0emystery_module\x8c\x05thing\x93)R."
+        payload = b"MIT License\nCopyright Example\n" + protocol_less_pickle
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            _writestr_preserving_member_name(archive, member_name, payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        _assert_inconclusive_pickle_member(result, archive_path, member_name)
+
     def test_scan_zip_fails_closed_for_oversized_legal_member(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "oversized_legal_member.zip"
         prefix = b"NOTICE\nCopyright (c) Example\n"

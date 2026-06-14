@@ -818,6 +818,55 @@ def test_scan_file_fails_closed_for_binary_pickle_embedded_in_license_text(tmp_p
     _assert_incomplete_pickle_routing(result, path)
 
 
+def test_scan_file_fails_closed_for_protocolless_binary_pickle_embedded_in_license_text(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    protocol_less_pickle = b"\x8c\x0emystery_module\x8c\x05thing\x93)R."
+    path.write_bytes(b"MIT License\nCopyright Example\n" + protocol_less_pickle)
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    _assert_incomplete_pickle_routing(result, path)
+
+
+@pytest.mark.parametrize(
+    "encoder",
+    [
+        pytest.param(base64.b64encode, id="base64"),
+        pytest.param(binascii.hexlify, id="hex"),
+    ],
+)
+def test_scan_file_fails_closed_for_encoded_execution_syntax(
+    tmp_path: Path,
+    encoder: Callable[[bytes], bytes],
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(encoder(b"os.system('id')"))
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    _assert_incomplete_pickle_routing(result, path)
+
+
+@pytest.mark.parametrize(
+    "encoder",
+    [
+        pytest.param(base64.b64encode, id="base64"),
+        pytest.param(binascii.hexlify, id="hex"),
+    ],
+)
+def test_scan_file_keeps_benign_encoded_execution_word_on_text_route(
+    tmp_path: Path,
+    encoder: Callable[[bytes], bytes],
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"MIT License\n" + encoder(b"hello subprocess world") + b"\n")
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.scanner_names == ["text"]
+    assert determine_exit_code(result) == 0
+
+
 def test_scan_file_fails_closed_for_urlsafe_base64_encoded_pickle(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     embedded_pickle = b"\xfb" + b"cposix\nsystem\n(S'id'\ntR."
