@@ -272,7 +272,9 @@ class TestShardedModelDetector:
         result = AdvancedFileHandler(str(shard), CompletingShardScanner()).scan()
 
         assert shard_info is not None
-        assert shard_info["safetensors_index_path"] == str(index_path)
+        assert os.path.normcase(os.path.normpath(shard_info["safetensors_index_path"])) == os.path.normcase(
+            os.path.normpath(str(index_path))
+        )
         assert shard_info["shard_index_base"] == "zero"
         assert shard_info["shards"] == [str(shard)]
         assert "missing_shard_count" not in shard_info
