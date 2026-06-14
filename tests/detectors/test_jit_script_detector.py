@@ -6344,10 +6344,17 @@ class TestJITScriptDetector:
         assert aliases.lookups == identifier_count
         assert aliases.iterations == 0
 
-    def test_scan_model_detects_runpy_call_after_builtins_alias_helper_noise(self) -> None:
+    def test_scan_model_detects_tail_runpy_call_after_builtins_alias_helper_noise(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
         aliases = b"".join(f"bi_{index} = builtins\n".encode() for index in range(64))
         helper_writes = b"bi_0.setattr = lambda *args: None\n" * 64
-        source = b"import runpy as rp\nimport builtins\n" + aliases + helper_writes + b"rp.run_path('payload.py')\n"
+        source = (
+            b"\x00\xffimport runpy as rp\nimport builtins\n"
+            + aliases
+            + helper_writes
+            + padding
+            + b"\x00\xff((rp).run_path)('payload.py')\n"
+        )
 
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
 
