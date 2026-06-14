@@ -5664,6 +5664,15 @@ def _has_terminal_persid_signal(value: bytes) -> bool:
     )
 
 
+def _has_short_terminal_persid_signal(value: bytes) -> bool:
+    """Accept a short operand at STOP/EOF without admitting sentence-like prose."""
+    value = value.removesuffix(b"\r")
+    if not value or value[-1:] in b".,;:!?":
+        return False
+    words = value.split()
+    return 1 <= len(words) <= 2 and all(_is_compact_pickle_line(word) for word in words)
+
+
 def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
     """Cheaply reject incomplete first operands before charging structural work."""
     if offset >= len(payload):
@@ -5698,7 +5707,9 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
         if opcode.name in {"GLOBAL", "INST"}:
             operands = (lines[0], lines[1])
             return all(_plausible_pickle_import_operand(line) for line in operands) and (
-                _has_structural_pickle_continuation(payload, cursor) or _has_pickle_import_signal(operands)
+                _has_structural_pickle_continuation(payload, cursor)
+                or _has_compact_invalid_pickle_tail(payload, cursor)
+                or _has_pickle_import_signal(operands)
             )
         if opcode.name == "PERSID":
             normalized_operand = lines[0].removesuffix(b"\r")
@@ -5706,14 +5717,17 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
                 return (
                     cursor == len(payload)
                     or payload[cursor : cursor + 1] == b"."
-                    or _has_single_invalid_pickle_tail(payload, cursor)
+                    or _has_compact_invalid_pickle_tail(payload, cursor)
                 )
+            terminal_or_stop = cursor == len(payload) or payload[cursor : cursor + 1] == b"."
+            if terminal_or_stop and _has_short_terminal_persid_signal(lines[0]):
+                return True
             return _is_compact_pickle_line(lines[0]) or (
                 _has_terminal_persid_signal(lines[0])
                 and (
-                    cursor == len(payload)
+                    terminal_or_stop
                     or _has_structural_pickle_continuation(payload, cursor)
-                    or _has_single_invalid_pickle_tail(payload, cursor)
+                    or _has_compact_invalid_pickle_tail(payload, cursor)
                 )
             )
         if opcode.name == "STRING":
@@ -5772,9 +5786,9 @@ def _has_structural_pickle_continuation(payload: bytes, offset: int) -> bool:
     return opcode is not None and opcode.name not in _PICKLE_LINE_PAIR_OPCODES
 
 
-def _has_single_invalid_pickle_tail(payload: bytes, offset: int) -> bool:
+def _has_compact_invalid_pickle_tail(payload: bytes, offset: int) -> bool:
     tail = payload[offset:].strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
-    return len(tail) == 1 and tail[0] not in _PICKLE_OPCODE_BY_BYTE
+    return _is_compact_pickle_line(tail) and tail[0] not in _PICKLE_OPCODE_BY_BYTE
 
 
 @lru_cache(maxsize=128)
@@ -5851,7 +5865,7 @@ def _iter_pickle_candidate_offsets(
                 and line_start == offset
                 and (
                     _has_structural_pickle_continuation(payload, line_end + 1)
-                    or _has_single_invalid_pickle_tail(payload, line_end + 1)
+                    or _has_compact_invalid_pickle_tail(payload, line_end + 1)
                 )
             ):
                 require_continuation = False
@@ -5872,16 +5886,18 @@ def _iter_pickle_candidate_offsets(
             )
             continuation_offset = second_line_end + 1
             has_structural_continuation = _has_structural_pickle_continuation(payload, continuation_offset)
+            has_compact_invalid_tail = _has_compact_invalid_pickle_tail(payload, continuation_offset)
             has_import_boundary = not has_nontrivial_prefix or payload[offset - 1] in b" \t#;:="
-            has_nonstructural_import_signal = (
-                has_import_boundary
-                and _has_pickle_import_signal(operands)
-                and (
-                    opcode_name == "GLOBAL"
-                    or continuation_offset == len(payload)
-                    or _has_importable_pickle_module(operands)
-                    or _has_single_invalid_pickle_tail(payload, continuation_offset)
-                    or (has_trivial_prefix and ord("(") in payload[line_start:offset])
+            has_nonstructural_import_signal = has_import_boundary and (
+                has_compact_invalid_tail
+                or (
+                    _has_pickle_import_signal(operands)
+                    and (
+                        opcode_name == "GLOBAL"
+                        or continuation_offset == len(payload)
+                        or _has_importable_pickle_module(operands)
+                        or (has_trivial_prefix and ord("(") in payload[line_start:offset])
+                    )
                 )
             )
             if require_continuation and not (has_structural_continuation or has_nonstructural_import_signal):
@@ -5935,7 +5951,7 @@ def _iter_pickle_candidate_offsets(
                 require_continuation = candidate_start > 0 and bool(trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES))
                 if require_continuation and (
                     _has_structural_pickle_continuation(payload, line_end + 1)
-                    or _has_single_invalid_pickle_tail(payload, line_end + 1)
+                    or _has_compact_invalid_pickle_tail(payload, line_end + 1)
                 ):
                     require_continuation = False
                 yield from maybe_add(

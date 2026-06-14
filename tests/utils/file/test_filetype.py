@@ -3899,6 +3899,7 @@ def test_protocol0_binpersid_callback_precedes_invalid_continuation() -> None:
     [
         pytest.param(b"Pid\r\n.", "id\r", id="crlf-PERSID"),
         pytest.param(b"P\n.", "", id="empty-PERSID"),
+        pytest.param(b"Pmit license\n.", "mit license", id="lowercase-spaced-PERSID"),
         pytest.param(b"U\x01aQ.", "a", id="short-string-BINPERSID"),
     ],
 )
@@ -4095,6 +4096,22 @@ def test_next_buffer_callback_precedes_invalid_continuation() -> None:
             b"MIT License\nP\n.",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-empty-PERSID",
+        ),
+        pytest.param(b"Pmit license\n.", "pickle", id="initial-lowercase-spaced-PERSID"),
+        pytest.param(
+            b"MIT License\nPmit license\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-lowercase-spaced-PERSID-before-EOF",
+        ),
+        pytest.param(
+            b"MIT License\nPid\nAB",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-PERSID-before-multibyte-invalid-tail",
+        ),
+        pytest.param(
+            b"MIT License\ncmalicious\npayload\nAB",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-unknown-GLOBAL-before-multibyte-invalid-tail",
         ),
         pytest.param(
             b"MIT License\ncnumpy\narray\n",
@@ -4330,6 +4347,21 @@ def test_xgboost_json_legal_name_without_route_evidence_remains_unknown(tmp_path
             b"MIT License\n" + base64.b64encode(b"P\n."),
             "pickle",
             id="base64-empty-PERSID",
+        ),
+        pytest.param(
+            b"MIT License\n" + base64.b64encode(b"Pmit license\n."),
+            "pickle",
+            id="base64-lowercase-spaced-PERSID",
+        ),
+        pytest.param(
+            b"MIT License\n" + binascii.hexlify(b"Pid\nAB"),
+            "pickle",
+            id="hex-PERSID-before-multibyte-invalid-tail",
+        ),
+        pytest.param(
+            b"MIT License\n" + base64.b64encode(b"cmalicious\npayload\nAB"),
+            "pickle",
+            id="base64-unknown-GLOBAL-before-multibyte-invalid-tail",
         ),
         pytest.param(
             b"MIT License\nWFBpZAou\n",
