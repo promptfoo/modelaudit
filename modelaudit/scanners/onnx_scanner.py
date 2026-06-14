@@ -1849,6 +1849,7 @@ def _build_onnx_weight_analysis_plan(
         producers_by_value: dict[str, Any],
         live_values: set[str],
         graph_output_names: set[str],
+        known_value_shapes: dict[str, tuple[int, ...]],
         *,
         graph_outputs_are_authoritative: bool,
     ) -> tuple[_OnnxWeightQuantization | None, str | None]:
@@ -2111,22 +2112,25 @@ def _build_onnx_weight_analysis_plan(
                         pending.extend(str(output) for output in downstream.output if output)
                 return False
 
-            metadata_expression_cache: dict[str, tuple[bool, bool]] = {}
+            metadata_expression_cache: dict[tuple[str, str, bool], tuple[bool, bool]] = {}
             metadata_expression_visits = 0
 
             def bounded_metadata_expression_summary(
                 value_name: str,
                 *,
+                traced_value_name: str,
+                allow_unrelated_root: bool,
                 depth: int = 0,
                 visiting: frozenset[str] = frozenset(),
             ) -> tuple[bool, bool]:
                 nonlocal metadata_expression_visits
                 if not value_name or value_name in visiting or depth > _ONNX_METADATA_EXPRESSION_DEPTH_LIMIT:
                     return False, False
-                if value_name in metadata_expression_cache:
-                    return metadata_expression_cache[value_name]
+                cache_key = (value_name, traced_value_name, allow_unrelated_root)
+                if cache_key in metadata_expression_cache:
+                    return metadata_expression_cache[cache_key]
                 if value_name in constants:
-                    metadata_expression_cache[value_name] = (True, False)
+                    metadata_expression_cache[cache_key] = (True, False)
                     return True, False
                 producer = producers_by_value.get(value_name)
                 if (
@@ -2134,27 +2138,34 @@ def _build_onnx_weight_analysis_plan(
                     or getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
                     or _operator_identifier(producer) in functions
                 ):
-                    metadata_expression_cache[value_name] = (False, False)
+                    metadata_expression_cache[cache_key] = (False, False)
                     return False, False
                 if check_interrupted_callback is not None:
                     check_interrupted_callback()
                 metadata_expression_visits += 1
                 if metadata_expression_visits > _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT:
-                    metadata_expression_cache[value_name] = (False, False)
+                    metadata_expression_cache[cache_key] = (False, False)
                     return False, False
                 if producer.op_type in _METADATA_ONLY_LINEAGE_OPERATORS:
-                    metadata_expression_cache[value_name] = (True, True)
-                    return True, True
+                    metadata_inputs = [str(source) for source in producer.input if source]
+                    valid_root = (
+                        allow_unrelated_root or producer.op_type == "Size" or metadata_inputs == [traced_value_name]
+                    )
+                    result = valid_root, valid_root
+                    metadata_expression_cache[cache_key] = result
+                    return result
                 if producer.op_type == "Constant":
-                    metadata_expression_cache[value_name] = (True, False)
+                    metadata_expression_cache[cache_key] = (True, False)
                     return True, False
                 if producer.op_type not in {"Cast", "Div", "Slice", "Sqrt"}:
-                    metadata_expression_cache[value_name] = (False, False)
+                    metadata_expression_cache[cache_key] = (False, False)
                     return False, False
                 next_visiting = frozenset((*visiting, value_name))
                 source_summaries = [
                     bounded_metadata_expression_summary(
                         str(source),
+                        traced_value_name=traced_value_name,
+                        allow_unrelated_root=allow_unrelated_root,
                         depth=depth + 1,
                         visiting=next_visiting,
                     )
@@ -2165,7 +2176,7 @@ def _build_onnx_weight_analysis_plan(
                     bool(source_summaries) and all(valid for valid, _ in source_summaries),
                     any(has_metadata_root for _, has_metadata_root in source_summaries),
                 )
-                metadata_expression_cache[value_name] = result
+                metadata_expression_cache[cache_key] = result
                 return result
 
             while queue:
@@ -2285,11 +2296,6 @@ def _build_onnx_weight_analysis_plan(
                     reached_terminal = True
                     continue
                 if consumer.op_type != "Mul":
-                    if scale_data_type is not None and graph_outputs_are_authoritative:
-                        later_scale = downstream_has_static_scale(next_values)
-                        if later_scale is False:
-                            reached_terminal = True
-                            continue
                     return None, "unresolved_quantized_weight_scale"
                 mul_inputs = [str(source) for source in consumer.input if source]
                 if mul_inputs.count(value_name) != 1 or len(mul_inputs) < 2:
@@ -2300,17 +2306,22 @@ def _build_onnx_weight_analysis_plan(
                 if not retain_narrowest_output_data_type(current_data_type):
                     return None, "unresolved_quantized_weight_scale"
                 for source_name in (str(source) for source in consumer.input if source and str(source) != value_name):
-                    source_scale = scale_initializer_names_in_expression(source_name)
-                    if source_scale is None:
-                        if (
-                            passed_complete_dynamic_bias
-                            and graph_outputs_are_authoritative
-                            and bounded_metadata_expression_summary(source_name) == (True, True)
-                        ):
+                    if passed_complete_dynamic_bias:
+                        if graph_outputs_are_authoritative and bounded_metadata_expression_summary(
+                            source_name,
+                            traced_value_name=value_name,
+                            allow_unrelated_root=(
+                                (source_shape := known_value_shapes.get(source_name)) is not None
+                                and all(dimension == 1 for dimension in source_shape)
+                            ),
+                        ) == (True, True):
                             later_scale = downstream_has_static_scale(next_values)
                             if later_scale is False:
                                 reached_terminal = True
                                 break
+                        return None, "unresolved_quantized_weight_scale"
+                    source_scale = scale_initializer_names_in_expression(source_name)
+                    if source_scale is None:
                         return None, "unresolved_quantized_weight_scale"
                     source_scale_names, source_has_dynamic_quantize_scale = source_scale
                     scale_names.extend(source_scale_names)
@@ -3414,6 +3425,7 @@ def _build_onnx_weight_analysis_plan(
                         producers_by_value,
                         live_values,
                         graph_output_names,
+                        known_value_shapes,
                         graph_outputs_are_authoritative=source_scope == ("root_graph",),
                     )
                     if quantization_gap is not None:
