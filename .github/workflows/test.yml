@@ -656,7 +656,7 @@ jobs:
   test-numpy-compatibility:
     name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
     needs: changes
-    # Only run on main branch or if dependencies changed
+    # Integration events fail closed instead of relying on changed-path data.
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -665,7 +665,7 @@ jobs:
         # Test both NumPy versions with appropriate Python versions:
         # - NumPy 1.x on Python 3.10 (last version supporting NumPy 1.x)
         # - NumPy 2.x on Python 3.11+ (requires Python >=3.11)
-        # Reduced matrix for PRs, full matrix for main branch
+        # Reduced matrix for PRs, full matrix for main and merge_group runs
         include: ${{ github.event_name == 'pull_request' && fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"}]') || fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"},{"python-version":"3.12","numpy-mode":"2.x"},{"python-version":"3.13","numpy-mode":"2.x"}]') }}
     steps:
       - name: Checkout repo
@@ -838,7 +838,7 @@ jobs:
   test-extras-smoke:
     name: Extras Smoke Test (${{ matrix.extra }})
     needs: changes
-    # Only run on main or when dependencies change
+    # Integration events fail closed instead of relying on changed-path data.
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -894,7 +894,7 @@ jobs:
   build:
     name: Build and Package
     needs: changes
-    # Always build on main, otherwise only if Python/dependency/workflow files changed
+    # Integration events fail closed instead of relying on changed-path data.
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
