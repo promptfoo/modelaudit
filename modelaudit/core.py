@@ -1958,26 +1958,27 @@ def _onnx_weight_anomaly_provenance(results: ModelAuditResultModel, issue: Issue
 
 def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
     clusters: dict[tuple[Any, ...], list[Issue]] = {}
+    issue_keys: list[tuple[Any, ...] | None] = []
     for issue in results.issues:
         key = _onnx_weight_anomaly_cluster_key(issue, content_hash=_file_content_hash(results, issue.location))
+        issue_keys.append(key)
         if key is not None:
             clusters.setdefault(key, []).append(issue)
 
-    def is_export_cluster(cluster: list[Issue]) -> bool:
-        return len({issue.location for issue in cluster if issue.location}) > 1
-
-    if not any(is_export_cluster(cluster) for cluster in clusters.values()):
+    export_cluster_keys = {
+        key for key, cluster in clusters.items() if len({issue.location for issue in cluster if issue.location}) > 1
+    }
+    if not export_cluster_keys:
         return
 
     emitted: set[tuple[Any, ...]] = set()
     retained_issues: list[Issue] = []
-    for issue in results.issues:
-        key = _onnx_weight_anomaly_cluster_key(issue, content_hash=_file_content_hash(results, issue.location))
+    for issue, key in zip(results.issues, issue_keys, strict=True):
         if key is None:
             retained_issues.append(issue)
             continue
         cluster = clusters[key]
-        if not is_export_cluster(cluster):
+        if key not in export_cluster_keys:
             retained_issues.append(issue)
             continue
         if key in emitted:

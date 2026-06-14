@@ -34,6 +34,7 @@ from modelaudit.scanners.onnx_scanner import (
     _configured_onnx_weight_array_limit,
     _confirmed_onnx_operator_findings,
     _confirmed_python_operator_findings,
+    _onnx_reverse_live_values,
 )
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
@@ -2012,6 +2013,7 @@ def create_generated_zero_value_transform_model(
     *,
     op_type: str,
     malicious: bool,
+    legacy_pad: bool = False,
 ) -> Path:
     generated_shape = [100, 9] if op_type == "Pad" else [100, 1]
     generated_name = "generated_weight" if op_type == "Pad" else "generated_column"
@@ -2026,16 +2028,28 @@ def create_generated_zero_value_transform_model(
     initializers = [onnx.numpy_helper.from_array(np.asarray(generated_shape, dtype=np.int64), name="generated_shape")]
     value_info = [helper.make_tensor_value_info(generated_name, TensorProto.FLOAT, generated_shape)]
     if op_type == "Pad":
-        nodes.append(helper.make_node("Pad", [generated_name, "pads", "pad_value"], ["W"]))
-        initializers.extend(
-            [
-                onnx.numpy_helper.from_array(np.asarray([0, 0, 0, 1], dtype=np.int64), name="pads"),
-                onnx.numpy_helper.from_array(
-                    np.asarray(100.0 if malicious else 0.0, dtype=np.float32),
-                    name="pad_value",
-                ),
-            ]
-        )
+        if legacy_pad:
+            nodes.append(
+                helper.make_node(
+                    "Pad",
+                    [generated_name],
+                    ["W"],
+                    mode="constant",
+                    pads=[0, 0, 0, 1],
+                    value=100.0 if malicious else 0.0,
+                )
+            )
+        else:
+            nodes.append(helper.make_node("Pad", [generated_name, "pads", "pad_value"], ["W"]))
+            initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(np.asarray([0, 0, 0, 1], dtype=np.int64), name="pads"),
+                    onnx.numpy_helper.from_array(
+                        np.asarray(100.0 if malicious else 0.0, dtype=np.float32),
+                        name="pad_value",
+                    ),
+                ]
+            )
     elif op_type == "Clip":
         nodes.extend(
             [
@@ -2065,10 +2079,11 @@ def create_generated_zero_value_transform_model(
         initializer=initializers,
         value_info=value_info,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 10 if legacy_pad else 13)])
     model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / f"generated-zero-{op_type.lower()}-{'malicious' if malicious else 'benign'}.onnx"
+    legacy_suffix = "-legacy" if legacy_pad else ""
+    path = tmp_path / f"generated-zero-{op_type.lower()}{legacy_suffix}-{'malicious' if malicious else 'benign'}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -2148,6 +2163,203 @@ def create_generated_value_parameter_model(tmp_path: Path) -> Path:
     model.ir_version = 8
     onnx.checker.check_model(model)
     path = tmp_path / "generated-value-parameter.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_generated_zero_matmul_integer_model(tmp_path: Path, *, malicious_zero_point: bool) -> Path:
+    weight_zero_point = np.zeros(10, dtype=np.int8)
+    if malicious_zero_point:
+        weight_zero_point[3] = -100
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "ConstantOfShape",
+                ["weight_shape"],
+                ["W"],
+                value=helper.make_tensor("fill", TensorProto.INT8, [1], bytes([0]), raw=True),
+            ),
+            helper.make_node(
+                "MatMulInteger",
+                ["X", "W", "X_zero_point", "W_zero_point"],
+                ["Y"],
+            ),
+        ],
+        "generated_zero_matmul_integer_weight",
+        [helper.make_tensor_value_info("X", TensorProto.INT8, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.INT32, [1, 10])],
+        initializer=[
+            onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="weight_shape"),
+            onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="X_zero_point"),
+            onnx.numpy_helper.from_array(weight_zero_point, name="W_zero_point"),
+        ],
+        value_info=[helper.make_tensor_value_info("W", TensorProto.INT8, [100, 10])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"generated-zero-matmul-integer-{'malicious' if malicious_zero_point else 'benign'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_dynamic_pad_fill_weight_model(tmp_path: Path, *, fill_value: float) -> Path:
+    graph = helper.make_graph(
+        [
+            helper.make_node("Pad", ["dynamic_base", "pads", "pad_value"], ["W"]),
+            helper.make_node("MatMul", ["X", "W"], ["Y"]),
+        ],
+        "dynamic_pad_fill_weight",
+        [
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100]),
+            helper.make_tensor_value_info("dynamic_base", TensorProto.FLOAT, [100, 9]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[
+            onnx.numpy_helper.from_array(np.asarray([0, 0, 0, 1], dtype=np.int64), name="pads"),
+            onnx.numpy_helper.from_array(np.asarray(fill_value, dtype=np.float32), name="pad_value"),
+        ],
+        value_info=[helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"dynamic-pad-fill-{fill_value}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_shape_derived_weight_model(tmp_path: Path, *, op_type: str, malicious: bool) -> Path:
+    assert op_type in {"Shape", "Size"}
+    if op_type == "Shape":
+        shape_values = np.zeros((100, 10), dtype=np.int64)
+        if malicious:
+            shape_values[50:55, 3] = 100
+        source = onnx.TensorProto()
+        source.name = "metadata_source"
+        source.data_type = TensorProto.FLOAT
+        source.dims.extend(int(value) for value in shape_values.reshape(-1))
+    else:
+        source = onnx.numpy_helper.from_array(
+            np.zeros((100, 10) if malicious else (0, 10), dtype=np.float32),
+            name="metadata_source",
+        )
+    metadata_shape = [1000] if op_type == "Shape" else []
+    nodes = [
+        helper.make_node(op_type, ["metadata_source"], ["metadata_values"]),
+        helper.make_node("Cast", ["metadata_values"], ["cast_metadata"], to=TensorProto.FLOAT),
+    ]
+    if op_type == "Size":
+        nodes.append(helper.make_node("Expand", ["cast_metadata", "flat_shape"], ["flat_weight"]))
+    else:
+        nodes.append(helper.make_node("Identity", ["cast_metadata"], ["flat_weight"]))
+    nodes.extend(
+        [
+            helper.make_node("Reshape", ["flat_weight", "weight_shape"], ["W"]),
+            helper.make_node("MatMul", ["X", "W"], ["Y"]),
+        ]
+    )
+    graph = helper.make_graph(
+        nodes,
+        "shape_derived_weight",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[
+            source,
+            onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="weight_shape"),
+            onnx.numpy_helper.from_array(np.asarray([1000], dtype=np.int64), name="flat_shape"),
+        ],
+        value_info=[
+            helper.make_tensor_value_info("metadata_values", TensorProto.INT64, metadata_shape),
+            helper.make_tensor_value_info("cast_metadata", TensorProto.FLOAT, metadata_shape),
+            helper.make_tensor_value_info("flat_weight", TensorProto.FLOAT, [1000]),
+            helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10]),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"{op_type.lower()}-derived-{'malicious' if malicious else 'benign'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_typed_constant_of_shape_weight_model(
+    tmp_path: Path,
+    *,
+    data_type: int,
+    fill_value: float | int,
+    malformed: bool = False,
+) -> Path:
+    fill = helper.make_tensor("fill", data_type, [1], [fill_value])
+    if malformed:
+        fill.int32_data.append(0)
+    quantized = data_type == TensorProto.INT8
+    consumer = "MatMulInteger" if quantized else "MatMul"
+    output_type = TensorProto.INT32 if quantized else data_type
+    graph = helper.make_graph(
+        [
+            helper.make_node("ConstantOfShape", ["shape"], ["W"], value=fill),
+            helper.make_node(consumer, ["X", "W"], ["Y"]),
+        ],
+        "typed_constant_of_shape_weight",
+        [helper.make_tensor_value_info("X", data_type, [1, 100])],
+        [helper.make_tensor_value_info("Y", output_type, [1, 10])],
+        initializer=[onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="shape")],
+        value_info=[helper.make_tensor_value_info("W", data_type, [100, 10])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    if not malformed:
+        onnx.checker.check_model(model)
+    path = tmp_path / f"typed-constant-of-shape-{data_type}-{fill_value}-{'bad' if malformed else 'valid'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_shared_zero_proof_fanout_model(
+    tmp_path: Path,
+    *,
+    generated_source: bool,
+    consumer_count: int = 1000,
+) -> Path:
+    element_count = 256 * 1024
+    nodes = []
+    initializers = [onnx.numpy_helper.from_array(np.zeros(element_count, dtype=np.float32), name="shared_zero")]
+    inputs = []
+    value_info = []
+    if generated_source:
+        initializers.append(
+            onnx.numpy_helper.from_array(np.asarray([element_count], dtype=np.int64), name="generated_shape")
+        )
+        nodes.append(
+            helper.make_node(
+                "ConstantOfShape",
+                ["generated_shape"],
+                ["source"],
+                value=helper.make_tensor("fill", TensorProto.FLOAT, [1], [0.0]),
+            )
+        )
+        value_info.append(helper.make_tensor_value_info("source", TensorProto.FLOAT, [element_count]))
+    else:
+        inputs.append(helper.make_tensor_value_info("source", TensorProto.FLOAT, [element_count]))
+    outputs = []
+    for index in range(consumer_count):
+        output_name = f"output_{index}"
+        nodes.append(helper.make_node("Add", ["source", "shared_zero"], [output_name]))
+        outputs.append(helper.make_tensor_value_info(output_name, TensorProto.FLOAT, [element_count]))
+    graph = helper.make_graph(
+        nodes,
+        "shared_zero_proof_fanout",
+        inputs,
+        outputs,
+        initializer=initializers,
+        value_info=value_info,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"shared-zero-proof-{'generated' if generated_source else 'dynamic'}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -8480,10 +8692,65 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 0
         assert semantics["coverage_gaps"] == {}
 
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_legacy_pad_value_attribute_preserves_generated_zero_proof(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(
+                create_generated_zero_value_transform_model(
+                    tmp_path,
+                    op_type="Pad",
+                    malicious=malicious,
+                    legacy_pad=True,
+                )
+            )
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is not malicious
+        assert semantics["analyzed_initializer_count"] == 0
+        if malicious:
+            assert semantics["eligible_initializer_count"] == 1
+            assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+            assert semantics["unresolved_lineage_samples"][0]["reason"] == "generated_value_lineage_unproven"
+        else:
+            assert semantics["eligible_initializer_count"] == 0
+            assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize("malicious_zero_point", [False, True])
+    def test_generated_quantized_zero_requires_effective_zero_proof(
+        self,
+        tmp_path: Path,
+        malicious_zero_point: bool,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(
+                create_generated_zero_matmul_integer_model(
+                    tmp_path,
+                    malicious_zero_point=malicious_zero_point,
+                )
+            )
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is not malicious_zero_point
+        assert semantics["analyzed_initializer_count"] == 0
+        if malicious_zero_point:
+            assert semantics["eligible_initializer_count"] == 1
+            assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+            assert semantics["unresolved_lineage_samples"][0]["reason"] == "generated_quantized_zero_lineage_unproven"
+        else:
+            assert semantics["eligible_initializer_count"] == 0
+            assert semantics["coverage_gaps"] == {}
+
     @pytest.mark.parametrize(
         ("op_type", "parameter", "expected_success"),
         [
             pytest.param("Abs", None, True, id="zero-preserving-unary"),
+            pytest.param("Floor", None, True, id="zero-preserving-floor"),
             pytest.param("Add", 0.0, True, id="zero-preserving-binary"),
             pytest.param("Add", 100.0, False, id="constant-injecting-binary"),
             pytest.param("Exp", None, False, id="zero-changing-unary"),
@@ -8540,6 +8807,135 @@ class TestWeightDistributionSemantics:
         sample = semantics["unresolved_lineage_samples"][0]
         assert sample["initializer"] == "generated_zero"
         assert sample["reason"] == "generated_value_lineage_unproven"
+
+    @pytest.mark.parametrize("fill_value", [0.0, 100.0], ids=["benign-zero", "malicious-nonzero"])
+    def test_static_pad_fill_reaching_weight_role_fails_closed(
+        self,
+        tmp_path: Path,
+        fill_value: float,
+    ) -> None:
+        result = OnnxScanner().scan(str(create_dynamic_pad_fill_weight_model(tmp_path, fill_value=fill_value)))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        assert semantics["unresolved_lineage_samples"][0]["initializer"] == "pad_value"
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "dynamic_input_lineage"
+
+    @pytest.mark.parametrize("op_type", ["Shape", "Size"])
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
+    def test_shape_derived_values_reaching_weight_role_fail_closed(
+        self,
+        tmp_path: Path,
+        op_type: str,
+        malicious: bool,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(create_shape_derived_weight_model(tmp_path, op_type=op_type, malicious=malicious))
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        assert semantics["unresolved_lineage_samples"][0]["initializer"] == "metadata_source"
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "metadata_derived_lineage"
+
+    @pytest.mark.parametrize("data_type", [TensorProto.FLOAT16, TensorProto.BFLOAT16, TensorProto.INT8])
+    @pytest.mark.parametrize("fill_value", [0, 1], ids=["zero", "nonzero"])
+    def test_typed_constant_of_shape_fill_uses_semantic_scalar_decoder(
+        self,
+        tmp_path: Path,
+        data_type: int,
+        fill_value: int,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(
+                create_typed_constant_of_shape_weight_model(
+                    tmp_path,
+                    data_type=data_type,
+                    fill_value=fill_value,
+                )
+            )
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is (fill_value == 0)
+        assert semantics["analyzed_initializer_count"] == 0
+        if fill_value == 0:
+            assert semantics["eligible_initializer_count"] == 0
+            assert semantics["coverage_gaps"] == {}
+        else:
+            assert semantics["eligible_initializer_count"] == 1
+            assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+            assert semantics["unresolved_lineage_samples"][0]["reason"] == "generated_constant_of_shape_lineage"
+
+    @pytest.mark.parametrize("data_type", [TensorProto.FLOAT16, TensorProto.BFLOAT16, TensorProto.INT8])
+    def test_malformed_typed_constant_of_shape_fill_fails_closed(self, tmp_path: Path, data_type: int) -> None:
+        result = OnnxScanner().scan(
+            str(
+                create_typed_constant_of_shape_weight_model(
+                    tmp_path,
+                    data_type=data_type,
+                    fill_value=0,
+                    malformed=True,
+                )
+            )
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+
+    @pytest.mark.parametrize("generated_source", [False, True], ids=["no-generated-source", "generated-source"])
+    def test_generated_zero_proof_decodes_shared_large_constant_at_most_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        generated_source: bool,
+    ) -> None:
+        model_path = create_shared_zero_proof_fanout_model(tmp_path, generated_source=generated_source)
+        original_to_array = onnx.numpy_helper.to_array
+        shared_zero_decodes = 0
+
+        def counted_to_array(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal shared_zero_decodes
+            if tensor.name == "shared_zero":
+                shared_zero_decodes += 1
+            return original_to_array(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", counted_to_array)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert shared_zero_decodes == int(generated_source)
+
+    def test_reverse_liveness_expands_wide_producer_once(self) -> None:
+        class CountingInputs:
+            def __init__(self) -> None:
+                self.iteration_count = 0
+
+            def __iter__(self) -> Any:
+                self.iteration_count += 1
+                return iter(f"input_{index}" for index in range(4000))
+
+        class Producer:
+            def __init__(self) -> None:
+                self.input = CountingInputs()
+
+        producer = Producer()
+        output_names = {f"output_{index}" for index in range(4000)}
+
+        live_values = _onnx_reverse_live_values(dict.fromkeys(output_names, producer), output_names)
+
+        assert producer.input.iteration_count == 1
+        assert len(live_values) == 8000
 
     def test_matmul_integer_non_unit_add_scale_chain_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_matmul_integer_scale_chain_model(tmp_path, duplicate_add_input=True)
@@ -9550,6 +9946,42 @@ class TestWeightDistributionSemantics:
             assert len(group["files"]) == 20
             assert group["files_truncated"] is True
 
+    def test_duplicate_cluster_key_work_is_linear(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        first = create_onnx_weight_model(tmp_path, weights, op_type="MatMul", filename="cluster-key-a.onnx")
+        second = tmp_path / "cluster-key-b.onnx"
+        second.write_bytes(first.read_bytes())
+        aggregate = scan_model_directory_or_file(str(first), scanners=["onnx"], cache_enabled=False)
+        template = next(
+            issue for issue in aggregate.issues if issue.type == "onnx_check" and "affected_neurons" in issue.details
+        )
+        aggregate.file_metadata[str(second)] = aggregate.file_metadata[str(first)].model_copy(deep=True)
+        issue_count = 4000
+        aggregate.issues = [
+            template.model_copy(update={"location": str(first if index % 2 == 0 else second)}, deep=True)
+            for index in range(issue_count)
+        ]
+        cluster_key_call_count = 0
+        original_cluster_key = modelaudit_core._onnx_weight_anomaly_cluster_key
+
+        def recording_cluster_key(issue: Any, *, content_hash: str | None = None) -> tuple[Any, ...] | None:
+            nonlocal cluster_key_call_count
+            cluster_key_call_count += 1
+            return original_cluster_key(issue, content_hash=content_hash)
+
+        monkeypatch.setattr(modelaudit_core, "_onnx_weight_anomaly_cluster_key", recording_cluster_key)
+
+        modelaudit_core._cluster_onnx_weight_anomaly_issues(aggregate)
+
+        assert cluster_key_call_count == issue_count
+        assert len(aggregate.issues) == 1
+        assert aggregate.issues[0].details["cluster_size"] == issue_count
+
     def test_aggregate_does_not_cluster_distinct_file_hashes_with_same_signature(self, tmp_path: Path) -> None:
         positive_weights = np.zeros((100, 10), dtype=np.float32)
         positive_weights[50:55, 3] = 10.0
@@ -9637,7 +10069,7 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible_initializer_count"] == 72
         assert semantics["analyzed_initializer_count"] == 72
         assert semantics["analyzed_layer_count"] == 72
-        assert semantics["coverage_gaps"] == {"lineages_per_value_limit": 109}
+        assert semantics["coverage_gaps"] == {}
         anomaly_checks = [
             check
             for check in result.checks
