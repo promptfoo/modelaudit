@@ -4041,8 +4041,6 @@ def _file_finder_state(
         and type(path_mtime) in {int, float}
         and len(typed_path_cache) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
         and len(typed_relaxed_path_cache) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
-        and all(type(name) is str for name in typed_path_cache)
-        and all(type(name) is str for name in typed_relaxed_path_cache)
     ):
         return None
     return (
@@ -4072,6 +4070,13 @@ def _cached_file_finder_resolution_summary(finder_id: int) -> _FileFinderResolut
     return _FileFinderResolutionSummary()
 
 
+def _file_finder_cache_names_are_strings(
+    path_cache: Iterable[object],
+    relaxed_path_cache: Iterable[object],
+) -> bool:
+    return all(type(name) is str for name in path_cache) and all(type(name) is str for name in relaxed_path_cache)
+
+
 def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | None:
     state = _file_finder_state(finder, cache_key)
     if state is None:
@@ -4087,6 +4092,8 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
             and relaxed_path_cache is summary.relaxed_path_cache
         ):
             return summary.identity
+        if not _file_finder_cache_names_are_strings(path_cache, relaxed_path_cache):
+            return None
         canonical_state = _canonical_file_finder_state(finder_path)
         if canonical_state is None:
             return None

@@ -1700,7 +1700,9 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
     assert finder.find_spec("module_0") is not None
     finder_state = object.__getattribute__(finder, "__dict__")
     original_identity = call_graph._string_sequence_identity
+    original_type_validation = call_graph._file_finder_cache_names_are_strings
     work_count = 0
+    type_validation_count = 0
 
     def counted_identity(values: Iterable[str]) -> str:
         nonlocal work_count
@@ -1708,20 +1710,33 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
         work_count += len(materialized)
         return original_identity(materialized)
 
+    def counted_type_validation(
+        path_cache: Iterable[object],
+        relaxed_path_cache: Iterable[object],
+    ) -> bool:
+        nonlocal type_validation_count
+        type_validation_count += 1
+        return original_type_validation(path_cache, relaxed_path_cache)
+
     call_graph._cached_file_finder_resolution_summary.cache_clear()
     monkeypatch.setattr(call_graph, "_string_sequence_identity", counted_identity)
+    monkeypatch.setattr(call_graph, "_file_finder_cache_names_are_strings", counted_type_validation)
     try:
         first_identity = call_graph._file_finder_resolution_identity(finder, path_entry)
         assert first_identity is not None
         first_work_count = work_count
+        first_type_validation_count = type_validation_count
         assert first_work_count <= len(finder_state["_path_cache"]) + 4
+        assert first_type_validation_count == 1
         assert call_graph._file_finder_resolution_identity(finder, path_entry) == first_identity
         assert not work_count > first_work_count
+        assert type_validation_count == first_type_validation_count
 
         replacement_work_count = work_count
         finder_state["_path_cache"] = set(finder_state["_path_cache"])
         assert call_graph._file_finder_resolution_identity(finder, path_entry) == first_identity
         assert replacement_work_count < work_count <= replacement_work_count + len(finder_state["_path_cache"]) + 4
+        assert type_validation_count == first_type_validation_count + 1
         work_before_transition = work_count
         transitioned_cache = set(cast(frozenset[str], finder_state["_path_cache"]))
         finder_state["_path_cache"] = transitioned_cache
