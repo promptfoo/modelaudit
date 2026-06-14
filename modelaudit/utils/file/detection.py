@@ -2,6 +2,7 @@ import base64
 import binascii
 import bz2
 import codecs
+import importlib.util
 import json
 import lzma
 import math
@@ -5699,11 +5700,8 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
             return all(_plausible_pickle_import_operand(line) for line in lines)
         if opcode.name == "PERSID":
             return _is_compact_pickle_line(lines[0]) or (
-                offset == 0
-                and (
-                    (cursor == len(payload) and _has_terminal_persid_signal(lines[0]))
-                    or (cursor < len(payload) and payload[cursor] in _PICKLE_OPCODE_BY_BYTE)
-                )
+                (cursor == len(payload) and _has_terminal_persid_signal(lines[0]))
+                or (offset == 0 and cursor < len(payload) and payload[cursor] in _PICKLE_OPCODE_BY_BYTE)
             )
         if opcode.name == "STRING":
             value = lines[0]
@@ -5761,6 +5759,16 @@ def _has_structural_pickle_continuation(payload: bytes, offset: int) -> bool:
     return opcode is not None and opcode.name not in _PICKLE_LINE_PAIR_OPCODES
 
 
+@lru_cache(maxsize=128)
+def _is_importable_top_level_module(module: str) -> bool:
+    if module in sys.builtin_module_names or module in sys.stdlib_module_names:
+        return True
+    try:
+        return importlib.util.find_spec(module) is not None
+    except Exception:
+        return False
+
+
 def _has_terminal_pickle_import_signal(operands: tuple[bytes, bytes]) -> bool:
     """Reject lowercase prose pairs while retaining import-shaped terminal operands."""
     module, _name = operands
@@ -5770,7 +5778,7 @@ def _has_terminal_pickle_import_signal(operands: tuple[bytes, bytes]) -> bool:
         top_level_module = module.decode("utf-8").partition(".")[0]
     except UnicodeDecodeError:
         return False
-    return top_level_module in sys.builtin_module_names or top_level_module in sys.stdlib_module_names
+    return _is_importable_top_level_module(top_level_module)
 
 
 def _iter_pickle_candidate_offsets(
@@ -5880,7 +5888,14 @@ def _iter_pickle_candidate_offsets(
                     yield from maybe_add(context_start)
                 recent_line_starts.clear()
                 lookbehind_truncated = False
-            if _is_plausible_pickle_candidate(payload, candidate_start):
+            plausible_candidate = _is_plausible_pickle_candidate(payload, candidate_start)
+            if (
+                plausible_candidate
+                and payload[candidate_start] == ord("P")
+                and payload.find(b"\n", candidate_start + 1) == len(payload) - 1
+            ):
+                yield from maybe_add(candidate_start, prevalidated=True)
+            if plausible_candidate:
                 recent_line_starts.append(candidate_start)
                 if len(recent_line_starts) > _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES + 1:
                     recent_line_starts.popleft()
@@ -5909,6 +5924,7 @@ def _bounded_pickle_candidate_route(
     budget: _LegalTextPickleCandidateBudget | None = None,
     scan_embedded: bool = True,
     decoded: bool = False,
+    trust_decoded_weak_nonstop_suffix: bool = True,
     is_plain_text: bool | None = None,
 ) -> str | None:
     if budget is None:
@@ -5933,7 +5949,7 @@ def _bounded_pickle_candidate_route(
     ):
         if lookbehind_truncated:
             return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-        exact_weak_decoded_stream = False
+        trusted_weak_decoded_stream = False
         if decoded:
             opcode_name = _PICKLE_OPCODE_BY_BYTE[payload[offset]].name
             if opcode_name not in _PICKLE_DECODED_ENTRY_OPCODES and not (
@@ -5949,11 +5965,25 @@ def _bounded_pickle_candidate_route(
                     for value in payload[weak_suffix_offset:]
                 )
             )
+            structural_weak_continuation = (
+                weak_suffix_offset is not None
+                and offset == 0
+                and _decoded_weak_pickle_side_effect_has_structural_continuation(payload[offset:])
+            )
+            trusted_weak_decoded_stream = (
+                exact_weak_decoded_stream
+                or structural_weak_continuation
+                or (
+                    trust_decoded_weak_nonstop_suffix
+                    and weak_suffix_offset is not None
+                    and offset == 0
+                    and _decoded_weak_pickle_side_effect_has_nonstop_suffix(payload, offset)
+                )
+            )
             if (
                 weak_suffix_offset is not None
-                and not exact_weak_decoded_stream
+                and not trusted_weak_decoded_stream
                 and last_security_offset < offset + weak_suffix_offset
-                and not _decoded_weak_pickle_side_effect_has_continuation(payload, offset)
             ):
                 continue
         if not prevalidated and not _is_plausible_pickle_candidate(payload, offset):
@@ -5965,7 +5995,7 @@ def _bounded_pickle_candidate_route(
         route = _classify_bounded_pickle_candidate(
             candidate,
             embedded=offset != 0,
-            decoded=decoded and not exact_weak_decoded_stream,
+            decoded=decoded and not trusted_weak_decoded_stream,
             require_continuation=require_continuation,
             require_strong_continuation=require_strong_continuation,
             budget=budget,
@@ -5996,7 +6026,7 @@ def _decoded_base64_has_exact_weak_pickle_signal(decoded: bytes) -> bool:
     )
 
 
-def _decoded_weak_pickle_side_effect_has_continuation(decoded: bytes, offset: int = 0) -> bool:
+def _decoded_weak_pickle_side_effect_has_nonstop_suffix(decoded: bytes, offset: int = 0) -> bool:
     if offset >= len(decoded):
         return False
     opcode = _PICKLE_OPCODE_BY_BYTE.get(decoded[offset])
@@ -6005,14 +6035,30 @@ def _decoded_weak_pickle_side_effect_has_continuation(decoded: bytes, offset: in
     suffix_offset = _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.get(opcode.name)
     if suffix_offset is None or offset + suffix_offset >= len(decoded):
         return False
-    continuation = _PICKLE_OPCODE_BY_BYTE.get(decoded[offset + suffix_offset])
-    return continuation is not None and continuation.name != "STOP"
+    return decoded[offset + suffix_offset] != ord(".")
+
+
+def _decoded_weak_pickle_side_effect_has_structural_continuation(decoded: bytes) -> bool:
+    if not _decoded_weak_pickle_side_effect_has_nonstop_suffix(decoded):
+        return False
+    opcode = _PICKLE_OPCODE_BY_BYTE[decoded[0]]
+    suffix_offset = _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS[opcode.name]
+    return decoded[suffix_offset] in _PICKLE_OPCODE_BY_BYTE
+
+
+def _decoded_weak_pickle_side_effect_has_single_nonstop_suffix(decoded: bytes) -> bool:
+    if not _decoded_weak_pickle_side_effect_has_nonstop_suffix(decoded):
+        return False
+    opcode = _PICKLE_OPCODE_BY_BYTE[decoded[0]]
+    suffix_offset = _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS[opcode.name]
+    return len(decoded) == suffix_offset + 1
 
 
 def _decoded_base64_has_structural_pickle_signal(decoded: bytes) -> bool:
     return (
         _looks_like_binary_pickle_protocol(decoded[:4])
-        or _decoded_weak_pickle_side_effect_has_continuation(decoded)
+        or _decoded_weak_pickle_side_effect_has_structural_continuation(decoded)
+        or _decoded_weak_pickle_side_effect_has_single_nonstop_suffix(decoded)
         or _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(decoded) is not None
         or _LEGAL_TEXT_ENCODED_EXECUTION_RE.search(decoded) is not None
         or any(
@@ -6055,27 +6101,27 @@ def _iter_encoded_route_tokens(
     token_re: re.Pattern[bytes],
     *,
     alphabetic_whitespace_is_prose: bool,
-) -> Iterator[bytes]:
+) -> Iterator[tuple[bytes, bool]]:
     block = bytearray()
     trusted_start: int | None = None
     alphabetic_starts: dict[int, int] = {}
     recent_starts: deque[int] = deque()
     pending_weak_tokens: dict[int, bytes] = {}
 
-    def flush_block() -> Iterator[bytes]:
+    def flush_block() -> Iterator[tuple[bytes, bool]]:
         if trusted_start is not None:
-            yield bytes(block[trusted_start:])
+            yield bytes(block[trusted_start:]), True
         if alphabetic_whitespace_is_prose:
             # One earliest line start per base64 alignment covers every later
             # start with bounded linear work instead of testing every suffix.
             for start in alphabetic_starts.values():
                 token = bytes(block[start:])
                 if _alphabetic_base64_has_pickle_signal(token):
-                    yield token
+                    yield token, False
             for start in recent_starts:
                 token = bytes(block[start:])
                 if _alphabetic_base64_has_pickle_signal(token):
-                    yield token
+                    yield token, False
 
         block.clear()
         alphabetic_starts.clear()
@@ -6094,7 +6140,7 @@ def _iter_encoded_route_tokens(
                 and encoded_line.isalpha()
             )
             if encoded_line != line and not normalized_alphabetic_prose:
-                yield encoded_line
+                yield encoded_line, True
 
             line_start = len(block)
             if not normalized_alphabetic_prose and trusted_start is None:
@@ -6114,12 +6160,12 @@ def _iter_encoded_route_tokens(
                 for start in line_alignment_starts.values():
                     token = bytes(block[start:])
                     if _alphabetic_base64_has_structural_pickle_signal(token):
-                        yield token
+                        yield token, start == line_start
                 while recent_starts and len(block) - recent_starts[0] > _RECENT_EXACT_BASE64_MAX_CHARS:
                     expired_start = recent_starts.popleft()
                     pending_token = pending_weak_tokens.pop(expired_start, None)
                     if pending_token is not None:
-                        yield pending_token
+                        yield pending_token, False
                 for start in recent_starts:
                     token = bytes(block[start:])
                     if _alphabetic_base64_has_exact_weak_pickle_signal(token):
@@ -6139,7 +6185,7 @@ def _iter_encoded_route_tokens(
         if compact_line and token_re.fullmatch(compact_line) is not None:
             continue
         for match in token_re.finditer(raw_line):
-            yield match.group(0)
+            yield match.group(0), raw_line.strip(b" \t") == match.group(0)
 
 
 def _encoded_pickle_route(
@@ -6175,7 +6221,7 @@ def _encoded_pickle_route(
             binascii.unhexlify,
         ),
     ):
-        for token in _iter_encoded_route_tokens(
+        for token, trust_weak_nonstop_suffix in _iter_encoded_route_tokens(
             payload,
             token_re,
             alphabetic_whitespace_is_prose=alphabetic_offset_zero_only,
@@ -6218,7 +6264,10 @@ def _encoded_pickle_route(
                 continue
             if len(token) < general_minimum_length and not _decoded_base64_has_structural_pickle_signal(decoded):
                 opcode = _PICKLE_OPCODE_BY_BYTE.get(decoded[0])
-                if opcode is None or _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.get(opcode.name) != len(decoded):
+                if opcode is None or (
+                    _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.get(opcode.name) != len(decoded)
+                    and not _decoded_weak_pickle_side_effect_has_nonstop_suffix(decoded)
+                ):
                     continue
             if len(decoded) > _LEGAL_TEXT_MAX_DECODED_BYTES:
                 return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
@@ -6228,6 +6277,7 @@ def _encoded_pickle_route(
                 budget=budget,
                 scan_embedded=True,
                 decoded=True,
+                trust_decoded_weak_nonstop_suffix=trust_weak_nonstop_suffix,
             )
             if route is not None:
                 return route

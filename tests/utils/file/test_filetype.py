@@ -3939,6 +3939,20 @@ def test_next_buffer_callback_precedes_eof() -> None:
     assert callback_count == 1
 
 
+def test_next_buffer_callback_precedes_invalid_continuation() -> None:
+    callback_count = 0
+
+    def buffers() -> Iterator[memoryview]:
+        nonlocal callback_count
+        callback_count += 1
+        yield memoryview(b"x")
+
+    with pytest.raises(pickle.UnpicklingError):
+        pickle.loads(b"\x97A", buffers=buffers())
+
+    assert callback_count == 1
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_format"),
     [
@@ -3997,6 +4011,11 @@ def test_next_buffer_callback_precedes_eof() -> None:
         pytest.param(b"PMIT License\n.", "pickle", id="spaced-PERSID-before-STOP"),
         pytest.param(b"PMIT License\n", "pickle", id="spaced-PERSID-before-EOF"),
         pytest.param(
+            b"MIT License\nPMIT License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-spaced-PERSID-before-EOF",
+        ),
+        pytest.param(
             b"MIT License\nXPid\n)R.\n",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="adjacent-embedded-PERSID",
@@ -4019,6 +4038,16 @@ def test_next_buffer_callback_precedes_eof() -> None:
             b"MIT License\nimystery_module\nThing\n",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-terminal-INST",
+        ),
+        pytest.param(
+            b"MIT License\ncnumpy\narray\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-terminal-third-party-GLOBAL",
+        ),
+        pytest.param(
+            b"MIT License\ninumpy\narray\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-terminal-third-party-INST",
         ),
         pytest.param(
             b"MIT License\nS'id'\nQApache License\n",
@@ -4198,6 +4227,26 @@ def test_xgboost_json_legal_name_without_route_evidence_remains_unknown(tmp_path
             b"MIT License\n" + binascii.hexlify(b"\x97\x98."),
             "pickle",
             id="hex-NEXT_BUFFER-with-continuation",
+        ),
+        pytest.param(
+            b"MIT License\n" + base64.b64encode(b"\x97A"),
+            "pickle",
+            id="base64-NEXT_BUFFER-before-invalid-continuation",
+        ),
+        pytest.param(
+            b"MIT License\n" + binascii.hexlify(b"\x97A"),
+            "pickle",
+            id="hex-NEXT_BUFFER-before-invalid-continuation",
+        ),
+        pytest.param(
+            b"MIT License\n" + base64.b64encode(b"\x82\x01A"),
+            "pickle",
+            id="base64-EXT1-before-invalid-continuation",
+        ),
+        pytest.param(
+            b"MIT License\n" + binascii.hexlify(b"\x82\x01A"),
+            "pickle",
+            id="hex-EXT1-before-invalid-continuation",
         ),
         pytest.param(
             b"MIT License\nWFBpZAou\n",
