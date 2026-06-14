@@ -395,7 +395,9 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
 
     coverage_job = jobs["coverage"]
     assert isinstance(coverage_job, dict)
-    assert coverage_job["if"] == ("github.ref == 'refs/heads/main' || needs.changes.outputs.workflows == 'true'")
+    assert coverage_job["if"] == (
+        "needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'"
+    )
     assert coverage_job["permissions"] == {"contents": "read", "id-token": "write"}
     assert coverage_job["strategy"]["matrix"]["shard"] == [0, 1, 2, 3, 4]
     coverage_steps = coverage_job["steps"]
@@ -411,5 +413,8 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     ci_success_steps = ci_success_job["steps"]
     assert isinstance(ci_success_steps, list)
     gate_script = _step_by_name(ci_success_steps, "Check if all jobs succeeded")["run"]
-    assert 'if [[ "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then' in gate_script
-    assert '[[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true' in gate_script
+    assert (
+        "EXPECT_COVERAGE=\"${{ needs.changes.outputs.integration == 'true' || "
+        "needs.changes.outputs.workflows == 'true' }}\"" in gate_script
+    )
+    assert 'require_success "$EXPECT_COVERAGE" "$COVERAGE_RESULT" "coverage"' in gate_script

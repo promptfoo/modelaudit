@@ -8,6 +8,9 @@ on:
       - "**.rst"
       - "LICENSE*"
       - ".github/workflows/docs-check.yml"
+  merge_group:
+    types:
+      - checks_requested
   push:
     branches:
       - main
@@ -19,6 +22,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
+  # Source-head PR runs can be superseded, but exact integration SHAs on main
+  # and merge_group should run to completion once scheduled.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -27,12 +32,21 @@ jobs:
     name: Detect Changes
     runs-on: ubuntu-latest
     outputs:
+      integration: ${{ steps.classify.outputs.integration }}
       python: ${{ steps.filter.outputs.python }}
       picklescan: ${{ steps.filter.outputs.picklescan }}
       docker: ${{ steps.filter.outputs.docker }}
       workflows: ${{ steps.filter.outputs.workflows }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
     steps:
+      - name: Classify CI event
+        id: classify
+        run: |
+          if [[ "$GITHUB_REF" == "refs/heads/main" || "$GITHUB_EVENT_NAME" == "merge_group" ]]; then
+            echo "integration=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "integration=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
         id: filter
@@ -58,8 +72,8 @@ jobs:
   lint:
     name: Lint and Format
     needs: changes
-    # Always run on main branch, otherwise only if Python files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    # Integration events fail closed instead of relying on changed-path data.
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -156,7 +170,7 @@ jobs:
   license-check:
     name: License Compliance
     needs: changes
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -302,7 +316,7 @@ jobs:
   uv-lock-check:
     name: Lock File Consistency
     needs: changes
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -326,8 +340,7 @@ jobs:
   type-check:
     name: Type Check
     needs: changes
-    # Only run if Python files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -377,8 +390,7 @@ jobs:
   quick-feedback:
     name: Quick Feedback (Python 3.12)
     needs: changes
-    # Always run for fastest feedback
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     # The full fast suite can approach 40 minutes on hosted runners when the
     # bounded-replay security regressions land on the long-running worker.
@@ -424,7 +436,7 @@ jobs:
   windows-tests:
     name: Windows Tests (Python 3.11)
     needs: changes
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: windows-latest
     timeout-minutes: 50
     steps:
@@ -454,8 +466,7 @@ jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
     needs: changes
-    # Only run if Python files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     # Coverage runs in dedicated shards below. Keep enough time here for the
     # full uninstrumented matrix and the Python 3.12 slow/integration step.
@@ -504,6 +515,7 @@ jobs:
       - name: Run fast tests with fail-fast (PRs)
         if: github.event_name == 'pull_request'
         run: |
+          echo "MODELAUDIT_PYTHON_TEST_JOB_RAN=1" >> "$GITHUB_ENV"
           uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
       - name: Run slow/integration tests on PR (if labeled)
@@ -513,29 +525,37 @@ jobs:
         timeout-minutes: 20
         run: |
           echo "Running slow/integration tests due to 'run-slow-tests' label"
+          echo "MODELAUDIT_PYTHON_TEST_JOB_RAN=1" >> "$GITHUB_ENV"
           uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
 
-      - name: Run fast tests (main branch)
-        if: github.ref == 'refs/heads/main'
+      - name: Run fast tests (integration event)
+        if: needs.changes.outputs.integration == 'true'
         run: |
+          echo "MODELAUDIT_PYTHON_TEST_JOB_RAN=1" >> "$GITHUB_ENV"
           uv run pytest tests -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
-      - name: Run slow/integration tests (main branch only)
-        # Run ALL slow/integration/performance tests on main branch.
+      - name: Run slow/integration tests (integration event only)
+        # Run ALL slow/integration/performance tests for exact integration SHAs.
         # Tests with missing dependencies auto-skip via pytest.importorskip() or framework markers.
         # Runs on Python 3.12 only to keep CI time reasonable.
-        if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
+        if: needs.changes.outputs.integration == 'true' && matrix.python-version == '3.12'
         timeout-minutes: 20
         run: |
           # Run all slow, integration, and performance tests
+          echo "MODELAUDIT_PYTHON_TEST_JOB_RAN=1" >> "$GITHUB_ENV"
           uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
+
+      - name: Verify Python test command ran
+        if: always()
+        run: |
+          test "${MODELAUDIT_PYTHON_TEST_JOB_RAN:-}" = "1"
 
   coverage:
     name: Coverage (${{ matrix.shard }})
     needs: changes
-    # Prove workflow changes on their PR, but avoid adding five expensive jobs
-    # to ordinary Python PRs. Main always receives the sharded coverage gate.
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.workflows == 'true'
+    # Prove workflow changes on their PR, but fail closed on exact integration
+    # SHAs even when merge_group path classification is unavailable.
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'
     permissions:
       contents: read
       id-token: write
@@ -602,8 +622,7 @@ jobs:
   test-numpy-compatibility:
     name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
     needs: changes
-    # Only run on main branch or if dependencies changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -675,8 +694,7 @@ jobs:
   test-vendored-protos:
     name: Test Vendored TensorFlow Protos
     needs: changes
-    # Run on main branch or if Python/dependency files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -736,8 +754,7 @@ jobs:
   test-proto-reproducibility:
     name: Verify Vendored Proto Reproducibility
     needs: changes
-    # Only run on main or when proto-related files change
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -784,8 +801,7 @@ jobs:
   test-extras-smoke:
     name: Extras Smoke Test (${{ matrix.extra }})
     needs: changes
-    # Only run on main or when dependencies change
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -840,8 +856,7 @@ jobs:
   build:
     name: Build and Package
     needs: changes
-    # Always build on main, otherwise only if Python/dependency/workflow files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -903,7 +918,7 @@ jobs:
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
-            PYTHONPATH= /tmp/modelaudit-wheel-smoke/bin/python -I - <<'PY'
+            PYTHONPATH='' /tmp/modelaudit-wheel-smoke/bin/python -I - <<'PY'
           import importlib.util
 
           import modelaudit
@@ -925,7 +940,7 @@ jobs:
   picklescan-package:
     name: Standalone Pickle Package (${{ matrix.python-version }})
     needs: changes
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -1036,7 +1051,7 @@ jobs:
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
-            PYTHONPATH= /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
+            PYTHONPATH='' /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
           import importlib.util
 
           import modelaudit_picklescan
@@ -1078,8 +1093,17 @@ jobs:
     steps:
       - name: Check if all jobs succeeded
         run: |
-          # Most jobs may be skipped when their path conditions are not met.
-          # Jobs required for the current event are checked separately below.
+          require_success() {
+            local expected="$1"
+            local result="$2"
+            local job_name="$3"
+
+            if [[ "$expected" == "true" && "$result" != "success" ]]; then
+              echo "Expected $job_name to succeed, got: $result"
+              FAILED=true
+            fi
+          }
+
           QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
           LINT_RESULT="${{ needs.lint.result }}"
           DEPENDENCY_AUDIT_RESULT="${{ needs.dependency-audit.result }}"
@@ -1098,11 +1122,14 @@ jobs:
           CHANGES_RESULT="${{ needs.changes.result }}"
 
           # Check if conditional jobs should have run
-          ON_MAIN_BRANCH="${{ github.ref == 'refs/heads/main' }}"
-          DEPENDENCIES_CHANGED="${{ needs.changes.outputs.dependencies == 'true' }}"
-          PICKLESCAN_CHANGED="${{ needs.changes.outputs.picklescan == 'true' }}"
-          PYTHON_CHANGED="${{ needs.changes.outputs.python == 'true' }}"
-          WORKFLOWS_CHANGED="${{ needs.changes.outputs.workflows == 'true' }}"
+          INTEGRATION_EVENT="${{ needs.changes.outputs.integration }}"
+          EXPECT_CORE_PYTHON="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true' }}"
+          EXPECT_DEPENDENCY_AUDIT="${{ github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true') }}"
+          EXPECT_DEPENDENCY_SURFACE="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' }}"
+          EXPECT_COVERAGE="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true' }}"
+          EXPECT_BUILD="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' }}"
+          EXPECT_PICKLESCAN="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true' }}"
+          EXPECT_VENDORED_PROTOS="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' }}"
           echo "Job results:"
           echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
@@ -1120,48 +1147,39 @@ jobs:
           echo "  build: $BUILD_RESULT"
           echo "  picklescan-package: $PICKLESCAN_RESULT"
           echo "  changes: $CHANGES_RESULT"
+          echo "Expected job groups:"
+          echo "  integration-event: $INTEGRATION_EVENT"
+          echo "  core-python: $EXPECT_CORE_PYTHON"
+          echo "  dependency-audit: $EXPECT_DEPENDENCY_AUDIT"
+          echo "  dependency-surface: $EXPECT_DEPENDENCY_SURFACE"
+          echo "  coverage: $EXPECT_COVERAGE"
+          echo "  build: $EXPECT_BUILD"
+          echo "  picklescan: $EXPECT_PICKLESCAN"
+          echo "  vendored-protos: $EXPECT_VENDORED_PROTOS"
 
-          # Check if any job failed or was cancelled
           FAILED=false
 
-          [[ "$CHANGES_RESULT" == "failure" || "$CHANGES_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$DEPENDENCY_AUDIT_RESULT" == "failure" || "$DEPENDENCY_AUDIT_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]] && FAILED=true
-
-          # Conditional jobs: only fail if they should have run
-          # Coverage is mandatory on main and for workflow changes. Requiring
-          # exact success prevents a skipped shard matrix from passing the gate.
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
-            [[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true
-          fi
-
-          # License/lock checks run on main or when dependencies change
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
-            [[ "$LICENSE_RESULT" == "failure" || "$LICENSE_RESULT" == "cancelled" ]] && FAILED=true
-            [[ "$UV_LOCK_RESULT" == "failure" || "$UV_LOCK_RESULT" == "cancelled" ]] && FAILED=true
-            [[ "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ]] && FAILED=true
-            [[ "$EXTRAS_RESULT" == "failure" || "$EXTRAS_RESULT" == "cancelled" ]] && FAILED=true
-          fi
-
-          # Vendored protos jobs run on main or when python/dependencies change
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
-            [[ "$PROTOS_RESULT" == "failure" || "$PROTOS_RESULT" == "cancelled" ]] && FAILED=true
-            [[ "$PROTO_REPRO_RESULT" == "failure" || "$PROTO_REPRO_RESULT" == "cancelled" ]] && FAILED=true
-          fi
-
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$PICKLESCAN_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
-            [[ "$PICKLESCAN_RESULT" == "failure" || "$PICKLESCAN_RESULT" == "cancelled" ]] && FAILED=true
-          fi
+          [[ "$CHANGES_RESULT" == "success" ]] || FAILED=true
+          require_success "$EXPECT_CORE_PYTHON" "$QUICK_FEEDBACK_RESULT" "quick-feedback"
+          require_success "$EXPECT_CORE_PYTHON" "$LINT_RESULT" "lint"
+          require_success "$EXPECT_DEPENDENCY_AUDIT" "$DEPENDENCY_AUDIT_RESULT" "dependency-audit"
+          require_success "$EXPECT_DEPENDENCY_SURFACE" "$LICENSE_RESULT" "license-check"
+          require_success "$EXPECT_DEPENDENCY_SURFACE" "$UV_LOCK_RESULT" "uv-lock-check"
+          require_success "$EXPECT_CORE_PYTHON" "$TYPE_CHECK_RESULT" "type-check"
+          require_success "$EXPECT_CORE_PYTHON" "$WINDOWS_RESULT" "windows-tests"
+          require_success "$EXPECT_CORE_PYTHON" "$TEST_RESULT" "test"
+          require_success "$EXPECT_COVERAGE" "$COVERAGE_RESULT" "coverage"
+          require_success "$EXPECT_DEPENDENCY_SURFACE" "$NUMPY_RESULT" "test-numpy-compatibility"
+          require_success "$EXPECT_VENDORED_PROTOS" "$PROTOS_RESULT" "test-vendored-protos"
+          require_success "$EXPECT_VENDORED_PROTOS" "$PROTO_REPRO_RESULT" "test-proto-reproducibility"
+          require_success "$EXPECT_DEPENDENCY_SURFACE" "$EXTRAS_RESULT" "test-extras-smoke"
+          require_success "$EXPECT_BUILD" "$BUILD_RESULT" "build"
+          require_success "$EXPECT_PICKLESCAN" "$PICKLESCAN_RESULT" "picklescan-package"
 
           if [[ "$FAILED" == "true" ]]; then
-            echo "Some CI checks failed!"
+            echo "One or more required jobs failed"
             exit 1
           else
-            echo "All CI checks passed (or were skipped due to path filters)!"
+            echo "All required CI checks reported success"
             exit 0
           fi
