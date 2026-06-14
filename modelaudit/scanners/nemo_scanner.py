@@ -51,6 +51,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_PREFLIGHT_PREFIX_ANALYSIS_REASONS = frozenset(
+    {
+        "tar_metadata_read_limit_exceeded",
+        "tar_total_size_limit_exceeded",
+    }
+)
+
 # Safe _target_ prefixes that are expected in legitimate NeMo configs
 _SAFE_TARGET_PREFIXES = (
     "nemo.",
@@ -1380,14 +1387,25 @@ class NemoScanner(BaseScanner):
             return result
 
         preflight_result = ScanResult(scanner_name="tar")
+        shared_budget = tar_scanner._get_or_create_shared_budget()
+        initial_member_bytes = shared_budget.member_bytes_consumed
+        initial_budget_exhausted = shared_budget.exhausted
         if not tar_scanner._preflight_tar_archive(
             path,
             preflight_result,
             retain_member_budget=is_declared_nemo,
         ):
-            mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
-            preflight_result.finish(success=False)
-            result.merge(preflight_result)
+            preflight_reasons = set(preflight_result.metadata.get("scan_outcome_reasons", []))
+            if preflight_reasons and preflight_reasons <= _PREFLIGHT_PREFIX_ANALYSIS_REASONS:
+                shared_budget.member_bytes_consumed = initial_member_bytes
+                shared_budget.exhausted = initial_budget_exhausted
+                tar_scanner.config["cache_enabled"] = False
+                tar_scanner.current_file_path = path
+                result.merge(tar_scanner._scan_tar_file(path, depth=archive_depth))
+            else:
+                mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
+                preflight_result.finish(success=False)
+                result.merge(preflight_result)
             result.bytes_scanned = file_size
             self._finish_scan_result(result)
             return result
