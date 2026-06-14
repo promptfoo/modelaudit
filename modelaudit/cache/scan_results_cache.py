@@ -320,7 +320,7 @@ def _parse_resolution_context(
     return parts[0], parts[1], parts[2]
 
 
-def _path_importer_context_is_current(search_path: object, resolution_context: object) -> bool:
+def _path_importer_context_status(search_path: object, resolution_context: object) -> tuple[bool, bool]:
     if (
         not isinstance(search_path, list)
         or not all(isinstance(entry, str) for entry in search_path)
@@ -328,13 +328,13 @@ def _path_importer_context_is_current(search_path: object, resolution_context: o
         or not all(isinstance(identity, str) for identity in resolution_context)
         or _search_path_has_untrusted_importer(search_path)
     ):
-        return False
+        return False, False
     expected = tuple(resolution_context)
     current = _path_importer_resolution_context(search_path)
-    return current == expected or _resolution_context_allows_trusted_cache_population(
-        ((), (), expected),
-        ((), (), current),
-    )
+    if current == expected:
+        return True, False
+    populated = _resolution_context_allows_trusted_cache_population(((), (), expected), ((), (), current))
+    return populated, populated
 
 
 def _loaded_module_source_override(module_name: str) -> tuple[bool, str | None]:
@@ -1718,18 +1718,15 @@ class ScanResultsCache:
         module_sources = fingerprint_metadata.get("module_sources")
         if not isinstance(module_sources, dict):
             return False
+        unresolved_module_sources: list[tuple[str, str]] = []
         for module_name, expected_source in module_sources.items():
             if not isinstance(module_name, str) or not isinstance(expected_source, str):
                 return False
             is_overridden, current_source = _loaded_module_source_override(module_name)
             if is_overridden and current_source != expected_source:
                 return False
-            if (
-                not is_overridden
-                and importer_cache_was_populated
-                and _current_module_source_path(module_name) != expected_source
-            ):
-                return False
+            if not is_overridden:
+                unresolved_module_sources.append((module_name, expected_source))
         loaded_module_sources = fingerprint_metadata.get("loaded_module_sources")
         if not isinstance(loaded_module_sources, dict):
             return False
@@ -1754,8 +1751,13 @@ class ScanResultsCache:
             if current_search_path != expected_search_path:
                 return False
             expected_resolution_context = loaded_package_resolution_contexts.get(module_name)
-            if not _path_importer_context_is_current(current_search_path, expected_resolution_context):
+            context_is_current, context_was_populated = _path_importer_context_status(
+                current_search_path,
+                expected_resolution_context,
+            )
+            if not context_is_current:
                 return False
+            importer_cache_was_populated |= context_was_populated
         for module_name in module_sources:
             if any(
                 parent_name not in loaded_package_paths for parent_name in _loaded_parent_package_names(module_name)
@@ -1769,10 +1771,17 @@ class ScanResultsCache:
                 return False
             search_path = raw_context.get("search_path")
             expected_resolution_context = raw_context.get("path_importers")
-            if module_name in sys.modules or not _path_importer_context_is_current(
-                search_path, expected_resolution_context
-            ):
+            context_is_current, context_was_populated = _path_importer_context_status(
+                search_path,
+                expected_resolution_context,
+            )
+            if module_name in sys.modules or not context_is_current:
                 return False
+            importer_cache_was_populated |= context_was_populated
+        if importer_cache_was_populated:
+            for module_name, expected_source in unresolved_module_sources:
+                if _current_module_source_path(module_name) != expected_source:
+                    return False
         fingerprints = fingerprint_metadata.get("fingerprints")
         if not isinstance(fingerprints, dict) or len(fingerprints) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
             return False

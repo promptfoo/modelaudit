@@ -1977,6 +1977,84 @@ def test_scan_cache_revalidates_sources_after_standard_importer_cache_population
     assert calls == [module]
 
 
+@pytest.mark.parametrize("context_kind", ["loaded", "namespace"])
+@pytest.mark.parametrize("source_matches", [True, False], ids=["benign", "changed"])
+def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    context_kind: str,
+    source_matches: bool,
+) -> None:
+    parent_module = f"{context_kind}_cache_population"
+    module = f"{parent_module}.child"
+    package_path = tmp_path / parent_module
+    package_path.mkdir()
+    source_path = package_path / "child.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+    path_entry = str(package_path)
+    file_path = _make_cacheable_file(tmp_path, "nested-population.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
+    if context_kind == "loaded":
+        loaded_parent = ModuleType(parent_module)
+        loaded_parent.__path__ = [path_entry]
+        loaded_parent.__spec__ = ModuleSpec(parent_module, loader=None, is_package=True)
+        monkeypatch.setitem(sys.modules, parent_module, loaded_parent)
+    else:
+        monkeypatch.delitem(sys.modules, parent_module, raising=False)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        root_finder = FileFinder(
+            str(tmp_path),
+            (ExtensionFileLoader, EXTENSION_SUFFIXES),
+            (SourceFileLoader, SOURCE_SUFFIXES),
+            (SourcelessFileLoader, BYTECODE_SUFFIXES),
+        )
+        assert root_finder.find_spec(parent_module) is not None
+        monkeypatch.setitem(sys.path_importer_cache, str(tmp_path), root_finder)
+
+    source = str(source_path.absolute())
+    fingerprint_metadata = _call_graph_fingerprint_metadata(
+        {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+        module_sources={module: source},
+        loaded_package_paths={parent_module: [path_entry]} if context_kind == "loaded" else None,
+    )
+    if context_kind == "namespace":
+        fingerprint_metadata["namespace_package_resolution_contexts"] = {
+            parent_module: {"search_path": [path_entry], "path_importers": []}
+        }
+
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    finder = FileFinder(
+        path_entry,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    if source_matches:
+        assert finder.find_spec(module) is not None
+    else:
+        finder_state = object.__getattribute__(finder, "__dict__")
+        finder_state.update(
+            _path_mtime=os.stat(path_entry).st_mtime,
+            _path_cache=set(),
+            _relaxed_path_cache=set(),
+        )
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+
+    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+    assert (cached_result is not None) is source_matches
+
+
 def test_resolution_context_rejects_mutated_zipimporter_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

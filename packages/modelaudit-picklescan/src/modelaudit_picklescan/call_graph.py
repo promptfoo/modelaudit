@@ -3792,28 +3792,31 @@ def _stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, 
     )
 
 
-def _zipimport_central_directory_is_bounded(archive: str, expected_stat: os.stat_result) -> bool:
+def _zipimport_bounded_central_directory_names(
+    archive: str,
+    expected_stat: os.stat_result,
+) -> frozenset[bytes] | None:
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         file_descriptor = os.open(archive, flags)
     except OSError:
-        return False
+        return None
     try:
         opened = os.fstat(file_descriptor)
         if _stat_identity(expected_stat) != _stat_identity(opened) or opened.st_size < _ZIP_END_RECORD_SIZE:
-            return False
+            return None
 
         tail_size = min(opened.st_size, _ZIP_END_RECORD_SIZE + _ZIP_MAX_COMMENT_BYTES)
         os.lseek(file_descriptor, opened.st_size - tail_size, os.SEEK_SET)
         tail = _read_exact_file_descriptor(file_descriptor, tail_size)
         if tail is None:
-            return False
+            return None
         search_end = len(tail)
         end_record: tuple[int, int, int] | None = None
         while search_end:
             end_offset = tail.rfind(b"PK\x05\x06", 0, search_end)
             if end_offset < 0:
-                return False
+                return None
             search_end = end_offset
             if end_offset + _ZIP_END_RECORD_SIZE > len(tail):
                 continue
@@ -3840,47 +3843,65 @@ def _zipimport_central_directory_is_bounded(archive: str, expected_stat: os.stat
                 or central_directory_size == 0xFFFFFFFF
                 or central_directory_offset == 0xFFFFFFFF
             ):
-                return False
+                return None
             absolute_end_offset = opened.st_size - tail_size + end_offset
             central_directory_start = absolute_end_offset - central_directory_size
             if central_directory_start < central_directory_offset or central_directory_start < 0:
-                return False
+                return None
             end_record = central_directory_start, central_directory_size, entry_count
             break
         if end_record is None:
-            return False
+            return None
 
         central_directory_start, central_directory_size, expected_entries = end_record
         os.lseek(file_descriptor, central_directory_start, os.SEEK_SET)
         central_directory = _read_exact_file_descriptor(file_descriptor, central_directory_size)
         if central_directory is None:
-            return False
+            return None
 
         position = 0
         entry_count = 0
+        entry_names: set[bytes] = set()
         while position < len(central_directory):
             signature = central_directory[position : position + 4]
             if signature == b"PK\x01\x02":
                 if position + _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE > len(central_directory):
-                    return False
-                variable_sizes = struct.unpack_from("<3H", central_directory, position + 28)
-                position += _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE + sum(variable_sizes)
+                    return None
+                filename_size, extra_size, comment_size = struct.unpack_from(
+                    "<3H",
+                    central_directory,
+                    position + 28,
+                )
+                filename_start = position + _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE
+                position = filename_start + filename_size + extra_size + comment_size
                 entry_count += 1
                 if entry_count > _MAX_SOURCE_FINGERPRINT_CANDIDATES or position > len(central_directory):
-                    return False
+                    return None
+                entry_names.add(central_directory[filename_start : filename_start + filename_size])
                 continue
             if signature == b"PK\x05\x05" and entry_count == expected_entries:
                 if position + 6 > len(central_directory):
-                    return False
+                    return None
                 signature_size = int.from_bytes(central_directory[position + 4 : position + 6], "little")
                 position += 6 + signature_size
                 break
-            return False
-        return position == len(central_directory) and entry_count == expected_entries
+            return None
+        finished = os.fstat(file_descriptor)
+        if (
+            position != len(central_directory)
+            or entry_count != expected_entries
+            or _stat_identity(opened) != _stat_identity(finished)
+        ):
+            return None
+        return frozenset(entry_names)
     except (OSError, struct.error):
-        return False
+        return None
     finally:
         os.close(file_descriptor)
+
+
+def _zipimport_central_directory_is_bounded(archive: str, expected_stat: os.stat_result) -> bool:
+    return _zipimport_bounded_central_directory_names(archive, expected_stat) is not None
 
 
 def _zipimport_runtime_is_trusted() -> bool:
@@ -3901,6 +3922,144 @@ def _zipimport_directory_cache_files(archive: str) -> object:
     if not _zipimport_runtime_is_trusted():
         return None
     return dict.get(cast(dict[str, object], _ZIP_DIRECTORY_CACHE), archive)
+
+
+def _zipimport_expected_prefix(archive: str, entry: str) -> str | None:
+    try:
+        archive_path = os.path.abspath(archive)
+        entry_path = os.path.abspath(entry)
+    except (OSError, ValueError):
+        return None
+    normalized_archive = os.path.normcase(archive_path)
+    normalized_entry = os.path.normcase(entry_path)
+    if normalized_entry == normalized_archive:
+        return ""
+    archive_root = f"{normalized_archive}{os.sep}"
+    if not normalized_entry.startswith(archive_root):
+        return None
+    relative_entry = entry_path[len(archive_path) :].replace("\\", "/").strip("/")
+    parts = relative_entry.split("/")
+    if not relative_entry or any(part in {"", ".", ".."} for part in parts):
+        return None
+    return f"{'/'.join(parts)}/"
+
+
+def _zipimport_names_exclude_module(
+    names: Iterable[object],
+    prefix: str,
+    module_name: str,
+) -> bool:
+    leaf_name = module_name.rsplit(".", maxsplit=1)[-1]
+    if not leaf_name or not leaf_name.isascii() or "/" in leaf_name or "\\" in leaf_name or "\0" in leaf_name:
+        return False
+    candidate = f"{prefix}{leaf_name}".encode()
+    for name in names:
+        if type(name) is bytes:
+            raw_name = name
+        elif type(name) is str:
+            raw_name = name.encode()
+        else:
+            return False
+        normalized_name = raw_name.replace(b"\\", b"/")
+        if normalized_name in {candidate + b".py", candidate + b".pyc"} or normalized_name.startswith(candidate + b"/"):
+            return False
+    return True
+
+
+def _zipimport_absent_cache_snapshot(files: object, prefix: str, module_name: str) -> dict[str, object] | None:
+    if not _zipimport_files_are_safe(files):
+        return None
+    try:
+        snapshot = dict.copy(cast(dict[str, object], files))
+        if files != snapshot or not _zipimport_names_exclude_module(snapshot.keys(), prefix, module_name):
+            return None
+    except RuntimeError:
+        return None
+    return snapshot
+
+
+def _oversized_zip_archive_excludes_module(archive: str, prefix: str, module_name: str) -> bool:
+    try:
+        archive_stat = os.stat(archive)
+    except OSError:
+        return False
+    if not stat.S_ISREG(archive_stat.st_mode) or archive_stat.st_size <= _MAX_ZIPIMPORT_ARCHIVE_BYTES:
+        return False
+    names = _zipimport_bounded_central_directory_names(archive, archive_stat)
+    return names is not None and _zipimport_names_exclude_module(names, prefix, module_name)
+
+
+def _zipimport_archive_state_from_entry(entry: str) -> tuple[str, str] | None:
+    if not os.path.isabs(entry):
+        return None
+    try:
+        candidate = os.path.abspath(entry)
+    except (OSError, ValueError):
+        return None
+    for _ in range(_MAX_MODULE_COMPONENTS + 1):
+        try:
+            candidate_stat = os.stat(candidate)
+        except OSError:
+            pass
+        else:
+            if stat.S_ISDIR(candidate_stat.st_mode):
+                return None
+            if stat.S_ISREG(candidate_stat.st_mode):
+                prefix = _zipimport_expected_prefix(candidate, entry)
+                return (candidate, prefix) if prefix is not None else None
+            return None
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            return None
+        candidate = parent
+    return None
+
+
+def _uncached_oversized_zip_excludes_module(entry: str, module_name: str) -> bool:
+    if not _zipimport_runtime_is_trusted() or not _path_hooks_are_trusted():
+        return False
+    archive_state = _zipimport_archive_state_from_entry(entry)
+    if archive_state is None:
+        return False
+    archive, prefix = archive_state
+    if not _oversized_zip_archive_excludes_module(archive, prefix, module_name):
+        return False
+    directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
+    if not dict.__contains__(directory_cache, archive):
+        return True
+    files = dict.__getitem__(directory_cache, archive)
+    snapshot = _zipimport_absent_cache_snapshot(files, prefix, module_name)
+    return snapshot is not None and files == snapshot
+
+
+def _cached_oversized_zipimporter_excludes_module(
+    finder: object,
+    module_name: str,
+    cache_key: str,
+) -> bool:
+    if (
+        type(finder) is not zipimporter
+        or not _zipimport_runtime_is_trusted()
+        or not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS)
+    ):
+        return False
+    try:
+        instance_state = object.__getattribute__(finder, "__dict__")
+    except (AttributeError, TypeError):
+        return False
+    if not (
+        type(instance_state) is dict and len(instance_state) <= 5 and all(type(key) is str for key in instance_state)
+    ):
+        return False
+    archive = dict.get(instance_state, "archive")
+    prefix = dict.get(instance_state, "prefix")
+    if type(archive) is not str or type(prefix) is not str or _zipimport_expected_prefix(archive, cache_key) != prefix:
+        return False
+    files = _zipimport_directory_cache_files(archive)
+    snapshot = _zipimport_absent_cache_snapshot(files, prefix, module_name)
+    if snapshot is None or dict.get(instance_state, "_files", files) is not files:
+        return False
+    return _oversized_zip_archive_excludes_module(archive, prefix, module_name) and files == snapshot
 
 
 def _zipimport_archive_files_match(archive: str, files: object) -> bool:
@@ -4076,6 +4235,9 @@ def _file_finder_state(
 class _FileFinderResolutionSummary:
     finder: object | None = None
     finder_path: str | None = None
+    observed_path_mtime: int | float | None = None
+    observed_path_cache: object | None = None
+    observed_relaxed_path_cache: object | None = None
     path_mtime: int | float | None = None
     path_cache: frozenset[str] | None = None
     relaxed_path_cache: frozenset[str] | None = None
@@ -4101,15 +4263,15 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
     state = _file_finder_state(finder, cache_key)
     if state is None:
         return None
-    instance_state, finder_path, path_mtime, path_cache, relaxed_path_cache = state
+    _, finder_path, path_mtime, path_cache, relaxed_path_cache = state
     with _FILE_FINDER_IDENTITY_LOCK:
         summary = _cached_file_finder_resolution_summary(id(finder))
         if (
             summary.finder is finder
             and summary.finder_path == finder_path
-            and summary.path_mtime == path_mtime
-            and path_cache is summary.path_cache
-            and relaxed_path_cache is summary.relaxed_path_cache
+            and summary.observed_path_mtime == path_mtime
+            and path_cache is summary.observed_path_cache
+            and relaxed_path_cache is summary.observed_relaxed_path_cache
         ):
             return summary.identity
         if not _file_finder_cache_names_are_strings(path_cache, relaxed_path_cache):
@@ -4127,10 +4289,6 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
             validated_relaxed_path_cache = (
                 frozenset(cast(Iterable[str], relaxed_path_cache)) & canonical_relaxed_path_cache
             )
-        instance_state["_loaders"] = _STANDARD_FILE_FINDER_LOADERS
-        instance_state["_path_mtime"] = path_mtime
-        instance_state["_path_cache"] = validated_path_cache
-        instance_state["_relaxed_path_cache"] = validated_relaxed_path_cache
         state_identity = _string_sequence_identity(
             (
                 finder_path,
@@ -4141,6 +4299,9 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
         )
         summary.finder = finder
         summary.finder_path = finder_path
+        summary.observed_path_mtime = state[2]
+        summary.observed_path_cache = path_cache
+        summary.observed_relaxed_path_cache = relaxed_path_cache
         summary.path_mtime = path_mtime
         summary.path_cache = validated_path_cache
         summary.relaxed_path_cache = validated_relaxed_path_cache
@@ -4148,6 +4309,50 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
         summary.canonical_relaxed_path_cache = canonical_relaxed_path_cache
         summary.identity = f"trusted:importlib.machinery.FileFinder:{state_identity}"
         return summary.identity
+
+
+def _file_finder_spec_from_summary(
+    finder: object,
+    module_name: str,
+    *,
+    canonical: bool = False,
+) -> ModuleSpec | _UnsafePathResolution | None:
+    with _FILE_FINDER_IDENTITY_LOCK:
+        summary = _cached_file_finder_resolution_summary(id(finder))
+        if (
+            summary.finder is not finder
+            or summary.finder_path is None
+            or summary.path_mtime is None
+            or summary.path_cache is None
+            or summary.relaxed_path_cache is None
+            or summary.canonical_path_cache is None
+            or summary.canonical_relaxed_path_cache is None
+        ):
+            return _UNSAFE_PATH_RESOLUTION
+        finder_path = summary.finder_path
+        path_mtime = summary.path_mtime
+        path_cache = summary.canonical_path_cache if canonical else summary.path_cache
+        relaxed_path_cache = summary.canonical_relaxed_path_cache if canonical else summary.relaxed_path_cache
+
+    try:
+        resolution_finder = FileFinder(finder_path, *_STANDARD_FILE_FINDER_LOADER_DETAILS)
+        resolution_state = object.__getattribute__(resolution_finder, "__dict__")
+        if type(resolution_state) is not dict:
+            return _UNSAFE_PATH_RESOLUTION
+        resolution_state["_loaders"] = _STANDARD_FILE_FINDER_LOADERS
+        resolution_state["_path_mtime"] = path_mtime
+        resolution_state["_path_cache"] = path_cache
+        resolution_state["_relaxed_path_cache"] = relaxed_path_cache
+        spec = FileFinder.find_spec(resolution_finder, module_name)
+    except Exception:
+        return _UNSAFE_PATH_RESOLUTION
+    if not (
+        dict.get(resolution_state, "_path_mtime") == path_mtime
+        and dict.get(resolution_state, "_path_cache") is path_cache
+        and dict.get(resolution_state, "_relaxed_path_cache") is relaxed_path_cache
+    ):
+        return _UNSAFE_PATH_RESOLUTION
+    return spec if type(spec) is ModuleSpec else None
 
 
 def _file_finder_miss_matches_canonical_state(finder: object, module_name: str) -> bool:
@@ -4168,29 +4373,7 @@ def _file_finder_miss_matches_canonical_state(finder: object, module_name: str) 
             and summary.relaxed_path_cache == summary.canonical_relaxed_path_cache
         ):
             return True
-        finder_path = summary.finder_path
-        path_mtime = summary.path_mtime
-        canonical_path_cache = summary.canonical_path_cache
-        canonical_relaxed_path_cache = summary.canonical_relaxed_path_cache
-
-    try:
-        canonical_finder = FileFinder(finder_path, *_STANDARD_FILE_FINDER_LOADER_DETAILS)
-        canonical_state = object.__getattribute__(canonical_finder, "__dict__")
-        if type(canonical_state) is not dict:
-            return False
-        canonical_state["_loaders"] = _STANDARD_FILE_FINDER_LOADERS
-        canonical_state["_path_mtime"] = path_mtime
-        canonical_state["_path_cache"] = canonical_path_cache
-        canonical_state["_relaxed_path_cache"] = canonical_relaxed_path_cache
-        canonical_spec = FileFinder.find_spec(canonical_finder, module_name)
-    except Exception:
-        return False
-    return (
-        canonical_spec is None
-        and dict.get(canonical_state, "_path_mtime") == path_mtime
-        and dict.get(canonical_state, "_path_cache") is canonical_path_cache
-        and dict.get(canonical_state, "_relaxed_path_cache") is canonical_relaxed_path_cache
-    )
+    return _file_finder_spec_from_summary(finder, module_name, canonical=True) is None
 
 
 def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
@@ -5068,6 +5251,8 @@ def _current_module_source_path(module_name: str) -> str | None:
 
 
 def _zipimport_archive_path(entry: str) -> Path | None:
+    if not _zipimport_runtime_is_trusted():
+        return None
     try:
         archive = zipimporter(entry).archive
     except (ImportError, OSError):
@@ -5211,6 +5396,8 @@ def _fresh_standard_path_importer(entry: str) -> FileFinder | zipimporter | _Uns
     for hook in path_hooks:
         if not _is_standard_path_hook(hook):
             return _UNSAFE_PATH_RESOLUTION
+        if hook is zipimporter and not _zipimport_runtime_is_trusted():
+            return _UNSAFE_PATH_RESOLUTION
         try:
             finder = zipimporter(entry) if hook is zipimporter else cast(Callable[[str], FileFinder], hook)(entry)
         except ImportError:
@@ -5228,16 +5415,17 @@ def _trusted_path_importer_spec(
     module_name: str,
     cache_key: str,
 ) -> ModuleSpec | _UnsafePathResolution | None:
-    if type(finder) is FileFinder and _file_finder_resolution_identity(finder, cache_key) is None:
-        return _UNSAFE_PATH_RESOLUTION
-    try:
-        spec = (
-            FileFinder.find_spec(finder, module_name)
-            if type(finder) is FileFinder
-            else zipimporter.find_spec(cast(zipimporter, finder), module_name)
-        )
-    except Exception:
-        return _UNSAFE_PATH_RESOLUTION
+    if type(finder) is FileFinder:
+        if _file_finder_resolution_identity(finder, cache_key) is None:
+            return _UNSAFE_PATH_RESOLUTION
+        spec = _file_finder_spec_from_summary(finder, module_name)
+    else:
+        try:
+            spec = zipimporter.find_spec(cast(zipimporter, finder), module_name)
+        except Exception:
+            return _UNSAFE_PATH_RESOLUTION
+    if isinstance(spec, _UnsafePathResolution):
+        return spec
     if spec is None:
         if type(finder) is FileFinder and not _file_finder_miss_matches_canonical_state(finder, module_name):
             return _UNSAFE_PATH_RESOLUTION
@@ -5267,11 +5455,15 @@ def _find_standard_path_spec(
             cached_finder = dict.__getitem__(path_importer_cache, cache_key)
             if cached_finder is None:
                 continue
+            if _cached_oversized_zipimporter_excludes_module(cached_finder, module_name, cache_key):
+                continue
             if not _is_trusted_standard_path_importer(cached_finder, cache_key):
                 _mark_shared_source_snapshot_unreusable()
                 return _UNSAFE_PATH_RESOLUTION
             finder = cast(FileFinder | zipimporter, cached_finder)
         else:
+            if _uncached_oversized_zip_excludes_module(cache_key, module_name):
+                continue
             fresh_finder = _fresh_standard_path_importer(cache_key)
             if isinstance(fresh_finder, _UnsafePathResolution):
                 _mark_shared_source_snapshot_unreusable()

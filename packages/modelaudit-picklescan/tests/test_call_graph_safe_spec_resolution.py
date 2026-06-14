@@ -80,6 +80,14 @@ def _write_zipimporter_archive(archive_path: Path, module: str, *, include_modul
             archive.writestr(f"{module}.py", "class Fraction:\n    pass\n")
 
 
+def _write_oversized_zipimporter_archive(archive_path: Path, module: str, *, include_module: bool) -> None:
+    payload_path = archive_path.with_suffix(".payload.zip")
+    _write_zipimporter_archive(payload_path, module, include_module=include_module)
+    with archive_path.open("wb") as archive:
+        archive.seek(call_graph._MAX_ZIPIMPORT_ARCHIVE_BYTES + 1)
+        archive.write(payload_path.read_bytes())
+
+
 def _refresh_zipimporter_directory_files(
     archive_path: Path,
     files: dict[str, tuple[object, ...]],
@@ -1680,6 +1688,34 @@ def test_zipimporter_directory_validation_does_not_execute_mutated_reader_global
     assert calls == []
 
 
+def test_uncached_zip_path_does_not_construct_importer_with_mutated_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "uncached-mutated-runtime.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    zipimport_namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    original_unpack = dict.get(zipimport_namespace, "_unpack_uint32")
+    assert callable(original_unpack)
+    calls: list[bytes] = []
+
+    def poisoned_unpack(value: bytes) -> int:
+        calls.append(value)
+        return cast(Callable[[bytes], int], original_unpack)(value)
+
+    monkeypatch.setitem(zipimport_namespace, "_unpack_uint32", poisoned_unpack)
+    with _standard_import_runtime(
+        monkeypatch,
+        module="trusted_module",
+        importer_cache={},
+        search_path=[str(archive_path)],
+        trusted_site_package_root=tmp_path,
+    ):
+        assert call_graph._trusted_module_origin_kind("trusted_module") is None
+        assert call_graph._zipimport_archive_path(str(archive_path)) is None
+    assert calls == []
+
+
 def test_zipimporter_identity_does_not_rebuild_evicted_cache_with_mutated_reader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1742,6 +1778,62 @@ def test_zipimporter_directory_validation_bounds_entries_before_reader(
     assert calls == []
 
 
+@pytest.mark.parametrize("cached", [True, False], ids=["cached", "uncached"])
+@pytest.mark.parametrize("include_module", [False, True], ids=["absent", "present"])
+def test_oversized_zip_falls_through_only_when_module_is_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cached: bool,
+    include_module: bool,
+) -> None:
+    module = "statistics"
+    archive_path = tmp_path / f"oversized-{cached}-{include_module}.zip"
+    _write_oversized_zipimporter_archive(archive_path, module, include_module=include_module)
+    path_entry = str(archive_path)
+    stdlib_path = sysconfig.get_path("stdlib")
+    assert stdlib_path is not None
+    importer_cache: dict[Any, Any] = {stdlib_path: FileFinder(stdlib_path, *_standard_file_finder_loader_details())}
+    if cached:
+        importer_cache[path_entry] = zipimporter(path_entry)
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache=importer_cache,
+        search_path=[path_entry, stdlib_path],
+    ):
+        origin_kind = call_graph._trusted_module_origin_kind(module)
+
+    assert origin_kind == (None if include_module else "stdlib")
+
+
+def test_oversized_zip_absence_proof_rejects_forged_cached_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = "statistics"
+    archive_path = tmp_path / "oversized-forged.zip"
+    _write_oversized_zipimporter_archive(archive_path, module, include_module=False)
+    path_entry = str(archive_path)
+    finder = zipimporter(path_entry)
+    files = _zipimporter_directory_files(finder)
+    files[f"{module}.py"] = files["payload.py"]
+    assert type(zipimporter.find_spec(finder, module)) is ModuleSpec
+    stdlib_path = sysconfig.get_path("stdlib")
+    assert stdlib_path is not None
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache={
+            path_entry: finder,
+            stdlib_path: FileFinder(stdlib_path, *_standard_file_finder_loader_details()),
+        },
+        search_path=[path_entry, stdlib_path],
+    ):
+        assert call_graph._trusted_module_origin_kind(module) is None
+
+
 def test_file_finder_identity_does_not_execute_mutated_fill_cache(tmp_path: Path) -> None:
     finder = FileFinder(str(tmp_path), *_standard_file_finder_loader_details())
     fill_cache = FileFinder.__dict__["_fill_cache"]
@@ -1780,6 +1872,35 @@ def test_file_finder_miss_rejects_incomplete_current_cache(tmp_path: Path) -> No
             call_graph._trusted_path_importer_spec(finder, module, path_entry),
             call_graph._UnsafePathResolution,
         )
+    finally:
+        call_graph._cached_file_finder_resolution_summary.cache_clear()
+
+
+def test_file_finder_validation_does_not_mutate_live_cache(
+    tmp_path: Path,
+) -> None:
+    module = "recreated_after_validation"
+    source_path = tmp_path / f"{module}.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+    path_entry = str(tmp_path)
+    finder = FileFinder(path_entry, *_standard_file_finder_loader_details())
+    assert finder.find_spec(module) is not None
+    finder_state = object.__getattribute__(finder, "__dict__")
+    path_cache = finder_state["_path_cache"]
+    relaxed_path_cache = finder_state["_relaxed_path_cache"]
+    directory_stat = os.stat(path_entry)
+
+    source_path.unlink()
+    os.utime(path_entry, ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns))
+    call_graph._cached_file_finder_resolution_summary.cache_clear()
+    try:
+        assert call_graph._file_finder_resolution_identity(finder, path_entry) is not None
+        assert finder_state["_path_cache"] is path_cache
+        assert finder_state["_relaxed_path_cache"] is relaxed_path_cache
+
+        source_path.write_text("value = 2\n", encoding="utf-8")
+        os.utime(path_entry, ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns))
+        assert finder.find_spec(module) is not None
     finally:
         call_graph._cached_file_finder_resolution_summary.cache_clear()
 
@@ -1901,7 +2022,7 @@ def test_importer_context_preserves_symlink_sensitive_parent_components(
         _clear_call_graph_caches()
 
 
-def test_invalidated_file_finder_is_normalized_before_snapshot(
+def test_invalidated_file_finder_is_resolved_without_mutating_live_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1921,7 +2042,8 @@ def test_invalidated_file_finder_is_normalized_before_snapshot(
     ):
         first_context = call_graph._source_resolution_context()
         assert call_graph._source_resolution_context() == first_context
-        assert object.__getattribute__(finder, "__dict__")["_path_mtime"] != -1
+        assert object.__getattribute__(finder, "__dict__")["_path_mtime"] == -1
+        assert type(call_graph._find_standard_path_spec(module, [path_entry])) is ModuleSpec
 
 
 @pytest.mark.parametrize("transition", ["finder-to-none", "none-to-finder"])
