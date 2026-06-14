@@ -1889,17 +1889,20 @@ def create_dynamic_matmul_integer_bias_model(
     metadata_sink_from_bias_output: bool = False,
     post_bias_scale: bool = False,
     post_bias_operator: str | None = None,
-    terminal_post_bias_dynamic: bool = False,
+    terminal_post_bias_factor: bool = False,
     integer_op_boundary: str = "direct",
 ) -> Path:
     assert integer_op_boundary in {"direct", "function", "if_subgraph"}
-    assert not terminal_post_bias_dynamic or (post_bias_scale and post_bias_operator == "dynamic_mul")
+    assert not terminal_post_bias_factor or (
+        post_bias_scale and post_bias_operator in {"constant_mul", "dynamic_mul", "metadata_mul"}
+    )
     assert post_bias_operator in {
         None,
         "Abs",
         "Add",
         "Cast",
         "canonical_gelu",
+        "constant_mul",
         "Div",
         "Exp",
         "Identity",
@@ -1910,6 +1913,7 @@ def create_dynamic_matmul_integer_bias_model(
         "dynamic_mul",
         "dynamic_mul_with_transpose",
         "local_identity",
+        "metadata_mul",
         "self_mul",
         "spoofed_gelu",
     }
@@ -2065,6 +2069,28 @@ def create_dynamic_matmul_integer_bias_model(
                 nodes.append(helper.make_node("Transpose", [post_bias_input], ["Y_dummy"], perm=[0, 1]))
                 extra_outputs.append(helper.make_tensor_value_info("Y_dummy", TensorProto.FLOAT, [1, 10]))
             post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "constant_mul":
+            nodes.extend(
+                [
+                    helper.make_node(
+                        "Constant",
+                        [],
+                        ["post_bias_factor"],
+                        value=onnx.numpy_helper.from_array(weight_scale),
+                    ),
+                    helper.make_node("Mul", [post_bias_input, "post_bias_factor"], ["Y_post_bias"]),
+                ]
+            )
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "metadata_mul":
+            nodes.extend(
+                [
+                    helper.make_node("Size", [post_bias_input], ["post_bias_size"]),
+                    helper.make_node("Cast", ["post_bias_size"], ["post_bias_factor"], to=TensorProto.FLOAT),
+                    helper.make_node("Mul", [post_bias_input, "post_bias_factor"], ["Y_post_bias"]),
+                ]
+            )
+            post_bias_input = "Y_post_bias"
         elif post_bias_operator == "self_mul":
             nodes.append(helper.make_node("Mul", [post_bias_input, post_bias_input], ["Y_post_bias"]))
             post_bias_input = "Y_post_bias"
@@ -2096,7 +2122,7 @@ def create_dynamic_matmul_integer_bias_model(
                 ]
             )
             post_bias_input = "Y_post_bias"
-        if terminal_post_bias_dynamic:
+        if terminal_post_bias_factor:
             nodes.append(helper.make_node("Identity", [post_bias_input], ["Y"]))
         else:
             nodes.append(helper.make_node("Mul", [post_bias_input, "W_scale_1"], ["Y"]))
@@ -2146,7 +2172,7 @@ def create_dynamic_matmul_integer_bias_model(
             onnx.numpy_helper.from_array(initial_scale, name=initial_scale_name),
             *(
                 [onnx.numpy_helper.from_array(weight_scale, name="W_scale_1")]
-                if post_bias_scale and not terminal_post_bias_dynamic
+                if post_bias_scale and not terminal_post_bias_factor
                 else []
             ),
             onnx.numpy_helper.from_array(np.zeros(10, dtype=np.float32), name="bias"),
@@ -9230,13 +9256,18 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 0
         assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
 
-    def test_dynamic_matmul_integer_terminal_graph_input_gate_fails_closed(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("post_bias_operator", ["constant_mul", "dynamic_mul"])
+    def test_dynamic_matmul_integer_terminal_unresolved_factor_fails_closed(
+        self,
+        tmp_path: Path,
+        post_bias_operator: str,
+    ) -> None:
         model_path = create_dynamic_matmul_integer_bias_model(
             tmp_path,
-            malicious=False,
+            malicious=post_bias_operator == "constant_mul",
             post_bias_scale=True,
-            post_bias_operator="dynamic_mul",
-            terminal_post_bias_dynamic=True,
+            post_bias_operator=post_bias_operator,
+            terminal_post_bias_factor=True,
         )
 
         result = OnnxScanner().scan(str(model_path))
@@ -9245,6 +9276,23 @@ class TestWeightDistributionSemantics:
         assert result.success is False
         assert semantics["analyzed_initializer_count"] == 0
         assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+
+    def test_dynamic_matmul_integer_terminal_size_factor_is_complete(self, tmp_path: Path) -> None:
+        model_path = create_dynamic_matmul_integer_bias_model(
+            tmp_path,
+            malicious=False,
+            post_bias_scale=True,
+            post_bias_operator="metadata_mul",
+            terminal_post_bias_factor=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is True
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {}
 
     @pytest.mark.parametrize("post_bias_operator", ["Abs", "Relu"])
     @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])

@@ -2111,55 +2111,59 @@ def _build_onnx_weight_analysis_plan(
                         pending.extend(str(output) for output in downstream.output if output)
                 return False
 
-            metadata_expression_cache: dict[str, bool] = {}
+            metadata_expression_cache: dict[str, tuple[bool, bool]] = {}
             metadata_expression_visits = 0
 
-            def is_bounded_metadata_expression(
+            def bounded_metadata_expression_summary(
                 value_name: str,
                 *,
                 depth: int = 0,
                 visiting: frozenset[str] = frozenset(),
-            ) -> bool:
+            ) -> tuple[bool, bool]:
                 nonlocal metadata_expression_visits
                 if not value_name or value_name in visiting or depth > _ONNX_METADATA_EXPRESSION_DEPTH_LIMIT:
-                    return False
+                    return False, False
                 if value_name in metadata_expression_cache:
                     return metadata_expression_cache[value_name]
                 if value_name in constants:
-                    metadata_expression_cache[value_name] = True
-                    return True
+                    metadata_expression_cache[value_name] = (True, False)
+                    return True, False
                 producer = producers_by_value.get(value_name)
                 if (
                     producer is None
                     or getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
                     or _operator_identifier(producer) in functions
                 ):
-                    metadata_expression_cache[value_name] = False
-                    return False
+                    metadata_expression_cache[value_name] = (False, False)
+                    return False, False
                 if check_interrupted_callback is not None:
                     check_interrupted_callback()
                 metadata_expression_visits += 1
                 if metadata_expression_visits > _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT:
-                    metadata_expression_cache[value_name] = False
-                    return False
+                    metadata_expression_cache[value_name] = (False, False)
+                    return False, False
                 if producer.op_type in _METADATA_ONLY_LINEAGE_OPERATORS:
-                    metadata_expression_cache[value_name] = True
-                    return True
+                    metadata_expression_cache[value_name] = (True, True)
+                    return True, True
                 if producer.op_type == "Constant":
-                    metadata_expression_cache[value_name] = True
-                    return True
+                    metadata_expression_cache[value_name] = (True, False)
+                    return True, False
                 if producer.op_type not in {"Cast", "Div", "Slice", "Sqrt"}:
-                    metadata_expression_cache[value_name] = False
-                    return False
+                    metadata_expression_cache[value_name] = (False, False)
+                    return False, False
                 next_visiting = frozenset((*visiting, value_name))
-                result = bool(producer.input) and all(
-                    is_bounded_metadata_expression(
+                source_summaries = [
+                    bounded_metadata_expression_summary(
                         str(source),
                         depth=depth + 1,
                         visiting=next_visiting,
                     )
                     for source in producer.input
                     if source
+                ]
+                result = (
+                    bool(source_summaries) and all(valid for valid, _ in source_summaries),
+                    any(has_metadata_root for _, has_metadata_root in source_summaries),
                 )
                 metadata_expression_cache[value_name] = result
                 return result
@@ -2301,7 +2305,7 @@ def _build_onnx_weight_analysis_plan(
                         if (
                             passed_complete_dynamic_bias
                             and graph_outputs_are_authoritative
-                            and is_bounded_metadata_expression(source_name)
+                            and bounded_metadata_expression_summary(source_name) == (True, True)
                         ):
                             later_scale = downstream_has_static_scale(next_values)
                             if later_scale is False:
