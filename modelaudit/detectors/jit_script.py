@@ -8912,18 +8912,32 @@ def _line_calls_fail_closed_runpy_member(
 
 def _line_starts_continued_priority_getattr(
     code_line: bytes,
-    canonical_builtin_helper_aliases: dict[str, str] | None = None,
+    canonical_builtin_helper_aliases: Mapping[str, str] | None = None,
     shadowed_builtin_helper_names: set[str] | None = None,
 ) -> bool:
     if re.fullmatch(rb"\s*(?:builtins\s*\.\s*)?getattr\s*(?:\\\s*|\(\s*)", code_line) is not None:
         return True
+    identifiers = _python_identifier_names(code_line)
+    reference_match = re.fullmatch(rb"\s*(?P<reference>\S+?)\s*(?:\\\s*|\(\s*)", code_line)
+    if reference_match is not None:
+        try:
+            reference = reference_match.group("reference").decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            if reference.isidentifier():
+                identifiers.add(reference)
     blocked_helpers = shadowed_builtin_helper_names or set()
+    helper_aliases = _canonical_builtin_helper_aliases_in(
+        identifiers,
+        canonical_builtin_helper_aliases or {},
+        {"getattr"},
+        excluded_aliases=blocked_helpers,
+    )
     return any(
         "." not in reference
-        and helper_name == "getattr"
-        and reference not in blocked_helpers
         and re.fullmatch(rb"\s*" + re.escape(reference.encode("utf-8")) + rb"\s*(?:\\\s*|\(\s*)", code_line) is not None
-        for reference, helper_name in (canonical_builtin_helper_aliases or {}).items()
+        for reference in helper_aliases
     )
 
 

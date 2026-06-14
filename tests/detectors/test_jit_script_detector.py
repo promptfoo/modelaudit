@@ -15,7 +15,7 @@ _PRIORITY_USAGE_STRESS_LINES = 10
 
 
 class _CountingAliasMapping(Mapping[str, str]):
-    def __init__(self, aliases: dict[str, str]) -> None:
+    def __init__(self, aliases: Mapping[str, str]) -> None:
         self._aliases = aliases
         self.lookups = 0
         self.iterations = 0
@@ -6343,6 +6343,110 @@ class TestJITScriptDetector:
         assert matched == identifiers
         assert aliases.lookups == identifier_count
         assert aliases.iterations == 0
+
+    @pytest.mark.parametrize("alias_count", [25, 50, 100])
+    def test_multiline_builtins_alias_continuation_lookup_is_linear(
+        self, alias_count: int, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        original_line_check = jit_script_module._line_starts_continued_priority_getattr
+        calls = 0
+        lookups = 0
+        iterations = 0
+        alias_map_sizes: list[int] = []
+
+        def counted_line_check(
+            code_line: bytes,
+            canonical_builtin_helper_aliases: Mapping[str, str] | None = None,
+            shadowed_builtin_helper_names: set[str] | None = None,
+        ) -> bool:
+            nonlocal calls, lookups, iterations
+            calls += 1
+            alias_map_sizes.append(len(canonical_builtin_helper_aliases or {}))
+            counted_aliases = _CountingAliasMapping(canonical_builtin_helper_aliases or {})
+            result = original_line_check(code_line, counted_aliases, shadowed_builtin_helper_names)
+            lookups += counted_aliases.lookups
+            iterations += counted_aliases.iterations
+            return result
+
+        monkeypatch.setattr(
+            jit_script_module,
+            "_line_starts_continued_priority_getattr",
+            counted_line_check,
+        )
+        candidate = b"".join(f"bi_{index} = (\n    builtins\n)\n".encode() for index in range(alias_count))
+
+        usage_lines, proved_rule_codes = jit_script_module._priority_alias_usage_lines(
+            candidate,
+            frozenset({b"rp"}),
+            0,
+        )
+
+        assert usage_lines == []
+        assert proved_rule_codes == frozenset()
+        assert calls == 3 * alias_count
+        assert lookups == 2 * alias_count
+        assert iterations == 0
+        assert alias_map_sizes[-1] == 4 * alias_count + 8
+
+    @pytest.mark.parametrize(
+        ("helper_transition", "endpoint", "expect_dynamic_finding"),
+        [
+            pytest.param(
+                b"",
+                b"read_member(\n    rp,\n    'run_path'\n)('payload.py')\n",
+                True,
+                id="malicious",
+            ),
+            pytest.param(
+                b"read_member = len\n",
+                b"read_member(\n    []\n)\n",
+                False,
+                id="safe-rebound",
+            ),
+        ],
+    )
+    def test_scan_model_preserves_multiline_getattr_alias_state_after_alias_noise(
+        self, helper_transition: bytes, endpoint: bytes, expect_dynamic_finding: bool
+    ) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        aliases = b"".join(f"bi_{index} = (\n    builtins\n)\n".encode() for index in range(16))
+        source = (
+            b"\x00\xffimport runpy as rp\nimport builtins\nread_member = builtins.getattr\n"
+            + aliases
+            + padding
+            + helper_transition
+            + endpoint
+            + padding
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+        has_dynamic_finding = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+        assert has_dynamic_finding is expect_dynamic_finding
+        if not expect_dynamic_finding:
+            assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_detects_multiline_unicode_getattr_alias_after_alias_noise(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        aliases = b"".join(f"bi_{index} = (\n    builtins\n)\n".encode() for index in range(16))
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + "from builtins import getattr as réad\n".encode()
+            + aliases
+            + padding
+            + "réad(\n    rp,\n    'run_path'\n)('payload.py')\n".encode()
+            + padding
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
 
     def test_scan_model_detects_tail_runpy_call_after_builtins_alias_helper_noise(self) -> None:
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
