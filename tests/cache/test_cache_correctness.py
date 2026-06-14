@@ -45,7 +45,6 @@ from modelaudit.cache.scan_results_cache import (
     _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
     AncestorIdentity,
     ScanResultsCache,
-    _current_module_source_path,
     _path_importer_resolution_context,
     _source_resolution_context,
 )
@@ -2014,8 +2013,7 @@ def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
         assert root_finder.find_spec(parent_module) is not None
         monkeypatch.setitem(sys.path_importer_cache, str(tmp_path), root_finder)
 
-    source = _current_module_source_path(module)
-    assert source is not None
+    source = str(source_path.absolute())
     fingerprint_metadata = _call_graph_fingerprint_metadata(
         {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
         module_sources={module: source},
@@ -2052,9 +2050,17 @@ def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
             _relaxed_path_cache=set(),
         )
     monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+    calls: list[str] = []
+
+    def current_source(module_name: str) -> str | None:
+        calls.append(module_name)
+        return source if source_matches else None
+
+    monkeypatch.setattr("modelaudit.cache.scan_results_cache._current_module_source_path", current_source)
 
     cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
     assert (cached_result is not None) is source_matches
+    assert calls == [module]
 
 
 def test_resolution_context_rejects_mutated_zipimporter_state(
