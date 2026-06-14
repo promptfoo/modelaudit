@@ -1361,6 +1361,7 @@ def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX symlink parent-traversal semantics")
 def test_scan_cache_invalidates_symlink_sensitive_parent_search_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

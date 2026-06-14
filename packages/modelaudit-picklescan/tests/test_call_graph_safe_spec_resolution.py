@@ -1684,6 +1684,7 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
         call_graph._cached_file_finder_resolution_summary.cache_clear()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX symlink parent-traversal semantics")
 def test_importer_context_preserves_symlink_sensitive_parent_components(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
