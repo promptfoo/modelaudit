@@ -5933,7 +5933,22 @@ def _iter_encoded_route_tokens(
     alphabetic_whitespace_is_prose: bool,
 ) -> Iterator[bytes]:
     block = bytearray()
-    block_lines = 0
+    trusted_start: int | None = None
+    alphabetic_starts: dict[int, int] = {}
+
+    def flush_block() -> Iterator[bytes]:
+        if trusted_start is not None:
+            yield bytes(block[trusted_start:])
+        if alphabetic_whitespace_is_prose:
+            # One earliest line start per base64 alignment covers every later
+            # start with bounded linear work instead of testing every suffix.
+            for start in alphabetic_starts.values():
+                token = bytes(block[start:])
+                if _alphabetic_base64_has_pickle_signal(token):
+                    yield token
+
+        block.clear()
+        alphabetic_starts.clear()
 
     for raw_line in payload.splitlines():
         line = raw_line.strip(b" \t")
@@ -5946,20 +5961,21 @@ def _iter_encoded_route_tokens(
                 and b"=" not in encoded_line
                 and encoded_line.isalpha()
             )
-            if encoded_line != line and (
-                not normalized_alphabetic_prose or _alphabetic_base64_has_pickle_signal(encoded_line)
-            ):
+            if encoded_line != line and not normalized_alphabetic_prose:
                 yield encoded_line
-            if encoded_line == line or not normalized_alphabetic_prose or block_lines:
-                block.extend(encoded_line)
-                block_lines += 1
+
+            line_start = len(block)
+            if normalized_alphabetic_prose:
+                alphabetic_starts.setdefault(line_start % 4, line_start)
+            elif trusted_start is None:
+                trusted_start = line_start
+            block.extend(encoded_line)
+            if b"=" not in encoded_line:
                 continue
-        if block_lines > 1:
-            yield bytes(block)
-        block.clear()
-        block_lines = 0
-    if block_lines > 1:
-        yield bytes(block)
+
+        yield from flush_block()
+        trusted_start = None
+    yield from flush_block()
 
     for match in token_re.finditer(payload):
         yield match.group(0)

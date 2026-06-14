@@ -11376,6 +11376,11 @@ class TestZipScanner:
             pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), 1, id="base64-sole-NEXT_BUFFER"),
             pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),
             pytest.param(b"MIT License\nWF Bp ZA ou\n", 2, id="base64-spaced-alpha-prefixed-PERSID"),
+            pytest.param(
+                b"MIT License\nWF Bp\nZA ou\n",
+                2,
+                id="base64-split-spaced-alpha-prefixed-PERSID",
+            ),
             pytest.param(b"MIT License\nggE =\n", 1, id="base64-whitespace-padded-EXT1"),
             pytest.param(b"MIT License\nlw ==\n", 1, id="base64-whitespace-padded-NEXT_BUFFER"),
             pytest.param(b"MIT License\ngwEA\n", 1, id="base64-unpadded-alphabetic-EXT2"),
@@ -11447,6 +11452,10 @@ class TestZipScanner:
             pytest.param(
                 b"Permission is granted to users.\nPermission remains granted.\n",
                 id="two-P-leading-prose-lines",
+            ),
+            pytest.param(
+                b"MIT License\nPermission is\ngranted to\nall users\n",
+                id="multiline-spaced-alphabetic-prose",
             ),
             pytest.param(
                 b"MIT License\nPURPOSE\nARE DISCLAIMED. IN NO EVENT SHALL THE AUTHORS BE LIABLE.\n",
