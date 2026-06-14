@@ -1310,8 +1310,8 @@ def _streamed_onnx_external_data_hash_paths(
     path: Path,
     *,
     deadline: float | None = None,
-) -> list[Path] | None:
-    """Return safe ONNX sidecars, or ``None`` when discovery cannot complete."""
+) -> list[tuple[Path, _FileIdentitySnapshot]] | None:
+    """Return validated ONNX sidecar instances, or ``None`` when discovery cannot complete."""
     if not _is_streamed_onnx_external_data_hash_candidate(path):
         return []
 
@@ -1358,7 +1358,7 @@ def _streamed_onnx_external_data_hash_paths(
     except OSError:
         return None
 
-    external_paths: list[Path] = []
+    external_paths: list[tuple[Path, _FileIdentitySnapshot]] = []
     seen_external_paths: set[Path] = set()
     for tensors in _iter_model_external_data_tensor_groups(model, check_discovery_interrupted):
         for tensor in tensors:
@@ -1391,7 +1391,6 @@ def _streamed_onnx_external_data_hash_paths(
                 external_path = _resolve_external_location(model_dir, location)
             except (OSError, RuntimeError):
                 return None
-            external_hash_path = lexical_external_path
             if not is_within_directory(
                 str(resolved_model_dir), str(external_path)
             ) and not _is_trusted_huggingface_cache_external_alias(
@@ -1400,12 +1399,18 @@ def _streamed_onnx_external_data_hash_paths(
                 external_path,
             ):
                 return None
-            if not external_hash_path.is_file():
+            external_identity = _snapshot_file_identity(lexical_external_path)
+            if (
+                external_identity is None
+                or external_identity.stat is None
+                or not stat.S_ISREG(external_identity.stat[2])
+                or external_identity.resolved_path != str(external_path)
+            ):
                 return None
             if lexical_external_path in seen_external_paths:
                 continue
             seen_external_paths.add(lexical_external_path)
-            external_paths.append(external_hash_path)
+            external_paths.append((lexical_external_path, external_identity))
 
     return external_paths
 
@@ -4742,8 +4747,7 @@ def scan_model_directory_or_file(
                         if discovered_external_data_paths is None:
                             aggregate_hash_complete = False
                             onnx_package_hash_complete_by_path[representative_file] = False
-                        for external_data_path in discovered_external_data_paths or ():
-                            external_data_identity = _snapshot_file_identity(external_data_path)
+                        for external_data_path, external_data_identity in discovered_external_data_paths or ():
                             external_data_target_key = _file_target_identity_key(
                                 external_data_path,
                                 external_data_identity,
@@ -4752,28 +4756,19 @@ def scan_model_directory_or_file(
                                 external_data_target_key is not None
                                 and external_data_target_key in scan_entry_target_keys
                             ):
-                                if external_data_identity is None:
-                                    onnx_package_hash_complete_by_path[representative_file] = False
-                                else:
-                                    representative_external_identities.append(
-                                        (external_data_path, external_data_identity)
+                                representative_external_identities.append((external_data_path, external_data_identity))
+                                representative_external_sources.append(
+                                    str(
+                                        Path(external_data_identity.resolved_path)
+                                        if external_data_identity.resolved_path is not None
+                                        else external_data_path
                                     )
-                                    representative_external_sources.append(
-                                        str(
-                                            Path(external_data_identity.resolved_path)
-                                            if external_data_identity.resolved_path is not None
-                                            else external_data_path
-                                        )
-                                    )
-                                    representative_external_roles.append(
-                                        _onnx_external_data_role(Path(representative_file), external_data_path)
-                                    )
+                                )
+                                representative_external_roles.append(
+                                    _onnx_external_data_role(Path(representative_file), external_data_path)
+                                )
                                 continue
                             if _should_defer_hash_for_max_file_size(str(external_data_path), config):
-                                aggregate_hash_complete = False
-                                onnx_package_hash_complete_by_path[representative_file] = False
-                                continue
-                            if external_data_identity is None:
                                 aggregate_hash_complete = False
                                 onnx_package_hash_complete_by_path[representative_file] = False
                                 continue
@@ -7551,6 +7546,7 @@ def scan_model_streaming(
         scan_config: dict[str, Any],
         *,
         progress_label: str,
+        expected_identity: _FileIdentitySnapshot | None = None,
         track_stream_source: bool = False,
         skip_if_stream_source_seen: bool = False,
         skip_if_stream_target_seen: bool = False,
@@ -7559,7 +7555,12 @@ def scan_model_streaming(
         nonlocal aggregate_hash_complete, top_level_hashed_bytes
 
         scan_path_key = Path(os.path.abspath(scan_path))
-        scan_path_identity = _snapshot_file_identity(scan_path)
+        current_identity = _snapshot_file_identity(scan_path)
+        if expected_identity is not None and current_identity != expected_identity:
+            unstable_stream_hash_paths.add(scan_path_key)
+            aggregate_hash_complete = False
+            return None
+        scan_path_identity = expected_identity or current_identity
         prior_stream_source = hashed_stream_source_hashes_by_path.get(scan_path_key)
         prior_stream_source_hash: str | None = None
         if skip_if_stream_source_seen and prior_stream_source is not None:
@@ -8079,9 +8080,8 @@ def scan_model_streaming(
                     if discovered_external_data_paths is None:
                         aggregate_hash_complete = False
                         onnx_package_hash_complete = False
-                    for onnx_external_data_path in discovered_external_data_paths or ():
+                    for onnx_external_data_path, external_data_identity in discovered_external_data_paths or ():
                         external_data_key = Path(os.path.abspath(onnx_external_data_path))
-                        external_data_identity = _snapshot_file_identity(onnx_external_data_path)
                         external_data_target_key = _file_target_identity_key(
                             onnx_external_data_path,
                             external_data_identity,
@@ -8091,32 +8091,27 @@ def scan_model_streaming(
                             and external_data_target_key in hashed_stream_source_hashes_by_target
                         )
                         external_data_already_hashed = (
-                            external_data_identity is not None
-                            and (external_data_key, external_data_identity) in hashed_stream_file_instances
-                        ) or (
+                            external_data_key,
+                            external_data_identity,
+                        ) in hashed_stream_file_instances or (
                             external_data_target_key is not None
                             and external_data_target_key in hashed_stream_file_hashes_by_target
                         )
-                        if external_data_identity is not None:
-                            onnx_external_data_pre_scan_identities[onnx_external_data_path] = external_data_identity
-                            external_data_instance = (external_data_key, external_data_identity)
-                            if (
-                                not external_data_was_stream_source
-                                and external_data_instance not in counted_onnx_external_data_instances
-                                and (
-                                    external_data_target_key is None
-                                    or external_data_target_key not in counted_onnx_external_data_targets
-                                )
-                            ):
-                                onnx_external_data_bytes_scanned += _snapshot_file_size(external_data_identity)
-                                counted_onnx_external_data_instances.add(external_data_instance)
-                                if external_data_target_key is not None:
-                                    counted_onnx_external_data_targets.add(external_data_target_key)
+                        onnx_external_data_pre_scan_identities[onnx_external_data_path] = external_data_identity
+                        external_data_instance = (external_data_key, external_data_identity)
+                        if (
+                            not external_data_was_stream_source
+                            and external_data_instance not in counted_onnx_external_data_instances
+                            and (
+                                external_data_target_key is None
+                                or external_data_target_key not in counted_onnx_external_data_targets
+                            )
+                        ):
+                            onnx_external_data_bytes_scanned += _snapshot_file_size(external_data_identity)
+                            counted_onnx_external_data_instances.add(external_data_instance)
+                            if external_data_target_key is not None:
+                                counted_onnx_external_data_targets.add(external_data_target_key)
                         if not external_data_was_stream_source and not external_data_already_hashed:
-                            if external_data_identity is None:
-                                aggregate_hash_complete = False
-                                onnx_package_hash_complete = False
-                                continue
                             external_data_size = _snapshot_file_size(external_data_identity)
                             if max_total_size > 0 and top_level_hashed_bytes + external_data_size > max_total_size:
                                 aggregate_hash_complete = False
@@ -8128,6 +8123,7 @@ def scan_model_streaming(
                                 onnx_external_data_path,
                                 scan_config,
                                 progress_label=onnx_external_data_path.name,
+                                expected_identity=external_data_identity,
                                 skip_if_stream_source_seen=True,
                                 skip_if_stream_target_seen=True,
                             )

@@ -1929,6 +1929,7 @@ def create_dynamic_matmul_integer_bias_model(
         "self_mul",
         "spoofed_gelu",
         "unrelated_metadata_mul",
+        "unrelated_size_mul",
     }
     weights = np.ones((100, 10), dtype=np.int8)
     weight_scale = np.ones(10, dtype=np.float32)
@@ -2140,6 +2141,16 @@ def create_dynamic_matmul_integer_bias_model(
                 ]
             )
             extra_value_info.append(helper.make_tensor_value_info("post_bias_factor", TensorProto.FLOAT, [10]))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "unrelated_size_mul":
+            inputs.append(helper.make_tensor_value_info("unrelated_metadata", TensorProto.FLOAT, [1, 10]))
+            nodes.extend(
+                [
+                    helper.make_node("Size", ["unrelated_metadata"], ["post_bias_size"]),
+                    helper.make_node("Cast", ["post_bias_size"], ["post_bias_factor"], to=TensorProto.FLOAT),
+                    helper.make_node("Mul", [post_bias_input, "post_bias_factor"], ["Y_post_bias"]),
+                ]
+            )
             post_bias_input = "Y_post_bias"
         elif post_bias_operator == "self_mul":
             nodes.append(helper.make_node("Mul", [post_bias_input, post_bias_input], ["Y_post_bias"]))
@@ -9288,7 +9299,14 @@ class TestWeightDistributionSemantics:
 
     @pytest.mark.parametrize(
         "post_bias_operator",
-        ["constant_mul", "constant_size_mul", "initializer_mul", "dynamic_mul", "unrelated_metadata_mul"],
+        [
+            "constant_mul",
+            "constant_size_mul",
+            "initializer_mul",
+            "dynamic_mul",
+            "unrelated_metadata_mul",
+            "unrelated_size_mul",
+        ],
     )
     def test_dynamic_matmul_integer_terminal_unresolved_factor_fails_closed(
         self,
@@ -11604,6 +11622,64 @@ class TestWeightDistributionSemantics:
         assert checks[0].status == CheckStatus.FAILED
         assert checks[0].details["scan_outcome_reason"] == "onnx_external_data_changed_during_scan"
 
+    @pytest.mark.parametrize("retarget_after_validation", [False, True], ids=["stable", "retargeted"])
+    def test_streaming_binds_sidecar_hash_to_validated_target(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+        retarget_after_validation: bool,
+    ) -> None:
+        reset_cache_manager()
+        model_path = create_external_onnx_weight_package(
+            tmp_path / "validated-target",
+            np.zeros((100, 10), dtype=np.float32),
+        )
+        sidecar = model_path.parent / "weights.bin"
+        original_sidecar = model_path.parent / "original.bin"
+        replacement_sidecar = model_path.parent / "replacement.bin"
+        original_sidecar.write_bytes(sidecar.read_bytes())
+        replacement_sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
+        sidecar.unlink()
+        sidecar.symlink_to(original_sidecar.name)
+        original_discovery = modelaudit_core._streamed_onnx_external_data_hash_paths
+        retargeted = False
+
+        def retarget_after_discovery(*args: Any, **kwargs: Any) -> Any:
+            nonlocal retargeted
+            discovered = original_discovery(*args, **kwargs)
+            if retarget_after_validation and not retargeted:
+                sidecar.unlink()
+                sidecar.symlink_to(replacement_sidecar.name)
+                retargeted = True
+            return discovered
+
+        monkeypatch.setattr(
+            modelaudit_core,
+            "_streamed_onnx_external_data_hash_paths",
+            retarget_after_discovery,
+        )
+        result = scan_model_streaming(
+            iter([(model_path, True)]),
+            delete_after_scan=False,
+            scanners=["onnx"],
+            cache_enabled=False,
+            cache_dir=str(tmp_path / "cache"),
+        )
+        reset_cache_manager()
+
+        assert retargeted is retarget_after_validation
+        metadata = result.file_metadata[str(model_path)]
+        checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+        if retarget_after_validation:
+            assert determine_exit_code(result) == 2
+            assert getattr(metadata, "onnx_package_hash_complete", None) is False
+            assert len(checks) == 1
+            assert checks[0].status == CheckStatus.FAILED
+        else:
+            assert getattr(metadata, "onnx_package_hash_complete", None) is True
+            assert checks == []
+
     @pytest.mark.parametrize("retarget_during_hash", [False, True], ids=["stable", "retargeted"])
     def test_streaming_rechecks_sidecar_identity_immediately_after_hash(
         self,
@@ -11810,7 +11886,9 @@ class TestWeightDistributionSemantics:
             sidecar.unlink()
             sidecar.symlink_to(target.name)
 
-        assert modelaudit_core._streamed_onnx_external_data_hash_paths(path) == [sidecar]
+        discovered_sidecars = modelaudit_core._streamed_onnx_external_data_hash_paths(path)
+        assert discovered_sidecars is not None
+        assert [sidecar_path for sidecar_path, _ in discovered_sidecars] == [sidecar]
         aggregate = (
             scan_model_streaming(
                 iter([(path, True)]),

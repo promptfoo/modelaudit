@@ -2148,7 +2148,7 @@ def _build_onnx_weight_analysis_plan(
                     return False, False
                 if producer.op_type in _METADATA_ONLY_LINEAGE_OPERATORS:
                     metadata_inputs = [str(source) for source in producer.input if source]
-                    root_is_scalar = allow_unrelated_root or producer.op_type == "Size"
+                    root_is_scalar = allow_unrelated_root and producer.op_type != "Size"
                     valid_root = metadata_inputs == [traced_value_name] or (
                         root_is_scalar
                         and bool(metadata_inputs)
