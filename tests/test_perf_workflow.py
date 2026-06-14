@@ -550,8 +550,7 @@ def test_python_ci_runs_slow_suite_in_a_separate_job() -> None:
     assert slow_job["if"] == (
         "github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || "
         "(github.event_name == 'pull_request' && "
-        "(needs.changes.outputs.workflows == 'true' || "
-        "contains(github.event.pull_request.labels.*.name, 'run-slow-tests')))"
+        "contains(github.event.pull_request.labels.*.name, 'run-slow-tests'))"
     )
     slow_steps = slow_job["steps"]
     assert isinstance(slow_steps, list)
@@ -613,4 +612,8 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     assert '[[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true' in gate_script
     assert '[[ "$TEST_RESULT" != "success" ]] && FAILED=true' in gate_script
     assert '[[ "$WINDOWS_RESULT" != "success" ]] && FAILED=true' in gate_script
+    assert (
+        'if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$RUN_SLOW_LABEL" == "true" ]]; then'
+        in gate_script
+    )
     assert '[[ "$SLOW_RESULT" != "success" ]] && FAILED=true' in gate_script

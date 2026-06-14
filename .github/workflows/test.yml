@@ -532,7 +532,7 @@ jobs:
   slow-tests:
     name: Slow/Integration Tests (Python 3.12)
     needs: changes
-    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && (needs.changes.outputs.workflows == 'true' || contains(github.event.pull_request.labels.*.name, 'run-slow-tests')))
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -1203,7 +1203,7 @@ jobs:
             [[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true
           fi
 
-          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || ( "$ON_PULL_REQUEST" == "true" && ( "$WORKFLOWS_CHANGED" == "true" || "$RUN_SLOW_LABEL" == "true" ) ) ]]; then
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$RUN_SLOW_LABEL" == "true" ]]; then
             [[ "$SLOW_RESULT" != "success" ]] && FAILED=true
           fi
 
