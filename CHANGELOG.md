@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - stream large TAR and compressed-TAR model archives through TAR-specific inspection instead of generic whole-file read rejection, bound shared nested NeMo work after aggregate-budget exhaustion, and preserve trusted HDF5 findings when overlapping TAR routing is inconclusive
+- keep JIT alias replay linear, including multiline builtin-helper continuations, as alias state grows while preserving bounded analysis for attacker-controlled model content
 - inspect oversized ONNX protobuf structure from descriptor-bound, memory- and result-bounded file-backed reads; preserve external-data security checks while explicitly reporting deferred schema, raw-detector, weight-analysis, and content-hash coverage
 - treat dotted package versions in README and model-card pip install commands as informational without downgrading active URLs
 - bound embedded Python assignment-line probes, deduplicate exact extraction windows, and fast-path proven passive priority references without weakening incomplete-analysis reporting

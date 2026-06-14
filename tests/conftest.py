@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import importlib.util
 import logging
@@ -42,6 +43,48 @@ _FRAMEWORK_AVAILABILITY: dict[str, bool] = {}
 # subset. Keep this centralized so adding a supported Python version requires one
 # deliberate update instead of duplicating version checks in hook logic.
 RESTRICTED_PYTHON_VERSIONS = frozenset({(3, 10), (3, 12), (3, 13)})
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register deterministic CI sharding options."""
+    group = parser.getgroup("modelaudit sharding")
+    group.addoption(
+        "--modelaudit-shard-count",
+        dest="modelaudit_shard_count",
+        type=int,
+        default=None,
+        help="Split collected tests into this many deterministic shards.",
+    )
+    group.addoption(
+        "--modelaudit-shard-index",
+        dest="modelaudit_shard_index",
+        type=int,
+        default=None,
+        help="Run this zero-based deterministic shard.",
+    )
+
+
+def _nodeid_shard(nodeid: str, shard_count: int) -> int:
+    """Map a pytest node ID to one stable shard."""
+    if shard_count <= 0:
+        raise ValueError("shard_count must be positive")
+    digest = hashlib.sha256(nodeid.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % shard_count
+
+
+def _configured_shard(config: pytest.Config) -> tuple[int, int] | None:
+    """Return the validated ``(index, count)`` requested by CI."""
+    shard_count = config.getoption("modelaudit_shard_count")
+    shard_index = config.getoption("modelaudit_shard_index")
+    if shard_count is None and shard_index is None:
+        return None
+    if shard_count is None or shard_index is None:
+        raise pytest.UsageError("--modelaudit-shard-count and --modelaudit-shard-index must be used together")
+    if shard_count <= 0:
+        raise pytest.UsageError("--modelaudit-shard-count must be positive")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise pytest.UsageError(f"--modelaudit-shard-index must be between 0 and {shard_count - 1}")
+    return shard_index, shard_count
 
 
 def _check_framework(name: str) -> bool:
@@ -559,6 +602,19 @@ def pytest_collection_modifyitems(config, items):
         # Mark integration tests by file name
         if "integration" in test_file:
             item.add_marker(pytest.mark.integration)
+
+    configured_shard = _configured_shard(config)
+    if configured_shard is None:
+        return
+
+    shard_index, shard_count = configured_shard
+    selected: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        destination = selected if _nodeid_shard(item.nodeid, shard_count) == shard_index else deselected
+        destination.append(item)
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
 
 
 @pytest.fixture
