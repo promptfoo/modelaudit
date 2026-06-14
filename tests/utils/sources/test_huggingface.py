@@ -1,6 +1,7 @@
 """Tests for HuggingFace URL handling."""
 
 import gzip
+import hashlib
 import importlib
 import json
 import os
@@ -16,7 +17,7 @@ import zipfile
 import zlib
 from collections.abc import Callable, Iterator
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import ANY, MagicMock, call, patch
@@ -43,6 +44,7 @@ from modelaudit.utils.file.hdf5 import HDF5_MAGIC, hdf5_metadata_checksum
 from modelaudit.utils.file.streaming import StreamedSourceByteAccounting
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
+    _HF_ACQUIRED_SAFETENSORS_INDEX_BASENAME,
     _HF_CONTENT_SNIFF_BYTES,
     _HF_CONTENT_SNIFF_MAX_FILES,
     _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES,
@@ -64,6 +66,7 @@ from modelaudit.utils.sources.huggingface import (
     _list_huggingface_repo_files_at_revision,
     _list_repo_files_with_timeout,
     _loads_json_without_duplicate_keys,
+    _private_huggingface_acquired_index_candidate,
     _range_response_validator,
     _read_huggingface_prefix,
     _read_huggingface_strict_range,
@@ -76,6 +79,7 @@ from modelaudit.utils.sources.huggingface import (
     _select_streamable_hf_files,
     _tensor_name_digest,
     _terminate_huggingface_download_process,
+    _validate_huggingface_repo_filename,
     download_file_from_hf,
     download_model,
     download_model_streaming,
@@ -8395,6 +8399,301 @@ class TestModelDownloadStreaming:
         assert sum(len(asset.tensors or []) for asset in aggregate.assets) == 2
         mock_cache_store.assert_not_called()
 
+    @pytest.mark.parametrize("with_index", [False, True], ids=["huge-header-name", "huge-index-name"])
+    def test_remote_safetensors_huge_tensor_names_are_source_native_and_result_bounded(
+        self,
+        with_index: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        huge_name = "benign_" + ("x" * 1_000_000)
+        shard_name = "model.safetensors"
+        frame, header_len = _make_safetensors_frame(
+            {huge_name: {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}},
+            b"\x00",
+        )
+        index_name = "model.safetensors.index.json"
+        index_payload = json.dumps(
+            {"weight_map": {huge_name: shard_name}},
+            separators=(",", ":"),
+        ).encode()
+        repo_files = [index_name, shard_name] if with_index else [shard_name]
+        payloads = {index_name: index_payload, shard_name: frame}
+        sizes = {filename: len(payloads[filename]) for filename in repo_files}
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: (repo_files, _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (sizes, _HF_TEST_REVISION),
+        )
+
+        def hub_url(*, repo_id: str, filename: str, revision: str) -> str:
+            return f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
+
+        class CompleteRangeResponse(_FakeRangeResponse):
+            def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+                for offset in range(0, len(self.payload), chunk_size):
+                    yield self.payload[offset : offset + chunk_size]
+
+        def range_response(url: str, *, headers: dict[str, str], **_kwargs: object) -> _FakeRangeResponse:
+            filename = index_name if url.endswith(index_name) else shard_name
+            payload = payloads[filename]
+            start_text, end_text = headers["Range"].removeprefix("bytes=").split("-", 1)
+            start, end = int(start_text), min(int(end_text), len(payload) - 1)
+            response = _strict_range_response(
+                payload[start : end + 1],
+                len(payload),
+                start_offset=start,
+                url=url,
+            )
+            return CompleteRangeResponse(
+                response.payload,
+                headers=response.headers,
+                status_code=response.status_code,
+                url=response.url,
+            )
+
+        with (
+            patch("huggingface_hub.hf_hub_url", side_effect=hub_url),
+            patch(
+                "huggingface_hub.utils.build_hf_headers",
+                side_effect=lambda *, token=None, headers=None: headers or {},
+            ),
+            patch("huggingface_hub.hf_hub_download") as mock_download,
+            patch("requests.get", side_effect=range_response) as mock_get,
+            patch("modelaudit.core.scan_file") as mock_scan_file,
+            patch("modelaudit.cache.scan_results_cache.ScanResultsCache.store_result") as mock_cache_store,
+        ):
+            streamed = list(
+                download_model_streaming(
+                    f"hf://test/model?revision={_HF_TEST_REVISION}",
+                    max_size=32 * 1024 * 1024,
+                    scannable_extensions={".safetensors"},
+                    scannable_filenames=set(),
+                    scannable_scanner_ids={"safetensors"},
+                    _include_scan_results=True,
+                )
+            )
+            aggregate = scan_model_streaming(
+                iter(streamed),
+                timeout=30,
+                delete_after_scan=False,
+                cache_enabled=True,
+                scanners=["safetensors"],
+                skip_file_types=False,
+            )
+
+        assert len(streamed) == 1
+        _path, is_last, scan_result, _accounting = _unpack_internal_stream_item(streamed[0])
+        assert is_last is True
+        assert sum(bool(item[1]) for item in streamed) == 1
+        assert scan_result.success is True, [
+            (check.name, check.status.value, check.message, check.details) for check in scan_result.checks
+        ]
+        assert scan_result.metadata["tensor_count"] == 1
+        assert scan_result.metadata["tensor_name_utf8_bytes"] == len(huge_name.encode())
+        assert scan_result.metadata["max_tensor_name_utf8_bytes"] == len(huge_name.encode())
+        assert scan_result.metadata["tensor_name_preview_truncated_count"] == 1
+        assert scan_result.metadata["tensor_names_digest"] == _tensor_name_digest([huge_name])
+        name_preview = scan_result.metadata["tensors"][0]
+        assert len(name_preview.encode()) <= 256
+        assert huge_name not in name_preview
+
+        expected_bytes = 16 + header_len + (len(index_payload) if with_index else 0)
+        assert aggregate.files_scanned == 1
+        assert aggregate.bytes_scanned == expected_bytes
+        assert aggregate.success is True
+        assert aggregate.has_errors is False
+        assert determine_exit_code(aggregate) == 0
+        assert aggregate.content_hash is None
+        serialized = aggregate.model_dump_json()
+        assert len(serialized.encode()) < _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES
+        assert huge_name not in serialized
+        assert mock_get.call_count == (3 if with_index else 2)
+        mock_download.assert_not_called()
+        mock_scan_file.assert_not_called()
+        mock_cache_store.assert_not_called()
+
+        if with_index:
+            shard_family = scan_result.metadata["remote_shard_family"]
+            assert shard_family["index_complete"] is True
+            assert shard_family["index_tensor_name_utf8_bytes"] == len(huge_name.encode())
+            assert shard_family["index_tensor_name_utf8_bytes_for_shard"] == len(huge_name.encode())
+            assert shard_family["index_tensor_name_preview_truncated_count"] == 1
+            assert shard_family["index_tensor_names_for_shard"] == [name_preview]
+            assert huge_name not in json.dumps(shard_family)
+
+    def test_tensor_name_digest_preserves_canonical_length_prefixed_utf8_semantics(self) -> None:
+        tensor_names = ["z", "界" * (64 * 1024 + 1), "a"]
+        expected = hashlib.sha256()
+        for name in sorted(tensor_names):
+            encoded_name = name.encode("utf-8")
+            expected.update(len(encoded_name).to_bytes(8, "little"))
+            expected.update(encoded_name)
+
+        assert _tensor_name_digest(tensor_names) == expected.hexdigest()
+
+    @pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
+    def test_remote_safetensors_near_max_tensor_name_is_memory_and_output_bounded(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        script = textwrap.dedent(
+            """
+            import json
+            import resource
+            import struct
+            import sys
+            from pathlib import Path
+            from unittest.mock import patch
+
+            from modelaudit.core import determine_exit_code, scan_model_streaming
+            from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES
+            from modelaudit.utils.sources.huggingface import _scan_remote_huggingface_safetensors_header
+
+            revision = "a" * 40
+            name = "x" * 16_000_000
+            header = json.dumps(
+                {name: {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}},
+                separators=(",", ":"),
+            ).encode()
+            frame = struct.pack("<Q", len(header)) + header + b"\\x00"
+
+            class Response:
+                def __init__(self, payload, start):
+                    self.payload = payload
+                    self.status_code = 206
+                    self.url = f"https://huggingface.co/test/model/resolve/{revision}/model.safetensors"
+                    self.headers = {
+                        "Content-Range": f"bytes {start}-{start + len(payload) - 1}/{len(frame)}",
+                        "Content-Length": str(len(payload)),
+                        "ETag": '"stable"',
+                    }
+                    self.raw = None
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+                def raise_for_status(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def iter_content(self, chunk_size):
+                    for offset in range(0, len(self.payload), chunk_size):
+                        yield self.payload[offset : offset + chunk_size]
+
+            def range_response(_url, *, headers, **_kwargs):
+                start_text, end_text = headers["Range"].removeprefix("bytes=").split("-", 1)
+                start = int(start_text)
+                end = min(int(end_text), len(frame) - 1)
+                return Response(frame[start : end + 1], start)
+
+            with (
+                patch(
+                    "huggingface_hub.hf_hub_url",
+                    return_value=f"https://huggingface.co/test/model/resolve/{revision}/model.safetensors",
+                ),
+                patch(
+                    "huggingface_hub.utils.build_hf_headers",
+                    side_effect=lambda *, token=None, headers=None: headers or {},
+                ),
+                patch("requests.get", side_effect=range_response) as mock_get,
+                patch("modelaudit.cache.scan_results_cache.ScanResultsCache.store_result") as mock_cache_store,
+                patch("modelaudit.core.scan_file") as mock_scan_file,
+            ):
+                before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                result = _scan_remote_huggingface_safetensors_header(
+                    "test/model",
+                    "model.safetensors",
+                    revision,
+                    declared_size=len(frame),
+                    deadline=None,
+                    active_scanner_ids={"safetensors"},
+                )
+                streamed = [(Path("model.safetensors"), True, result)]
+                aggregate = scan_model_streaming(
+                    iter(streamed),
+                    delete_after_scan=False,
+                    cache_enabled=True,
+                    scanners=["safetensors"],
+                    skip_file_types=False,
+                )
+                after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+            result_json = json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":"), default=str)
+            aggregate_json = aggregate.model_dump_json()
+            scale = 1 if sys.platform == "darwin" else 1024
+            print(
+                json.dumps(
+                    {
+                        "header_bytes": len(header),
+                        "header_limit": MAX_HEADER_BYTES,
+                        "range_requests": mock_get.call_count,
+                        "result_success": result.success,
+                        "aggregate_success": aggregate.success,
+                        "has_errors": aggregate.has_errors,
+                        "exit_code": determine_exit_code(aggregate),
+                        "content_hash": aggregate.content_hash,
+                        "cache_store_calls": mock_cache_store.call_count,
+                        "scan_file_calls": mock_scan_file.call_count,
+                        "bytes_match": aggregate.bytes_scanned == result.bytes_scanned,
+                        "source_path": result.metadata.get("source_path"),
+                        "tensor_name_utf8_bytes": result.metadata.get("tensor_name_utf8_bytes"),
+                        "tensor_names_digest_present": "tensor_names_digest" in result.metadata,
+                        "scan_outcome": result.metadata.get("scan_outcome"),
+                        "json_parse_failures": sum(
+                            check.name == "SafeTensors JSON Parse" and check.status.value == "failed"
+                            for check in result.checks
+                        ),
+                        "last_marker_count": sum(bool(item[1]) for item in streamed),
+                        "result_bytes": len(result_json.encode()),
+                        "aggregate_bytes": len(aggregate_json.encode()),
+                        "raw_name_retained": name in result_json or name in aggregate_json,
+                        "peak_delta_bytes": (after - before) * scale,
+                    }
+                )
+            )
+            """
+        )
+        env = {**os.environ, "PYTHONPATH": str(repo_root), "PROMPTFOO_DISABLE_TELEMETRY": "1"}
+
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            env=env,
+            text=True,
+            timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
+        metrics = json.loads(completed.stdout.strip().splitlines()[-1])
+
+        assert metrics["header_bytes"] == 16_000_052
+        assert metrics["header_bytes"] < metrics["header_limit"]
+        assert metrics["range_requests"] == 2
+        assert metrics["result_success"] is True
+        assert metrics["aggregate_success"] is True
+        assert metrics["has_errors"] is False
+        assert metrics["exit_code"] == 0
+        assert metrics["content_hash"] is None
+        assert metrics["cache_store_calls"] == 0
+        assert metrics["scan_file_calls"] == 0
+        assert metrics["bytes_match"] is True
+        assert metrics["source_path"].startswith("hf://test/model@")
+        assert metrics["tensor_name_utf8_bytes"] == 16_000_000
+        assert metrics["tensor_names_digest_present"] is True
+        assert metrics["scan_outcome"] is None
+        assert metrics["json_parse_failures"] == 0
+        assert metrics["last_marker_count"] == 1
+        assert metrics["result_bytes"] < 32 * 1024 * 1024
+        assert metrics["aggregate_bytes"] < 32 * 1024 * 1024
+        assert metrics["raw_name_retained"] is False
+        assert metrics["peak_delta_bytes"] < 64 * 1024 * 1024
+
     @pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
     @pytest.mark.parametrize(
         ("malformed_index_count", "expected_budget_scope"),
@@ -8437,7 +8736,8 @@ class TestModelDownloadStreaming:
             header_name = "weights.safetensors"
             filenames = [*index_names, header_name]
             index_payload = b"{"
-            header = {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}
+            huge_name = "huge-" + ("x" * 6_000_000) if index_count == 511 else None
+            header = {(huge_name or "tensor"): {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}
             header_bytes = json.dumps(header, separators=(",", ":")).encode()
             frame = struct.pack("<Q", len(header_bytes)) + header_bytes + b"\\x00"
             sizes = {**dict.fromkeys(index_names, len(index_payload)), header_name: len(frame)}
@@ -8525,6 +8825,7 @@ class TestModelDownloadStreaming:
                 )
                 after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
+            serialized_aggregate = aggregate.model_dump_json()
             budget_results = [
                 result
                 for result in source_results
@@ -8562,7 +8863,9 @@ class TestModelDownloadStreaming:
                         "success": aggregate.success,
                         "exit_code": determine_exit_code(aggregate),
                         "content_hash": aggregate.content_hash,
-                        "serialized_bytes": len(aggregate.model_dump_json().encode()),
+                        "serialized_bytes": len(serialized_aggregate.encode()),
+                        "huge_header_bytes": len(header_bytes) if huge_name is not None else None,
+                        "huge_name_retained": huge_name in serialized_aggregate if huge_name is not None else None,
                         "peak_delta_bytes": (after - before) * scale,
                         "last_path": str(Path(streamed[-1][0])),
                         "last_is_last": bool(streamed[-1][1]),
@@ -8609,7 +8912,11 @@ class TestModelDownloadStreaming:
 
         expected_results = min(malformed_index_count + 1, _MAX_HF_SAFETENSORS_RETAINED_RESULTS)
         expected_range_requests = (
-            _MAX_HF_SAFETENSORS_RETAINED_RESULTS if expected_budget_scope == "index" else malformed_index_count + 2
+            _MAX_HF_SAFETENSORS_RETAINED_RESULTS
+            if expected_budget_scope == "index"
+            else malformed_index_count
+            if expected_budget_scope == "header"
+            else malformed_index_count + 2
         )
         assert metrics["streamed_results"] == expected_results
         assert metrics["files_scanned"] == expected_results
@@ -8650,6 +8957,9 @@ class TestModelDownloadStreaming:
                 assert metrics["budget_is_index_only"] is None
                 assert metrics["budget_has_header_only"] is True
                 assert metrics["budget_index_reason"] is None
+                assert metrics["budget_details"]["candidate_scan_preflighted"] is True
+                assert metrics["huge_header_bytes"] > 6_000_000
+                assert metrics["huge_name_retained"] is False
         else:
             assert metrics["budget_results"] == 0
             assert metrics["budget_checks"] == 0
@@ -8846,19 +9156,88 @@ class TestModelDownloadStreaming:
     def test_safetensors_index_duplicate_key_count_is_not_sample_count(self) -> None:
         pairs = ",".join(f'"tensor_{index}":0,"tensor_{index}":1' for index in range(25))
 
-        parsed, duplicate_keys, duplicate_key_count, parse_error = _loads_json_without_duplicate_keys(
-            f"{{{pairs}}}".encode()
-        )
+        (
+            parsed,
+            duplicate_keys,
+            duplicate_key_count,
+            _duplicate_key_utf8_bytes,
+            _duplicate_key_preview_truncated_count,
+            parse_error,
+        ) = _loads_json_without_duplicate_keys(f"{{{pairs}}}".encode())
 
         assert isinstance(parsed, dict)
         assert parse_error is None
         assert duplicate_key_count == 25
         assert len(duplicate_keys) == 20
 
+    def test_safetensors_index_duplicate_key_preview_is_utf8_bounded(self) -> None:
+        duplicate_name = "界" * 1000
+        raw = f'{{"{duplicate_name}":0,"{duplicate_name}":1}}'.encode()
+
+        (
+            parsed,
+            duplicate_keys,
+            duplicate_key_count,
+            duplicate_key_utf8_bytes,
+            duplicate_key_preview_truncated_count,
+            parse_error,
+        ) = _loads_json_without_duplicate_keys(raw)
+
+        assert isinstance(parsed, dict)
+        assert parse_error is None
+        assert duplicate_key_count == 1
+        assert duplicate_key_utf8_bytes == len(duplicate_name.encode())
+        assert duplicate_key_preview_truncated_count == 1
+        assert len(duplicate_keys) == 1
+        assert len(duplicate_keys[0].encode()) <= 256
+        assert duplicate_name not in duplicate_keys[0]
+
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url")
+    @patch("requests.get")
+    def test_safetensors_index_invalid_entry_preview_is_utf8_bounded(
+        self,
+        mock_requests_get: MagicMock,
+        mock_hf_hub_url: MagicMock,
+        _mock_build_headers: MagicMock,
+    ) -> None:
+        index_name = "model.safetensors.index.json"
+        shard_name = "model.safetensors"
+        invalid_name = "界" * 1000
+        payload = json.dumps({"weight_map": {invalid_name: "../escape.safetensors"}}).encode()
+        mock_hf_hub_url.return_value = f"https://huggingface.co/test/model/resolve/{_HF_TEST_REVISION}/{index_name}"
+        mock_requests_get.return_value = _strict_range_response(payload, len(payload))
+
+        details, transferred, acquired_indexes, unscoped_failures = _remote_safetensors_index_details_by_file(
+            "test/model",
+            [shard_name],
+            [index_name, shard_name],
+            _HF_TEST_REVISION,
+            {index_name: len(payload), shard_name: 128},
+            deadline=None,
+            max_transferred_bytes=None,
+        )
+
+        assert transferred == len(payload)
+        assert acquired_indexes == {index_name: payload}
+        assert unscoped_failures == {}
+        invalid_entries = details[shard_name]["index_invalid_entries"]
+        assert len(invalid_entries) == 1
+        assert len(invalid_entries[0].encode()) < 512
+        assert invalid_name not in invalid_entries[0]
+        assert details[shard_name]["index_tensor_name_utf8_bytes"] == len(invalid_name.encode())
+
     def test_safetensors_index_container_graph_is_bounded_before_parse(self) -> None:
         raw = b'{"metadata":[' + (b"null," * 504_096) + b'null],"weight_map":{}}'
 
-        parsed, duplicate_keys, duplicate_key_count, parse_error = _loads_json_without_duplicate_keys(raw)
+        (
+            parsed,
+            duplicate_keys,
+            duplicate_key_count,
+            _duplicate_key_utf8_bytes,
+            _duplicate_key_preview_truncated_count,
+            parse_error,
+        ) = _loads_json_without_duplicate_keys(raw)
 
         assert parsed is None
         assert duplicate_keys == []
@@ -8872,7 +9251,14 @@ class TestModelDownloadStreaming:
             separators=(",", ":"),
         ).encode()
 
-        parsed, duplicate_keys, duplicate_key_count, parse_error = _loads_json_without_duplicate_keys(raw)
+        (
+            parsed,
+            duplicate_keys,
+            duplicate_key_count,
+            _duplicate_key_utf8_bytes,
+            _duplicate_key_preview_truncated_count,
+            parse_error,
+        ) = _loads_json_without_duplicate_keys(raw)
 
         assert isinstance(parsed, dict)
         assert duplicate_keys == []
@@ -9105,29 +9491,48 @@ class TestModelDownloadStreaming:
         assert details[shard_name]["index_invalid_entry_count"] == 1
         assert details[shard_name]["index_invalid_entries"] == ["weight_map occurrence is not a JSON object"]
 
+    def test_private_acquired_index_path_is_windows_safe_and_filename_independent(self) -> None:
+        private_root = PureWindowsPath("C:/private/modelaudit_hf_index_1234")
+        malicious_name = "D:/nested/model.safetensors.index.json"
+
+        with pytest.raises(ValueError, match="unsafe repository filename"):
+            _validate_huggingface_repo_filename("attacker/repo", malicious_name)
+        with pytest.raises(ValueError, match="unsafe repository filename"):
+            _private_huggingface_acquired_index_candidate(private_root, "attacker/repo", malicious_name)
+
+        nested_name = "nested/model.safetensors.index.json"
+        candidate = _private_huggingface_acquired_index_candidate(private_root, "test/model", nested_name)
+
+        assert candidate == private_root / _HF_ACQUIRED_SAFETENSORS_INDEX_BASENAME
+        assert candidate.is_relative_to(private_root)
+        assert nested_name not in str(candidate)
+
     @pytest.mark.parametrize(
         ("budget_adjustment", "expected_success"),
         [(0, True), (-1, False)],
         ids=["exact-budget", "one-byte-over-budget"],
     )
     @pytest.mark.parametrize("use_cache_root", [False, True], ids=["ephemeral", "scan-root-contained"])
+    @pytest.mark.parametrize("nested", [False, True], ids=["root-index", "nested-index"])
     def test_download_model_streaming_counts_selected_safetensors_index_once(
         self,
         budget_adjustment: int,
         expected_success: bool,
         use_cache_root: bool,
+        nested: bool,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A default-selected index is charged once after reconciliation reads it."""
-        index_name = "model.safetensors.index.json"
-        shard_name = "model.safetensors"
+        parent_prefix = "nested/" if nested else ""
+        index_name = f"{parent_prefix}model.safetensors.index.json"
+        shard_name = f"{parent_prefix}model.safetensors"
         frame, header_len = _make_safetensors_frame(
             {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}},
             b"\x00",
         )
         index_payload = json.dumps(
-            {"weight_map": {"tensor": shard_name}},
+            {"weight_map": {"tensor": PurePosixPath(shard_name).name}},
             separators=(",", ":"),
         ).encode()
         repo_files = [index_name, shard_name]
@@ -9174,7 +9579,9 @@ class TestModelDownloadStreaming:
             cache_dir = tmp_path / "cache" if use_cache_root else None
             canonical_index_path: Path | None = None
             if cache_dir is not None:
-                canonical_index_path = cache_dir / "huggingface" / "test" / "model" / index_name
+                canonical_index_path = (cache_dir / "huggingface" / "test" / "model").joinpath(
+                    *PurePosixPath(index_name).parts
+                )
                 canonical_index_path.parent.mkdir(parents=True)
                 canonical_index_path.write_bytes(b"existing cache sentinel")
             stream = download_model_streaming(
@@ -9186,8 +9593,12 @@ class TestModelDownloadStreaming:
             )
             index_result = next(stream)
             acquired_index_path = index_result[0]
-            assert acquired_index_path.name == index_name
+            assert acquired_index_path.name == _HF_ACQUIRED_SAFETENSORS_INDEX_BASENAME
+            assert index_name not in acquired_index_path.as_posix()
             assert acquired_index_path.read_bytes() == index_payload
+            index_accounting = cast(tuple[Path, bool, None, StreamedSourceByteAccounting], index_result)[3]
+            remote_index_source = f"hf://test/model@{_HF_TEST_REVISION}/{index_name}"
+            assert index_accounting.source_path == remote_index_source
             if cache_dir is not None:
                 scan_root = (cache_dir / "huggingface").resolve()
                 assert acquired_index_path.resolve().is_relative_to(scan_root)
@@ -9195,7 +9606,7 @@ class TestModelDownloadStreaming:
                 assert canonical_index_path is not None
                 assert canonical_index_path.read_bytes() == b"existing cache sentinel"
                 contained_result = scan_model_streaming(
-                    iter([(acquired_index_path, True)]),
+                    iter([index_result]),
                     scan_root=str(scan_root),
                     delete_after_scan=False,
                     cache_enabled=False,
@@ -9203,6 +9614,8 @@ class TestModelDownloadStreaming:
                     skip_file_types=False,
                 )
                 assert not [issue for issue in contained_result.issues if "path traversal" in issue.message.lower()]
+                assert remote_index_source in contained_result.file_metadata
+                assert str(acquired_index_path) not in contained_result.file_metadata
             shard_result = next(stream)
             with pytest.raises(StopIteration):
                 next(stream)
@@ -9317,7 +9730,10 @@ class TestModelDownloadStreaming:
             tuple[Path, bool, None, StreamedSourceByteAccounting],
             streamed_items[1],
         )
-        assert selected_index_item[3] == StreamedSourceByteAccounting(source_bytes_preaccounted=len(index_payload))
+        assert selected_index_item[3] == StreamedSourceByteAccounting(
+            source_bytes_preaccounted=len(index_payload),
+            source_path=f"hf://test/model@{_HF_TEST_REVISION}/{index_name}",
+        )
         assert aggregate.bytes_scanned == expected_bytes
         assert aggregate.files_scanned == 3
         assert not any(issue.details.get("max_total_size") == expected_bytes for issue in aggregate.issues)
@@ -9516,11 +9932,12 @@ class TestModelDownloadStreaming:
             assert first_item[2].bytes_scanned == 69
             assert first_item[3] == StreamedSourceByteAccounting(pretransferred_bytes=len(index_payload))
         else:
-            assert first_item[0].name == index_name
+            assert first_item[0].name == _HF_ACQUIRED_SAFETENSORS_INDEX_BASENAME
             assert first_item[2] is None
             assert first_item[3] == StreamedSourceByteAccounting(
                 pretransferred_bytes=len(index_payload),
                 source_bytes_preaccounted=len(index_payload),
+                source_path=f"hf://test/model@{_HF_TEST_REVISION}/{index_name}",
             )
         assert aggregate.bytes_scanned == expected_bytes
         assert aggregate.files_scanned == int(shard_first)

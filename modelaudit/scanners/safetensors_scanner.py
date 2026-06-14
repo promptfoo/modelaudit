@@ -59,6 +59,9 @@ _MAX_REPORTED_TENSOR_NAMES = 1024
 _MAX_REPORTED_TENSOR_FINDINGS = 20
 _MAX_REPORTED_METADATA_FINDINGS = 20
 _MAX_SAFETENSORS_JSON_TOKENS = 100_000
+_SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES = 256
+_SAFETENSORS_NAME_PREVIEW_DIGEST_HEX_CHARS = 12
+_SAFETENSORS_NAME_UTF8_CHUNK_CHARS = 64 * 1024
 
 _HTML_METADATA_PATTERNS = (
     r"javascript:",
@@ -213,6 +216,54 @@ def _validate_json_structural_token_limit(raw: bytes, max_tokens: int, label: st
             token_count += 1
             if token_count > max_tokens:
                 raise ValueError(f"{label} exceeds JSON object/value limit")
+
+
+def _iter_safetensors_name_utf8_chunks(name: str) -> Iterator[bytes]:
+    """Yield bounded UTF-8 chunks without materializing the full encoded name."""
+    for offset in range(0, len(name), _SAFETENSORS_NAME_UTF8_CHUNK_CHARS):
+        yield name[offset : offset + _SAFETENSORS_NAME_UTF8_CHUNK_CHARS].encode("utf-8")
+
+
+def _safetensors_name_utf8_bytes(name: str) -> int:
+    """Return the UTF-8 byte length without materializing the full encoded name."""
+    return sum(len(chunk) for chunk in _iter_safetensors_name_utf8_chunks(name))
+
+
+def _update_safetensors_tensor_name_digest(
+    digest: Any,
+    name: str,
+    *,
+    name_utf8_bytes: int | None = None,
+) -> None:
+    """Update the canonical tensor-name digest using bounded UTF-8 chunks."""
+    encoded_size = name_utf8_bytes if name_utf8_bytes is not None else _safetensors_name_utf8_bytes(name)
+    digest.update(encoded_size.to_bytes(8, "little"))
+    for chunk in _iter_safetensors_name_utf8_chunks(name):
+        digest.update(chunk)
+
+
+def _safetensors_name_preview(name: str) -> tuple[str, int, bool]:
+    """Return a stable UTF-8-byte-bounded preview plus the original byte length."""
+    encoded_size = 0
+    prefix = bytearray()
+    digest: Any | None = None
+    for chunk in _iter_safetensors_name_utf8_chunks(name):
+        if digest is None and encoded_size + len(chunk) > _SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES:
+            digest = hashlib.sha256()
+            digest.update(prefix)
+        if digest is not None:
+            digest.update(chunk)
+        if len(prefix) < _SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES:
+            prefix.extend(chunk[: _SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES - len(prefix)])
+        encoded_size += len(chunk)
+    if digest is None:
+        return name, encoded_size, False
+
+    digest_suffix = digest.hexdigest()[:_SAFETENSORS_NAME_PREVIEW_DIGEST_HEX_CHARS]
+    suffix = f"...#{digest_suffix}"
+    prefix_budget = _SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES - len(suffix.encode("utf-8"))
+    prefix_text = prefix[:prefix_budget].decode("utf-8", errors="ignore")
+    return f"{prefix_text}{suffix}", encoded_size, True
 
 
 _CODE_METADATA_PATTERNS = (
@@ -745,9 +796,12 @@ class SafeTensorsScanner(BaseScanner):
         return first_matches, total_matches
 
     @classmethod
-    def _load_json_header(cls, header_bytes: bytes) -> tuple[Any, list[str]]:
+    def _load_json_header(cls, header_bytes: bytes) -> tuple[Any, list[str], int, int, int]:
         """Parse a SafeTensors header while tracking duplicate object keys."""
         duplicate_keys: list[str] = []
+        duplicate_key_count = 0
+        duplicate_key_utf8_bytes = 0
+        duplicate_key_preview_truncated_count = 0
         _validate_json_structural_token_limit(
             header_bytes,
             _MAX_SAFETENSORS_JSON_TOKENS,
@@ -755,16 +809,29 @@ class SafeTensorsScanner(BaseScanner):
         )
 
         def track_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            nonlocal duplicate_key_count, duplicate_key_preview_truncated_count, duplicate_key_utf8_bytes
             parsed: dict[str, Any] = {}
             seen: set[str] = set()
             for key, value in pairs:
-                if key in seen and len(duplicate_keys) < _DUPLICATE_JSON_KEY_DETAIL_LIMIT:
-                    duplicate_keys.append(key)
+                if key in seen:
+                    preview, key_utf8_bytes, preview_truncated = _safetensors_name_preview(key)
+                    duplicate_key_count += 1
+                    duplicate_key_utf8_bytes += key_utf8_bytes
+                    duplicate_key_preview_truncated_count += int(preview_truncated)
+                    if len(duplicate_keys) < _DUPLICATE_JSON_KEY_DETAIL_LIMIT:
+                        duplicate_keys.append(preview)
                 seen.add(key)
                 parsed[key] = value
             return parsed
 
-        return json.loads(header_bytes.decode("utf-8"), object_pairs_hook=track_duplicate_keys), duplicate_keys
+        parsed = json.loads(header_bytes.decode("utf-8"), object_pairs_hook=track_duplicate_keys)
+        return (
+            parsed,
+            duplicate_keys,
+            duplicate_key_count,
+            duplicate_key_utf8_bytes,
+            duplicate_key_preview_truncated_count,
+        )
 
     @classmethod
     def _looks_like_ordinary_license_document(cls, value: str) -> bool:
@@ -1493,7 +1560,13 @@ class SafeTensorsScanner(BaseScanner):
                     )
 
                 try:
-                    header, duplicate_keys = self._load_json_header(header_bytes)
+                    (
+                        header,
+                        duplicate_keys,
+                        duplicate_key_count,
+                        duplicate_key_utf8_bytes,
+                        duplicate_key_preview_truncated_count,
+                    ) = self._load_json_header(header_bytes)
                 except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as e:
                     result.add_check(
                         name="SafeTensors JSON Parse",
@@ -1517,7 +1590,11 @@ class SafeTensorsScanner(BaseScanner):
                         location=path,
                         details={
                             "duplicate_keys": duplicate_keys,
-                            "duplicate_key_count": len(duplicate_keys),
+                            "duplicate_key_count": duplicate_key_count,
+                            "duplicate_key_utf8_bytes": duplicate_key_utf8_bytes,
+                            "duplicate_key_preview_truncated_count": duplicate_key_preview_truncated_count,
+                            "duplicate_keys_truncated": duplicate_key_count > len(duplicate_keys)
+                            or duplicate_key_preview_truncated_count > 0,
                         },
                     )
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
@@ -1553,14 +1630,49 @@ class SafeTensorsScanner(BaseScanner):
 
                 tensor_count = max(len(header) - (1 if "__metadata__" in header else 0), 0)
                 tensor_names: list[str] = []
+                tensor_name_previews: dict[str, str] = {}
+                tensor_name_sizes: dict[str, int] = {}
+                tensor_name_utf8_bytes = 0
+                max_tensor_name_utf8_bytes = 0
+                tensor_name_preview_truncated_count = 0
+                tensor_cardinality_exceeded = tensor_count > _MAX_SAFETENSORS_TENSORS
                 for name in header:
-                    if name != "__metadata__" and len(tensor_names) < _MAX_REPORTED_TENSOR_NAMES:
-                        tensor_names.append(name)
+                    if name == "__metadata__":
+                        continue
+                    retain_preview = not tensor_cardinality_exceeded or len(tensor_names) < _MAX_REPORTED_TENSOR_NAMES
+                    if retain_preview:
+                        preview, name_utf8_bytes, preview_truncated = _safetensors_name_preview(name)
+                        if len(tensor_names) < _MAX_REPORTED_TENSOR_NAMES:
+                            tensor_names.append(preview)
+                        if not tensor_cardinality_exceeded:
+                            tensor_name_previews[name] = preview
+                            tensor_name_sizes[name] = name_utf8_bytes
+                    else:
+                        name_utf8_bytes = _safetensors_name_utf8_bytes(name)
+                        preview_truncated = name_utf8_bytes > _SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES
+                    tensor_name_utf8_bytes += name_utf8_bytes
+                    max_tensor_name_utf8_bytes = max(max_tensor_name_utf8_bytes, name_utf8_bytes)
+                    tensor_name_preview_truncated_count += int(preview_truncated)
                 result.metadata["tensor_count"] = tensor_count
                 result.metadata["tensors"] = tensor_names
                 result.metadata["tensor_count_reported"] = len(tensor_names)
-                result.metadata["tensor_metadata_truncated"] = tensor_count > len(tensor_names)
+                result.metadata["tensor_metadata_truncated"] = (
+                    tensor_count > len(tensor_names) or tensor_name_preview_truncated_count > 0
+                )
                 result.metadata["max_reported_tensors"] = _MAX_REPORTED_TENSOR_NAMES
+                result.metadata["tensor_name_utf8_bytes"] = tensor_name_utf8_bytes
+                result.metadata["max_tensor_name_utf8_bytes"] = max_tensor_name_utf8_bytes
+                result.metadata["tensor_name_preview_truncated_count"] = tensor_name_preview_truncated_count
+
+                if not tensor_cardinality_exceeded:
+                    tensor_name_digest = hashlib.sha256()
+                    for name in sorted(tensor_name_previews):
+                        _update_safetensors_tensor_name_digest(
+                            tensor_name_digest,
+                            name,
+                            name_utf8_bytes=tensor_name_sizes[name],
+                        )
+                    result.metadata["tensor_names_digest"] = tensor_name_digest.hexdigest()
 
                 custom_metadata_security_flags = self._detect_metadata_injection_attacks(
                     header=header,
@@ -1572,7 +1684,7 @@ class SafeTensorsScanner(BaseScanner):
                 if "__metadata__" in header:
                     result.metadata["custom_metadata_security_flags"] = sorted(custom_metadata_security_flags)
 
-                if tensor_count > _MAX_SAFETENSORS_TENSORS:
+                if tensor_cardinality_exceeded:
                     result.add_check(
                         name="SafeTensors Tensor Cardinality Limit",
                         passed=False,
@@ -1588,12 +1700,6 @@ class SafeTensorsScanner(BaseScanner):
                     self._mark_inconclusive(result, SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON)
                     result.finish(success=False)
                     return result
-                tensor_name_digest = hashlib.sha256()
-                for name in sorted(name for name in header if name != "__metadata__"):
-                    encoded_name = name.encode("utf-8")
-                    tensor_name_digest.update(len(encoded_name).to_bytes(8, "little"))
-                    tensor_name_digest.update(encoded_name)
-                result.metadata["tensor_names_digest"] = tensor_name_digest.hexdigest()
 
                 # Validate tensor offsets and sizes
                 data_size = file_size - (8 + header_len)
@@ -1627,13 +1733,18 @@ class SafeTensorsScanner(BaseScanner):
                 for name, info in header.items():
                     if name == "__metadata__":
                         continue
+                    reported_name = tensor_name_previews[name]
                     if not isinstance(info, dict):
                         add_tensor_check(
                             name="Tensor Entry Type Validation",
                             passed=False,
-                            message=f"Invalid tensor entry for {name}",
+                            message=f"Invalid tensor entry for {reported_name}",
                             severity=IssueSeverity.INFO,
-                            details={"tensor": name, "actual_type": type(info).__name__, "expected_type": "dict"},
+                            details={
+                                "tensor": reported_name,
+                                "actual_type": type(info).__name__,
+                                "expected_type": "dict",
+                            },
                         )
                         self._mark_inconclusive(result, SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON)
                         structural_validation_failed = True
@@ -1647,10 +1758,10 @@ class SafeTensorsScanner(BaseScanner):
                         add_tensor_check(
                             name="Tensor Offset Structure Validation",
                             passed=False,
-                            message=f"Invalid data_offsets structure for {name}",
+                            message=f"Invalid data_offsets structure for {reported_name}",
                             severity=IssueSeverity.INFO,
                             details={
-                                "tensor": name,
+                                "tensor": reported_name,
                                 "actual_type": type(raw_offsets).__name__,
                                 "expected_type": "list",
                                 "expected_length": 2,
@@ -1671,10 +1782,10 @@ class SafeTensorsScanner(BaseScanner):
                         add_tensor_check(
                             name="Tensor Offset Type Validation",
                             passed=False,
-                            message=f"Invalid data_offsets for {name}",
+                            message=f"Invalid data_offsets for {reported_name}",
                             severity=IssueSeverity.INFO,
                             details={
-                                "tensor": name,
+                                "tensor": reported_name,
                                 "begin_type": type(begin).__name__,
                                 "end_type": type(end).__name__,
                             },
@@ -1693,10 +1804,10 @@ class SafeTensorsScanner(BaseScanner):
                         add_tensor_check(
                             name="Tensor Offset Validation",
                             passed=False,
-                            message=f"Tensor {name} offsets out of bounds",
+                            message=f"Tensor {reported_name} offsets out of bounds",
                             severity=IssueSeverity.CRITICAL,
                             details={
-                                "tensor": name,
+                                "tensor": reported_name,
                                 "begin": begin,
                                 "end": end,
                                 "data_size": data_size,
@@ -1708,8 +1819,8 @@ class SafeTensorsScanner(BaseScanner):
                         add_tensor_check(
                             name="Tensor Offset Validation",
                             passed=True,
-                            message=f"Tensor {name} offsets are valid",
-                            details={"tensor": name, "begin": begin, "end": end},
+                            message=f"Tensor {reported_name} offsets are valid",
+                            details={"tensor": reported_name, "begin": begin, "end": end},
                         )
 
                     offsets.append((begin, end))
@@ -1719,10 +1830,10 @@ class SafeTensorsScanner(BaseScanner):
                         add_tensor_check(
                             name="Tensor Dtype Validation",
                             passed=False,
-                            message=f"Invalid dtype for tensor {name}",
+                            message=f"Invalid dtype for tensor {reported_name}",
                             severity=IssueSeverity.INFO,
                             details={
-                                "tensor": name,
+                                "tensor": reported_name,
                                 "dtype": dtype,
                                 "actual_type": type(dtype).__name__,
                             },
@@ -1735,10 +1846,10 @@ class SafeTensorsScanner(BaseScanner):
                         add_tensor_check(
                             name="Tensor Shape Validation",
                             passed=False,
-                            message=f"Invalid shape for tensor {name}",
+                            message=f"Invalid shape for tensor {reported_name}",
                             severity=IssueSeverity.INFO,
                             details={
-                                "tensor": name,
+                                "tensor": reported_name,
                                 "shape": shape,
                                 "actual_type": type(shape).__name__,
                             },
@@ -1752,10 +1863,10 @@ class SafeTensorsScanner(BaseScanner):
                         add_tensor_check(
                             name="Tensor Size Computation Check",
                             passed=False,
-                            message=f"Unable to compute expected size for tensor {name}",
+                            message=f"Unable to compute expected size for tensor {reported_name}",
                             severity=IssueSeverity.INFO,
                             details={
-                                "tensor": name,
+                                "tensor": reported_name,
                                 "dtype": dtype,
                                 "shape": shape,
                             },
@@ -1768,10 +1879,10 @@ class SafeTensorsScanner(BaseScanner):
                         add_tensor_check(
                             name="Tensor Size Consistency Check",
                             passed=False,
-                            message=f"Size mismatch for tensor {name}",
+                            message=f"Size mismatch for tensor {reported_name}",
                             severity=IssueSeverity.CRITICAL,
                             details={
-                                "tensor": name,
+                                "tensor": reported_name,
                                 "expected_size": expected_size,
                                 "actual_size": end - begin,
                             },
@@ -1780,9 +1891,9 @@ class SafeTensorsScanner(BaseScanner):
                         add_tensor_check(
                             name="Tensor Size Consistency Check",
                             passed=True,
-                            message=f"Tensor {name} size matches dtype/shape",
+                            message=f"Tensor {reported_name} size matches dtype/shape",
                             details={
-                                "tensor": name,
+                                "tensor": reported_name,
                                 "size": expected_size,
                             },
                         )
@@ -1893,20 +2004,26 @@ class SafeTensorsScanner(BaseScanner):
             return security_flags
 
         # Check tensor names for injection attempts
-        tensor_names = [k for k in header if k != "__metadata__"]
         suspicious_tensor_name_count = 0
-        for tensor_name in tensor_names:
+        for tensor_name in header:
+            if tensor_name == "__metadata__":
+                continue
             if self._is_suspicious_tensor_name(tensor_name):
                 suspicious_tensor_name_count += 1
                 if suspicious_tensor_name_count <= _MAX_REPORTED_TENSOR_FINDINGS:
+                    tensor_name_preview, tensor_name_utf8_bytes, preview_truncated = _safetensors_name_preview(
+                        tensor_name
+                    )
                     result.add_check(
                         name="SafeTensors Tensor Name Injection Check",
                         passed=False,
-                        message=f"Suspicious tensor name detected: {tensor_name}",
+                        message=f"Suspicious tensor name detected: {tensor_name_preview}",
                         severity=IssueSeverity.WARNING,
                         location=path,
                         details={
-                            "tensor_name": tensor_name,
+                            "tensor_name": tensor_name_preview,
+                            "tensor_name_utf8_bytes": tensor_name_utf8_bytes,
+                            "tensor_name_preview_truncated": preview_truncated,
                             "attack_type": "tensor_name_injection",
                             "reason": "Contains path traversal or dangerous characters",
                         },
@@ -1926,20 +2043,39 @@ class SafeTensorsScanner(BaseScanner):
                 if unexpected_keys:
                     unexpected_tensor_metadata_count += 1
                     if unexpected_tensor_metadata_count <= _MAX_REPORTED_TENSOR_FINDINGS:
-                        reported_unexpected_keys = sorted(unexpected_keys)[:_MAX_REPORTED_TENSOR_FINDINGS]
+                        reported_unexpected_keys: list[str] = []
+                        unexpected_key_utf8_bytes = 0
+                        unexpected_key_preview_truncated_count = 0
+                        for key in sorted(unexpected_keys):
+                            key_preview, key_utf8_bytes, key_preview_truncated = _safetensors_name_preview(key)
+                            unexpected_key_utf8_bytes += key_utf8_bytes
+                            unexpected_key_preview_truncated_count += int(key_preview_truncated)
+                            if len(reported_unexpected_keys) < _MAX_REPORTED_TENSOR_FINDINGS:
+                                reported_unexpected_keys.append(key_preview)
+                        tensor_name_preview, tensor_name_utf8_bytes, preview_truncated = _safetensors_name_preview(
+                            tensor_name
+                        )
                         result.add_check(
                             name="SafeTensors Tensor Metadata Injection Check",
                             passed=False,
                             message=(
-                                f"Tensor {tensor_name} contains unexpected metadata keys: {reported_unexpected_keys}"
+                                f"Tensor {tensor_name_preview} contains unexpected metadata keys: "
+                                f"{reported_unexpected_keys}"
                             ),
                             severity=IssueSeverity.INFO,
                             location=path,
                             details={
-                                "tensor_name": tensor_name,
+                                "tensor_name": tensor_name_preview,
+                                "tensor_name_utf8_bytes": tensor_name_utf8_bytes,
+                                "tensor_name_preview_truncated": preview_truncated,
                                 "unexpected_key_count": len(unexpected_keys),
+                                "unexpected_key_utf8_bytes": unexpected_key_utf8_bytes,
+                                "unexpected_key_preview_truncated_count": unexpected_key_preview_truncated_count,
                                 "unexpected_keys": reported_unexpected_keys,
-                                "unexpected_keys_truncated": len(unexpected_keys) > len(reported_unexpected_keys),
+                                "unexpected_keys_truncated": (
+                                    len(unexpected_keys) > len(reported_unexpected_keys)
+                                    or unexpected_key_preview_truncated_count > 0
+                                ),
                                 "attack_type": "tensor_metadata_injection",
                             },
                         )
@@ -2221,33 +2357,53 @@ class SafeTensorsScanner(BaseScanner):
                 if len(header_bytes) != header_len:
                     metadata["extraction_error"] = "Truncated SafeTensors header"
                     return metadata
-                header, duplicate_keys = self._load_json_header(header_bytes)
+                (
+                    header,
+                    duplicate_keys,
+                    duplicate_key_count,
+                    duplicate_key_utf8_bytes,
+                    duplicate_key_preview_truncated_count,
+                ) = self._load_json_header(header_bytes)
                 if duplicate_keys:
                     metadata["extraction_error"] = "Duplicate SafeTensors header keys"
                     metadata["duplicate_header_keys"] = duplicate_keys
+                    metadata["duplicate_header_key_count"] = duplicate_key_count
+                    metadata["duplicate_header_key_utf8_bytes"] = duplicate_key_utf8_bytes
+                    metadata["duplicate_header_key_preview_truncated_count"] = duplicate_key_preview_truncated_count
                     return metadata
 
                 # Extract tensor info
                 tensors: dict[str, dict[str, Any]] = {}
                 total_params = 0
                 invalid_tensor_entries: list[str] = []
+                tensor_name_digest = hashlib.sha256()
+                tensor_name_utf8_bytes = 0
+                max_tensor_name_utf8_bytes = 0
+                tensor_name_preview_truncated_count = 0
+
+                for name in sorted(name for name in header if name != "__metadata__"):
+                    _update_safetensors_tensor_name_digest(tensor_name_digest, name)
 
                 for name, info in header.items():
                     if name != "__metadata__":  # Skip metadata entry
+                        name_preview, name_utf8_bytes, preview_truncated = _safetensors_name_preview(name)
+                        tensor_name_utf8_bytes += name_utf8_bytes
+                        max_tensor_name_utf8_bytes = max(max_tensor_name_utf8_bytes, name_utf8_bytes)
+                        tensor_name_preview_truncated_count += int(preview_truncated)
                         if not isinstance(info, dict):
-                            invalid_tensor_entries.append(name)
+                            invalid_tensor_entries.append(name_preview)
                             continue
 
                         dtype = info.get("dtype")
                         shape = info.get("shape")
                         if not isinstance(dtype, str) or not isinstance(shape, list):
-                            invalid_tensor_entries.append(name)
+                            invalid_tensor_entries.append(name_preview)
                             continue
                         if not all(isinstance(dim, int) and dim >= 0 for dim in shape):
-                            invalid_tensor_entries.append(name)
+                            invalid_tensor_entries.append(name_preview)
                             continue
 
-                        tensors[name] = {"dtype": dtype, "shape": shape}
+                        tensors[name_preview] = {"dtype": dtype, "shape": shape}
                         # Calculate parameter count
                         param_count = 1
                         for dim in shape:
@@ -2260,6 +2416,10 @@ class SafeTensorsScanner(BaseScanner):
                         "total_parameters": total_params,
                         "tensors": tensors,
                         "dtypes": sorted({info["dtype"] for info in tensors.values()}),
+                        "tensor_names_digest": tensor_name_digest.hexdigest(),
+                        "tensor_name_utf8_bytes": tensor_name_utf8_bytes,
+                        "max_tensor_name_utf8_bytes": max_tensor_name_utf8_bytes,
+                        "tensor_name_preview_truncated_count": tensor_name_preview_truncated_count,
                     }
                 )
                 if invalid_tensor_entries:

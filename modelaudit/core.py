@@ -7368,12 +7368,14 @@ def scan_model_streaming(
             precomputed_result: ScanResult | None = None
             source_bytes_preaccounted = 0
             pretransferred_bytes = 0
+            reported_source_path: str | None = None
             if len(streamed_item) == 4:
                 file_path, _is_last, precomputed_result, byte_accounting = streamed_item
                 if not isinstance(byte_accounting, StreamedSourceByteAccounting):
                     raise TypeError("Invalid streamed source byte accounting metadata")
                 pretransferred_bytes = byte_accounting.pretransferred_bytes
                 source_bytes_preaccounted = byte_accounting.source_bytes_preaccounted
+                reported_source_path = byte_accounting.source_path
             elif len(streamed_item) == 3:
                 file_path, _is_last, precomputed_result = streamed_item
             elif len(streamed_item) == 2:
@@ -7383,6 +7385,7 @@ def scan_model_streaming(
             if precomputed_result is not None and not isinstance(precomputed_result, ScanResult):
                 raise TypeError("Invalid precomputed streamed scan result")
             source_path = Path(file_path)
+            report_path = reported_source_path or str(source_path)
             is_precomputed_streamed_result = precomputed_result is not None
             source_key = Path(os.path.abspath(source_path))
             if pretransferred_bytes:
@@ -7395,14 +7398,13 @@ def scan_model_streaming(
             if (
                 pretransferred_bytes
                 and not is_precomputed_streamed_result
-                and record_max_total_size_failure(str(source_path))
+                and record_max_total_size_failure(report_path)
             ):
                 delete_streamed_source(source_path, "after streaming size limit")
                 break
             if not is_precomputed_streamed_result and source_key in consumed_openvino_companions:
                 continue
             scan_path = source_path
-            report_path = str(source_path)
             pinned_scan_context: Any | None = None
             preserve_source_after_scan = is_precomputed_streamed_result
             openvino_scan_companion_path: Path | None = None

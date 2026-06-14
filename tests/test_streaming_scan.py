@@ -4172,6 +4172,12 @@ def test_streamed_source_byte_accounting_rejects_invalid_values(
         )
 
 
+@pytest.mark.parametrize("source_path", ["", 1])
+def test_streamed_source_byte_accounting_rejects_invalid_source_path(source_path: object) -> None:
+    with pytest.raises(ValueError, match="source_path must be a non-empty string"):
+        StreamedSourceByteAccounting(source_path=cast(Any, source_path))
+
+
 def test_scan_model_streaming_fails_closed_after_max_total_size(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

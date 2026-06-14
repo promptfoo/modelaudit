@@ -1,8 +1,12 @@
 import base64
 import builtins
+import hashlib
 import json
 import os
 import struct
+import subprocess
+import sys
+import textwrap
 import zipfile
 from pathlib import Path
 from types import TracebackType
@@ -32,8 +36,10 @@ from modelaudit.scanners.safetensors_scanner import (
     _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY,
     _REMOTE_HEADER_INTEGRITY_CONFIG_KEY,
     _REMOTE_HEADER_ONLY_CONFIG_KEY,
+    _SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES,
     SAFETENSORS_READ_INCONCLUSIVE_REASON,
     SafeTensorsScanner,
+    _safetensors_name_preview,
 )
 
 CYRILLIC_SMALL_A = chr(0x0430)
@@ -231,6 +237,24 @@ def test_duplicate_safetensors_header_keys_are_inconclusive(tmp_path: Path) -> N
     assert duplicate_check.details["duplicate_keys"] == ["tensor"]
 
 
+def test_safetensors_name_preview_is_utf8_bounded_and_stable() -> None:
+    name = "界" * 1000
+
+    preview, original_utf8_bytes, truncated = _safetensors_name_preview(name)
+    repeated_preview, repeated_utf8_bytes, repeated_truncated = _safetensors_name_preview(name)
+
+    assert len(preview.encode("utf-8")) <= _SAFETENSORS_NAME_PREVIEW_MAX_UTF8_BYTES
+    assert original_utf8_bytes == len(name.encode("utf-8"))
+    assert truncated is True
+    assert (preview, original_utf8_bytes, truncated) == (
+        repeated_preview,
+        repeated_utf8_bytes,
+        repeated_truncated,
+    )
+    assert name not in preview
+    assert preview.endswith(f"...#{hashlib.sha256(name.encode()).hexdigest()[:12]}")
+
+
 def test_remote_invalid_header_length_does_not_hash_sparse_stub(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -269,9 +293,119 @@ def test_tensor_cardinality_limit_bounds_result_amplification(tmp_path: Path) ->
     assert result.metadata["tensor_count_reported"] == 1024
     assert result.metadata["tensor_metadata_truncated"] is True
     assert len(result.metadata["tensors"]) == 1024
+    assert "tensor_names_digest" not in result.metadata
     cardinality_check = next(check for check in result.checks if check.name == "SafeTensors Tensor Cardinality Limit")
     assert cardinality_check.status == CheckStatus.FAILED
     assert len(result.checks) < 20
+
+
+@pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
+def test_max_token_tensor_cardinality_failure_is_memory_and_output_bounded() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    script = textwrap.dedent(
+        """
+        import gc
+        import json
+        import resource
+        import struct
+        import sys
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from modelaudit.scanners import safetensors_scanner as safetensors_module
+
+        tensor_count = 14_000
+        header = {
+            f"tensor_{index:05d}_" + ("界" * 362): {
+                "dtype": "U8",
+                "shape": [0],
+                "data_offsets": [0, 0],
+            }
+            for index in range(tensor_count)
+        }
+        assert tensor_count * 7 <= safetensors_module._MAX_SAFETENSORS_JSON_TOKENS
+        assert safetensors_module._MAX_SAFETENSORS_JSON_TOKENS - (tensor_count * 7) < 4096
+        header_bytes = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode()
+        header_size = len(header_bytes)
+        expected_name_bytes = sum(len(name.encode()) for name in header)
+        expected_max_name_bytes = max(len(name.encode()) for name in header)
+        preview_calls = 0
+        original_name_preview = safetensors_module._safetensors_name_preview
+
+        def count_name_preview(name):
+            global preview_calls
+            preview_calls += 1
+            return original_name_preview(name)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "max-token-cardinality.safetensors"
+            path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes)
+            del header
+            del header_bytes
+            gc.collect()
+            before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            with patch.object(
+                safetensors_module,
+                "_safetensors_name_preview",
+                side_effect=count_name_preview,
+            ):
+                result = safetensors_module.SafeTensorsScanner().scan(str(path))
+            after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+        serialized = json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":"), default=str)
+        scale = 1 if sys.platform == "darwin" else 1024
+        print(
+            json.dumps(
+                {
+                    "success": result.success,
+                    "header_size": header_size,
+                    "header_limit": safetensors_module.MAX_HEADER_BYTES,
+                    "tensor_count": result.metadata.get("tensor_count"),
+                    "reported_tensor_count": len(result.metadata.get("tensors", [])),
+                    "tensor_name_utf8_bytes": result.metadata.get("tensor_name_utf8_bytes"),
+                    "expected_name_bytes": expected_name_bytes,
+                    "max_tensor_name_utf8_bytes": result.metadata.get("max_tensor_name_utf8_bytes"),
+                    "expected_max_name_bytes": expected_max_name_bytes,
+                    "preview_truncated_count": result.metadata.get("tensor_name_preview_truncated_count"),
+                    "has_tensor_names_digest": "tensor_names_digest" in result.metadata,
+                    "preview_calls": preview_calls,
+                    "cardinality_checks": sum(
+                        check.name == "SafeTensors Tensor Cardinality Limit" for check in result.checks
+                    ),
+                    "serialized_bytes": len(serialized.encode()),
+                    "peak_delta_bytes": (after - before) * scale,
+                }
+            )
+        )
+        """
+    )
+    env = {**os.environ, "PYTHONPATH": str(repo_root), "PROMPTFOO_DISABLE_TELEMETRY": "1"}
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    metrics = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert metrics["success"] is False
+    assert metrics["header_size"] > 15 * 1024 * 1024
+    assert metrics["header_size"] < metrics["header_limit"]
+    assert metrics["tensor_count"] == 14_000
+    assert metrics["reported_tensor_count"] == 1024
+    assert metrics["tensor_name_utf8_bytes"] == metrics["expected_name_bytes"]
+    assert metrics["max_tensor_name_utf8_bytes"] == metrics["expected_max_name_bytes"]
+    assert metrics["preview_truncated_count"] == metrics["tensor_count"]
+    assert metrics["has_tensor_names_digest"] is False
+    assert metrics["preview_calls"] == 1024
+    assert metrics["cardinality_checks"] == 1
+    assert metrics["serialized_bytes"] < 32 * 1024 * 1024
+    assert metrics["peak_delta_bytes"] < 64 * 1024 * 1024
 
 
 def test_tensor_cardinality_limit_still_reports_custom_metadata_attacks(tmp_path: Path) -> None:

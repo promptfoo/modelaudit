@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from functools import cache
 from glob import escape as escape_glob
 from io import BytesIO
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, Literal, cast, overload
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
@@ -74,6 +74,7 @@ _MAX_HF_REPOSITORY_PATH_CHARS = 4096
 _HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES = 64 * 1024
 _HF_PATH_INFO_BATCH_SIZE = 512
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
+_HF_ACQUIRED_SAFETENSORS_INDEX_BASENAME = "acquired.safetensors.index.json"
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
 _HF_SAFETENSORS_SHARD_PATTERN = re.compile(
@@ -156,9 +157,32 @@ class _HuggingFaceSafeTensorsRetentionBudget:
     retained_tensor_names: int = 0
     retained_result_bytes: int = 0
 
+    def preflight_result_count(self) -> dict[str, Any] | None:
+        """Reject a result slot before materializing work that cannot be retained."""
+        projected_results = self.retained_results + 1
+        if projected_results < _MAX_HF_SAFETENSORS_RETAINED_RESULTS:
+            return None
+        return {
+            "exceeded": ["result_count"],
+            "retained_results": self.retained_results,
+            "retained_tensor_names": self.retained_tensor_names,
+            "retained_result_bytes": self.retained_result_bytes,
+            "candidate_tensor_names": 0,
+            "candidate_result_bytes": 0,
+            "projected_results": projected_results,
+            "projected_tensor_names": self.retained_tensor_names,
+            "projected_result_bytes": self.retained_result_bytes,
+            "max_retained_results": _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
+            "max_retained_tensor_names": _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
+            "max_retained_result_bytes": _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
+            "candidate_serialization_failed": False,
+            "candidate_scan_preflighted": True,
+        }
+
     def retain(self, result: Any) -> dict[str, Any] | None:
         """Charge one source-native result or describe the exceeded repository budget."""
-        raw_names = result.metadata.get("tensors") if isinstance(result.metadata, dict) else None
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        raw_names = metadata.get("tensors")
         tensor_name_count = sum(1 for name in raw_names if isinstance(name, str)) if isinstance(raw_names, list) else 0
         serialization_failed = False
         try:
@@ -806,6 +830,10 @@ def _scan_remote_huggingface_safetensors_header(
         tail_probe = b""
         tail_probe_start = declared_size
         sparse_overlap_probes: list[tuple[int, bytes]] = []
+        header_range: _HuggingFaceStrictRangeRead | None = None
+        frame_probe = b""
+        covered_prefix = b""
+        sparse_ranges: list[tuple[int, bytes]] = []
         temp_path: str | None = None
         try:
             if max_transferred_bytes is not None and total_bytes_transferred + 8 > max_transferred_bytes:
@@ -993,6 +1021,18 @@ def _scan_remote_huggingface_safetensors_header(
                         )
                     )
 
+            tensor_payload_bytes_downloaded = (
+                len(payload_probe) + len(tail_probe) + sum(len(probe_bytes) for _, probe_bytes in sparse_overlap_probes)
+            )
+            header_payload = b""
+            header_range = None
+            frame_probe = b""
+            covered_prefix = b""
+            sparse_ranges.clear()
+            payload_probe = b""
+            tail_probe = b""
+            sparse_overlap_probes.clear()
+
             integrity_details: dict[str, Any] = {
                 "hf_repo_id": repo_id,
                 "hf_revision": revision,
@@ -1005,11 +1045,7 @@ def _scan_remote_huggingface_safetensors_header(
                 "remote_final_host": urlparse(final_url).hostname,
                 "range_semantics": "strict_206_content_range",
                 "range_attempts": attempt + 1,
-                "tensor_payload_bytes_downloaded": (
-                    len(payload_probe)
-                    + len(tail_probe)
-                    + sum(len(probe_bytes) for _, probe_bytes in sparse_overlap_probes)
-                ),
+                "tensor_payload_bytes_downloaded": tensor_payload_bytes_downloaded,
             }
             remote_scanner_config = dict(caller_scanner_config)
             remote_scanner_config.update(
@@ -1228,19 +1264,23 @@ def _normalize_safetensors_index_shard_path(index_filename: str, shard_name: obj
     return f"{parent_prefix}{shard_path.as_posix()}" if parent_prefix else shard_path.as_posix(), None
 
 
-def _loads_json_without_duplicate_keys(raw: bytes) -> tuple[Any | None, list[str], int, str | None]:
-    from ...scanners.safetensors_scanner import _validate_json_structural_token_limit
+def _loads_json_without_duplicate_keys(
+    raw: bytes,
+) -> tuple[Any | None, list[str], int, int, int, str | None]:
+    from ...scanners.safetensors_scanner import _safetensors_name_preview, _validate_json_structural_token_limit
 
     duplicate_keys: list[str] = []
     duplicate_key_count = 0
+    duplicate_key_utf8_bytes = 0
+    duplicate_key_preview_truncated_count = 0
 
     try:
         _validate_json_structural_token_limit(raw, _MAX_HF_SAFETENSORS_INDEX_JSON_TOKENS, "SafeTensors index")
     except ValueError as exc:
-        return None, [], 0, str(exc)
+        return None, [], 0, 0, 0, str(exc)
 
     def object_pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        nonlocal duplicate_key_count
+        nonlocal duplicate_key_count, duplicate_key_preview_truncated_count, duplicate_key_utf8_bytes
         obj: dict[str, Any] = {}
         seen: set[str] = set()
         overwritten_items: list[tuple[str, Any]] = []
@@ -1248,8 +1288,11 @@ def _loads_json_without_duplicate_keys(raw: bytes) -> tuple[Any | None, list[str
             if key in seen:
                 duplicate_key_count += 1
                 overwritten_items.append((key, obj[key]))
-                if key not in duplicate_keys and len(duplicate_keys) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
-                    duplicate_keys.append(key)
+                key_preview, key_utf8_bytes, preview_truncated = _safetensors_name_preview(key)
+                duplicate_key_utf8_bytes += key_utf8_bytes
+                duplicate_key_preview_truncated_count += int(preview_truncated)
+                if key_preview not in duplicate_keys and len(duplicate_keys) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
+                    duplicate_keys.append(key_preview)
             seen.add(key)
             obj[key] = value
         return _DuplicateAwareJsonObject(obj, overwritten_items)
@@ -1257,12 +1300,26 @@ def _loads_json_without_duplicate_keys(raw: bytes) -> tuple[Any | None, list[str
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        return None, [], 0, f"invalid UTF-8: {exc}"
+        return None, [], 0, 0, 0, f"invalid UTF-8: {exc}"
     try:
         parsed = json.loads(text, object_pairs_hook=object_pairs_hook)
     except json.JSONDecodeError as exc:
-        return None, [], duplicate_key_count, f"invalid JSON: {exc}"
-    return parsed, sorted(duplicate_keys), duplicate_key_count, None
+        return (
+            None,
+            [],
+            duplicate_key_count,
+            duplicate_key_utf8_bytes,
+            duplicate_key_preview_truncated_count,
+            f"invalid JSON: {exc}",
+        )
+    return (
+        parsed,
+        sorted(duplicate_keys),
+        duplicate_key_count,
+        duplicate_key_utf8_bytes,
+        duplicate_key_preview_truncated_count,
+        None,
+    )
 
 
 def _index_failure_details(
@@ -1338,6 +1395,8 @@ def _remote_safetensors_index_failure_result(
 
 def _tensor_name_digest(tensor_names: Collection[str], *, deadline: float | None = None) -> str:
     """Return an order-independent digest without retaining an unbounded name list."""
+    from ...scanners.safetensors_scanner import _update_safetensors_tensor_name_digest
+
     digest = hashlib.sha256()
     sorted_names = sorted(tensor_names)
     if deadline is not None and time.monotonic() >= deadline:
@@ -1345,9 +1404,7 @@ def _tensor_name_digest(tensor_names: Collection[str], *, deadline: float | None
     for index, name in enumerate(sorted_names):
         if index % 1024 == 0 and deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("SafeTensors index reconciliation timed out")
-        encoded = name.encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "little"))
-        digest.update(encoded)
+        _update_safetensors_tensor_name_digest(digest, name)
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("SafeTensors index reconciliation timed out")
     return digest.hexdigest()
@@ -1401,6 +1458,8 @@ def _remote_safetensors_index_details_by_file(
     retain_unscoped_failure: Callable[[str, dict[str, Any]], bool] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]]]:
     """Return per-shard details, stopping when an optional failure retainer rejects a result."""
+    from ...scanners.safetensors_scanner import _safetensors_name_preview
+
     selected_files = set(model_files)
     repo_file_set = set(repo_files)
     if not selected_files:
@@ -1471,9 +1530,14 @@ def _remote_safetensors_index_details_by_file(
             index_bytes_transferred = index_range.bytes_transferred
             total_index_bytes += index_range.bytes_transferred
             acquired_index_bytes[index_filename] = index_range.data
-            parsed, duplicate_keys, duplicate_key_count, parse_error = _loads_json_without_duplicate_keys(
-                index_range.data
-            )
+            (
+                parsed,
+                duplicate_keys,
+                duplicate_key_count,
+                duplicate_key_utf8_bytes,
+                duplicate_key_preview_truncated_count,
+                parse_error,
+            ) = _loads_json_without_duplicate_keys(index_range.data)
             if parse_error is not None:
                 raise ValueError(parse_error)
             if not isinstance(parsed, dict):
@@ -1511,20 +1575,54 @@ def _remote_safetensors_index_details_by_file(
             continue
 
         referenced_by_file: dict[str, list[str]] = {}
-        invalid_entries = ["weight_map occurrence is not a JSON object"] * invalid_weight_map_count
+        referenced_name_previews_by_file: dict[str, list[str]] = {}
+        referenced_name_utf8_bytes_by_file: dict[str, int] = {}
+        referenced_max_name_utf8_bytes_by_file: dict[str, int] = {}
+        referenced_name_preview_truncated_by_file: dict[str, int] = {}
+        index_tensor_name_utf8_bytes = 0
+        index_max_tensor_name_utf8_bytes = 0
+        index_tensor_name_preview_truncated_count = 0
+        invalid_entry_count = invalid_weight_map_count
+        invalid_entries = ["weight_map occurrence is not a JSON object"] * min(
+            invalid_weight_map_count,
+            _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS,
+        )
         reconciliation_timed_out = False
         for entry_index, (tensor_name, shard_name) in enumerate(weight_map_items):
             if entry_index % 1024 == 0 and deadline is not None and time.monotonic() >= deadline:
                 reconciliation_timed_out = True
                 break
             if not isinstance(tensor_name, str) or not tensor_name:
-                invalid_entries.append("<invalid tensor key>")
+                invalid_entry_count += 1
+                if len(invalid_entries) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
+                    invalid_entries.append("<invalid tensor key>")
                 continue
+            tensor_name_preview, tensor_name_utf8_bytes, tensor_name_preview_truncated = _safetensors_name_preview(
+                tensor_name
+            )
+            index_tensor_name_utf8_bytes += tensor_name_utf8_bytes
+            index_max_tensor_name_utf8_bytes = max(index_max_tensor_name_utf8_bytes, tensor_name_utf8_bytes)
+            index_tensor_name_preview_truncated_count += int(tensor_name_preview_truncated)
             normalized_path, invalid_reason = _normalize_safetensors_index_shard_path(index_filename, shard_name)
             if normalized_path is None:
-                invalid_entries.append(f"{tensor_name}: {invalid_reason}")
+                invalid_entry_count += 1
+                if len(invalid_entries) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
+                    invalid_entries.append(f"{tensor_name_preview}: {invalid_reason}")
                 continue
             referenced_by_file.setdefault(normalized_path, []).append(tensor_name)
+            previews = referenced_name_previews_by_file.setdefault(normalized_path, [])
+            if len(previews) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
+                previews.append(tensor_name_preview)
+            referenced_name_utf8_bytes_by_file[normalized_path] = (
+                referenced_name_utf8_bytes_by_file.get(normalized_path, 0) + tensor_name_utf8_bytes
+            )
+            referenced_max_name_utf8_bytes_by_file[normalized_path] = max(
+                referenced_max_name_utf8_bytes_by_file.get(normalized_path, 0),
+                tensor_name_utf8_bytes,
+            )
+            referenced_name_preview_truncated_by_file[normalized_path] = referenced_name_preview_truncated_by_file.get(
+                normalized_path, 0
+            ) + int(tensor_name_preview_truncated)
 
         if reconciliation_timed_out:
             failure = _index_failure_details(
@@ -1589,7 +1687,7 @@ def _remote_safetensors_index_details_by_file(
 
         index_complete = (
             not duplicate_keys
-            and not invalid_entries
+            and invalid_entry_count == 0
             and not missing_files
             and not unselected_files
             and not invalid_total_size
@@ -1604,6 +1702,9 @@ def _remote_safetensors_index_details_by_file(
             "index_object_validator": index_range.validator,
             "index_final_host": urlparse(index_range.final_url).hostname,
             "index_weight_map_tensor_count": len(weight_map_items),
+            "index_tensor_name_utf8_bytes": index_tensor_name_utf8_bytes,
+            "index_max_tensor_name_utf8_bytes": index_max_tensor_name_utf8_bytes,
+            "index_tensor_name_preview_truncated_count": index_tensor_name_preview_truncated_count,
             "index_referenced_shard_count": len(referenced_files),
             "index_missing_shard_count": len(missing_files),
             "index_missing_shards": missing_files[:20],
@@ -1611,12 +1712,16 @@ def _remote_safetensors_index_details_by_file(
             "index_unselected_shard_count": len(unselected_files),
             "index_unselected_shards": unselected_files[:20],
             "index_unselected_shards_truncated": len(unselected_files) > 20,
-            "index_invalid_entry_count": len(invalid_entries),
-            "index_invalid_entries": invalid_entries[:20],
-            "index_invalid_entries_truncated": len(invalid_entries) > 20,
+            "index_invalid_entry_count": invalid_entry_count,
+            "index_invalid_entries": invalid_entries,
+            "index_invalid_entries_truncated": invalid_entry_count > len(invalid_entries),
             "index_duplicate_json_key_count": duplicate_key_count,
+            "index_duplicate_json_key_utf8_bytes": duplicate_key_utf8_bytes,
+            "index_duplicate_json_key_preview_truncated_count": duplicate_key_preview_truncated_count,
             "index_duplicate_json_keys": duplicate_keys[:20],
-            "index_duplicate_json_keys_truncated": duplicate_key_count > len(duplicate_keys),
+            "index_duplicate_json_keys_truncated": (
+                duplicate_key_count > len(duplicate_keys) or duplicate_key_preview_truncated_count > 0
+            ),
             "index_metadata_total_size": metadata_total_size,
             "index_metadata_total_size_plausible": not invalid_total_size,
             "index_metadata_total_size_verified": None if metadata_total_size is None else False,
@@ -1634,7 +1739,7 @@ def _remote_safetensors_index_details_by_file(
         }
         attach_filenames = (
             sorted(filename_family.union(selected_referenced))
-            if duplicate_keys or invalid_entries or invalid_total_size or not selected_referenced
+            if duplicate_keys or invalid_entry_count or invalid_total_size or not selected_referenced
             else selected_referenced
         )
         if not attach_filenames and not index_complete and not record_failure(index_filename, common_details, ()):
@@ -1644,8 +1749,19 @@ def _remote_safetensors_index_details_by_file(
             tensors = referenced_by_file.get(filename, [])
             details["index_referenced_by_manifest"] = filename in referenced_by_file
             details["index_tensor_count_for_shard"] = len(tensors)
-            details["index_tensor_names_for_shard"] = tensors[:20]
-            details["index_tensor_names_for_shard_truncated"] = len(tensors) > 20
+            tensor_name_previews = referenced_name_previews_by_file.get(filename, [])
+            details["index_tensor_names_for_shard"] = tensor_name_previews
+            details["index_tensor_name_utf8_bytes_for_shard"] = referenced_name_utf8_bytes_by_file.get(filename, 0)
+            details["index_max_tensor_name_utf8_bytes_for_shard"] = referenced_max_name_utf8_bytes_by_file.get(
+                filename, 0
+            )
+            details["index_tensor_name_preview_truncated_count_for_shard"] = (
+                referenced_name_preview_truncated_by_file.get(filename, 0)
+            )
+            details["index_tensor_names_for_shard_truncated"] = (
+                len(tensors) > len(tensor_name_previews)
+                or referenced_name_preview_truncated_by_file.get(filename, 0) > 0
+            )
             details["index_tensor_names_digest"] = tensor_digests_by_file.get(filename, _tensor_name_digest(()))
             attach_details(filename, details)
 
@@ -3229,7 +3345,13 @@ def _validate_huggingface_repo_filename(repo_id: str, filename: str) -> str:
             "Hugging Face repository inventory incomplete: repository filename exceeds "
             f"the bounded path length ({_MAX_HF_REPOSITORY_PATH_CHARS}) for {repo_id}"
         )
-    if not filename or filename.startswith("/") or "\x00" in filename or "\\" in filename:
+    if (
+        not filename
+        or filename.startswith("/")
+        or "\x00" in filename
+        or "\\" in filename
+        or bool(ntpath.splitdrive(filename)[0])
+    ):
         raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
     if any(ord(character) < 32 or ord(character) == 127 for character in filename):
         raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
@@ -3238,6 +3360,16 @@ def _validate_huggingface_repo_filename(repo_id: str, filename: str) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
     return filename
+
+
+def _private_huggingface_acquired_index_candidate(
+    temp_root: PurePath,
+    repo_id: str,
+    filename: str,
+) -> PurePath:
+    """Return a fixed private index path after validating remote identity separately."""
+    _validate_huggingface_repo_filename(repo_id, filename)
+    return temp_root / _HF_ACQUIRED_SAFETENSORS_INDEX_BASENAME
 
 
 def _normalize_huggingface_repo_files(repo_id: str, filenames: Collection[str]) -> list[str]:
@@ -5534,6 +5666,11 @@ def download_model_streaming(
                     if source_bytes_preaccounted is None
                     else source_bytes_preaccounted
                 ),
+                source_path=(
+                    _remote_safetensors_source_path(repo_id, download_revision, filename)
+                    if precomputed_result is None and filename in preaccounted_acquired_index_bytes
+                    else None
+                ),
             )
             pending_pretransferred_bytes = 0
             if accounting.pretransferred_bytes or accounting.source_bytes_preaccounted:
@@ -5630,13 +5767,18 @@ def download_model_streaming(
             payload = acquired_index_bytes.get(filename)
             if payload is None:
                 return None
-            validated_filename = _validate_huggingface_repo_filename(repo_id, filename)
             temp_dir = tempfile.TemporaryDirectory(
                 prefix=".modelaudit_hf_index_" if download_path is not None else "modelaudit_hf_index_",
                 dir=download_path,
             )
             try:
-                temp_path = Path(temp_dir.name).joinpath(*PurePosixPath(validated_filename).parts)
+                temp_root = Path(temp_dir.name).resolve()
+                candidate = _private_huggingface_acquired_index_candidate(temp_root, repo_id, filename)
+                temp_path = Path(candidate).resolve(strict=False)
+                try:
+                    temp_path.relative_to(temp_root)
+                except ValueError as exc:
+                    raise ValueError("Private Hugging Face index path escaped its temporary root") from exc
                 temp_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path.write_bytes(payload)
             except Exception:
@@ -5824,6 +5966,26 @@ def download_model_streaming(
                     continue
 
                 if filename in safetensors_header_files:
+                    preflight_budget_failure = safetensors_retention_budget.preflight_result_count()
+                    if preflight_budget_failure is not None:
+                        preflight_candidate = _remote_safetensors_failure_result(
+                            repo_id,
+                            filename,
+                            download_revision,
+                            declared_size=selected_sizes[filename],
+                            bytes_transferred=0,
+                            reason=_HF_SAFETENSORS_RESULT_BUDGET_REASON,
+                            error=ValueError("repository retained SafeTensors result count preflight failed"),
+                        )
+                        scan_result = _remote_safetensors_result_budget_failure_result(
+                            repo_id,
+                            filename,
+                            download_revision,
+                            preflight_candidate,
+                            preflight_budget_failure,
+                        )
+                        yield make_streamed_item(filename, Path(filename), True, scan_result)
+                        return
                     scan_result = scan_remote_safetensors(filename)
                     scan_result, result_budget_exhausted = apply_safetensors_retention_budget(filename, scan_result)
                     yield make_streamed_item(
