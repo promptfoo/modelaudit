@@ -2179,6 +2179,58 @@ def create_constant_of_shape_weight_model(
     return path
 
 
+def create_generated_zero_dequantize_weight_model(
+    tmp_path: Path,
+    *,
+    zero_point: int,
+    malformed_scale: bool = False,
+) -> Path:
+    scale_value = (
+        np.ones(2, dtype=np.float32)
+        if malformed_scale
+        else np.ones(10, dtype=np.float32)
+        if zero_point
+        else np.asarray(1.0, dtype=np.float32)
+    )
+    zero_point_value = np.full(10, zero_point, dtype=np.int8) if zero_point else np.asarray(0, dtype=np.int8)
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "ConstantOfShape",
+                ["weight_shape"],
+                ["quantized_zero"],
+                value=helper.make_tensor("fill", TensorProto.INT8, [1], [0]),
+            ),
+            helper.make_node(
+                "DequantizeLinear",
+                ["quantized_zero", "scale", "zero_point"],
+                ["W"],
+            ),
+            helper.make_node("MatMul", ["X", "W"], ["Y"]),
+        ],
+        "generated_zero_dequantize_weight",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[
+            onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="weight_shape"),
+            onnx.numpy_helper.from_array(scale_value, name="scale"),
+            onnx.numpy_helper.from_array(zero_point_value, name="zero_point"),
+        ],
+        value_info=[
+            helper.make_tensor_value_info("quantized_zero", TensorProto.INT8, [100, 10]),
+            helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10]),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    path = tmp_path / f"generated-zero-dequantize-zp-{zero_point}-scale-{malformed_scale}.onnx"
+    if malformed_scale:
+        onnx.save(model, str(path))
+    else:
+        _save_checked_onnx_model(model, path)
+    return path
+
+
 def create_generated_zero_value_transform_model(
     tmp_path: Path,
     *,
@@ -3299,6 +3351,76 @@ def create_local_function_weight_model(tmp_path: Path, weights: np.ndarray) -> P
     )
     model.ir_version = 8
     path = tmp_path / "local-function-weight.onnx"
+    _save_checked_onnx_model(model, path)
+    return path
+
+
+def create_local_qlinear_matmul_collision_model(
+    tmp_path: Path,
+    *,
+    malicious_decoy: bool,
+    malicious_weight: bool,
+) -> Path:
+    decoy = np.zeros((100, 10), dtype=np.int8)
+    if malicious_decoy:
+        decoy[50:55, 3] = 100
+    weights = np.zeros((100, 10), dtype=np.float32)
+    if malicious_weight:
+        weights[50:55, 3] = 100.0
+    function_inputs = [
+        "decoy",
+        "decoy_scale",
+        "decoy_zero_point",
+        "weight",
+        "scale",
+        "zero_point",
+        "output_scale",
+        "output_zero_point",
+    ]
+    function = helper.make_function(
+        "",
+        "QLinearMatMul",
+        function_inputs,
+        ["function_weight"],
+        [helper.make_node("Identity", ["weight"], ["function_weight"])],
+        [helper.make_opsetid("", 13)],
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "QLinearMatMul",
+                [
+                    "decoy",
+                    "decoy_scale",
+                    "decoy_zero_point",
+                    "weight",
+                    "scale",
+                    "zero_point",
+                    "output_scale",
+                    "output_zero_point",
+                ],
+                ["W"],
+            ),
+            helper.make_node("MatMul", ["X", "W"], ["Y"]),
+        ],
+        "local_qlinear_matmul_collision",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[
+            onnx.numpy_helper.from_array(decoy, name="decoy"),
+            onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="decoy_scale"),
+            onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="decoy_zero_point"),
+            onnx.numpy_helper.from_array(weights, name="weight"),
+            onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="scale"),
+            onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="zero_point"),
+            onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="output_scale"),
+            onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="output_zero_point"),
+        ],
+        value_info=[helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10])],
+    )
+    model = helper.make_model(graph, functions=[function], opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / f"local-qlinear-collision-{malicious_decoy}-{malicious_weight}.onnx"
     _save_checked_onnx_model(model, path)
     return path
 
@@ -8905,6 +9027,42 @@ class TestWeightDistributionSemantics:
         assert semantics["unresolved_lineage_samples"][0]["initializer"] == "W"
         assert semantics["unresolved_lineage_samples"][0]["reason"] == "generated_constant_of_shape_lineage"
 
+    @pytest.mark.parametrize(
+        ("zero_point", "malformed_scale"),
+        [
+            pytest.param(0, False, id="effective-zero"),
+            pytest.param(1, False, id="shifted-nonzero"),
+            pytest.param(0, True, id="malformed-scale"),
+        ],
+    )
+    def test_generated_zero_dequantize_requires_effective_zero_proof(
+        self,
+        tmp_path: Path,
+        zero_point: int,
+        malformed_scale: bool,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(
+                create_generated_zero_dequantize_weight_model(
+                    tmp_path,
+                    zero_point=zero_point,
+                    malformed_scale=malformed_scale,
+                )
+            )
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        expected_success = zero_point == 0 and not malformed_scale
+        assert result.success is expected_success
+        assert semantics["analyzed_initializer_count"] == 0
+        if expected_success:
+            assert semantics["eligible_initializer_count"] == 0
+            assert semantics["coverage_gaps"] == {}
+        else:
+            assert semantics["eligible_initializer_count"] == 1
+            assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+            assert semantics["unresolved_lineage_samples"][0]["reason"] == "generated_value_lineage_unproven"
+
     @pytest.mark.parametrize("fill_value", [0.0, 100.0])
     def test_padded_constant_of_shape_weight_preserves_generated_lineage_without_promoting_metadata(
         self,
@@ -9944,6 +10102,28 @@ class TestWeightDistributionSemantics:
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
         assert result.metadata["onnx_weight_distribution_semantics"]["analyzed_layer_count"] == 1
 
+    @pytest.mark.parametrize("malicious_weight", [False, True], ids=["benign-weight", "malicious-weight"])
+    def test_local_quantized_operator_collision_uses_function_body_semantics(
+        self,
+        tmp_path: Path,
+        malicious_weight: bool,
+    ) -> None:
+        model_path = create_local_qlinear_matmul_collision_model(
+            tmp_path,
+            malicious_decoy=not malicious_weight,
+            malicious_weight=malicious_weight,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious_weight)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
+        assert semantics["eligible"][0]["initializer"] == "weight"
+
     def test_repeated_function_constant_is_one_physical_initializer(self, tmp_path: Path) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)
         model_path = create_repeated_local_function_default_weight_model(tmp_path, weights)
@@ -10595,6 +10775,48 @@ class TestWeightDistributionSemantics:
             for path in (first, second)
         )
         assert not any(issue.details.get("clustered_onnx_weight_anomaly") is True for issue in aggregate.issues)
+
+    @pytest.mark.parametrize("invalid_sidecar", ["missing", "traversal"])
+    def test_invalid_declared_external_data_disables_package_identity_and_clustering(
+        self,
+        tmp_path: Path,
+        invalid_sidecar: str,
+    ) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        paths = [create_external_onnx_weight_package(tmp_path / name, weights) for name in ("invalid-a", "invalid-b")]
+        for path in paths:
+            sidecar = path.parent / "weights.bin"
+            if invalid_sidecar == "missing":
+                sidecar.unlink()
+            else:
+                model = onnx.load(str(path), load_external_data=False)
+                model.graph.initializer[0].external_data[0].value = "../outside.bin"
+                onnx.save(model, str(path))
+                sidecar.unlink()
+        if invalid_sidecar == "traversal":
+            (tmp_path / "outside.bin").write_bytes(weights.tobytes())
+
+        assert all(modelaudit_core._streamed_onnx_external_data_hash_paths(path) is None for path in paths)
+        aggregate = scan_model_directory_or_file(
+            str(tmp_path),
+            recursive=True,
+            scanners=["onnx"],
+            cache_enabled=False,
+        )
+
+        assert all(
+            getattr(aggregate.file_metadata[str(path)], "onnx_package_hash_complete", None) is False for path in paths
+        )
+        assert not any(issue.details.get("clustered_onnx_weight_anomaly") is True for issue in aggregate.issues)
+
+    def test_complete_declared_external_data_retains_package_identity(self, tmp_path: Path) -> None:
+        path = create_external_onnx_weight_package(tmp_path / "complete", np.zeros((100, 10), dtype=np.float32))
+
+        assert modelaudit_core._streamed_onnx_external_data_hash_paths(path) == [path.parent / "weights.bin"]
+        aggregate = scan_model_directory_or_file(str(path.parent), scanners=["onnx"], cache_enabled=False)
+
+        assert getattr(aggregate.file_metadata[str(path)], "onnx_package_hash_complete", None) is True
 
     def test_aggregate_preserves_distinct_analysis_groups_within_one_file(self, tmp_path: Path) -> None:
         model_path = create_qlinear_matmul_group_fanout_model(tmp_path, consumer_count=2)

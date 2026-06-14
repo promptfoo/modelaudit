@@ -1302,7 +1302,7 @@ def _streamed_onnx_external_data_hash_paths(
             _resolve_external_location_lexically,
         )
     except Exception:
-        return []
+        return None
 
     try:
         model_path = Path(os.path.abspath(path))
@@ -1318,14 +1318,14 @@ def _streamed_onnx_external_data_hash_paths(
     except _OnnxStructureParseError:
         return None
     except Exception:
-        return []
+        return None
 
     model_dir = model_path.parent
     lexical_model_dir = Path(os.path.abspath(model_dir))
     try:
         resolved_model_dir = model_dir.resolve()
     except OSError:
-        return []
+        return None
 
     external_paths: list[Path] = []
     seen_external_paths: set[Path] = set()
@@ -1334,10 +1334,12 @@ def _streamed_onnx_external_data_hash_paths(
             if getattr(tensor, "data_location", None) != onnx.TensorProto.EXTERNAL:
                 continue
             if not getattr(tensor, "external_data", ()):
-                continue
+                return None
             info: dict[str, str] = {}
             for entry in tensor.external_data:
                 check_discovery_interrupted()
+                if entry.key in info:
+                    return None
                 info[entry.key] = entry.value
             location = info.get("location")
             if (
@@ -1346,15 +1348,18 @@ def _streamed_onnx_external_data_hash_paths(
                 or "\x00" in location
                 or _is_windows_absolute_path(location)
             ):
-                continue
+                return None
 
             lexical_external_path = _resolve_external_location_lexically(model_dir, location)
             try:
                 lexical_external_path.relative_to(lexical_model_dir)
             except ValueError:
-                continue
+                return None
 
-            external_path = _resolve_external_location(model_dir, location)
+            try:
+                external_path = _resolve_external_location(model_dir, location)
+            except (OSError, RuntimeError):
+                return None
             external_hash_path = external_path
             if not is_within_directory(str(resolved_model_dir), str(external_path)):
                 if not _is_trusted_huggingface_cache_external_alias(
@@ -1362,10 +1367,10 @@ def _streamed_onnx_external_data_hash_paths(
                     lexical_external_path,
                     external_path,
                 ):
-                    continue
+                    return None
                 external_hash_path = lexical_external_path
             if not external_hash_path.is_file():
-                continue
+                return None
             if external_path in seen_external_paths:
                 continue
             seen_external_paths.add(external_path)

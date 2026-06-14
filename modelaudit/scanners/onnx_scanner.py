@@ -386,7 +386,14 @@ def _onnx_gather_axis(node: Any, rank: int) -> int | None:
     return axis if 0 <= axis < rank else None
 
 
-def _onnx_quantized_weight_input(node: Any, input_index: int) -> bool:
+def _onnx_quantized_weight_input(
+    node: Any,
+    input_index: int,
+    *,
+    is_model_local_function: bool = False,
+) -> bool:
+    if is_model_local_function:
+        return False
     if getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
         return False
     return (str(getattr(node, "op_type", "")), input_index) in _QUANTIZED_WEIGHT_INPUT_METADATA
@@ -1447,6 +1454,8 @@ def _onnx_potential_weight_input(
     is_registered_standard_operator: bool = True,
 ) -> bool:
     """Return whether initializer lineage at this input needs weight coverage."""
+    if is_model_local_function:
+        return False
     domain = getattr(node, "domain", "")
     if domain not in _STANDARD_NEURAL_NETWORK_DOMAINS:
         # ONNX-ML operators store learned parameters in attributes; tensor inputs are data.
@@ -1457,7 +1466,11 @@ def _onnx_potential_weight_input(
         )
     if node.op_type in {"Gemm", "MatMul"}:
         return input_index in {0, 1}
-    if _onnx_quantized_weight_input(node, input_index):
+    if _onnx_quantized_weight_input(
+        node,
+        input_index,
+        is_model_local_function=is_model_local_function,
+    ):
         return True
     if node.op_type in {"Conv", "ConvTranspose"}:
         return input_index == 1
@@ -2624,6 +2637,8 @@ def _build_onnx_weight_analysis_plan(
 
         if node.op_type == "Cast" and _onnx_int_attribute(node, "to", -1) not in zero_preserving_cast_types:
             return False
+        if node.op_type == "DequantizeLinear":
+            return input_is_zero(0)
         if node.op_type in _ZERO_PRESERVING_DATA_OPERATORS:
             data_indexes = _STANDARD_DATA_LINEAGE_INPUT_INDEXES.get(node.op_type, frozenset({0}))
             return bool(data_indexes) and all(input_is_zero(input_index) for input_index in data_indexes)
@@ -2951,7 +2966,8 @@ def _build_onnx_weight_analysis_plan(
                 input_index
                 for input_index, input_name in enumerate(node.input)
                 for lineage in value_lineages.get(str(input_name), {}).values()
-                if lineage.unresolved_reason is None
+                if not is_model_local_function
+                and lineage.unresolved_reason is None
                 and _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))[0] is not None
             }
             lineage_input_indexes = {
@@ -3090,6 +3106,9 @@ def _build_onnx_weight_analysis_plan(
                                 node,
                                 input_index,
                             )
+                        continue
+                    if is_model_local_function:
+                        record_exclusion(initializer_index, "model_local_function_input", node, input_index)
                         continue
                     output_axes, reason = _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))
                     if output_axes is None:
@@ -3509,6 +3528,17 @@ def _build_onnx_weight_analysis_plan(
                 is_registered_standard_operator=is_registered_standard_operator,
                 opset_versions=opset_versions,
             )
+            if zero_output_proven and node.op_type == "DequantizeLinear":
+                dequantized_zero_lineages = [
+                    lineage
+                    for initializer_index, lineage in output_lineages.items()
+                    if initializer_index in zero_source_indexes
+                ]
+                zero_output_proven = bool(dequantized_zero_lineages) and all(
+                    lineage.quantization is not None
+                    and quantized_zero_value_is_proven(lineage, lineage.quantization, constants)
+                    for lineage in dequantized_zero_lineages
+                )
             if zero_output_proven:
                 generic_zero_safe_reasons = {
                     None,
