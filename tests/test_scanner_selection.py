@@ -952,6 +952,11 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
             id="comment-prefixed-GLOBAL",
         ),
         pytest.param(_overlapping_global_candidate_in_legal_text(), 2, id="overlapping-comment-GLOBAL"),
+        pytest.param(
+            b"MIT License\nCopyright Y2IK eAou\n",
+            1,
+            id="base64-same-line-prose-prefix",
+        ),
         pytest.param(b"MIT License\nY2IK eAou\n", 1, id="base64-intra-line-whitespace"),
         pytest.param(b"MIT License\n63620a 780a2e\n", 1, id="hex-intra-line-whitespace"),
         pytest.param(b"MIT License\nY 2IKeAou\n", 1, id="base64-unaligned-intra-line-whitespace"),
@@ -972,6 +977,7 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         pytest.param(b"MIT License\ngwEA\n", 1, id="base64-unpadded-alphabetic-EXT2"),
         pytest.param(b"MIT License\nggE\n", 1, id="base64-unpadded-alphabetic-EXT1"),
         pytest.param(b"MIT License\nlw\n", 1, id="base64-unpadded-alphabetic-NEXT_BUFFER"),
+        pytest.param(b"MIT License\ngASMAWGMAWGTLg\n", 1, id="base64-alphabetic-protocol-STACK_GLOBAL"),
         pytest.param(
             b"MIT License\nAA AA\ng g\nE\n",
             1,
@@ -1037,6 +1043,20 @@ def test_scan_file_routes_malicious_lightgbm_named_license_before_text(tmp_path:
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
+    )
+
+
+def test_scan_file_routes_oversized_lightgbm_named_license_before_text(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    payload = _malicious_lightgbm_legal_payload()
+    path.write_bytes(payload + (b" " * (_LEGAL_TEXT_ROUTE_MAX_BYTES + 1 - len(payload))))
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.scanner_names == ["lightgbm"]
+    assert determine_exit_code(result) == 1
+    assert any(
+        check.name == "Command Indicator Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
 
 
@@ -1107,8 +1127,10 @@ def test_scan_file_keeps_benign_encoded_execution_word_on_text_route(
             id="base64-word-groups",
         ),
         pytest.param(b"MIT License\ngroups\n", id="standalone-base64-word-groups"),
+        pytest.param(b"MIT License\nCopyright grou ps\n", id="same-line-base64-word-groups"),
+        pytest.param(b"MIT License\ngAROLg\n", id="base64-alphabetic-benign-protocol"),
         pytest.param(
-            b"MIT License\nAA AA\ng r\nou ps\n",
+            b"MIT License\nAA AA\ng r o u\np s\n",
             id="base64-split-word-groups-alignment-collision",
         ),
         pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),

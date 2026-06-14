@@ -4074,6 +4074,11 @@ def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_pa
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="base64-prefixed-STACK_GLOBAL",
         ),
+        pytest.param(
+            b"MIT License\nCopyright Y2IK eAou\n",
+            "pickle",
+            id="base64-same-line-prose-prefix",
+        ),
         pytest.param(b"MIT License\nY2IK eAou\n", "pickle", id="base64-intra-line-whitespace"),
         pytest.param(b"MIT License\n63620a 780a2e\n", "pickle", id="hex-intra-line-whitespace"),
         pytest.param(b"MIT License\nY 2IKeAou\n", "pickle", id="base64-unaligned-intra-line-whitespace"),
@@ -4106,6 +4111,11 @@ def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_pa
         pytest.param(b"MIT License\ngwEA\n", "pickle", id="base64-unpadded-alphabetic-EXT2"),
         pytest.param(b"MIT License\nggE\n", "pickle", id="base64-unpadded-alphabetic-EXT1"),
         pytest.param(b"MIT License\nlw\n", "pickle", id="base64-unpadded-alphabetic-NEXT_BUFFER"),
+        pytest.param(
+            b"MIT License\ngASMAWGMAWGTLg\n",
+            "pickle",
+            id="base64-alphabetic-protocol-STACK_GLOBAL",
+        ),
         pytest.param(
             b"MIT License\nAA AA\ng g\nE\n",
             "pickle",
@@ -4164,8 +4174,10 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
             id="base64-word-groups",
         ),
         pytest.param(b"MIT License\ngroups\n", id="standalone-base64-word-groups"),
+        pytest.param(b"MIT License\nCopyright grou ps\n", id="same-line-base64-word-groups"),
+        pytest.param(b"MIT License\ngAROLg\n", id="base64-alphabetic-benign-protocol"),
         pytest.param(
-            b"MIT License\nAA AA\ng r\nou ps\n",
+            b"MIT License\nAA AA\ng r o u\np s\n",
             id="base64-split-word-groups-alignment-collision",
         ),
         pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),
@@ -4504,6 +4516,40 @@ def test_structured_model_named_license_precedes_legal_text_fallback(
 ) -> None:
     path = tmp_path / "LICENSE"
     path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(path)) == expected_format
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_format"),
+    [
+        pytest.param(_lightgbm_text_payload("license=MIT License"), "lightgbm", id="lightgbm"),
+        pytest.param(
+            b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions",
+            "cntk",
+            id="cntk",
+        ),
+        pytest.param(
+            b'{"framework":"jax","orbax_version":"0.1.0","license":"MIT License"}',
+            "jax_checkpoint",
+            id="jax-json",
+        ),
+        pytest.param(
+            b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+            "jinja2_template",
+            id="renamed-tokenizer-template",
+        ),
+    ],
+)
+def test_oversized_structured_model_named_license_precedes_legal_text_limit(
+    tmp_path: Path,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload + (b" " * (file_detection._LEGAL_TEXT_ROUTE_MAX_BYTES + 1 - len(payload))))
 
     assert detect_file_format(str(path)) == expected_format
     assert detect_file_format_from_magic(str(path)) == expected_format

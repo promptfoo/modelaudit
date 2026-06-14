@@ -11362,6 +11362,11 @@ class TestZipScanner:
                 id="comment-prefixed-GLOBAL",
             ),
             pytest.param(_overlapping_global_candidate_in_legal_text(), 2, id="overlapping-comment-GLOBAL"),
+            pytest.param(
+                b"MIT License\nCopyright Y2IK eAou\n",
+                1,
+                id="base64-same-line-prose-prefix",
+            ),
             pytest.param(b"MIT License\nY2IK eAou\n", 1, id="base64-intra-line-whitespace"),
             pytest.param(b"MIT License\n63620a 780a2e\n", 1, id="hex-intra-line-whitespace"),
             pytest.param(b"MIT License\nY 2IKeAou\n", 1, id="base64-unaligned-intra-line-whitespace"),
@@ -11386,6 +11391,11 @@ class TestZipScanner:
             pytest.param(b"MIT License\ngwEA\n", 1, id="base64-unpadded-alphabetic-EXT2"),
             pytest.param(b"MIT License\nggE\n", 1, id="base64-unpadded-alphabetic-EXT1"),
             pytest.param(b"MIT License\nlw\n", 1, id="base64-unpadded-alphabetic-NEXT_BUFFER"),
+            pytest.param(
+                b"MIT License\ngASMAWGMAWGTLg\n",
+                1,
+                id="base64-alphabetic-protocol-STACK_GLOBAL",
+            ),
             pytest.param(
                 b"MIT License\nAA AA\ng g\nE\n",
                 1,
@@ -11448,8 +11458,10 @@ class TestZipScanner:
                 id="base64-word-groups",
             ),
             pytest.param(b"MIT License\ngroups\n", id="standalone-base64-word-groups"),
+            pytest.param(b"MIT License\nCopyright grou ps\n", id="same-line-base64-word-groups"),
+            pytest.param(b"MIT License\ngAROLg\n", id="base64-alphabetic-benign-protocol"),
             pytest.param(
-                b"MIT License\nAA AA\ng r\nou ps\n",
+                b"MIT License\nAA AA\ng r o u\np s\n",
                 id="base64-split-word-groups-alignment-collision",
             ),
             pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),
@@ -11676,6 +11688,23 @@ class TestZipScanner:
             and check.severity == IssueSeverity.CRITICAL
             and check.location == f"{archive_path}:{member_name}"
             and check.details.get("zip_entry") == member_name
+            for check in result.checks
+        )
+
+    def test_scan_zip_routes_oversized_lightgbm_license_member_before_text(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "oversized_lightgbm_license.zip"
+        payload = _malicious_lightgbm_legal_payload()
+        payload += b" " * (file_detection._LEGAL_TEXT_ROUTE_MAX_BYTES + 1 - len(payload))
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", payload)
+
+        result = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert core.determine_exit_code(result) == 1
+        assert any(
+            check.name == "Command Indicator Check"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("zip_entry") == "LICENSE"
             for check in result.checks
         )
 

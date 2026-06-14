@@ -5918,10 +5918,17 @@ def _decoded_base64_has_exact_weak_pickle_signal(decoded: bytes) -> bool:
     )
 
 
+def _decoded_base64_has_line_or_protocol_pickle_signal(decoded: bytes) -> bool:
+    return (
+        _looks_like_binary_pickle_protocol(decoded[:4])
+        or _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(decoded) is not None
+    )
+
+
 def _decoded_alphabetic_base64_has_pickle_signal(decoded: bytes) -> bool:
-    return _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(
+    return _decoded_base64_has_line_or_protocol_pickle_signal(decoded) or _decoded_base64_has_exact_weak_pickle_signal(
         decoded
-    ) is not None or _decoded_base64_has_exact_weak_pickle_signal(decoded)
+    )
 
 
 def _alphabetic_base64_has_pickle_signal(token: bytes) -> bool:
@@ -5934,6 +5941,13 @@ def _alphabetic_base64_has_pickle_signal(token: bytes) -> bool:
 def _alphabetic_base64_has_exact_weak_pickle_signal(token: bytes) -> bool:
     try:
         return _decoded_base64_has_exact_weak_pickle_signal(_decode_base64_route_token(token))
+    except (binascii.Error, ValueError):
+        return False
+
+
+def _alphabetic_base64_has_line_or_protocol_pickle_signal(token: bytes) -> bool:
+    try:
+        return _decoded_base64_has_line_or_protocol_pickle_signal(_decode_base64_route_token(token))
     except (binascii.Error, ValueError):
         return False
 
@@ -5983,14 +5997,24 @@ def _iter_encoded_route_tokens(
                 yield encoded_line
 
             line_start = len(block)
-            if normalized_alphabetic_prose:
-                alphabetic_starts.setdefault(line_start % 4, line_start)
-            elif trusted_start is None:
+            if not normalized_alphabetic_prose and trusted_start is None:
                 trusted_start = line_start
+            line_alignment_starts: dict[int, int] = {}
             if alphabetic_whitespace_is_prose:
-                recent_starts.append(line_start)
+                compact_offset = 0
+                for segment in re.split(rb"[ \t]+", line):
+                    segment_start = line_start + compact_offset
+                    recent_starts.append(segment_start)
+                    if encoded_line != line:
+                        alphabetic_starts.setdefault(segment_start % 4, segment_start)
+                        line_alignment_starts.setdefault(segment_start % 4, segment_start)
+                    compact_offset += len(segment)
             block.extend(encoded_line)
             if alphabetic_whitespace_is_prose:
+                for start in line_alignment_starts.values():
+                    token = bytes(block[start:])
+                    if _alphabetic_base64_has_line_or_protocol_pickle_signal(token):
+                        yield token
                 while recent_starts and len(block) - recent_starts[0] > _WEAK_DECODED_BASE64_MAX_CHARS:
                     recent_starts.popleft()
             if b"=" not in encoded_line:
@@ -6000,8 +6024,13 @@ def _iter_encoded_route_tokens(
         trusted_start = None
     yield from flush_block()
 
-    for match in token_re.finditer(payload):
-        yield match.group(0)
+    for raw_line in payload.splitlines():
+        line = raw_line.strip(b" \t")
+        compact_line = line.translate(None, b" \t")
+        if compact_line and token_re.fullmatch(compact_line) is not None:
+            continue
+        for match in token_re.finditer(raw_line):
+            yield match.group(0)
 
 
 def _encoded_pickle_route(
@@ -9792,18 +9821,11 @@ def _detect_content_routed_signature_model(
     return None
 
 
-def _resolve_legal_text_sidecar_route(
+def _detect_structured_legal_sidecar_route(
     file_path: Path,
     file_size: int,
     prefix: bytes,
-    *,
-    logical_name: str | None,
 ) -> str | None:
-    """Preserve structured-model authority over a validated text fallback."""
-    legal_text_route = _detect_legal_text_sidecar_route(file_path, file_size, logical_name=logical_name)
-    if legal_text_route != "text":
-        return legal_text_route
-
     torch7_probe_size = min(file_size, _TORCH7_SIGNATURE_READ_BYTES)
     torch7_prefix = prefix[:torch7_probe_size]
     if len(torch7_prefix) < torch7_probe_size:
@@ -9824,7 +9846,28 @@ def _resolve_legal_text_sidecar_route(
         )
         if xgboost_route is not None:
             return xgboost_route
-    return "text"
+    return None
+
+
+def _resolve_legal_text_sidecar_route(
+    file_path: Path,
+    file_size: int,
+    prefix: bytes,
+    *,
+    logical_name: str | None,
+) -> str | None:
+    """Preserve structured-model authority over a validated text fallback."""
+    if not _is_legal_text_sidecar_name(file_path, logical_name):
+        return None
+    if file_size > _LEGAL_TEXT_ROUTE_MAX_BYTES:
+        structured_route = _detect_structured_legal_sidecar_route(file_path, file_size, prefix)
+        if structured_route is not None:
+            return structured_route
+
+    legal_text_route = _detect_legal_text_sidecar_route(file_path, file_size, logical_name=logical_name)
+    if legal_text_route != "text":
+        return legal_text_route
+    return _detect_structured_legal_sidecar_route(file_path, file_size, prefix) or "text"
 
 
 def detect_file_format_from_magic(path: str, *, logical_name: str | None = None) -> str:
