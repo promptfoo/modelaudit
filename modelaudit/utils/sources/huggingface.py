@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from bisect import bisect_left
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -3174,18 +3175,15 @@ def _skip_hf_safetensors_probe_candidate(
     *,
     allow_index_expansion: bool,
     selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
 ) -> bool:
-    """Mirror filtered SafeTensors exclusions in content and metadata-only plans."""
-    if allow_index_expansion:
+    """Skip index metadata only when no selected content route can claim it."""
+    if not _is_hf_safetensors_index_filename(filename):
         return False
-    if selected_route_scanner_ids is not None and not _hf_safetensors_routes_excluded_by_selection(
+    return allow_index_expansion or _hf_safetensors_routes_excluded_by_selection(
         selected_route_scanner_ids,
-        None,
-    ):
-        return False
-    if _is_hf_safetensors_index_filename(filename):
-        return True
-    return filename.lower().endswith(".safetensors")
+        selected_route_formats,
+    )
 
 
 def _hf_safetensors_index_stem(filename: str) -> str | None:
@@ -3215,6 +3213,7 @@ def _select_huggingface_model_files(
     inaccessible_probe_files: list[str] | None = None,
     allow_safetensors_index_expansion: bool = True,
     scannable_scanner_ids: Collection[str] | None = None,
+    restrict_content_routes_to_model_extensions: bool = False,
     deadline: float | None = None,
 ) -> list[str]:
     """Select extension matches, bounded content routes, and validated SafeTensors index families."""
@@ -3229,8 +3228,27 @@ def _select_huggingface_model_files(
             or PurePosixPath(filename).name.lower() in selected_filenames
         )
     )
-    selected_route_scanner_ids = (
-        {str(scanner_id).lower() for scanner_id in scannable_scanner_ids} if scannable_scanner_ids is not None else None
+    selected_route_scanner_ids: set[str] | None = None
+    selected_route_formats: set[str] | None = None
+    if scannable_scanner_ids is not None:
+        selected_route_scanner_ids = {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}.intersection(
+            _get_hf_content_route_scanner_ids()
+        )
+    elif restrict_content_routes_to_model_extensions:
+        selected_route_formats = _get_selected_hf_content_route_formats(model_extensions, scannable_filenames)
+    content_probes_relevant = (
+        bool(selected_route_scanner_ids)
+        if selected_route_scanner_ids is not None
+        else selected_route_formats is None or bool(selected_route_formats)
+    )
+    exact_openvino_companion_candidates = (
+        {
+            companion
+            for selected_file in model_files
+            if (companion := _openvino_bin_companion_name(selected_file, repo_files)) is not None
+        }
+        if selected_route_scanner_ids == {"openvino"}
+        else set()
     )
     if not allow_content_probes:
         selected_safetensors_indexes = [
@@ -3238,15 +3256,21 @@ def _select_huggingface_model_files(
         ]
         if allow_safetensors_index_expansion and selected_safetensors_indexes:
             _raise_metadata_only_hf_selection_incomplete(repo_id, selected_safetensors_indexes)
-        candidate_files = [
-            filename
-            for filename in _metadata_only_hf_content_probe_candidates(repo_files, model_files)
-            if not _skip_hf_safetensors_probe_candidate(
-                filename,
-                allow_index_expansion=allow_safetensors_index_expansion,
-                selected_route_scanner_ids=selected_route_scanner_ids,
-            )
-        ]
+        candidate_files = (
+            [
+                filename
+                for filename in _metadata_only_hf_content_probe_candidates(repo_files, model_files)
+                if filename not in exact_openvino_companion_candidates
+                if not _skip_hf_safetensors_probe_candidate(
+                    filename,
+                    allow_index_expansion=allow_safetensors_index_expansion,
+                    selected_route_scanner_ids=selected_route_scanner_ids,
+                    selected_route_formats=selected_route_formats,
+                )
+            ]
+            if content_probes_relevant
+            else []
+        )
         if candidate_files:
             _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
         return model_files
@@ -3258,15 +3282,18 @@ def _select_huggingface_model_files(
         deadline=deadline,
     )
 
-    for filename in repo_files:
+    for filename in repo_files if content_probes_relevant else ():
         if filename in selected_files:
             continue
         if _is_huggingface_repo_bookkeeping_file(filename):
+            continue
+        if filename in exact_openvino_companion_candidates:
             continue
         if _skip_hf_safetensors_probe_candidate(
             filename,
             allow_index_expansion=allow_safetensors_index_expansion,
             selected_route_scanner_ids=selected_route_scanner_ids,
+            selected_route_formats=selected_route_formats,
         ):
             continue
         if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
@@ -3290,12 +3317,22 @@ def _select_huggingface_model_files(
                 continue
             raise
         if detected_format is None:
+            if _has_hf_safetensors_shard_shape(filename):
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: unable to classify SafeTensors shard-shaped "
+                    f"candidate for {repo_id}: {filename}"
+                )
             continue
         if selected_route_scanner_ids is not None:
             from ...scanner_selection import scanner_ids_for_detected_format
 
             if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
                 continue
+        elif selected_route_formats is not None and _hf_detected_format_excluded_by_selected_route_formats(
+            detected_format,
+            selected_route_formats,
+        ):
+            continue
         model_files.append(filename)
         selected_files.add(filename)
 
@@ -3435,39 +3472,54 @@ def _validate_remote_safetensors_indexes(
     updated_model_files = list(model_files)
     if not allow_index_expansion:
         return updated_model_files
-    selected_safetensors_shard_paths = [
-        PurePosixPath(filename) for filename in selected_files if _remote_safetensors_shard_parts(filename) is not None
-    ]
-    selected_safetensors_parents = {path.parent for path in selected_safetensors_shard_paths}
-    selected_safetensors_ancestor_dirs = {
-        ancestor.as_posix() for path in selected_safetensors_shard_paths for ancestor in path.parents
+    selected_safetensors_parents = {
+        filename.rpartition("/")[0] or "."
+        for filename in selected_files
+        if _remote_safetensors_shard_parts(filename) is not None
     }
+    sorted_selected_safetensors_parents = sorted(selected_safetensors_parents)
     selected_family_keys = set(_remote_safetensors_family_files(selected_files))
     selected_named_family_parents = {(parent, stem.casefold()) for parent, stem, _total in selected_family_keys}
     repo_family_files = _remote_safetensors_family_files(repo_files)
     repo_named_family_parents = {(parent, stem.casefold()) for parent, stem, _total in repo_family_files}
     relevant_index_files: list[str] = []
     strongly_relevant_index_files: set[str] = set()
-    for index_file in repo_files:
+    probe_budget.check_deadline(repo_id)
+    for file_number, index_file in enumerate(repo_files, start=1):
+        if file_number % 128 == 0:
+            probe_budget.check_deadline(repo_id)
         if not _is_hf_safetensors_index_filename(index_file):
             continue
-        index_parent = PurePosixPath(index_file).parent
+        index_parent = index_file.rpartition("/")[0] or "."
         index_stem = _hf_safetensors_index_stem(index_file)
         assert index_stem is not None
-        index_named_family_parent = (index_parent.as_posix(), index_stem.casefold())
+        index_named_family_parent = (index_parent, index_stem.casefold())
         strongly_relevant = index_parent in selected_safetensors_parents and (
             index_named_family_parent in selected_named_family_parents
             or index_named_family_parent not in repo_named_family_parents
         )
-        if strongly_relevant or index_parent.as_posix() in selected_safetensors_ancestor_dirs:
+        selected_parent_index = bisect_left(sorted_selected_safetensors_parents, index_parent)
+        selected_descendant_index = bisect_left(sorted_selected_safetensors_parents, f"{index_parent}/")
+        selected_parent_descends_from_index = bool(sorted_selected_safetensors_parents) and (
+            index_parent == "."
+            or (
+                selected_parent_index < len(sorted_selected_safetensors_parents)
+                and sorted_selected_safetensors_parents[selected_parent_index] == index_parent
+            )
+            or (
+                selected_descendant_index < len(sorted_selected_safetensors_parents)
+                and sorted_selected_safetensors_parents[selected_descendant_index].startswith(f"{index_parent}/")
+            )
+        )
+        if strongly_relevant or selected_parent_descends_from_index:
             relevant_index_files.append(index_file)
+            if len(relevant_index_files) > _HF_SAFETENSORS_INDEX_MAX_FILES:
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: SafeTensors index inspection limit exceeded "
+                    f"for {repo_id} ({_HF_SAFETENSORS_INDEX_MAX_FILES} files)"
+                )
             if strongly_relevant:
                 strongly_relevant_index_files.add(index_file)
-    if len(relevant_index_files) > _HF_SAFETENSORS_INDEX_MAX_FILES:
-        raise ValueError(
-            "Hugging Face selective filtering incomplete: SafeTensors index inspection limit exceeded "
-            f"for {repo_id} ({_HF_SAFETENSORS_INDEX_MAX_FILES} files)"
-        )
     if relevant_index_files and not allow_content_probes:
         _raise_metadata_only_hf_selection_incomplete(repo_id, relevant_index_files)
 
@@ -3871,25 +3923,6 @@ def _hf_route_scanner_ids_for_formats(format_names: frozenset[str]) -> frozenset
     return frozenset(scanner_ids)
 
 
-def _hf_safetensors_shard_excluded_by_selection(
-    filename: str,
-    selected_route_scanner_ids: set[str] | None,
-    selected_route_formats: set[str] | None,
-    *,
-    complete_safetensors_shard_files: Collection[str] | None = None,
-) -> bool:
-    """Return whether no selected scanner can claim a declared SafeTensors shard."""
-    validated_complete_shard = complete_safetensors_shard_files is not None and (
-        filename in complete_safetensors_shard_files
-    )
-    if _parse_hf_safetensors_shard(filename) is None and not validated_complete_shard:
-        return False
-    if complete_safetensors_shard_files is not None and not validated_complete_shard:
-        return False
-
-    return _hf_safetensors_routes_excluded_by_selection(selected_route_scanner_ids, selected_route_formats)
-
-
 def _hf_safetensors_routes_excluded_by_selection(
     selected_route_scanner_ids: set[str] | None,
     selected_route_formats: set[str] | None,
@@ -3929,39 +3962,6 @@ def _parse_hf_safetensors_shard_shape(filename: str) -> tuple[str, int, int] | N
 
 def _has_hf_safetensors_shard_shape(filename: str) -> bool:
     return _parse_hf_safetensors_shard_shape(filename) is not None
-
-
-def _complete_hf_safetensors_shard_files(repo_files: Collection[str]) -> frozenset[str]:
-    """Return canonical SafeTensors shards whose directory-scoped family is complete."""
-    families: dict[tuple[str, int], dict[int, set[str]]] = {}
-    for filename in repo_files:
-        parsed = _parse_hf_safetensors_shard(filename)
-        if parsed is None:
-            continue
-        stem, index, total = parsed
-        families.setdefault((stem, total), {}).setdefault(index, set()).add(filename)
-
-    complete_files: set[str] = set()
-    for (_stem, total), indexed_files in families.items():
-        if len(indexed_files) != total:
-            continue
-        if any(index not in indexed_files or len(indexed_files[index]) != 1 for index in range(1, total + 1)):
-            continue
-        for filenames in indexed_files.values():
-            complete_files.update(filenames)
-    return frozenset(complete_files)
-
-
-def _zero_based_hf_safetensors_shard_candidates(repo_files: Collection[str]) -> list[str]:
-    """Return zero-indexed shard-shaped files that require index authority."""
-    candidates: list[str] = []
-    for filename in repo_files:
-        match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(filename)
-        if match is None:
-            continue
-        if int(match.group("index")) == 0 and int(match.group("total")) > 0:
-            candidates.append(filename)
-    return list(dict.fromkeys(candidates))
 
 
 def _hf_detected_format_excluded_by_selected_route_formats(
@@ -4057,16 +4057,11 @@ def _get_selected_hf_content_route_formats(
 def _streamable_hf_content_probe_candidates(
     repo_files: list[str],
     selected_files: Collection[str],
-    selected_route_scanner_ids: set[str] | None,
-    selected_route_formats: set[str] | None,
     exact_openvino_companion_candidates: Collection[str],
-    complete_safetensors_shard_files: Collection[str] | None = None,
 ) -> list[str]:
     """Return streaming files that the renamed-file sniff loop would inspect."""
     processed_files = set(selected_files)
     exact_openvino_companion_candidate_set = set(exact_openvino_companion_candidates)
-    if complete_safetensors_shard_files is None:
-        complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
     candidates: list[str] = []
     for file_name in repo_files:
         if file_name in processed_files:
@@ -4075,13 +4070,6 @@ def _streamable_hf_content_probe_candidates(
         if _is_huggingface_repo_bookkeeping_file(file_name):
             continue
         if file_name in exact_openvino_companion_candidate_set:
-            continue
-        if _hf_safetensors_shard_excluded_by_selection(
-            file_name,
-            selected_route_scanner_ids,
-            selected_route_formats,
-            complete_safetensors_shard_files=complete_safetensors_shard_files,
-        ):
             continue
         candidates.append(file_name)
     return candidates
@@ -4176,32 +4164,6 @@ def _select_streamable_hf_files(
                 )
             model_files.append(file_name)
 
-    complete_safetensors_shard_files = set(_complete_hf_safetensors_shard_files(repo_files))
-    selected_safetensors_indexes = {filename for filename in model_files if _is_hf_safetensors_index_filename(filename)}
-    if (
-        sniff_renamed_files
-        and not selected_safetensors_indexes
-        and _hf_safetensors_routes_excluded_by_selection(
-            selected_route_scanner_ids,
-            selected_route_formats,
-        )
-    ):
-        zero_based_candidates = _zero_based_hf_safetensors_shard_candidates(repo_files)
-        if zero_based_candidates:
-            probe_budget = _HuggingFaceProbeBudget(
-                remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
-                deadline=deadline,
-            )
-            validated_zero_based_targets: set[str] = set()
-            _validate_remote_safetensors_indexes(
-                repo_id,
-                repo_files,
-                revision,
-                zero_based_candidates,
-                probe_budget,
-                validated_target_files=validated_zero_based_targets,
-            )
-            complete_safetensors_shard_files.update(validated_zero_based_targets)
     exact_openvino_companion_candidates = (
         {
             companion
@@ -4216,10 +4178,7 @@ def _select_streamable_hf_files(
         candidate_files = _streamable_hf_content_probe_candidates(
             repo_files,
             model_files,
-            selected_route_scanner_ids,
-            selected_route_formats,
             exact_openvino_companion_candidates,
-            complete_safetensors_shard_files,
         )
         if candidate_files:
             _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
@@ -4231,16 +4190,18 @@ def _select_streamable_hf_files(
                 remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
                 deadline=deadline,
             )
-        unskippable_detected_safetensors_shards: list[str] = []
         for file_name in _streamable_hf_content_probe_candidates(
             repo_files,
             model_files,
-            selected_route_scanner_ids,
-            selected_route_formats,
             exact_openvino_companion_candidates,
-            complete_safetensors_shard_files,
         ):
-            if _is_safetensors_index_file(file_name):
+            if _is_safetensors_index_file(file_name) and (
+                defer_safetensors_index_validation
+                or _hf_safetensors_routes_excluded_by_selection(
+                    selected_route_scanner_ids,
+                    selected_route_formats,
+                )
+            ):
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -4250,32 +4211,24 @@ def _select_streamable_hf_files(
             inspected_files += 1
             detected_format = _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget)
             if detected_format is None:
+                if _has_hf_safetensors_shard_shape(file_name):
+                    raise ValueError(
+                        "Hugging Face selective filtering incomplete: unable to classify SafeTensors shard-shaped "
+                        f"candidate for {repo_id}: {file_name}"
+                    )
                 continue
             if selected_route_scanner_ids is not None:
                 from ...scanner_selection import scanner_ids_for_detected_format
 
                 if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
-                    if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
-                        unskippable_detected_safetensors_shards.append(file_name)
                     continue
             elif selected_route_formats is not None and _hf_detected_format_excluded_by_selected_route_formats(
                 detected_format,
                 selected_route_formats,
             ):
-                if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
-                    unskippable_detected_safetensors_shards.append(file_name)
                 continue
             model_files.append(file_name)
             content_route_formats[file_name] = detected_format
-        if unskippable_detected_safetensors_shards:
-            preview = ", ".join(unskippable_detected_safetensors_shards[:3])
-            if len(unskippable_detected_safetensors_shards) > 3:
-                preview = f"{preview}, ..."
-            raise ValueError(
-                "Hugging Face selective filtering incomplete: detected SafeTensors shard candidates "
-                f"that do not form a complete canonical shard family for {repo_id}: {preview}; "
-                "streaming coverage is incomplete"
-            )
 
     if not model_files:
         _raise_no_scannable_hf_files(repo_id)
@@ -4540,6 +4493,29 @@ def _build_huggingface_filtered_download_path(
     if not _is_within_directory(resolved_cache_root, selection_path) or not _ensure_secure_directory(selection_path):
         raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
     return selection_path
+
+
+def _prune_huggingface_filtered_download_path(download_path: Path, selected_files: Collection[str]) -> None:
+    """Remove stale unselected leaves from one ModelAudit-owned filtered view."""
+    selected = set(selected_files)
+    for root, directories, filenames in os.walk(download_path, topdown=False, followlinks=False):
+        root_path = Path(root)
+        for filename in filenames:
+            candidate = root_path / filename
+            relative = candidate.relative_to(download_path).as_posix()
+            if PurePosixPath(relative).parts[:2] == (".cache", "huggingface") or relative in selected:
+                continue
+            candidate.unlink()
+        for directory in directories:
+            candidate = root_path / directory
+            relative_parts = candidate.relative_to(download_path).parts
+            if relative_parts[:2] == (".cache", "huggingface"):
+                continue
+            if candidate.is_symlink():
+                candidate.unlink()
+            else:
+                with suppress(OSError):
+                    candidate.rmdir()
 
 
 def _list_repo_files_with_timeout(
@@ -5230,6 +5206,21 @@ def _build_huggingface_model_info(
                 scannable_scanner_ids,
             ),
             scannable_scanner_ids=scannable_scanner_ids,
+            restrict_content_routes_to_model_extensions=(
+                scannable_scanner_ids is None and (scannable_extensions is not None or scannable_filenames is not None)
+            ),
+            deadline=deadline,
+        )
+        include_openvino_companions = scannable_scanner_ids is None or "openvino" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        model_files = _include_huggingface_openvino_companions(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_files,
+            allow_content_probes=allow_content_probes,
+            include_openvino_companions=include_openvino_companions,
             deadline=deadline,
         )
     inventory_files = list(dict.fromkeys([*model_files, *inaccessible_probe_files]))
@@ -5514,7 +5505,7 @@ def download_model(
     model_size = (
         None if selection_is_filtered else _get_model_size_with_deadline(repo_id, deadline, revision=requested_revision)
     )
-    download_path = None  # Will be set only if cache_dir is provided
+    download_path = None
     disk_check_path = None
     download_path_preexisting = False
 
@@ -5568,8 +5559,8 @@ def download_model(
                 scannable_extensions,
                 scannable_scanner_ids,
             )
-            # Selection directories are immutable-revision namespaces. Never
-            # delete them on failure: another concurrent scan may own the same selection.
+            # The immutable-revision selection namespace may be shared by
+            # concurrent equivalent scans, so never remove the whole directory.
             download_path_preexisting = True
             disk_check_path = download_path
 
@@ -5598,9 +5589,8 @@ def download_model(
             if not has_space:
                 raise Exception(f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}")
 
-        # Download strategy:
-        # - When cache_dir is provided: Use local_dir to place files directly there (safer)
-        # - When cache_dir is None: Use HF's default caching mechanism (avoid interfering)
+        # Custom and filtered downloads use selection-specific local directories. Broad
+        # default-cache downloads retain huggingface_hub's ordinary cache path.
 
         download_kwargs: dict[str, Any] = {
             "repo_id": repo_id,
@@ -5610,9 +5600,11 @@ def download_model(
         if selection_is_filtered:
             # A filtered view must not trust prior local-dir metadata or bytes.
             download_kwargs["force_download"] = True
+            assert download_path is not None
+            _prune_huggingface_filtered_download_path(download_path, model_files)
 
         if download_path is not None:
-            # Custom and filtered downloads use an isolated local directory.
+            # Custom and filtered downloads use a contained local directory.
             download_kwargs["local_dir"] = str(download_path)
         else:
             # No cache directory provided - let HF use its default cache
@@ -5637,6 +5629,10 @@ def download_model(
         external_data_files: list[str] = []
         if onnx_external_data_enabled:
             repo_file_set = set(plan.repo_files)
+
+            def check_onnx_sidecar_discovery_interrupted() -> None:
+                _check_hf_acquisition_interrupted(repo_id, deadline)
+
             for filename in model_files:
                 selected_path = downloaded_path / filename
                 is_onnx_candidate = PurePosixPath(filename).suffix.lower() == ".onnx"
@@ -5656,6 +5652,7 @@ def download_model(
                         selected_path,
                         filename,
                         repo_file_set,
+                        check_onnx_sidecar_discovery_interrupted,
                     )
                 )
         external_data_files = list(dict.fromkeys(external_data_files))
@@ -5727,8 +5724,7 @@ def download_model(
 
         return Path(local_path)
     except Exception as e:
-        # Clean up directory on failure only if we created a custom cache directory
-        # When cache_dir is None, we use HF's default cache and shouldn't clean it up
+        # Clean up only a new unfiltered custom directory owned by this call.
         if (
             cache_dir is not None
             and download_path is not None
@@ -5799,6 +5795,9 @@ def plan_huggingface_model_download(
             scannable_scanner_ids,
         ),
         scannable_scanner_ids=scannable_scanner_ids,
+        restrict_content_routes_to_model_extensions=(
+            scannable_scanner_ids is None and (scannable_extensions is not None or scannable_filenames is not None)
+        ),
         deadline=deadline,
     )
     model_files = _include_huggingface_openvino_companions(
@@ -5887,10 +5886,14 @@ def plan_huggingface_streaming_download(
         ),
         deadline=deadline,
     )
-    defer_safetensors_index_validation = _stream_safetensors_headers and _allows_safetensors_index_expansion(
-        scannable_extensions,
-        scannable_scanner_ids,
-        include_all_files=include_all_files,
+    defer_safetensors_index_validation = (
+        _stream_safetensors_headers
+        and allow_content_probes
+        and _allows_safetensors_index_expansion(
+            scannable_extensions,
+            scannable_scanner_ids,
+            include_all_files=include_all_files,
+        )
     )
     selection = _select_streamable_hf_files(
         repo_id,
@@ -6288,11 +6291,15 @@ def download_model_streaming(
         }
         repo_file_set = set(repo_files)
         selected_file_set = set(model_files)
-        preaccounted_acquired_index_bytes = {
-            filename: len(payload)
-            for filename, payload in acquired_index_bytes.items()
-            if filename in selected_file_set and filename not in safetensors_header_files
-        }
+        preaccounted_acquired_index_bytes = (
+            {
+                filename: len(payload)
+                for filename, payload in acquired_index_bytes.items()
+                if filename in selected_file_set and filename not in safetensors_header_files
+            }
+            if _include_scan_results
+            else {}
+        )
         onnx_external_data_enabled = scannable_scanner_ids is None or "onnx" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }

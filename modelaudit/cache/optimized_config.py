@@ -24,6 +24,7 @@ _CACHE_ONLY_CONFIG_KEYS = frozenset(
 _RUNTIME_ONLY_CONFIG_KEYS = frozenset(
     {
         "_archive_nested_scan_callback",
+        "_trusted_safetensors_index_inspection_context",
         "enable_progress",
         "format",
         "output",

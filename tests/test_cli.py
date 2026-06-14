@@ -997,6 +997,45 @@ def test_scan_multiple_cross_directory_zero_based_shards_requires_index_authorit
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode policy")
+@pytest.mark.parametrize(
+    ("scope_mode", "index_mode", "expected_exit"),
+    [(0o755, 0o644, 0), (0o755, 0o666, 2), (0o777, 0o644, 2)],
+)
+def test_explicit_zero_based_index_authority_requires_trusted_scope(
+    tmp_path: Path,
+    scope_mode: int,
+    index_mode: int,
+    expected_exit: int,
+) -> None:
+    """Writable common authority cannot clear explicit cross-directory coverage failures."""
+    scope = tmp_path / "shared"
+    scope.mkdir()
+    scope.chmod(scope_mode)
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shards: list[Path] = []
+    weight_map: dict[str, str] = {}
+    for shard_index in range(2):
+        shard_dir = scope / f"part-{shard_index}"
+        _make_trusted_shard_parent(shard_dir)
+        shard = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        shards.append(shard)
+        weight_map[f"tensor-{shard_index}"] = shard.relative_to(scope).as_posix()
+    index_path = scope / "model.safetensors.index.json"
+    index_path.write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+    index_path.chmod(index_mode)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *(str(shard) for shard in shards), "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == expected_exit, result.output
+    assert parse_click_json_output(result.output)["success"] is (expected_exit == 0)
+
+
 @pytest.mark.parametrize(
     ("first_index", "index_mode", "expected_exit_code"),
     [(0, "stable", 0), (0, "swap", 2), (1, "stable", 0), (1, "swap", 2), (1, "invalid", 2)],
@@ -1179,10 +1218,14 @@ def test_scan_path_state_revalidates_index_authority_for_cached_results(tmp_path
 
     write_index(selected_shards)
     shard_paths = tuple(str(shard) for shard in selected_shards)
-    path_state = _ScanPathState(explicit_shard_families=_explicit_local_shard_family_groups(shard_paths))
+    index_context = cli_module._SafetensorsIndexInspectionContext()
+    path_state = _ScanPathState(
+        explicit_shard_families=_explicit_local_shard_family_groups(shard_paths, index_context),
+        safetensors_index_context=index_context,
+    )
     family = path_state.explicit_shard_family_for(str(selected_shards[0]))
     assert family is not None
-    initial_proof = cli_module._current_explicit_shard_index_proof(family)
+    initial_proof = cli_module._current_explicit_shard_index_proof(family, index_context)
     assert initial_proof is not None
     pre_scan_target = cli_module._snapshot_validated_shard_target(
         str(selected_shards[0]),
@@ -1191,6 +1234,7 @@ def test_scan_path_state_revalidates_index_authority_for_cached_results(tmp_path
         authoritative_shard_index_base=initial_proof[0],
         authoritative_shard_index_path=initial_proof[1],
         authoritative_shard_index_fingerprint=initial_proof[2],
+        authoritative_shard_index_generation=initial_proof[3],
     )
     cached_result = create_initial_audit_result()
     cached_result.assets.append(

@@ -16,9 +16,10 @@ import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
-from contextvars import copy_context
-from dataclasses import dataclass
+from contextvars import ContextVar, copy_context
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
+from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..helpers.cache_decorator import (
@@ -55,6 +56,9 @@ SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
 MAX_SAFETENSORS_SHARD_INDEX_FILES = 256
+MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_SAFETENSORS_SHARD_INDEX_DIRECTORIES = 256
+_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY = "_trusted_safetensors_index_inspection_context"
 
 ValidatedShardTargets = dict[str, dict[str, int | str]]
 ExpectedShardIndices = range | frozenset[int]
@@ -94,7 +98,116 @@ class _SafetensorsShardIndexInventory:
     expected_indices: ExpectedShardIndices
     index_base: str
     fingerprint: str | None = None
+    generation: int | None = None
     error: str | None = None
+
+
+@dataclass
+class _SafetensorsIndexInspectionContext:
+    """Bound and memoize local SafeTensors index inspection for one top-level scan."""
+
+    lock: RLock = field(default_factory=RLock)
+    candidate_paths: set[str] = field(default_factory=set)
+    directory_paths: set[str] = field(default_factory=set)
+    charged_observations: set[tuple[Any, ...]] = field(default_factory=set)
+    parsed_inventories: dict[tuple[Any, ...], _SafetensorsShardIndexInventory] = field(default_factory=dict)
+    last_observations: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    generations: dict[str, int] = field(default_factory=dict)
+    bytes_read: int = 0
+    failure: str | None = None
+
+    def register_directory(self, directory: Path) -> str | None:
+        """Charge one lexical ancestor directory once."""
+        normalized = _normalized_absolute_path(directory)
+        with self.lock:
+            if self.failure is not None:
+                return self.failure
+            self.directory_paths.add(normalized)
+            if len(self.directory_paths) > MAX_SAFETENSORS_SHARD_INDEX_DIRECTORIES:
+                self.failure = "safetensors index ancestor inspection limit exceeded"
+            return self.failure
+
+    def register_candidates(self, candidates: list[Path]) -> str | None:
+        """Charge lexical index candidates once across the whole scan."""
+        with self.lock:
+            if self.failure is not None:
+                return self.failure
+            self.candidate_paths.update(_normalized_absolute_path(path) for path in candidates)
+            if len(self.candidate_paths) > MAX_SAFETENSORS_SHARD_INDEX_FILES:
+                self.failure = "safetensors index inspection limit exceeded"
+            return self.failure
+
+    def reserve_observation(self, observation: tuple[Any, ...], size: int) -> str | None:
+        """Charge bytes only for a newly observed stable lexical generation."""
+        with self.lock:
+            if self.failure is not None:
+                return self.failure
+            if observation in self.charged_observations:
+                return None
+            if self.bytes_read + size > MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES:
+                self.failure = "safetensors index aggregate byte limit exceeded"
+                return self.failure
+            self.charged_observations.add(observation)
+            self.bytes_read += size
+            return None
+
+    def cached_inventory(self, cache_key: tuple[Any, ...]) -> _SafetensorsShardIndexInventory | None:
+        """Return an unchanged parsed inventory, if any."""
+        with self.lock:
+            return self.parsed_inventories.get(cache_key)
+
+    def record_inventory(
+        self,
+        cache_key: tuple[Any, ...],
+        lexical_path: Path,
+        observation: tuple[Any, ...],
+        inventory: _SafetensorsShardIndexInventory,
+    ) -> _SafetensorsShardIndexInventory:
+        """Bind a parsed inventory to a monotonic observed path generation."""
+        normalized_path = _normalized_absolute_path(lexical_path)
+        with self.lock:
+            if self.last_observations.get(normalized_path) != observation:
+                self.generations[normalized_path] = self.generations.get(normalized_path, 0) + 1
+                self.last_observations[normalized_path] = observation
+            generation = self.generations[normalized_path]
+            result = replace(inventory, generation=generation)
+            self.parsed_inventories[cache_key] = replace(inventory, generation=None)
+            return result
+
+    def observe_cached_inventory(
+        self,
+        cache_key: tuple[Any, ...],
+        lexical_path: Path,
+        observation: tuple[Any, ...],
+    ) -> _SafetensorsShardIndexInventory | None:
+        """Refresh generation state while reusing an unchanged parsed payload."""
+        cached = self.cached_inventory(cache_key)
+        if cached is None:
+            return None
+        return self.record_inventory(cache_key, lexical_path, observation, cached)
+
+
+_CURRENT_SAFETENSORS_INDEX_CONTEXT: ContextVar[_SafetensorsIndexInspectionContext | None] = ContextVar(
+    "modelaudit_safetensors_index_context",
+    default=None,
+)
+
+
+def _activate_safetensors_index_inspection_context(
+    context: _SafetensorsIndexInspectionContext | None = None,
+) -> tuple[Any | None, _SafetensorsIndexInspectionContext]:
+    """Activate one context, reusing an outer top-level scan when present."""
+    active = _CURRENT_SAFETENSORS_INDEX_CONTEXT.get()
+    selected = context or active or _SafetensorsIndexInspectionContext()
+    if active is selected:
+        return None, selected
+    return _CURRENT_SAFETENSORS_INDEX_CONTEXT.set(selected), selected
+
+
+def _deactivate_safetensors_index_inspection_context(token: Any | None) -> None:
+    """Restore the previous scan context."""
+    if token is not None:
+        _CURRENT_SAFETENSORS_INDEX_CONTEXT.reset(token)
 
 
 def _validated_stat_matches_target(opened_stat: os.stat_result, target: dict[str, int | str]) -> bool:
@@ -629,9 +742,13 @@ class ShardedModelDetector:
         index_path: Path,
         pattern: str,
         expected_total: int | None,
+        inspection_context: _SafetensorsIndexInspectionContext,
     ) -> _SafetensorsShardIndexInventory:
         """Parse one SafeTensors index, returning its shard inventory or a validation error."""
         expected_paths: set[str] = set()
+        cache_key: tuple[Any, ...] | None = None
+        observation_prefix: tuple[Any, ...] | None = None
+        index_fingerprint: str | None = None
         try:
             resolved_index = index_path.resolve(strict=True)
             hf_cache_root = _find_hf_cache_root(index_path.absolute())
@@ -646,6 +763,35 @@ class ShardedModelDetector:
                 raise ValueError("safetensors index is not a regular file")
             if pre_read_stat.st_size > MAX_SAFETENSORS_SHARD_INDEX_BYTES:
                 raise ValueError("safetensors index exceeds bounded parse limit")
+            observation_prefix = (
+                _normalized_absolute_path(index_path),
+                _normalized_absolute_path(resolved_index),
+                pre_read_stat.st_dev,
+                pre_read_stat.st_ino,
+                pre_read_stat.st_mode,
+                pre_read_stat.st_size,
+                pre_read_stat.st_mtime_ns,
+                pre_read_stat.st_ctime_ns,
+            )
+            cache_key = (
+                _normalized_absolute_path(index_dir),
+                pattern,
+                expected_total,
+                *observation_prefix,
+            )
+            cached = inspection_context.cached_inventory(cache_key)
+            if cached is not None:
+                cached_observation = (*observation_prefix, cached.fingerprint)
+                observed_cached = inspection_context.observe_cached_inventory(
+                    cache_key,
+                    index_path,
+                    cached_observation,
+                )
+                assert observed_cached is not None
+                return observed_cached
+            budget_error = inspection_context.reserve_observation(cache_key, pre_read_stat.st_size)
+            if budget_error is not None:
+                raise ValueError(budget_error)
             with resolved_index.open("rb") as index_file:
                 opened_stat = os.fstat(index_file.fileno())
                 if not os.path.samestat(pre_read_stat, opened_stat):
@@ -703,30 +849,53 @@ class ShardedModelDetector:
             zero_based = cls._expected_index_range(index_expected_total, zero_based=True)
             one_based = cls._expected_index_range(index_expected_total, zero_based=False)
             if all(index in zero_based for index in target_indices):
-                return _SafetensorsShardIndexInventory(
+                inventory = _SafetensorsShardIndexInventory(
                     index_path=index_path,
                     expected_source_paths=frozenset(expected_paths),
                     expected_indices=zero_based,
                     index_base="zero",
                     fingerprint=index_fingerprint,
                 )
+                assert cache_key is not None and observation_prefix is not None
+                return inspection_context.record_inventory(
+                    cache_key,
+                    index_path,
+                    (*observation_prefix, index_fingerprint),
+                    inventory,
+                )
             if all(index in one_based for index in target_indices):
-                return _SafetensorsShardIndexInventory(
+                inventory = _SafetensorsShardIndexInventory(
                     index_path=index_path,
                     expected_source_paths=frozenset(expected_paths),
                     expected_indices=one_based,
                     index_base="one",
                     fingerprint=index_fingerprint,
                 )
+                assert cache_key is not None and observation_prefix is not None
+                return inspection_context.record_inventory(
+                    cache_key,
+                    index_path,
+                    (*observation_prefix, index_fingerprint),
+                    inventory,
+                )
             raise ValueError("safetensors index shard indices are ambiguous")
         except Exception as exc:
-            return _SafetensorsShardIndexInventory(
+            inventory = _SafetensorsShardIndexInventory(
                 index_path=index_path,
                 expected_source_paths=frozenset(expected_paths),
                 expected_indices=cls._expected_index_range(expected_total or 1, zero_based=False),
                 index_base="invalid",
+                fingerprint=index_fingerprint,
                 error=str(exc),
             )
+            if cache_key is not None and observation_prefix is not None:
+                return inspection_context.record_inventory(
+                    cache_key,
+                    index_path,
+                    (*observation_prefix, index_fingerprint),
+                    inventory,
+                )
+            return inventory
 
     @staticmethod
     def _safetensors_inventory_governs_file(
@@ -760,7 +929,6 @@ class ShardedModelDetector:
         canonical_path = index_dir / SAFETENSORS_INDEX_NAME
         canonical_available = canonical_path.exists() or canonical_path.is_symlink()
         candidates: list[Path] = []
-        inventory_complete = True
         try:
             for candidate in index_dir.iterdir():
                 basename = candidate.name
@@ -772,7 +940,7 @@ class ShardedModelDetector:
                 if len(candidates) > MAX_SAFETENSORS_SHARD_INDEX_FILES:
                     return candidates, True
         except OSError:
-            inventory_complete = False
+            return candidates, True
         if canonical_available:
             # Keep the actual directory entry when canonical_path is only a case-insensitive alias.
             for candidate in candidates:
@@ -780,8 +948,6 @@ class ShardedModelDetector:
                     continue
                 if candidate == canonical_path:
                     break
-                if not inventory_complete:
-                    continue
                 try:
                     if candidate.samefile(canonical_path):
                         break
@@ -804,6 +970,7 @@ class ShardedModelDetector:
         expected_total: int | None,
         current_file: Path,
         index_search_root: Path,
+        inspection_context: _SafetensorsIndexInspectionContext,
     ) -> _SafetensorsShardIndexInventory | None:
         """Load a governing SafeTensors index inventory or captured validation error."""
         if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
@@ -825,25 +992,57 @@ class ShardedModelDetector:
 
         index_dir = absolute_dir
         while True:
-            index_candidates, candidate_limit_exceeded = cls._safetensors_index_candidates(index_dir)
-            if candidate_limit_exceeded:
+            directory_error = inspection_context.register_directory(index_dir)
+            if directory_error is not None:
                 return _SafetensorsShardIndexInventory(
-                    index_path=index_candidates[0],
+                    index_path=index_dir / SAFETENSORS_INDEX_NAME,
                     expected_source_paths=frozenset(),
                     expected_indices=cls._expected_index_range(expected_total, zero_based=False),
                     index_base="invalid",
-                    error="safetensors index inspection limit exceeded",
+                    error=directory_error,
+                )
+            index_candidates, candidate_limit_exceeded = cls._safetensors_index_candidates(index_dir)
+            if candidate_limit_exceeded:
+                return _SafetensorsShardIndexInventory(
+                    index_path=index_candidates[0] if index_candidates else index_dir / SAFETENSORS_INDEX_NAME,
+                    expected_source_paths=frozenset(),
+                    expected_indices=cls._expected_index_range(expected_total, zero_based=False),
+                    index_base="invalid",
+                    error=(
+                        "safetensors index inspection limit exceeded"
+                        if len(index_candidates) > MAX_SAFETENSORS_SHARD_INDEX_FILES
+                        else "safetensors index directory enumeration incomplete"
+                    ),
+                )
+            candidate_error = inspection_context.register_candidates(index_candidates)
+            if candidate_error is not None:
+                return _SafetensorsShardIndexInventory(
+                    index_path=index_candidates[0] if index_candidates else index_dir / SAFETENSORS_INDEX_NAME,
+                    expected_source_paths=frozenset(),
+                    expected_indices=cls._expected_index_range(expected_total, zero_based=False),
+                    index_base="invalid",
+                    error=candidate_error,
                 )
             governing_inventory: _SafetensorsShardIndexInventory | None = None
             for index_path in index_candidates:
-                inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, None)
+                inventory = cls._read_safetensors_index_inventory(
+                    index_dir,
+                    index_path,
+                    pattern,
+                    None,
+                    inspection_context,
+                )
                 if inventory.error is not None:
                     normalized_current = _normalized_absolute_path(current_file)
-                    same_directory_canonical_stem = (
-                        _normalized_absolute_path(index_dir) == _normalized_absolute_path(absolute_dir)
-                        and index_path.name.casefold() == SAFETENSORS_INDEX_NAME
+                    same_directory_candidate = _normalized_absolute_path(index_dir) == _normalized_absolute_path(
+                        absolute_dir
                     )
-                    if normalized_current in inventory.expected_source_paths or same_directory_canonical_stem:
+                    proven_unrelated_nonsharded_index = bool(inventory.expected_source_paths) and inventory.error == (
+                        "safetensors index target does not match shard filename pattern"
+                    )
+                    if normalized_current in inventory.expected_source_paths or (
+                        same_directory_candidate and not proven_unrelated_nonsharded_index
+                    ):
                         return inventory
                     continue
                 if not cls._safetensors_inventory_governs_file(inventory, current_file, pattern, expected_total):
@@ -874,6 +1073,7 @@ class ShardedModelDetector:
         allowed_paths: list[str] | None = None,
         allowed_targets: ValidatedShardTargets | None = None,
         index_search_root: str | os.PathLike[str] | None = None,
+        index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
     ) -> dict[str, Any] | None:
         """
         Detect if a file is part of a sharded model.
@@ -888,6 +1088,9 @@ class ShardedModelDetector:
         dir_path = Path(file_path).parent
         effective_index_search_root = (
             Path(index_search_root) if index_search_root is not None else Path(os.path.abspath(dir_path))
+        )
+        inspection_context = (
+            index_inspection_context or _CURRENT_SAFETENSORS_INDEX_CONTEXT.get() or _SafetensorsIndexInspectionContext()
         )
         requested_path = str(Path(file_path).absolute())
         normalized_allowed_targets = (
@@ -935,6 +1138,7 @@ class ShardedModelDetector:
                     requested_expected_total,
                     Path(file_path),
                     effective_index_search_root,
+                    inspection_context,
                 )
                 if index_inventory is not None:
                     shard_info["safetensors_index_path"] = str(index_inventory.index_path)
@@ -944,10 +1148,15 @@ class ShardedModelDetector:
                         unvalidated_shards.append(str(index_inventory.index_path))
                     elif index_inventory.fingerprint is not None:
                         shard_info["safetensors_index_fingerprint"] = index_inventory.fingerprint
+                        if index_inventory.generation is not None:
+                            shard_info["safetensors_index_generation"] = index_inventory.generation
+                        shard_info["safetensors_index_declares_current_file"] = (
+                            _normalized_absolute_path(file_path) in index_inventory.expected_source_paths
+                        )
 
                 # Collect local siblings and caller-snapshotted peers; validated index targets are added below.
                 candidate_paths: dict[str, Path] = {}
-                for candidate in (*dir_path.glob("*"), *validated_peer_paths):
+                for candidate in (Path(file_path), *dir_path.glob("*"), *validated_peer_paths):
                     normalized_candidate = os.path.normcase(os.path.normpath(os.path.abspath(candidate)))
                     candidate_paths.setdefault(normalized_candidate, candidate)
                 if index_inventory is not None and index_inventory.error is None:

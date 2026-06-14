@@ -1310,6 +1310,44 @@ def test_scan_model_streaming_zero_based_family_uses_validated_index(tmp_path: P
     )
 
 
+def test_scan_model_streaming_index_authority_requires_exact_declared_member_path(tmp_path: Path) -> None:
+    """Equivalent numeric shard spellings cannot substitute for an index-declared member."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    canonical_zero = tmp_path / "model-00000-of-00002.safetensors"
+    alternate_one = tmp_path / "model-1-of-00002.safetensors"
+    for shard in (canonical_zero, alternate_one):
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": canonical_zero.name,
+                    "b": "model-00001-of-00002.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(canonical_zero, False), (alternate_one, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        shard_family_group="trusted-stream:model-a",
+        _trusted_shard_family_root=_make_trusted_stream_shard_root(str(tmp_path)),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    coverage_reasons = {
+        check.details.get("scan_outcome_reason") for check in result.checks if check.details.get("scan_outcome_reason")
+    }
+    assert {"missing_model_shards", "unexpected_model_shards"}.intersection(coverage_reasons)
+
+
 @pytest.mark.parametrize(
     ("first_index", "replace_index_between_shards", "expected_success"),
     [(0, False, True), (0, True, False), (1, False, True), (1, True, False)],

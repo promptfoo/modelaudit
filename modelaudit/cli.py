@@ -89,10 +89,12 @@ from .telemetry import (
 )
 from .utils import resolve_dvc_file_with_metadata, should_skip_file
 from .utils.file.handlers import (
+    _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY,
     SAFETENSORS_SHARD_PATTERN,
     ShardedModelDetector,
     ValidatedShardTargets,
     _count_expected_shard_indices,
+    _SafetensorsIndexInspectionContext,
     _shard_boundary_failure_result,
 )
 from .utils.helpers.auto_defaults import (
@@ -1734,6 +1736,9 @@ class _ScanPathState:
     dvc_covered_directories: set[str] = field(default_factory=set)
     validated_shard_targets: ValidatedShardTargets = field(default_factory=dict)
     explicit_shard_families: dict[str, _ExplicitShardFamily] = field(default_factory=dict)
+    safetensors_index_context: _SafetensorsIndexInspectionContext = field(
+        default_factory=_SafetensorsIndexInspectionContext
+    )
     has_errors_outside_reconciled_shards: bool = False
 
     def mark_non_shard_error(self, audit_result: ModelAuditResultModel) -> None:
@@ -1780,7 +1785,10 @@ class _ScanPathState:
             if metadata is not None and metadata.get("operational_error") is True:
                 continue
             explicit_family = self.explicit_shard_family_for(asset.path)
-            authoritative_index_proof = _current_explicit_shard_index_proof(explicit_family)
+            authoritative_index_proof = _current_explicit_shard_index_proof(
+                explicit_family,
+                self.safetensors_index_context,
+            )
             authority_required = explicit_family is not None and explicit_family.authoritative_index_scope is not None
             if authority_required and (not pre_scan_target or authoritative_index_proof is None):
                 _record_explicit_shard_boundary_failure(scan_result, asset.path)
@@ -1793,6 +1801,9 @@ class _ScanPathState:
                 authoritative_shard_index_path=(authoritative_index_proof[1] if authoritative_index_proof else None),
                 authoritative_shard_index_fingerprint=(
                     authoritative_index_proof[2] if authoritative_index_proof else None
+                ),
+                authoritative_shard_index_generation=(
+                    authoritative_index_proof[3] if authoritative_index_proof else None
                 ),
             )
             if not post_scan_target:
@@ -2319,18 +2330,21 @@ def _explicit_shard_index_authority(
     *,
     scope: str,
     expected_total: int,
-) -> tuple[tuple[str, str, str] | None, bool]:
+    index_inspection_context: _SafetensorsIndexInspectionContext,
+) -> tuple[tuple[str, str, str, int] | None, bool]:
     """Return stable index authority and whether a governing index was found."""
     shard_info = ShardedModelDetector.detect_shards(
         paths[0],
         allowed_paths=list(paths),
         index_search_root=scope,
+        index_inspection_context=index_inspection_context,
     )
     if not isinstance(shard_info, dict):
         return None, False
     index_base = shard_info.get("shard_index_base")
     index_path = shard_info.get("safetensors_index_path")
     index_fingerprint = shard_info.get("safetensors_index_fingerprint")
+    index_generation = shard_info.get("safetensors_index_generation")
     authority_present = isinstance(index_path, str) and bool(index_path)
     if (
         index_base not in {"zero", "one"}
@@ -2338,6 +2352,9 @@ def _explicit_shard_index_authority(
         or not index_path
         or not isinstance(index_fingerprint, str)
         or not index_fingerprint
+        or not isinstance(index_generation, int)
+        or isinstance(index_generation, bool)
+        or index_generation <= 0
         or shard_info.get("safetensors_index_error")
         or shard_info.get("expected_total_shards") != expected_total
         or shard_info.get("total_shards") != expected_total
@@ -2362,19 +2379,62 @@ def _explicit_shard_index_authority(
     }
     if normalized_shards != set(paths):
         return None, authority_present
+    if not _trusted_explicit_shard_index_authority(index_path, scope):
+        return None, True
     return (
         (
             index_base,
             os.path.normcase(os.path.normpath(os.path.abspath(index_path))),
             index_fingerprint,
+            index_generation,
         ),
         True,
     )
 
 
+def _trusted_explicit_shard_index_authority(index_path: str, scope: str) -> bool:
+    """Return whether POSIX authority is owned and immutable to other users."""
+    if os.name == "nt":
+        return True
+    get_effective_uid = getattr(os, "geteuid", None)
+    if not callable(get_effective_uid):
+        return False
+    effective_uid = get_effective_uid()
+    try:
+        lexical_index = Path(index_path).absolute()
+        index_stat = os.stat(lexical_index, follow_symlinks=False)
+        resolved_scope = Path(scope).resolve(strict=True)
+        resolved_parent = lexical_index.parent.resolve(strict=True)
+        if lexical_index.is_symlink() or not stat.S_ISREG(index_stat.st_mode):
+            return False
+        if index_stat.st_uid != effective_uid:
+            return False
+        resolved_parent.relative_to(resolved_scope)
+        current = resolved_parent
+        index_parent_private = False
+        while True:
+            directory_stat = os.stat(current, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != effective_uid
+                or stat.S_IMODE(directory_stat.st_mode) & 0o022
+            ):
+                return False
+            if current == resolved_parent:
+                index_parent_private = stat.S_IMODE(directory_stat.st_mode) & 0o077 == 0
+            if current == resolved_scope:
+                return not (stat.S_IMODE(index_stat.st_mode) & 0o022) or index_parent_private
+            if current == current.parent:
+                return False
+            current = current.parent
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _current_explicit_shard_index_proof(
     family: _ExplicitShardFamily | None,
-) -> tuple[str, str, str] | None:
+    index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
+) -> tuple[str, str, str, int] | None:
     """Refresh index authority for one explicit family at the snapshot boundary."""
     if (
         family is None
@@ -2383,16 +2443,24 @@ def _current_explicit_shard_index_proof(
         or not family.authoritative_index_paths
     ):
         return None
+    if index_inspection_context is None:
+        index_inspection_context = _SafetensorsIndexInspectionContext()
     proof, _authority_present = _explicit_shard_index_authority(
         family.authoritative_index_paths,
         scope=family.authoritative_index_scope,
         expected_total=family.authoritative_index_expected_total,
+        index_inspection_context=index_inspection_context,
     )
     return proof
 
 
-def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, _ExplicitShardFamily]:
+def _explicit_local_shard_family_groups(
+    paths: tuple[str, ...],
+    index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
+) -> dict[str, _ExplicitShardFamily]:
     """Map exact local file arguments to conservative explicit-family metadata."""
+    if index_inspection_context is None:
+        index_inspection_context = _SafetensorsIndexInspectionContext()
     grouped_paths: dict[tuple[str, int], list[tuple[str, Path, int]]] = {}
     seen_paths: set[str] = set()
     for path_str in paths:
@@ -2460,6 +2528,7 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, _Ex
                     scoped_paths,
                     scope=scope,
                     expected_total=expected_total,
+                    index_inspection_context=index_inspection_context,
                 )
                 if _pattern == SAFETENSORS_SHARD_PATTERN
                 else (None, False)
@@ -3263,7 +3332,10 @@ def _scan_local_or_downloaded_path(
     actual_path = source_result.actual_path
     display_path = _display_path(path)
     explicit_family = path_state.explicit_shard_family_for(actual_path)
-    authoritative_index_proof = _current_explicit_shard_index_proof(explicit_family)
+    authoritative_index_proof = _current_explicit_shard_index_proof(
+        explicit_family,
+        path_state.safetensors_index_context,
+    )
     authority_required = explicit_family is not None and explicit_family.authoritative_index_scope is not None
     pre_scan_shard_target = (
         _snapshot_validated_shard_target(
@@ -3273,6 +3345,7 @@ def _scan_local_or_downloaded_path(
             authoritative_shard_index_base=(authoritative_index_proof[0] if authoritative_index_proof else None),
             authoritative_shard_index_path=(authoritative_index_proof[1] if authoritative_index_proof else None),
             authoritative_shard_index_fingerprint=(authoritative_index_proof[2] if authoritative_index_proof else None),
+            authoritative_shard_index_generation=(authoritative_index_proof[3] if authoritative_index_proof else None),
         )
         if os.path.isfile(actual_path) and (not authority_required or authoritative_index_proof is not None)
         else {}
@@ -3319,7 +3392,10 @@ def _scan_local_or_downloaded_path(
                 use_hf_whitelist=runtime.use_hf_whitelist,
                 cache_enabled=runtime.cache_enabled,
                 cache_dir=runtime.cache_dir,
-                **_scanner_selection_overrides(runtime),
+                **{
+                    **_scanner_selection_overrides(runtime),
+                    _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
+                },
             )
             path_state.record_non_shard_result_errors(streaming_result)
             audit_result.aggregate_scan_result(streaming_result.model_dump())
@@ -3337,6 +3413,7 @@ def _scan_local_or_downloaded_path(
             "progress_update_interval": 2.0,
             "cache_enabled": runtime.cache_enabled,
             "cache_dir": runtime.cache_dir,
+            _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
             **_scanner_selection_overrides(runtime),
         }
         is_dvc_pointer = actual_path.lower().endswith(".dvc")
@@ -3717,6 +3794,7 @@ def _resolve_scan_source_for_path(
                     streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
                 streaming_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = stream_repository_file_inventory
                 streaming_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] = str(stream_repository_scan_root)
+                streaming_kwargs[_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY] = path_state.safetensors_index_context
                 streaming_kwargs.update(_scanner_selection_overrides(runtime))
 
                 try:
@@ -3889,7 +3967,10 @@ def _resolve_scan_source_for_path(
                     use_hf_whitelist=runtime.use_hf_whitelist,
                     cache_enabled=runtime.cache_enabled,
                     cache_dir=runtime.cache_dir,
-                    **_scanner_selection_overrides(runtime),
+                    **{
+                        **_scanner_selection_overrides(runtime),
+                        _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
+                    },
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
                 path_state.record_non_shard_result_errors(streaming_result)
@@ -4031,7 +4112,10 @@ def _resolve_scan_source_for_path(
                     use_hf_whitelist=runtime.use_hf_whitelist,
                     cache_enabled=runtime.cache_enabled,
                     cache_dir=runtime.cache_dir,
-                    **_scanner_selection_overrides(runtime),
+                    **{
+                        **_scanner_selection_overrides(runtime),
+                        _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
+                    },
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
                 path_state.record_non_shard_result_errors(streaming_result)
@@ -4948,9 +5032,13 @@ def scan_command(
         cast(Any, audit_result).dry_run = True
     if runtime.scanner_selection_metadata is not None:
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
+    safetensors_index_context = _SafetensorsIndexInspectionContext()
     path_state = _ScanPathState(
         collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths),
-        explicit_shard_families=_explicit_local_shard_family_groups(paths) if assume_shard_family else {},
+        explicit_shard_families=(
+            _explicit_local_shard_family_groups(paths, safetensors_index_context) if assume_shard_family else {}
+        ),
+        safetensors_index_context=safetensors_index_context,
     )
 
     # Scan each path with interrupt handling

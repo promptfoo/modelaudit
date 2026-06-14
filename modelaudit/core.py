@@ -127,14 +127,18 @@ from modelaudit.utils.file.detection import (
 )
 from modelaudit.utils.file.handlers import (
     _PREVALIDATED_SHARD_INFO_CONFIG_KEY,
+    _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY,
     _SHARD_ALREADY_PINNED_CONFIG_KEY,
     MAX_RECORDED_MISSING_SHARD_INDICES,
     ShardedModelDetector,
     ValidatedShardTargets,
+    _activate_safetensors_index_inspection_context,
     _count_expected_shard_indices,
+    _deactivate_safetensors_index_inspection_context,
     _pinned_shard_scan_path,
     _preserve_findings_with_shard_boundary_failure,
     _rebase_pinned_shard_result,
+    _SafetensorsIndexInspectionContext,
     _ShardPinUnavailableError,
     scan_advanced_large_file,
     should_use_advanced_handler,
@@ -1199,6 +1203,7 @@ def _snapshot_validated_shard_target(
     authoritative_shard_index_base: str | None = None,
     authoritative_shard_index_path: str | None = None,
     authoritative_shard_index_fingerprint: str | None = None,
+    authoritative_shard_index_generation: int | None = None,
 ) -> ValidatedShardTargets:
     """Snapshot one selected shard path after resolving it to a regular file."""
     source = Path(source_path)
@@ -1249,12 +1254,16 @@ def _snapshot_validated_shard_target(
         and authoritative_shard_index_path
         and isinstance(authoritative_shard_index_fingerprint, str)
         and authoritative_shard_index_fingerprint
+        and isinstance(authoritative_shard_index_generation, int)
+        and not isinstance(authoritative_shard_index_generation, bool)
+        and authoritative_shard_index_generation > 0
     ):
         target["authoritative_shard_index_base"] = authoritative_shard_index_base
         target["authoritative_shard_index_path"] = os.path.normcase(
             os.path.normpath(os.path.abspath(authoritative_shard_index_path))
         )
         target["authoritative_shard_index_fingerprint"] = authoritative_shard_index_fingerprint
+        target["authoritative_shard_index_generation"] = authoritative_shard_index_generation
     return {str(source.absolute()): target}
 
 
@@ -1572,11 +1581,15 @@ def _validated_shard_family_scopes(
         scopes.add(f"trusted-group:{family_group}")
     authoritative_index_path = target.get("authoritative_shard_index_path")
     authoritative_index_fingerprint = target.get("authoritative_shard_index_fingerprint")
+    authoritative_index_generation = target.get("authoritative_shard_index_generation")
     if (
         isinstance(authoritative_index_path, str)
         and target.get("authoritative_shard_index_base") in {"zero", "one"}
         and isinstance(authoritative_index_fingerprint, str)
         and authoritative_index_fingerprint
+        and isinstance(authoritative_index_generation, int)
+        and not isinstance(authoritative_index_generation, bool)
+        and authoritative_index_generation > 0
     ):
         scopes.add(f"validated-index:{authoritative_index_path}")
     return scopes
@@ -1616,7 +1629,7 @@ def _authoritative_shard_indices_for_group(
     targets_by_index: dict[int, list[tuple[str, dict[str, int | str]]]],
 ) -> tuple[range | None, bool]:
     """Return consistent index authority and whether any target claimed it."""
-    proofs: set[tuple[str, str, str]] = set()
+    proofs: set[tuple[str, str, str, int]] = set()
     authority_present = False
     missing_proof = False
     for records in targets_by_index.values():
@@ -1624,7 +1637,8 @@ def _authoritative_shard_indices_for_group(
             index_base = target.get("authoritative_shard_index_base")
             index_path = target.get("authoritative_shard_index_path")
             index_fingerprint = target.get("authoritative_shard_index_fingerprint")
-            if all(value is None for value in (index_base, index_path, index_fingerprint)):
+            index_generation = target.get("authoritative_shard_index_generation")
+            if all(value is None for value in (index_base, index_path, index_fingerprint, index_generation)):
                 missing_proof = True
                 continue
             authority_present = True
@@ -1635,14 +1649,17 @@ def _authoritative_shard_indices_for_group(
                 or not index_path
                 or not isinstance(index_fingerprint, str)
                 or not index_fingerprint
+                or not isinstance(index_generation, int)
+                or isinstance(index_generation, bool)
+                or index_generation <= 0
             ):
                 return None, True
-            proofs.add((index_base, index_path, index_fingerprint))
+            proofs.add((index_base, index_path, index_fingerprint, index_generation))
     if not authority_present:
         return None, False
     if missing_proof or len(proofs) != 1:
         return None, True
-    index_base, _index_path, _index_fingerprint = next(iter(proofs))
+    index_base, _index_path, _index_fingerprint, _index_generation = next(iter(proofs))
     return ShardedModelDetector._expected_index_range(expected_total, zero_based=index_base == "zero"), True
 
 
@@ -3736,6 +3753,11 @@ def scan_model_directory_or_file(
 
     # Check if metadata scanner is available once (optimization - avoids loading scanner)
     metadata_scanner_available = scanner_selection.allows("metadata") and _registry.has_scanner_class("MetadataScanner")
+    configured_index_context = config.get(_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY)
+    index_context_token, index_inspection_context = _activate_safetensors_index_inspection_context(
+        configured_index_context if isinstance(configured_index_context, _SafetensorsIndexInspectionContext) else None
+    )
+    config[_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY] = index_inspection_context
 
     try:
         # Handle streaming paths
@@ -5968,6 +5990,7 @@ def scan_model_directory_or_file(
         _add_error_asset_to_results(results, report_path)
     finally:
         pickle_source_snapshot_stack.close()
+        _deactivate_safetensors_index_inspection_context(index_context_token)
 
     # Final timing is handled by finalize_statistics()
 
@@ -6400,9 +6423,17 @@ def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     config = normalize_scanner_selection_config({} if config is None else dict(config))
     config.setdefault(NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_file)
     validate_scan_config(config)
+    configured_index_context = config.get(_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY)
+    index_context_token, index_inspection_context = _activate_safetensors_index_inspection_context(
+        configured_index_context if isinstance(configured_index_context, _SafetensorsIndexInspectionContext) else None
+    )
+    config[_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY] = index_inspection_context
 
     # Delegate to internal implementation - cache decorator handles caching
-    return _scan_file_internal(path, config)
+    try:
+        return _scan_file_internal(path, config)
+    finally:
+        _deactivate_safetensors_index_inspection_context(index_context_token)
 
 
 def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> ScanResult:
@@ -7664,6 +7695,11 @@ def scan_model_streaming(
         None if is_hf_cache and scanner_selection.active else scanner_selection_extensions
     )
     stream_started = False
+    configured_index_context = scan_kwargs.get(_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY)
+    index_context_token, index_inspection_context = _activate_safetensors_index_inspection_context(
+        configured_index_context if isinstance(configured_index_context, _SafetensorsIndexInspectionContext) else None
+    )
+    scan_kwargs[_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY] = index_inspection_context
 
     try:
         try:
@@ -7999,6 +8035,7 @@ def scan_model_streaming(
                     source_safetensors_shard_info.get("shard_index_base")
                     if isinstance(source_safetensors_shard_info, dict)
                     and isinstance(source_safetensors_shard_info.get("safetensors_index_path"), str)
+                    and source_safetensors_shard_info.get("safetensors_index_declares_current_file") is True
                     and not source_safetensors_shard_info.get("safetensors_index_error")
                     else None
                 )
@@ -8019,6 +8056,14 @@ def scan_model_streaming(
                     if authoritative_shard_index_path is not None
                     and isinstance(source_safetensors_shard_info, dict)
                     and isinstance(source_safetensors_shard_info.get("safetensors_index_fingerprint"), str)
+                    else None
+                )
+                authoritative_shard_index_generation = (
+                    source_safetensors_shard_info.get("safetensors_index_generation")
+                    if authoritative_shard_index_path is not None
+                    and isinstance(source_safetensors_shard_info, dict)
+                    and isinstance(source_safetensors_shard_info.get("safetensors_index_generation"), int)
+                    and not isinstance(source_safetensors_shard_info.get("safetensors_index_generation"), bool)
                     else None
                 )
                 scan_repository_inventory_context = streaming_repository_inventory_context()
@@ -8046,6 +8091,7 @@ def scan_model_streaming(
                     authoritative_shard_index_base=authoritative_shard_index_base,
                     authoritative_shard_index_path=authoritative_shard_index_path,
                     authoritative_shard_index_fingerprint=authoritative_shard_index_fingerprint,
+                    authoritative_shard_index_generation=authoritative_shard_index_generation,
                 )
                 selected_resolved_path = str(scan_path)
                 pre_scan_shard_target: ValidatedShardTargets = {}
@@ -8068,6 +8114,7 @@ def scan_model_streaming(
                                 authoritative_shard_index_base=authoritative_shard_index_base,
                                 authoritative_shard_index_path=authoritative_shard_index_path,
                                 authoritative_shard_index_fingerprint=authoritative_shard_index_fingerprint,
+                                authoritative_shard_index_generation=authoritative_shard_index_generation,
                             )
                             scan_config[_SHARD_ALREADY_PINNED_CONFIG_KEY] = True
                             if is_single_safetensors_stream and single_source_shard_info is not None:
@@ -8276,6 +8323,7 @@ def scan_model_streaming(
                         authoritative_shard_index_base=authoritative_shard_index_base,
                         authoritative_shard_index_path=authoritative_shard_index_path,
                         authoritative_shard_index_fingerprint=authoritative_shard_index_fingerprint,
+                        authoritative_shard_index_generation=authoritative_shard_index_generation,
                     )
                     stable_while_scanning = bool(
                         pre_scan_shard_target and pre_scan_shard_target == post_scan_shard_target
@@ -8293,6 +8341,7 @@ def scan_model_streaming(
                         authoritative_shard_index_base=authoritative_shard_index_base,
                         authoritative_shard_index_path=authoritative_shard_index_path,
                         authoritative_shard_index_fingerprint=authoritative_shard_index_fingerprint,
+                        authoritative_shard_index_generation=authoritative_shard_index_generation,
                     )
                     stable_after_unpinning = False
                     if not pinned_target_changed and initial_shard_target and final_shard_target:
@@ -8312,6 +8361,7 @@ def scan_model_streaming(
                                 "authoritative_shard_index_base",
                                 "authoritative_shard_index_path",
                                 "authoritative_shard_index_fingerprint",
+                                "authoritative_shard_index_generation",
                             )
                         )
                     shard_target_stable = stable_while_scanning and stable_after_unpinning
@@ -8456,6 +8506,7 @@ def scan_model_streaming(
         results.has_errors = True
         raise
     finally:
+        _deactivate_safetensors_index_inspection_context(index_context_token)
         close_generator = getattr(file_generator, "close", None)
         if callable(close_generator):
             try:
