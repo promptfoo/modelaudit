@@ -724,6 +724,27 @@ def test_nested_legal_jax_template_overlap_preserves_both_analyses(tmp_path: Pat
     )
 
 
+def test_selected_jinja_scanner_handles_legal_jax_template_overlap(tmp_path: Path) -> None:
+    license_path = tmp_path / "LICENSE"
+    license_path.write_bytes(
+        b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        b'"framework":"jax","orbax_version":"0.1.0",'
+        b'"payload":"jax.experimental.host_callback.call(os.system, \'id\')"}'
+    )
+
+    result = scan_file(
+        str(license_path),
+        config={"scanners": ["jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "jinja2_template"
+    assert result.metadata["scanner_dependency_ids"] == ["jinja2_template"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_embedded_pickle_helpers_honor_selection_policy(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt", malicious=True)
 

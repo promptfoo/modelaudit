@@ -11444,6 +11444,11 @@ class TestZipScanner:
                 2,
                 id="embedded-unknown-GLOBAL-before-opcode-prefixed-tail",
             ),
+            pytest.param(
+                b"MIT License\ncnotinstalled\nname\ncxx\n",
+                2,
+                id="embedded-unknown-GLOBAL-before-newline-terminated-opcode-prefixed-tail",
+            ),
             pytest.param(b"MIT License\ncnumpy\narray\n", 2, id="embedded-terminal-third-party-GLOBAL"),
             pytest.param(b"MIT License\ninumpy\narray\n", 2, id="embedded-terminal-third-party-INST"),
             pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
@@ -11587,6 +11592,16 @@ class TestZipScanner:
                 b"MIT License\n" + binascii.hexlify(b"cnotinstalled\nname\ncxx"),
                 1,
                 id="hex-unknown-GLOBAL-before-opcode-prefixed-tail",
+            ),
+            pytest.param(
+                b"MIT License\n" + base64.b64encode(b"cnotinstalled\nname\ncxx\n"),
+                1,
+                id="base64-unknown-GLOBAL-before-newline-terminated-opcode-prefixed-tail",
+            ),
+            pytest.param(
+                b"MIT License\n" + binascii.hexlify(b"cnotinstalled\nname\ncxx\n"),
+                1,
+                id="hex-unknown-GLOBAL-before-newline-terminated-opcode-prefixed-tail",
             ),
             pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),
             pytest.param(b"MIT License\nWF Bp ZA ou\n", 2, id="base64-spaced-alpha-prefixed-PERSID"),

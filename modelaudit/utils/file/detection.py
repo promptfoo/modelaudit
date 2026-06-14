@@ -2701,6 +2701,7 @@ _PICKLE_TRIVIAL_NO_ARGUMENT_PREFIX_BYTES: frozenset[int] = frozenset(
 _PICKLE_LINE_PAIR_OPCODES: frozenset[str] = frozenset({"GLOBAL", "INST"})
 _PICKLE_TEXT_LINE_SIDE_EFFECT_OPCODES: frozenset[str] = _PICKLE_LINE_PAIR_OPCODES | {"PERSID"}
 _PICKLE_VARIABLE_LENGTH_HEADER_BYTES: dict[int, int] = {-2: 1, -3: 4, -4: 4, -5: 8}
+_PICKLE_SHORT_TRUNCATED_GLOBAL_MAX_BYTES = 3
 
 
 def _read_proto_length_delimited_bounds_stream(
@@ -5791,7 +5792,12 @@ def _has_compact_malformed_pickle_tail(payload: bytes, offset: int) -> bool:
     tail = raw_tail.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
     if not _is_compact_pickle_line(tail):
         return False
-    return tail[0] not in _PICKLE_OPCODE_BY_BYTE or raw_tail == tail
+    tail_opcode = _PICKLE_OPCODE_BY_BYTE.get(tail[0])
+    return (
+        tail_opcode is None
+        or raw_tail == tail
+        or (tail_opcode.name == "GLOBAL" and len(tail) <= _PICKLE_SHORT_TRUNCATED_GLOBAL_MAX_BYTES)
+    )
 
 
 @lru_cache(maxsize=128)

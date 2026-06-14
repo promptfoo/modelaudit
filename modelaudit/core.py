@@ -2155,10 +2155,20 @@ def _select_non_hdf5_preferred_scanner_id(
             return "nemo"
 
     scanner_policy = policy_from_config(config) if config is not None else None
+    selected_renamed_template_overlap = (
+        scanner_policy is not None
+        and scanner_policy.active
+        and scanner_policy.allows("jinja2_template")
+        and not scanner_policy.allows("jax_checkpoint")
+        and header_format == "jax_checkpoint"
+    )
     tokenizer_template_route = (
         config is not None
         and header_format in {"unknown", "pytorch_binary", "jax_checkpoint"}
-        and huggingface_tokenizer_json_has_template_route_evidence(path)
+        and huggingface_tokenizer_json_has_template_route_evidence(
+            path,
+            allow_renamed_path=selected_renamed_template_overlap,
+        )
     )
     if tokenizer_template_route and scanner_policy is not None and scanner_policy.allows("jinja2_template"):
         return "jinja2_template"
