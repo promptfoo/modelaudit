@@ -9,7 +9,7 @@ This repo is a monorepo with **two independently versioned PyPI packages**:
 
 Both packages are driven by a single [release-please](https://github.com/googleapis/release-please) workflow (`.github/workflows/release-please.yml`) with two components declared in `release-please-config.json` and current versions pinned in `.release-please-manifest.json`.
 
-The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-picklescan>=0.1.4,<0.2.0` in `pyproject.toml`. When the sibling version crosses `0.2.0`, the constraint must be bumped in the same PR.
+The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-picklescan>=0.1.7,<0.2.0` in `pyproject.toml`. When the sibling version crosses `0.2.0`, the constraint must be bumped in the same PR.
 
 ## Normal flow
 

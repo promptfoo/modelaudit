@@ -124,6 +124,7 @@ _MAX_FILE_FINDER_IDENTITY_CACHE_SIZE = 128
 _MAX_FILE_FINDER_RESOLUTION_ATTEMPTS = 3
 _MAX_ZIPIMPORT_ARCHIVE_BYTES = 64 * 1024 * 1024
 _MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES = 4 * 1024 * 1024
+_MAX_ZIPIMPORT_PATH_COMPONENTS = 256
 _ZIP_END_RECORD_SIZE = 22
 _ZIP_MAX_COMMENT_BYTES = 65_535
 _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE = 46
@@ -155,7 +156,7 @@ _STANDARD_FILE_FINDER_LOADERS = tuple(
     (suffix, loader) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_IDENTITY for suffix in suffixes
 )
 _STANDARD_FILE_FINDER_PATH_HOOK_CODE = FileFinder.path_hook(*_STANDARD_FILE_FINDER_LOADER_DETAILS).__code__
-_TRUSTED_FILE_FINDER_METHOD_NAMES = ("__init__", "find_spec", "_get_spec", "_fill_cache")
+_TRUSTED_FILE_FINDER_METHOD_NAMES = ("__new__", "__init__", "find_spec", "_get_spec", "_fill_cache")
 _TRUSTED_ZIPIMPORTER_METHOD_NAMES = (
     "__init__",
     "find_spec",
@@ -266,11 +267,21 @@ def _runtime_value_matches_snapshot(value: object, expected: _RuntimeValueSnapsh
     )
 
 
+def _type_member_without_hooks(class_: type[object], name: str) -> tuple[bool, object | None]:
+    for base in type.__getattribute__(class_, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if name in namespace:
+            return True, namespace[name]
+    return False, None
+
+
 _TRUSTED_FILE_FINDER_METHODS = tuple(
-    (name, _runtime_value_snapshot(getattr(FileFinder, name))) for name in _TRUSTED_FILE_FINDER_METHOD_NAMES
+    (name, _runtime_value_snapshot(_type_member_without_hooks(FileFinder, name)[1]))
+    for name in _TRUSTED_FILE_FINDER_METHOD_NAMES
 )
 _TRUSTED_ZIPIMPORTER_METHODS = tuple(
-    (name, _runtime_value_snapshot(getattr(zipimporter, name))) for name in _TRUSTED_ZIPIMPORTER_METHOD_NAMES
+    (name, _runtime_value_snapshot(_type_member_without_hooks(zipimporter, name)[1]))
+    for name in _TRUSTED_ZIPIMPORTER_METHOD_NAMES
 )
 _ZIPIMPORT_NAMESPACE = ModuleType.__getattribute__(zipimport, "__dict__")
 _ZIP_DIRECTORY_CACHE = dict.get(_ZIPIMPORT_NAMESPACE, "_zip_directory_cache")
@@ -847,14 +858,6 @@ def _executable_value_functions(value: object) -> tuple[FunctionType, ...]:
                     break
         return tuple(functions)
     return ()
-
-
-def _type_member_without_hooks(class_: type[object], name: str) -> tuple[bool, object | None]:
-    for base in type.__getattribute__(class_, "__mro__"):
-        namespace = type.__getattribute__(base, "__dict__")
-        if name in namespace:
-            return True, namespace[name]
-    return False, None
 
 
 def _runtime_attribute_path_without_hooks(
@@ -3676,7 +3679,7 @@ def _path_importer_methods_are_trusted(
     trusted_methods: tuple[tuple[str, _RuntimeValueSnapshot], ...],
 ) -> bool:
     return all(
-        _runtime_value_matches_snapshot(getattr(importer_type, name, None), snapshot)
+        _runtime_value_matches_snapshot(_type_member_without_hooks(importer_type, name)[1], snapshot)
         for name, snapshot in trusted_methods
     )
 
@@ -3931,9 +3934,9 @@ def _zipimport_directory_cache_files(archive: str) -> object:
 
 def _zipimport_expected_prefix(archive: str, entry: str) -> str | None:
     archive_state = _zipimport_archive_state_from_entry(entry)
-    if archive_state is None:
+    if not isinstance(archive_state, tuple):
         return None
-    expected_archive, prefix = archive_state
+    expected_archive, prefix, _cache_key = archive_state
     try:
         if not os.path.samefile(archive, expected_archive):
             return None
@@ -3995,15 +3998,19 @@ def _bounded_zip_archive_excludes_module(archive: str, prefix: str, module_name:
     return names is not None and _zipimport_names_exclude_module(names, prefix, module_name)
 
 
-def _zipimport_archive_state_from_entry(entry: str) -> tuple[str, str] | None:
+def _zipimport_archive_state_from_entry(
+    entry: str,
+) -> tuple[str, str, str] | _UnsafePathResolution | None:
     try:
         candidate = entry if os.path.isabs(entry) else os.path.join(os.getcwd(), entry)
     except (OSError, ValueError):
-        return None
+        return _UNSAFE_PATH_RESOLUTION
+    cache_key = entry
     if os.path.altsep:
         candidate = candidate.replace(os.path.altsep, os.path.sep)
+        cache_key = cache_key.replace(os.path.altsep, os.path.sep)
     prefix_parts: list[str] = []
-    for _ in range(_MAX_MODULE_COMPONENTS + 1):
+    for _ in range(_MAX_ZIPIMPORT_PATH_COMPONENTS + 1):
         try:
             candidate_stat = os.stat(candidate)
         except OSError:
@@ -4013,24 +4020,28 @@ def _zipimport_archive_state_from_entry(entry: str) -> tuple[str, str] | None:
                 return None
             if stat.S_ISREG(candidate_stat.st_mode):
                 prefix = os.path.join(*reversed(prefix_parts)).replace("\\", "/") if prefix_parts else ""
-                return candidate, f"{prefix}/" if prefix else ""
-            return None
+                return candidate, f"{prefix}/" if prefix else "", cache_key
+            return _UNSAFE_PATH_RESOLUTION
         parent, basename = os.path.split(candidate)
-        if parent == candidate:
-            return None
+        cache_parent = os.path.dirname(cache_key)
+        if parent == candidate or cache_parent == cache_key:
+            return _UNSAFE_PATH_RESOLUTION
         candidate = parent
+        cache_key = cache_parent
         if basename:
             prefix_parts.append(basename)
-    return None
+    return _UNSAFE_PATH_RESOLUTION
 
 
 def _uncached_oversized_zip_excludes_module(entry: str, module_name: str) -> bool | None:
     if not _zipimport_runtime_is_trusted() or not _path_hooks_are_trusted():
         return False
     archive_state = _zipimport_archive_state_from_entry(entry)
+    if isinstance(archive_state, _UnsafePathResolution):
+        return False
     if archive_state is None:
         return None
-    archive, prefix = archive_state
+    archive, prefix, cache_key = archive_state
     try:
         archive_stat = os.stat(archive)
     except OSError:
@@ -4042,9 +4053,9 @@ def _uncached_oversized_zip_excludes_module(entry: str, module_name: str) -> boo
     if not _bounded_zip_archive_excludes_module(archive, prefix, module_name):
         return False
     directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
-    if not dict.__contains__(directory_cache, archive):
+    if not dict.__contains__(directory_cache, cache_key):
         return True
-    files = dict.__getitem__(directory_cache, archive)
+    files = dict.__getitem__(directory_cache, cache_key)
     snapshot = _zipimport_absent_cache_snapshot(files, prefix, module_name)
     return snapshot is not None and files == snapshot
 
@@ -4642,7 +4653,11 @@ def _path_importer_context_allows_trusted_cache_population(
             return False
         if state.startswith(("trusted:importlib.machinery.FileFinder:", "trusted:zipimport.zipimporter:")):
             continue
-        if state != "cached-none" or _fresh_standard_path_importer(path) is not None:
+        if (
+            state != "cached-none"
+            or _zipimport_archive_state_from_entry(path) is not None
+            or _fresh_standard_path_importer(path) is not None
+        ):
             return False
     return before_index == len(before)
 
@@ -5301,9 +5316,9 @@ def _zipimport_archive_path(entry: str) -> Path | None:
     if not _zipimport_runtime_is_trusted():
         return None
     archive_state = _zipimport_archive_state_from_entry(entry)
-    if archive_state is None:
+    if not isinstance(archive_state, tuple):
         return None
-    archive, _prefix = archive_state
+    archive, _prefix, _cache_key = archive_state
     try:
         archive_stat = os.stat(archive)
     except OSError:

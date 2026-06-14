@@ -61,6 +61,18 @@ def _standard_file_finder_loader_details() -> tuple[tuple[Any, list[str]], ...]:
     )
 
 
+def _record_fresh_importer_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    original = call_graph._fresh_standard_path_importer
+
+    def recording(entry: str) -> FileFinder | zipimporter | call_graph._UnsafePathResolution | None:
+        calls.append(entry)
+        return original(entry)
+
+    monkeypatch.setattr(call_graph, "_fresh_standard_path_importer", recording)
+    return calls
+
+
 def _zipimporter_directory_files(finder: zipimporter) -> dict[str, tuple[object, ...]]:
     finder_state = object.__getattribute__(finder, "__dict__")
     archive = dict.get(finder_state, "archive")
@@ -73,16 +85,28 @@ def _zipimporter_directory_files(finder: zipimporter) -> dict[str, tuple[object,
     return cast(dict[str, tuple[object, ...]], files)
 
 
-def _write_zipimporter_archive(archive_path: Path, module: str, *, include_module: bool) -> None:
+def _write_zipimporter_archive(
+    archive_path: Path,
+    module: str,
+    *,
+    include_module: bool,
+    prefix: str = "",
+) -> None:
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("payload.py", "value = 1\n")
         if include_module:
-            archive.writestr(f"{module}.py", "class Fraction:\n    pass\n")
+            archive.writestr(f"{prefix}{module}.py", "class Fraction:\n    pass\n")
 
 
-def _write_oversized_zipimporter_archive(archive_path: Path, module: str, *, include_module: bool) -> None:
+def _write_oversized_zipimporter_archive(
+    archive_path: Path,
+    module: str,
+    *,
+    include_module: bool,
+    prefix: str = "",
+) -> None:
     payload_path = archive_path.with_suffix(".payload.zip")
-    _write_zipimporter_archive(payload_path, module, include_module=include_module)
+    _write_zipimporter_archive(payload_path, module, include_module=include_module, prefix=prefix)
     with archive_path.open("wb") as archive:
         archive.seek(call_graph._MAX_ZIPIMPORT_ARCHIVE_BYTES + 1)
         archive.write(payload_path.read_bytes())
@@ -460,6 +484,55 @@ def test_shared_source_snapshot_bounds_full_import_runtime_validation(
         call_graph._ensure_shared_source_snapshot_stable(report_generation)
 
     assert validation_count == 2
+
+
+def test_shared_snapshot_revalidates_file_finder_constructor_without_execution(
+    tmp_path: Path,
+) -> None:
+    module = "constructor_mutation_probe"
+    (tmp_path / f"{module}.py").write_text("value = 1\n", encoding="utf-8")
+    script = f"""
+import sys
+from importlib.machinery import BuiltinImporter, FileFinder, FrozenImporter, PathFinder
+from pathlib import Path
+from zipimport import zipimporter
+
+import modelaudit_picklescan.call_graph as call_graph
+
+module = {module!r}
+path_entry = sys.argv[1]
+finder = FileFinder(path_entry, *call_graph._STANDARD_FILE_FINDER_LOADER_DETAILS)
+calls = []
+
+def hostile_new(cls, *args, **kwargs):
+    del cls, args, kwargs
+    calls.append("FileFinder.__new__")
+    raise AssertionError("mutated FileFinder.__new__ was executed")
+
+sys.modules.pop(module, None)
+sys.meta_path = [BuiltinImporter, FrozenImporter, PathFinder]
+sys.path_hooks = [zipimporter, FileFinder.path_hook(*call_graph._STANDARD_FILE_FINDER_LOADER_DETAILS)]
+sys.path_importer_cache = {{path_entry: finder}}
+sys.path = [path_entry]
+call_graph._TRUSTED_SITE_PACKAGE_PATHS = (Path(path_entry).resolve(),)
+call_graph._TRUSTED_DELEGATED_SITE_PACKAGE_PATHS = ()
+
+with call_graph.shared_source_sensitive_caches():
+    call_graph._begin_shared_source_report()
+    assert call_graph._interpreter_import_runtime_is_trusted() is True
+    type.__setattr__(FileFinder, "__new__", hostile_new)
+    assert call_graph._trusted_module_origin_kind(module) is None
+
+assert calls == []
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_unresolved_top_level_module_uses_report_boundary_invalidation(
@@ -1838,14 +1911,7 @@ def test_oversized_zip_falls_through_only_when_module_is_absent(
     importer_cache: dict[Any, Any] = {stdlib_path: FileFinder(stdlib_path, *_standard_file_finder_loader_details())}
     if cached:
         importer_cache[path_entry] = zipimporter(path_entry)
-    fresh_calls: list[str] = []
-    original_fresh_importer = call_graph._fresh_standard_path_importer
-
-    def recording_fresh_importer(entry: str) -> FileFinder | zipimporter | call_graph._UnsafePathResolution | None:
-        fresh_calls.append(entry)
-        return original_fresh_importer(entry)
-
-    monkeypatch.setattr(call_graph, "_fresh_standard_path_importer", recording_fresh_importer)
+    fresh_calls = _record_fresh_importer_calls(monkeypatch)
 
     with _standard_import_runtime(
         monkeypatch,
@@ -1857,6 +1923,81 @@ def test_oversized_zip_falls_through_only_when_module_is_absent(
 
     assert origin_kind == (None if include_module else "stdlib")
     assert path_entry not in fresh_calls
+
+
+@pytest.mark.parametrize("include_module", [False, True], ids=["absent", "present"])
+def test_oversized_zip_long_prefix_is_bounded_before_importer_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_module: bool,
+) -> None:
+    module = "statistics"
+    prefix = "/".join(f"p{index}" for index in range(call_graph._MAX_MODULE_COMPONENTS + 1))
+    archive_path = tmp_path / f"oversized-long-prefix-{include_module}.zip"
+    _write_oversized_zipimporter_archive(
+        archive_path,
+        module,
+        include_module=include_module,
+        prefix=f"{prefix}/",
+    )
+    path_entry = f"{archive_path}/{prefix}"
+    stdlib_path = sysconfig.get_path("stdlib")
+    assert stdlib_path is not None
+    fresh_calls = _record_fresh_importer_calls(monkeypatch)
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache={stdlib_path: FileFinder(stdlib_path, *_standard_file_finder_loader_details())},
+        search_path=[path_entry, stdlib_path],
+    ):
+        origin_kind = call_graph._trusted_module_origin_kind(module)
+
+    assert origin_kind == (None if include_module else "stdlib")
+    assert path_entry not in fresh_calls
+
+
+def test_zip_archive_path_walk_has_an_independent_work_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "bounded-walk.zip"
+    _write_zipimporter_archive(archive_path, "statistics", include_module=False)
+    prefix = "/".join(f"p{index}" for index in range(call_graph._MAX_ZIPIMPORT_PATH_COMPONENTS + 1))
+    stat_calls: list[str] = []
+    original_stat = os.stat
+
+    def recording_stat(path: str | os.PathLike[str], *args: Any, **kwargs: Any) -> os.stat_result:
+        stat_calls.append(os.fspath(path))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", recording_stat)
+
+    archive_state = call_graph._zipimport_archive_state_from_entry(f"{archive_path}/{prefix}")
+
+    assert isinstance(archive_state, call_graph._UnsafePathResolution)
+    assert len(stat_calls) == call_graph._MAX_ZIPIMPORT_PATH_COMPONENTS + 1
+
+
+def test_cached_none_population_rejects_regular_archive_without_constructing_importer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "cached-none-oversized.zip"
+    _write_oversized_zipimporter_archive(archive_path, "statistics", include_module=False)
+    calls: list[str] = []
+
+    def fail_if_constructed(entry: str) -> None:
+        calls.append(entry)
+        pytest.fail("zipimporter was constructed for cached None validation")
+
+    monkeypatch.setattr(call_graph, "_fresh_standard_path_importer", fail_if_constructed)
+
+    assert not call_graph._path_importer_context_allows_trusted_cache_population(
+        (),
+        (f"{archive_path}=cached-none",),
+    )
+    assert calls == []
 
 
 def test_oversized_zip_candidate_tracking_does_not_construct_importer(
@@ -1878,6 +2019,37 @@ def test_oversized_zip_candidate_tracking_does_not_construct_importer(
     assert calls == []
 
 
+@pytest.mark.parametrize("forged", [False, True], ids=["benign", "forged"])
+def test_relative_oversized_zip_uses_exact_directory_cache_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forged: bool,
+) -> None:
+    module = "statistics"
+    archive_path = tmp_path / f"relative-cache-{forged}.zip"
+    _write_oversized_zipimporter_archive(archive_path, module, include_module=False)
+    monkeypatch.chdir(tmp_path)
+    path_entry = archive_path.name
+    finder = zipimporter(path_entry)
+    files = _zipimporter_directory_files(finder)
+    if forged:
+        files[f"{module}.py"] = files["payload.py"]
+    stdlib_path = sysconfig.get_path("stdlib")
+    assert stdlib_path is not None
+    fresh_calls = _record_fresh_importer_calls(monkeypatch)
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache={stdlib_path: FileFinder(stdlib_path, *_standard_file_finder_loader_details())},
+        search_path=[path_entry, stdlib_path],
+    ):
+        origin_kind = call_graph._trusted_module_origin_kind(module)
+
+    assert origin_kind == (None if forged else "stdlib")
+    assert path_entry not in fresh_calls
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink parent traversal")
 def test_relative_zip_preflight_preserves_symlink_parent_traversal(
     tmp_path: Path,
@@ -1895,10 +2067,11 @@ def test_relative_zip_preflight_preserves_symlink_parent_traversal(
 
     archive_state = call_graph._zipimport_archive_state_from_entry("link/../modules.zip")
 
-    assert archive_state is not None
-    archive, prefix = archive_state
+    assert isinstance(archive_state, tuple)
+    archive, prefix, cache_key = archive_state
     assert os.path.samefile(archive, archive_path)
     assert prefix == ""
+    assert cache_key == "link/../modules.zip"
 
 
 @pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
@@ -1921,9 +2094,10 @@ def test_zip_preflight_preserves_literal_dot_segments(
 
     archive_state = call_graph._zipimport_archive_state_from_entry(entry)
 
-    assert archive_state is not None
-    archive, prefix = archive_state
+    assert isinstance(archive_state, tuple)
+    archive, prefix, cache_key = archive_state
     assert prefix == "pkg/../evil/"
+    assert cache_key == root
     assert call_graph._zipimport_expected_prefix(archive, entry) == prefix
     assert call_graph._bounded_zip_archive_excludes_module(archive, prefix, module) is not include_module
     assert (type(zipimporter.find_spec(zipimporter(entry), module)) is ModuleSpec) is include_module

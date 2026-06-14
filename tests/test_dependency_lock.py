@@ -10,9 +10,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 LOCKFILE = ROOT_DIR / "uv.lock"
+ROOT_PYPROJECT = ROOT_DIR / "pyproject.toml"
 PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproject.toml"
 PATCHED_GITPYTHON_FLOOR = (3, 1, 50)
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
+REQUIRED_PICKLESCAN_RELEASE = "modelaudit-picklescan>=0.1.7,<0.2.0"
 
 
 def _lock_package_block(name: str) -> str:
@@ -68,3 +70,9 @@ def test_picklescan_build_backend_is_exactly_pinned() -> None:
     assert build_system["build-backend"] == "maturin"
     # PEP 440 `==1.13.3` also accepts local versions such as `1.13.3+local`.
     assert build_system["requires"] == [PINNED_MATURIN_BACKEND]
+
+
+def test_root_requires_hardened_picklescan_release() -> None:
+    root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+
+    assert REQUIRED_PICKLESCAN_RELEASE in root_config["project"]["dependencies"]
