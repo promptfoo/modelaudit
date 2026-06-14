@@ -2148,8 +2148,15 @@ def _build_onnx_weight_analysis_plan(
                     return False, False
                 if producer.op_type in _METADATA_ONLY_LINEAGE_OPERATORS:
                     metadata_inputs = [str(source) for source in producer.input if source]
-                    valid_root = (
-                        allow_unrelated_root or producer.op_type == "Size" or metadata_inputs == [traced_value_name]
+                    root_is_scalar = allow_unrelated_root or producer.op_type == "Size"
+                    valid_root = metadata_inputs == [traced_value_name] or (
+                        root_is_scalar
+                        and bool(metadata_inputs)
+                        and all(
+                            source not in constants
+                            and getattr(producers_by_value.get(source), "op_type", None) != "Constant"
+                            for source in metadata_inputs
+                        )
                     )
                     result = valid_root, valid_root
                     metadata_expression_cache[cache_key] = result
@@ -2280,7 +2287,7 @@ def _build_onnx_weight_analysis_plan(
                     queue.extend((output_name, depth) for output_name in next_values)
                     continue
                 if (
-                    consumer.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                    consumer.op_type in {"Abs", "Relu"}
                     and scale_data_type is not None
                     and graph_outputs_are_authoritative
                     and all(output_name in graph_output_names for output_name in next_values)

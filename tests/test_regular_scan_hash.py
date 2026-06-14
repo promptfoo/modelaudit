@@ -15,7 +15,7 @@ from typing import Any, BinaryIO, cast
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import _onnx_package_content_hash, determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
@@ -186,6 +186,13 @@ def _write_regular_scan_onnx_model(
 
 def _path_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _onnx_external_package_aggregate_hash(model_path: Path, sidecar_path: Path) -> str:
+    model_hash = _path_sha256(model_path)
+    sidecar_hash = _path_sha256(sidecar_path)
+    package_hash = _onnx_package_content_hash(model_hash, [(sidecar_path.name, sidecar_hash)])
+    return compute_aggregate_hash([model_hash, sidecar_hash, package_hash])
 
 
 def _skip_path_during_directory_prefilter(monkeypatch: pytest.MonkeyPatch, skipped_path: Path) -> None:
@@ -1615,7 +1622,7 @@ class TestOnnxExternalDataContentHash:
         )
 
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
-        assert result.content_hash == compute_aggregate_hash([_path_sha256(model_path), _path_sha256(sidecar)])
+        assert result.content_hash == _onnx_external_package_aggregate_hash(model_path, sidecar)
         assert str(sidecar) not in result.file_metadata
 
     def test_directory_hash_does_not_double_count_top_level_onnx_sidecar(self, tmp_path: Path) -> None:
@@ -1628,7 +1635,7 @@ class TestOnnxExternalDataContentHash:
         result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
 
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
-        assert result.content_hash == compute_aggregate_hash([_path_sha256(model_path), _path_sha256(sidecar)])
+        assert result.content_hash == _onnx_external_package_aggregate_hash(model_path, sidecar)
         assert str(sidecar) in result.file_metadata
 
     def test_directory_hash_omits_hash_when_onnx_sidecar_exceeds_max_file_size(

@@ -954,6 +954,13 @@ class _FileIdentitySnapshot:
     resolved_path: str | None
 
 
+def _file_stat_identity(stat_result: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return tuple(
+        getattr(stat_result, field)
+        for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    )  # type: ignore[return-value]
+
+
 def _make_trusted_stream_shard_root(path: FilePath) -> object:
     """Mark a persistent root selected by a trusted remote-source dispatcher."""
     return _TrustedStreamShardRoot(
@@ -1461,31 +1468,49 @@ def _snapshot_file_identity(path: Path) -> _FileIdentitySnapshot | None:
     resolved_path: str | None = None
     try:
         target_stat = os.stat(path)
-        stat_fields = (
-            target_stat.st_dev,
-            target_stat.st_ino,
-            target_stat.st_mode,
-            target_stat.st_size,
-            target_stat.st_mtime_ns,
-            target_stat.st_ctime_ns,
-        )
+        stat_fields = _file_stat_identity(target_stat)
         resolved_path = str(path.resolve(strict=True))
     except OSError:
         # TOCTOU races or inaccessible symlink targets still leave a useful lstat snapshot.
         logger.debug("Could not snapshot target identity for %s", path, exc_info=True)
 
     return _FileIdentitySnapshot(
-        lstat=(
-            link_stat.st_dev,
-            link_stat.st_ino,
-            link_stat.st_mode,
-            link_stat.st_size,
-            link_stat.st_mtime_ns,
-            link_stat.st_ctime_ns,
-        ),
+        lstat=_file_stat_identity(link_stat),
         stat=stat_fields,
         resolved_path=resolved_path,
     )
+
+
+def _hash_streamed_file_instance(
+    path: Path,
+    expected_identity: _FileIdentitySnapshot | None,
+) -> str | None:
+    """Hash the exact regular-file target captured by a path identity snapshot."""
+    if expected_identity is None or expected_identity.stat is None:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            opened_stat = os.fstat(source.fileno())
+            opened_identity = _file_stat_identity(opened_stat)
+            if opened_identity != expected_identity.stat or not stat.S_ISREG(opened_stat.st_mode):
+                return None
+            digest = hashlib.sha256()
+            while chunk := source.read(8192):
+                digest.update(chunk)
+            final_stat = os.fstat(source.fileno())
+            final_identity = _file_stat_identity(final_stat)
+            if final_identity != opened_identity or _snapshot_file_identity(path) != expected_identity:
+                return None
+            return digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
 
 
 def _file_target_identity_key(
@@ -5335,6 +5360,14 @@ def scan_model_directory_or_file(
                             ):
                                 file_hashes.append(external_data_content_hash)
                                 recorded_content_hashes.add(external_data_content_hash)
+                        package_content_hash = onnx_package_hashes_by_path.get(representative_file)
+                        if (
+                            package_content_hash is not None
+                            and onnx_external_data_sources_by_path.get(representative_file)
+                            and package_content_hash not in recorded_content_hashes
+                        ):
+                            file_hashes.append(package_content_hash)
+                            recorded_content_hashes.add(package_content_hash)
 
                         # Add scanner to tracking list (different from scanner_names)
                         scanner_name = file_result.scanner_name
@@ -7342,7 +7375,6 @@ def scan_model_streaming(
     """
     from .models import convert_assets_to_models
     from .utils.helpers.assets import asset_from_scan_result
-    from .utils.helpers.file_hash import compute_sha256_hash
     from .utils.helpers.secure_hasher import compute_aggregate_hash
 
     start_time = time.time()
@@ -7350,8 +7382,9 @@ def scan_model_streaming(
     file_hashes: list[str] = []
     hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     hashed_stream_file_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
-    hashed_stream_source_hashes_by_path: dict[Path, str] = {}
+    hashed_stream_source_hashes_by_path: dict[Path, tuple[_FileIdentitySnapshot, str]] = {}
     hashed_stream_source_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
+    unstable_stream_hash_paths: set[Path] = set()
     counted_onnx_external_data_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     counted_onnx_external_data_targets: set[_FileTargetIdentityKey] = set()
     consumed_onnx_external_data_aliases: dict[Path, _FileTargetIdentityKey] = {}
@@ -7526,10 +7559,15 @@ def scan_model_streaming(
         nonlocal aggregate_hash_complete, top_level_hashed_bytes
 
         scan_path_key = Path(os.path.abspath(scan_path))
-        if skip_if_stream_source_seen and scan_path_key in hashed_stream_source_hashes_by_path:
-            return hashed_stream_source_hashes_by_path[scan_path_key]
-
         scan_path_identity = _snapshot_file_identity(scan_path)
+        prior_stream_source = hashed_stream_source_hashes_by_path.get(scan_path_key)
+        prior_stream_source_hash: str | None = None
+        if skip_if_stream_source_seen and prior_stream_source is not None:
+            prior_identity, prior_hash = prior_stream_source
+            if scan_path_identity == prior_identity:
+                return prior_hash
+            prior_stream_source_hash = prior_hash
+
         scan_target_key = _file_target_identity_key(scan_path, scan_path_identity)
         if (
             skip_if_stream_target_seen
@@ -7555,9 +7593,14 @@ def scan_model_streaming(
             or defer_hash_for_file_backed_onnx
             or defer_hash_for_pytorch_read_limit
         ):
+            if prior_stream_source_hash is not None:
+                unstable_stream_hash_paths.add(scan_path_key)
             aggregate_hash_complete = False
             return None
         if _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config):
+            if prior_stream_source_hash is not None:
+                unstable_stream_hash_paths.add(scan_path_key)
+                aggregate_hash_complete = False
             return None
 
         if progress_callback:
@@ -7567,17 +7610,30 @@ def scan_model_streaming(
             )
         with suppress(OSError):
             top_level_hashed_bytes += scan_path.stat().st_size
-        file_hash = compute_sha256_hash(scan_path)
-        if _snapshot_file_identity(scan_path) != scan_path_identity:
+        file_hash = _hash_streamed_file_instance(scan_path, scan_path_identity)
+        if file_hash is None:
+            unstable_stream_hash_paths.add(scan_path_key)
             aggregate_hash_complete = False
             return None
+        if prior_stream_source_hash is not None:
+            if file_hash != prior_stream_source_hash:
+                unstable_stream_hash_paths.add(scan_path_key)
+                aggregate_hash_complete = False
+                return None
+            if scan_path_identity is not None:
+                hashed_stream_source_hashes_by_path[scan_path_key] = (scan_path_identity, file_hash)
+                hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
+            if scan_target_key is not None:
+                hashed_stream_file_hashes_by_target.setdefault(scan_target_key, file_hash)
+                hashed_stream_source_hashes_by_target.setdefault(scan_target_key, file_hash)
+            return file_hash
         file_hashes.append(file_hash)
         if scan_path_identity is not None:
             hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
         if scan_target_key is not None:
             hashed_stream_file_hashes_by_target.setdefault(scan_target_key, file_hash)
-        if track_stream_source:
-            hashed_stream_source_hashes_by_path[scan_path_key] = file_hash
+        if track_stream_source and scan_path_identity is not None:
+            hashed_stream_source_hashes_by_path[scan_path_key] = (scan_path_identity, file_hash)
             if scan_target_key is not None:
                 hashed_stream_source_hashes_by_target.setdefault(scan_target_key, file_hash)
         return file_hash
@@ -8075,7 +8131,10 @@ def scan_model_streaming(
                                 skip_if_stream_source_seen=True,
                                 skip_if_stream_target_seen=True,
                             )
-                            if _snapshot_file_identity(onnx_external_data_path) != external_data_identity:
+                            if (
+                                external_data_key in unstable_stream_hash_paths
+                                or _snapshot_file_identity(onnx_external_data_path) != external_data_identity
+                            ):
                                 onnx_external_data_hash_unstable.add(onnx_external_data_path)
                                 aggregate_hash_complete = False
                                 onnx_package_hash_complete = False
@@ -8164,11 +8223,14 @@ def scan_model_streaming(
                     if onnx_package_hash_complete is not None:
                         metadata_dict["onnx_package_hash_complete"] = onnx_package_hash_complete
                         if onnx_package_hash_complete and file_hash is not None:
-                            metadata_dict["content_hash"] = (
+                            package_content_hash = (
                                 _onnx_package_content_hash(file_hash, onnx_external_data_hashes)
                                 if onnx_external_data_hashes
                                 else file_hash
                             )
+                            metadata_dict["content_hash"] = package_content_hash
+                            if onnx_external_data_hashes:
+                                file_hashes.append(package_content_hash)
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
                     if operational_scan_failure:
                         preserve_shard_reconciliation_errors = True

@@ -7,6 +7,7 @@ import sys
 import time
 import tracemalloc
 import weakref
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,16 @@ from modelaudit.scanners.weight_distribution_scanner import WeightDistributionSc
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
+
+
+def compute_onnx_package_aggregate_hash(model_path: Path, sidecar_path: Path) -> str:
+    model_hash = compute_sha256_hash(model_path)
+    sidecar_hash = compute_sha256_hash(sidecar_path)
+    package_hash = modelaudit_core._onnx_package_content_hash(
+        model_hash,
+        [(sidecar_path.name, sidecar_hash)],
+    )
+    return compute_aggregate_hash([model_hash, sidecar_hash, package_hash])
 
 
 def _make_external_tensor(name: str, data_type: int, dims: list[int], external_path: str) -> Any:
@@ -1901,6 +1912,7 @@ def create_dynamic_matmul_integer_bias_model(
         "Cast",
         "canonical_gelu",
         "constant_mul",
+        "constant_size_mul",
         "Div",
         "Exp",
         "Identity",
@@ -1908,6 +1920,7 @@ def create_dynamic_matmul_integer_bias_model(
         "Relu",
         "Reshape",
         "Squeeze",
+        "Softmax",
         "Transpose",
         "dynamic_mul",
         "dynamic_mul_with_transpose",
@@ -2083,6 +2096,21 @@ def create_dynamic_matmul_integer_bias_model(
                 ]
             )
             post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "constant_size_mul":
+            nodes.extend(
+                [
+                    helper.make_node(
+                        "Constant",
+                        [],
+                        ["post_bias_metadata_source"],
+                        value=onnx.numpy_helper.from_array(np.zeros((2, 2), dtype=np.float32)),
+                    ),
+                    helper.make_node("Size", ["post_bias_metadata_source"], ["post_bias_size"]),
+                    helper.make_node("Cast", ["post_bias_size"], ["post_bias_factor"], to=TensorProto.FLOAT),
+                    helper.make_node("Mul", [post_bias_input, "post_bias_factor"], ["Y_post_bias"]),
+                ]
+            )
+            post_bias_input = "Y_post_bias"
         elif post_bias_operator == "initializer_mul":
             extra_initializers.append(onnx.numpy_helper.from_array(weight_scale, name="post_bias_factor"))
             nodes.append(helper.make_node("Mul", [post_bias_input, "post_bias_factor"], ["Y_post_bias"]))
@@ -2148,7 +2176,7 @@ def create_dynamic_matmul_integer_bias_model(
             nodes.append(helper.make_node("Identity", [post_bias_input], ["Y"]))
         else:
             nodes.append(helper.make_node("Mul", [post_bias_input, "W_scale_1"], ["Y"]))
-    elif post_bias_operator in {"Abs", "Relu"}:
+    elif post_bias_operator in {"Abs", "Exp", "Relu", "Softmax"}:
         nodes.append(helper.make_node(post_bias_operator, [bias_output], ["Y"]))
     elif post_bias_operator == "canonical_gelu":
         extra_initializers.extend(
@@ -4744,12 +4772,7 @@ def test_directory_scan_hashes_external_data_for_content_routed_onnx_bin(tmp_pat
 
     assert_only_onnx_external_schema_validation_skipped(result)
     assert result.bytes_scanned == routed_model_path.stat().st_size + sidecar_path.stat().st_size
-    assert result.content_hash == compute_aggregate_hash(
-        [
-            compute_sha256_hash(routed_model_path),
-            compute_sha256_hash(sidecar_path),
-        ]
-    )
+    assert result.content_hash == compute_onnx_package_aggregate_hash(routed_model_path, sidecar_path)
     assert not any(check.name == "Format Validation" for check in result.checks)
 
 
@@ -7141,12 +7164,7 @@ class TestCVE202634447SymlinkTraversal:
         assert len(resolved_checks) == 1
         assert_only_onnx_external_schema_validation_skipped(result)
         assert result.bytes_scanned == model_path.stat().st_size + sidecar_path.stat().st_size
-        assert result.content_hash == compute_aggregate_hash(
-            [
-                compute_sha256_hash(model_path),
-                compute_sha256_hash(sidecar_path),
-            ]
-        )
+        assert result.content_hash == compute_onnx_package_aggregate_hash(model_path, sidecar_path)
         assert not any(check.name == "Format Validation" for check in result.checks)
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
 
@@ -9270,7 +9288,7 @@ class TestWeightDistributionSemantics:
 
     @pytest.mark.parametrize(
         "post_bias_operator",
-        ["constant_mul", "initializer_mul", "dynamic_mul", "unrelated_metadata_mul"],
+        ["constant_mul", "constant_size_mul", "initializer_mul", "dynamic_mul", "unrelated_metadata_mul"],
     )
     def test_dynamic_matmul_integer_terminal_unresolved_factor_fails_closed(
         self,
@@ -9317,6 +9335,27 @@ class TestWeightDistributionSemantics:
             post_bias_scale=True,
             post_bias_operator="Div",
             terminal_post_bias_output=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+
+    @pytest.mark.parametrize("post_bias_operator", ["Exp", "Softmax"])
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])
+    def test_dynamic_matmul_integer_unmodeled_terminal_unary_fails_closed(
+        self,
+        tmp_path: Path,
+        post_bias_operator: str,
+        malicious: bool,
+    ) -> None:
+        model_path = create_dynamic_matmul_integer_bias_model(
+            tmp_path,
+            malicious=malicious,
+            post_bias_operator=post_bias_operator,
         )
 
         result = OnnxScanner().scan(str(model_path))
@@ -11471,25 +11510,29 @@ class TestWeightDistributionSemantics:
         second = create_two_sidecar_onnx_package(tmp_path / "second", swap_contents=True)
         assert compute_sha256_hash(first) == compute_sha256_hash(second)
 
-        aggregate = (
-            scan_model_streaming(
-                iter([(first, False), (second, True)]),
-                delete_after_scan=False,
+        def scan_package(path: Path) -> Any:
+            if streaming:
+                return scan_model_streaming(
+                    iter([(path, True)]),
+                    delete_after_scan=False,
+                    scanners=["onnx"],
+                    cache_enabled=False,
+                )
+            return scan_model_directory_or_file(
+                str(path.parent),
+                recursive=False,
                 scanners=["onnx"],
                 cache_enabled=False,
             )
-            if streaming
-            else scan_model_directory_or_file(
-                str(tmp_path),
-                recursive=True,
-                scanners=["onnx"],
-                cache_enabled=False,
-            )
-        )
 
-        metadata = [aggregate.file_metadata[str(path)] for path in (first, second)]
+        first_result = scan_package(first)
+        second_result = scan_package(second)
+        metadata = [first_result.file_metadata[str(first)], second_result.file_metadata[str(second)]]
         assert all(getattr(item, "onnx_package_hash_complete", None) is True for item in metadata)
         assert len({getattr(item, "content_hash", None) for item in metadata}) == 2
+        assert first_result.content_hash is not None
+        assert second_result.content_hash is not None
+        assert first_result.content_hash != second_result.content_hash
 
     @pytest.mark.parametrize("streaming", [True, False], ids=["streaming", "directory"])
     @pytest.mark.parametrize("symlink_sidecar", [False, True], ids=["regular", "symlink"])
@@ -11581,32 +11624,31 @@ class TestWeightDistributionSemantics:
         replacement_sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
         sidecar.unlink()
         sidecar.symlink_to(original_sidecar.name)
-        original_compute_sha256_hash = compute_sha256_hash
-        original_scan_file = modelaudit_core.scan_file
+        original_os_open = os.open
         retargeted = False
         restored = False
 
-        def retarget_sidecar_while_hashing(path: str | Path) -> str:
-            nonlocal retargeted
-            if retarget_during_hash and Path(path) == sidecar:
+        def open_retargeted_sidecar(
+            path: str | bytes | os.PathLike[str],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal restored, retargeted
+            if retarget_during_hash and not retargeted and Path(os.fsdecode(path)) == sidecar:
                 sidecar.unlink()
                 sidecar.symlink_to(replacement_sidecar.name)
                 retargeted = True
-            return original_compute_sha256_hash(path)
+                try:
+                    return original_os_open(path, flags, mode, dir_fd=dir_fd)
+                finally:
+                    sidecar.unlink()
+                    sidecar.symlink_to(original_sidecar.name)
+                    restored = True
+            return original_os_open(path, flags, mode, dir_fd=dir_fd)
 
-        def restore_sidecar_before_scan(path: str, config: dict[str, Any]) -> Any:
-            nonlocal restored
-            if path == str(model_path) and retargeted:
-                sidecar.unlink()
-                sidecar.symlink_to(original_sidecar.name)
-                restored = True
-            return original_scan_file(path, config)
-
-        monkeypatch.setattr(
-            "modelaudit.utils.helpers.file_hash.compute_sha256_hash",
-            retarget_sidecar_while_hashing,
-        )
-        monkeypatch.setattr(modelaudit_core, "scan_file", restore_sidecar_before_scan)
+        monkeypatch.setattr(modelaudit_core.os, "open", open_retargeted_sidecar)
         result = scan_model_streaming(
             iter([(model_path, True)]),
             delete_after_scan=False,
@@ -11629,6 +11671,40 @@ class TestWeightDistributionSemantics:
         else:
             assert getattr(metadata, "onnx_package_hash_complete", None) is True
             assert checks == []
+
+    def test_streaming_rejects_changed_cached_sidecar_hash(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        reset_cache_manager()
+        model_path = create_external_onnx_weight_package(
+            tmp_path / "cached-sidecar",
+            np.zeros((100, 10), dtype=np.float32),
+        )
+        sidecar = model_path.parent / "weights.bin"
+        replacement = model_path.parent / "replacement.bin"
+        replacement.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
+
+        def changed_sidecar_stream() -> Iterator[tuple[Path, bool]]:
+            yield sidecar, False
+            replacement.replace(sidecar)
+            yield model_path, True
+
+        result = scan_model_streaming(
+            changed_sidecar_stream(),
+            delete_after_scan=False,
+            scanners=["onnx"],
+            cache_enabled=False,
+            cache_dir=str(tmp_path / "cache"),
+        )
+        reset_cache_manager()
+
+        assert determine_exit_code(result) == 2
+        assert getattr(result.file_metadata[str(model_path)], "onnx_package_hash_complete", None) is False
+        checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert checks[0].details["scan_outcome_reason"] == "onnx_external_data_changed_during_scan"
 
     @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
     def test_incomplete_external_data_discovery_disables_onnx_clustering(
