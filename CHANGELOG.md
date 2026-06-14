@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- keep JIT alias replay linear as builtin-helper alias state grows, preserving bounded analysis for attacker-controlled model content
 - inspect oversized ONNX protobuf structure from descriptor-bound, memory- and result-bounded file-backed reads; preserve external-data security checks while explicitly reporting deferred schema, raw-detector, weight-analysis, and content-hash coverage
 - treat dotted package versions in README and model-card pip install commands as informational without downgrading active URLs
 - bound embedded Python assignment-line probes, deduplicate exact extraction windows, and fast-path proven passive priority references without weakening incomplete-analysis reporting

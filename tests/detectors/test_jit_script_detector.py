@@ -2,6 +2,7 @@
 
 import ast
 import json
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,25 @@ from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors.jit_script import JITScriptDetector, detect_jit_script_risks
 
 _PRIORITY_USAGE_STRESS_LINES = 10
+
+
+class _CountingAliasMapping(Mapping[str, str]):
+    def __init__(self, aliases: dict[str, str]) -> None:
+        self._aliases = aliases
+        self.lookups = 0
+        self.iterations = 0
+
+    def __getitem__(self, key: str) -> str:
+        self.lookups += 1
+        return self._aliases[key]
+
+    def __iter__(self) -> Iterator[str]:
+        for key in self._aliases:
+            self.iterations += 1
+            yield key
+
+    def __len__(self) -> int:
+        return len(self._aliases)
 
 
 class TestJITScriptDetector:
@@ -6303,6 +6323,52 @@ class TestJITScriptDetector:
         assert not any(
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
+
+    @pytest.mark.parametrize("identifier_count", [25, 50, 100])
+    def test_canonical_builtin_helper_lookup_scales_with_current_identifiers(self, identifier_count: int) -> None:
+        identifiers = {f"helper_{index}" for index in range(identifier_count)}
+        aliases = _CountingAliasMapping(
+            {
+                **dict.fromkeys(identifiers, "vars"),
+                **{f"unrelated_{index}": "getattr" for index in range(identifier_count * 8)},
+            }
+        )
+
+        matched = jit_script_module._canonical_builtin_helper_aliases_in(
+            identifiers,
+            aliases,
+            {"vars"},
+        )
+
+        assert matched == identifiers
+        assert aliases.lookups == identifier_count
+        assert aliases.iterations == 0
+
+    def test_scan_model_detects_runpy_call_after_builtins_alias_helper_noise(self) -> None:
+        aliases = b"".join(f"bi_{index} = builtins\n".encode() for index in range(64))
+        helper_writes = b"bi_0.setattr = lambda *args: None\n" * 64
+        source = b"import runpy as rp\nimport builtins\n" + aliases + helper_writes + b"rp.run_path('payload.py')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_safe_runpy_call_clean_after_builtins_alias_helper_noise(self) -> None:
+        aliases = b"".join(f"bi_{index} = builtins\n".encode() for index in range(64))
+        helper_writes = b"bi_0.setattr = lambda *args: None\n" * 64
+        source = (
+            b"import runpy as rp\nimport builtins\n"
+            + aliases
+            + helper_writes
+            + b"rp.run_path = print\nrp.run_path('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(finding.type in {"code_execution_pattern", "analysis_incomplete"} for finding in findings)
 
     def test_scan_model_detects_tail_framed_runpy_member_restore_with_prefix_context(self) -> None:
         detector = JITScriptDetector()
