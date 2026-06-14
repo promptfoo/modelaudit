@@ -4830,6 +4830,41 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     mock_rmtree.assert_called()
 
 
+@patch("modelaudit.cli.is_huggingface_url", return_value=True)
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_filtered_cache_cleans_owned_staging_after_scan(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    _mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Exclusive filtered cache views must survive scanning but not accumulate afterward."""
+    cache_dir = tmp_path / "cache"
+    selection_dir = cache_dir / "huggingface" / ".modelaudit-selections" / "test" / "model" / "selection"
+    selection_dir.mkdir(parents=True)
+    (selection_dir / "model.onnx").write_bytes(b"onnx")
+
+    def download_side_effect(*_args: object, **kwargs: object) -> Path:
+        temporary_paths = cast(list[Path], kwargs["temporary_download_paths"])
+        temporary_paths.append(selection_dir)
+        return selection_dir
+
+    mock_download.side_effect = download_side_effect
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--quiet", "--cache-dir", str(cache_dir), "--scanners", "onnx", "hf://test/model"],
+    )
+
+    assert result.exit_code == 0, result.output
+    mock_scan.assert_called_once()
+    mock_rmtree.assert_called_once_with(str(selection_dir))
+
+
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")

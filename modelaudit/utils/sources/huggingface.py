@@ -5716,6 +5716,7 @@ def download_model(
     timeout_seconds: float | None = None,
     repository_file_inventory: list[str] | None = None,
     safetensors_index_proofs: list[HuggingFaceSafetensorsIndexProof] | None = None,
+    temporary_download_paths: list[Path] | None = None,
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
@@ -5730,6 +5731,7 @@ def download_model(
         timeout_seconds: Optional end-to-end acquisition deadline in seconds
         repository_file_inventory: Optional list filled with repository member names from metadata
         safetensors_index_proofs: Optional list filled with verified immutable SafeTensors index evidence
+        temporary_download_paths: Optional list filled with call-owned staging paths that callers must remove
         scannable_extensions: Optional remote prefilter extensions from scanner selection policy
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
@@ -5753,6 +5755,8 @@ def download_model(
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    if temporary_download_paths is not None:
+        temporary_download_paths.clear()
 
     # Disk space path setup. Selection-aware size evidence is collected after planning.
     selection_is_filtered = (
@@ -5820,9 +5824,9 @@ def download_model(
                 scannable_extensions,
                 scannable_scanner_ids,
             )
-            # The immutable-revision selection namespace may be shared by
-            # concurrent equivalent scans, so never remove the whole directory.
-            download_path_preexisting = True
+            # Each filtered view is exclusive to this invocation and must be
+            # retained only until its caller finishes scanning it.
+            download_path_preexisting = False
             disk_check_path = download_path
 
         if selection_is_filtered:
@@ -5875,6 +5879,18 @@ def download_model(
 
         download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
 
+        def verified_downloaded_path(local_path: str) -> Path:
+            """Bind a filtered SDK result to the exclusive staging path we created."""
+            downloaded = Path(local_path)
+            if not selection_is_filtered or temporary_download_paths is None:
+                return downloaded
+            assert download_path is not None and filtered_cache_root is not None
+            if os.path.normcase(os.path.abspath(downloaded)) != os.path.normcase(
+                os.path.abspath(download_path)
+            ) or not _is_trusted_huggingface_filtered_download_path(filtered_cache_root, downloaded):
+                raise ValueError(f"Filtered Hugging Face download returned an unsafe path for {repo_id}")
+            return downloaded
+
         if selection_is_filtered:
             assert download_path is not None and filtered_cache_root is not None
             if not _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path):
@@ -5889,7 +5905,7 @@ def download_model(
         )
 
         # Verify we actually got model files
-        downloaded_path = Path(local_path)
+        downloaded_path = verified_downloaded_path(local_path)
         onnx_external_data_enabled = scannable_scanner_ids is None or "onnx" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
@@ -5971,7 +5987,7 @@ def download_model(
                 repo_id,
                 direct_download=snapshot_download,
             )
-            downloaded_path = Path(local_path)
+            downloaded_path = verified_downloaded_path(local_path)
         _verify_huggingface_selection_within_max_size(repo_id, downloaded_path, model_files, size_limit)
         downloaded_files = {
             path.relative_to(downloaded_path).as_posix() for path in downloaded_path.rglob("*") if path.is_file()
@@ -6002,11 +6018,23 @@ def download_model(
         )
         if safetensors_index_proofs is not None:
             safetensors_index_proofs[:] = plan.safetensors_index_proofs
+        if selection_is_filtered and temporary_download_paths is not None:
+            temporary_download_paths.append(downloaded_path)
 
         return Path(local_path)
     except Exception as e:
-        # Clean up only a new unfiltered custom directory owned by this call.
+        # A filtered view is always exclusive to this invocation. Remove it on
+        # acquisition failure; successful callers retain it through scanning.
         if (
+            selection_is_filtered
+            and filtered_cache_root is not None
+            and download_path is not None
+            and download_path.exists()
+            and _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path)
+        ):
+            with suppress(OSError):
+                shutil.rmtree(download_path)
+        elif (
             cache_dir is not None
             and download_path is not None
             and not download_path_preexisting

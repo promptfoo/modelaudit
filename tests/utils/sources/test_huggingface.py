@@ -1631,6 +1631,9 @@ class TestModelDownload:
 
         assert repository_path.is_symlink()
         assert sentinel.read_bytes() == b"keep"
+        selection_parent = cache_root / ".modelaudit-selections" / "test" / "model"
+        assert selection_parent.is_dir()
+        assert list(selection_parent.iterdir()) == []
 
     def test_download_model_filtered_default_cache_uses_selection_directory(self, tmp_path: Path) -> None:
         """Default-cache filtering must not expose stale files from a broader snapshot."""
@@ -1691,6 +1694,41 @@ class TestModelDownload:
             len(_MINIMAL_ONNX_MODEL_PROTO),
             len(_MINIMAL_ONNX_MODEL_PROTO),
         ]
+
+    def test_download_model_cleanup_contract_rejects_unexpected_return_path(self, tmp_path: Path) -> None:
+        """A call-owned filtered view cannot redirect deferred cleanup outside its staging path."""
+        cache_dir = tmp_path / "cache"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
+        temporary_paths: list[Path] = []
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
+            ),
+            patch("huggingface_hub.snapshot_download", return_value=str(outside)),
+            pytest.raises(Exception, match="returned an unsafe path"),
+        ):
+            download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                temporary_download_paths=temporary_paths,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert temporary_paths == []
+        assert (outside / "model.onnx").is_file()
+        selection_parent = cache_dir / "huggingface" / ".modelaudit-selections" / "test" / "model"
+        assert selection_parent.is_dir()
+        assert list(selection_parent.iterdir()) == []
 
     def test_download_model_filtered_isolates_equivalent_concurrent_selections(self, tmp_path: Path) -> None:
         """Equivalent acquisitions must never prune another scan's active staging tree."""

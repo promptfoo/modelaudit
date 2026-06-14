@@ -1693,6 +1693,7 @@ class _SourceDispatchResult:
     actual_path: str
     local_scan_required: bool = True
     temp_path: str | None = None
+    temp_path_owned: bool = False
     source_model_id: str | None = None
     source_model_source: str | None = None
     repository_file_inventory: tuple[str, ...] = ()
@@ -1996,9 +1997,16 @@ class _ScanPathState:
             if asset.path:
                 self.scanned_paths.append(_display_scan_path(asset.path))
 
-    def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
+    def defer_temp_cleanup(
+        self,
+        temp_path: str | None,
+        *,
+        cache_enabled: bool,
+        verbose: bool,
+        owned: bool = False,
+    ) -> None:
         """Track temporary artifacts for post-SBOM cleanup."""
-        if temp_path and os.path.exists(temp_path) and not cache_enabled:
+        if temp_path and os.path.exists(temp_path) and (owned or not cache_enabled):
             self.temp_cleanup_entries.append((temp_path, os.path.isdir(temp_path)))
             if verbose:
                 logger.debug(f"Deferring cleanup of temporary artifact: {temp_path}")
@@ -3996,6 +4004,7 @@ def _resolve_scan_source_for_path(
                 )
 
         temp_dir = None
+        owned_filtered_temp_path: str | None = None
         try:
             source_model_id, source_model_source = extract_model_id_from_path(path)
             if runtime.cache_enabled and runtime.cache_dir:
@@ -4111,6 +4120,7 @@ def _resolve_scan_source_for_path(
             show_progress = runtime.show_styled_output and should_show_spinner()
             download_repository_file_inventory: list[str] = []
             download_safetensors_index_proofs: list[HuggingFaceSafetensorsIndexProof] = []
+            temporary_download_paths: list[Path] = []
             download_path = download_model(
                 path,
                 cache_dir=hf_cache_dir,
@@ -4119,9 +4129,13 @@ def _resolve_scan_source_for_path(
                 timeout_seconds=runtime.timeout,
                 repository_file_inventory=download_repository_file_inventory,
                 safetensors_index_proofs=download_safetensors_index_proofs,
+                temporary_download_paths=temporary_download_paths,
                 scannable_extensions=runtime.scannable_extensions,
                 scannable_filenames=runtime.scannable_filenames,
                 scannable_scanner_ids=runtime.scannable_scanner_ids,
+            )
+            owned_filtered_temp_path = (
+                str(temporary_download_paths[0]) if runtime.cache_enabled and temporary_download_paths else None
             )
             download_duration = time.time() - download_start
             try:
@@ -4139,7 +4153,8 @@ def _resolve_scan_source_for_path(
 
             return _SourceDispatchResult(
                 actual_path=str(download_path),
-                temp_path=temp_dir,
+                temp_path=temp_dir or owned_filtered_temp_path,
+                temp_path_owned=owned_filtered_temp_path is not None,
                 source_model_id=source_model_id,
                 source_model_source=source_model_source,
                 repository_file_inventory=tuple(download_repository_file_inventory),
@@ -4188,9 +4203,10 @@ def _resolve_scan_source_for_path(
                 error_msg=error_msg,
             )
             path_state.defer_temp_cleanup(
-                temp_dir,
+                temp_dir or owned_filtered_temp_path,
                 cache_enabled=runtime.cache_enabled,
                 verbose=verbose,
+                owned=owned_filtered_temp_path is not None,
             )
             return None
 
@@ -5361,6 +5377,7 @@ def scan_command(
                     source_result.temp_path,
                     cache_enabled=runtime.cache_enabled,
                     verbose=verbose,
+                    owned=source_result.temp_path_owned,
                 )
 
                 if interrupt_handler.is_interrupted():
