@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -6364,6 +6365,10 @@ def test_get_huggingface_file_metadata_fails_closed_when_deadline_expires() -> N
 
 def test_get_huggingface_file_metadata_uses_deadline_worker() -> None:
     """Direct-file metadata SDK calls should be bounded by the shared acquisition deadline."""
+    timeout_seconds = 7.0
+    # Crossing this binary exponent boundary reproduces the Windows cancellation roundoff.
+    monotonic_now = 4095.1
+    assert (monotonic_now + timeout_seconds) - monotonic_now > timeout_seconds
 
     def run_worker(
         operation: str,
@@ -6377,8 +6382,9 @@ def test_get_huggingface_file_metadata_uses_deadline_worker() -> None:
         assert operation_kwargs["filenames"] == ["model.bin"]
         assert operation_kwargs["requested_revision"] == "main"
         assert operation_kwargs["resolved_revision"] is None
-        assert 0 < operation_kwargs["request_timeout"] <= 7
-        assert 0 < deadline - cli_module.time.monotonic() <= 7
+        deadline_roundoff = math.ulp(deadline)
+        assert 0 < operation_kwargs["request_timeout"] <= timeout_seconds + deadline_roundoff
+        assert 0 < deadline - cli_module.time.monotonic() <= timeout_seconds + deadline_roundoff
         return {
             "value": {
                 "revision": _HF_TEST_REVISION,
@@ -6387,6 +6393,7 @@ def test_get_huggingface_file_metadata_uses_deadline_worker() -> None:
         }
 
     with (
+        patch("modelaudit.cli.time.monotonic", return_value=monotonic_now),
         patch("huggingface_hub.HfApi") as mock_hf_api,
         patch(
             "modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline", side_effect=run_worker
@@ -6396,7 +6403,7 @@ def test_get_huggingface_file_metadata_uses_deadline_worker() -> None:
             "test/model",
             "main",
             "model.bin",
-            timeout_seconds=7,
+            timeout_seconds=timeout_seconds,
         )
 
     assert metadata == {"size_bytes": 2048, "resolved_revision": _HF_TEST_REVISION}
