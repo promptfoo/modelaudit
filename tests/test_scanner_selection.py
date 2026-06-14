@@ -925,6 +925,7 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
             id="embedded-import-only-GLOBAL",
         ),
         pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
+        pytest.param(b"MIT\nXS'id'\nQtext\n", 2, id="mid-line-STRING-before-BINPERSID"),
         pytest.param(
             b"MIT License\nNcposix\nsystem\n(S'id'\ntR.",
             2,
@@ -1164,6 +1165,10 @@ def test_scan_file_keeps_benign_encoded_execution_word_on_text_route(
         pytest.param(
             b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
             id="context-opcode-leading-prose-lines",
+        ),
+        pytest.param(
+            b"MIT License\nXS'id'\nZtext\n",
+            id="mid-line-STRING-without-opcode-continuation",
         ),
         pytest.param(
             b"MIT License\nNcopyright\nconditions\ninclude\n",

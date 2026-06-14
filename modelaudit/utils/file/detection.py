@@ -5645,6 +5645,10 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
             or payload[operand_end] in _PICKLE_OPCODE_BY_BYTE
         )
     if argument_size == -1:
+        if opcode.name == "STRING" and (
+            offset + 1 >= len(payload) or payload[offset + 1 : offset + 2] not in {b"'", b'"'}
+        ):
+            return False
         cursor = offset + 1
         lines: list[bytes] = []
         for _ in range(2 if opcode.name in _PICKLE_LINE_PAIR_OPCODES else 1):
@@ -5682,7 +5686,7 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
     )
 
 
-def _iter_nonblank_line_starts(payload: bytes) -> Iterator[int]:
+def _iter_pickle_line_candidate_starts(payload: bytes) -> Iterator[int]:
     line_start = 0
     for line_end in range(len(payload) + 1):
         if line_end < len(payload) and payload[line_end] not in b"\r\n":
@@ -5692,6 +5696,14 @@ def _iter_nonblank_line_starts(payload: bytes) -> Iterator[int]:
             candidate_start += 1
         if candidate_start < line_end:
             yield candidate_start
+            search_start = candidate_start + 1
+            while search_start < line_end:
+                string_start = payload.find(b"S", search_start, line_end)
+                if string_start < 0:
+                    break
+                if string_start + 1 < line_end and payload[string_start + 1 : string_start + 2] in {b"'", b'"'}:
+                    yield string_start
+                search_start = string_start + 1
         line_start = line_end + 1
 
 
@@ -5791,7 +5803,7 @@ def _iter_pickle_candidate_offsets(
     if is_plain_text:
         recent_line_starts: deque[int] = deque()
         lookbehind_truncated = False
-        for candidate_start in _iter_nonblank_line_starts(payload):
+        for candidate_start in _iter_pickle_line_candidate_starts(payload):
             while recent_line_starts and candidate_start - recent_line_starts[0] > PROTO0_1_MAX_PROBE_BYTES:
                 recent_line_starts.popleft()
                 lookbehind_truncated = True
@@ -5810,7 +5822,7 @@ def _iter_pickle_candidate_offsets(
                     lookbehind_truncated = True
         return
 
-    for candidate_start in _iter_nonblank_line_starts(payload):
+    for candidate_start in _iter_pickle_line_candidate_starts(payload):
         yield from maybe_add(candidate_start)
 
     plain_controls = b"\t\n\r\f"

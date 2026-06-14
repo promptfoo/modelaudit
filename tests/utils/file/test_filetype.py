@@ -3990,6 +3990,11 @@ def test_next_buffer_callback_precedes_eof() -> None:
             id="embedded-BINPERSID",
         ),
         pytest.param(
+            b"MIT\nXS'id'\nQtext\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="mid-line-STRING-before-BINPERSID",
+        ),
+        pytest.param(
             b"MIT License\nNcposix\nsystem\n(S'id'\ntR.",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="trivial-prefix-before-GLOBAL",
@@ -4215,6 +4220,10 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
         pytest.param(
             b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
             id="context-opcode-leading-prose-lines",
+        ),
+        pytest.param(
+            b"MIT License\nXS'id'\nZtext\n",
+            id="mid-line-STRING-without-opcode-continuation",
         ),
         pytest.param(
             b"MIT License\nNcopyright\nconditions\ninclude\n",
