@@ -1825,12 +1825,20 @@ class TestModelDownload:
         [KeyboardInterrupt(), SystemExit(130)],
         ids=["keyboard-interrupt", "system-exit"],
     )
+    @pytest.mark.parametrize(
+        "cleanup_failure",
+        ["removal", "ownership-oserror", "ownership-runtime"],
+        ids=["rmtree", "containment-oserror", "containment-runtime"],
+    )
     def test_download_model_custom_cache_cleanup_preserves_interrupt(
         self,
         tmp_path: Path,
         interrupt: BaseException,
+        cleanup_failure: str,
     ) -> None:
         """A best-effort cache cleanup failure must not mask process-control exits."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
         cache_dir = tmp_path / "cache"
         plan = SimpleNamespace(
             deadline=None,
@@ -1842,6 +1850,16 @@ class TestModelDownload:
             download_revision=_HF_TEST_REVISION,
             safetensors_index_proofs=(),
         )
+        original_is_within_directory = huggingface_module._is_within_directory
+        containment_calls = 0
+
+        def containment_with_cleanup_failure(base_dir: Path, target_path: Path) -> bool:
+            nonlocal containment_calls
+            containment_calls += 1
+            if cleanup_failure.startswith("ownership-") and containment_calls > 1:
+                error_type = RuntimeError if cleanup_failure == "ownership-runtime" else OSError
+                raise error_type("cleanup containment stat failed")
+            return original_is_within_directory(base_dir, target_path)
 
         with (
             patch("modelaudit.utils.sources.huggingface._get_model_size_with_deadline", return_value=0),
@@ -1850,13 +1868,23 @@ class TestModelDownload:
                 "modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline",
                 side_effect=interrupt,
             ),
-            patch("modelaudit.utils.sources.huggingface.shutil.rmtree", side_effect=OSError("locked")) as mock_rmtree,
+            patch(
+                "modelaudit.utils.sources.huggingface._is_within_directory",
+                side_effect=containment_with_cleanup_failure,
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface.shutil.rmtree",
+                side_effect=OSError("locked") if cleanup_failure == "removal" else None,
+            ) as mock_rmtree,
             pytest.raises(type(interrupt)) as raised,
         ):
             download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
         assert raised.value is interrupt
-        mock_rmtree.assert_called_once()
+        if cleanup_failure == "removal":
+            mock_rmtree.assert_called_once()
+        else:
+            mock_rmtree.assert_not_called()
 
     def test_download_model_filtered_default_cache_uses_selection_directory(self, tmp_path: Path) -> None:
         """Default-cache filtering must not expose stale files from a broader snapshot."""

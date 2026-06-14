@@ -51,7 +51,7 @@ from modelaudit.utils.repository_context import (
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
-from tests.helpers import create_mock_pytorch_zip
+from tests.helpers import create_mock_pytorch_zip, create_resource_limited_safetensors_index
 
 
 @pytest.fixture(autouse=True)
@@ -1189,6 +1189,108 @@ def test_explicit_shard_family_rejects_overlapping_duplicate_ancestor_index(tmp_
         f'{{"weight_map":{{{selected_map}}},"weight_map":{{{decoy_map}}}}}',
         encoding="utf-8",
     )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *(str(shard) for shard in selected),
+            "--assume-shard-family",
+            "--scanners",
+            "safetensors",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in output_payload["checks"]
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_scope",
+    [
+        "byte-limit",
+        "token-limit",
+        "normalizable-target",
+        "outside-alias",
+        "contained-alias",
+        "identity-cap",
+        "broken-targets",
+    ],
+)
+def test_explicit_shard_family_rejects_incompletely_scoped_ancestor_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_scope: str,
+) -> None:
+    """Parser ceilings and rejected contained paths cannot erase ancestor authority."""
+    from modelaudit.utils.file import handlers as handlers_module
+
+    header = b'{"__metadata__":{"format":"pt"}}'
+    scope = tmp_path / "scope"
+    selected_dir = scope / "aa"
+    omitted_dir = scope / "cc"
+    _make_trusted_shard_parent(selected_dir, parents=True)
+    _make_trusted_shard_parent(omitted_dir, parents=True)
+    selected = [selected_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+    omitted = omitted_dir / "model-00002-of-00002.safetensors"
+    for shard in (*selected, omitted):
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    selected_target = selected[0].relative_to(scope).as_posix()
+    if invalid_scope == "outside-alias":
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        outside_alias = outside_dir / selected[0].name
+        os.link(selected[0], outside_alias)
+        selected_target = f"../outside/{outside_alias.name}"
+    elif invalid_scope == "contained-alias":
+        alias_dir = scope / "aliases"
+        alias_dir.mkdir()
+        contained_alias = alias_dir / selected[0].name
+        os.link(selected[0], contained_alias)
+        selected_target = contained_alias.relative_to(scope).as_posix()
+    elif invalid_scope in {"identity-cap", "broken-targets"}:
+        if invalid_scope == "broken-targets" and os.name == "nt":
+            pytest.skip("requires portable symlink creation")
+        base_dir = scope / "base"
+        base_dir.mkdir()
+        base_targets = [base_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        for target in base_targets:
+            if invalid_scope == "broken-targets":
+                target.symlink_to(base_dir / f"missing-{target.name}")
+            else:
+                target.write_bytes(struct.pack("<Q", len(header)) + header)
+        selected_target = base_targets[0].relative_to(scope).as_posix()
+        omitted = base_targets[1]
+        if invalid_scope == "identity-cap":
+            monkeypatch.setattr(handlers_module, "MAX_SAFETENSORS_SHARD_ALIAS_IDENTITY_CHECKS", 1)
+    weight_map = {
+        "selected": f"zz/../{selected_target}" if invalid_scope == "normalizable-target" else selected_target,
+        "omitted": omitted.relative_to(scope).as_posix(),
+    }
+    index_path = scope / "model.safetensors.index.json"
+    if invalid_scope == "byte-limit":
+        create_resource_limited_safetensors_index(
+            index_path,
+            weight_map,
+            max_bytes=handlers_module.MAX_SAFETENSORS_SHARD_INDEX_BYTES,
+        )
+    elif invalid_scope == "token-limit":
+        create_resource_limited_safetensors_index(
+            index_path,
+            weight_map,
+            max_tokens=handlers_module.MAX_SAFETENSORS_SHARD_INDEX_JSON_TOKENS,
+        )
+    else:
+        index_path.write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
 
     result = CliRunner().invoke(
         cli,

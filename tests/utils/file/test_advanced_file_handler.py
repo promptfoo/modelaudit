@@ -1043,20 +1043,52 @@ class TestShardedModelDetector:
         assert result.success is False
         assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
 
-    @pytest.mark.parametrize(
-        "index_payload",
-        [
-            "{not-json",
-            json.dumps({"weight_map": {"tensor": "../outside/model-00000-of-00001.safetensors"}}),
-        ],
-        ids=["nested-malformed-json", "nested-traversal-target"],
-    )
-    def test_detect_safetensors_invalid_ancestor_index_does_not_poison_nested_family(
+    def test_detect_safetensors_outside_alias_ancestor_fails_closed(
         self,
         tmp_path: Path,
-        index_payload: str,
     ) -> None:
-        """Malformed and traversal-bearing ancestor indexes must not claim nested shards."""
+        """An out-of-root target cannot be assumed disjoint from selected shard identity."""
+        model_root = tmp_path / "scope"
+        shard_dir = model_root / "shards"
+        shard_dir.mkdir(parents=True)
+        shards = [
+            shard_dir / "model-00001-of-00002.safetensors",
+            shard_dir / "model-00002-of-00002.safetensors",
+        ]
+        for shard in shards:
+            shard.write_bytes(shard.name.encode())
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        outside_alias = outside_dir / shards[0].name
+        os.link(shards[0], outside_alias)
+        index_path = model_root / "model.safetensors.index.json"
+        index_path.write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "alias": f"../outside/{outside_alias.name}",
+                        "omitted": "cc/model-00002-of-00002.safetensors",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]), index_search_root=model_root)
+        result = AdvancedFileHandler(
+            str(shards[0]),
+            CompletingShardScanner(),
+            index_search_root=model_root,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "unsafe safetensors index target path"
+        assert shard_info["unvalidated_shards"] == [str(index_path)]
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_unparseable_ancestor_index_fails_closed(self, tmp_path: Path) -> None:
+        """An ancestor whose target scope was not parsed cannot be assumed unrelated."""
         shard_dir = tmp_path / "shards"
         shard_dir.mkdir()
         shards = [
@@ -1065,7 +1097,8 @@ class TestShardedModelDetector:
         ]
         for shard in shards:
             shard.write_bytes(shard.name.encode())
-        (tmp_path / "model.safetensors.index.json").write_text(index_payload, encoding="utf-8")
+        index_path = tmp_path / "model.safetensors.index.json"
+        index_path.write_text("{not-json", encoding="utf-8")
 
         shard_info = ShardedModelDetector.detect_shards(str(shards[0]), index_search_root=tmp_path)
         result = AdvancedFileHandler(
@@ -1075,11 +1108,92 @@ class TestShardedModelDetector:
         ).scan()
 
         assert shard_info is not None
-        assert "safetensors_index_path" not in shard_info
-        assert "safetensors_index_error" not in shard_info
-        assert "unvalidated_shards" not in shard_info
-        assert shard_info["shards"] == [str(shard) for shard in shards]
-        assert result.success is True
+        assert shard_info["safetensors_index_error"]
+        assert shard_info["unvalidated_shards"] == [str(index_path)]
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("limit_name", "limit_value", "expected_error"),
+        [
+            ("MAX_SAFETENSORS_SHARD_INDEX_BYTES", 1, "safetensors index exceeds bounded parse limit"),
+            (
+                "MAX_SAFETENSORS_SHARD_INDEX_JSON_TOKENS",
+                1,
+                "SafeTensors index exceeds JSON object/value limit",
+            ),
+        ],
+        ids=["byte-limit", "token-limit"],
+    )
+    def test_detect_safetensors_bounded_ancestor_scope_failure_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        limit_name: str,
+        limit_value: int,
+        expected_error: str,
+    ) -> None:
+        """A resource ceiling cannot turn canonical ancestor authority into absence."""
+        selected_dir = tmp_path / "aa"
+        selected_dir.mkdir()
+        shards = [selected_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        for shard in shards:
+            shard.write_bytes(shard.name.encode())
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "selected": shards[0].relative_to(tmp_path).as_posix(),
+                        "omitted": "cc/model-00002-of-00002.safetensors",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(f"modelaudit.utils.file.handlers.{limit_name}", limit_value)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(shards[0]),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == expected_error
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_normalizable_unsafe_target_retains_ancestor_overlap(self, tmp_path: Path) -> None:
+        """A rejected contained traversal still binds an invalid index to its selected shard."""
+        selected_dir = tmp_path / "aa"
+        selected_dir.mkdir()
+        shards = [selected_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        for shard in shards:
+            shard.write_bytes(shard.name.encode())
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "selected": f"zz/../{shards[0].relative_to(tmp_path).as_posix()}",
+                        "omitted": "cc/model-00002-of-00002.safetensors",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(shards[0]),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "unsafe safetensors index target path"
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
 
     def test_detect_safetensors_invalid_ancestor_index_governing_nested_family_fails_closed(
         self,
@@ -1289,6 +1403,114 @@ class TestShardedModelDetector:
         assert shard_info["shard_index_base"] == "one"
         assert shard_info["shards"] == [str(shard) for shard in adapter_shards]
         assert result.success is True
+
+    def test_detect_safetensors_alias_identity_limit_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An alias-check ceiling cannot authorize a lexically disjoint ancestor index."""
+        _write_safetensors_index(
+            tmp_path,
+            [f"base/model-{index:05d}-of-00002.safetensors" for index in (1, 2)],
+        )
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        adapter_shards = [
+            adapter_dir / "model-00001-of-00002.safetensors",
+            adapter_dir / "model-00002-of-00002.safetensors",
+        ]
+        for shard in adapter_shards:
+            shard.write_bytes(shard.name.encode())
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_SAFETENSORS_SHARD_ALIAS_IDENTITY_CHECKS", 1)
+
+        shard_info = ShardedModelDetector.detect_shards(str(adapter_shards[0]), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(adapter_shards[0]),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "safetensors index target identity is indeterminate"
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires portable symlink creation")
+    def test_detect_safetensors_broken_alias_identity_fails_closed(self, tmp_path: Path) -> None:
+        """Broken target aliases are indeterminate rather than unrelated authority."""
+        base_dir = tmp_path / "base"
+        adapter_dir = tmp_path / "adapter"
+        base_dir.mkdir()
+        adapter_dir.mkdir()
+        base_targets = [base_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        for target in base_targets:
+            target.symlink_to(base_dir / f"missing-{target.name}")
+        _write_safetensors_index(tmp_path, [target.relative_to(tmp_path).as_posix() for target in base_targets])
+        adapter_shards = [
+            adapter_dir / "model-00001-of-00002.safetensors",
+            adapter_dir / "model-00002-of-00002.safetensors",
+        ]
+        for shard in adapter_shards:
+            shard.write_bytes(shard.name.encode())
+
+        shard_info = ShardedModelDetector.detect_shards(str(adapter_shards[0]), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(adapter_shards[0]),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "safetensors index target identity is indeterminate"
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_alias_identity_work_is_linear(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One identity snapshot must serve every shard membership check."""
+        total_shards = 8
+        selected_dir = tmp_path / "aa"
+        alias_dir = tmp_path / "aliases"
+        selected_dir.mkdir()
+        alias_dir.mkdir()
+        selected = [
+            selected_dir / f"model-{index:05d}-of-{total_shards:05d}.safetensors"
+            for index in range(1, total_shards + 1)
+        ]
+        aliases: list[Path] = []
+        for shard in selected:
+            shard.write_bytes(shard.name.encode())
+            alias = alias_dir / shard.name
+            os.link(shard, alias)
+            aliases.append(alias)
+        _write_safetensors_index(tmp_path, [alias.relative_to(tmp_path).as_posix() for alias in aliases])
+        original_identity = ShardedModelDetector._safetensors_stat_identity
+        identity_calls = 0
+
+        def counting_identity(
+            path: str | os.PathLike[str],
+            path_stat: os.stat_result,
+        ) -> tuple[int | str, ...] | None:
+            nonlocal identity_calls
+            identity_calls += 1
+            return original_identity(path, path_stat)
+
+        monkeypatch.setattr(
+            ShardedModelDetector,
+            "_safetensors_stat_identity",
+            staticmethod(counting_identity),
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(selected[0]), index_search_root=tmp_path)
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_declares_current_file"] is True
+        assert "safetensors_index_error" not in shard_info
+        assert identity_calls <= (2 * total_shards) + 4
 
     def test_detect_safetensors_same_directory_unrelated_index_does_not_poison_family(
         self,

@@ -6108,23 +6108,23 @@ def download_model(
     except BaseException as e:
         # A filtered view is always exclusive to this invocation. Remove it on
         # acquisition failure; successful callers retain it through scanning.
-        failed_staging_is_owned = (
-            selection_is_filtered
-            and not filtered_staging_handed_off
-            and filtered_cache_root is not None
-            and download_path is not None
-            and download_path.exists()
-            and _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path)
-        ) or (
-            not selection_is_filtered
-            and cache_dir is not None
-            and download_path is not None
-            and not download_path_preexisting
-            and download_path.exists()
-            and _is_within_directory(cache_dir / "huggingface", download_path)
-        )
-        if failed_staging_is_owned:
-            with suppress(OSError):
+        with suppress(OSError, RuntimeError):
+            failed_staging_is_owned = (
+                selection_is_filtered
+                and not filtered_staging_handed_off
+                and filtered_cache_root is not None
+                and download_path is not None
+                and download_path.exists()
+                and _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path)
+            ) or (
+                not selection_is_filtered
+                and cache_dir is not None
+                and download_path is not None
+                and not download_path_preexisting
+                and download_path.exists()
+                and _is_within_directory(cache_dir / "huggingface", download_path)
+            )
+            if failed_staging_is_owned:
                 assert download_path is not None
                 shutil.rmtree(download_path)
         if not isinstance(e, Exception):

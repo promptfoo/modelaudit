@@ -417,6 +417,29 @@ def create_mock_safetensors(path: Path) -> Path:
     return path
 
 
+def create_resource_limited_safetensors_index(
+    path: Path,
+    weight_map: dict[str, str],
+    *,
+    max_bytes: int | None = None,
+    max_tokens: int | None = None,
+) -> Path:
+    """Create a valid index just beyond one production parser resource limit."""
+    if (max_bytes is None) == (max_tokens is None):
+        raise ValueError("exactly one SafeTensors index resource limit is required")
+    weight_map_json = json.dumps(weight_map, separators=(",", ":"))
+    if max_bytes is not None:
+        prefix = '{"metadata":{"padding":"'
+        suffix = f'"}},"weight_map":{weight_map_json}}}'
+        padding_size = max(max_bytes + 1 - len(prefix.encode()) - len(suffix.encode()), 0)
+        payload = prefix + ("x" * padding_size) + suffix
+    else:
+        assert max_tokens is not None
+        payload = f'{{"metadata":[{"0," * max_tokens}0],"weight_map":{weight_map_json}}}'
+    path.write_text(payload, encoding="utf-8")
+    return path
+
+
 def create_mock_h5(path: Path, *, keras_style: bool = False) -> Path:
     """Create a mock HDF5 file for testing.
 

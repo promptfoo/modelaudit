@@ -62,6 +62,7 @@ MAX_SAFETENSORS_SHARD_INDEX_DIRECTORIES = 256
 MAX_SAFETENSORS_SHARD_INDEX_OBSERVATIONS = 512
 MAX_SAFETENSORS_SHARD_INDEX_TENSORS = 250_000
 MAX_SAFETENSORS_SHARD_INDEX_JSON_TOKENS = (2 * MAX_SAFETENSORS_SHARD_INDEX_TENSORS) + 4096
+MAX_SAFETENSORS_SHARD_ALIAS_IDENTITY_CHECKS = 1024
 _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY = "_trusted_safetensors_index_inspection_context"
 
 ValidatedShardTargets = dict[str, dict[str, int | str]]
@@ -105,6 +106,10 @@ class _SafetensorsShardIndexInventory:
     generation: int | None = None
     error: str | None = None
     proven_unrelated: bool = False
+    target_scope_complete: bool = False
+    expected_source_identities: frozenset[tuple[int | str, ...]] = frozenset()
+    target_identities_observed: bool = False
+    target_identity_error: str | None = None
 
 
 @dataclass
@@ -869,6 +874,75 @@ class ShardedModelDetector:
             raise ValueError("unsafe safetensors index target path")
         return index_dir.joinpath(*target_path.parts)
 
+    @staticmethod
+    def _index_target_scope_path(index_dir: Path, raw_target: str) -> Path | None:
+        """Normalize a target only for invalid-index scope comparison."""
+        try:
+            candidate = Path(raw_target)
+            if not candidate.is_absolute():
+                candidate = index_dir / candidate
+            normalized_index_dir = _normalized_absolute_path(index_dir)
+            normalized_candidate = _normalized_absolute_path(candidate)
+            if os.path.commonpath([normalized_index_dir, normalized_candidate]) != normalized_index_dir:
+                return None
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return Path(normalized_candidate)
+
+    @staticmethod
+    def _safetensors_stat_identity(
+        path: str | os.PathLike[str],
+        path_stat: os.stat_result,
+    ) -> tuple[int | str, ...] | None:
+        """Return a stable identity for alias comparison, if the platform exposes one."""
+        if path_stat.st_ino:
+            return ("inode", path_stat.st_dev, path_stat.st_ino)
+        if path_stat.st_nlink > 1:
+            return None
+        try:
+            resolved_path = Path(path).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return ("path", _normalized_absolute_path(resolved_path))
+
+    @classmethod
+    def _observe_safetensors_inventory_target_identities(
+        cls,
+        inventory: _SafetensorsShardIndexInventory,
+    ) -> _SafetensorsShardIndexInventory:
+        """Snapshot bounded target identities once for O(1) alias membership checks."""
+        identities: set[tuple[int | str, ...]] = set()
+        identity_error: str | None = None
+        if len(inventory.expected_source_paths) > MAX_SAFETENSORS_SHARD_ALIAS_IDENTITY_CHECKS:
+            identity_error = "safetensors index target identity is indeterminate"
+        else:
+            for source_path in sorted(inventory.expected_source_paths):
+                try:
+                    source_stat = os.stat(source_path)
+                except FileNotFoundError:
+                    try:
+                        if os.path.lexists(source_path):
+                            identity_error = "safetensors index target identity is indeterminate"
+                            break
+                    except (OSError, RuntimeError, ValueError):
+                        identity_error = "safetensors index target identity is indeterminate"
+                        break
+                    continue
+                except (OSError, RuntimeError, ValueError):
+                    identity_error = "safetensors index target identity is indeterminate"
+                    break
+                identity = cls._safetensors_stat_identity(source_path, source_stat)
+                if identity is None:
+                    identity_error = "safetensors index target identity is indeterminate"
+                    break
+                identities.add(identity)
+        return replace(
+            inventory,
+            expected_source_identities=frozenset(identities),
+            target_identities_observed=True,
+            target_identity_error=identity_error,
+        )
+
     @classmethod
     def _read_safetensors_index_inventory(
         cls,
@@ -883,6 +957,7 @@ class ShardedModelDetector:
     ) -> _SafetensorsShardIndexInventory:
         """Parse one SafeTensors index, returning its shard inventory or a validation error."""
         expected_paths: set[str] = set()
+        target_scope_complete = False
         cache_key: tuple[Any, ...] | None = None
         observation_prefix: tuple[Any, ...] | None = None
         index_fingerprint: str | None = None
@@ -988,14 +1063,20 @@ class ShardedModelDetector:
             target_candidates: Iterable[str] = sorted(set(string_targets))
             target_files: list[Path] = []
             target_path_error: ValueError | None = None
+            all_target_paths_scoped = True
             for raw_target in target_candidates:
                 try:
                     target_file = cls._safe_index_target_path(index_dir, raw_target)
                 except ValueError as exc:
                     target_path_error = exc
+                    all_target_paths_scoped = False
+                    scope_path = cls._index_target_scope_path(index_dir, raw_target)
+                    if scope_path is not None:
+                        expected_paths.add(_normalized_absolute_path(scope_path))
                     continue
                 target_files.append(target_file)
             expected_paths.update(_normalized_absolute_path(target_file) for target_file in target_files)
+            target_scope_complete = all_target_paths_scoped
             if target_path_error is not None:
                 raise target_path_error
             if occurrence_limit_exceeded:
@@ -1014,7 +1095,9 @@ class ShardedModelDetector:
                     fingerprint=index_fingerprint,
                     error="safetensors index target does not match shard filename pattern",
                     proven_unrelated=True,
+                    target_scope_complete=True,
                 )
+                inventory = cls._observe_safetensors_inventory_target_identities(inventory)
                 assert cache_key is not None and observation_prefix is not None
                 return inspection_context.record_inventory(
                     cache_key,
@@ -1050,7 +1133,9 @@ class ShardedModelDetector:
                     expected_indices=zero_based,
                     index_base="zero",
                     fingerprint=index_fingerprint,
+                    target_scope_complete=True,
                 )
+                inventory = cls._observe_safetensors_inventory_target_identities(inventory)
                 assert cache_key is not None and observation_prefix is not None
                 return inspection_context.record_inventory(
                     cache_key,
@@ -1065,7 +1150,9 @@ class ShardedModelDetector:
                     expected_indices=one_based,
                     index_base="one",
                     fingerprint=index_fingerprint,
+                    target_scope_complete=True,
                 )
+                inventory = cls._observe_safetensors_inventory_target_identities(inventory)
                 assert cache_key is not None and observation_prefix is not None
                 return inspection_context.record_inventory(
                     cache_key,
@@ -1082,7 +1169,10 @@ class ShardedModelDetector:
                 index_base="invalid",
                 fingerprint=index_fingerprint,
                 error=str(exc),
+                target_scope_complete=target_scope_complete,
             )
+            if target_scope_complete:
+                inventory = cls._observe_safetensors_inventory_target_identities(inventory)
             if cache_key is not None and observation_prefix is not None:
                 return inspection_context.record_inventory(
                     cache_key,
@@ -1093,13 +1183,36 @@ class ShardedModelDetector:
             return inventory
 
     @staticmethod
+    def _safetensors_inventory_file_relationship(
+        inventory: _SafetensorsShardIndexInventory,
+        current_file: Path,
+    ) -> bool | None:
+        """Return whether stable identity links a target, or None when indeterminate."""
+        normalized_current = _normalized_absolute_path(current_file)
+        if normalized_current in inventory.expected_source_paths:
+            return True
+        if not inventory.expected_source_paths:
+            return False
+        if not inventory.target_identities_observed or inventory.target_identity_error is not None:
+            return None
+        try:
+            current_stat = os.stat(current_file)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        current_identity = ShardedModelDetector._safetensors_stat_identity(current_file, current_stat)
+        if current_identity is None:
+            return None
+        return current_identity in inventory.expected_source_identities
+
+    @classmethod
     def _safetensors_inventory_governs_file(
+        cls,
         inventory: _SafetensorsShardIndexInventory,
         current_file: Path,
         pattern: str,
         expected_total: int,
-    ) -> bool:
-        """Return whether an ancestor index is authoritative for this shard path."""
+    ) -> bool | None:
+        """Return index authority, or None when target identity is indeterminate."""
         normalized_current = _normalized_absolute_path(current_file)
         if normalized_current in inventory.expected_source_paths:
             return True
@@ -1114,6 +1227,9 @@ class ShardedModelDetector:
             return False
         if _count_expected_shard_indices(inventory.expected_indices) != expected_total:
             return False
+        file_relationship = cls._safetensors_inventory_file_relationship(inventory, current_file)
+        if file_relationship is not False:
+            return file_relationship
         current_parent = os.path.dirname(normalized_current)
         expected_parents = {os.path.dirname(source_path) for source_path in inventory.expected_source_paths}
         return current_parent in expected_parents
@@ -1195,6 +1311,7 @@ class ShardedModelDetector:
         *,
         force_content_revalidation: bool = False,
         content_revalidated_paths: set[str] | None = None,
+        target_identity_refreshes: dict[str, _SafetensorsShardIndexInventory] | None = None,
     ) -> _SafetensorsShardIndexInventory | None:
         """Load a governing SafeTensors index inventory or captured validation error."""
         if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
@@ -1259,18 +1376,51 @@ class ShardedModelDetector:
                     force_content_revalidation=force_content_revalidation,
                     content_revalidated_paths=content_revalidated_paths,
                 )
+                if force_content_revalidation and inventory.target_scope_complete:
+                    normalized_index_path = _normalized_absolute_path(index_path)
+                    refreshed_inventory = (
+                        target_identity_refreshes.get(normalized_index_path)
+                        if target_identity_refreshes is not None
+                        else None
+                    )
+                    if (
+                        refreshed_inventory is None
+                        or refreshed_inventory.fingerprint != inventory.fingerprint
+                        or refreshed_inventory.generation != inventory.generation
+                        or refreshed_inventory.expected_source_paths != inventory.expected_source_paths
+                    ):
+                        refreshed_inventory = cls._observe_safetensors_inventory_target_identities(inventory)
+                        if target_identity_refreshes is not None:
+                            target_identity_refreshes[normalized_index_path] = refreshed_inventory
+                    inventory = refreshed_inventory
                 if inventory.error is not None:
-                    normalized_current = _normalized_absolute_path(current_file)
+                    if not inventory.target_scope_complete:
+                        return inventory
                     same_directory_candidate = _normalized_absolute_path(index_dir) == _normalized_absolute_path(
                         absolute_dir
                     )
-                    if normalized_current in inventory.expected_source_paths or (
+                    if cls._safetensors_inventory_file_relationship(inventory, current_file) is not False or (
                         same_directory_candidate
                         and not cls._safetensors_inventory_is_proven_unrelated(inventory, current_file)
                     ):
                         return inventory
                     continue
-                if not cls._safetensors_inventory_governs_file(inventory, current_file, pattern, expected_total):
+                governs_file = cls._safetensors_inventory_governs_file(
+                    inventory,
+                    current_file,
+                    pattern,
+                    expected_total,
+                )
+                if governs_file is None:
+                    return _SafetensorsShardIndexInventory(
+                        index_path=index_path,
+                        expected_source_paths=inventory.expected_source_paths,
+                        expected_indices=inventory.expected_indices,
+                        index_base="invalid",
+                        fingerprint=inventory.fingerprint,
+                        error="safetensors index target identity is indeterminate",
+                    )
+                if not governs_file:
                     continue
                 if governing_inventory is not None:
                     return _SafetensorsShardIndexInventory(
@@ -1370,6 +1520,7 @@ class ShardedModelDetector:
         agreed_proof: tuple[str, str, str, int] | None = None
         authority_by_parent: list[bool] = []
         revalidated_indexes: set[str] = set()
+        refreshed_target_identities: dict[str, _SafetensorsShardIndexInventory] = {}
         for current_file in representatives_by_parent.values():
             inventory = cls._load_safetensors_index_inventory(
                 current_file.parent,
@@ -1380,6 +1531,7 @@ class ShardedModelDetector:
                 inspection_context,
                 force_content_revalidation=force_content_revalidation,
                 content_revalidated_paths=revalidated_indexes,
+                target_identity_refreshes=refreshed_target_identities,
             )
             authority_present = inventory is not None
             authority_by_parent.append(authority_present)
@@ -1500,7 +1652,7 @@ class ShardedModelDetector:
                         if index_inventory.generation is not None:
                             shard_info["safetensors_index_generation"] = index_inventory.generation
                         shard_info["safetensors_index_declares_current_file"] = (
-                            _normalized_absolute_path(file_path) in index_inventory.expected_source_paths
+                            cls._safetensors_inventory_file_relationship(index_inventory, Path(file_path)) is True
                         )
 
                 # Collect local siblings and caller-snapshotted peers; validated index targets are added below.
@@ -1646,14 +1798,18 @@ class ShardedModelDetector:
                     shard_info["shard_index_base"] = index_base
                     present_expected_indices: set[int] = set()
                     unexpected_shards: list[str] = []
-                    expected_source_paths = (
-                        index_inventory.expected_source_paths
-                        if index_inventory is not None and index_inventory.error is None
-                        else None
+                    validated_index_inventory = (
+                        index_inventory if index_inventory is not None and index_inventory.error is None else None
                     )
                     for shard_path, shard_index in shard_indices.items():
-                        normalized_source = os.path.normcase(os.path.normpath(os.path.abspath(shard_path)))
-                        if expected_source_paths is not None and normalized_source not in expected_source_paths:
+                        if (
+                            validated_index_inventory is not None
+                            and cls._safetensors_inventory_file_relationship(
+                                validated_index_inventory,
+                                Path(shard_path),
+                            )
+                            is not True
+                        ):
                             unexpected_shards.append(shard_path)
                             continue
                         if shard_index in expected_indices:

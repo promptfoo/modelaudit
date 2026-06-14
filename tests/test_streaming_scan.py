@@ -47,7 +47,12 @@ from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from modelaudit.utils.sources.huggingface import download_model_streaming
-from tests.helpers import create_malicious_pickle, create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
+from tests.helpers import (
+    create_malicious_pickle,
+    create_mock_pytorch_zip,
+    create_resource_limited_safetensors_index,
+    write_mock_pytorch_zip_metadata,
+)
 
 
 class _StreamingMaliciousPicklePayload:
@@ -1310,6 +1315,7 @@ def test_scan_model_streaming_zero_based_family_uses_validated_index(tmp_path: P
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows retained shard guard prevents the fixture rewrite")
 def test_scan_model_streaming_revalidates_preserved_family_members_before_reconciliation(tmp_path: Path) -> None:
     """A previously scanned shard replaced between streamed items cannot certify the final family."""
     original_header = b'{"__metadata__":{"format":"pt"}}'
@@ -1614,7 +1620,8 @@ def test_scan_model_streaming_rechecks_index_after_reconciliation(
     assert reconciliation_count == 1
     assert result.success is False
     assert determine_exit_code(result) == 2
-    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+    outcome_reasons = {check.details.get("scan_outcome_reason") for check in result.checks}
+    assert "shard_boundary_changed" in outcome_reasons, outcome_reasons
 
 
 def test_scan_model_streaming_stable_windows_index_uses_one_terminal_revalidation(
@@ -2037,6 +2044,87 @@ def test_scan_model_streaming_total_one_consults_authoritative_index(
         expected_reason in metadata.model_dump().get("scan_outcome_reasons", [])
         for metadata in result.file_metadata.values()
     )
+
+
+@pytest.mark.parametrize(
+    "authority_case",
+    ["byte-limit", "token-limit", "hardlink-alias", "identity-cap", "broken-targets"],
+)
+def test_scan_model_streaming_rejects_indeterminate_ancestor_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority_case: str,
+) -> None:
+    """Terminal streaming reconciliation must retain bounded and alias authority."""
+    from modelaudit.utils.file import handlers as handlers_module
+
+    header = b'{"__metadata__":{"format":"pt"}}'
+    selected_dir = tmp_path / "aa"
+    omitted_dir = tmp_path / "cc"
+    selected_dir.mkdir()
+    omitted_dir.mkdir()
+    selected = [selected_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+    omitted = omitted_dir / "model-00002-of-00002.safetensors"
+    for shard in (*selected, omitted):
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    weight_map = {
+        "selected": selected[0].relative_to(tmp_path).as_posix(),
+        "omitted": omitted.relative_to(tmp_path).as_posix(),
+    }
+    index_path = tmp_path / "model.safetensors.index.json"
+    if authority_case == "byte-limit":
+        create_resource_limited_safetensors_index(
+            index_path,
+            weight_map,
+            max_bytes=handlers_module.MAX_SAFETENSORS_SHARD_INDEX_BYTES,
+        )
+    elif authority_case == "token-limit":
+        create_resource_limited_safetensors_index(
+            index_path,
+            weight_map,
+            max_tokens=handlers_module.MAX_SAFETENSORS_SHARD_INDEX_JSON_TOKENS,
+        )
+    elif authority_case == "hardlink-alias":
+        alias_dir = tmp_path / "aliases"
+        alias_dir.mkdir()
+        alias = alias_dir / selected[0].name
+        os.link(selected[0], alias)
+        weight_map["selected"] = alias.relative_to(tmp_path).as_posix()
+        index_path.write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+    else:
+        if authority_case == "broken-targets" and os.name == "nt":
+            pytest.skip("requires portable symlink creation")
+        base_dir = tmp_path / "base"
+        base_dir.mkdir()
+        base_targets = [base_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        for target in base_targets:
+            if authority_case == "broken-targets":
+                target.symlink_to(base_dir / f"missing-{target.name}")
+            else:
+                target.write_bytes(struct.pack("<Q", len(header)) + header)
+        weight_map = {
+            "selected": base_targets[0].relative_to(tmp_path).as_posix(),
+            "omitted": base_targets[1].relative_to(tmp_path).as_posix(),
+        }
+        if authority_case == "identity-cap":
+            monkeypatch.setattr(handlers_module, "MAX_SAFETENSORS_SHARD_ALIAS_IDENTITY_CHECKS", 1)
+        index_path.write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+
+    result = scan_model_streaming(
+        file_generator=iter((shard, index == len(selected) - 1) for index, shard in enumerate(selected)),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        skip_file_types=True,
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    outcome_reasons = {check.details.get("scan_outcome_reason") for check in result.checks}
+    expected_reason = "unexpected_model_shards" if authority_case == "hardlink-alias" else "shard_boundary_changed"
+    assert expected_reason in outcome_reasons, outcome_reasons
 
 
 def test_scan_model_streaming_total_one_rebases_pinned_result_paths(
