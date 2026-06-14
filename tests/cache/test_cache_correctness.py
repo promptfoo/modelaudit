@@ -48,6 +48,7 @@ from modelaudit.cache.scan_results_cache import (
     _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
     AncestorIdentity,
     ScanResultsCache,
+    _current_module_source_path,
     _path_importer_resolution_context,
     _source_resolution_context,
 )
@@ -2147,6 +2148,66 @@ def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
     monkeypatch.setitem(sys.path_importer_cache, path_entry, None)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+@pytest.mark.parametrize("shadowing_source", [False, True], ids=["benign", "shadowing"])
+def test_scan_cache_revalidates_sources_when_namespace_precedence_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shadowing_source: bool,
+) -> None:
+    parent_module = "cached_namespace_precedence"
+    module_name = f"{parent_module}.child"
+    earlier_root = tmp_path / "earlier"
+    later_root = tmp_path / "later"
+    earlier_root.mkdir()
+    later_package = later_root / parent_module
+    later_package.mkdir(parents=True)
+    later_source = later_package / "child.py"
+    later_source.write_text("value = 'later'\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "path", [str(earlier_root), str(later_root), *sys.path])
+    monkeypatch.delitem(sys.modules, parent_module, raising=False)
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.delitem(sys.path_importer_cache, str(earlier_root), raising=False)
+    monkeypatch.delitem(sys.path_importer_cache, str(later_root), raising=False)
+    monkeypatch.delitem(sys.path_importer_cache, str(later_package), raising=False)
+
+    expected_source = str(later_source.absolute())
+    assert _current_module_source_path(module_name) == expected_source
+    fingerprint_metadata = _call_graph_fingerprint_metadata(
+        {expected_source: hashlib.sha256(later_source.read_bytes()).hexdigest()},
+        module_sources={module_name: expected_source},
+    )
+    fingerprint_metadata["namespace_package_resolution_contexts"] = {
+        parent_module: {
+            "search_path": [str(later_package)],
+            "path_importers": list(_path_importer_resolution_context([str(later_package)])),
+        }
+    }
+    file_path = _make_cacheable_file(tmp_path, "namespace-precedence.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    earlier_package = earlier_root / parent_module
+    earlier_package.mkdir()
+    if shadowing_source:
+        (earlier_package / "child.py").write_text("value = 'earlier'\n", encoding="utf-8")
+    else:
+        (earlier_package / "other.py").write_text("value = 1\n", encoding="utf-8")
+
+    current_source = str((earlier_package / "child.py").absolute()) if shadowing_source else expected_source
+    assert _current_module_source_path(module_name) == current_source
+    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+    assert (cached_result is not None) is not shadowing_source
 
 
 def test_cache_module_validation_does_not_execute_custom_path_hooks(

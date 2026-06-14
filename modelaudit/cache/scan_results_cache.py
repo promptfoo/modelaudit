@@ -1778,7 +1778,7 @@ class ScanResultsCache:
             if module_name in sys.modules or not context_is_current:
                 return False
             importer_cache_was_populated |= context_was_populated
-        if importer_cache_was_populated:
+        if importer_cache_was_populated or namespace_package_contexts:
             for module_name, expected_source in unresolved_module_sources:
                 if _current_module_source_path(module_name) != expected_source:
                     return False

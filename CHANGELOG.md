@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - require and bundle `modelaudit-picklescan>=0.1.7` so root releases and source-built Docker images cannot run with the pre-hardening call-graph resolver
 - publish and verify coordinated `modelaudit-picklescan` releases before uploading a dependent root release
-- keep result-cache resolution fingerprints aligned with cached misses, symlink-sensitive lexical paths, loaded-package importer contexts, bounded `FileFinder` summaries, archive-validated `zipimporter` state, and startup-frozen distribution roots so shared scans cannot reuse stale origin trust or fail on metadata-only finder removal
+- keep result-cache resolution fingerprints aligned with cached misses, symlink-sensitive lexical paths, loaded-package and namespace source-precedence contexts, bounded `FileFinder` summaries, archive-validated `zipimporter` state, and startup-frozen distribution roots so shared scans cannot reuse stale origin trust or fail on metadata-only finder removal
 - stream Hugging Face SafeTensors shard headers with bounded range reads instead of downloading tensor payload bodies
 - keep JIT alias replay linear, including multiline builtin-helper continuations, as alias state grows while preserving bounded analysis for attacker-controlled model content
 - inspect oversized ONNX protobuf structure from descriptor-bound, memory- and result-bounded file-backed reads; preserve external-data security checks while explicitly reporting deferred schema, raw-detector, weight-analysis, and content-hash coverage
