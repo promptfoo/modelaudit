@@ -13,7 +13,7 @@ import re
 import stat
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar, copy_context
@@ -59,6 +59,7 @@ MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
 MAX_SAFETENSORS_SHARD_INDEX_FILES = 256
 MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_SAFETENSORS_SHARD_INDEX_DIRECTORIES = 256
+MAX_SAFETENSORS_SHARD_INDEX_OBSERVATIONS = 512
 MAX_SAFETENSORS_SHARD_INDEX_TENSORS = 250_000
 MAX_SAFETENSORS_SHARD_INDEX_JSON_TOKENS = (2 * MAX_SAFETENSORS_SHARD_INDEX_TENSORS) + 4096
 _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY = "_trusted_safetensors_index_inspection_context"
@@ -103,6 +104,7 @@ class _SafetensorsShardIndexInventory:
     fingerprint: str | None = None
     generation: int | None = None
     error: str | None = None
+    proven_unrelated: bool = False
 
 
 @dataclass
@@ -118,6 +120,13 @@ class _SafetensorsIndexInspectionContext:
     generations: dict[str, int] = field(default_factory=dict)
     bytes_read: int = 0
     failure: str | None = None
+
+    def record_failure(self, message: str) -> str:
+        """Retain the first aggregate inspection failure for the full scan."""
+        with self.lock:
+            if self.failure is None:
+                self.failure = message
+            return self.failure
 
     def register_directory(self, directory: Path) -> str | None:
         """Charge one lexical ancestor directory once."""
@@ -151,6 +160,9 @@ class _SafetensorsIndexInspectionContext:
                 return self.failure
             if observation in self.charged_observations:
                 return None
+            if len(self.charged_observations) >= MAX_SAFETENSORS_SHARD_INDEX_OBSERVATIONS:
+                self.failure = "safetensors index observation limit exceeded"
+                return self.failure
             if self.bytes_read + size > MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES:
                 self.failure = "safetensors index aggregate byte limit exceeded"
                 return self.failure
@@ -184,6 +196,8 @@ class _SafetensorsIndexInspectionContext:
         """Bind a parsed inventory to a monotonic observed path generation."""
         normalized_path = _normalized_absolute_path(lexical_path)
         with self.lock:
+            if cache_key not in self.charged_observations:
+                return inventory
             if self.last_observations.get(normalized_path) != observation:
                 self.generations[normalized_path] = self.generations.get(normalized_path, 0) + 1
                 self.last_observations[normalized_path] = observation
@@ -280,6 +294,7 @@ def _validated_stat_matches_target(opened_stat: os.stat_result, target: dict[str
         ("size", opened_stat.st_size),
         ("mtime_ns", opened_stat.st_mtime_ns),
         ("ctime_ns", opened_stat.st_ctime_ns),
+        ("nlink", opened_stat.st_nlink),
     )
     return stat.S_ISREG(opened_stat.st_mode) and all(
         not isinstance(target.get(key), int) or target[key] == current_value for key, current_value in expected_values
@@ -336,6 +351,52 @@ def _rebase_pinned_shard_result(result: "ScanResult", pinned_path: str, report_p
     result.metadata = rebase(result.metadata)
 
 
+def _open_windows_shard_guard_fd(path: str) -> int:
+    """Open a Windows shard for shared reads while denying writes and replacement."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        path,
+        0x80000000,
+        0x00000001,
+        None,
+        3,
+        0x00000080,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle_value):
+        raise ctypes_windows.WinError(ctypes_windows.get_last_error())
+
+    handle_value = handle if isinstance(handle, int) else int(handle.value)
+    try:
+        msvcrt_module: Any = msvcrt
+        return int(
+            msvcrt_module.open_osfhandle(
+                handle_value,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
+            )
+        )
+    except Exception:
+        kernel32.CloseHandle(handle_value)
+        raise
+
+
 @contextmanager
 def _pinned_windows_shard_scan_path(
     resolved_path: str,
@@ -344,29 +405,15 @@ def _pinned_windows_shard_scan_path(
     """Pin a Windows shard with open handles that prevent rename/delete replacement."""
     source_path = Path(resolved_path)
     source_fd: int | None = None
-    pinned_fd: int | None = None
-    staging_directory: tempfile.TemporaryDirectory[str] | None = None
     pinned_scan: _PinnedShardScan | None = None
-    pinned_stat: os.stat_result | None = None
+    source_stat: os.stat_result | None = None
     try:
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
-        source_fd = os.open(source_path, flags)
+        source_fd = _open_windows_shard_guard_fd(str(source_path))
         source_stat = os.fstat(source_fd)
         if not _validated_stat_matches_target(source_stat, target):
             raise _ShardPinUnavailableError("validated shard target changed before pinning")
 
-        staging_directory = tempfile.TemporaryDirectory(
-            prefix=".modelaudit_scan_",
-            dir=str(source_path.parent),
-        )
-        pinned_path = Path(staging_directory.name) / source_path.name
-        os.link(source_path, pinned_path, follow_symlinks=False)
-        pinned_fd = os.open(pinned_path, flags)
-        pinned_stat = os.fstat(pinned_fd)
-        if not os.path.samestat(source_stat, pinned_stat):
-            raise _ShardPinUnavailableError("validated shard target changed while pinning")
-
-        pinned_scan = _PinnedShardScan(path=str(pinned_path))
+        pinned_scan = _PinnedShardScan(path=str(source_path))
         yield pinned_scan
     except _ShardPinUnavailableError:
         raise
@@ -375,21 +422,16 @@ def _pinned_windows_shard_scan_path(
             raise
         raise _ShardPinUnavailableError(str(error)) from error
     finally:
-        if pinned_scan is not None and pinned_stat is not None and pinned_fd is not None:
+        if pinned_scan is not None and source_stat is not None and source_fd is not None:
             try:
-                final_stat = os.fstat(pinned_fd)
+                final_stat = os.fstat(source_fd)
             except OSError:
                 pinned_scan.changed_during_scan = True
             else:
                 identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
                 pinned_scan.changed_during_scan = any(
-                    getattr(pinned_stat, field) != getattr(final_stat, field) for field in identity_fields
+                    getattr(source_stat, field) != getattr(final_stat, field) for field in identity_fields
                 )
-        if pinned_fd is not None:
-            os.close(pinned_fd)
-        if staging_directory is not None:
-            with suppress(OSError):
-                staging_directory.cleanup()
         if source_fd is not None:
             os.close(source_fd)
 
@@ -807,6 +849,7 @@ class ShardedModelDetector:
         inspection_context: _SafetensorsIndexInspectionContext,
         *,
         force_content_revalidation: bool = False,
+        content_revalidated_paths: set[str] | None = None,
     ) -> _SafetensorsShardIndexInventory:
         """Parse one SafeTensors index, returning its shard inventory or a validation error."""
         expected_paths: set[str] = set()
@@ -835,9 +878,19 @@ class ShardedModelDetector:
                 *observation_prefix,
             )
             cached = inspection_context.cached_inventory(cache_key)
+            normalized_index_path = _normalized_absolute_path(index_path)
             revalidate_cached_content = (
-                cached is not None and force_content_revalidation and _safetensors_index_requires_content_revalidation()
+                cached is not None
+                and force_content_revalidation
+                and _safetensors_index_requires_content_revalidation()
+                and (content_revalidated_paths is None or normalized_index_path not in content_revalidated_paths)
             )
+            if (
+                force_content_revalidation
+                and content_revalidated_paths is not None
+                and (cached is None or revalidate_cached_content)
+            ):
+                content_revalidated_paths.add(normalized_index_path)
             if cached is not None and not revalidate_cached_content:
                 cached_observation = (*observation_prefix, cached.fingerprint)
                 observed_cached = inspection_context.observe_cached_inventory(
@@ -894,18 +947,39 @@ class ShardedModelDetector:
             target_indices: set[int] = set()
             index_expected_total: int | None = expected_total
             raw_targets = list(weight_map.values())
-            for raw_target in raw_targets:
-                if not isinstance(raw_target, str):
-                    continue
-                with suppress(ValueError):
-                    candidate_path = cls._safe_index_target_path(index_dir, raw_target)
-                    expected_paths.add(_normalized_absolute_path(candidate_path))
             if not all(isinstance(target, str) for target in raw_targets):
                 raise ValueError("safetensors index weight_map targets must be strings")
             unique_targets = set(raw_targets)
+            target_files: list[Path] = []
+            target_path_error: ValueError | None = None
             for raw_target in sorted(unique_targets):
-                target_file = cls._safe_index_target_path(index_dir, raw_target)
-                target_match = cls.match_safetensors_shard_filename(target_file.name)
+                try:
+                    target_files.append(cls._safe_index_target_path(index_dir, raw_target))
+                except ValueError as exc:
+                    target_path_error = exc
+            expected_paths.update(_normalized_absolute_path(target_file) for target_file in target_files)
+            if target_path_error is not None:
+                raise target_path_error
+            target_matches = [cls.match_safetensors_shard_filename(target_file.name) for target_file in target_files]
+            if target_matches and all(target_match is None for target_match in target_matches):
+                inventory = _SafetensorsShardIndexInventory(
+                    index_path=index_path,
+                    expected_source_paths=frozenset(expected_paths),
+                    expected_indices=cls._expected_index_range(expected_total or 1, zero_based=False),
+                    index_base="invalid",
+                    fingerprint=index_fingerprint,
+                    error="safetensors index target does not match shard filename pattern",
+                    proven_unrelated=True,
+                )
+                assert cache_key is not None and observation_prefix is not None
+                return inspection_context.record_inventory(
+                    cache_key,
+                    index_path,
+                    (*observation_prefix, index_fingerprint),
+                    inventory,
+                )
+
+            for target_match in target_matches:
                 if target_match is None:
                     raise ValueError("safetensors index target does not match shard filename pattern")
                 target_index = target_match["current_shard_index"]
@@ -916,7 +990,6 @@ class ShardedModelDetector:
                     index_expected_total = target_total
                 elif target_total != index_expected_total:
                     raise ValueError("safetensors index target total does not match selected shard total")
-                expected_paths.add(_normalized_absolute_path(target_file))
                 target_indices.add(target_index)
 
             if index_expected_total is None:
@@ -1002,6 +1075,32 @@ class ShardedModelDetector:
         return current_parent in expected_parents
 
     @staticmethod
+    def _safetensors_inventory_is_proven_unrelated(
+        inventory: _SafetensorsShardIndexInventory,
+        current_file: Path,
+    ) -> bool:
+        """Return whether every non-shard target is a distinct stable local file."""
+        if not inventory.proven_unrelated or not inventory.expected_source_paths:
+            return False
+        index_name = inventory.index_path.name
+        if index_name.casefold() == SAFETENSORS_INDEX_NAME:
+            return False
+        normalized_current = _normalized_absolute_path(current_file)
+        for source_path in inventory.expected_source_paths:
+            if source_path == normalized_current:
+                return False
+            if not os.path.lexists(source_path):
+                if os.path.islink(source_path):
+                    return False
+                continue
+            try:
+                if Path(source_path).samefile(current_file):
+                    return False
+            except OSError:
+                return False
+        return True
+
+    @staticmethod
     def _safetensors_index_candidates(index_dir: Path) -> tuple[list[Path], bool]:
         """Return bounded local index candidates, preferring the canonical name."""
         canonical_path = index_dir / SAFETENSORS_INDEX_NAME
@@ -1051,6 +1150,7 @@ class ShardedModelDetector:
         inspection_context: _SafetensorsIndexInspectionContext,
         *,
         force_content_revalidation: bool = False,
+        content_revalidated_paths: set[str] | None = None,
     ) -> _SafetensorsShardIndexInventory | None:
         """Load a governing SafeTensors index inventory or captured validation error."""
         if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
@@ -1083,16 +1183,17 @@ class ShardedModelDetector:
                 )
             index_candidates, candidate_limit_exceeded = cls._safetensors_index_candidates(index_dir)
             if candidate_limit_exceeded:
+                candidate_failure = inspection_context.record_failure(
+                    "safetensors index inspection limit exceeded"
+                    if len(index_candidates) > MAX_SAFETENSORS_SHARD_INDEX_FILES
+                    else "safetensors index directory enumeration incomplete"
+                )
                 return _SafetensorsShardIndexInventory(
                     index_path=index_candidates[0] if index_candidates else index_dir / SAFETENSORS_INDEX_NAME,
                     expected_source_paths=frozenset(),
                     expected_indices=cls._expected_index_range(expected_total, zero_based=False),
                     index_base="invalid",
-                    error=(
-                        "safetensors index inspection limit exceeded"
-                        if len(index_candidates) > MAX_SAFETENSORS_SHARD_INDEX_FILES
-                        else "safetensors index directory enumeration incomplete"
-                    ),
+                    error=candidate_failure,
                 )
             candidate_error = inspection_context.register_candidates(index_candidates)
             if candidate_error is not None:
@@ -1112,17 +1213,16 @@ class ShardedModelDetector:
                     None,
                     inspection_context,
                     force_content_revalidation=force_content_revalidation,
+                    content_revalidated_paths=content_revalidated_paths,
                 )
                 if inventory.error is not None:
                     normalized_current = _normalized_absolute_path(current_file)
                     same_directory_candidate = _normalized_absolute_path(index_dir) == _normalized_absolute_path(
                         absolute_dir
                     )
-                    proven_unrelated_nonsharded_index = bool(inventory.expected_source_paths) and inventory.error == (
-                        "safetensors index target does not match shard filename pattern"
-                    )
                     if normalized_current in inventory.expected_source_paths or (
-                        same_directory_candidate and not proven_unrelated_nonsharded_index
+                        same_directory_candidate
+                        and not cls._safetensors_inventory_is_proven_unrelated(inventory, current_file)
                     ):
                         return inventory
                     continue
@@ -1197,6 +1297,76 @@ class ShardedModelDetector:
             ),
             True,
         )
+
+    @classmethod
+    def refresh_safetensors_index_proofs(
+        cls,
+        file_paths: Iterable[str],
+        *,
+        expected_total: int,
+        index_search_root: str | os.PathLike[str],
+        index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
+        force_content_revalidation: bool = False,
+    ) -> tuple[tuple[str, str, str, int] | None, bool]:
+        """Resolve one order-independent governing proof across selected shard parents."""
+        inspection_context = (
+            index_inspection_context or _CURRENT_SAFETENSORS_INDEX_CONTEXT.get() or _SafetensorsIndexInspectionContext()
+        )
+        search_root = Path(index_search_root)
+        representatives_by_parent: dict[str, Path] = {}
+        for file_path in file_paths:
+            path = Path(file_path)
+            shard_match = cls.match_safetensors_shard_filename(path.name)
+            if shard_match is None or shard_match.get("expected_total_shards") != expected_total:
+                return None, False
+            representatives_by_parent.setdefault(_normalized_absolute_path(path.parent), path)
+        if not representatives_by_parent:
+            return None, False
+
+        agreed_proof: tuple[str, str, str, int] | None = None
+        authority_by_parent: list[bool] = []
+        revalidated_indexes: set[str] = set()
+        for current_file in representatives_by_parent.values():
+            inventory = cls._load_safetensors_index_inventory(
+                current_file.parent,
+                SAFETENSORS_SHARD_PATTERN,
+                expected_total,
+                current_file,
+                search_root,
+                inspection_context,
+                force_content_revalidation=force_content_revalidation,
+                content_revalidated_paths=revalidated_indexes,
+            )
+            authority_present = inventory is not None
+            authority_by_parent.append(authority_present)
+            if inventory is None:
+                continue
+            if (
+                inventory.error is not None
+                or inventory.index_base not in {"zero", "one"}
+                or not isinstance(inventory.fingerprint, str)
+                or not inventory.fingerprint
+                or not isinstance(inventory.generation, int)
+                or isinstance(inventory.generation, bool)
+                or inventory.generation <= 0
+            ):
+                return None, True
+            proof = (
+                inventory.index_base,
+                _normalized_absolute_path(inventory.index_path),
+                inventory.fingerprint,
+                inventory.generation,
+            )
+            if agreed_proof is None:
+                agreed_proof = proof
+            elif proof != agreed_proof:
+                return None, True
+
+        if agreed_proof is None:
+            return None, any(authority_by_parent)
+        if not all(authority_by_parent):
+            return None, True
+        return agreed_proof, True
 
     @classmethod
     def detect_shards(

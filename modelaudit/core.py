@@ -135,11 +135,13 @@ from modelaudit.utils.file.handlers import (
     _activate_safetensors_index_inspection_context,
     _count_expected_shard_indices,
     _deactivate_safetensors_index_inspection_context,
+    _open_windows_shard_guard_fd,
     _pinned_shard_scan_path,
     _preserve_findings_with_shard_boundary_failure,
     _rebase_pinned_shard_result,
     _SafetensorsIndexInspectionContext,
     _ShardPinUnavailableError,
+    _validated_stat_matches_target,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -1265,6 +1267,44 @@ def _snapshot_validated_shard_target(
         target["authoritative_shard_index_fingerprint"] = authoritative_shard_index_fingerprint
         target["authoritative_shard_index_generation"] = authoritative_shard_index_generation
     return {str(source.absolute()): target}
+
+
+_WindowsShardGuards = list[tuple[int, str, dict[str, int | str]]]
+
+
+def _retain_windows_shard_guard(
+    guards: _WindowsShardGuards,
+    resolved_path: str,
+    source_path: str,
+    target: dict[str, int | str],
+) -> None:
+    """Retain one write-denying Windows shard handle through reconciliation."""
+    if os.name != "nt":
+        return
+    guard_fd: int | None = None
+    try:
+        guard_fd = _open_windows_shard_guard_fd(resolved_path)
+        if not _validated_stat_matches_target(os.fstat(guard_fd), target):
+            raise _ShardPinUnavailableError("validated shard changed before terminal guarding")
+        guards.append((guard_fd, source_path, dict(target)))
+        guard_fd = None
+    finally:
+        if guard_fd is not None:
+            os.close(guard_fd)
+
+
+def _windows_shard_guard_is_stable(guard_fd: int, target: dict[str, int | str]) -> bool:
+    try:
+        return _validated_stat_matches_target(os.fstat(guard_fd), target)
+    except OSError:
+        return False
+
+
+def _close_windows_shard_guards(guards: _WindowsShardGuards) -> None:
+    for guard_fd, _source_path, _target in reversed(guards):
+        with suppress(OSError):
+            os.close(guard_fd)
+    guards.clear()
 
 
 def _rebase_prevalidated_shard_info(value: Any, source_path: str, pinned_path: str, depth: int = 0) -> Any:
@@ -3716,6 +3756,7 @@ def scan_model_directory_or_file(
     top_level_hashed_bytes = 0
     nearby_license_cache: dict[str, list[str]] = {}
     pickle_source_snapshot_stack = ExitStack()
+    windows_shard_guards: _WindowsShardGuards = []
 
     phase_timings: dict[str, float] | None = {} if bool(kwargs.get("profile_timings")) else None
 
@@ -3961,6 +4002,8 @@ def scan_model_directory_or_file(
             shard_family_representatives: dict[_ShardFamilyKey, str] = {}
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
             shard_family_targets: dict[_ShardFamilyKey, ValidatedShardTargets] = {}
+            covered_shard_family_keys: set[_ShardFamilyKey] = set()
+            covered_shard_sources: set[str] = set()
             complete_hf_shard_families: set[_ShardFamilyKey] = set()
             trusted_hf_shard_paths: list[str] | None = None
             dvc_directory_output_owners: list[tuple[Path, str]] = []
@@ -4391,6 +4434,13 @@ def scan_model_directory_or_file(
 
                         # Add to files to scan list instead of scanning immediately
                         if shard_family_key is not None:
+                            raw_shard_family_key = shard_family_key
+                            normalized_shard_source = os.path.normcase(os.path.normpath(os.path.abspath(target_str)))
+                            if (
+                                raw_shard_family_key in covered_shard_family_keys
+                                or normalized_shard_source in covered_shard_sources
+                            ):
+                                continue
                             shard_is_in_hf_snapshot = bool(
                                 is_hf_cache
                                 and hf_cache_root is not None
@@ -4406,6 +4456,7 @@ def scan_model_directory_or_file(
                                 allowed_paths=allowed_hf_shard_paths,
                                 index_search_root=base_dir,
                             )
+                            covered_shard_family_keys.add(raw_shard_family_key)
                             if shard_info is not None and not shard_info.get("safetensors_index_error"):
                                 governing_index = shard_info.get("safetensors_index_path")
                                 pattern = shard_info.get("pattern")
@@ -4448,6 +4499,15 @@ def scan_model_directory_or_file(
                                         )
                                         if shard_in_base_dir or shard_in_hf_blobs:
                                             lexical_shard_path = str(Path(shard_path).absolute())
+                                            _retain_windows_shard_guard(
+                                                windows_shard_guards,
+                                                resolved_shard_path,
+                                                lexical_shard_path,
+                                                detected_target,
+                                            )
+                                            covered_shard_sources.add(
+                                                os.path.normcase(os.path.normpath(os.path.abspath(lexical_shard_path)))
+                                            )
                                             family_paths.add(lexical_shard_path)
                                             shard_repository_member = repository_member_path_for_discovered_path(
                                                 lexical_shard_path
@@ -5567,6 +5627,29 @@ def scan_model_directory_or_file(
                     location=path,
                     details={"max_total_size": max_total_size, "analysis_incomplete": True},
                 )
+            for guard_fd, guarded_path, guarded_target in windows_shard_guards:
+                if _windows_shard_guard_is_stable(guard_fd, guarded_target):
+                    continue
+                aggregate_hash_complete = False
+                scan_metadata["success"] = False
+                scan_metadata["has_operational_errors"] = True
+                results.checks.append(
+                    Check(
+                        name="Sharded Model Boundary Check",
+                        status=CheckStatus.FAILED,
+                        message="Validated directory shard changed before terminal reconciliation.",
+                        severity=IssueSeverity.INFO,
+                        location=guarded_path,
+                        details={
+                            "path": guarded_path,
+                            "reason": "shard_target_changed_after_scan",
+                            "analysis_incomplete": True,
+                            "operational_error": True,
+                            "scan_outcome": "inconclusive",
+                            "scan_outcome_reason": "shard_boundary_changed",
+                        },
+                    )
+                )
         else:
             # Scan a single file or DVC pointer
             target_files = [path]
@@ -5989,6 +6072,7 @@ def scan_model_directory_or_file(
         )
         _add_error_asset_to_results(results, report_path)
     finally:
+        _close_windows_shard_guards(windows_shard_guards)
         pickle_source_snapshot_stack.close()
         _deactivate_safetensors_index_inspection_context(index_context_token)
 
@@ -7459,6 +7543,7 @@ def scan_model_streaming(
     pending_delete_failures: dict[Path, Exception] = {}
     deleted_streamed_sources: set[str] = set()
     validated_shard_targets: ValidatedShardTargets = {}
+    stream_windows_shard_guards: _WindowsShardGuards = []
     preserved_openvino_companion_snapshots: dict[Path, _FileIdentitySnapshot] = {}
     deferred_openvino_sidecars: dict[Path, Path] = {}
     consumed_openvino_companions: set[Path] = set()
@@ -8137,6 +8222,13 @@ def scan_model_streaming(
                     if isinstance(resolved_target, str):
                         selected_resolved_path = resolved_target
                         try:
+                            if not delete_after_scan:
+                                _retain_windows_shard_guard(
+                                    stream_windows_shard_guards,
+                                    resolved_target,
+                                    str(source_path),
+                                    initial_target,
+                                )
                             pending_pinned_scan_context = _pinned_shard_scan_path(resolved_target, initial_target)
                             pinned_scan = pending_pinned_scan_context.__enter__()
                             pinned_scan_context = pending_pinned_scan_context
@@ -8522,6 +8614,10 @@ def scan_model_streaming(
                     deferred_openvino_sidecars.pop(openvino_scan_companion_key, None)
                     preserved_openvino_companion_snapshots.pop(openvino_scan_companion_key, None)
 
+        for guard_fd, guarded_source, guarded_target in stream_windows_shard_guards:
+            if not _windows_shard_guard_is_stable(guard_fd, guarded_target):
+                record_terminal_shard_boundary_failure(guarded_source, "shard_target_changed_after_scan")
+
         terminal_index_families: dict[tuple[Any, ...], list[str]] = {}
         expected_index_proofs: dict[tuple[Any, ...], tuple[str, str, str, int] | None] = {}
         for validated_source_path, expected_target in validated_shard_targets.items():
@@ -8615,6 +8711,7 @@ def scan_model_streaming(
         results.has_errors = True
         raise
     finally:
+        _close_windows_shard_guards(stream_windows_shard_guards)
         _deactivate_safetensors_index_inspection_context(index_context_token)
         close_generator = getattr(file_generator, "close", None)
         if callable(close_generator):

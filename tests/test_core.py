@@ -61,6 +61,7 @@ from modelaudit.utils.file.detection import (
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
 )
+from modelaudit.utils.file.handlers import ShardedModelDetector
 from modelaudit.utils.file.hdf5 import (
     HDF5_MAGIC,
     HDF5_SIGNATURE_SCAN_MAX_BYTES,
@@ -2872,16 +2873,25 @@ def test_directory_scan_scans_sharded_model_family_once(
         shards.append(shard_path.resolve())
     family_size = sum(shard.stat().st_size for shard in shards)
     calls: list[str] = []
+    detect_calls: list[str] = []
+    original_detect_shards = ShardedModelDetector.detect_shards
+
+    def counted_detect_shards(cls: type[ShardedModelDetector], file_path: str, **kwargs: Any) -> dict[str, Any] | None:
+        del cls
+        detect_calls.append(file_path)
+        return original_detect_shards(file_path, **kwargs)
 
     def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
         calls.append(path)
         return _mock_sharded_scan_result(family_size)
 
     monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    monkeypatch.setattr(ShardedModelDetector, "detect_shards", classmethod(counted_detect_shards))
 
     result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
 
     assert len(calls) == 1
+    assert len(detect_calls) == 1
     assert Path(calls[0]).name in {shard.name for shard in shards}
     assert result.files_scanned == len(shards)
     assert result.bytes_scanned == family_size
@@ -3148,6 +3158,13 @@ def test_directory_scan_groups_indexed_hf_shards_across_nested_directories(
 
     shard_calls: list[str] = []
     shard_configs: list[dict[str, Any]] = []
+    detect_calls: list[str] = []
+    original_detect_shards = ShardedModelDetector.detect_shards
+
+    def counted_detect_shards(cls: type[ShardedModelDetector], file_path: str, **kwargs: Any) -> dict[str, Any] | None:
+        del cls
+        detect_calls.append(file_path)
+        return original_detect_shards(file_path, **kwargs)
 
     def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
         if path.endswith(".safetensors"):
@@ -3160,6 +3177,7 @@ def test_directory_scan_groups_indexed_hf_shards_across_nested_directories(
         return result
 
     monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    monkeypatch.setattr(ShardedModelDetector, "detect_shards", classmethod(counted_detect_shards))
 
     result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
 
@@ -3167,6 +3185,7 @@ def test_directory_scan_groups_indexed_hf_shards_across_nested_directories(
         core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY
     ]
     assert len(shard_calls) == 1
+    assert len(detect_calls) == 1
     assert {member["path"] for member in fingerprint["members"]} == {str(blob) for blob in blob_paths}
     assert result.success is True
     assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)

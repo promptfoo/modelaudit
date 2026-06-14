@@ -80,6 +80,7 @@ from modelaudit.utils.sources.huggingface import (
     _remote_safetensors_result_budget_failure_result,
     _run_huggingface_download_with_deadline,
     _scan_remote_huggingface_safetensors_header,
+    _select_huggingface_model_files,
     _select_streamable_hf_files,
     _tensor_name_digest,
     _terminate_huggingface_download_process,
@@ -1278,7 +1279,7 @@ class TestModelDownload:
         assert (result / "model.onnx").is_file()
         assert {path.name for path in result.iterdir()} == {"model.onnx"}
 
-    @pytest.mark.parametrize("local_index_state", ["exact", "malformed", "retargeted"])
+    @pytest.mark.parametrize("local_index_state", ["exact", "malformed", "retargeted", "missing-target"])
     def test_download_model_verifies_planned_safetensors_index_proof(
         self,
         tmp_path: Path,
@@ -1293,13 +1294,14 @@ class TestModelDownload:
         def materialize_snapshot(**kwargs: Any) -> str:
             local_dir = Path(kwargs["local_dir"])
             (local_dir / shard_file).parent.mkdir(parents=True, exist_ok=True)
-            (local_dir / shard_file).write_bytes(b"shard")
+            if local_index_state != "missing-target":
+                (local_dir / shard_file).write_bytes(b"shard")
             local_indexes = {
                 "exact": remote_index,
                 "malformed": b"{malformed",
                 "retargeted": json.dumps({"weight_map": {"tensor": "other/model-00001-of-00001.safetensors"}}).encode(),
             }
-            (local_dir / index_file).write_bytes(local_indexes[local_index_state])
+            (local_dir / index_file).write_bytes(local_indexes.get(local_index_state, remote_index))
             return str(local_dir)
 
         proofs: list[HuggingFaceSafetensorsIndexProof] = []
@@ -1316,7 +1318,10 @@ class TestModelDownload:
         )
         with patches[0], patches[1], patches[2]:
             if local_index_state != "exact":
-                with pytest.raises(Exception, match="SafeTensors index proof mismatch"):
+                error_pattern = (
+                    "snapshot missing" if local_index_state == "missing-target" else "SafeTensors index proof mismatch"
+                )
+                with pytest.raises(Exception, match=error_pattern):
                     download_model(
                         "https://huggingface.co/test/model",
                         cache_dir=tmp_path / "cache",
@@ -1549,27 +1554,41 @@ class TestModelDownload:
         mock_prune.assert_not_called()
         mock_snapshot_download.assert_not_called()
 
-    def test_build_filtered_cache_fails_closed_without_platform_ownership_proof(
+    def test_build_filtered_cache_uses_exclusive_staging_without_platform_ownership_proof(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Destructive deterministic cache reuse is unavailable without an owner/ACL trust proof."""
+        """Exclusive non-destructive staging remains available without POSIX ownership APIs."""
         from modelaudit.utils.sources import huggingface as huggingface_module
 
         monkeypatch.setattr(huggingface_module, "_filtered_huggingface_cache_trust_supported", lambda: False)
 
-        with pytest.raises(ValueError, match="cannot be established on Windows; use streaming mode"):
-            _build_huggingface_filtered_download_path(
-                tmp_path / "hf-cache",
-                "test",
-                "model",
-                "test/model",
-                _HF_TEST_REVISION,
-                ["model.onnx"],
-                {".onnx"},
-                {"onnx"},
-            )
+        first = _build_huggingface_filtered_download_path(
+            tmp_path / "hf-cache",
+            "test",
+            "model",
+            "test/model",
+            _HF_TEST_REVISION,
+            ["model.onnx"],
+            {".onnx"},
+            {"onnx"},
+        )
+        second = _build_huggingface_filtered_download_path(
+            tmp_path / "hf-cache",
+            "test",
+            "model",
+            "test/model",
+            _HF_TEST_REVISION,
+            ["model.onnx"],
+            {".onnx"},
+            {"onnx"},
+        )
+
+        assert first.is_dir()
+        assert second.is_dir()
+        assert first != second
+        assert first.parent == second.parent
 
     def test_download_model_filtered_cache_preserves_symlink_target_on_failure(
         self,
@@ -1673,8 +1692,8 @@ class TestModelDownload:
             len(_MINIMAL_ONNX_MODEL_PROTO),
         ]
 
-    def test_download_model_filtered_prunes_stale_selection_files(self, tmp_path: Path) -> None:
-        """A reused filtered directory must remove stale unselected leaves before acquisition."""
+    def test_download_model_filtered_isolates_equivalent_concurrent_selections(self, tmp_path: Path) -> None:
+        """Equivalent acquisitions must never prune another scan's active staging tree."""
 
         def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
             local_path = Path(local_dir)
@@ -1711,8 +1730,9 @@ class TestModelDownload:
                 scannable_scanner_ids={"onnx"},
             )
 
-        assert second_result == result
-        assert not (result / "stale.pkl").exists()
+        assert second_result != result
+        assert (result / "stale.pkl").read_bytes() == b"stale"
+        assert not (second_result / "stale.pkl").exists()
         assert all(call.kwargs["force_download"] is True for call in mock_snapshot_download.call_args_list)
         assert [call.args[1] for call in mock_check_disk_space.call_args_list] == [
             len(_MINIMAL_ONNX_MODEL_PROTO),
@@ -1795,7 +1815,7 @@ class TestModelDownload:
                 scannable_scanner_ids={"onnx"},
             )
 
-        assert snapshot_calls == [["model.onnx"], ["model.onnx", "weights/model.onnx_data"]]
+        assert snapshot_calls == [["model.onnx"], ["weights/model.onnx_data"]]
         assert (result / "weights" / "model.onnx_data").read_bytes() == b"weights"
 
     def test_download_model_filtered_content_routed_onnx_includes_external_data(self, tmp_path: Path) -> None:
@@ -1844,7 +1864,7 @@ class TestModelDownload:
                 scannable_scanner_ids={"onnx"},
             )
 
-        assert snapshot_calls == [["renamed.bin"], ["renamed.bin", "weights/model.onnx_data"]]
+        assert snapshot_calls == [["renamed.bin"], ["weights/model.onnx_data"]]
         mock_detect_local.assert_called_once_with(str(result / "renamed.bin"))
         assert (result / "weights" / "model.onnx_data").read_bytes() == b"weights"
 
@@ -4905,6 +4925,49 @@ class TestModelDownloadStreaming:
 
         assert result == selected_files
 
+    @pytest.mark.parametrize("selection_mode", ["standard", "source-native"])
+    def test_safetensors_index_suffix_does_not_hide_selected_pickle_route(self, selection_mode: str) -> None:
+        """A disjoint index-shaped payload must still reach an explicitly selected content route."""
+        selected_shard = "model-00001-of-00001.safetensors"
+        routed_index = "evil.safetensors.index.json"
+        repo_files = [selected_shard, routed_index, "adapter.bin"]
+        index_payload = json.dumps({"weight_map": {"adapter": "adapter.bin"}}).encode()
+
+        def detect_route(_repo_id: str, filename: str, *_args: object, **_kwargs: object) -> str | None:
+            return "pickle" if filename == routed_index else None
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                side_effect=detect_route,
+            ) as mock_detect,
+            patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix", return_value=index_payload),
+        ):
+            if selection_mode == "standard":
+                selected = _select_huggingface_model_files(
+                    "test/model",
+                    repo_files,
+                    _HF_TEST_REVISION,
+                    {".safetensors"},
+                    scannable_scanner_ids={"safetensors", "pickle"},
+                )
+                selected_formats: dict[str, str] = {}
+            else:
+                selection = _select_streamable_hf_files(
+                    "test/model",
+                    repo_files,
+                    _HF_TEST_REVISION,
+                    {".safetensors"},
+                    scannable_scanner_ids={"safetensors", "pickle"},
+                    defer_safetensors_index_validation=True,
+                )
+                selected = selection.filenames
+                selected_formats = selection.content_route_formats
+
+        assert routed_index in selected
+        assert selected_formats.get(routed_index, "pickle") == "pickle"
+        assert any(call.args[1] == routed_index for call in mock_detect.call_args_list)
+
     def test_remote_safetensors_validation_does_not_probe_indexes_for_unsharded_selection(self) -> None:
         """Selecting one unsharded model must not make same-parent adapter indexes authoritative."""
         repo_files = [
@@ -4930,8 +4993,8 @@ class TestModelDownloadStreaming:
 
     @pytest.mark.parametrize(
         "index_state",
-        ["complete", "missing"],
-        ids=["benign-complete", "benign-missing"],
+        ["complete", "missing", "standalone"],
+        ids=["benign-complete", "benign-missing", "standalone-adapter"],
     )
     def test_remote_safetensors_validation_ignores_unrelated_same_parent_family(
         self,
@@ -4947,6 +5010,9 @@ class TestModelDownloadStreaming:
                 "adapter-00001-of-00002.safetensors",
             ]
             repo_files = ["adapter.safetensors.index.json", selected_shard, adapter_targets[0]]
+        elif index_state == "standalone":
+            adapter_targets = ["adapter.safetensors"]
+            repo_files = ["adapter.safetensors.index.json", selected_shard, *adapter_targets]
         selected_files = [selected_shard]
         budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
         payload = json.dumps(

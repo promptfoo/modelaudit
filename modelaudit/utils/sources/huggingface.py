@@ -3192,7 +3192,8 @@ def _skip_hf_safetensors_probe_candidate(
     """Skip index metadata only when no selected content route can claim it."""
     if not _is_hf_safetensors_index_filename(filename):
         return False
-    return allow_index_expansion or _hf_safetensors_routes_excluded_by_selection(
+    del allow_index_expansion
+    return _hf_safetensors_routes_excluded_by_selection(
         selected_route_scanner_ids,
         selected_route_formats,
     )
@@ -3522,7 +3523,6 @@ def _validate_remote_safetensors_indexes(
     repo_family_files = _remote_safetensors_family_files(repo_files)
     repo_named_family_parents = {(parent, stem.casefold()) for parent, stem, _total in repo_family_files}
     relevant_index_files: list[str] = []
-    strongly_relevant_index_files: set[str] = set()
     probe_budget.check_deadline(repo_id)
     for file_number, index_file in enumerate(repo_files, start=1):
         if file_number % 128 == 0:
@@ -3557,16 +3557,12 @@ def _validate_remote_safetensors_indexes(
                     "Hugging Face selective filtering incomplete: SafeTensors index inspection limit exceeded "
                     f"for {repo_id} ({_HF_SAFETENSORS_INDEX_MAX_FILES} files)"
                 )
-            if strongly_relevant:
-                strongly_relevant_index_files.add(index_file)
     if relevant_index_files and not allow_content_probes:
         _raise_metadata_only_hf_selection_incomplete(repo_id, relevant_index_files)
 
     for index_file in relevant_index_files:
         probe_budget.check_deadline(repo_id)
         index_selected = index_file in selected_files
-        strongly_relevant = index_file in strongly_relevant_index_files
-
         index_prefix = _read_huggingface_prefix(
             repo_id,
             index_file,
@@ -3623,6 +3619,7 @@ def _validate_remote_safetensors_indexes(
                 "Hugging Face selective filtering incomplete: "
                 f"SafeTensors index {repo_id}/{index_file} has non-string shard targets"
             )
+        scoped_targets: set[str] = set()
         parsed_targets: dict[str, tuple[str, int, int]] = {}
         for raw_target in raw_targets:
             try:
@@ -3632,12 +3629,10 @@ def _validate_remote_safetensors_indexes(
                     "Hugging Face selective filtering incomplete: "
                     f"SafeTensors index {repo_id}/{index_file} references an unsafe shard target"
                 ) from exc
+            scoped_targets.add(scoped_target)
             scoped_parts = _remote_safetensors_shard_parts(scoped_target)
             if scoped_parts is None:
-                raise ValueError(
-                    "Hugging Face selective filtering incomplete: "
-                    f"SafeTensors index {repo_id}/{index_file} references a non-SafeTensors shard target"
-                )
+                continue
             _scoped_stem, _scoped_index, scoped_total = scoped_parts
             if scoped_total <= 0:
                 raise ValueError(
@@ -3648,10 +3643,25 @@ def _validate_remote_safetensors_indexes(
         scoped_target_families = {
             (PurePosixPath(target).parent.as_posix(), parts[0], parts[2]) for target, parts in parsed_targets.items()
         }
-        if selected_family_keys.isdisjoint(scoped_target_families) and (
-            scoped_target_families or not strongly_relevant
-        ):
+        targets_overlap_selection = not selected_files.isdisjoint(scoped_targets)
+        families_overlap_selection = not selected_family_keys.isdisjoint(scoped_target_families)
+        index_parent = PurePosixPath(index_file).parent.as_posix()
+        index_stem = _hf_safetensors_index_stem(index_file)
+        assert index_stem is not None
+        index_name_may_govern_selection = not scoped_target_families and any(
+            index_stem.casefold() == selected_stem.casefold()
+            and (
+                index_parent == selected_parent or index_parent == "." or selected_parent.startswith(f"{index_parent}/")
+            )
+            for selected_parent, selected_stem, _selected_total in selected_family_keys
+        )
+        if not targets_overlap_selection and not families_overlap_selection and not index_name_may_govern_selection:
             continue
+        if len(parsed_targets) != len(scoped_targets):
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} references a non-SafeTensors shard target"
+            )
         target_files = sorted(parsed_targets)
 
         target_indices: set[int] = set()
@@ -4257,14 +4267,26 @@ def _select_streamable_hf_files(
             model_files,
             exact_openvino_companion_candidates,
         ):
-            if _is_safetensors_index_file(file_name) and (
-                defer_safetensors_index_validation
-                or _hf_safetensors_routes_excluded_by_selection(
+            if _is_safetensors_index_file(file_name):
+                if _hf_safetensors_routes_excluded_by_selection(
                     selected_route_scanner_ids,
                     selected_route_formats,
+                ):
+                    continue
+                deferred_index_route_scanner_ids = (
+                    selected_route_scanner_ids
+                    if selected_route_scanner_ids is not None
+                    else (
+                        None
+                        if selected_route_formats is None
+                        else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+                    )
                 )
-            ):
-                continue
+                if defer_safetensors_index_validation and (
+                    deferred_index_route_scanner_ids is None
+                    or not deferred_index_route_scanner_ids.difference({"safetensors"})
+                ):
+                    continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
@@ -4530,8 +4552,8 @@ def _stat_huggingface_cache_path(path: Path) -> os.stat_result:
 
 
 def _filtered_huggingface_cache_trust_supported() -> bool:
-    """Return whether this platform exposes the ownership checks required for destructive reuse."""
-    return os.name != "nt"
+    """Return whether per-invocation filtered staging is available."""
+    return True
 
 
 def _is_trusted_huggingface_filtered_download_path(cache_root: Path, download_path: Path) -> bool:
@@ -4603,9 +4625,7 @@ def _build_huggingface_filtered_download_path(
     scannable_extensions: Collection[str] | None,
     scannable_scanner_ids: Collection[str] | None,
 ) -> Path:
-    """Return a non-symlink selection-specific directory under a trusted cache root."""
-    if not _filtered_huggingface_cache_trust_supported():
-        raise ValueError("Filtered Hugging Face cache ownership cannot be established on Windows; use streaming mode")
+    """Return an exclusive non-symlink staging directory under a trusted cache root."""
     lexical_cache_root = Path(os.path.abspath(cache_root))
     selection_key = hashlib.sha256(
         json.dumps(
@@ -4629,16 +4649,22 @@ def _build_huggingface_filtered_download_path(
             sort_keys=True,
         ).encode()
     ).hexdigest()
-    selection_path = lexical_cache_root / ".modelaudit-selections" / namespace
+    selection_parent = lexical_cache_root / ".modelaudit-selections" / namespace
     if repo_name:
-        selection_path = selection_path / repo_name
-    selection_path = selection_path / selection_key
+        selection_parent = selection_parent / repo_name
     if (
-        not _is_lexically_within_directory(lexical_cache_root, selection_path)
-        or not _ensure_secure_directory(selection_path)
-        or not _is_trusted_huggingface_filtered_download_path(lexical_cache_root, selection_path)
+        not _is_lexically_within_directory(lexical_cache_root, selection_parent)
+        or not _ensure_secure_directory(selection_parent)
+        or not _is_trusted_huggingface_filtered_download_path(lexical_cache_root, selection_parent)
     ):
         raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
+    try:
+        selection_path = Path(tempfile.mkdtemp(prefix=f"{selection_key}-", dir=selection_parent))
+        if not _is_trusted_huggingface_filtered_download_path(lexical_cache_root, selection_path):
+            selection_path.rmdir()
+            raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
+    except OSError as exc:
+        raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}") from exc
     return selection_path
 
 
@@ -5254,6 +5280,33 @@ def verify_downloaded_huggingface_safetensors_index_proofs(
                 f"Hugging Face SafeTensors index proof mismatch: downloaded index bytes changed: {proof.index_file}"
             )
 
+        for target_file in proof.target_files:
+            _validate_huggingface_repo_filename(repo_id, target_file)
+            lexical_target = downloaded_path / target_file
+            try:
+                resolved_target = lexical_target.resolve(strict=True)
+                target_parent = lexical_target.parent.resolve(strict=True)
+                target_stat = os.stat(resolved_target, follow_symlinks=False)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(
+                    f"Hugging Face SafeTensors index proof mismatch: downloaded shard is missing: {target_file}"
+                ) from exc
+            if not _is_within_directory(downloaded_path, target_parent):
+                raise ValueError(
+                    f"Hugging Face SafeTensors index proof mismatch: downloaded shard path escaped: {target_file}"
+                )
+            if not _is_within_directory(downloaded_path, resolved_target) and not _is_huggingface_cache_blob_target(
+                downloaded_path,
+                resolved_target,
+            ):
+                raise ValueError(
+                    f"Hugging Face SafeTensors index proof mismatch: downloaded shard target escaped: {target_file}"
+                )
+            if not stat.S_ISREG(target_stat.st_mode):
+                raise ValueError(
+                    f"Hugging Face SafeTensors index proof mismatch: downloaded shard is invalid: {target_file}"
+                )
+
 
 def _should_cleanup_hf_streaming_context_file(
     cache_dir: Path | None,
@@ -5814,7 +5867,6 @@ def download_model(
             assert download_path is not None and filtered_cache_root is not None
             if not _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path):
                 raise ValueError(f"Filtered Hugging Face cache path became unsafe for {repo_id}")
-            _prune_huggingface_filtered_download_path(download_path, model_files)
 
         if download_path is not None:
             # Custom and filtered downloads use a contained local directory.
@@ -5874,8 +5926,10 @@ def download_model(
                     )
                 )
         external_data_files = list(dict.fromkeys(external_data_files))
-        if external_data_files:
-            model_files = list(dict.fromkeys([*model_files, *external_data_files]))
+        initial_model_files = set(model_files)
+        new_external_data_files = [filename for filename in external_data_files if filename not in initial_model_files]
+        if new_external_data_files:
+            model_files = [*model_files, *new_external_data_files]
             external_size_evidence: Mapping[str, int | None]
             if size_limit is not None:
                 _revision, expanded_size_evidence = _ensure_huggingface_selection_within_max_size(
@@ -5890,7 +5944,7 @@ def download_model(
                 try:
                     external_size_evidence, _size_revision = _get_huggingface_path_sizes(
                         repo_id,
-                        external_data_files,
+                        new_external_data_files,
                         resolved_revision=plan.repo_revision,
                         deadline=deadline,
                     )
@@ -5898,17 +5952,17 @@ def download_model(
                     external_size_evidence = {}
             external_sizes = {
                 filename: size
-                for filename in external_data_files
+                for filename in new_external_data_files
                 if isinstance((size := external_size_evidence.get(filename)), int) and not isinstance(size, bool)
             }
-            if disk_check_path is not None and len(external_sizes) == len(external_data_files):
+            if disk_check_path is not None and len(external_sizes) == len(new_external_data_files):
                 external_data_size = sum(external_sizes.values(), start=0)
                 has_space, message = check_disk_space(disk_check_path, external_data_size)
                 if not has_space:
                     raise Exception(
                         f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}"
                     )
-            download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
+            download_kwargs["allow_patterns"] = _build_literal_allow_patterns(new_external_data_files)
             if selection_is_filtered:
                 assert download_path is not None and filtered_cache_root is not None
                 if not _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path):

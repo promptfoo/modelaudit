@@ -43,6 +43,7 @@ from modelaudit.cli import (
 )
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import AssetModel, FileMetadataModel, ModelAuditResultModel, create_initial_audit_result
+from modelaudit.scanner_results import ScanResult
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.repository_context import (
     REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
@@ -1078,6 +1079,94 @@ def test_scan_multiple_explicit_shards_revalidates_windows_index_once_per_family
     assert output_payload["files_scanned"] == len(shard_paths)
 
 
+@pytest.mark.parametrize("reverse_inputs", [False, True], ids=["root-first", "closer-first"])
+def test_explicit_shard_index_authority_is_order_independent(
+    tmp_path: Path,
+    reverse_inputs: bool,
+) -> None:
+    """A closer conflicting index for any selected member must reject the whole family."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    root = tmp_path / "scope"
+    first = root / "a" / "model-00001-of-00002.safetensors"
+    second = root / "b" / "model-00002-of-00002.safetensors"
+    decoy = root / "b" / "decoy" / "model-00001-of-00002.safetensors"
+    for shard in (first, second, decoy):
+        _make_trusted_shard_parent(shard.parent, parents=True)
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {"first": first.relative_to(root).as_posix(), "second": second.relative_to(root).as_posix()}}
+        ),
+        encoding="utf-8",
+    )
+    (second.parent / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "decoy": decoy.relative_to(second.parent).as_posix(),
+                    "second": second.name,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    inputs = [str(first), str(second)]
+    if reverse_inputs:
+        inputs.reverse()
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *inputs, "--assume-shard-family", "--scanners", "safetensors", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    assert parse_click_json_output(result.output)["success"] is False
+
+
+def test_explicit_shard_family_does_not_ignore_governing_ancestor_index(tmp_path: Path) -> None:
+    """A deeper name-complete scope cannot hide conflicting ancestor authority."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    selected_dir = tmp_path / "scope" / "selected"
+    decoy_dir = tmp_path / "scope" / "decoy"
+    _make_trusted_shard_parent(selected_dir, parents=True)
+    _make_trusted_shard_parent(decoy_dir, parents=True)
+    selected = [selected_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+    decoy = decoy_dir / "model-00002-of-00002.safetensors"
+    for shard in (*selected, decoy):
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    scope = selected_dir.parent
+    (scope / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "selected": selected[0].relative_to(scope).as_posix(),
+                    "decoy": decoy.relative_to(scope).as_posix(),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *(str(shard) for shard in selected),
+            "--assume-shard-family",
+            "--scanners",
+            "safetensors",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    assert parse_click_json_output(result.output)["success"] is False
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode policy")
 @pytest.mark.parametrize(
     ("scope_mode", "index_mode", "expected_exit"),
@@ -1590,6 +1679,44 @@ def test_windows_shard_replacement_guard_allows_stable_cli_scan(tmp_path: Path) 
         check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
         for check in output_payload["checks"]
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows file-sharing semantics")
+@pytest.mark.parametrize("stream", [False, True], ids=["standard-directory", "streaming-directory"])
+def test_windows_directory_shard_guard_denies_writes_through_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """Directory and streaming core paths retain write-denying guards until completion."""
+    from modelaudit import core as core_module
+
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    original_bytes = _minimal_safetensors_bytes()
+    shard.write_bytes(original_bytes)
+    original_scan_file = core_module.scan_file
+    attempted_write = False
+
+    def scan_with_write_attempt(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal attempted_write
+        if Path(path).name == shard.name and not attempted_write:
+            attempted_write = True
+            with pytest.raises(OSError):
+                shard.write_bytes(b"X" * len(original_bytes))
+        return original_scan_file(path, config)
+
+    monkeypatch.setattr(core_module, "scan_file", scan_with_write_attempt)
+    arguments = ["scan", str(tmp_path), "--scanners", "safetensors", "--format", "json", "--no-cache"]
+    if stream:
+        arguments.append("--stream")
+
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+
+    assert attempted_write is True
+    assert result.exit_code == 0, result.output
+    assert parse_click_json_output(result.output)["success"] is True
+    shard.write_bytes(b"Y" * len(original_bytes))
+    assert shard.read_bytes() == b"Y" * len(original_bytes)
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
@@ -4774,8 +4901,12 @@ def test_scan_huggingface_standard_preserves_selected_extensionless_filenames(
     mock_rmtree.assert_called()
 
 
-def test_scan_huggingface_standard_revalidates_index_proof_after_local_scan(tmp_path: Path) -> None:
-    """A downloaded governing index cannot change between acquisition and local scan completion."""
+@pytest.mark.parametrize("mutation", ["index", "target-delete"])
+def test_scan_huggingface_standard_revalidates_index_proof_after_local_scan(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Downloaded index authority and every declared target remain present after scanning."""
     from modelaudit.utils.sources.huggingface import HuggingFaceSafetensorsIndexProof
 
     downloaded_dir = tmp_path / "downloaded"
@@ -4783,6 +4914,9 @@ def test_scan_huggingface_standard_revalidates_index_proof_after_local_scan(tmp_
     index_path = downloaded_dir / "weights.safetensors.index.json"
     index_bytes = b'{"weight_map":{"tensor":"nested/model-00001-of-00001.safetensors"}}'
     index_path.write_bytes(index_bytes)
+    target_path = downloaded_dir / "nested" / "model-00001-of-00001.safetensors"
+    target_path.parent.mkdir()
+    target_path.write_bytes(_minimal_safetensors_bytes())
     proof = HuggingFaceSafetensorsIndexProof(
         index_file=index_path.name,
         fingerprint=hashlib.sha256(index_bytes).hexdigest(),
@@ -4795,7 +4929,10 @@ def test_scan_huggingface_standard_revalidates_index_proof_after_local_scan(tmp_
         return downloaded_dir
 
     def mutate_index_after_scan(*_args: Any, **_kwargs: Any) -> ModelAuditResultModel:
-        index_path.write_text('{"weight_map":{"tensor":"other/model-00001-of-00001.safetensors"}}')
+        if mutation == "index":
+            index_path.write_text('{"weight_map":{"tensor":"other/model-00001-of-00001.safetensors"}}')
+        else:
+            target_path.unlink()
         return create_mock_scan_result(files_scanned=1, issues=[])
 
     with (
@@ -5851,6 +5988,43 @@ def test_scan_huggingface_no_cache_uses_ephemeral_cache_dir(
     assert isinstance(cache_dir, Path)
     assert cache_dir.name.startswith("modelaudit_hf_")
     mock_rmtree.assert_called()
+
+
+@patch("tempfile.mkdtemp")
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_no_cache_canonicalizes_internal_temp_root(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_hf_url: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A platform temp alias such as macOS /var must not fail path hardening."""
+    del requires_symlinks
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    alias_root = tmp_path / "var"
+    alias_root.symlink_to(private_root, target_is_directory=True)
+    canonical_temp = private_root / "modelaudit_hf_alias"
+    canonical_temp.mkdir()
+    mock_mkdtemp.return_value = str(alias_root / canonical_temp.name)
+    mock_is_hf_url.return_value = True
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.safetensors").write_bytes(b"weights")
+    mock_download.return_value = downloaded_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "hf://test/model"])
+
+    assert result.exit_code == 0, result.output
+    assert mock_download.call_args.kwargs["cache_dir"] == canonical_temp
+    mock_rmtree.assert_called_with(str(canonical_temp))
 
 
 @patch("tempfile.mkdtemp")

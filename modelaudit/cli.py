@@ -95,8 +95,10 @@ from .utils.file.handlers import (
     ShardedModelDetector,
     ValidatedShardTargets,
     _count_expected_shard_indices,
+    _open_windows_shard_guard_fd,
     _SafetensorsIndexInspectionContext,
     _shard_boundary_failure_result,
+    _validated_stat_matches_target,
 )
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
@@ -1705,10 +1707,12 @@ class _ExplicitShardFamily:
 
     group: str
     scope: str
+    pattern: str
     expected_total: int
     paths: tuple[str, ...]
     supports_index_authority: bool = False
     initial_index_proof: tuple[str, str, str, int] | None = None
+    authority_invalid: bool = False
 
 
 def _record_shard_boundary_failure(scan_result: ModelAuditResultModel, path: str) -> None:
@@ -1728,73 +1732,6 @@ def _record_shard_boundary_failure(scan_result: ModelAuditResultModel, path: str
     scan_result.file_metadata[path] = FileMetadataModel(**merged_metadata)
     scan_result.has_errors = True
     scan_result.success = False
-
-
-def _open_windows_shard_guard_fd(path: str) -> int:
-    """Open a Windows shard for shared reads while denying writes and replacement."""
-    import ctypes
-    import ctypes.wintypes as wintypes
-    import msvcrt
-
-    ctypes_windows: Any = ctypes
-    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    create_file.restype = wintypes.HANDLE
-
-    generic_read = 0x80000000
-    file_share_read = 0x00000001
-    open_existing = 3
-    file_attribute_normal = 0x00000080
-    handle = create_file(
-        path,
-        generic_read,
-        file_share_read,
-        None,
-        open_existing,
-        file_attribute_normal,
-        None,
-    )
-    invalid_handle_value = ctypes.c_void_p(-1).value
-    if handle in (None, invalid_handle_value):
-        error = ctypes_windows.get_last_error()
-        raise ctypes_windows.WinError(error)
-
-    handle_value = handle if isinstance(handle, int) else int(handle.value)
-    try:
-        msvcrt_module: Any = msvcrt
-        return int(
-            msvcrt_module.open_osfhandle(
-                handle_value,
-                os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
-            )
-        )
-    except Exception:
-        _close_windows_handle(handle_value)
-        raise
-
-
-def _shard_guard_stat_matches_target(opened_stat: os.stat_result, target: dict[str, int | str]) -> bool:
-    """Return whether a guarded file descriptor still matches its shard receipt."""
-    return stat.S_ISREG(opened_stat.st_mode) and all(
-        not isinstance(target.get(field), int) or target[field] == value
-        for field, value in (
-            ("device", opened_stat.st_dev),
-            ("inode", opened_stat.st_ino),
-            ("size", opened_stat.st_size),
-            ("mtime_ns", opened_stat.st_mtime_ns),
-            ("ctime_ns", opened_stat.st_ctime_ns),
-            ("nlink", opened_stat.st_nlink),
-        )
-    )
 
 
 @dataclass
@@ -1820,6 +1757,7 @@ class _ScanPathState:
         """Record an aggregate error that shard reconciliation does not own."""
         self.has_errors_outside_reconciled_shards = True
         audit_result.has_errors = True
+        audit_result.success = False
 
     def record_dry_run_preview(self, preview: dict[str, Any]) -> None:
         """Record a source that was previewed without scanning."""
@@ -1879,7 +1817,7 @@ class _ScanPathState:
             if (
                 not isinstance(resolved_path, str)
                 or os.path.normcase(os.path.normpath(source_path)) != os.path.normcase(os.path.normpath(resolved_path))
-                or not _shard_guard_stat_matches_target(os.fstat(guard_fd), target)
+                or not _validated_stat_matches_target(os.fstat(guard_fd), target)
             ):
                 return {}
             self.windows_shard_guards.append((guard_fd, source_path, dict(target)))
@@ -1893,7 +1831,7 @@ class _ScanPathState:
         """Fail closed if a retained Windows shard handle changed before reconciliation."""
         for guard_fd, source_path, target in self.windows_shard_guards:
             try:
-                stable = _shard_guard_stat_matches_target(os.fstat(guard_fd), target)
+                stable = _validated_stat_matches_target(os.fstat(guard_fd), target)
             except OSError:
                 stable = False
             if not stable:
@@ -1933,7 +1871,9 @@ class _ScanPathState:
                 explicit_family,
                 self.safetensors_index_context,
             )
-            authority_required = explicit_family is not None and explicit_family.initial_index_proof is not None
+            authority_required = explicit_family is not None and (
+                explicit_family.initial_index_proof is not None or explicit_family.authority_invalid
+            )
             if authority_required and (not pre_scan_target or authoritative_index_proof is None):
                 _record_shard_boundary_failure(scan_result, asset.path)
                 continue
@@ -1974,30 +1914,38 @@ class _ScanPathState:
     def revalidate_explicit_shard_targets(self, audit_result: ModelAuditResultModel) -> None:
         """Recheck explicit shard identity and index authority immediately before reconciliation."""
         refreshed_states: dict[
-            _ExplicitShardFamily,
-            tuple[tuple[str, str, str, int] | None, bool],
+            tuple[str, str, int],
+            tuple[bool, tuple[str, str, str, int] | None, bool],
         ] = {}
         for source_path, expected_target in list(self.validated_shard_targets.items()):
             explicit_family = self.explicit_shard_family_for(source_path)
             if explicit_family is None:
                 continue
-            scope_stable = _trusted_explicit_shard_family_scope(
-                explicit_family.scope,
-                explicit_family.paths,
-            )
-            if scope_stable and explicit_family.supports_index_authority and explicit_family not in refreshed_states:
-                refreshed_states[explicit_family] = _explicit_shard_index_authority(
+            family_key = (explicit_family.scope, explicit_family.pattern, explicit_family.expected_total)
+            if family_key not in refreshed_states:
+                scope_stable = _trusted_explicit_shard_family_scope(
+                    explicit_family.scope,
                     explicit_family.paths,
-                    scope=explicit_family.scope,
-                    expected_total=explicit_family.expected_total,
-                    index_inspection_context=self.safetensors_index_context,
-                    force_index_content_revalidation=True,
                 )
-            authoritative_index_proof, authority_present = refreshed_states.get(explicit_family, (None, False))
+                authoritative_index_proof, authority_present = (None, False)
+                if scope_stable and explicit_family.supports_index_authority:
+                    authoritative_index_proof, authority_present = _explicit_shard_index_authority(
+                        explicit_family.paths,
+                        scope=explicit_family.scope,
+                        expected_total=explicit_family.expected_total,
+                        index_inspection_context=self.safetensors_index_context,
+                        force_index_content_revalidation=True,
+                    )
+                refreshed_states[family_key] = (scope_stable, authoritative_index_proof, authority_present)
+            scope_stable, authoritative_index_proof, authority_present = refreshed_states[family_key]
             expected_index_proof = explicit_family.initial_index_proof
-            authority_stable = scope_stable and (
-                authoritative_index_proof == expected_index_proof
-                and authority_present == (expected_index_proof is not None)
+            authority_stable = (
+                not explicit_family.authority_invalid
+                and scope_stable
+                and (
+                    authoritative_index_proof == expected_index_proof
+                    and authority_present == (expected_index_proof is not None)
+                )
             )
             current_target = (
                 _snapshot_validated_shard_target(
@@ -2539,12 +2487,21 @@ def _explicit_shard_index_authority(
     force_index_content_revalidation: bool = False,
 ) -> tuple[tuple[str, str, str, int] | None, bool]:
     """Return stable index authority and whether a governing index was found."""
+    agreed_proof, authority_present = ShardedModelDetector.refresh_safetensors_index_proofs(
+        paths,
+        expected_total=expected_total,
+        index_search_root=scope,
+        index_inspection_context=index_inspection_context,
+        force_content_revalidation=force_index_content_revalidation,
+    )
+    if agreed_proof is None:
+        return None, authority_present
     shard_info = ShardedModelDetector.detect_shards(
         paths[0],
         allowed_paths=list(paths),
         index_search_root=scope,
         index_inspection_context=index_inspection_context,
-        force_index_content_revalidation=force_index_content_revalidation,
+        force_index_content_revalidation=False,
     )
     if not isinstance(shard_info, dict):
         return None, False
@@ -2552,7 +2509,7 @@ def _explicit_shard_index_authority(
     index_path = shard_info.get("safetensors_index_path")
     index_fingerprint = shard_info.get("safetensors_index_fingerprint")
     index_generation = shard_info.get("safetensors_index_generation")
-    authority_present = isinstance(index_path, str) and bool(index_path)
+    detected_authority_present = isinstance(index_path, str) and bool(index_path)
     if (
         index_base not in {"zero", "one"}
         or not isinstance(index_path, str)
@@ -2566,7 +2523,7 @@ def _explicit_shard_index_authority(
         or shard_info.get("expected_total_shards") != expected_total
         or shard_info.get("total_shards") != expected_total
     ):
-        return None, authority_present
+        return None, authority_present or detected_authority_present
     if any(
         shard_info.get(key)
         for key in (
@@ -2588,15 +2545,15 @@ def _explicit_shard_index_authority(
         return None, authority_present
     if not _trusted_explicit_shard_index_authority(index_path, scope):
         return None, True
-    return (
-        (
-            index_base,
-            os.path.normcase(os.path.normpath(os.path.abspath(index_path))),
-            index_fingerprint,
-            index_generation,
-        ),
-        True,
+    detected_proof = (
+        index_base,
+        os.path.normcase(os.path.normpath(os.path.abspath(index_path))),
+        index_fingerprint,
+        index_generation,
     )
+    if detected_proof != agreed_proof:
+        return None, True
+    return agreed_proof, True
 
 
 def _trusted_explicit_shard_index_authority(index_path: str, scope: str) -> bool:
@@ -2779,6 +2736,7 @@ def _explicit_local_shard_family_groups(
                 targets_by_scope.setdefault(normalized_scope, {}).setdefault(shard_index, []).append(normalized_path)
 
         complete_scopes: dict[str, tuple[str, str, str, int] | None] = {}
+        authority_scopes: set[str] = set()
         expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(expected_total)
         for scope, targets_by_index in targets_by_scope.items():
             scoped_paths = tuple(path for targets in targets_by_index.values() for path in targets)
@@ -2799,6 +2757,8 @@ def _explicit_local_shard_family_groups(
                 if _pattern == SAFETENSORS_SHARD_PATTERN
                 else (None, False)
             )
+            if authority_present:
+                authority_scopes.add(scope)
             if authority_present and authoritative_index_proof is None:
                 continue
             if not complete_by_name:
@@ -2817,6 +2777,24 @@ def _explicit_local_shard_family_groups(
             complete_scopes[scope] = authoritative_index_proof
         for normalized_path, _resolved_path, _shard_index in records:
             matching_scopes = scopes_by_source[normalized_path] & complete_scopes.keys()
+            matching_authority_scopes = scopes_by_source[normalized_path] & authority_scopes
+            if matching_authority_scopes:
+                matching_scopes = {scope for scope in matching_scopes if complete_scopes[scope] is not None}
+                if not matching_scopes:
+                    invalid_scope = max(matching_authority_scopes, key=lambda scope: len(Path(scope).parts))
+                    invalid_paths = tuple(
+                        path for targets in targets_by_scope[invalid_scope].values() for path in targets
+                    )
+                    groups[normalized_path] = _ExplicitShardFamily(
+                        group=f"explicit-cli:{invalid_scope}",
+                        scope=invalid_scope,
+                        pattern=_pattern,
+                        expected_total=expected_total,
+                        paths=invalid_paths,
+                        supports_index_authority=_pattern == SAFETENSORS_SHARD_PATTERN,
+                        authority_invalid=True,
+                    )
+                    continue
             if matching_scopes:
                 family_scope = max(matching_scopes, key=lambda scope: len(Path(scope).parts))
                 initial_index_proof = complete_scopes[family_scope]
@@ -2826,6 +2804,7 @@ def _explicit_local_shard_family_groups(
                 groups[normalized_path] = _ExplicitShardFamily(
                     group=f"explicit-cli:{family_scope}",
                     scope=family_scope,
+                    pattern=_pattern,
                     expected_total=expected_total,
                     paths=authoritative_index_paths,
                     supports_index_authority=_pattern == SAFETENSORS_SHARD_PATTERN,
@@ -3605,7 +3584,9 @@ def _scan_local_or_downloaded_path(
         path_state.safetensors_index_context,
     )
     pre_scan_shard_target = source_result.initial_shard_target
-    if explicit_family is not None and authoritative_index_proof != explicit_family.initial_index_proof:
+    if explicit_family is not None and (
+        explicit_family.authority_invalid or authoritative_index_proof != explicit_family.initial_index_proof
+    ):
         pre_scan_shard_target = {}
     if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
         return
@@ -3874,7 +3855,7 @@ def _resolve_scan_source_for_path(
             else:
                 import tempfile
 
-                hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
+                hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_")).resolve(strict=True)
                 temp_dir = str(hf_cache_dir)
 
             _repo_id, _revision, repository_current_file = parse_huggingface_file_url(path)
@@ -4024,7 +4005,7 @@ def _resolve_scan_source_for_path(
             else:
                 import tempfile
 
-                hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
+                hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_")).resolve(strict=True)
                 temp_dir = str(hf_cache_dir)
 
             record_download_started("huggingface", display_path)
