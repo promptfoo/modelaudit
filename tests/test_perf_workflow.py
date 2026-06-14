@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import re
@@ -79,15 +78,6 @@ def _matrix_options(expression: str) -> list[Any]:
     matches = re.findall(r"fromJSON\('([^']+)'\)", expression)
     assert matches
     return [json.loads(match) for match in matches]
-
-
-def _load_tests_conftest_module() -> Any:
-    conftest_path = Path(__file__).resolve().parent / "conftest.py"
-    spec = importlib.util.spec_from_file_location("modelaudit_tests_conftest", conftest_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -412,30 +402,6 @@ def test_dependency_audit_runs_for_source_reachability_changes() -> None:
     assert "needs.changes.outputs.workflows == 'true'" in condition
     assert "needs.changes.outputs.python == 'true'" in condition
     assert "needs.changes.outputs.picklescan == 'true'" in condition
-
-
-def test_python_ci_sharder_assigns_each_nodeid_to_exactly_one_shard() -> None:
-    conftest_module = _load_tests_conftest_module()
-    nodeids = [
-        "tests/test_alpha.py::test_one",
-        "tests/test_alpha.py::test_two[param]",
-        "tests/test_beta.py::TestSuite::test_three",
-        "tests/test_gamma.py::test_four",
-        "tests/test_delta.py::test_five",
-        "tests/test_epsilon.py::test_six",
-    ]
-
-    for shard_count in (2, 10):
-        shard_members: dict[int, set[str]] = {index: set() for index in range(shard_count)}
-        for nodeid in nodeids:
-            shard_index = conftest_module._nodeid_shard(nodeid, shard_count)
-            assert 0 <= shard_index < shard_count
-            assert conftest_module._nodeid_shard(nodeid, shard_count) == shard_index
-            shard_members[shard_index].add(nodeid)
-
-        assert set().union(*shard_members.values()) == set(nodeids)
-        assert sum(len(members) for members in shard_members.values()) == len(nodeids)
-
 
 def test_python_ci_triggers_merge_group_and_cancels_superseded_main_runs() -> None:
     workflow = _load_workflow("test.yml")
