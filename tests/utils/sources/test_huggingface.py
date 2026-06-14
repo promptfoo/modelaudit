@@ -4064,12 +4064,12 @@ class TestModelDownloadStreaming:
         mock_hf_hub_download.assert_not_called()
 
     @pytest.mark.parametrize("scanner_ids", [None, {"xgboost"}], ids=["extensions-only", "scanner-ids"])
-    def test_download_model_streaming_selected_json_does_not_expand_safetensors_index(
+    def test_download_model_streaming_selected_json_validates_index_without_expanding_shards(
         self,
         tmp_path: Path,
         scanner_ids: set[str] | None,
     ) -> None:
-        """A non-SafeTensors scanner selection may scan an index JSON without downloading its shards."""
+        """A selected index can prove zero-based shards are safely excluded without expanding them."""
         repo_files = [
             "model.safetensors.index.json",
             "model-00000-of-00001.safetensors",
@@ -4091,12 +4091,20 @@ class TestModelDownloadStreaming:
                 "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
                 return_value=(repo_files, _HF_TEST_REVISION, None),
             ),
-            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                return_value="safetensors",
+            ) as mock_detect_content,
             patch(
                 "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
                 return_value=(sizes, _HF_TEST_REVISION),
             ) as mock_get_sizes,
-            patch("requests.get") as mock_requests_get,
+            patch(
+                "requests.get",
+                return_value=_FakeRangeResponse(
+                    json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}).encode()
+                ),
+            ) as mock_requests_get,
             patch("huggingface_hub.hf_hub_download", side_effect=download_side_effect) as mock_hf_hub_download,
         ):
             results = list(
@@ -4115,7 +4123,8 @@ class TestModelDownloadStreaming:
             "model.safetensors.index.json",
             "model.ubj",
         ]
-        mock_requests_get.assert_not_called()
+        mock_detect_content.assert_not_called()
+        mock_requests_get.assert_called_once()
 
     def test_model_plan_metadata_only_skips_excluded_safetensors_candidates(self) -> None:
         """A filtered metadata-only plan must mirror real SafeTensors exclusions."""

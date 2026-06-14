@@ -2422,14 +2422,9 @@ def _select_streamable_hf_files(
 
     probe_budget: _HuggingFaceProbeBudget | None = None
     complete_safetensors_shard_files = set(_complete_hf_safetensors_shard_files(repo_files))
-    selected_safetensors_indexes = {filename for filename in model_files if _is_hf_safetensors_index_filename(filename)}
-    if (
-        sniff_renamed_files
-        and not selected_safetensors_indexes
-        and _hf_safetensors_routes_excluded_by_selection(
-            selected_route_scanner_ids,
-            selected_route_formats,
-        )
+    if sniff_renamed_files and _hf_safetensors_routes_excluded_by_selection(
+        selected_route_scanner_ids,
+        selected_route_formats,
     ):
         zero_based_candidates = _zero_based_hf_safetensors_shard_candidates(repo_files)
         if zero_based_candidates:

@@ -362,6 +362,32 @@ class TestShardedModelDetector:
         assert "unexpected_shard_count" not in shard_info
         assert result.success is True
 
+    def test_detect_safetensors_parent_index_rejects_split_directory_family(self, tmp_path: Path) -> None:
+        """An ancestor index cannot combine shard indices from separate directories."""
+        first = tmp_path / "a" / "model-00001-of-00002.safetensors"
+        second = tmp_path / "b" / "model-00002-of-00002.safetensors"
+        first.parent.mkdir()
+        second.parent.mkdir()
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        index_path = _write_safetensors_index(
+            tmp_path,
+            [first.relative_to(tmp_path).as_posix(), second.relative_to(tmp_path).as_posix()],
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(first), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(first),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "safetensors index targets must share one shard parent"
+        assert shard_info["unvalidated_shards"] == [str(index_path)]
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
     def test_detect_shards_records_missing_expected_indices(self, tmp_path: Path) -> None:
         """Missing numbered shards should be explicit in detector metadata."""
         shard_one = tmp_path / "model-00001-of-00003.safetensors"
@@ -616,11 +642,11 @@ class TestShardedModelDetector:
         assert shard_info["shards"] == [str(standalone)]
         assert result.success is True
 
-    def test_detect_safetensors_index_spanning_nested_sibling_directories(
+    def test_detect_safetensors_index_rejects_split_nested_directories(
         self,
         tmp_path: Path,
     ) -> None:
-        """A governing root index may define one family across sibling directories."""
+        """A governing root index cannot combine shard indices from sibling directories."""
         header = b'{"__metadata__":{"format":"pt"}}'
         shards = [
             tmp_path / "a" / "model-00000-of-00002.safetensors",
@@ -635,13 +661,10 @@ class TestShardedModelDetector:
         result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, scanners=["safetensors"])
 
         assert shard_info is not None
-        assert [os.path.normcase(os.path.normpath(path)) for path in shard_info["shards"]] == [
-            os.path.normcase(os.path.normpath(str(shard))) for shard in shards
-        ]
-        assert "missing_shard_count" not in shard_info
-        assert "out_of_scope_shard_count" not in shard_info
-        assert result.success is True
-        assert determine_exit_code(result) == 0
+        assert shard_info["safetensors_index_error"] == "safetensors index targets must share one shard parent"
+        assert shard_info["unvalidated_shards"] == [str(tmp_path / "model.safetensors.index.json")]
+        assert result.success is False
+        assert determine_exit_code(result) == 2
 
     def test_detect_safetensors_nested_index_rejects_symlink_outside_root(
         self,
@@ -650,11 +673,11 @@ class TestShardedModelDetector:
     ) -> None:
         """Index-relative nested targets cannot authorize an external symlink target."""
         model_root = tmp_path / "model"
-        first = model_root / "a" / "model-00000-of-00002.safetensors"
-        second = model_root / "b" / "model-00001-of-00002.safetensors"
+        first = model_root / "shards" / "model-00000-of-00002.safetensors"
+        second = model_root / "shards" / "model-00001-of-00002.safetensors"
         outside = tmp_path / "outside.safetensors"
         first.parent.mkdir(parents=True)
-        second.parent.mkdir(parents=True)
+        second.parent.mkdir(parents=True, exist_ok=True)
         first.write_bytes(b"first")
         outside.write_bytes(b"outside")
         second.symlink_to(outside)
@@ -2261,11 +2284,11 @@ class TestAdvancedFileHandler:
         """Equivalent shard inventories with different trusted roots must not share cache entries."""
         model_root = tmp_path / "model"
         shards = [
-            model_root / "a" / "model-00000-of-00002.safetensors",
-            model_root / "b" / "model-00001-of-00002.safetensors",
+            model_root / "shards" / "model-00000-of-00002.safetensors",
+            model_root / "shards" / "model-00001-of-00002.safetensors",
         ]
         for shard in shards:
-            shard.parent.mkdir(parents=True)
+            shard.parent.mkdir(parents=True, exist_ok=True)
             shard.write_bytes(shard.name.encode())
         _write_safetensors_index(model_root, [shard.relative_to(model_root).as_posix() for shard in shards])
         scanned_payloads: list[bytes] = []

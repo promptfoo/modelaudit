@@ -2320,10 +2320,15 @@ def _explicit_shard_index_authority(
     expected_total: int,
 ) -> tuple[tuple[str, str, str] | None, bool]:
     """Return stable index authority and whether a governing index was found."""
+    allowed_targets: ValidatedShardTargets = {}
+    for path in paths:
+        allowed_targets.update(_snapshot_validated_shard_target(path))
     shard_info = ShardedModelDetector.detect_shards(
         paths[0],
         allowed_paths=list(paths),
+        allowed_targets=allowed_targets,
         index_search_root=scope,
+        trusted_cross_parent_family=True,
     )
     if not isinstance(shard_info, dict):
         return None, False

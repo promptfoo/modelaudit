@@ -627,6 +627,9 @@ class ShardedModelDetector:
         index_path: Path,
         pattern: str,
         expected_total: int | None,
+        *,
+        allowed_cross_parent_source_paths: frozenset[str] | None = None,
+        trusted_cross_parent_family: bool = False,
     ) -> _SafetensorsShardIndexInventory:
         """Parse one SafeTensors index, returning its shard inventory or a validation error."""
         expected_paths: set[str] = set()
@@ -666,6 +669,7 @@ class ShardedModelDetector:
                 raise ValueError("safetensors index weight_map must be a non-empty object")
 
             target_indices: set[int] = set()
+            target_parents: set[str] = set()
             index_expected_total: int | None = expected_total
             raw_targets = list(weight_map.values())
             for raw_target in raw_targets:
@@ -692,9 +696,16 @@ class ShardedModelDetector:
                     raise ValueError("safetensors index target total does not match selected shard total")
                 expected_paths.add(_normalized_absolute_path(target_file))
                 target_indices.add(target_index)
+                target_parents.add(_normalized_absolute_path(target_file.parent))
 
             if index_expected_total is None:
                 raise ValueError("safetensors index shard count does not match selected shard total")
+            cross_parent_targets_allowed = trusted_cross_parent_family or (
+                allowed_cross_parent_source_paths is not None
+                and expected_paths.issubset(allowed_cross_parent_source_paths)
+            )
+            if len(target_parents) != 1 and not cross_parent_targets_allowed:
+                raise ValueError("safetensors index targets must share one shard parent")
             if len(expected_paths) != index_expected_total or len(target_indices) != index_expected_total:
                 raise ValueError("safetensors index shard count does not match selected shard total")
 
@@ -760,6 +771,9 @@ class ShardedModelDetector:
         expected_total: int | None,
         current_file: Path,
         index_search_root: Path,
+        *,
+        allowed_cross_parent_source_paths: frozenset[str] | None = None,
+        trusted_cross_parent_family: bool = False,
     ) -> _SafetensorsShardIndexInventory | None:
         """Load a governing SafeTensors index inventory or captured validation error."""
         if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
@@ -783,7 +797,14 @@ class ShardedModelDetector:
         while True:
             index_path = index_dir / SAFETENSORS_INDEX_NAME
             if index_path.exists() or index_path.is_symlink():
-                inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, None)
+                inventory = cls._read_safetensors_index_inventory(
+                    index_dir,
+                    index_path,
+                    pattern,
+                    None,
+                    allowed_cross_parent_source_paths=allowed_cross_parent_source_paths,
+                    trusted_cross_parent_family=trusted_cross_parent_family,
+                )
                 if inventory.error is not None and _normalized_absolute_path(index_dir) == _normalized_absolute_path(
                     absolute_dir
                 ):
@@ -803,6 +824,7 @@ class ShardedModelDetector:
         allowed_paths: list[str] | None = None,
         allowed_targets: ValidatedShardTargets | None = None,
         index_search_root: str | os.PathLike[str] | None = None,
+        trusted_cross_parent_family: bool = False,
     ) -> dict[str, Any] | None:
         """
         Detect if a file is part of a sharded model.
@@ -832,6 +854,21 @@ class ShardedModelDetector:
             [Path(source_path) for source_path in allowed_targets if isinstance(source_path, str)]
             if allowed_targets is not None
             else []
+        )
+        current_target = (
+            normalized_allowed_targets.get(_normalized_absolute_path(file_path))
+            if normalized_allowed_targets is not None
+            else None
+        )
+        current_family_group = current_target.get("family_group") if current_target is not None else None
+        allowed_cross_parent_source_paths = (
+            frozenset(
+                source_path
+                for source_path, target in normalized_allowed_targets.items()
+                if target.get("family_group") == current_family_group
+            )
+            if normalized_allowed_targets is not None and isinstance(current_family_group, str) and current_family_group
+            else None
         )
         allowed_path_set: set[str] | None = None
         if allowed_paths is not None:
@@ -864,6 +901,8 @@ class ShardedModelDetector:
                     requested_expected_total,
                     Path(file_path),
                     effective_index_search_root,
+                    allowed_cross_parent_source_paths=allowed_cross_parent_source_paths,
+                    trusted_cross_parent_family=trusted_cross_parent_family,
                 )
                 if index_inventory is not None:
                     shard_info["safetensors_index_path"] = str(index_inventory.index_path)

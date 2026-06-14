@@ -3062,11 +3062,11 @@ def test_directory_scan_groups_hf_cache_sharded_symlinks(
 
 
 @pytest.mark.usefixtures("requires_symlinks")
-def test_directory_scan_groups_indexed_hf_shards_across_nested_directories(
+def test_directory_scan_keeps_indexed_hf_shards_in_separate_nested_directories(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A trusted snapshot index may group nested aliases that share the same blobs root."""
+    """An ancestor index cannot combine shard coverage across logical directories."""
     hf_home = tmp_path / "hf-home"
     monkeypatch.setenv("HF_HOME", str(hf_home))
     cache_dir = hf_home / "hub" / "models--org--model"
@@ -3113,11 +3113,15 @@ def test_directory_scan_groups_indexed_hf_shards_across_nested_directories(
 
     result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
 
-    fingerprint = normalize_material_scan_config(shard_configs[0])[
-        core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY
+    fingerprints = [
+        normalize_material_scan_config(config)[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
+        for config in shard_configs
     ]
-    assert len(shard_calls) == 1
-    assert {member["path"] for member in fingerprint["members"]} == {str(blob) for blob in blob_paths}
+    assert len(shard_calls) == 2
+    assert all(len(fingerprint["members"]) == 1 for fingerprint in fingerprints)
+    assert {member["path"] for fingerprint in fingerprints for member in fingerprint["members"]} == {
+        str(blob) for blob in blob_paths
+    }
     assert result.success is True
     assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
 
