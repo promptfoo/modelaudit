@@ -121,6 +121,7 @@ _MAX_SOURCE_BYTES = 1024 * 1024
 _CALL_GRAPH_REGULAR_FILE_FINGERPRINT = "regular-file"
 _MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
 _MAX_FILE_FINDER_IDENTITY_CACHE_SIZE = 128
+_MAX_FILE_FINDER_RESOLUTION_ATTEMPTS = 3
 _MAX_ZIPIMPORT_ARCHIVE_BYTES = 64 * 1024 * 1024
 _MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES = 4 * 1024 * 1024
 _ZIP_END_RECORD_SIZE = 22
@@ -3973,12 +3974,12 @@ def _zipimport_absent_cache_snapshot(files: object, prefix: str, module_name: st
     return snapshot
 
 
-def _oversized_zip_archive_excludes_module(archive: str, prefix: str, module_name: str) -> bool:
+def _bounded_zip_archive_excludes_module(archive: str, prefix: str, module_name: str) -> bool:
     try:
         archive_stat = os.stat(archive)
     except OSError:
         return False
-    if not stat.S_ISREG(archive_stat.st_mode) or archive_stat.st_size <= _MAX_ZIPIMPORT_ARCHIVE_BYTES:
+    if not stat.S_ISREG(archive_stat.st_mode):
         return False
     names = _zipimport_bounded_central_directory_names(archive, archive_stat)
     return names is not None and _zipimport_names_exclude_module(names, prefix, module_name)
@@ -4010,14 +4011,22 @@ def _zipimport_archive_state_from_entry(entry: str) -> tuple[str, str] | None:
     return None
 
 
-def _uncached_oversized_zip_excludes_module(entry: str, module_name: str) -> bool:
+def _uncached_oversized_zip_excludes_module(entry: str, module_name: str) -> bool | None:
     if not _zipimport_runtime_is_trusted() or not _path_hooks_are_trusted():
         return False
     archive_state = _zipimport_archive_state_from_entry(entry)
     if archive_state is None:
-        return False
+        return None
     archive, prefix = archive_state
-    if not _oversized_zip_archive_excludes_module(archive, prefix, module_name):
+    try:
+        archive_stat = os.stat(archive)
+    except OSError:
+        return False
+    if not stat.S_ISREG(archive_stat.st_mode):
+        return False
+    if archive_stat.st_size <= _MAX_ZIPIMPORT_ARCHIVE_BYTES:
+        return None
+    if not _bounded_zip_archive_excludes_module(archive, prefix, module_name):
         return False
     directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
     if not dict.__contains__(directory_cache, archive):
@@ -4027,7 +4036,7 @@ def _uncached_oversized_zip_excludes_module(entry: str, module_name: str) -> boo
     return snapshot is not None and files == snapshot
 
 
-def _cached_oversized_zipimporter_excludes_module(
+def _cached_bounded_zipimporter_excludes_module(
     finder: object,
     module_name: str,
     cache_key: str,
@@ -4058,7 +4067,7 @@ def _cached_oversized_zipimporter_excludes_module(
     snapshot = _zipimport_absent_cache_snapshot(files, prefix, module_name)
     if snapshot is None or dict.get(instance_state, "_files", files) is not files:
         return False
-    return _oversized_zip_archive_excludes_module(archive, prefix, module_name) and files == snapshot
+    return _bounded_zip_archive_excludes_module(archive, prefix, module_name) and files == snapshot
 
 
 def _zipimport_archive_files_match(archive: str, files: object) -> bool:
@@ -4271,7 +4280,12 @@ def _file_finder_cache_matches_snapshot(
     )
 
 
-def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | None:
+def _file_finder_resolution_identity(
+    finder: object,
+    cache_key: str,
+    *,
+    force_refresh: bool = False,
+) -> str | None:
     state = _file_finder_state(finder, cache_key)
     if state is None:
         return None
@@ -4279,7 +4293,8 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
     with _FILE_FINDER_IDENTITY_LOCK:
         summary = _cached_file_finder_resolution_summary(id(finder))
         if (
-            summary.finder is finder
+            not force_refresh
+            and summary.finder is finder
             and summary.finder_path == finder_path
             and summary.observed_path_mtime == path_mtime
             and path_cache is summary.observed_path_cache
@@ -5435,19 +5450,21 @@ def _trusted_path_importer_spec(
     cache_key: str,
 ) -> ModuleSpec | _UnsafePathResolution | None:
     if type(finder) is FileFinder:
-        if _file_finder_resolution_identity(finder, cache_key) is None:
-            return _UNSAFE_PATH_RESOLUTION
-        spec = _file_finder_spec_from_summary(finder, module_name)
-    else:
-        try:
-            spec = zipimporter.find_spec(cast(zipimporter, finder), module_name)
-        except Exception:
-            return _UNSAFE_PATH_RESOLUTION
-    if isinstance(spec, _UnsafePathResolution):
-        return spec
+        for attempt in range(_MAX_FILE_FINDER_RESOLUTION_ATTEMPTS):
+            if _file_finder_resolution_identity(finder, cache_key, force_refresh=attempt > 0) is None:
+                return _UNSAFE_PATH_RESOLUTION
+            spec = _file_finder_spec_from_summary(finder, module_name)
+            if isinstance(spec, _UnsafePathResolution):
+                continue
+            if spec is None and not _file_finder_miss_matches_canonical_state(finder, module_name):
+                continue
+            return spec
+        return _UNSAFE_PATH_RESOLUTION
+    try:
+        spec = zipimporter.find_spec(cast(zipimporter, finder), module_name)
+    except Exception:
+        return _UNSAFE_PATH_RESOLUTION
     if spec is None:
-        if type(finder) is FileFinder and not _file_finder_miss_matches_canonical_state(finder, module_name):
-            return _UNSAFE_PATH_RESOLUTION
         return None
     if type(spec) is ModuleSpec:
         return spec
@@ -5474,15 +5491,19 @@ def _find_standard_path_spec(
             cached_finder = dict.__getitem__(path_importer_cache, cache_key)
             if cached_finder is None:
                 continue
-            if _cached_oversized_zipimporter_excludes_module(cached_finder, module_name, cache_key):
-                continue
             if not _is_trusted_standard_path_importer(cached_finder, cache_key):
+                if _cached_bounded_zipimporter_excludes_module(cached_finder, module_name, cache_key):
+                    continue
                 _mark_shared_source_snapshot_unreusable()
                 return _UNSAFE_PATH_RESOLUTION
             finder = cast(FileFinder | zipimporter, cached_finder)
         else:
-            if _uncached_oversized_zip_excludes_module(cache_key, module_name):
-                continue
+            oversized_zip_excludes_module = _uncached_oversized_zip_excludes_module(cache_key, module_name)
+            if oversized_zip_excludes_module is not None:
+                if oversized_zip_excludes_module:
+                    continue
+                _mark_shared_source_snapshot_unreusable()
+                return _UNSAFE_PATH_RESOLUTION
             fresh_finder = _fresh_standard_path_importer(cache_key)
             if isinstance(fresh_finder, _UnsafePathResolution):
                 _mark_shared_source_snapshot_unreusable()

@@ -1605,6 +1605,8 @@ def test_zipimporter_identity_accepts_bounded_launcher_prefix_and_trailer(
 
     assert call_graph._zipimporter_resolution_identity(finder, str(launcher_path)) is not None
     assert type(zipimporter.find_spec(finder, "trusted_module")) is ModuleSpec
+    object.__getattribute__(finder, "__dict__")["launcher_state"] = None
+    assert call_graph._zipimporter_resolution_identity(finder, str(launcher_path)) is None
 
     module = "statistics"
     stdlib_path = sysconfig.get_path("stdlib")
@@ -1801,6 +1803,14 @@ def test_oversized_zip_falls_through_only_when_module_is_absent(
     importer_cache: dict[Any, Any] = {stdlib_path: FileFinder(stdlib_path, *_standard_file_finder_loader_details())}
     if cached:
         importer_cache[path_entry] = zipimporter(path_entry)
+    fresh_calls: list[str] = []
+    original_fresh_importer = call_graph._fresh_standard_path_importer
+
+    def recording_fresh_importer(entry: str) -> FileFinder | zipimporter | call_graph._UnsafePathResolution | None:
+        fresh_calls.append(entry)
+        return original_fresh_importer(entry)
+
+    monkeypatch.setattr(call_graph, "_fresh_standard_path_importer", recording_fresh_importer)
 
     with _standard_import_runtime(
         monkeypatch,
@@ -1811,6 +1821,7 @@ def test_oversized_zip_falls_through_only_when_module_is_absent(
         origin_kind = call_graph._trusted_module_origin_kind(module)
 
     assert origin_kind == (None if include_module else "stdlib")
+    assert path_entry not in fresh_calls
 
 
 def test_oversized_zip_absence_proof_rejects_forged_cached_module(
@@ -1907,6 +1918,50 @@ def test_file_finder_validation_does_not_mutate_live_cache(
         source_path.write_text("value = 2\n", encoding="utf-8")
         os.utime(path_entry, ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns))
         assert finder.find_spec(module) is not None
+    finally:
+        call_graph._cached_file_finder_resolution_summary.cache_clear()
+
+
+def test_file_finder_resolution_retries_one_stale_directory_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_module = "first_module"
+    second_module = "second_module"
+    (tmp_path / f"{first_module}.py").write_text("value = 1\n", encoding="utf-8")
+    path_entry = str(tmp_path)
+    finder = FileFinder(path_entry, *_standard_file_finder_loader_details())
+    assert finder.find_spec(first_module) is not None
+    finder_state = object.__getattribute__(finder, "__dict__")
+    path_cache = finder_state["_path_cache"]
+    relaxed_path_cache = finder_state["_relaxed_path_cache"]
+
+    call_graph._cached_file_finder_resolution_summary.cache_clear()
+    try:
+        assert type(call_graph._trusted_path_importer_spec(finder, first_module, path_entry)) is ModuleSpec
+        original_canonical_state = call_graph._canonical_file_finder_state
+        canonical_calls = 0
+
+        def counted_canonical_state(path: str) -> tuple[int | float, frozenset[str], frozenset[str]] | None:
+            nonlocal canonical_calls
+            canonical_calls += 1
+            return original_canonical_state(path)
+
+        monkeypatch.setattr(call_graph, "_canonical_file_finder_state", counted_canonical_state)
+        (tmp_path / f"{second_module}.py").write_text("value = 2\n", encoding="utf-8")
+        directory_stat = os.stat(path_entry)
+        os.utime(
+            path_entry,
+            ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns + 1_000_000_000),
+        )
+
+        refreshed_spec = call_graph._trusted_path_importer_spec(finder, second_module, path_entry)
+
+        assert type(refreshed_spec) is ModuleSpec
+        assert refreshed_spec.origin == str(tmp_path / f"{second_module}.py")
+        assert canonical_calls == 1
+        assert finder_state["_path_cache"] is path_cache
+        assert finder_state["_relaxed_path_cache"] is relaxed_path_cache
     finally:
         call_graph._cached_file_finder_resolution_summary.cache_clear()
 
@@ -2050,7 +2105,12 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
             call_graph._trusted_path_importer_spec(finder, "module_0", path_entry),
             call_graph._UnsafePathResolution,
         )
-        assert work_before_transition < work_count <= work_before_transition + len(transitioned_cache) + 4
+        assert (
+            work_before_transition
+            < work_count
+            <= work_before_transition
+            + (call_graph._MAX_FILE_FINDER_RESOLUTION_ATTEMPTS * (len(transitioned_cache) + 4))
+        )
 
         work_before_oversized = work_count
         finder_state["_path_cache"] = {
