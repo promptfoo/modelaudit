@@ -126,6 +126,7 @@ _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
 _ONNX_WEIGHT_NODE_VISIT_LIMIT = 200_000
 _ONNX_WEIGHT_EDGE_VISIT_LIMIT = 1_000_000
 _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT = 4
+_ONNX_METADATA_EXPRESSION_DEPTH_LIMIT = 16
 _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT = 32
 _ONNX_WEIGHT_RETAINED_ARRAY_BUDGET_MULTIPLIER = 8
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
@@ -1949,6 +1950,7 @@ def _build_onnx_weight_analysis_plan(
             visited_nodes = 0
             scale_names: list[str] = []
             reached_terminal = False
+            passed_complete_dynamic_bias = False
             current_data_type = int(onnx.TensorProto.FLOAT)
             scale_data_type: int | None = None
             narrowest_output_data_type: int | None = None
@@ -2109,36 +2111,58 @@ def _build_onnx_weight_analysis_plan(
                         pending.extend(str(output) for output in downstream.output if output)
                 return False
 
-            def expression_has_non_scalar_floating_constant(value_name: str) -> bool | None:
-                pending = [value_name]
-                visited: set[str] = set()
-                while pending:
-                    candidate = pending.pop()
-                    if not candidate or candidate in visited:
-                        continue
-                    visited.add(candidate)
-                    if len(visited) > _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT:
-                        return None
-                    tensor = constants.get(candidate)
-                    if tensor is not None:
-                        try:
-                            if int(tensor.data_type) in floating_types and math.prod(tensor.dims) != 1:
-                                return True
-                        except (AttributeError, TypeError, ValueError):
-                            return None
-                        continue
-                    producer = producers_by_value.get(candidate)
-                    if producer is None:
-                        continue
-                    if (
-                        getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
-                        or _operator_identifier(producer) in functions
-                    ):
-                        return None
-                    if producer.op_type in _METADATA_ONLY_LINEAGE_OPERATORS:
-                        continue
-                    pending.extend(str(source) for source in producer.input if source)
-                return False
+            metadata_expression_cache: dict[str, bool] = {}
+            metadata_expression_visits = 0
+
+            def is_bounded_metadata_expression(
+                value_name: str,
+                *,
+                depth: int = 0,
+                visiting: frozenset[str] = frozenset(),
+            ) -> bool:
+                nonlocal metadata_expression_visits
+                if not value_name or value_name in visiting or depth > _ONNX_METADATA_EXPRESSION_DEPTH_LIMIT:
+                    return False
+                if value_name in metadata_expression_cache:
+                    return metadata_expression_cache[value_name]
+                if value_name in constants:
+                    metadata_expression_cache[value_name] = True
+                    return True
+                producer = producers_by_value.get(value_name)
+                if (
+                    producer is None
+                    or getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    or _operator_identifier(producer) in functions
+                ):
+                    metadata_expression_cache[value_name] = False
+                    return False
+                if check_interrupted_callback is not None:
+                    check_interrupted_callback()
+                metadata_expression_visits += 1
+                if metadata_expression_visits > _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT:
+                    metadata_expression_cache[value_name] = False
+                    return False
+                if producer.op_type in _METADATA_ONLY_LINEAGE_OPERATORS:
+                    metadata_expression_cache[value_name] = True
+                    return True
+                if producer.op_type == "Constant":
+                    metadata_expression_cache[value_name] = True
+                    return True
+                if producer.op_type not in {"Cast", "Div", "Slice", "Sqrt"}:
+                    metadata_expression_cache[value_name] = False
+                    return False
+                next_visiting = frozenset((*visiting, value_name))
+                result = bool(producer.input) and all(
+                    is_bounded_metadata_expression(
+                        str(source),
+                        depth=depth + 1,
+                        visiting=next_visiting,
+                    )
+                    for source in producer.input
+                    if source
+                )
+                metadata_expression_cache[value_name] = result
+                return result
 
             while queue:
                 value_name, depth = queue.pop(0)
@@ -2224,6 +2248,7 @@ def _build_onnx_weight_analysis_plan(
                                     reached_terminal = True
                                     continue
                                 return None, "unresolved_quantized_weight_scale"
+                            passed_complete_dynamic_bias = True
                     elif consumer.op_type == "Cast":
                         cast_data_type = _onnx_int_attribute(consumer, "to", -1)
                         if cast_data_type not in floating_types:
@@ -2267,17 +2292,19 @@ def _build_onnx_weight_analysis_plan(
                     return None, "unresolved_quantized_weight_scale"
                 if scale_data_type is not None and scale_data_type != current_data_type:
                     return None, "unresolved_quantized_weight_scale"
-                had_resolved_scale = bool(scale_names)
                 scale_data_type = current_data_type
                 if not retain_narrowest_output_data_type(current_data_type):
                     return None, "unresolved_quantized_weight_scale"
                 for source_name in (str(source) for source in consumer.input if source and str(source) != value_name):
                     source_scale = scale_initializer_names_in_expression(source_name)
                     if source_scale is None:
-                        if graph_outputs_are_authoritative:
+                        if (
+                            passed_complete_dynamic_bias
+                            and graph_outputs_are_authoritative
+                            and is_bounded_metadata_expression(source_name)
+                        ):
                             later_scale = downstream_has_static_scale(next_values)
-                            hidden_static_scale = expression_has_non_scalar_floating_constant(source_name)
-                            if had_resolved_scale and later_scale is False and hidden_static_scale is False:
+                            if later_scale is False:
                                 reached_terminal = True
                                 break
                         return None, "unresolved_quantized_weight_scale"

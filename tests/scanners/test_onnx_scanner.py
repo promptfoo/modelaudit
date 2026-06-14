@@ -1577,6 +1577,7 @@ def create_matmul_integer_weight_model(
     omit_scale: bool = False,
     bind_scale: bool = True,
     dynamic_scale_input: bool = False,
+    resolved_scale_before_dynamic: bool = False,
     zero_scale: bool = False,
     weight_on_left: bool = False,
     dead_scale_branch: bool = False,
@@ -1584,6 +1585,7 @@ def create_matmul_integer_weight_model(
     self_multiply_output: bool = False,
     filename: str = "matmul-integer-weight.onnx",
 ) -> Path:
+    assert not resolved_scale_before_dynamic or dynamic_scale_input
     if dead_scale_branch:
         bind_scale = False
     if self_multiply_output:
@@ -1599,9 +1601,14 @@ def create_matmul_integer_weight_model(
         onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="X_zero_point"),
         onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="W_zero_point"),
     ]
-    if not omit_scale and not dynamic_scale_input:
+    if not omit_scale and (not dynamic_scale_input or resolved_scale_before_dynamic):
         scale_value = 0.0 if zero_scale else 0.1
-        initializers.append(onnx.numpy_helper.from_array(np.asarray(scale_value, dtype=np.float32), name="W_scale"))
+        initializers.append(
+            onnx.numpy_helper.from_array(
+                np.asarray(scale_value, dtype=np.float32),
+                name="W_scale_0" if dynamic_scale_input else "W_scale",
+            )
+        )
     X = helper.make_tensor_value_info("X", TensorProto.INT8, [100, 1] if weight_on_left else [1, 100])
     inputs = [X]
     if dynamic_scale_input:
@@ -1629,18 +1636,20 @@ def create_matmul_integer_weight_model(
         ),
     ]
     if bind_scale:
-        nodes.extend(
-            [
-                helper.make_node(
-                    "Cast", [matmul_output], ["Y_cast"], name="quantized_linear_cast", to=TensorProto.FLOAT
-                ),
-                helper.make_node(
-                    "Mul",
-                    ["Y_cast", "Y_cast" if self_multiply_output else "W_scale"],
-                    ["Y"],
-                    name="quantized_linear_scale",
-                ),
-            ],
+        nodes.append(
+            helper.make_node("Cast", [matmul_output], ["Y_cast"], name="quantized_linear_cast", to=TensorProto.FLOAT)
+        )
+        scale_input = "Y_cast"
+        if resolved_scale_before_dynamic:
+            nodes.append(helper.make_node("Mul", [scale_input, "W_scale_0"], ["Y_static_scaled"]))
+            scale_input = "Y_static_scaled"
+        nodes.append(
+            helper.make_node(
+                "Mul",
+                [scale_input, scale_input if self_multiply_output else "W_scale"],
+                ["Y"],
+                name="quantized_linear_scale",
+            )
         )
     elif dead_scale_branch:
         nodes.extend(
@@ -1880,9 +1889,11 @@ def create_dynamic_matmul_integer_bias_model(
     metadata_sink_from_bias_output: bool = False,
     post_bias_scale: bool = False,
     post_bias_operator: str | None = None,
+    terminal_post_bias_dynamic: bool = False,
     integer_op_boundary: str = "direct",
 ) -> Path:
     assert integer_op_boundary in {"direct", "function", "if_subgraph"}
+    assert not terminal_post_bias_dynamic or (post_bias_scale and post_bias_operator == "dynamic_mul")
     assert post_bias_operator in {
         None,
         "Abs",
@@ -2085,7 +2096,10 @@ def create_dynamic_matmul_integer_bias_model(
                 ]
             )
             post_bias_input = "Y_post_bias"
-        nodes.append(helper.make_node("Mul", [post_bias_input, "W_scale_1"], ["Y"]))
+        if terminal_post_bias_dynamic:
+            nodes.append(helper.make_node("Identity", [post_bias_input], ["Y"]))
+        else:
+            nodes.append(helper.make_node("Mul", [post_bias_input, "W_scale_1"], ["Y"]))
     elif post_bias_operator in {"Abs", "Relu"}:
         nodes.append(helper.make_node(post_bias_operator, [bias_output], ["Y"]))
     elif post_bias_operator == "canonical_gelu":
@@ -2130,7 +2144,11 @@ def create_dynamic_matmul_integer_bias_model(
             onnx.numpy_helper.from_array(weights, name="W_quantized"),
             onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="W_zero_point"),
             onnx.numpy_helper.from_array(initial_scale, name=initial_scale_name),
-            *([onnx.numpy_helper.from_array(weight_scale, name="W_scale_1")] if post_bias_scale else []),
+            *(
+                [onnx.numpy_helper.from_array(weight_scale, name="W_scale_1")]
+                if post_bias_scale and not terminal_post_bias_dynamic
+                else []
+            ),
             onnx.numpy_helper.from_array(np.zeros(10, dtype=np.float32), name="bias"),
             *extra_initializers,
         ],
@@ -8967,16 +8985,19 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 1
         assert semantics["eligible"][0]["quantization_scale"] is None
 
+    @pytest.mark.parametrize("resolved_scale_before_dynamic", [False, True], ids=["direct", "after-scalar"])
     @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
     def test_matmul_integer_graph_input_weight_scale_fails_closed(
         self,
         tmp_path: Path,
         malicious: bool,
+        resolved_scale_before_dynamic: bool,
     ) -> None:
         model_path = create_matmul_integer_weight_model(
             tmp_path,
             malicious=malicious,
             dynamic_scale_input=True,
+            resolved_scale_before_dynamic=resolved_scale_before_dynamic,
         )
 
         result = OnnxScanner().scan(str(model_path))
@@ -9200,6 +9221,22 @@ class TestWeightDistributionSemantics:
             malicious=malicious,
             post_bias_scale=True,
             post_bias_operator=post_bias_operator,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+
+    def test_dynamic_matmul_integer_terminal_graph_input_gate_fails_closed(self, tmp_path: Path) -> None:
+        model_path = create_dynamic_matmul_integer_bias_model(
+            tmp_path,
+            malicious=False,
+            post_bias_scale=True,
+            post_bias_operator="dynamic_mul",
+            terminal_post_bias_dynamic=True,
         )
 
         result = OnnxScanner().scan(str(model_path))
@@ -11374,25 +11411,45 @@ class TestWeightDistributionSemantics:
         assert all(getattr(item, "onnx_package_hash_complete", None) is True for item in metadata)
         assert len({getattr(item, "content_hash", None) for item in metadata}) == 2
 
-    @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
+    @pytest.mark.parametrize("streaming", [True, False], ids=["streaming", "directory"])
+    @pytest.mark.parametrize("symlink_sidecar", [False, True], ids=["regular", "symlink"])
     def test_package_identity_is_invalidated_when_sidecar_changes_during_scan(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         streaming: bool,
+        symlink_sidecar: bool,
     ) -> None:
+        reset_cache_manager()
         model_path = create_external_onnx_weight_package(
             tmp_path / "mutable",
             np.zeros((100, 10), dtype=np.float32),
         )
+        unique_model_path = model_path.with_name(f"mutable-{streaming}-{symlink_sidecar}.onnx")
+        model_path.rename(unique_model_path)
+        model_path = unique_model_path
+        model = onnx.load(str(model_path), load_external_data=False)
+        model.doc_string = f"mutation-{streaming}-{symlink_sidecar}"
+        onnx.save(model, str(model_path))
         sidecar = model_path.parent / "weights.bin"
+        replacement_sidecar = model_path.parent / "replacement.bin"
+        if symlink_sidecar:
+            original_sidecar = model_path.parent / "original.bin"
+            original_sidecar.write_bytes(sidecar.read_bytes())
+            replacement_sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
+            sidecar.unlink()
+            sidecar.symlink_to(original_sidecar.name)
         original_scan_file = modelaudit_core.scan_file
         mutated = False
 
         def mutate_sidecar_before_scan(path: str, config: dict[str, Any]) -> Any:
             nonlocal mutated
             if path == str(model_path):
-                sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
+                if symlink_sidecar:
+                    sidecar.unlink()
+                    sidecar.symlink_to(replacement_sidecar.name)
+                else:
+                    sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
                 mutated = True
             return original_scan_file(path, config)
 
@@ -11403,6 +11460,7 @@ class TestWeightDistributionSemantics:
                 delete_after_scan=False,
                 scanners=["onnx"],
                 cache_enabled=False,
+                cache_dir=str(tmp_path / "cache"),
             )
             if streaming
             else scan_model_directory_or_file(
@@ -11410,12 +11468,12 @@ class TestWeightDistributionSemantics:
                 recursive=False,
                 scanners=["onnx"],
                 cache_enabled=False,
+                cache_dir=str(tmp_path / "cache"),
             )
         )
+        reset_cache_manager()
 
         assert mutated is True
-        if not streaming:
-            assert result.content_hash is None
         assert determine_exit_code(result) == 2
         assert getattr(result.file_metadata[str(model_path)], "onnx_package_hash_complete", None) is False
         checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
@@ -11504,13 +11562,50 @@ class TestWeightDistributionSemantics:
         )
         assert not any(issue.details.get("clustered_onnx_weight_anomaly") is True for issue in aggregate.issues)
 
-    def test_complete_declared_external_data_retains_package_identity(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
+    @pytest.mark.parametrize("symlink_sidecar", [False, True], ids=["regular", "symlink"])
+    def test_complete_declared_external_data_retains_package_identity(
+        self,
+        tmp_path: Path,
+        streaming: bool,
+        symlink_sidecar: bool,
+    ) -> None:
+        reset_cache_manager()
         path = create_external_onnx_weight_package(tmp_path / "complete", np.zeros((100, 10), dtype=np.float32))
+        unique_path = path.with_name(f"stable-{streaming}-{symlink_sidecar}.onnx")
+        path.rename(unique_path)
+        path = unique_path
+        model = onnx.load(str(path), load_external_data=False)
+        model.doc_string = f"stable-{streaming}-{symlink_sidecar}"
+        onnx.save(model, str(path))
+        sidecar = path.parent / "weights.bin"
+        if symlink_sidecar:
+            target = path.parent / "stable.bin"
+            target.write_bytes(sidecar.read_bytes())
+            sidecar.unlink()
+            sidecar.symlink_to(target.name)
 
-        assert modelaudit_core._streamed_onnx_external_data_hash_paths(path) == [path.parent / "weights.bin"]
-        aggregate = scan_model_directory_or_file(str(path.parent), scanners=["onnx"], cache_enabled=False)
+        assert modelaudit_core._streamed_onnx_external_data_hash_paths(path) == [sidecar]
+        aggregate = (
+            scan_model_streaming(
+                iter([(path, True)]),
+                delete_after_scan=False,
+                scanners=["onnx"],
+                cache_enabled=False,
+                cache_dir=str(tmp_path / "cache"),
+            )
+            if streaming
+            else scan_model_directory_or_file(
+                str(path.parent),
+                scanners=["onnx"],
+                cache_enabled=False,
+                cache_dir=str(tmp_path / "cache"),
+            )
+        )
+        reset_cache_manager()
 
         assert getattr(aggregate.file_metadata[str(path)], "onnx_package_hash_complete", None) is True
+        assert not any(check.name == "ONNX External Data Stability" for check in aggregate.checks)
 
     def test_aggregate_preserves_distinct_analysis_groups_within_one_file(self, tmp_path: Path) -> None:
         model_path = create_qlinear_matmul_group_fanout_model(tmp_path, consumer_count=2)

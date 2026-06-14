@@ -1384,20 +1384,20 @@ def _streamed_onnx_external_data_hash_paths(
                 external_path = _resolve_external_location(model_dir, location)
             except (OSError, RuntimeError):
                 return None
-            external_hash_path = external_path
-            if not is_within_directory(str(resolved_model_dir), str(external_path)):
-                if not _is_trusted_huggingface_cache_external_alias(
-                    model_path,
-                    lexical_external_path,
-                    external_path,
-                ):
-                    return None
-                external_hash_path = lexical_external_path
+            external_hash_path = lexical_external_path
+            if not is_within_directory(
+                str(resolved_model_dir), str(external_path)
+            ) and not _is_trusted_huggingface_cache_external_alias(
+                model_path,
+                lexical_external_path,
+                external_path,
+            ):
+                return None
             if not external_hash_path.is_file():
                 return None
-            if external_path in seen_external_paths:
+            if lexical_external_path in seen_external_paths:
                 continue
-            seen_external_paths.add(external_path)
+            seen_external_paths.add(lexical_external_path)
             external_paths.append(external_hash_path)
 
     return external_paths
