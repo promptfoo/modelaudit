@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - validate index-driven zero- and one-based SafeTensors shard families, retain case-insensitive or prefixed index authority after remote materialization, intersect same-parent indexes with selected shard families, and bind streamed or explicit scans to one index generation without widening selected scanners to foreign shard formats, suppressing overlap-capable routes, trusting names without index authority, exposing transient descriptor paths, or accepting post-pin source changes
+- keep JIT alias replay linear, including multiline builtin-helper continuations, as alias state grows while preserving bounded analysis for attacker-controlled model content
 - inspect oversized ONNX protobuf structure from descriptor-bound, memory- and result-bounded file-backed reads; preserve external-data security checks while explicitly reporting deferred schema, raw-detector, weight-analysis, and content-hash coverage
 - treat dotted package versions in README and model-card pip install commands as informational without downgrading active URLs
 - bound embedded Python assignment-line probes, deduplicate exact extraction windows, and fast-path proven passive priority references without weakening incomplete-analysis reporting
