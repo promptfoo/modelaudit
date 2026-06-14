@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import struct
 import sys
 import tempfile
 import time
@@ -25,6 +26,7 @@ from types import FunctionType, ModuleType
 from typing import Any
 from zipimport import zipimporter
 
+import modelaudit_picklescan.call_graph as picklescan_call_graph
 import pytest
 from modelaudit_picklescan.call_graph import _import_hook_identity as _picklescan_import_hook_identity
 from modelaudit_picklescan.call_graph import _path_hook_resolution_identity as _picklescan_path_hook_resolution_identity
@@ -2088,6 +2090,60 @@ def test_resolution_context_rejects_mutated_zipimporter_state(
     mutated_context = _source_resolution_context()
     assert mutated_context["path_importers"] == list(_picklescan_source_resolution_context()[2])
     assert mutated_context != trusted_context
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a Windows console-script launcher")
+def test_windows_console_launcher_zipimporter_cache_can_exclude_stdlib() -> None:
+    launcher_entries = [
+        (key, finder)
+        for key, finder in dict.items(sys.path_importer_cache)
+        if type(key) is str and key.lower().endswith("pytest.exe") and type(finder) is zipimporter
+    ]
+    if not launcher_entries:
+        pytest.skip("pytest.exe is not cached as a zipimporter")
+
+    cache_key, finder = launcher_entries[0]
+    state = object.__getattribute__(finder, "__dict__")
+    archive = dict.get(state, "archive")
+    prefix = dict.get(state, "prefix")
+    assert type(archive) is str and type(prefix) is str, state
+    files = picklescan_call_graph._zipimport_directory_cache_files(archive)
+    archive_stat = os.stat(archive)
+    assert archive_stat.st_size <= picklescan_call_graph._MAX_ZIPIMPORT_ARCHIVE_BYTES
+    archive_bytes = Path(archive).read_bytes()
+    end_offset = archive_bytes.rfind(b"PK\x05\x06")
+    end_fields = (
+        struct.unpack_from("<4H2LH", archive_bytes, end_offset + 4)
+        if 0 <= end_offset <= len(archive_bytes) - 22
+        else None
+    )
+    central_directory_size = end_fields[4] if end_fields is not None else 0
+    physical_names = picklescan_call_graph._zipimport_bounded_central_directory_names(
+        archive,
+        archive_stat,
+    )
+    details = {
+        "archive_size": len(archive_bytes),
+        "bounded_names": None if physical_names is None else sorted(physical_names),
+        "cache_entries": len(files) if type(files) is dict else None,
+        "cache_is_finder_files": dict.get(state, "_files", files) is files,
+        "cache_key": cache_key,
+        "central_directory_signature": archive_bytes[
+            max(0, end_offset - central_directory_size) : max(0, end_offset - central_directory_size) + 4
+        ],
+        "end_fields": end_fields,
+        "end_offset": end_offset,
+        "expected_prefix": picklescan_call_graph._zipimport_expected_prefix(archive, cache_key),
+        "prefix": prefix,
+        "state_keys": sorted(state),
+        "trailing_bytes": len(archive_bytes) - end_offset - 22 if end_offset >= 0 else None,
+    }
+
+    assert picklescan_call_graph._cached_bounded_zipimporter_excludes_module(
+        finder,
+        "linecache",
+        cache_key,
+    ), details
 
 
 def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
