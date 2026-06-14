@@ -210,7 +210,6 @@ def _xgboost_json_legal_payload() -> bytes:
         {
             "version": [1, 7, 4],
             "learner": {"gradient_booster": {"model": {"trees": ["invalid"]}}},
-            "license": "MIT License",
             "metadata": "os.system('id')",
         }
     ).encode()
@@ -11337,6 +11336,7 @@ class TestZipScanner:
             pytest.param(b"MIT License\nPid\n0", 2, id="embedded-PERSID-structural-continuation"),
             pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
             pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
+            pytest.param(b"PMIT License\n.", 1, id="spaced-PERSID-before-STOP"),
             pytest.param(b"MIT License\nXPid\n)R.\n", 2, id="adjacent-embedded-PERSID"),
             pytest.param(b"\x82\x01", 1, id="sole-EXT1"),
             pytest.param(b"\x97", 1, id="sole-NEXT_BUFFER"),
@@ -11392,6 +11392,9 @@ class TestZipScanner:
             pytest.param(b"MIT License\n63620a\t780a2e\n", 1, id="hex-intra-line-tab"),
             pytest.param(base64.b64encode(b"S'id'\nQ."), 1, id="base64-BINPERSID"),
             pytest.param(binascii.hexlify(b"S'id'\nQ."), 1, id="hex-BINPERSID"),
+            pytest.param(b"MIT License\nXVEu\n", 1, id="base64-unpadded-BINPERSID"),
+            pytest.param(b"MIT License\nXVE\n", 1, id="base64-unpadded-BINPERSID-before-EOF"),
+            pytest.param(b"MIT License\n5d51\n", 1, id="short-hex-BINPERSID-before-EOF"),
             pytest.param(b"MIT License\n" + base64.b64encode(b"\x82\x01"), 1, id="base64-sole-EXT1"),
             pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), 1, id="base64-sole-NEXT_BUFFER"),
             pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),

@@ -5410,6 +5410,8 @@ def _decoded_pickle_events_are_meaningful(
     names = {name for _index, name, _flag in events}
     if explicit_protocol or names.intersection({"GLOBAL", "INST", "PERSID", "STACK_GLOBAL"}):
         return True
+    if any(index > 0 and name not in _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES for index, name, _flag in events):
+        return True
     return completed and bool(names.intersection({"BINPERSID", "BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ", "REDUCE"}))
 
 
@@ -5568,7 +5570,7 @@ def _classify_bounded_pickle_candidate(
                     continue
 
                 meaningful_events = _meaningful_pickle_events(
-                    events,
+                    [(index, name, meaningful or name == "PERSID") for index, name, meaningful in events],
                     allow_embedded_persid=(decoded or not require_continuation or not text_line_side_effects_only),
                     embedded=embedded,
                 )
@@ -5662,7 +5664,9 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
         if opcode.name in {"GLOBAL", "INST"}:
             return all(_plausible_pickle_import_operand(line) for line in lines)
         if opcode.name == "PERSID":
-            return _is_compact_pickle_line(lines[0])
+            return _is_compact_pickle_line(lines[0]) or (
+                offset == 0 and cursor < len(payload) and payload[cursor] in _PICKLE_OPCODE_BY_BYTE
+            )
         if opcode.name == "STRING":
             value = lines[0]
             if len(value) < 2 or value[:1] not in {b"'", b'"'} or value[-1:] != value[:1]:
@@ -5935,16 +5939,21 @@ def _decoded_base64_has_exact_weak_pickle_signal(decoded: bytes) -> bool:
     )
 
 
-def _decoded_base64_has_line_or_protocol_pickle_signal(decoded: bytes) -> bool:
+def _decoded_base64_has_structural_pickle_signal(decoded: bytes) -> bool:
     return (
         _looks_like_binary_pickle_protocol(decoded[:4])
         or _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(decoded) is not None
         or _LEGAL_TEXT_ENCODED_EXECUTION_RE.search(decoded) is not None
+        or any(
+            decoded[offset] in _PICKLE_CONTEXT_REQUIRED_SECURITY_OPCODE_BYTES
+            and decoded[offset - 1] in _PICKLE_TRIVIAL_NO_ARGUMENT_PREFIX_BYTES
+            for offset in range(1, len(decoded))
+        )
     )
 
 
 def _decoded_alphabetic_base64_has_pickle_signal(decoded: bytes) -> bool:
-    return _decoded_base64_has_line_or_protocol_pickle_signal(decoded) or _decoded_base64_has_exact_weak_pickle_signal(
+    return _decoded_base64_has_structural_pickle_signal(decoded) or _decoded_base64_has_exact_weak_pickle_signal(
         decoded
     )
 
@@ -5963,9 +5972,9 @@ def _alphabetic_base64_has_exact_weak_pickle_signal(token: bytes) -> bool:
         return False
 
 
-def _alphabetic_base64_has_line_or_protocol_pickle_signal(token: bytes) -> bool:
+def _alphabetic_base64_has_structural_pickle_signal(token: bytes) -> bool:
     try:
-        return _decoded_base64_has_line_or_protocol_pickle_signal(_decode_base64_route_token(token))
+        return _decoded_base64_has_structural_pickle_signal(_decode_base64_route_token(token))
     except (binascii.Error, ValueError):
         return False
 
@@ -6033,7 +6042,7 @@ def _iter_encoded_route_tokens(
             if alphabetic_whitespace_is_prose:
                 for start in line_alignment_starts.values():
                     token = bytes(block[start:])
-                    if _alphabetic_base64_has_line_or_protocol_pickle_signal(token):
+                    if _alphabetic_base64_has_structural_pickle_signal(token):
                         yield token
                 while recent_starts and len(block) - recent_starts[0] > _RECENT_EXACT_BASE64_MAX_CHARS:
                     expired_start = recent_starts.popleft()
@@ -6088,7 +6097,7 @@ def _encoded_pickle_route(
         ),
         (
             _LEGAL_TEXT_HEX_CHUNK_RE,
-            6,
+            4,
             6,
             2 * _LEGAL_TEXT_MAX_DECODED_BYTES,
             False,
@@ -6128,14 +6137,15 @@ def _encoded_pickle_route(
                 continue
             if not decoded:
                 continue
-            if (
+            alphabetic_pickle_signal = (
                 alphabetic_offset_zero_only
                 and b"=" not in token
                 and token.isalpha()
-                and not _decoded_alphabetic_base64_has_pickle_signal(decoded)
-            ):
+                and _decoded_alphabetic_base64_has_pickle_signal(decoded)
+            )
+            if alphabetic_offset_zero_only and b"=" not in token and token.isalpha() and not alphabetic_pickle_signal:
                 continue
-            if len(token) < general_minimum_length:
+            if len(token) < general_minimum_length and not _decoded_base64_has_structural_pickle_signal(decoded):
                 opcode = _PICKLE_OPCODE_BY_BYTE.get(decoded[0])
                 if opcode is None or _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.get(opcode.name) != len(decoded):
                     continue
@@ -9901,9 +9911,9 @@ def _resolve_legal_text_sidecar_route(
             return structured_route
 
     legal_text_route = _detect_legal_text_sidecar_route(file_path, file_size, logical_name=logical_name)
-    if legal_text_route != "text":
+    if legal_text_route not in {None, "text"}:
         return legal_text_route
-    return _detect_structured_legal_sidecar_route(file_path, file_size, prefix) or "text"
+    return _detect_structured_legal_sidecar_route(file_path, file_size, prefix) or legal_text_route
 
 
 def detect_file_format_from_magic(path: str, *, logical_name: str | None = None) -> str:

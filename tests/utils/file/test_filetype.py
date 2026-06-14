@@ -3980,6 +3980,7 @@ def test_next_buffer_callback_precedes_eof() -> None:
             id="embedded-GLOBAL-punctuation",
         ),
         pytest.param(b"Pid\nApache License\n", "pickle", id="whole-PERSID"),
+        pytest.param(b"PMIT License\n.", "pickle", id="spaced-PERSID-before-STOP"),
         pytest.param(
             b"MIT License\nXPid\n)R.\n",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -4087,6 +4088,22 @@ def test_xgboost_json_legal_sidecar_near_matches_remain_text(tmp_path: Path, pay
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b'{"version":"1.7.4","learner":{}}', id="scalar-version"),
+        pytest.param(b'{"version":[1,7,4],"learner":"student"}', id="scalar-learner"),
+    ],
+)
+def test_xgboost_json_legal_name_without_route_evidence_remains_unknown(tmp_path: Path, payload: bytes) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == "unknown"
+    assert detect_file_format_from_magic(str(path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(path)) == "unknown"
+
+
+@pytest.mark.parametrize(
     ("payload", "expected_format"),
     [
         pytest.param(base64.b64encode(b"cb\nx\n."), "pickle", id="short-base64"),
@@ -4131,6 +4148,9 @@ def test_xgboost_json_legal_sidecar_near_matches_remain_text(tmp_path: Path, pay
         pytest.param(b"MIT License\n63620a\t780a2e\n", "pickle", id="hex-intra-line-tab"),
         pytest.param(base64.b64encode(b"S'id'\nQ."), "pickle", id="base64-BINPERSID"),
         pytest.param(binascii.hexlify(b"S'id'\nQ."), "pickle", id="hex-BINPERSID"),
+        pytest.param(b"MIT License\nXVEu\n", "pickle", id="base64-unpadded-BINPERSID"),
+        pytest.param(b"MIT License\nXVE\n", "pickle", id="base64-unpadded-BINPERSID-before-EOF"),
+        pytest.param(b"MIT License\n5d51\n", "pickle", id="short-hex-BINPERSID-before-EOF"),
         pytest.param(b"MIT License\n" + base64.b64encode(b"\x82\x01"), "pickle", id="base64-sole-EXT1"),
         pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), "pickle", id="base64-sole-NEXT_BUFFER"),
         pytest.param(
@@ -4548,6 +4568,11 @@ def test_structured_xml_model_named_license_precedes_legal_text_fallback(
             b'{"version":[1,7,4],"learner":{},"license":"MIT License"}',
             "xgboost",
             id="xgboost-json",
+        ),
+        pytest.param(
+            b'{"version":[1,7,4],"learner":{},"metadata":"os.system(id)"}',
+            "xgboost",
+            id="xgboost-json-without-legal-text",
         ),
         pytest.param(
             json.dumps(
