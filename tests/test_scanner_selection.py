@@ -724,6 +724,30 @@ def test_nested_legal_jax_template_overlap_preserves_both_analyses(tmp_path: Pat
     )
 
 
+def test_nested_selected_jinja_scanner_handles_legal_jax_template_overlap(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "member"
+    extracted_member.write_bytes(
+        b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        b'"framework":"jax","orbax_version":"0.1.0"}'
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        config={
+            "scanners": ["jinja2_template"],
+            "cache_enabled": False,
+            LOGICAL_SCAN_PATH_CONFIG_KEY: "LICENSE",
+        },
+    )
+
+    assert result.scanner_name == "jinja2_template"
+    assert "jax_checkpoint" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_selected_jinja_scanner_handles_legal_jax_template_overlap(tmp_path: Path) -> None:
     license_path = tmp_path / "LICENSE"
     license_path.write_bytes(
@@ -739,6 +763,50 @@ def test_selected_jinja_scanner_handles_legal_jax_template_overlap(tmp_path: Pat
 
     assert result.scanner_name == "jinja2_template"
     assert result.metadata["scanner_dependency_ids"] == ["jinja2_template"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_selected_jinja_scanner_handles_legal_xgboost_template_overlap(tmp_path: Path) -> None:
+    license_path = tmp_path / "LICENSE"
+    license_path.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}'
+    )
+
+    result = scan_file(
+        str(license_path),
+        config={"scanners": ["jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "jinja2_template"
+    assert result.metadata["scanner_dependency_ids"] == ["jinja2_template"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_nested_selected_jinja_scanner_handles_legal_xgboost_template_overlap(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "member"
+    extracted_member.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}'
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        config={
+            "scanners": ["jinja2_template"],
+            "cache_enabled": False,
+            LOGICAL_SCAN_PATH_CONFIG_KEY: "NOTICE",
+        },
+    )
+
+    assert result.scanner_name == "jinja2_template"
+    assert "xgboost" in result.metadata["skipped_scanner_ids"]
     assert any(
         check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
         for check in result.checks

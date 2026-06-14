@@ -57,6 +57,7 @@ from modelaudit.scanner_selection import (
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
     policy_from_config,
+    selected_overlap_replaces_excluded_owner,
     selected_scanner_extensions,
 )
 from modelaudit.scanners import _registry
@@ -2155,16 +2156,14 @@ def _select_non_hdf5_preferred_scanner_id(
             return "nemo"
 
     scanner_policy = policy_from_config(config) if config is not None else None
-    selected_renamed_template_overlap = (
-        scanner_policy is not None
-        and scanner_policy.active
-        and scanner_policy.allows("jinja2_template")
-        and not scanner_policy.allows("jax_checkpoint")
-        and header_format == "jax_checkpoint"
+    selected_renamed_template_overlap = scanner_policy is not None and selected_overlap_replaces_excluded_owner(
+        scanner_policy,
+        _registry.get_scanner_id_for_header_format(header_format),
+        "jinja2_template",
     )
     tokenizer_template_route = (
         config is not None
-        and header_format in {"unknown", "pytorch_binary", "jax_checkpoint"}
+        and (header_format in {"unknown", "pytorch_binary", "jax_checkpoint"} or selected_renamed_template_overlap)
         and huggingface_tokenizer_json_has_template_route_evidence(
             path,
             allow_renamed_path=selected_renamed_template_overlap,

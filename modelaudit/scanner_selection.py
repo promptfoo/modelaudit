@@ -195,6 +195,21 @@ class ScannerSelectionPolicy:
         }
 
 
+def selected_overlap_replaces_excluded_owner(
+    policy: ScannerSelectionPolicy,
+    owner_scanner_id: str | None,
+    overlap_scanner_id: str,
+) -> bool:
+    """Return whether an explicit overlap scanner should replace an excluded owner."""
+    return (
+        owner_scanner_id is not None
+        and owner_scanner_id != overlap_scanner_id
+        and policy.active
+        and policy.allows(overlap_scanner_id)
+        and not policy.allows(owner_scanner_id)
+    )
+
+
 def allows_protobuf_model_candidate_analysis(policy: ScannerSelectionPolicy) -> bool:
     """Return whether a bounded protobuf candidate may receive concrete analysis."""
     if _PROTOBUF_MODEL_CANDIDATE_SCANNER_ID in policy.exclude_scanner_ids:

@@ -11065,6 +11065,25 @@ class TestZipScanner:
             for check in result.checks
         )
 
+    def test_scan_zip_selected_jinja_handles_legal_jax_template_overlap(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "selected_legal_jax_template_overlap.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(
+                "LICENSE",
+                b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+                b'"framework":"jax","orbax_version":"0.1.0"}',
+            )
+
+        result = ZipScanner({"scanners": ["zip", "jinja2_template"], "cache_enabled": False}).scan(str(archive_path))
+
+        assert any(
+            check.name == "Jinja2 Template Injection Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("zip_entry") == "LICENSE"
+            for check in result.checks
+        )
+        assert not any(check.name == "JSON Pattern Security Check" for check in result.checks)
+
     @pytest.mark.parametrize(
         "member_name",
         ["LICENSE", "LICENSE.markdown", "NOTICE.markdown", r"docs\LICENSE"],

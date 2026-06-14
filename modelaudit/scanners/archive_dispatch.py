@@ -27,6 +27,7 @@ from ..scanner_selection import (
     allows_zip_structure_analysis,
     make_scanner_selection_skip_result,
     policy_from_config,
+    selected_overlap_replaces_excluded_owner,
 )
 from ..utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
@@ -53,6 +54,7 @@ from ..utils.file.detection import (
     has_safetensors_gzip_nonmember_trailing_overlap,
     has_safetensors_routing_candidate,
     has_structural_torch7_content_route,
+    huggingface_tokenizer_json_has_template_route_evidence,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
@@ -1318,6 +1320,17 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             if xgboost_route == "xgboost":
                 config = dict(config or {})
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
+    trusted_owner_scanner_id = _HEADER_FORMAT_TO_SCANNER_ID.get(trusted_content_format)
+    selected_template_overlap_owner_id = (
+        trusted_owner_scanner_id
+        if selected_overlap_replaces_excluded_owner(
+            scanner_selection,
+            trusted_owner_scanner_id,
+            "jinja2_template",
+        )
+        and huggingface_tokenizer_json_has_template_route_evidence(path, allow_renamed_path=True)
+        else None
+    )
     if trusted_content_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
         return with_safetensors_overlap(_make_incomplete_llamafile_routing_result(path, config))
     if trusted_content_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
@@ -1353,11 +1366,16 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         result.finish(success=not result.has_errors)
         return with_safetensors_overlap(result)
 
-    header_format_override = (
-        trusted_content_format
-        if trusted_content_format in {"hdf5", "jinja2_template", "mxnet", "pickle", "text", "xgboost"}
-        else None
-    )
+    header_format_override = "jinja2_template" if selected_template_overlap_owner_id is not None else None
+    if header_format_override is None and trusted_content_format in {
+        "hdf5",
+        "jinja2_template",
+        "mxnet",
+        "pickle",
+        "text",
+        "xgboost",
+    }:
+        header_format_override = trusted_content_format
     try:
         scanner_id = _select_nested_scanner_id(path, header_format_override, config)
     except ZipPreflightRejected as exc:
@@ -1367,7 +1385,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         if os.path.splitext(path)[1].lower() == ".bin" and scanner_id == "pytorch_binary"
         else None
     )
-    skipped_preferred_scanner_id: str | None = None
+    skipped_preferred_scanner_id: str | None = selected_template_overlap_owner_id
     unavailable_preferred_scanner_id: str | None = None
     trusted_flax_overlap_scanner_id: str | None = None
     if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
