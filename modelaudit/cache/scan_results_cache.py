@@ -3,7 +3,6 @@
 import hashlib
 import json
 import logging
-import marshal
 import os
 import stat
 import struct
@@ -11,26 +10,19 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
     EXTENSION_SUFFIXES,
     SOURCE_SUFFIXES,
-    BuiltinImporter,
-    ExtensionFileLoader,
-    FileFinder,
-    FrozenImporter,
     ModuleSpec,
-    PathFinder,
-    SourceFileLoader,
-    SourcelessFileLoader,
 )
 from pathlib import Path
-from types import CodeType, FunctionType, MethodType, ModuleType
-from typing import Any, BinaryIO, cast
-from zipimport import zipimporter
+from types import ModuleType
+from typing import Any, BinaryIO
+
+import modelaudit_picklescan.call_graph as _picklescan_call_graph
 
 from ..utils.helpers.secure_hasher import SecureFileHasher
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
@@ -45,29 +37,48 @@ _CALL_GRAPH_READ_FINGERPRINT_MAX_BYTES = 4 * _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_
 _MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
 _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
-_MAX_HOOK_IDENTITY_ITEMS = 16
-_MAX_HOOK_IDENTITY_DEPTH = 4
-_UNREUSABLE_HOOK_STATE_IDENTITY = "<unreusable-hook-state>"
 _PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
 _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
-_STANDARD_FILE_FINDER_LOADER_DETAILS = (
-    (ExtensionFileLoader, list(EXTENSION_SUFFIXES)),
-    (SourceFileLoader, list(SOURCE_SUFFIXES)),
-    (SourcelessFileLoader, list(BYTECODE_SUFFIXES)),
+_UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT = (
+    "modelaudit_picklescan.call_graph:unreusable:resolution-context-unavailable",
 )
-_STANDARD_FILE_FINDER_LOADER_IDENTITY = tuple(
-    (loader, tuple(suffixes)) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_DETAILS
+
+
+def _unavailable_import_hook_identity(_hook: object) -> str:
+    return "modelaudit_picklescan.call_graph:unreusable:unavailable"
+
+
+def _unavailable_source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    unavailable = _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
+    return unavailable, unavailable, unavailable
+
+
+def _unavailable_search_path_has_untrusted_importer(_search_path: object) -> bool:
+    return True
+
+
+# Older independently released picklescan versions do not expose these helpers.
+# Their fingerprint metadata also lacks resolution_context, so the conservative
+# fallbacks reject reuse without making the root package unimportable.
+_import_hook_identity = getattr(
+    _picklescan_call_graph,
+    "_import_hook_identity",
+    _unavailable_import_hook_identity,
 )
-_STANDARD_FILE_FINDER_LOADERS = tuple(
-    (suffix, loader) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_IDENTITY for suffix in suffixes
+_path_hook_resolution_identity = getattr(
+    _picklescan_call_graph,
+    "_path_hook_resolution_identity",
+    _unavailable_import_hook_identity,
 )
-_STANDARD_FILE_FINDER_PATH_HOOK_CODE = FileFinder.path_hook(*_STANDARD_FILE_FINDER_LOADER_DETAILS).__code__
-_TRUSTED_FILE_FINDER_METHODS = tuple(
-    (name, getattr(FileFinder, name)) for name in ("__init__", "find_spec", "_get_spec", "_fill_cache")
+_search_path_has_untrusted_importer = getattr(
+    _picklescan_call_graph,
+    "_search_path_has_untrusted_importer",
+    _unavailable_search_path_has_untrusted_importer,
 )
-_TRUSTED_ZIPIMPORTER_METHODS = tuple(
-    (name, getattr(zipimporter, name))
-    for name in ("__init__", "find_spec", "get_code", "get_data", "get_filename", "get_source", "is_package")
+_picklescan_source_resolution_context = getattr(
+    _picklescan_call_graph,
+    "_source_resolution_context",
+    _unavailable_source_resolution_context,
 )
 
 AncestorEntry = tuple[str, int, int, int, int, int]
@@ -259,348 +270,13 @@ def _is_sampled_fingerprint(value: object) -> bool:
     return isinstance(value, str) and value.startswith("fingerprint:")
 
 
-def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
-    if value is None or isinstance(value, bool | int | float):
-        return repr(value)
-    if isinstance(value, str):
-        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
-    if isinstance(value, bytes):
-        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
-    if isinstance(value, type):
-        return f"{value.__module__}.{value.__qualname__}:{_UNREUSABLE_HOOK_STATE_IDENTITY}"
-    if isinstance(value, (CodeType, FunctionType, MethodType, ModuleType)):
-        return _UNREUSABLE_HOOK_STATE_IDENTITY
-    if depth >= _MAX_HOOK_IDENTITY_DEPTH:
-        return _UNREUSABLE_HOOK_STATE_IDENTITY
-    if isinstance(value, tuple | list):
-        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
-            return _UNREUSABLE_HOOK_STATE_IDENTITY
-        sequence_identity = ",".join(_bounded_hook_value_identity(item, depth + 1) for item in value)
-        return f"{type(value).__name__}({sequence_identity})"
-    if isinstance(value, dict):
-        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
-            return _UNREUSABLE_HOOK_STATE_IDENTITY
-        mapping_items = sorted(value.items(), key=lambda item: str(item[0]))
-        return (
-            "dict("
-            + ",".join(
-                f"{_bounded_hook_value_identity(key, depth + 1)}:{_bounded_hook_value_identity(item, depth + 1)}"
-                for key, item in mapping_items
-            )
-            + ")"
-        )
-    try:
-        instance_state = object.__getattribute__(value, "__dict__")
-    except (AttributeError, TypeError):
-        return _UNREUSABLE_HOOK_STATE_IDENTITY
-    if not isinstance(instance_state, dict):
-        return _UNREUSABLE_HOOK_STATE_IDENTITY
-    return (
-        f"<{type(value).__module__}.{type(value).__qualname__}:"
-        f"{_bounded_hook_value_identity(instance_state, depth + 1)}>"
-    )
-
-
-def _function_hook_state(function: FunctionType) -> str:
-    closure_values: list[object] = []
-    for cell in function.__closure__ or ():
-        try:
-            closure_values.append(cell.cell_contents)
-        except ValueError:
-            closure_values.append("<empty>")
-    referenced_globals = {
-        name: function.__globals__[name]
-        for name in sorted(set(function.__code__.co_names))
-        if name != "__builtins__" and name in function.__globals__
-    }
-    return "|".join(
-        (
-            f"closure={_bounded_hook_value_identity(tuple(closure_values))}",
-            f"defaults={_bounded_hook_value_identity(function.__defaults__ or ())}",
-            f"kwdefaults={_bounded_hook_value_identity(function.__kwdefaults__ or {})}",
-            f"globals={_bounded_hook_value_identity(referenced_globals)}",
-        )
-    )
-
-
-def _hook_type_methods(hook_type: type[object]) -> tuple[tuple[str, FunctionType], ...]:
-    methods: list[tuple[str, FunctionType]] = []
-    for method_name in ("find_spec", "__call__"):
-        for candidate_type in hook_type.__mro__:
-            method = candidate_type.__dict__.get(method_name)
-            if isinstance(method, (classmethod, staticmethod)):
-                method = method.__func__
-            if isinstance(method, FunctionType):
-                methods.append((method_name, method))
-                break
-    return tuple(methods)
-
-
-def _hook_type_code(hook_type: type[object]) -> bytes:
-    code_parts: list[bytes] = []
-    for _method_name, method in _hook_type_methods(hook_type):
-        code_parts.append(marshal.dumps(method.__code__))
-    return b"".join(code_parts)
-
-
-def _hook_type_state(hook_type: type[object]) -> str:
-    method_states: dict[str, str] = {}
-    class_attributes: dict[str, object] = {}
-    for method_name, method in _hook_type_methods(hook_type):
-        method_states[method_name] = _function_hook_state(method)
-        for attribute_name in sorted(set(method.__code__.co_names)):
-            for candidate_type in hook_type.__mro__:
-                if attribute_name not in candidate_type.__dict__:
-                    continue
-                class_attributes[f"{candidate_type.__module__}.{candidate_type.__qualname__}.{attribute_name}"] = (
-                    candidate_type.__dict__[attribute_name]
-                )
-                break
-    return _bounded_hook_value_identity({"methods": method_states, "class_attributes": class_attributes})
-
-
-def _import_hook_identity(hook: object) -> str:
-    if isinstance(hook, FunctionType):
-        module = hook.__module__
-        qualname = hook.__qualname__
-        code = marshal.dumps(hook.__code__)
-        state = _function_hook_state(hook)
-    elif isinstance(hook, MethodType):
-        function = cast(FunctionType, hook.__func__)
-        module = function.__module__
-        qualname = function.__qualname__
-        code = marshal.dumps(function.__code__)
-        bound_type = hook.__self__ if isinstance(hook.__self__, type) else type(hook.__self__)
-        state = "|".join(
-            (
-                f"type={_hook_type_state(bound_type)}",
-                f"self={_bounded_hook_value_identity(hook.__self__)}",
-                f"function={_function_hook_state(function)}",
-            )
-        )
-    elif isinstance(hook, type):
-        module = hook.__module__
-        qualname = hook.__qualname__
-        code = _hook_type_code(hook)
-        known_class_finder = hook in {BuiltinImporter, FrozenImporter, PathFinder}
-        state = "" if known_class_finder else f"{_UNREUSABLE_HOOK_STATE_IDENTITY}:{_hook_type_state(hook)}"
-    else:
-        hook_type = type(hook)
-        module = hook_type.__module__
-        qualname = hook_type.__qualname__
-        code = _hook_type_code(hook_type)
-        try:
-            instance_state = object.__getattribute__(hook, "__dict__")
-        except (AttributeError, TypeError):
-            instance_state = _UNREUSABLE_HOOK_STATE_IDENTITY
-        instance_identity = _bounded_hook_value_identity(instance_state)
-        virtualenv_module = sys.modules.get("_virtualenv")
-        virtualenv_finder_type = getattr(virtualenv_module, "_Finder", None) if virtualenv_module is not None else None
-        is_virtualenv_finder = isinstance(virtualenv_finder_type, type) and type(hook) is virtualenv_finder_type
-        state = (
-            f"self={instance_identity}"
-            if is_virtualenv_finder
-            else f"type={_hook_type_state(hook_type)}|self={instance_identity}"
-        )
-    digest = hashlib.sha256(code + state.encode()).hexdigest()
-    reuse_marker = "unreusable:" if _UNREUSABLE_HOOK_STATE_IDENTITY in state else ""
-    return f"{module}.{qualname}:{reuse_marker}{digest}"
-
-
-def _path_importer_methods_are_trusted(
-    importer_type: type[object],
-    trusted_methods: tuple[tuple[str, object], ...],
-) -> bool:
-    return all(getattr(importer_type, name, None) is method for name, method in trusted_methods)
-
-
-def _is_standard_file_finder_path_hook(hook: object) -> bool:
-    if not isinstance(hook, FunctionType) or hook.__code__ is not _STANDARD_FILE_FINDER_PATH_HOOK_CODE:
-        return False
-    closure = hook.__closure__ or ()
-    if len(closure) != len(hook.__code__.co_freevars):
-        return False
-    closure_values = dict(zip(hook.__code__.co_freevars, (cell.cell_contents for cell in closure), strict=True))
-    if closure_values.get("cls") is not FileFinder:
-        return False
-    loader_details = closure_values.get("loader_details")
-    if not isinstance(loader_details, tuple):
-        return False
-    try:
-        normalized_details = tuple((loader, tuple(suffixes)) for loader, suffixes in loader_details)
-    except (TypeError, ValueError):
-        return False
-    return normalized_details == _STANDARD_FILE_FINDER_LOADER_IDENTITY
-
-
-def _path_hook_resolution_identity(hook: object) -> str:
-    """Return a reusable identity only for unmodified standard path hooks."""
-    if hook is zipimporter:
-        if _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
-            return "trusted:zipimport.zipimporter"
-        return "zipimport.zipimporter:unreusable:methods-changed"
-    if _is_standard_file_finder_path_hook(hook):
-        if _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
-            return "trusted:importlib.machinery.FileFinder.path_hook"
-        return "importlib.machinery.FileFinder.path_hook:unreusable:methods-changed"
-    return f"untrusted:unreusable:{_import_hook_identity(hook)}"
-
-
-def _string_sequence_identity(values: Iterable[str]) -> str:
-    digest = hashlib.sha256()
-    count = 0
-    for value in values:
-        encoded = value.encode("utf-8", errors="surrogatepass")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
-        count += 1
-    return f"{count}:{digest.hexdigest()}"
-
-
-def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
-    rewrite_module = sys.modules.get("_pytest.assertion.rewrite")
-    finder_type = getattr(rewrite_module, "AssertionRewritingHook", None) if rewrite_module is not None else None
-    if not isinstance(finder_type, type) or type(finder) is not finder_type:
-        return None
-
-    basenames = {str(value) for value in getattr(finder, "_basenames_to_check_rewrite", ())}
-    session = getattr(finder, "session", None)
-    for initial_path in getattr(session, "_initialpaths", ()) if session is not None else ():
-        basenames.add(Path(str(initial_path)).stem)
-    state = "|".join(
-        (
-            _string_sequence_identity(sorted(str(value) for value in getattr(finder, "_must_rewrite", ()))),
-            _string_sequence_identity(str(value) for value in getattr(finder, "fnpats", ())),
-            _string_sequence_identity(sorted(basenames)),
-            repr(bool(getattr(finder, "_writing_pyc", False))),
-        )
-    )
-    digest = hashlib.sha256(_hook_type_code(finder_type) + state.encode()).hexdigest()
-    return f"{finder_type.__module__}.{finder_type.__qualname__}:{digest}"
-
-
-def _meta_path_finder_resolution_identity(finder: object) -> str:
-    return _pytest_assertion_rewrite_identity(finder) or _import_hook_identity(finder)
-
-
-def _file_finder_cache_is_safe(cache: object) -> bool:
-    return (
-        type(cache) is set
-        and len(cache) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
-        and all(type(entry) is str for entry in cache)
-    )
-
-
-def _file_finder_loaders_are_standard(loaders: object) -> bool:
-    if type(loaders) is not list or len(loaders) != len(_STANDARD_FILE_FINDER_LOADERS):
-        return False
-    return all(
-        type(actual) is tuple
-        and len(actual) == 2
-        and type(actual[0]) is str
-        and actual[0] == expected[0]
-        and actual[1] is expected[1]
-        for actual, expected in zip(loaders, _STANDARD_FILE_FINDER_LOADERS, strict=True)
-    )
-
-
-def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | None:
-    if type(finder) is not FileFinder or not _path_importer_methods_are_trusted(
-        FileFinder,
-        _TRUSTED_FILE_FINDER_METHODS,
-    ):
-        return None
-    try:
-        instance_state = object.__getattribute__(finder, "__dict__")
-    except (AttributeError, TypeError):
-        return None
-    if type(instance_state) is not dict:
-        return None
-    finder_path = dict.get(instance_state, "path")
-    loaders = dict.get(instance_state, "_loaders")
-    path_mtime = dict.get(instance_state, "_path_mtime")
-    path_cache = dict.get(instance_state, "_path_cache")
-    relaxed_path_cache = dict.get(instance_state, "_relaxed_path_cache")
-    if not (
-        set(instance_state) == {"_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache"}
-        and type(finder_path) is str
-        and os.path.abspath(finder_path) == os.path.abspath(cache_key)
-        and _file_finder_loaders_are_standard(loaders)
-        and type(path_mtime) in {int, float}
-        and _file_finder_cache_is_safe(path_cache)
-        and _file_finder_cache_is_safe(relaxed_path_cache)
-    ):
-        return None
-    state_identity = _string_sequence_identity(
-        (
-            finder_path,
-            repr(path_mtime),
-            _string_sequence_identity(sorted(cast(set[str], path_cache))),
-            _string_sequence_identity(sorted(cast(set[str], relaxed_path_cache))),
-        )
-    )
-    return f"trusted:importlib.machinery.FileFinder:{state_identity}"
-
-
-def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
-    if type(finder) is FileFinder:
-        return _file_finder_resolution_identity(finder, cache_key) is not None
-    try:
-        instance_state = object.__getattribute__(finder, "__dict__")
-    except (AttributeError, TypeError):
-        return False
-    if not isinstance(instance_state, dict):
-        return False
-    if type(finder) is zipimporter:
-        if not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
-            return False
-        try:
-            expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
-        except (AttributeError, ImportError, OSError, TypeError):
-            return False
-        return (
-            isinstance(expected_state, dict)
-            and set(instance_state) == set(expected_state)
-            and instance_state.get("archive") == expected_state.get("archive")
-            and instance_state.get("prefix") == expected_state.get("prefix")
-            and instance_state.get("_files") is expected_state.get("_files")
-        )
-    return False
-
-
 def _source_resolution_context() -> dict[str, list[str]]:
-    path_importers = []
-    for entry in sys.path:
-        cache_key = entry or os.getcwd()
-        if not dict.__contains__(sys.path_importer_cache, cache_key):
-            continue
-        finder = dict.__getitem__(sys.path_importer_cache, cache_key)
-        absolute_cache_key = Path(cache_key).absolute()
-        if finder is None:
-            path_importers.append(f"{absolute_cache_key}=cached-none")
-            continue
-        if type(finder) is FileFinder:
-            file_finder_identity = _file_finder_resolution_identity(finder, cache_key)
-            identity = file_finder_identity or _import_hook_identity(finder)
-            path_importers.append(f"{absolute_cache_key}={identity}")
-            continue
-        if _is_trusted_standard_path_importer(finder, cache_key):
-            continue
-        path_importers.append(f"{absolute_cache_key}={_import_hook_identity(finder)}")
+    meta_path, path_hooks, path_importers = _picklescan_source_resolution_context()
     return {
-        "meta_path": [_meta_path_finder_resolution_identity(finder) for finder in sys.meta_path],
-        "path_hooks": [_path_hook_resolution_identity(hook) for hook in sys.path_hooks],
-        "path_importers": path_importers,
+        "meta_path": list(meta_path),
+        "path_hooks": list(path_hooks),
+        "path_importers": list(path_importers),
     }
-
-
-def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
-    for entry in search_path:
-        cache_key = entry or os.getcwd()
-        finder = sys.path_importer_cache.get(cache_key)
-        if finder is not None and not _is_trusted_standard_path_importer(finder, cache_key):
-            return True
-    return False
 
 
 def _loaded_module_source_override(module_name: str) -> tuple[bool, str | None]:

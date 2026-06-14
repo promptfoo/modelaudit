@@ -10,7 +10,10 @@ import subprocess
 import sys
 import sysconfig
 import tarfile
-from collections.abc import Iterator
+import zipfile
+import zipimport
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
     EXTENSION_SUFFIXES,
@@ -57,6 +60,65 @@ def _standard_file_finder_loader_details() -> tuple[tuple[Any, list[str]], ...]:
     )
 
 
+def _zipimporter_directory_files(finder: zipimporter) -> dict[str, tuple[object, ...]]:
+    finder_state = object.__getattribute__(finder, "__dict__")
+    archive = dict.get(finder_state, "archive")
+    assert type(archive) is str
+    namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    directory_cache = dict.get(namespace, "_zip_directory_cache")
+    assert type(directory_cache) is dict
+    files = dict.get(directory_cache, archive)
+    assert type(files) is dict
+    return cast(dict[str, tuple[object, ...]], files)
+
+
+def _write_zipimporter_archive(archive_path: Path, module: str, *, include_module: bool) -> None:
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("payload.py", "value = 1\n")
+        if include_module:
+            archive.writestr(f"{module}.py", "class Fraction:\n    pass\n")
+
+
+def _refresh_zipimporter_directory_files(
+    archive_path: Path,
+    files: dict[str, tuple[object, ...]],
+) -> None:
+    namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    read_directory = dict.get(namespace, "_read_directory")
+    assert isinstance(read_directory, FunctionType)
+    refreshed = read_directory(str(archive_path))
+    assert type(refreshed) is dict
+    files.clear()
+    files.update(cast(dict[str, tuple[object, ...]], refreshed))
+
+
+@contextmanager
+def _standard_import_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    module: str,
+    importer_cache: dict[Any, Any],
+    search_path: list[str] | None = None,
+    trusted_site_package_root: Path | None = None,
+) -> Iterator[None]:
+    loader_details = _standard_file_finder_loader_details()
+    with monkeypatch.context() as context:
+        context.delitem(sys.modules, module, raising=False)
+        context.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
+        context.setattr(sys, "path_hooks", [zipimporter, FileFinder.path_hook(*loader_details)])
+        context.setattr(sys, "path_importer_cache", importer_cache)
+        if search_path is not None:
+            context.setattr(sys, "path", search_path)
+        if trusted_site_package_root is not None:
+            context.setattr(call_graph, "_TRUSTED_SITE_PACKAGE_PATHS", (trusted_site_package_root.resolve(),))
+            context.setattr(call_graph, "_TRUSTED_DELEGATED_SITE_PACKAGE_PATHS", ())
+        _clear_call_graph_caches()
+        try:
+            yield
+        finally:
+            _clear_call_graph_caches()
+
+
 class _FailIfExecutedFinder:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
@@ -69,6 +131,14 @@ class _FailIfExecutedFinder:
         del target
         self.calls.append(f"find_spec:{fullname}")
         raise AssertionError("untrusted cached finder was executed")
+
+
+def _assert_non_allowlisted_global(report: PickleReport, module: str, name: str) -> None:
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
 
 
 def _has_source_unavailable_notice(report: PickleReport, module: str, name: str) -> bool:
@@ -472,6 +542,7 @@ def test_loaded_trusted_reference_ignores_untrusted_cached_path_finder(
     baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get((module, name))
     if baseline is None:
         pytest.skip("argparse.Namespace was not loaded before the call-graph trust snapshot")
+    assert baseline is not None
     assert sys.modules[module] is baseline[0][1]
     calls: list[str] = []
     evil_entry = str(tmp_path / "loaded-module-evil-importer")
@@ -1203,30 +1274,22 @@ def test_later_untrusted_path_importer_does_not_block_prior_stdlib_source_resolu
     module = "statistics"
     stdlib_path = sysconfig.get_path("stdlib")
     assert stdlib_path is not None
-
-    stdlib_loader_details = _standard_file_finder_loader_details()
-    stdlib_finder = FileFinder(stdlib_path, *stdlib_loader_details)
+    finder = FileFinder(stdlib_path, *_standard_file_finder_loader_details())
     untrusted_entry = str(Path(stdlib_path) / "later-untrusted-importer")
-    importer_cache: dict[Any, Any] = dict(sys.path_importer_cache)
-    importer_cache[stdlib_path] = stdlib_finder
-    importer_cache[untrusted_entry] = object()
+    importer_cache: dict[Any, Any] = {
+        **sys.path_importer_cache,
+        stdlib_path: finder,
+        untrusted_entry: object(),
+    }
 
-    monkeypatch.delitem(sys.modules, module, raising=False)
-    monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
-    monkeypatch.setattr(
-        sys,
-        "path_hooks",
-        [zipimporter, FileFinder.path_hook(*stdlib_loader_details)],
-    )
-    monkeypatch.setattr(sys, "path", [stdlib_path, untrusted_entry])
-    monkeypatch.setattr(sys, "path_importer_cache", importer_cache)
-    _clear_call_graph_caches()
-
-    try:
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache=importer_cache,
+        search_path=[stdlib_path, untrusted_entry],
+    ):
         assert call_graph._trusted_module_origin_kind(module) == "stdlib"
         assert call_graph._resolve_module_source(module) is not None
-    finally:
-        _clear_call_graph_caches()
 
 
 def test_cached_and_fresh_stdlib_file_finder_resolution_are_equivalent(
@@ -1235,33 +1298,24 @@ def test_cached_and_fresh_stdlib_file_finder_resolution_are_equivalent(
     module = "statistics"
     stdlib_path = sysconfig.get_path("stdlib")
     assert stdlib_path is not None
-    loader_details = _standard_file_finder_loader_details()
     origins: list[str] = []
-    monkeypatch.delitem(sys.modules, module, raising=False)
-
     for cached in (False, True):
         importer_cache: dict[Any, Any] = dict(sys.path_importer_cache)
         importer_cache.pop(stdlib_path, None)
         if cached:
-            importer_cache[stdlib_path] = FileFinder(stdlib_path, *loader_details)
-
-        with monkeypatch.context() as context:
-            context.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
-            context.setattr(sys, "path_hooks", [zipimporter, FileFinder.path_hook(*loader_details)])
-            context.setattr(sys, "path", [stdlib_path])
-            context.setattr(sys, "path_importer_cache", importer_cache)
-            _clear_call_graph_caches()
-
-            try:
-                spec = call_graph._find_standard_filesystem_spec(module)
-                assert type(spec) is ModuleSpec
-                origin, _ = call_graph._module_spec_fields_without_hooks(spec)
-                assert type(origin) is str
-                origins.append(origin)
-                assert call_graph._trusted_module_origin_kind(module) == "stdlib"
-            finally:
-                _clear_call_graph_caches()
-
+            importer_cache[stdlib_path] = FileFinder(stdlib_path, *_standard_file_finder_loader_details())
+        with _standard_import_runtime(
+            monkeypatch,
+            module=module,
+            importer_cache=importer_cache,
+            search_path=[stdlib_path],
+        ):
+            spec = call_graph._find_standard_filesystem_spec(module)
+            assert type(spec) is ModuleSpec
+            origin, _ = call_graph._module_spec_fields_without_hooks(spec)
+            assert type(origin) is str
+            origins.append(origin)
+            assert call_graph._trusted_module_origin_kind(module) == "stdlib"
     assert origins[0] == origins[1]
 
 
@@ -1270,45 +1324,31 @@ def test_cached_stdlib_importer_miss_with_later_untrusted_finder_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     cached_stdlib_importer: str,
 ) -> None:
-    module = "statistics"
-    name = "mean"
+    module, name = "statistics", "mean"
     stdlib_path = sysconfig.get_path("stdlib")
     assert stdlib_path is not None
-    loader_details = _standard_file_finder_loader_details()
     calls: list[str] = []
-
     evil_entry = str(Path(stdlib_path) / "later-evil-importer")
     importer_cache: dict[Any, Any] = dict(sys.path_importer_cache)
     if cached_stdlib_importer == "none":
         importer_cache[stdlib_path] = None
     else:
-        stdlib_finder = FileFinder(stdlib_path, *loader_details)
-        finder_state = object.__getattribute__(stdlib_finder, "__dict__")
-        finder_state["_path_mtime"] = os.stat(stdlib_path).st_mtime
-        finder_state["_path_cache"] = set()
-        finder_state["_relaxed_path_cache"] = set()
-        assert stdlib_finder.find_spec(module) is None
-        importer_cache[stdlib_path] = stdlib_finder
+        finder = FileFinder(stdlib_path, *_standard_file_finder_loader_details())
+        finder_state = object.__getattribute__(finder, "__dict__")
+        finder_state.update(_path_mtime=os.stat(stdlib_path).st_mtime, _path_cache=set(), _relaxed_path_cache=set())
+        assert finder.find_spec(module) is None
+        importer_cache[stdlib_path] = finder
     importer_cache[evil_entry] = _FailIfExecutedFinder(calls)
 
-    monkeypatch.delitem(sys.modules, module, raising=False)
-    monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
-    monkeypatch.setattr(sys, "path_hooks", [zipimporter, FileFinder.path_hook(*loader_details)])
-    monkeypatch.setattr(sys, "path", [stdlib_path, evil_entry])
-    monkeypatch.setattr(sys, "path_importer_cache", importer_cache)
-    _clear_call_graph_caches()
-
-    try:
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache=importer_cache,
+        search_path=[stdlib_path, evil_entry],
+    ):
         assert call_graph._trusted_module_origin_kind(module) is None
         report = package_api.scan_bytes(f"c{module}\n{name}\n.".encode(), source="cached-importer-miss.pkl")
-    finally:
-        _clear_call_graph_caches()
-
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
-        for finding in report.findings
-    )
+    _assert_non_allowlisted_global(report, module, name)
     assert calls == []
 
 
@@ -1317,93 +1357,230 @@ def test_shared_cache_refreshes_when_path_importer_semantics_change(
     monkeypatch: pytest.MonkeyPatch,
     cache_transition: str,
 ) -> None:
-    module = "fractions"
-    name = "Fraction"
+    module, name = "fractions", "Fraction"
     stdlib_path = sysconfig.get_path("stdlib")
     assert stdlib_path is not None
-    loader_details = _standard_file_finder_loader_details()
     calls: list[str] = []
     evil_entry = str(Path(stdlib_path) / "later-shared-cache-evil-importer")
     importer_cache: dict[Any, Any] = dict(sys.path_importer_cache)
     importer_cache.pop(stdlib_path, None)
-    stdlib_finder: FileFinder | None = None
+    finder: FileFinder | None = None
     if cache_transition == "file_finder_to_poisoned":
-        stdlib_finder = FileFinder(stdlib_path, *loader_details)
-        assert stdlib_finder.find_spec(module) is not None
-        importer_cache[stdlib_path] = stdlib_finder
+        finder = FileFinder(stdlib_path, *_standard_file_finder_loader_details())
+        assert finder.find_spec(module) is not None
+        importer_cache[stdlib_path] = finder
     importer_cache[evil_entry] = _FailIfExecutedFinder(calls)
 
-    monkeypatch.delitem(sys.modules, module, raising=False)
-    monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
-    monkeypatch.setattr(sys, "path_hooks", [zipimporter, FileFinder.path_hook(*loader_details)])
-    monkeypatch.setattr(sys, "path", [stdlib_path, evil_entry])
-    monkeypatch.setattr(sys, "path_importer_cache", importer_cache)
-    _clear_call_graph_caches()
-
-    try:
-        with call_graph.shared_source_sensitive_caches():
-            trusted_report = package_api.scan_bytes(
-                f"c{module}\n{name}\n.".encode(),
-                source="shared-cache-trusted.pkl",
-                enrich_call_graph=False,
+    with (
+        _standard_import_runtime(
+            monkeypatch,
+            module=module,
+            importer_cache=importer_cache,
+            search_path=[stdlib_path, evil_entry],
+        ),
+        call_graph.shared_source_sensitive_caches(),
+    ):
+        trusted_report = package_api.scan_bytes(
+            f"c{module}\n{name}\n.".encode(), source="shared-cache-trusted.pkl", enrich_call_graph=False
+        )
+        if finder is None:
+            importer_cache[stdlib_path] = None
+        else:
+            finder_state = object.__getattribute__(finder, "__dict__")
+            finder_state.update(
+                _path_mtime=os.stat(stdlib_path).st_mtime,
+                _path_cache=set(),
+                _relaxed_path_cache=set(),
             )
-            if stdlib_finder is None:
-                importer_cache[stdlib_path] = None
-            else:
-                finder_state = object.__getattribute__(stdlib_finder, "__dict__")
-                finder_state["_path_mtime"] = os.stat(stdlib_path).st_mtime
-                finder_state["_path_cache"] = set()
-                finder_state["_relaxed_path_cache"] = set()
-            blocked_report = package_api.scan_bytes(
-                f"c{module}\n{name}\n.".encode(),
-                source="shared-cache-blocked.pkl",
-                enrich_call_graph=False,
-            )
-    finally:
-        _clear_call_graph_caches()
-
+        blocked_report = package_api.scan_bytes(
+            f"c{module}\n{name}\n.".encode(), source="shared-cache-blocked.pkl", enrich_call_graph=False
+        )
     assert trusted_report.verdict == SafetyVerdict.CLEAN
-    assert blocked_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
-        for finding in blocked_report.findings
-    )
+    _assert_non_allowlisted_global(blocked_report, module, name)
     assert calls == []
+
+
+@pytest.mark.parametrize("initial_has_module", [True, False], ids=["hit-to-miss", "miss-to-hit"])
+def test_shared_cache_refreshes_when_zipimporter_cache_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_has_module: bool,
+) -> None:
+    module, name = "fractions", "Fraction"
+    archive_path = tmp_path / "trusted-modules.zip"
+    _write_zipimporter_archive(archive_path, module, include_module=initial_has_module)
+    path_entry = str(archive_path)
+    finder = zipimporter(path_entry)
+    files = _zipimporter_directory_files(finder)
+    evil_entry = str(tmp_path / "later-zip-cache-evil-importer")
+    calls: list[str] = []
+    importer_cache: dict[Any, Any] = {
+        **sys.path_importer_cache,
+        path_entry: finder,
+        evil_entry: _FailIfExecutedFinder(calls),
+    }
+
+    with (
+        _standard_import_runtime(
+            monkeypatch,
+            module=module,
+            importer_cache=importer_cache,
+            search_path=[path_entry, evil_entry],
+            trusted_site_package_root=tmp_path,
+        ),
+        call_graph.shared_source_sensitive_caches(),
+    ):
+        first_report = package_api.scan_bytes(
+            f"c{module}\n{name}\n.".encode(), source="shared-zip-cache-first.pkl", enrich_call_graph=False
+        )
+        _write_zipimporter_archive(archive_path, module, include_module=not initial_has_module)
+        _refresh_zipimporter_directory_files(archive_path, files)
+        assert (type(zipimporter.find_spec(finder, module)) is ModuleSpec) is (not initial_has_module)
+        second_report = package_api.scan_bytes(
+            f"c{module}\n{name}\n.".encode(), source="shared-zip-cache-second.pkl", enrich_call_graph=False
+        )
+    trusted_report = first_report if initial_has_module else second_report
+    blocked_report = second_report if initial_has_module else first_report
+    assert trusted_report.verdict == SafetyVerdict.CLEAN
+    _assert_non_allowlisted_global(blocked_report, module, name)
+    assert calls == []
+
+
+@pytest.mark.parametrize("forgery", ["name", "offset", "metadata"])
+def test_forged_zipimporter_directory_entry_is_not_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forgery: str,
+) -> None:
+    module, name = "fractions", "Fraction"
+    archive_path = tmp_path / "trusted-forged-modules.zip"
+    _write_zipimporter_archive(archive_path, module, include_module=forgery != "name")
+    path_entry = str(archive_path)
+    finder = zipimporter(path_entry)
+    files = _zipimporter_directory_files(finder)
+    if forgery == "name":
+        forged_metadata = files["payload.py"]
+    else:
+        forged_values = list(files[f"{module}.py"])
+        forged_index = 4 if forgery == "offset" else 7
+        forged_value = forged_values[forged_index]
+        assert type(forged_value) is int
+        forged_values[forged_index] = forged_value + 1
+        forged_metadata = tuple(forged_values)
+    monkeypatch.setitem(files, f"{module}.py", forged_metadata)
+    assert type(zipimporter.find_spec(finder, module)) is ModuleSpec
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache={path_entry: finder},
+        search_path=[path_entry],
+        trusted_site_package_root=tmp_path,
+    ):
+        assert call_graph._trusted_module_origin_kind(module) is None
+        report = package_api.scan_bytes(
+            f"c{module}\n{name}\n.".encode(),
+            source=f"forged-zip-directory-{forgery}.pkl",
+            enrich_call_graph=False,
+        )
+    _assert_non_allowlisted_global(report, module, name)
+
+
+def test_file_finder_resolution_identity_caches_bounded_state_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path_entry = str(tmp_path)
+    finder = FileFinder(path_entry, *_standard_file_finder_loader_details())
+    finder_state = object.__getattribute__(finder, "__dict__")
+    finder_state.update(
+        _path_mtime=1,
+        _path_cache={f"module_{index}.py" for index in range(512)},
+        _relaxed_path_cache=set(),
+    )
+    original_identity = call_graph._string_sequence_identity
+    work_count = 0
+
+    def counted_identity(values: Iterable[str]) -> str:
+        nonlocal work_count
+        materialized = tuple(values)
+        work_count += len(materialized)
+        return original_identity(materialized)
+
+    call_graph._cached_file_finder_resolution_summary.cache_clear()
+    monkeypatch.setattr(call_graph, "_string_sequence_identity", counted_identity)
+    try:
+        first_identity = call_graph._file_finder_resolution_identity(finder, path_entry)
+        assert first_identity is not None
+        first_work_count = work_count
+        assert first_work_count <= len(finder_state["_path_cache"]) + 4
+        assert call_graph._file_finder_resolution_identity(finder, path_entry) == first_identity
+        assert work_count == first_work_count
+
+        finder_state["_path_cache"] = set(finder_state["_path_cache"])
+        assert call_graph._file_finder_resolution_identity(finder, path_entry) == first_identity
+        assert work_count == first_work_count
+        work_before_transition = work_count
+        transitioned_cache = cast(set[str], finder_state["_path_cache"])
+        transitioned_cache.remove("module_0.py")
+        transitioned_cache.add("transitioned.py")
+        assert call_graph._file_finder_resolution_identity(finder, path_entry) != first_identity
+        assert work_count > work_before_transition
+
+        work_before_oversized = work_count
+        finder_state["_path_cache"] = {
+            f"oversized_{index}.py" for index in range(call_graph._MAX_SOURCE_FINGERPRINT_CANDIDATES + 1)
+        }
+        assert call_graph._file_finder_resolution_identity(finder, path_entry) is None
+        assert work_count == work_before_oversized
+        cache_info = call_graph._cached_file_finder_resolution_summary.cache_info()
+        assert cache_info.maxsize == call_graph._MAX_FILE_FINDER_IDENTITY_CACHE_SIZE
+        assert cache_info.currsize <= cache_info.maxsize
+    finally:
+        call_graph._cached_file_finder_resolution_summary.cache_clear()
+
+
+def test_invalidated_file_finder_is_normalized_before_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = "invalidated_cache_module"
+    (tmp_path / f"{module}.py").write_text("value = 1\n", encoding="utf-8")
+    path_entry = str(tmp_path)
+    finder = FileFinder(path_entry, *_standard_file_finder_loader_details())
+    assert finder.find_spec(module) is not None
+    finder.invalidate_caches()
+    assert object.__getattribute__(finder, "__dict__")["_path_mtime"] == -1
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache={path_entry: finder},
+        search_path=[path_entry],
+    ):
+        first_context = call_graph._source_resolution_context()
+        assert call_graph._source_resolution_context() == first_context
+        assert object.__getattribute__(finder, "__dict__")["_path_mtime"] != -1
 
 
 def test_loaded_package_cached_untrusted_importer_is_not_unresolved_trusted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = "pathlib._local"
-    name = "PurePath"
+    module, name = "pathlib._local", "PurePath"
     calls: list[str] = []
-
-    pathlib_module = sys.modules["pathlib"]
-    pathlib_namespace = ModuleType.__getattribute__(pathlib_module, "__dict__")
+    pathlib_namespace = ModuleType.__getattribute__(sys.modules["pathlib"], "__dict__")
     package_entry = str(tmp_path.absolute())
-    loader_details = _standard_file_finder_loader_details()
-    importer_cache: dict[Any, Any] = dict(sys.path_importer_cache)
-    importer_cache[package_entry] = _FailIfExecutedFinder(calls)
-
+    importer_cache: dict[Any, Any] = {
+        **sys.path_importer_cache,
+        package_entry: _FailIfExecutedFinder(calls),
+    }
     monkeypatch.setitem(pathlib_namespace, "__path__", [package_entry])
-    monkeypatch.delitem(sys.modules, module, raising=False)
-    monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
-    monkeypatch.setattr(sys, "path_hooks", [zipimporter, FileFinder.path_hook(*loader_details)])
-    monkeypatch.setattr(sys, "path_importer_cache", importer_cache)
-    _clear_call_graph_caches()
 
-    try:
+    with _standard_import_runtime(monkeypatch, module=module, importer_cache=importer_cache):
         assert call_graph._trusted_module_origin_kind(module) is None
         report = package_api.scan_bytes(f"c{module}\n{name}\n.".encode(), source="cached-untrusted-parent.pkl")
-    finally:
-        _clear_call_graph_caches()
-
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
-        for finding in report.findings
-    )
+    _assert_non_allowlisted_global(report, module, name)
     assert calls == []
 
 
