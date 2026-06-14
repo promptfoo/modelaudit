@@ -6,6 +6,8 @@ capabilities, testing both malicious detection and false positive prevention.
 """
 
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -434,3 +436,39 @@ class TestNestedPickleIntegration:
             assert len(issue.why) > 10, "Explanation should be substantial"
 
             print(f"  ✅ Issue has proper explanation: {issue.why[:100]}...")
+
+
+def test_importlib_metadata_pathfinder_cleanup_preserves_nested_pickle_detection() -> None:
+    sample = Path(__file__).parent / "assets" / "samples" / "pickles" / "nested_pickle_raw.pkl"
+    script = """
+from importlib.machinery import PathFinder
+from pathlib import Path
+import sys
+
+from modelaudit_picklescan import PickleScanner
+import modelaudit_picklescan.call_graph as call_graph
+
+if "find_distributions" not in vars(PathFinder):
+    raise SystemExit(77)
+original_find_distributions = vars(PathFinder)["find_distributions"]
+assert call_graph._interpreter_import_runtime_is_trusted()
+import importlib_metadata
+assert "find_distributions" not in vars(PathFinder)
+assert call_graph._interpreter_import_runtime_is_trusted()
+
+report = PickleScanner().scan_file(Path(sys.argv[1]))
+assert report.status.value == "complete", report.errors
+assert report.verdict.value == "malicious", report.findings
+assert not any(error.category == "call_graph_analysis_error" for error in report.errors), report.errors
+type.__setattr__(PathFinder, "find_distributions", original_find_distributions)
+assert not call_graph._interpreter_import_runtime_is_trusted()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(sample)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 77:
+        pytest.skip("PathFinder has no stdlib distribution hook before importlib_metadata")
+    assert result.returncode == 0, result.stderr

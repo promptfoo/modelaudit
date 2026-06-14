@@ -8,12 +8,15 @@ import pickle
 import posixpath
 import subprocess
 import sys
+import sysconfig
 import tarfile
+import zipfile
 from collections.abc import Iterator
 from importlib.machinery import BuiltinImporter, FileFinder, FrozenImporter, ModuleSpec, PathFinder
 from pathlib import Path
-from types import BuiltinFunctionType, FunctionType, ModuleType
+from types import BuiltinFunctionType, FunctionType, MappingProxyType, ModuleType
 from typing import Any, cast
+from zipimport import zipimporter
 
 import pytest
 
@@ -1870,3 +1873,132 @@ def test_loaded_extension_export_does_not_hide_legacy_dotted_module_getattr(
     public_findings = [finding for finding in report.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH"]
     assert len(public_findings) == 1
     assert public_findings[0].details["sink"] == "os.system"
+
+
+def test_metadata_only_type_member_removal_is_one_way_and_class_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Finder:
+        @classmethod
+        def metadata_hook(cls) -> tuple[()]:
+            del cls
+            return ()
+
+    namespace = type.__getattribute__(Finder, "__dict__")
+    original = namespace["metadata_hook"]
+    expected = call_graph._type_namespace_snapshot(Finder)
+    monkeypatch.setattr(
+        call_graph,
+        "_SAFE_REMOVABLE_IMPORT_RUNTIME_TYPE_MEMBERS",
+        MappingProxyType({Finder: frozenset({"metadata_hook"})}),
+    )
+
+    assert call_graph._type_namespace_matches_snapshot(Finder, namespace, expected) is True
+    type.__delattr__(Finder, "metadata_hook")
+    assert call_graph._type_namespace_matches_snapshot(Finder, namespace, expected) is True
+
+    type.__setattr__(Finder, "metadata_hook", original)
+    assert call_graph._type_namespace_matches_snapshot(Finder, namespace, expected) is False
+    type.__delattr__(Finder, "metadata_hook")
+    assert call_graph._type_namespace_matches_snapshot(Finder, namespace, expected) is False
+
+
+def test_startup_distribution_roots_are_bounded_frozen_and_deduplicated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = call_graph._TRUSTED_SITE_PACKAGE_PATHS[0]
+    distribution_calls: list[str] = []
+
+    class FakeDistribution:
+        _path = trusted_root / "shared.dist-info"
+
+        @staticmethod
+        def locate_file(_name: str) -> Path:
+            return tmp_path
+
+    monkeypatch.setattr(
+        call_graph,
+        "packages_distributions",
+        lambda: {"first": ["shared"], "second": ["shared"], "ignored": ["third"]},
+    )
+
+    def fake_distribution(name: str) -> FakeDistribution:
+        distribution_calls.append(name)
+        return FakeDistribution()
+
+    monkeypatch.setattr(call_graph, "distribution", fake_distribution)
+    monkeypatch.setattr(call_graph, "_MAX_STARTUP_DISTRIBUTION_NAMES", 2)
+    captured = call_graph._capture_startup_distribution_roots()
+    expected_root = ((FakeDistribution._path.resolve(), tmp_path.resolve()),)
+    assert tuple(captured) == ("first", "second")
+    assert captured["first"] == captured["second"] == expected_root
+    assert distribution_calls == ["shared"]
+
+    runtime_calls: list[str] = []
+
+    def hostile_distribution(name: str) -> object:
+        runtime_calls.append(name)
+        raise AssertionError("runtime distribution discovery was executed")
+
+    monkeypatch.setattr(call_graph, "distribution", hostile_distribution)
+    monkeypatch.setattr(call_graph, "_STARTUP_DISTRIBUTION_ROOTS", {"probe": expected_root})
+    call_graph._installed_distribution_roots.cache_clear()
+    try:
+        assert call_graph._installed_distribution_roots("probe") == (tmp_path.resolve(),)
+    finally:
+        call_graph._installed_distribution_roots.cache_clear()
+    assert runtime_calls == []
+
+
+@pytest.mark.parametrize("archive_case", ["target-absent", "target-present", "truncated", "forged", "oversized"])
+def test_cached_launcher_zip_before_stdlib_is_skipped_only_when_target_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    archive_case: str,
+) -> None:
+    launcher = tmp_path / "pytest.exe"
+    marker = tmp_path / "zipapp-executed"
+    launcher.write_bytes(b"MZ" + b"\0" * 128)
+    archive_member = "linecache.py" if archive_case == "target-present" else "bootstrap.py"
+    with zipfile.ZipFile(launcher, "a") as archive:
+        archive.writestr(archive_member, f"open({str(marker)!r}, 'w').close()\n")
+    with launcher.open("ab") as file:
+        file.write(b"PE-RESOURCE" * 128)
+
+    finder = zipimporter(str(launcher))
+    finder_state = object.__getattribute__(finder, "__dict__")
+    assert type(finder_state) is dict
+    if archive_case == "truncated":
+        content = launcher.read_bytes()
+        end_offset = content.rfind(b"PK\x05\x06")
+        assert end_offset >= 0
+        launcher.write_bytes(content[: end_offset + 10])
+    elif archive_case == "forged":
+        mutable_content = bytearray(launcher.read_bytes())
+        end_offset = mutable_content.rfind(b"PK\x05\x06")
+        assert end_offset >= 0
+        mutable_content[end_offset + 12 : end_offset + 16] = b"\xff\xff\xff\xff"
+        launcher.write_bytes(mutable_content)
+    elif archive_case == "oversized":
+        monkeypatch.setattr(call_graph, "_MAX_ZIPIMPORT_ARCHIVE_BYTES", launcher.stat().st_size - 1)
+    stdlib_path = sysconfig.get_path("stdlib")
+    assert stdlib_path is not None
+    stdlib_finder = FileFinder(stdlib_path, *call_graph._STANDARD_FILE_FINDER_LOADER_DETAILS)
+    monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
+    monkeypatch.setattr(sys, "path", [str(launcher), stdlib_path])
+    monkeypatch.setattr(
+        sys,
+        "path_importer_cache",
+        {str(launcher): finder, stdlib_path: stdlib_finder},
+    )
+    monkeypatch.delitem(sys.modules, "linecache", raising=False)
+    _clear_call_graph_caches()
+
+    try:
+        origin_kind = call_graph._trusted_module_origin_kind("linecache")
+    finally:
+        _clear_call_graph_caches()
+
+    assert origin_kind == ("stdlib" if archive_case == "target-absent" else None)
+    assert marker.exists() is False

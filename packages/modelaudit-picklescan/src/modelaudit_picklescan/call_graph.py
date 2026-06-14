@@ -51,6 +51,58 @@ from types import (
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
 
+_MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
+_MAX_STARTUP_DISTRIBUTION_NAMES = 4096
+
+
+def _capture_startup_distribution_roots() -> Mapping[str, tuple[tuple[Path, Path], ...]]:
+    try:
+        discovered = packages_distributions()
+    except Exception:
+        return MappingProxyType({})
+    if type(discovered) is not dict:
+        return MappingProxyType({})
+
+    distribution_roots: dict[str, tuple[tuple[Path, Path], ...]] = {}
+    roots_by_distribution: dict[str, tuple[Path, Path] | None] = {}
+    for top_level_name, distribution_names in dict.items(discovered):
+        if len(distribution_roots) >= _MAX_STARTUP_DISTRIBUTION_NAMES:
+            break
+        if type(top_level_name) is not str or type(distribution_names) is not list:
+            continue
+
+        roots: list[tuple[Path, Path]] = []
+        for index, distribution_name in enumerate(list.__iter__(distribution_names)):
+            if index >= _MAX_DISTRIBUTIONS_PER_TOP_LEVEL:
+                break
+            if type(distribution_name) is not str:
+                continue
+            if distribution_name not in roots_by_distribution:
+                if len(roots_by_distribution) >= _MAX_STARTUP_DISTRIBUTION_NAMES:
+                    continue
+                try:
+                    installed_distribution = distribution(distribution_name)
+                    metadata_location = getattr(installed_distribution, "_path", None)
+                    root = (
+                        (
+                            Path(str(metadata_location)).resolve(),
+                            Path(str(installed_distribution.locate_file(""))).resolve(),
+                        )
+                        if metadata_location is not None
+                        else None
+                    )
+                except Exception:
+                    root = None
+                roots_by_distribution[distribution_name] = root
+            root = roots_by_distribution[distribution_name]
+            if root is not None and root not in roots:
+                roots.append(root)
+        distribution_roots[top_level_name] = tuple(roots)
+    return MappingProxyType(distribution_roots)
+
+
+_STARTUP_DISTRIBUTION_ROOTS = _capture_startup_distribution_roots()
+
 # Bound per-pass import/callable fan-out for untrusted inputs. The 32-reference
 # cap has kept call-graph enrichment useful while preventing pathological scan
 # growth; raising it improves completeness at a runtime cost, lowering it can
@@ -64,6 +116,11 @@ _MAX_MODULE_COMPONENTS = 32
 _MAX_SOURCE_BYTES = 1024 * 1024
 _CALL_GRAPH_REGULAR_FILE_FINGERPRINT = "regular-file"
 _MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
+_MAX_ZIPIMPORT_ARCHIVE_BYTES = 64 * 1024 * 1024
+_MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES = 4 * 1024 * 1024
+_ZIP_END_RECORD_SIZE = 22
+_ZIP_MAX_COMMENT_BYTES = 65_535
+_ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE = 46
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _SOURCE_RESOLUTION_SUFFIXES = tuple(dict.fromkeys((*SOURCE_SUFFIXES, *BYTECODE_SUFFIXES, *EXTENSION_SUFFIXES)))
 _MAX_HOOK_IDENTITY_ITEMS = 16
@@ -103,7 +160,6 @@ _MAX_INHERITED_CLASS_METHODS = 128
 _MAX_WILDCARD_IMPORTS = 16
 _MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
-_MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
 _MAX_TRUSTED_PTH_FILES = 64
 _MAX_TRUSTED_PTH_BYTES = 64 * 1024
 _MAX_TRUSTED_PTH_PATHS = 64
@@ -399,6 +455,13 @@ _IMPORT_RUNTIME_TYPES = tuple(
         )
     )
 )
+_SAFE_REMOVABLE_IMPORT_RUNTIME_TYPE_MEMBERS: Mapping[type[object], frozenset[str]] = MappingProxyType(
+    {PathFinder: frozenset({"find_distributions"})}
+)
+_IMPORT_RUNTIME_TYPE_MEMBER_REMOVED = 1
+_IMPORT_RUNTIME_TYPE_MEMBER_REAPPEARED = 2
+_IMPORT_RUNTIME_TYPE_MEMBER_STATE_LOCK = threading.RLock()
+_IMPORT_RUNTIME_REMOVABLE_TYPE_MEMBER_STATES: dict[tuple[type[object], str], int] = {}
 _IMPORT_RUNTIME_MODULE_SNAPSHOTS = (
     ("_imp", _imp, _module_namespace_snapshot(_imp)),
     (
@@ -504,12 +567,32 @@ def _namespace_matches_snapshot(
 
 
 def _type_namespace_matches_snapshot(
+    class_: type[object],
     namespace: Mapping[str, object],
     expected: Mapping[str, _RuntimeValueSnapshot],
 ) -> bool:
-    return _namespace_matches_snapshot(namespace, expected) and all(
-        name in expected or not _runtime_type_member_is_executable(value) for name, value in namespace.items()
-    )
+    safe_removals = _SAFE_REMOVABLE_IMPORT_RUNTIME_TYPE_MEMBERS.get(class_, frozenset())
+    with _IMPORT_RUNTIME_TYPE_MEMBER_STATE_LOCK:
+        for name, expected_value in expected.items():
+            state_key = (class_, name)
+            if name in safe_removals and name not in namespace:
+                if (
+                    _IMPORT_RUNTIME_REMOVABLE_TYPE_MEMBER_STATES.get(state_key)
+                    == _IMPORT_RUNTIME_TYPE_MEMBER_REAPPEARED
+                ):
+                    return False
+                _IMPORT_RUNTIME_REMOVABLE_TYPE_MEMBER_STATES[state_key] = _IMPORT_RUNTIME_TYPE_MEMBER_REMOVED
+                continue
+            if _IMPORT_RUNTIME_REMOVABLE_TYPE_MEMBER_STATES.get(state_key) == _IMPORT_RUNTIME_TYPE_MEMBER_REMOVED:
+                _IMPORT_RUNTIME_REMOVABLE_TYPE_MEMBER_STATES[state_key] = _IMPORT_RUNTIME_TYPE_MEMBER_REAPPEARED
+                return False
+            if (
+                name not in namespace
+                or namespace[name] is not expected_value[0]
+                or not _runtime_value_matches_snapshot(namespace[name], expected_value)
+            ):
+                return False
+    return all(name in expected or not _runtime_type_member_is_executable(value) for name, value in namespace.items())
 
 
 def _interpreter_import_runtime_is_trusted() -> bool:
@@ -533,7 +616,7 @@ def _interpreter_import_runtime_is_trusted() -> bool:
             return False
     for class_, expected_namespace in _IMPORT_RUNTIME_TYPE_SNAPSHOTS:
         namespace = type.__getattribute__(class_, "__dict__")
-        if not _type_namespace_matches_snapshot(namespace, expected_namespace):
+        if not _type_namespace_matches_snapshot(class_, namespace, expected_namespace):
             return False
     return True
 
@@ -1545,29 +1628,10 @@ def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunct
 
 
 @_register_source_sensitive_cache
-@lru_cache(maxsize=1)
-def _installed_package_distributions() -> Mapping[str, list[str]]:
-    try:
-        return packages_distributions()
-    except Exception:
-        return {}
-
-
-@_register_source_sensitive_cache
 @lru_cache(maxsize=256)
 def _installed_distribution_roots(top_level_name: str) -> tuple[Path, ...]:
     roots: list[Path] = []
-    distribution_names = _installed_package_distributions().get(top_level_name, ())
-    for distribution_name in distribution_names[:_MAX_DISTRIBUTIONS_PER_TOP_LEVEL]:
-        try:
-            installed_distribution = distribution(distribution_name)
-            metadata_location = getattr(installed_distribution, "_path", None)
-            if metadata_location is None:
-                continue
-            metadata_path = Path(str(metadata_location)).resolve()
-            root = Path(str(installed_distribution.locate_file(""))).resolve()
-        except Exception:
-            continue
+    for metadata_path, root in _STARTUP_DISTRIBUTION_ROOTS.get(top_level_name, ()):
         if not _path_is_in_trusted_package_environment(metadata_path):
             continue
         if root not in roots:
@@ -2923,7 +2987,7 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
                 return None
         spec = loaded_spec
     else:
-        if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
+        if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook(module_name):
             return None
         spec = standard_spec
     if spec is None:
@@ -3643,6 +3707,240 @@ def _meta_path_finder_resolution_identity(finder: object) -> str:
     return _pytest_assertion_rewrite_identity(finder) or _import_hook_identity(finder)
 
 
+def _read_exact_file_descriptor(file_descriptor: int, size: int) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(file_descriptor, remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=32)
+def _read_bounded_zipimport_names(
+    archive: str,
+    expected_identity: tuple[int, int, int, int, int, int],
+) -> frozenset[str] | None:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        file_descriptor = os.open(archive, flags)
+    except OSError:
+        return None
+    try:
+        before = os.fstat(file_descriptor)
+        if (
+            _stat_identity(before) != expected_identity
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_size < _ZIP_END_RECORD_SIZE
+            or before.st_size > _MAX_ZIPIMPORT_ARCHIVE_BYTES
+        ):
+            return None
+
+        tail_size = min(before.st_size, _ZIP_END_RECORD_SIZE + _ZIP_MAX_COMMENT_BYTES)
+        os.lseek(file_descriptor, before.st_size - tail_size, os.SEEK_SET)
+        tail = _read_exact_file_descriptor(file_descriptor, tail_size)
+        if tail is None:
+            return None
+
+        search_end = len(tail)
+        directory: tuple[int, int, int] | None = None
+        while search_end:
+            end_offset = tail.rfind(b"PK\x05\x06", 0, search_end)
+            if end_offset < 0:
+                return None
+            search_end = end_offset
+            record_end = end_offset + _ZIP_END_RECORD_SIZE
+            if record_end > len(tail):
+                continue
+            disk_number = int.from_bytes(tail[end_offset + 4 : end_offset + 6], "little")
+            central_directory_disk = int.from_bytes(tail[end_offset + 6 : end_offset + 8], "little")
+            entries_on_disk = int.from_bytes(tail[end_offset + 8 : end_offset + 10], "little")
+            entry_count = int.from_bytes(tail[end_offset + 10 : end_offset + 12], "little")
+            central_directory_size = int.from_bytes(tail[end_offset + 12 : end_offset + 16], "little")
+            central_directory_offset = int.from_bytes(tail[end_offset + 16 : end_offset + 20], "little")
+            comment_size = int.from_bytes(tail[end_offset + 20 : record_end], "little")
+            if record_end + comment_size > len(tail):
+                continue
+            if (
+                disk_number != 0
+                or central_directory_disk != 0
+                or entries_on_disk != entry_count
+                or entry_count > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+                or entry_count == 0xFFFF
+                or central_directory_size > _MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES
+                or central_directory_size == 0xFFFFFFFF
+                or central_directory_offset == 0xFFFFFFFF
+            ):
+                return None
+            absolute_end_offset = before.st_size - tail_size + end_offset
+            central_directory_start = absolute_end_offset - central_directory_size
+            if central_directory_start < central_directory_offset or central_directory_start < 0:
+                return None
+            directory = central_directory_start, central_directory_size, entry_count
+            break
+        if directory is None:
+            return None
+
+        central_directory_start, central_directory_size, expected_entries = directory
+        os.lseek(file_descriptor, central_directory_start, os.SEEK_SET)
+        central_directory = _read_exact_file_descriptor(file_descriptor, central_directory_size)
+        if central_directory is None:
+            return None
+
+        names: set[str] = set()
+        position = 0
+        entry_count = 0
+        while position < len(central_directory):
+            signature = central_directory[position : position + 4]
+            if signature == b"PK\x01\x02":
+                if position + _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE > len(central_directory):
+                    return None
+                general_flags = int.from_bytes(central_directory[position + 8 : position + 10], "little")
+                name_size = int.from_bytes(central_directory[position + 28 : position + 30], "little")
+                extra_size = int.from_bytes(central_directory[position + 30 : position + 32], "little")
+                comment_size = int.from_bytes(central_directory[position + 32 : position + 34], "little")
+                next_position = position + _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE + name_size + extra_size + comment_size
+                if next_position > len(central_directory):
+                    return None
+                raw_name = central_directory[
+                    position + _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE : position
+                    + _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE
+                    + name_size
+                ]
+                try:
+                    name = raw_name.decode("utf-8" if general_flags & 0x800 else "cp437")
+                except UnicodeDecodeError:
+                    return None
+                if "\x00" in name:
+                    return None
+                names.add(name.replace("\\", "/"))
+                position = next_position
+                entry_count += 1
+                if entry_count > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
+                    return None
+                continue
+            if signature == b"PK\x05\x05" and entry_count == expected_entries:
+                if position + 6 > len(central_directory):
+                    return None
+                signature_size = int.from_bytes(central_directory[position + 4 : position + 6], "little")
+                position += 6 + signature_size
+                break
+            return None
+        after = os.fstat(file_descriptor)
+        try:
+            path_stat = os.stat(archive)
+        except OSError:
+            return None
+        if _stat_identity(before) != _stat_identity(after) or _stat_identity(after) != _stat_identity(path_stat):
+            return None
+        if position != len(central_directory) or entry_count != expected_entries:
+            return None
+        return frozenset(names)
+    except OSError:
+        return None
+    finally:
+        os.close(file_descriptor)
+
+
+def _bounded_zipimport_names(archive: str) -> frozenset[str] | None:
+    try:
+        file_stat = os.stat(archive)
+    except OSError:
+        return None
+    if (
+        not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_size < _ZIP_END_RECORD_SIZE
+        or file_stat.st_size > _MAX_ZIPIMPORT_ARCHIVE_BYTES
+    ):
+        return None
+    return _read_bounded_zipimport_names(archive, _stat_identity(file_stat))
+
+
+def _cached_zipimporter_state(
+    finder: object,
+    cache_key: str,
+) -> tuple[str, str, dict[str, object]] | None:
+    if (
+        type(finder) is not zipimporter
+        or not _interpreter_import_runtime_is_trusted()
+        or not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS)
+    ):
+        return None
+    try:
+        instance_state = object.__getattribute__(finder, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    if type(instance_state) is not dict or not set(instance_state) <= {"_files", "archive", "prefix"}:
+        return None
+    archive = dict.get(instance_state, "archive")
+    prefix = dict.get(instance_state, "prefix")
+    files = dict.get(instance_state, "_files")
+    if (
+        type(archive) is not str
+        or type(prefix) is not str
+        or type(files) is not dict
+        or len(files) > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        or any(type(name) is not str for name in dict.keys(files))
+    ):
+        return None
+    normalized_prefix = prefix.replace("\\", "/")
+    prefix_parts = tuple(part for part in normalized_prefix.split("/") if part)
+    if normalized_prefix.startswith("/") or any(part in {".", ".."} for part in prefix_parts):
+        return None
+    expected_entry = os.path.join(archive, *prefix_parts)
+    if os.path.normcase(os.path.abspath(expected_entry)) != os.path.normcase(os.path.abspath(cache_key)):
+        return None
+    return archive, "/".join(prefix_parts), cast(dict[str, object], files)
+
+
+def _cached_standard_zipimporter_target_is_absent(
+    finder: object,
+    cache_key: str,
+    module_name: str,
+) -> bool | None:
+    parts = module_name.split(".")
+    if not parts or any(not part or "/" in part or "\\" in part for part in parts):
+        return None
+    state = _cached_zipimporter_state(finder, cache_key)
+    if state is None:
+        return None
+    archive, prefix, files = state
+    archive_names = _bounded_zipimport_names(archive)
+    if archive_names is None:
+        return None
+    base = "/".join(part for part in (prefix, parts[-1]) if part)
+    exact_candidates = {
+        f"{base}.py",
+        f"{base}.pyc",
+        f"{base}/__init__.py",
+        f"{base}/__init__.pyc",
+    }
+    namespace_prefix = f"{base}/"
+
+    def contains_target(names: Iterable[str]) -> bool:
+        return any(
+            (normalized := name.replace("\\", "/")) in exact_candidates or normalized.startswith(namespace_prefix)
+            for name in names
+        )
+
+    return not contains_target(archive_names) and not contains_target(cast(Iterable[str], dict.keys(files)))
+
+
 def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
     try:
         instance_state = object.__getattribute__(finder, "__dict__")
@@ -3651,7 +3949,10 @@ def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
     if not isinstance(instance_state, dict):
         return False
     if type(finder) is zipimporter:
-        if not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
+        if not _interpreter_import_runtime_is_trusted() or not _path_importer_methods_are_trusted(
+            zipimporter,
+            _TRUSTED_ZIPIMPORTER_METHODS,
+        ):
             return False
         try:
             expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
@@ -3679,14 +3980,22 @@ def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
     )
 
 
-def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
+def _search_path_has_untrusted_importer(search_path: Iterable[str], module_name: str | None = None) -> bool:
     path_importer_cache = _runtime_path_importer_cache_without_hooks()
     if path_importer_cache is None or type(search_path) not in {list, tuple}:
         return True
     for entry in search_path:
         cache_key = entry or os.getcwd()
         finder = dict.get(path_importer_cache, cache_key)
-        if finder is not None and not _is_trusted_standard_path_importer(finder, cache_key):
+        if finder is None:
+            continue
+        if module_name is not None and type(finder) is zipimporter:
+            target_is_absent = _cached_standard_zipimporter_target_is_absent(finder, cache_key, module_name)
+            if target_is_absent is None:
+                return True
+            if target_is_absent:
+                continue
+        if not _is_trusted_standard_path_importer(finder, cache_key):
             return True
     return False
 
@@ -4343,7 +4652,7 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
     if interpreter_origin is not None:
         return None
 
-    if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
+    if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook(module_name):
         return None
 
     return _find_standard_filesystem_spec(module_name)
@@ -4460,6 +4769,19 @@ def _current_module_source_path(module_name: str) -> str | None:
 
 
 def _zipimport_archive_path(entry: str) -> Path | None:
+    if not _interpreter_import_runtime_is_trusted() or not _path_importer_methods_are_trusted(
+        zipimporter,
+        _TRUSTED_ZIPIMPORTER_METHODS,
+    ):
+        return None
+    path_importer_cache = _runtime_path_importer_cache_without_hooks()
+    if path_importer_cache is None:
+        return None
+    cache_key = entry or os.getcwd()
+    if dict.__contains__(path_importer_cache, cache_key):
+        finder = dict.__getitem__(path_importer_cache, cache_key)
+        state = _cached_zipimporter_state(finder, cache_key)
+        return Path(state[0]).absolute() if state is not None else None
     try:
         archive = zipimporter(entry).archive
     except (ImportError, OSError):
@@ -4581,18 +4903,18 @@ def _is_standard_path_hook(hook: object) -> bool:
     return _path_hook_resolution_identity(hook).startswith("trusted:")
 
 
-def _has_untrusted_path_hook() -> bool:
+def _has_untrusted_path_hook(module_name: str | None = None) -> bool:
     path_hooks = _runtime_path_hooks_without_hooks()
     search_path = _runtime_search_path_without_hooks()
     if path_hooks is None or search_path is None:
         return True
     if any(not _is_standard_path_hook(hook) for hook in path_hooks):
         return True
-    return _search_path_has_untrusted_importer(search_path)
+    return _search_path_has_untrusted_importer(search_path, module_name)
 
 
 def _find_standard_path_spec(module_name: str, search_path: list[str]) -> ModuleSpec | None:
-    if not _interpreter_import_runtime_is_trusted() or _search_path_has_untrusted_importer(search_path):
+    if not _interpreter_import_runtime_is_trusted() or _search_path_has_untrusted_importer(search_path, module_name):
         _mark_shared_source_snapshot_unreusable()
         return None
 
@@ -4603,6 +4925,16 @@ def _find_standard_path_spec(module_name: str, search_path: list[str]) -> Module
         (SourcelessFileLoader, BYTECODE_SUFFIXES),
     )
     for entry in search_path:
+        path_importer_cache = _runtime_path_importer_cache_without_hooks()
+        cache_key = entry or os.getcwd()
+        cached_finder = dict.get(path_importer_cache, cache_key) if path_importer_cache is not None else None
+        if type(cached_finder) is zipimporter:
+            target_is_absent = _cached_standard_zipimporter_target_is_absent(cached_finder, cache_key, module_name)
+            if target_is_absent is None:
+                _mark_shared_source_snapshot_unreusable()
+                return None
+            if target_is_absent:
+                continue
         try:
             zip_spec = zipimporter(entry).find_spec(module_name)
         except ImportError:
@@ -7651,7 +7983,7 @@ def _resolve_module_source(module_name: str) -> Path | None:
                 return loaded_source_path
         elif loaded_origin not in {"built-in", "frozen"}:
             return None
-    elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
+    elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook(module_name):
         return None
 
     spec_origin = None
