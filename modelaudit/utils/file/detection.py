@@ -5249,11 +5249,7 @@ def _detect_safetensors_content_route(path: Path | None, magic8: bytes, file_siz
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
     sample_is_prefix = len(sample) < file_size
-    pickle_state = _classify_initial_pickle_security_signal(
-        sample,
-        sample_is_prefix=sample_is_prefix,
-        available_stream_length=file_size,
-    )
+    pickle_state = classify_safetensors_pickle_overlap_sample(sample, file_size=file_size)
     if pickle_state is None and header is not None:
         pickle_state = _classify_extended_initial_line_pickle_security_signal(path, file_size, sample)
     if (
@@ -5289,6 +5285,15 @@ def _detect_safetensors_content_route(path: Path | None, magic8: bytes, file_siz
     if pickle_state is None:
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     return "safetensors"
+
+
+def classify_safetensors_pickle_overlap_sample(sample: bytes, *, file_size: int) -> bool | None:
+    """Classify bounded SafeTensors bytes using the local pickle-overlap parser."""
+    return _classify_initial_pickle_security_signal(
+        sample,
+        sample_is_prefix=len(sample) < file_size,
+        available_stream_length=file_size,
+    )
 
 
 def _resolve_safetensors_flax_overlap(path: Path) -> str | None:
