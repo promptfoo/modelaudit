@@ -8,12 +8,11 @@ on:
       - "**.rst"
       - "LICENSE*"
       - ".github/workflows/docs-check.yml"
-  merge_group:
-    types:
-      - checks_requested
   push:
     branches:
       - main
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
@@ -340,6 +339,7 @@ jobs:
   type-check:
     name: Type Check
     needs: changes
+    # Only run if Python files changed
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -390,7 +390,9 @@ jobs:
   quick-feedback:
     name: Quick Feedback (Python 3.12)
     needs: changes
-    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    # PR-only: main and merge_group runs already execute the Python 3.12 fast
+    # suite via the sharded compatibility matrix and coverage jobs below.
+    if: github.event_name == 'pull_request' && (needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true')
     runs-on: ubuntu-latest
     # The full fast suite can approach 40 minutes on hosted runners when the
     # bounded-replay security regressions land on the long-running worker.
@@ -434,11 +436,15 @@ jobs:
           uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
 
   windows-tests:
-    name: Windows Tests (Python 3.11)
+    name: Windows Tests (Python 3.11, Shard ${{ matrix.shard-name }})
     needs: changes
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: windows-latest
     timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"shard-count":2,"shard-index":0,"shard-name":"1/2"},{"shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -460,24 +466,28 @@ jobs:
           uv sync --extra all-ci-windows
 
       - name: Run fast tests with fail-fast
+        if: github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'
         run: |
-          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
+          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
+
+      - name: Run exhaustive fast-test shard
+        if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'
+        run: |
+          uv run pytest tests -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
 
   test:
-    name: Test Python ${{ matrix.python-version }}
+    name: Fast Tests (Python ${{ matrix.python-version }}, Shard ${{ matrix.shard-name }})
     needs: changes
+    # Only run if Python files changed
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    # Coverage runs in dedicated shards below. Keep enough time here for the
-    # full uninstrumented matrix and the Python 3.12 slow/integration step.
+    # Coverage runs in dedicated shards below, and the Python 3.12
+    # slow/integration/performance suite now runs in a separate parallel job.
     timeout-minutes: 75
     strategy:
+      fail-fast: false
       matrix:
-        # For PRs, only test min and max Python versions to save time
-        # For main branch, test all versions
-        # Note: Python 3.10+ supported (see pyproject.toml)
-        # Python 3.10 gets NumPy 1.x, Python 3.11+ gets NumPy 2.x
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
+        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"python-version":"3.10","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.13","shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"python-version":"3.10","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.10","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.11","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.11","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.12","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.12","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.13","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.13","shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -512,49 +522,73 @@ jobs:
         run: |
           uv sync --extra all-ci
 
-      - name: Run fast tests with fail-fast (PRs)
-        if: github.event_name == 'pull_request'
+      - name: Run fast tests with fail-fast
+        if: github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'
         run: |
-          echo "MODELAUDIT_PYTHON_TEST_JOB_RAN=1" >> "$GITHUB_ENV"
-          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+          uv run pytest tests -x --maxfail=1 -n auto \
+            -m "not slow and not integration and not performance" \
+            --modelaudit-shard-count ${{ matrix.shard-count }} \
+            --modelaudit-shard-index ${{ matrix.shard-index }} \
+            --tb=short --durations=15
 
-      - name: Run slow/integration tests on PR (if labeled)
-        # Run slow tests on PRs when the 'run-slow-tests' label is added
-        # This allows developers to validate slow tests before merging
-        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests') && matrix.python-version == '3.12'
-        timeout-minutes: 20
+      - name: Run exhaustive fast-test shard
+        if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'
         run: |
-          echo "Running slow/integration tests due to 'run-slow-tests' label"
-          echo "MODELAUDIT_PYTHON_TEST_JOB_RAN=1" >> "$GITHUB_ENV"
+          uv run pytest tests -n auto \
+            -m "not slow and not integration and not performance" \
+            --modelaudit-shard-count ${{ matrix.shard-count }} \
+            --modelaudit-shard-index ${{ matrix.shard-index }} \
+            --tb=short --durations=15
+
+  slow-tests:
+    name: Slow/Integration Tests (Python 3.12)
+    needs: changes
+    if: needs.changes.outputs.integration == 'true' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Python dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-py3.12-
+            ${{ runner.os }}-uv-
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci
+
+      - name: Run slow, integration, and performance tests
+        run: |
           uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
-
-      - name: Run fast tests (integration event)
-        if: needs.changes.outputs.integration == 'true'
-        run: |
-          echo "MODELAUDIT_PYTHON_TEST_JOB_RAN=1" >> "$GITHUB_ENV"
-          uv run pytest tests -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
-
-      - name: Run slow/integration tests (integration event only)
-        # Run ALL slow/integration/performance tests for exact integration SHAs.
-        # Tests with missing dependencies auto-skip via pytest.importorskip() or framework markers.
-        # Runs on Python 3.12 only to keep CI time reasonable.
-        if: needs.changes.outputs.integration == 'true' && matrix.python-version == '3.12'
-        timeout-minutes: 20
-        run: |
-          # Run all slow, integration, and performance tests
-          echo "MODELAUDIT_PYTHON_TEST_JOB_RAN=1" >> "$GITHUB_ENV"
-          uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
-
-      - name: Verify Python test command ran
-        if: always()
-        run: |
-          test "${MODELAUDIT_PYTHON_TEST_JOB_RAN:-}" = "1"
 
   coverage:
     name: Coverage (${{ matrix.shard }})
     needs: changes
-    # Prove workflow changes on their PR, but fail closed on exact integration
-    # SHAs even when merge_group path classification is unavailable.
+    # Prove workflow changes on their PR, but avoid adding the expensive
+    # sharded coverage gate to ordinary Python PRs.
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'
     permissions:
       contents: read
@@ -566,7 +600,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -605,7 +639,7 @@ jobs:
         run: |
           uv run pytest tests -n auto \
             -m "not slow and not integration and not performance" \
-            --modelaudit-shard-count 5 --modelaudit-shard-index ${{ matrix.shard }} \
+            --modelaudit-shard-count 10 --modelaudit-shard-index ${{ matrix.shard }} \
             --cov=modelaudit --cov-report=xml:coverage.xml --tb=short --durations=15
           test -s coverage.xml
 
@@ -622,6 +656,7 @@ jobs:
   test-numpy-compatibility:
     name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
     needs: changes
+    # Only run on main branch or if dependencies changed
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -694,6 +729,7 @@ jobs:
   test-vendored-protos:
     name: Test Vendored TensorFlow Protos
     needs: changes
+    # Run on main branch or if Python/dependency files changed
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -754,6 +790,7 @@ jobs:
   test-proto-reproducibility:
     name: Verify Vendored Proto Reproducibility
     needs: changes
+    # Only run on main or when proto-related files change
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -801,6 +838,7 @@ jobs:
   test-extras-smoke:
     name: Extras Smoke Test (${{ matrix.extra }})
     needs: changes
+    # Only run on main or when dependencies change
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -856,6 +894,7 @@ jobs:
   build:
     name: Build and Package
     needs: changes
+    # Always build on main, otherwise only if Python/dependency/workflow files changed
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1080,6 +1119,7 @@ jobs:
         type-check,
         windows-tests,
         test,
+        slow-tests,
         coverage,
         test-numpy-compatibility,
         test-vendored-protos,
@@ -1112,6 +1152,7 @@ jobs:
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           TEST_RESULT="${{ needs.test.result }}"
+          SLOW_RESULT="${{ needs.slow-tests.result }}"
           COVERAGE_RESULT="${{ needs.coverage.result }}"
           NUMPY_RESULT="${{ needs.test-numpy-compatibility.result }}"
           PROTOS_RESULT="${{ needs.test-vendored-protos.result }}"
@@ -1123,14 +1164,16 @@ jobs:
 
           # Check if conditional jobs should have run
           INTEGRATION_EVENT="${{ needs.changes.outputs.integration }}"
-          EXPECT_CORE_PYTHON="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true' }}"
+          EXPECT_QUICK_FEEDBACK="${{ github.event_name == 'pull_request' && (needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true') }}"
+          EXPECT_CORE_FAST="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true' }}"
+          EXPECT_SLOW="${{ needs.changes.outputs.integration == 'true' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests')) }}"
           EXPECT_DEPENDENCY_AUDIT="${{ github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true') }}"
           EXPECT_DEPENDENCY_SURFACE="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' }}"
           EXPECT_OPTIONAL_DEPENDENCY_LANES="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' }}"
-          EXPECT_COVERAGE="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true' }}"
+          EXPECT_VENDORED_PROTOS="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' }}"
           EXPECT_BUILD="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' }}"
           EXPECT_PICKLESCAN="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true' }}"
-          EXPECT_VENDORED_PROTOS="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' }}"
+          EXPECT_COVERAGE="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true' }}"
           echo "Job results:"
           echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
@@ -1140,6 +1183,7 @@ jobs:
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
+          echo "  slow-tests: $SLOW_RESULT"
           echo "  coverage: $COVERAGE_RESULT"
           echo "  test-numpy-compatibility: $NUMPY_RESULT"
           echo "  test-vendored-protos: $PROTOS_RESULT"
@@ -1150,26 +1194,29 @@ jobs:
           echo "  changes: $CHANGES_RESULT"
           echo "Expected job groups:"
           echo "  integration-event: $INTEGRATION_EVENT"
-          echo "  core-python: $EXPECT_CORE_PYTHON"
+          echo "  quick-feedback: $EXPECT_QUICK_FEEDBACK"
+          echo "  core-fast: $EXPECT_CORE_FAST"
+          echo "  slow-tests: $EXPECT_SLOW"
           echo "  dependency-audit: $EXPECT_DEPENDENCY_AUDIT"
           echo "  dependency-surface: $EXPECT_DEPENDENCY_SURFACE"
           echo "  optional-dependency-lanes: $EXPECT_OPTIONAL_DEPENDENCY_LANES"
-          echo "  coverage: $EXPECT_COVERAGE"
+          echo "  vendored-protos: $EXPECT_VENDORED_PROTOS"
           echo "  build: $EXPECT_BUILD"
           echo "  picklescan: $EXPECT_PICKLESCAN"
-          echo "  vendored-protos: $EXPECT_VENDORED_PROTOS"
+          echo "  coverage: $EXPECT_COVERAGE"
 
           FAILED=false
 
           [[ "$CHANGES_RESULT" == "success" ]] || FAILED=true
-          require_success "$EXPECT_CORE_PYTHON" "$QUICK_FEEDBACK_RESULT" "quick-feedback"
-          require_success "$EXPECT_CORE_PYTHON" "$LINT_RESULT" "lint"
+          require_success "$EXPECT_QUICK_FEEDBACK" "$QUICK_FEEDBACK_RESULT" "quick-feedback"
+          require_success "$EXPECT_CORE_FAST" "$LINT_RESULT" "lint"
           require_success "$EXPECT_DEPENDENCY_AUDIT" "$DEPENDENCY_AUDIT_RESULT" "dependency-audit"
           require_success "$EXPECT_DEPENDENCY_SURFACE" "$LICENSE_RESULT" "license-check"
           require_success "$EXPECT_DEPENDENCY_SURFACE" "$UV_LOCK_RESULT" "uv-lock-check"
-          require_success "$EXPECT_CORE_PYTHON" "$TYPE_CHECK_RESULT" "type-check"
-          require_success "$EXPECT_CORE_PYTHON" "$WINDOWS_RESULT" "windows-tests"
-          require_success "$EXPECT_CORE_PYTHON" "$TEST_RESULT" "test"
+          require_success "$EXPECT_CORE_FAST" "$TYPE_CHECK_RESULT" "type-check"
+          require_success "$EXPECT_CORE_FAST" "$WINDOWS_RESULT" "windows-tests"
+          require_success "$EXPECT_CORE_FAST" "$TEST_RESULT" "test"
+          require_success "$EXPECT_SLOW" "$SLOW_RESULT" "slow-tests"
           require_success "$EXPECT_COVERAGE" "$COVERAGE_RESULT" "coverage"
           require_success "$EXPECT_OPTIONAL_DEPENDENCY_LANES" "$NUMPY_RESULT" "test-numpy-compatibility"
           require_success "$EXPECT_VENDORED_PROTOS" "$PROTOS_RESULT" "test-vendored-protos"
