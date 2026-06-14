@@ -155,6 +155,7 @@ def pytest_runtest_setup(item):
             "test_sarif_redaction.py",  # SARIF exported source credential-redaction regressions
             "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_dependency_lock.py",  # Security-sensitive uv.lock dependency guardrails
+            "test_perf_workflow.py",  # GitHub Actions workflow contract tests
             "test_bug1_confidence_exploit.py",  # Security bug test
             "test_gguf_scanner.py",  # GGUF scanner tests
             "test_jax_checkpoint_scanner.py",  # JAX checkpoint scanner tests

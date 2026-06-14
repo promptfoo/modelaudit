@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, cast
@@ -29,6 +31,13 @@ def _load_workflow(filename: str) -> dict[str, Any]:
 
 def _load_perf_workflow() -> dict[str, Any]:
     return _load_workflow("perf.yml")
+
+
+def _workflow_triggers(workflow: dict[str, Any]) -> dict[str, Any]:
+    raw_workflow = cast(dict[Any, Any], workflow)
+    triggers = raw_workflow.get("on", raw_workflow.get(True))
+    assert isinstance(triggers, dict)
+    return triggers
 
 
 def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -64,6 +73,21 @@ def _node_script(step: dict[str, Any]) -> str:
     assert run.startswith(prefix)
     assert run.endswith(suffix)
     return run[len(prefix) : -len(suffix)]
+
+
+def _matrix_options(expression: str) -> list[Any]:
+    matches = re.findall(r"fromJSON\('([^']+)'\)", expression)
+    assert matches
+    return [json.loads(match) for match in matches]
+
+
+def _load_tests_conftest_module() -> Any:
+    conftest_path = Path(__file__).resolve().parent / "conftest.py"
+    spec = importlib.util.spec_from_file_location("modelaudit_tests_conftest", conftest_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -389,27 +413,200 @@ def test_dependency_audit_runs_for_source_reachability_changes() -> None:
     assert "needs.changes.outputs.picklescan == 'true'" in condition
 
 
+def test_python_ci_sharder_assigns_each_nodeid_to_exactly_one_shard() -> None:
+    conftest_module = _load_tests_conftest_module()
+    nodeids = [
+        "tests/test_alpha.py::test_one",
+        "tests/test_alpha.py::test_two[param]",
+        "tests/test_beta.py::TestSuite::test_three",
+        "tests/test_gamma.py::test_four",
+        "tests/test_delta.py::test_five",
+        "tests/test_epsilon.py::test_six",
+    ]
+
+    for shard_count in (2, 10):
+        shard_members: dict[int, set[str]] = {index: set() for index in range(shard_count)}
+        for nodeid in nodeids:
+            shard_index = conftest_module._nodeid_shard(nodeid, shard_count)
+            assert 0 <= shard_index < shard_count
+            assert conftest_module._nodeid_shard(nodeid, shard_count) == shard_index
+            shard_members[shard_index].add(nodeid)
+
+        assert set().union(*shard_members.values()) == set(nodeids)
+        assert sum(len(members) for members in shard_members.values()) == len(nodeids)
+
+
+def test_python_ci_triggers_merge_group_and_cancels_superseded_main_runs() -> None:
+    workflow = _load_workflow("test.yml")
+    triggers = _workflow_triggers(workflow)
+
+    assert triggers["push"] == {"branches": ["main"]}
+    assert triggers["merge_group"] == {"types": ["checks_requested"]}
+
+    concurrency = workflow["concurrency"]
+    assert isinstance(concurrency, dict)
+    assert concurrency["group"] == "${{ github.workflow }}-${{ github.ref }}"
+    assert concurrency["cancel-in-progress"] == (
+        "${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}"
+    )
+
+
+def test_python_ci_keeps_quick_feedback_pr_only() -> None:
+    workflow = _load_workflow("test.yml")
+    quick_feedback_job = _jobs(workflow)["quick-feedback"]
+    assert isinstance(quick_feedback_job, dict)
+    assert quick_feedback_job["if"] == (
+        "github.event_name == 'pull_request' && "
+        "(needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true')"
+    )
+
+
+def test_python_ci_fast_linux_matrix_proves_main_shards_without_expanding_ordinary_prs() -> None:
+    workflow = _load_workflow("test.yml")
+    test_job = _jobs(workflow)["test"]
+    assert isinstance(test_job, dict)
+    assert test_job["if"] == (
+        "github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || "
+        "needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'"
+    )
+
+    matrix_options = _matrix_options(test_job["strategy"]["matrix"]["include"])
+    assert matrix_options == [
+        [
+            {"python-version": "3.10", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
+            {"python-version": "3.13", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
+        ],
+        [
+            {
+                "python-version": python_version,
+                "shard-count": 2,
+                "shard-index": shard_index,
+                "shard-name": f"{shard_index + 1}/2",
+            }
+            for python_version in ("3.10", "3.11", "3.12", "3.13")
+            for shard_index in (0, 1)
+        ],
+    ]
+
+    steps = test_job["steps"]
+    assert isinstance(steps, list)
+    fail_fast_step = _step_by_name(steps, "Run fast tests with fail-fast")
+    assert fail_fast_step["if"] == ("github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'")
+    fail_fast_run = fail_fast_step["run"]
+    assert "--maxfail=1" in fail_fast_run
+    assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in fail_fast_run
+    assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in fail_fast_run
+
+    exhaustive_step = _step_by_name(steps, "Run exhaustive fast-test shard")
+    assert exhaustive_step["if"] == ("github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'")
+    exhaustive_run = exhaustive_step["run"]
+    assert "--maxfail=1" not in exhaustive_run
+    assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in exhaustive_run
+    assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in exhaustive_run
+    assert '-m "not slow and not integration and not performance"' in exhaustive_run
+
+
+def test_python_ci_windows_matrix_shards_main_and_workflow_prs() -> None:
+    workflow = _load_workflow("test.yml")
+    windows_job = _jobs(workflow)["windows-tests"]
+    assert isinstance(windows_job, dict)
+    assert windows_job["if"] == (
+        "github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || "
+        "needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'"
+    )
+
+    matrix_options = _matrix_options(windows_job["strategy"]["matrix"]["include"])
+    assert matrix_options == [
+        [{"shard-count": 1, "shard-index": 0, "shard-name": "1/1"}],
+        [
+            {"shard-count": 2, "shard-index": 0, "shard-name": "1/2"},
+            {"shard-count": 2, "shard-index": 1, "shard-name": "2/2"},
+        ],
+    ]
+
+    steps = windows_job["steps"]
+    assert isinstance(steps, list)
+    fail_fast_step = _step_by_name(steps, "Run fast tests with fail-fast")
+    assert fail_fast_step["if"] == ("github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'")
+    fail_fast_run = fail_fast_step["run"]
+    assert "--maxfail=1" in fail_fast_run
+    assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in fail_fast_run
+    assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in fail_fast_run
+
+    exhaustive_step = _step_by_name(steps, "Run exhaustive fast-test shard")
+    assert exhaustive_step["if"] == ("github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'")
+    exhaustive_run = exhaustive_step["run"]
+    assert "--maxfail=1" not in exhaustive_run
+    assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in exhaustive_run
+    assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in exhaustive_run
+
+
+def test_python_ci_runs_slow_suite_in_a_separate_job() -> None:
+    workflow = _load_workflow("test.yml")
+    jobs = _jobs(workflow)
+
+    slow_job = jobs["slow-tests"]
+    assert isinstance(slow_job, dict)
+    assert slow_job["if"] == (
+        "github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || "
+        "(github.event_name == 'pull_request' && "
+        "(needs.changes.outputs.workflows == 'true' || "
+        "contains(github.event.pull_request.labels.*.name, 'run-slow-tests')))"
+    )
+    slow_steps = slow_job["steps"]
+    assert isinstance(slow_steps, list)
+    assert (
+        '-m "slow or integration or performance"'
+        in _step_by_name(
+            slow_steps,
+            "Run slow, integration, and performance tests",
+        )["run"]
+    )
+
+    fast_steps = jobs["test"]["steps"]
+    assert isinstance(fast_steps, list)
+    fast_step_names = {step.get("name") for step in fast_steps}
+    assert "Run slow/integration tests on PR (if labeled)" not in fast_step_names
+    assert "Run slow/integration tests (main branch only)" not in fast_step_names
+
+
 def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     workflow = _load_workflow("test.yml")
     jobs = _jobs(workflow)
 
     coverage_job = jobs["coverage"]
     assert isinstance(coverage_job, dict)
-    assert coverage_job["if"] == ("github.ref == 'refs/heads/main' || needs.changes.outputs.workflows == 'true'")
+    assert coverage_job["if"] == (
+        "github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || "
+        "needs.changes.outputs.workflows == 'true'"
+    )
     assert coverage_job["permissions"] == {"contents": "read", "id-token": "write"}
-    assert coverage_job["strategy"]["matrix"]["shard"] == [0, 1, 2, 3, 4]
+    assert coverage_job["strategy"]["matrix"]["shard"] == list(range(10))
     coverage_steps = coverage_job["steps"]
     assert isinstance(coverage_steps, list)
+    coverage_run = _step_by_name(coverage_steps, "Run branch coverage shard")["run"]
+    assert "--modelaudit-shard-count 10" in coverage_run
+    assert "--modelaudit-shard-index ${{ matrix.shard }}" in coverage_run
+    assert "--cov-report=xml:coverage.xml" in coverage_run
+    assert "test -s coverage.xml" in coverage_run
     upload_step = _step_by_name(coverage_steps, "Upload coverage to Codecov")
     assert upload_step["uses"] == "codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f"
     assert upload_step["with"]["fail_ci_if_error"] is True
     assert upload_step["with"]["use_oidc"] is True
+    assert upload_step["with"]["files"] == "./coverage.xml"
 
     ci_success_job = jobs["ci-success"]
     assert isinstance(ci_success_job, dict)
     assert "coverage" in ci_success_job["needs"]
+    assert "slow-tests" in ci_success_job["needs"]
     ci_success_steps = ci_success_job["steps"]
     assert isinstance(ci_success_steps, list)
     gate_script = _step_by_name(ci_success_steps, "Check if all jobs succeeded")["run"]
-    assert 'if [[ "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then' in gate_script
+    assert (
+        'if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then'
+        in gate_script
+    )
     assert '[[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true' in gate_script
+    assert '[[ "$TEST_RESULT" != "success" ]] && FAILED=true' in gate_script
+    assert '[[ "$WINDOWS_RESULT" != "success" ]] && FAILED=true' in gate_script
+    assert '[[ "$SLOW_RESULT" != "success" ]] && FAILED=true' in gate_script
