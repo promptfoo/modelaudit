@@ -7856,21 +7856,10 @@ def scan_model_streaming(
                     **scan_kwargs,
                 }
                 safetensors_shard_match = ShardedModelDetector.match_safetensors_shard_filename(source_path.name)
-                trusted_stream_family_group = (
-                    _trusted_stream_shard_family_group(
-                        source_path,
-                        scan_path,
-                        shard_family_group,
-                        _trusted_shard_family_root,
-                    )
-                    if shard_family_group
-                    else None
-                )
                 source_safetensors_shard_info = (
                     ShardedModelDetector.detect_shards(
                         str(source_path),
                         index_search_root=stream_index_search_root,
-                        trusted_cross_parent_family=trusted_stream_family_group is not None,
                     )
                     if safetensors_shard_match is not None
                     else None
@@ -8097,7 +8086,6 @@ def scan_model_streaming(
                     post_scan_safetensors_shard_info = ShardedModelDetector.detect_shards(
                         str(source_path),
                         index_search_root=stream_index_search_root,
-                        trusted_cross_parent_family=trusted_stream_family_group is not None,
                     )
                     if post_scan_safetensors_shard_info != source_safetensors_shard_info:
                         scan_result = _preserve_findings_with_shard_boundary_failure(
