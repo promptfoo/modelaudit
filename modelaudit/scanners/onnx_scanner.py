@@ -1107,6 +1107,12 @@ def _onnx_tensor_expected_storage_nbytes(tensor: Any, *, onnx: Any) -> int:
     return num_elements * int(_tensor_data_type_to_np_dtype(data_type).itemsize)
 
 
+def _onnx_tensor_decoded_nbytes(tensor: Any) -> int:
+    return math.prod(int(dimension) for dimension in tensor.dims) * int(
+        _tensor_data_type_to_np_dtype(int(tensor.data_type)).itemsize
+    )
+
+
 @dataclass(frozen=True)
 class _OnnxWeightTransform:
     kind: str
@@ -2017,8 +2023,14 @@ def _build_onnx_weight_analysis_plan(
                                     return None, "unresolved_quantized_weight_scale"
                             else:
                                 post_bias_ops = {str(downstream.op_type) for downstream in downstream_consumers}
-                                if post_bias_ops <= {"Abs", "Relu", "Mul"} or (
-                                    post_bias_ops & {"Cast", "Identity"} and len(downstream_consumers) != 1
+                                canonical_gelu_fanout = len(downstream_consumers) == 2 and post_bias_ops == {
+                                    "Div",
+                                    "Mul",
+                                }
+                                if (
+                                    post_bias_ops & {"Abs", "Relu"}
+                                    or ("Mul" in post_bias_ops and not canonical_gelu_fanout)
+                                    or (post_bias_ops & {"Cast", "Identity"} and len(downstream_consumers) != 1)
                                 ):
                                     return None, "unresolved_quantized_weight_scale"
                                 if not post_bias_ops & {"Cast", "Identity"}:
@@ -2494,9 +2506,8 @@ def _build_onnx_weight_analysis_plan(
         try:
             if _onnx_tensor_uses_external_storage(tensor, onnx=onnx):
                 raise ValueError("external constant storage")
-            expected_bytes = _onnx_tensor_expected_storage_nbytes(tensor, onnx=onnx)
             inline_bytes = _onnx_inline_storage_nbytes(tensor)
-            estimated_bytes = max(expected_bytes, inline_bytes)
+            estimated_bytes = max(_onnx_tensor_decoded_nbytes(tensor), inline_bytes)
             proof_limit = _ONNX_GENERATED_VALUE_PROOF_MAX_BYTES
             if max_array_size is not None and max_array_size > 0:
                 proof_limit = min(proof_limit, max_array_size)

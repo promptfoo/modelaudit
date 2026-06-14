@@ -1815,7 +1815,17 @@ def create_dynamic_matmul_integer_bias_model(
     integer_op_boundary: str = "direct",
 ) -> Path:
     assert integer_op_boundary in {"direct", "function", "if_subgraph"}
-    assert post_bias_operator in {None, "Abs", "Cast", "Identity", "Relu", "dynamic_mul", "local_identity", "self_mul"}
+    assert post_bias_operator in {
+        None,
+        "Abs",
+        "Cast",
+        "Identity",
+        "Relu",
+        "dynamic_mul",
+        "dynamic_mul_with_transpose",
+        "local_identity",
+        "self_mul",
+    }
     weights = np.ones((100, 10), dtype=np.int8)
     weight_scale = np.ones(10, dtype=np.float32)
     if malicious:
@@ -1921,6 +1931,7 @@ def create_dynamic_matmul_integer_bias_model(
             bias_name="bias",
             output_name=bias_output,
         )
+    extra_outputs = []
     if post_bias_scale:
         post_bias_input = bias_output
         if post_bias_operator in {"Abs", "Identity", "Relu"}:
@@ -1929,9 +1940,12 @@ def create_dynamic_matmul_integer_bias_model(
         elif post_bias_operator == "Cast":
             nodes.append(helper.make_node("Cast", [post_bias_input], ["Y_post_bias"], to=TensorProto.FLOAT))
             post_bias_input = "Y_post_bias"
-        elif post_bias_operator == "dynamic_mul":
+        elif post_bias_operator in {"dynamic_mul", "dynamic_mul_with_transpose"}:
             inputs.append(helper.make_tensor_value_info("post_bias_gate", TensorProto.FLOAT, [1, 10]))
             nodes.append(helper.make_node("Mul", [post_bias_input, "post_bias_gate"], ["Y_post_bias"]))
+            if post_bias_operator == "dynamic_mul_with_transpose":
+                nodes.append(helper.make_node("Transpose", [post_bias_input], ["Y_dummy"], perm=[0, 1]))
+                extra_outputs.append(helper.make_tensor_value_info("Y_dummy", TensorProto.FLOAT, [1, 10]))
             post_bias_input = "Y_post_bias"
         elif post_bias_operator == "self_mul":
             nodes.append(helper.make_node("Mul", [post_bias_input, post_bias_input], ["Y_post_bias"]))
@@ -1961,6 +1975,7 @@ def create_dynamic_matmul_integer_bias_model(
         [
             helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10]),
             helper.make_tensor_value_info("Y_shape", TensorProto.INT64, [2]),
+            *extra_outputs,
         ],
         initializer=[
             onnx.numpy_helper.from_array(weights, name="W_quantized"),
@@ -8709,7 +8724,10 @@ class TestWeightDistributionSemantics:
         assert len(checks) == int(malicious)
         assert semantics["eligible"][0]["quantization_scale_factor_names"] == ["W_scale_0", "W_scale_1"]
 
-    @pytest.mark.parametrize("post_bias_operator", ["Abs", "Relu", "dynamic_mul", "self_mul", "local_identity"])
+    @pytest.mark.parametrize(
+        "post_bias_operator",
+        ["Abs", "Relu", "dynamic_mul", "dynamic_mul_with_transpose", "self_mul", "local_identity"],
+    )
     @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])
     def test_dynamic_matmul_integer_fails_closed_on_ambiguous_post_bias_consumers(
         self,
@@ -9199,6 +9217,38 @@ class TestWeightDistributionSemantics:
         assert result.success is False
         assert decoded_fill is False
         assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+
+    def test_constant_proof_reserves_packed_decoded_size_before_decode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_typed_constant_of_shape_weight_model(
+            tmp_path,
+            data_type=TensorProto.FLOAT16,
+            fill_value=0,
+        )
+        model = onnx.load(str(model_path))
+        fill = onnx.TensorProto(name="fill", data_type=TensorProto.INT4, dims=[4096], raw_data=b"\0" * 2048)
+        next(attribute for attribute in model.graph.node[0].attribute if attribute.name == "value").t.CopyFrom(fill)
+        onnx.save(model, str(model_path))
+        original_to_array = onnx.numpy_helper.to_array
+        decoded_fill = False
+
+        def recording_to_array(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal decoded_fill
+            decoded_fill |= tensor.name == "fill"
+            return original_to_array(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", recording_to_array)
+
+        result = OnnxScanner({"max_array_size": 3000}).scan(str(model_path))
+
+        assert result.success is False
+        assert decoded_fill is False
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {
+            "unresolved_initializer_lineage": 1
+        }
 
     @pytest.mark.parametrize(
         ("target_data_type", "expected_success"),
