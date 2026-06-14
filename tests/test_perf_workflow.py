@@ -401,6 +401,7 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     coverage_steps = coverage_job["steps"]
     assert isinstance(coverage_steps, list)
     upload_step = _step_by_name(coverage_steps, "Upload coverage to Codecov")
+    assert upload_step["uses"] == "codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f"
     assert upload_step["with"]["fail_ci_if_error"] is True
     assert upload_step["with"]["use_oidc"] is True
 
