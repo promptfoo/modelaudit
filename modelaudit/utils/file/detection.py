@@ -5437,6 +5437,7 @@ def _incomplete_pickle_security_route(
     explicit_protocol: bool,
     only_text_line_side_effects: bool,
     require_continuation: bool,
+    require_strong_continuation: bool,
     stream_start: int,
     pre_stack_inst: bool,
     security_events: list[tuple[int, str, bool]],
@@ -5451,6 +5452,11 @@ def _incomplete_pickle_security_route(
     if not meaningful_events:
         return None
     if require_continuation and only_text_line_side_effects:
+        return None
+    if require_strong_continuation and not any(
+        index > 0 and name not in _PICKLE_TEXT_LINE_SIDE_EFFECT_OPCODES
+        for index, name, _meaningful in meaningful_events
+    ):
         return None
     if decoded and not _decoded_pickle_events_are_meaningful(
         meaningful_events,
@@ -5479,6 +5485,7 @@ def _classify_bounded_pickle_candidate(
     embedded: bool,
     decoded: bool,
     require_continuation: bool,
+    require_strong_continuation: bool,
     budget: _LegalTextPickleCandidateBudget,
 ) -> str | None:
     """Classify one raw or decoded candidate with shared structural budgets."""
@@ -5504,6 +5511,7 @@ def _classify_bounded_pickle_candidate(
             explicit_protocol=protocol,
             only_text_line_side_effects=text_line_side_effects_only,
             require_continuation=require_continuation,
+            require_strong_continuation=require_strong_continuation,
             stream_start=stream_start,
             pre_stack_inst=pre_inst,
             security_events=events,
@@ -5690,12 +5698,19 @@ def _has_trivial_pickle_prefix(payload: bytes, start: int, end: int) -> bool:
     return start < end and all(value in _PICKLE_TRIVIAL_NO_ARGUMENT_PREFIX_BYTES for value in payload[start:end])
 
 
+def _has_structural_pickle_continuation(payload: bytes, offset: int) -> bool:
+    if offset >= len(payload):
+        return False
+    opcode = _PICKLE_OPCODE_BY_BYTE.get(payload[offset])
+    return opcode is not None and opcode.name not in _PICKLE_LINE_PAIR_OPCODES
+
+
 def _iter_pickle_candidate_offsets(
     payload: bytes,
     *,
     scan_embedded: bool,
     is_plain_text: bool,
-) -> Iterator[tuple[int, bool, bool, bool]]:
+) -> Iterator[tuple[int, bool, bool, bool, bool]]:
     seen: set[int] = set()
 
     def maybe_add(
@@ -5703,10 +5718,11 @@ def _iter_pickle_candidate_offsets(
         *,
         prevalidated: bool = False,
         require_continuation: bool = False,
-    ) -> Iterator[tuple[int, bool, bool, bool]]:
+        require_strong_continuation: bool = False,
+    ) -> Iterator[tuple[int, bool, bool, bool, bool]]:
         if offset not in seen and offset < len(payload) and payload[offset] in _PICKLE_OPCODE_BY_BYTE:
             seen.add(offset)
-            yield offset, prevalidated, require_continuation, False
+            yield offset, prevalidated, require_continuation, require_strong_continuation, False
 
     yield from maybe_add(0, prevalidated=_is_plausible_pickle_candidate(payload))
     if not scan_embedded:
@@ -5719,38 +5735,56 @@ def _iter_pickle_candidate_offsets(
         while line_start < offset and payload[line_start] in b" \t":
             line_start += 1
         has_trivial_prefix = _has_trivial_pickle_prefix(payload, line_start, offset)
-        if (
-            opcode_name in {"GLOBAL", "INST"}
+        adjacent_word_prefix = (
+            opcode_name in _PICKLE_LINE_PAIR_OPCODES
             and line_start < offset
             and payload[offset - 1] in b"3456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
             and not has_trivial_prefix
-        ):
-            continue
+        )
         require_continuation = offset > 0
         if opcode_name in _PICKLE_LINE_PAIR_OPCODES:
             first_line_end = payload.find(b"\n", offset + 1)
             second_line_end = payload.find(b"\n", first_line_end + 1)
+            if adjacent_word_prefix and all(
+                len(line) % 2 == 0 and _LEGAL_TEXT_HEX_CHUNK_RE.fullmatch(line) is not None
+                for line in (
+                    payload[line_start:first_line_end],
+                    payload[first_line_end + 1 : second_line_end],
+                )
+            ):
+                continue
             operands = (
                 payload[offset + 1 : first_line_end],
                 payload[first_line_end + 1 : second_line_end],
             )
-            require_continuation = require_continuation and all(
-                operand.isalpha() and operand.islower() for operand in operands
+            require_continuation = require_continuation and (
+                adjacent_word_prefix or all(operand.isalpha() and operand.islower() for operand in operands)
             )
+            if require_continuation and not _has_structural_pickle_continuation(payload, second_line_end + 1):
+                continue
         if (opcode_name in {"GLOBAL", "INST"} and line_start < offset) or (
             opcode_name == "PERSID" and has_trivial_prefix
         ):
-            yield from maybe_add(line_start, require_continuation=require_continuation)
+            yield from maybe_add(
+                line_start,
+                require_continuation=require_continuation,
+                require_strong_continuation=adjacent_word_prefix,
+            )
         if opcode_name == "GLOBAL" and line_start > 0:
             previous_line_end = line_start - 1
             previous_line_start = payload.rfind(b"\n", 0, previous_line_end) + 1
             while previous_line_start < previous_line_end and payload[previous_line_start] in b" \t":
                 previous_line_start += 1
-            yield from maybe_add(previous_line_start, require_continuation=require_continuation)
+            yield from maybe_add(
+                previous_line_start,
+                require_continuation=require_continuation,
+                require_strong_continuation=adjacent_word_prefix,
+            )
         yield from maybe_add(
             offset,
             prevalidated=True,
             require_continuation=require_continuation,
+            require_strong_continuation=adjacent_word_prefix,
         )
 
     if is_plain_text:
@@ -5762,7 +5796,7 @@ def _iter_pickle_candidate_offsets(
                 lookbehind_truncated = True
             if payload[candidate_start] in _PICKLE_CONTEXT_REQUIRED_SECURITY_OPCODE_BYTES:
                 if lookbehind_truncated:
-                    yield candidate_start, False, False, True
+                    yield candidate_start, False, False, False, True
                     return
                 for context_start in recent_line_starts:
                     yield from maybe_add(context_start)
@@ -5808,7 +5842,13 @@ def _bounded_pickle_candidate_route(
         if decoded
         else -1
     )
-    for offset, prevalidated, require_continuation, lookbehind_truncated in _iter_pickle_candidate_offsets(
+    for (
+        offset,
+        prevalidated,
+        require_continuation,
+        require_strong_continuation,
+        lookbehind_truncated,
+    ) in _iter_pickle_candidate_offsets(
         payload,
         scan_embedded=scan_embedded,
         is_plain_text=is_plain_text,
@@ -5848,6 +5888,7 @@ def _bounded_pickle_candidate_route(
             embedded=offset != 0,
             decoded=decoded and not exact_weak_decoded_stream,
             require_continuation=require_continuation,
+            require_strong_continuation=require_strong_continuation,
             budget=budget,
         )
         if route is not None:
@@ -5862,11 +5903,7 @@ def _decode_base64_route_token(token: bytes) -> bytes:
     return base64.b64decode(token + padding, altchars=b"-_", validate=True)
 
 
-def _normalized_alphabetic_base64_has_pickle_signal(token: bytes) -> bool:
-    try:
-        decoded = _decode_base64_route_token(token)
-    except (binascii.Error, ValueError):
-        return False
+def _decoded_alphabetic_base64_has_pickle_signal(decoded: bytes) -> bool:
     if _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(decoded) is not None:
         return True
     if not decoded:
@@ -5880,6 +5917,13 @@ def _normalized_alphabetic_base64_has_pickle_signal(token: bytes) -> bool:
         and len(decoded) >= suffix_offset
         and all(value == ord(".") or value in PROTO0_1_IGNORABLE_TRAILING_BYTES for value in decoded[suffix_offset:])
     )
+
+
+def _alphabetic_base64_has_pickle_signal(token: bytes) -> bool:
+    try:
+        return _decoded_alphabetic_base64_has_pickle_signal(_decode_base64_route_token(token))
+    except (binascii.Error, ValueError):
+        return False
 
 
 def _iter_encoded_route_tokens(
@@ -5903,7 +5947,7 @@ def _iter_encoded_route_tokens(
                 and encoded_line.isalpha()
             )
             if encoded_line != line and (
-                not normalized_alphabetic_prose or _normalized_alphabetic_base64_has_pickle_signal(encoded_line)
+                not normalized_alphabetic_prose or _alphabetic_base64_has_pickle_signal(encoded_line)
             ):
                 yield encoded_line
             if encoded_line == line or not normalized_alphabetic_prose or block_lines:
@@ -5986,6 +6030,13 @@ def _encoded_pickle_route(
             except (binascii.Error, ValueError):
                 continue
             if not decoded:
+                continue
+            if (
+                alphabetic_offset_zero_only
+                and b"=" not in token
+                and token.isalpha()
+                and not _decoded_alphabetic_base64_has_pickle_signal(decoded)
+            ):
                 continue
             if len(token) < general_minimum_length:
                 opcode = _PICKLE_OPCODE_BY_BYTE.get(decoded[0])
@@ -9724,10 +9775,10 @@ def _resolve_legal_text_sidecar_route(
     signature_model = _detect_content_routed_signature_model(file_path, file_size, prefix)
     if signature_model is not None:
         return signature_model
-    if huggingface_tokenizer_json_has_template_route_evidence(file_path, allow_renamed_path=True):
-        return "jinja2_template"
     if _could_be_content_routed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
+    if huggingface_tokenizer_json_has_template_route_evidence(file_path, allow_renamed_path=True):
+        return "jinja2_template"
     if not file_path.suffix:
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(
             read_magic_bytes(str(file_path), min(file_size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))

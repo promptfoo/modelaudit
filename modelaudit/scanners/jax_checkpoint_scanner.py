@@ -2142,16 +2142,23 @@ class JaxCheckpointScanner(BaseScanner):
         """Preserve template analysis for JAX-owned tokenizer/config JSON files."""
         if self.config.get(JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY) is True:
             return
-        if Path(path).name.lower() not in {
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "chat_template.json",
-            "generation_config.json",
-        }:
-            return
-        if Path(path).name.lower() == "tokenizer.json" and not huggingface_tokenizer_json_has_template_route_evidence(
-            path
+        filename = Path(path).name.lower()
+        template_evidence = huggingface_tokenizer_json_has_template_route_evidence(
+            path,
+            allow_renamed_path=True,
+        )
+        if (
+            filename
+            not in {
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "chat_template.json",
+                "generation_config.json",
+            }
+            and not template_evidence
         ):
+            return
+        if filename == "tokenizer.json" and not template_evidence:
             return
 
         from .jinja2_template_scanner import JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY, Jinja2TemplateScanner

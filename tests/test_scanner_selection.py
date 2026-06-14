@@ -692,6 +692,29 @@ def test_nested_legal_tokenizer_template_preserves_jinja_ownership(tmp_path: Pat
     )
 
 
+def test_nested_legal_jax_template_overlap_preserves_both_analyses(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "member"
+    extracted_member.write_bytes(
+        b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        b'"framework":"jax","orbax_version":"0.1.0",'
+        b'"payload":"jax.experimental.host_callback.call(os.system, \'id\')"}'
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        config={"cache_enabled": False, LOGICAL_SCAN_PATH_CONFIG_KEY: "LICENSE"},
+    )
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_embedded_pickle_helpers_honor_selection_policy(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt", malicious=True)
 
@@ -908,6 +931,11 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
             2,
             id="trivial-prefix-before-GLOBAL",
         ),
+        pytest.param(
+            b"MIT License\nAcposix\nsystem\n(S'id'\ntRApache License\n",
+            2,
+            id="non-opcode-prefix-before-GLOBAL",
+        ),
         pytest.param(b"MIT License\nNPid\n.", 2, id="trivial-prefix-before-PERSID"),
         pytest.param(
             _long_binpersid_lookbehind_in_legal_text(),
@@ -1077,6 +1105,10 @@ def test_scan_file_keeps_benign_encoded_execution_word_on_text_route(
         pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),
         pytest.param(b"MIT License\n" + (b"groups " * 4096), id="candidate-budget-groups-words"),
         pytest.param(
+            b"MIT License\n" + (b"copyright\nconditions\n" * 4096),
+            id="candidate-budget-global-word-lines",
+        ),
+        pytest.param(
             b"Permission is granted to users.\nPermission remains granted.\n",
             id="two-P-leading-prose-lines",
         ),
@@ -1099,6 +1131,10 @@ def test_scan_file_keeps_benign_encoded_execution_word_on_text_route(
         pytest.param(
             b"MIT License\nNcopyright\nconditions\ninclude\n",
             id="trivial-prefix-like-global-prose",
+        ),
+        pytest.param(
+            b"MIT License\nAcopyright\nconditions\ninclude\n",
+            id="non-opcode-prefix-like-global-prose",
         ),
         pytest.param(
             b"MIT License\nNPermission\nterms\n",

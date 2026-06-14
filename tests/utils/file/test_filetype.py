@@ -3995,6 +3995,11 @@ def test_next_buffer_callback_precedes_eof() -> None:
             id="trivial-prefix-before-GLOBAL",
         ),
         pytest.param(
+            b"MIT License\nAcposix\nsystem\n(S'id'\ntRApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="non-opcode-prefix-before-GLOBAL",
+        ),
+        pytest.param(
             b"MIT License\nNPid\n.",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="trivial-prefix-before-PERSID",
@@ -4152,6 +4157,10 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
         pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),
         pytest.param(b"MIT License\n" + (b"groups " * 4096), id="candidate-budget-groups-words"),
         pytest.param(
+            b"MIT License\n" + (b"copyright\nconditions\n" * 4096),
+            id="candidate-budget-global-word-lines",
+        ),
+        pytest.param(
             b"Permission is granted to users.\nPermission remains granted.\n",
             id="two-P-leading-prose-lines",
         ),
@@ -4174,6 +4183,10 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
         pytest.param(
             b"MIT License\nNcopyright\nconditions\ninclude\n",
             id="trivial-prefix-like-global-prose",
+        ),
+        pytest.param(
+            b"MIT License\nAcopyright\nconditions\ninclude\n",
+            id="non-opcode-prefix-like-global-prose",
         ),
         pytest.param(
             b"MIT License\nNPermission\nterms\n",
@@ -4457,6 +4470,12 @@ def test_structured_xml_model_named_license_precedes_legal_text_fallback(
             b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
             "jinja2_template",
             id="renamed-tokenizer-template",
+        ),
+        pytest.param(
+            b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+            b'"framework":"jax","orbax_version":"0.1.0"}',
+            "jax_checkpoint",
+            id="renamed-jax-tokenizer-template-overlap",
         ),
     ],
 )

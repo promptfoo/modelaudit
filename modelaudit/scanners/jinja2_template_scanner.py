@@ -466,7 +466,7 @@ class Jinja2TemplateScanner(BaseScanner):
         if ext in [".jinja", ".j2", ".template"]:
             return True
 
-        if huggingface_tokenizer_json_has_template_route_evidence(path):
+        if huggingface_tokenizer_json_has_template_route_evidence(path, allow_renamed_path=True):
             return True
 
         # JSON files containing templates
