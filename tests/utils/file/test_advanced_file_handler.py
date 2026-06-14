@@ -1119,6 +1119,148 @@ class TestShardedModelDetector:
         assert result.success is False
         assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
 
+    def test_detect_safetensors_duplicate_tensor_target_retains_ancestor_overlap(self, tmp_path: Path) -> None:
+        """An overwritten tensor target must still bind an invalid ancestor to the selected family."""
+        selected_dir = tmp_path / "aa"
+        decoy_dir = tmp_path / "cc"
+        selected_dir.mkdir()
+        decoy_dir.mkdir()
+        selected = [selected_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        decoy = decoy_dir / "model-00001-of-00002.safetensors"
+        for shard in (*selected, decoy):
+            shard.write_bytes(shard.name.encode())
+        selected_target = selected[0].relative_to(tmp_path).as_posix()
+        decoy_target = decoy.relative_to(tmp_path).as_posix()
+        second_target = selected[1].relative_to(tmp_path).as_posix()
+        (tmp_path / "model.safetensors.index.json").write_text(
+            (f'{{"weight_map":{{"shared":"{selected_target}","shared":"{decoy_target}","second":"{second_target}"}}}}'),
+            encoding="utf-8",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(selected[0]), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(selected[0]),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "safetensors index contains duplicate JSON object keys"
+        assert shard_info["unvalidated_shards"] == [str(tmp_path / "model.safetensors.index.json")]
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("index_payload", "expected_error"),
+        [
+            (
+                '{"metadata":{"items":[{"duplicate":1,"duplicate":2}]},'
+                '"weight_map":{"tensor":"shards/model-00000-of-00001.safetensors"}}',
+                "safetensors index contains duplicate JSON object keys",
+            ),
+            (
+                '{"weight_map":{"tensor":"shards/model-00000-of-00001.safetensors","tensor":123}}',
+                "safetensors index weight_map targets must be strings",
+            ),
+        ],
+        ids=["duplicate-inside-list", "overwritten-by-non-string"],
+    )
+    def test_detect_safetensors_invalid_occurrence_retains_ancestor_overlap(
+        self,
+        tmp_path: Path,
+        index_payload: str,
+        expected_error: str,
+    ) -> None:
+        """Invalid occurrences cannot erase a recoverable selected target from scope evidence."""
+        shard_dir = tmp_path / "shards"
+        shard_dir.mkdir()
+        shard = shard_dir / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"selected")
+        (tmp_path / "model.safetensors.index.json").write_text(index_payload, encoding="utf-8")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(shard),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == expected_error
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_occurrence_limit_retains_ancestor_overlap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An over-limit index must retain selected-target evidence before failing closed."""
+        shard_dir = tmp_path / "shards"
+        shard_dir.mkdir()
+        shard = shard_dir / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"selected")
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "selected": shard.relative_to(tmp_path).as_posix(),
+                        "extra": "other/model-00000-of-00001.safetensors",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_SAFETENSORS_SHARD_INDEX_TENSORS", 1)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(shard),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "safetensors index exceeds tensor occurrence limit"
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_disjoint_duplicate_ancestor_remains_unrelated(self, tmp_path: Path) -> None:
+        """Recoverably disjoint duplicate maps must not poison a nested adapter family."""
+        selected_dir = tmp_path / "adapter"
+        first_decoy_dir = tmp_path / "base-a"
+        second_decoy_dir = tmp_path / "base-b"
+        for directory in (selected_dir, first_decoy_dir, second_decoy_dir):
+            directory.mkdir()
+        selected = [selected_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        first_decoys = [first_decoy_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        second_decoys = [second_decoy_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        for shard in (*selected, *first_decoys, *second_decoys):
+            shard.write_bytes(shard.name.encode())
+
+        def weight_map(shards: list[Path]) -> str:
+            return ",".join(
+                f'"tensor-{index}":"{shard.relative_to(tmp_path).as_posix()}"' for index, shard in enumerate(shards)
+            )
+
+        (tmp_path / "model.safetensors.index.json").write_text(
+            f'{{"weight_map":{{{weight_map(first_decoys)}}},"weight_map":{{{weight_map(second_decoys)}}}}}',
+            encoding="utf-8",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(selected[0]), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(selected[0]),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert "safetensors_index_path" not in shard_info
+        assert "safetensors_index_error" not in shard_info
+        assert shard_info["shards"] == [str(shard) for shard in selected]
+        assert result.success is True
+
     def test_detect_safetensors_unrelated_ancestor_index_does_not_poison_nested_family(
         self,
         tmp_path: Path,

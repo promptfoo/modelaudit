@@ -1820,6 +1820,44 @@ class TestModelDownload:
         assert selection_parent.is_dir()
         assert list(selection_parent.iterdir()) == []
 
+    @pytest.mark.parametrize(
+        "interrupt",
+        [KeyboardInterrupt(), SystemExit(130)],
+        ids=["keyboard-interrupt", "system-exit"],
+    )
+    def test_download_model_custom_cache_cleanup_preserves_interrupt(
+        self,
+        tmp_path: Path,
+        interrupt: BaseException,
+    ) -> None:
+        """A best-effort cache cleanup failure must not mask process-control exits."""
+        cache_dir = tmp_path / "cache"
+        plan = SimpleNamespace(
+            deadline=None,
+            size_limit=None,
+            selected_files=["model.bin"],
+            selected_sizes={},
+            repo_files=["model.bin"],
+            repo_revision=_HF_TEST_REVISION,
+            download_revision=_HF_TEST_REVISION,
+            safetensors_index_proofs=(),
+        )
+
+        with (
+            patch("modelaudit.utils.sources.huggingface._get_model_size_with_deadline", return_value=0),
+            patch("modelaudit.utils.sources.huggingface.plan_huggingface_model_download", return_value=plan),
+            patch(
+                "modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline",
+                side_effect=interrupt,
+            ),
+            patch("modelaudit.utils.sources.huggingface.shutil.rmtree", side_effect=OSError("locked")) as mock_rmtree,
+            pytest.raises(type(interrupt)) as raised,
+        ):
+            download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
+
+        assert raised.value is interrupt
+        mock_rmtree.assert_called_once()
+
     def test_download_model_filtered_default_cache_uses_selection_directory(self, tmp_path: Path) -> None:
         """Default-cache filtering must not expose stale files from a broader snapshot."""
         tmp_path.chmod(0o700)
@@ -2054,6 +2092,74 @@ class TestModelDownload:
 
         assert snapshot_calls == [["model.onnx"], ["weights/model.onnx_data"]]
         assert (result / "weights" / "model.onnx_data").read_bytes() == b"weights"
+
+    @pytest.mark.parametrize("streaming", [False, True], ids=["standard", "streaming"])
+    def test_huggingface_onnx_windows_alias_sidecar_fails_before_sdk_download(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        streaming: bool,
+    ) -> None:
+        """Win32-normalized traversal aliases cannot reach either SDK acquisition path."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        malicious_sidecar = "anchor/.. /.. /.. /Roaming/Microsoft/Windows/Start Menu/Programs/Startup/payload.bat"
+
+        def invalid_listing(*_args: object, **_kwargs: object) -> tuple[list[str], str, None]:
+            return (
+                huggingface_module._normalize_huggingface_repo_files(
+                    "test/model",
+                    ["model.onnx", malicious_sidecar],
+                ),
+                _HF_TEST_REVISION,
+                None,
+            )
+
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                side_effect=invalid_listing,
+            ),
+            patch("huggingface_hub.snapshot_download") as mock_snapshot_download,
+            patch("huggingface_hub.hf_hub_download") as mock_hf_hub_download,
+            pytest.raises(Exception, match="path component on Windows"),
+        ):
+            if streaming:
+                list(
+                    download_model_streaming(
+                        "https://huggingface.co/test/model",
+                        cache_dir=tmp_path / "cache",
+                        scannable_extensions={".onnx"},
+                        scannable_scanner_ids={"onnx"},
+                    )
+                )
+            else:
+                download_model(
+                    "https://huggingface.co/test/model",
+                    cache_dir=tmp_path / "cache",
+                    scannable_extensions={".onnx"},
+                    scannable_scanner_ids={"onnx"},
+                )
+
+        mock_snapshot_download.assert_not_called()
+        mock_hf_hub_download.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "location",
+        [".. /payload.bin", "CON/payload.bin", "weights./payload.bin", "weights/payload.bin:stream"],
+    )
+    def test_resolve_hf_onnx_external_data_rejects_windows_alias_components(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        location: str,
+    ) -> None:
+        """Sidecar resolution must reject Win32 aliases even with a validated model path."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+
+        assert huggingface_module._resolve_hf_onnx_external_data_path("model.onnx", location) is None
 
     def test_download_model_filtered_content_routed_onnx_includes_external_data(self, tmp_path: Path) -> None:
         """A renamed ONNX model must retain its declared external-data companions."""
@@ -12869,6 +12975,63 @@ class TestModelDownloadStreaming:
         assert aggregate.success is True
         mock_hf_hub_download.assert_not_called()
         assert mock_requests_get.call_args_list[0].kwargs["headers"]["Range"] == f"bytes=0-{len(index_payload) - 1}"
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url")
+    @patch("requests.get")
+    def test_download_model_streaming_fails_closed_for_index_only_repository(
+        self,
+        mock_requests_get: MagicMock,
+        mock_hf_hub_url: MagicMock,
+        mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An exact SafeTensors stream cannot treat an orphan index as a clean manifest."""
+        index_name = "model.safetensors.index.json"
+        missing_shard = "model-00001-of-00001.safetensors"
+        index_payload = json.dumps(
+            {"weight_map": {"weight": missing_shard}},
+            separators=(",", ":"),
+        ).encode()
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([index_name], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({index_name: len(index_payload)}, _HF_TEST_REVISION),
+        )
+        mock_hf_hub_url.side_effect = lambda *, repo_id, filename, revision: (
+            f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
+        )
+        mock_build_headers.side_effect = lambda *, token=None, headers=None: headers or {}
+        mock_requests_get.return_value = _strict_range_response(index_payload, len(index_payload))
+
+        aggregate = scan_model_streaming(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=4096,
+                scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
+            ),
+            timeout=30,
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["safetensors"],
+            skip_file_types=False,
+        )
+
+        assert aggregate.success is False
+        assert aggregate.has_errors is True
+        assert determine_exit_code(aggregate) == 2
+        assert any(
+            check.details.get("scan_outcome_reason") == "remote_safetensors_index_reconciliation_incomplete"
+            for check in aggregate.checks
+        )
+        assert mock_requests_get.call_count == 1
+        mock_hf_hub_download.assert_not_called()
 
     @patch("huggingface_hub.hf_hub_download")
     @patch("huggingface_hub.utils.build_hf_headers", return_value={})

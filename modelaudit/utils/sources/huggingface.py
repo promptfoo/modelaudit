@@ -33,6 +33,7 @@ from ..file.streaming import StreamedSourceByteAccounting
 from ..helpers.disk_space import check_disk_space
 from ..helpers.interrupt_handler import check_interrupted
 from .huggingface_paths import (
+    _validate_huggingface_windows_path_component,
     extract_model_id_from_path,
     is_huggingface_cache_path,
     is_huggingface_file_url,
@@ -1468,7 +1469,7 @@ def _remote_safetensors_index_details_by_file(
 
     selected_files = set(model_files)
     repo_file_set = set(repo_files)
-    if not selected_files:
+    if not selected_files and retain_unscoped_failure is None:
         return {}, 0, {}, {}
 
     details_by_file: dict[str, dict[str, Any]] = {}
@@ -1496,7 +1497,9 @@ def _remote_safetensors_index_details_by_file(
             record_failure(index_filename, failure, filename_family)
             break
         parent_prefix = _remote_index_parent_prefix(index_filename)
-        if not any(not parent_prefix or filename.startswith(parent_prefix) for filename in selected_files):
+        if selected_files and not any(
+            not parent_prefix or filename.startswith(parent_prefix) for filename in selected_files
+        ):
             continue
 
         index_size = path_sizes.get(index_filename)
@@ -3852,6 +3855,8 @@ def _validate_huggingface_repo_filename(repo_id: str, filename: str) -> str:
     parts = filename.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
+    for part in parts:
+        _validate_huggingface_windows_path_component(part, "repository filename")
     return filename
 
 
@@ -4410,6 +4415,11 @@ def _resolve_hf_onnx_external_data_path(onnx_filename: str, location: str) -> st
 
     normalized_location = posixpath.normpath(location)
     if normalized_location in {"", "."} or normalized_location == ".." or normalized_location.startswith("../"):
+        return None
+    try:
+        for part in PurePosixPath(normalized_location).parts:
+            _validate_huggingface_windows_path_component(part, "ONNX external_data")
+    except ValueError:
         return None
 
     onnx_parent = PurePosixPath(onnx_filename).parent
@@ -6098,25 +6108,25 @@ def download_model(
     except BaseException as e:
         # A filtered view is always exclusive to this invocation. Remove it on
         # acquisition failure; successful callers retain it through scanning.
-        if (
+        failed_staging_is_owned = (
             selection_is_filtered
             and not filtered_staging_handed_off
             and filtered_cache_root is not None
             and download_path is not None
             and download_path.exists()
             and _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path)
-        ):
-            with suppress(OSError):
-                shutil.rmtree(download_path)
-        elif (
+        ) or (
             not selection_is_filtered
             and cache_dir is not None
             and download_path is not None
             and not download_path_preexisting
             and download_path.exists()
             and _is_within_directory(cache_dir / "huggingface", download_path)
-        ):
-            shutil.rmtree(download_path)
+        )
+        if failed_staging_is_owned:
+            with suppress(OSError):
+                assert download_path is not None
+                shutil.rmtree(download_path)
         if not isinstance(e, Exception):
             raise
         raise Exception(
@@ -6570,11 +6580,17 @@ def download_model_streaming(
                 )
             }
             if safetensors_header_candidates
-            else set()
+            else (
+                {filename for filename in model_files if _is_safetensors_index_file(filename)}
+                if safetensors_header_streaming_allowed and safetensors_index_expansion_enabled
+                else set()
+            )
         )
         selected_sizes: dict[str, int] = dict(plan.selected_sizes)
         path_sizes: dict[str, int | None] = {}
-        if _include_scan_results and (size_limit is not None or safetensors_header_candidates):
+        if _include_scan_results and (
+            size_limit is not None or safetensors_header_candidates or safetensors_index_files
+        ):
             size_lookup_files = sorted(set(model_files).union(safetensors_index_files))
             path_sizes, metadata_revision = _get_huggingface_path_sizes(
                 repo_id,
@@ -6671,7 +6687,15 @@ def download_model_streaming(
         ) = _remote_safetensors_shard_details_by_file(
             repo_id,
             sorted(safetensors_header_files),
-            repo_files,
+            (
+                repo_files
+                if safetensors_header_files
+                else [
+                    filename
+                    for filename in repo_files
+                    if not _is_safetensors_index_file(filename) or filename in safetensors_index_files
+                ]
+            ),
             repo_revision,
             path_sizes,
             deadline=deadline,

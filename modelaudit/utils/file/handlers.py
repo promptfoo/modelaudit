@@ -248,8 +248,23 @@ def _safetensors_index_observation_prefix(
     )
 
 
+class _DuplicateAwareSafetensorsIndexObject(dict[str, Any]):
+    """Preserve overwritten JSON members so invalid indexes retain scope evidence."""
+
+    def __init__(
+        self,
+        values: dict[str, Any],
+        overwritten_items: list[tuple[str, Any]],
+        *,
+        has_duplicate_keys: bool,
+    ) -> None:
+        super().__init__(values)
+        self.overwritten_items = overwritten_items
+        self.has_duplicate_keys = has_duplicate_keys
+
+
 def _load_safetensors_index_json(raw: bytes) -> Any:
-    """Parse a bounded index document while rejecting ambiguous duplicate keys."""
+    """Parse a bounded index document while retaining ambiguous duplicate members."""
     from ...scanners.safetensors_scanner import _validate_json_structural_token_limit
 
     _validate_json_structural_token_limit(
@@ -257,16 +272,31 @@ def _load_safetensors_index_json(raw: bytes) -> Any:
         MAX_SAFETENSORS_SHARD_INDEX_JSON_TOKENS,
         "SafeTensors index",
     )
+    saw_duplicate_key = False
 
-    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    def preserve_duplicate_keys(pairs: list[tuple[str, Any]]) -> _DuplicateAwareSafetensorsIndexObject:
+        nonlocal saw_duplicate_key
         parsed: dict[str, Any] = {}
+        overwritten_items: list[tuple[str, Any]] = []
+        has_duplicate_keys = False
         for key, value in pairs:
             if key in parsed:
-                raise ValueError("safetensors index contains duplicate JSON object keys")
+                overwritten_items.append((key, parsed[key]))
+                has_duplicate_keys = True
+                saw_duplicate_key = True
             parsed[key] = value
-        return parsed
+            if isinstance(value, _DuplicateAwareSafetensorsIndexObject) and value.has_duplicate_keys:
+                has_duplicate_keys = True
+        return _DuplicateAwareSafetensorsIndexObject(
+            parsed,
+            overwritten_items,
+            has_duplicate_keys=has_duplicate_keys,
+        )
 
-    return json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=preserve_duplicate_keys)
+    if isinstance(parsed, _DuplicateAwareSafetensorsIndexObject):
+        parsed.has_duplicate_keys = saw_duplicate_key
+    return parsed
 
 
 def _activate_safetensors_index_inspection_context(
@@ -938,28 +968,42 @@ class ShardedModelDetector:
             index_doc = _load_safetensors_index_json(index_bytes)
             if not isinstance(index_doc, dict):
                 raise ValueError("safetensors index root must be an object")
-            weight_map = index_doc.get("weight_map")
-            if not isinstance(weight_map, dict) or not weight_map:
+            weight_map_values = [index_doc.get("weight_map")]
+            if isinstance(index_doc, _DuplicateAwareSafetensorsIndexObject):
+                weight_map_values.extend(value for key, value in index_doc.overwritten_items if key == "weight_map")
+            weight_maps = [value for value in weight_map_values if isinstance(value, dict) and value]
+            if not weight_maps:
                 raise ValueError("safetensors index weight_map must be a non-empty object")
-            if len(weight_map) > MAX_SAFETENSORS_SHARD_INDEX_TENSORS:
-                raise ValueError("safetensors index exceeds tensor occurrence limit")
 
             target_indices: set[int] = set()
             index_expected_total: int | None = expected_total
-            raw_targets = list(weight_map.values())
-            if not all(isinstance(target, str) for target in raw_targets):
-                raise ValueError("safetensors index weight_map targets must be strings")
-            unique_targets = set(raw_targets)
+            raw_targets: list[Any] = []
+            for weight_map in weight_maps:
+                raw_targets.extend(weight_map.values())
+                if isinstance(weight_map, _DuplicateAwareSafetensorsIndexObject):
+                    raw_targets.extend(value for _key, value in weight_map.overwritten_items)
+            occurrence_limit_exceeded = len(raw_targets) > MAX_SAFETENSORS_SHARD_INDEX_TENSORS
+            has_non_string_target = not all(isinstance(target, str) for target in raw_targets)
+            string_targets = [target for target in raw_targets if isinstance(target, str)]
+            target_candidates: Iterable[str] = sorted(set(string_targets))
             target_files: list[Path] = []
             target_path_error: ValueError | None = None
-            for raw_target in sorted(unique_targets):
+            for raw_target in target_candidates:
                 try:
-                    target_files.append(cls._safe_index_target_path(index_dir, raw_target))
+                    target_file = cls._safe_index_target_path(index_dir, raw_target)
                 except ValueError as exc:
                     target_path_error = exc
+                    continue
+                target_files.append(target_file)
             expected_paths.update(_normalized_absolute_path(target_file) for target_file in target_files)
             if target_path_error is not None:
                 raise target_path_error
+            if occurrence_limit_exceeded:
+                raise ValueError("safetensors index exceeds tensor occurrence limit")
+            if has_non_string_target:
+                raise ValueError("safetensors index weight_map targets must be strings")
+            if isinstance(index_doc, _DuplicateAwareSafetensorsIndexObject) and index_doc.has_duplicate_keys:
+                raise ValueError("safetensors index contains duplicate JSON object keys")
             target_matches = [cls.match_safetensors_shard_filename(target_file.name) for target_file in target_files]
             if target_matches and all(target_match is None for target_match in target_matches):
                 inventory = _SafetensorsShardIndexInventory(

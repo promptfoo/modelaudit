@@ -1167,6 +1167,53 @@ def test_explicit_shard_family_does_not_ignore_governing_ancestor_index(tmp_path
     assert parse_click_json_output(result.output)["success"] is False
 
 
+def test_explicit_shard_family_rejects_overlapping_duplicate_ancestor_index(tmp_path: Path) -> None:
+    """Overwritten index occurrences cannot hide selected shards from authority checks."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    scope = tmp_path / "scope"
+    selected_dir = scope / "aa"
+    decoy_dir = scope / "cc"
+    _make_trusted_shard_parent(selected_dir, parents=True)
+    _make_trusted_shard_parent(decoy_dir, parents=True)
+    selected = [selected_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+    decoys = [decoy_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+    for shard in (*selected, *decoys):
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    selected_map = ",".join(
+        f'"tensor-{index}":"{shard.relative_to(scope).as_posix()}"' for index, shard in enumerate(selected)
+    )
+    decoy_map = ",".join(
+        f'"tensor-{index}":"{shard.relative_to(scope).as_posix()}"' for index, shard in enumerate(decoys)
+    )
+    (scope / "model.safetensors.index.json").write_text(
+        f'{{"weight_map":{{{selected_map}}},"weight_map":{{{decoy_map}}}}}',
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *(str(shard) for shard in selected),
+            "--assume-shard-family",
+            "--scanners",
+            "safetensors",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in output_payload["checks"]
+    )
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode policy")
 @pytest.mark.parametrize(
     ("scope_mode", "index_mode", "expected_exit"),
@@ -1601,7 +1648,8 @@ def test_scan_same_directory_shards_rejects_split_index_authority(
         None,
     )
     assert boundary_check is not None, output_payload["checks"]
-    assert boundary_check["details"]["reason"] == "shard_family_changed_during_scan"
+    expected_reason = "shard_target_changed_during_scan" if os.name == "nt" else "shard_family_changed_during_scan"
+    assert boundary_check["details"]["reason"] == expected_reason
 
 
 @pytest.mark.parametrize("assume_shard_family", [False, True], ids=["default", "assumed-family"])
