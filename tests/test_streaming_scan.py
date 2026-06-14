@@ -1310,6 +1310,54 @@ def test_scan_model_streaming_zero_based_family_uses_validated_index(tmp_path: P
     )
 
 
+def test_scan_model_streaming_revalidates_preserved_family_members_before_reconciliation(tmp_path: Path) -> None:
+    """A previously scanned shard replaced between streamed items cannot certify the final family."""
+    original_header = b'{"__metadata__":{"format":"pt"}}'
+    replacement_header = b'{"__metadata__":{"format":"tf"}}'
+    shards: list[Path] = []
+    for shard_index in range(2):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir(mode=0o700)
+        shard = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(original_header)) + original_header)
+        shards.append(shard)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    f"tensor-{index}": shard.relative_to(tmp_path).as_posix() for index, shard in enumerate(shards)
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    replacement = struct.pack("<Q", len(replacement_header)) + replacement_header
+
+    def shard_stream() -> Iterator[tuple[Path, bool]]:
+        yield shards[0], False
+        shards[0].write_bytes(replacement)
+        yield shards[1], True
+
+    result = scan_model_streaming(
+        file_generator=shard_stream(),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        shard_family_group="trusted-stream:model-a",
+        _trusted_shard_family_root=_make_trusted_stream_shard_root(str(tmp_path)),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert shards[0].read_bytes() == replacement
+    assert any(
+        check.location == str(shards[0]) and check.details.get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in result.checks
+    )
+
+
 def test_scan_model_streaming_index_authority_requires_exact_declared_member_path(tmp_path: Path) -> None:
     """Equivalent numeric shard spellings cannot substitute for an index-declared member."""
     header = b'{"__metadata__":{"format":"pt"}}'
@@ -1412,6 +1460,180 @@ def test_scan_model_streaming_requires_one_index_generation_for_indexed_family(
         if check.details.get("scan_outcome_reason") in {"missing_model_shards", "unexpected_model_shards"}
     }
     assert bool(coverage_reasons) is not expected_success
+
+
+@pytest.mark.parametrize("mutation_timing", ["during_scan", "after_final_yield"])
+def test_scan_model_streaming_revalidates_index_content_when_stat_identity_is_unreliable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation_timing: str,
+) -> None:
+    """A same-stat index rewrite during streaming must invalidate final shard authority."""
+    shard = tmp_path / "model-00000-of-00001.safetensors"
+    header = b'{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+    shard.write_bytes(len(header).to_bytes(8, "little") + header + b"\x00" * 4)
+    index_path = tmp_path / "model.safetensors.index.json"
+    payload_a = b'{"weight_map":{"weight":"model-00000-of-00001.safetensors"}}'
+    payload_b = b'{"weight_map":{"decoyx":"model-00000-of-00001.safetensors"}}'
+    assert len(payload_a) == len(payload_b)
+    index_path.write_bytes(payload_a)
+
+    def mutate_index_during_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        del config
+        index_path.write_bytes(payload_b)
+        result = ScanResult(scanner_name="safetensors")
+        result.bytes_scanned = Path(path).stat().st_size
+        result.finish(success=True)
+        return result
+
+    if mutation_timing == "during_scan":
+        monkeypatch.setattr("modelaudit.core.scan_file", mutate_index_during_scan)
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._safetensors_index_requires_content_revalidation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._safetensors_index_observation_prefix",
+        lambda *_args: ("stable-stat-identity",),
+    )
+
+    def shard_stream() -> Iterator[tuple[Path, bool]]:
+        yield shard, True
+        if mutation_timing == "after_final_yield":
+            index_path.write_bytes(payload_b)
+
+    result = scan_model_streaming(
+        file_generator=shard_stream(),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert index_path.read_bytes() == payload_b
+    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
+@pytest.mark.parametrize("create_index_after_yield", [False, True], ids=["stable-unindexed", "new-index"])
+@pytest.mark.parametrize("delete_after_scan", [False, True], ids=["preserve-source", "delete-source"])
+def test_scan_model_streaming_rechecks_unindexed_authority_after_final_yield(
+    tmp_path: Path,
+    create_index_after_yield: bool,
+    delete_after_scan: bool,
+) -> None:
+    """An unindexed family stays clean only while no governing index appears."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def shard_stream() -> Iterator[tuple[Path, bool]]:
+        yield shard, True
+        if create_index_after_yield:
+            index_path.write_text(
+                json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+                encoding="utf-8",
+            )
+
+    result = scan_model_streaming(
+        file_generator=shard_stream(),
+        timeout=30,
+        delete_after_scan=delete_after_scan,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is (not create_index_after_yield)
+    assert determine_exit_code(result) == (2 if create_index_after_yield else 0)
+    assert index_path.is_file() is create_index_after_yield
+    assert (
+        any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+        is create_index_after_yield
+    )
+
+
+@pytest.mark.parametrize("recreate_index", [False, True], ids=["remains-deleted", "recreated-unrelated"])
+def test_scan_model_streaming_revalidates_program_deleted_index(
+    tmp_path: Path,
+    recreate_index: bool,
+) -> None:
+    """A deleted authority is accepted only while its path remains absent."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps({"weight_map": {"tensor": shard.name}}),
+        encoding="utf-8",
+    )
+
+    def shard_stream() -> Iterator[tuple[Path, bool]]:
+        yield shard, False
+        yield index_path, True
+        if recreate_index:
+            index_path.write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "a": "model-00001-of-00002.safetensors",
+                            "b": "model-00002-of-00002.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    result = scan_model_streaming(
+        file_generator=shard_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is (not recreate_index)
+    assert determine_exit_code(result) == (2 if recreate_index else 0)
+    assert not shard.exists()
+    assert index_path.is_file() is recreate_index
+    assert (
+        any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+        is recreate_index
+    )
+
+
+def test_scan_model_streaming_rejects_recreated_program_deleted_shard(tmp_path: Path) -> None:
+    """Recreating a program-deleted shard after its final yield must fail terminal identity validation."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+
+    def shard_stream() -> Iterator[tuple[Path, bool]]:
+        yield shard, True
+        shard.write_bytes(b"MALICIOUS REPLACEMENT")
+
+    result = scan_model_streaming(
+        file_generator=shard_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert shard.read_bytes() == b"MALICIOUS REPLACEMENT"
+    assert any(
+        check.location == str(shard)
+        and check.details.get("reason") == "shard_target_changed_after_scan"
+        and check.details.get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in result.checks
+    )
 
 
 def test_scan_model_streaming_preserves_max_total_size_failure_after_shard_reconciliation(

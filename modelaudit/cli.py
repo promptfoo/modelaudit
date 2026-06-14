@@ -1699,9 +1699,11 @@ class _ExplicitShardFamily:
     """Trusted reconciliation metadata for one explicit local shard argument."""
 
     group: str
-    authoritative_index_scope: str | None = None
-    authoritative_index_expected_total: int | None = None
-    authoritative_index_paths: tuple[str, ...] = ()
+    scope: str
+    expected_total: int
+    paths: tuple[str, ...]
+    supports_index_authority: bool = False
+    initial_index_proof: tuple[str, str, str, int] | None = None
 
 
 def _record_explicit_shard_boundary_failure(scan_result: ModelAuditResultModel, path: str) -> None:
@@ -1789,7 +1791,7 @@ class _ScanPathState:
                 explicit_family,
                 self.safetensors_index_context,
             )
-            authority_required = explicit_family is not None and explicit_family.authoritative_index_scope is not None
+            authority_required = explicit_family is not None and explicit_family.initial_index_proof is not None
             if authority_required and (not pre_scan_target or authoritative_index_proof is None):
                 _record_explicit_shard_boundary_failure(scan_result, asset.path)
                 continue
@@ -1819,6 +1821,60 @@ class _ScanPathState:
                         _record_explicit_shard_boundary_failure(scan_result, asset.path)
                     continue
             self.validated_shard_targets.update(post_scan_target)
+
+    def revalidate_explicit_shard_targets(self, audit_result: ModelAuditResultModel) -> None:
+        """Recheck explicit shard identity and index authority immediately before reconciliation."""
+        refreshed_states: dict[
+            _ExplicitShardFamily,
+            tuple[tuple[str, str, str, int] | None, bool],
+        ] = {}
+        for source_path, expected_target in list(self.validated_shard_targets.items()):
+            explicit_family = self.explicit_shard_family_for(source_path)
+            if explicit_family is None:
+                continue
+            scope_stable = _trusted_explicit_shard_family_scope(
+                explicit_family.scope,
+                explicit_family.paths,
+            )
+            if scope_stable and explicit_family.supports_index_authority and explicit_family not in refreshed_states:
+                refreshed_states[explicit_family] = _explicit_shard_index_authority(
+                    explicit_family.paths,
+                    scope=explicit_family.scope,
+                    expected_total=explicit_family.expected_total,
+                    index_inspection_context=self.safetensors_index_context,
+                    force_index_content_revalidation=True,
+                )
+            authoritative_index_proof, authority_present = refreshed_states.get(explicit_family, (None, False))
+            expected_index_proof = explicit_family.initial_index_proof
+            authority_stable = scope_stable and (
+                authoritative_index_proof == expected_index_proof
+                and authority_present == (expected_index_proof is not None)
+            )
+            current_target = (
+                _snapshot_validated_shard_target(
+                    source_path,
+                    family_group=explicit_family.group,
+                    family_group_policy="explicit",
+                    authoritative_shard_index_base=(
+                        authoritative_index_proof[0] if authoritative_index_proof else None
+                    ),
+                    authoritative_shard_index_path=(
+                        authoritative_index_proof[1] if authoritative_index_proof else None
+                    ),
+                    authoritative_shard_index_fingerprint=(
+                        authoritative_index_proof[2] if authoritative_index_proof else None
+                    ),
+                    authoritative_shard_index_generation=(
+                        authoritative_index_proof[3] if authoritative_index_proof else None
+                    ),
+                )
+                if authority_stable
+                else {}
+            )
+            if current_target.get(source_path) == expected_target:
+                continue
+            self.validated_shard_targets.pop(source_path, None)
+            _record_explicit_shard_boundary_failure(audit_result, source_path)
 
     def track_streaming_paths_for_sbom(
         self,
@@ -2331,6 +2387,7 @@ def _explicit_shard_index_authority(
     scope: str,
     expected_total: int,
     index_inspection_context: _SafetensorsIndexInspectionContext,
+    force_index_content_revalidation: bool = False,
 ) -> tuple[tuple[str, str, str, int] | None, bool]:
     """Return stable index authority and whether a governing index was found."""
     shard_info = ShardedModelDetector.detect_shards(
@@ -2338,6 +2395,7 @@ def _explicit_shard_index_authority(
         allowed_paths=list(paths),
         index_search_root=scope,
         index_inspection_context=index_inspection_context,
+        force_index_content_revalidation=force_index_content_revalidation,
     )
     if not isinstance(shard_info, dict):
         return None, False
@@ -2396,6 +2454,8 @@ def _trusted_explicit_shard_index_authority(index_path: str, scope: str) -> bool
     """Return whether POSIX authority is owned and immutable to other users."""
     if os.name == "nt":
         return True
+    if not _trusted_explicit_shard_family_scope(scope):
+        return False
     get_effective_uid = getattr(os, "geteuid", None)
     if not callable(get_effective_uid):
         return False
@@ -2431,25 +2491,83 @@ def _trusted_explicit_shard_index_authority(index_path: str, scope: str) -> bool
         return False
 
 
+def _stat_explicit_shard_scope_path(path: Path) -> os.stat_result:
+    """Return one non-following explicit-family path observation."""
+    return os.stat(path, follow_symlinks=False)
+
+
+def _trusted_explicit_shard_family_scope(scope: str, shard_paths: tuple[str, ...] = ()) -> bool:
+    """Return whether a cross-directory family scope resists replacement by other users."""
+    if os.name == "nt":
+        return True
+    get_effective_uid = getattr(os, "geteuid", None)
+    if not callable(get_effective_uid):
+        return False
+    effective_uid = get_effective_uid()
+    try:
+        resolved_scope = Path(scope).resolve(strict=True)
+        scope_stat = _stat_explicit_shard_scope_path(resolved_scope)
+        if (
+            not stat.S_ISDIR(scope_stat.st_mode)
+            or scope_stat.st_uid != effective_uid
+            or stat.S_IMODE(scope_stat.st_mode) & 0o022
+        ):
+            return False
+
+        for shard_path in shard_paths:
+            current = Path(shard_path).resolve(strict=True).parent
+            current.relative_to(resolved_scope)
+            while current != resolved_scope:
+                directory_stat = _stat_explicit_shard_scope_path(current)
+                if (
+                    not stat.S_ISDIR(directory_stat.st_mode)
+                    or directory_stat.st_uid != effective_uid
+                    or stat.S_IMODE(directory_stat.st_mode) & 0o022
+                ):
+                    return False
+                current = current.parent
+
+        protected_child_stat = scope_stat
+        current = resolved_scope.parent
+        while True:
+            directory_stat = _stat_explicit_shard_scope_path(current)
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                return False
+            directory_mode = stat.S_IMODE(directory_stat.st_mode)
+            if directory_mode & 0o022:
+                if (
+                    not directory_mode & stat.S_ISVTX
+                    or directory_stat.st_uid not in {0, effective_uid}
+                    or protected_child_stat.st_uid not in {0, effective_uid}
+                ):
+                    return False
+            elif directory_stat.st_uid not in {0, effective_uid}:
+                return False
+            if current == current.parent:
+                return True
+            protected_child_stat = directory_stat
+            current = current.parent
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _current_explicit_shard_index_proof(
     family: _ExplicitShardFamily | None,
     index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
+    *,
+    force_index_content_revalidation: bool = False,
 ) -> tuple[str, str, str, int] | None:
     """Refresh index authority for one explicit family at the snapshot boundary."""
-    if (
-        family is None
-        or family.authoritative_index_scope is None
-        or family.authoritative_index_expected_total is None
-        or not family.authoritative_index_paths
-    ):
+    if family is None or family.initial_index_proof is None:
         return None
     if index_inspection_context is None:
         index_inspection_context = _SafetensorsIndexInspectionContext()
     proof, _authority_present = _explicit_shard_index_authority(
-        family.authoritative_index_paths,
-        scope=family.authoritative_index_scope,
-        expected_total=family.authoritative_index_expected_total,
+        family.paths,
+        scope=family.scope,
+        expected_total=family.expected_total,
         index_inspection_context=index_inspection_context,
+        force_index_content_revalidation=force_index_content_revalidation,
     )
     return proof
 
@@ -2514,10 +2632,12 @@ def _explicit_local_shard_family_groups(
                 source_scopes.add(normalized_scope)
                 targets_by_scope.setdefault(normalized_scope, {}).setdefault(shard_index, []).append(normalized_path)
 
-        complete_scopes: dict[str, bool] = {}
+        complete_scopes: dict[str, tuple[str, str, str, int] | None] = {}
         expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(expected_total)
         for scope, targets_by_index in targets_by_scope.items():
             scoped_paths = tuple(path for targets in targets_by_index.values() for path in targets)
+            if not _trusted_explicit_shard_family_scope(scope, scoped_paths):
+                continue
             complete_by_name = (
                 len(targets_by_index) == _count_expected_shard_indices(expected_indices)
                 and all(shard_index in expected_indices for shard_index in targets_by_index)
@@ -2548,20 +2668,22 @@ def _explicit_local_shard_family_groups(
                     or any(len(targets) != 1 for targets in targets_by_index.values())
                 ):
                     continue
-            complete_scopes[scope] = authoritative_index_proof is not None
+            complete_scopes[scope] = authoritative_index_proof
         for normalized_path, _resolved_path, _shard_index in records:
             matching_scopes = scopes_by_source[normalized_path] & complete_scopes.keys()
             if matching_scopes:
                 family_scope = max(matching_scopes, key=lambda scope: len(Path(scope).parts))
-                has_authoritative_index = complete_scopes[family_scope]
+                initial_index_proof = complete_scopes[family_scope]
                 authoritative_index_paths = tuple(
                     path for targets in targets_by_scope[family_scope].values() for path in targets
                 )
                 groups[normalized_path] = _ExplicitShardFamily(
                     group=f"explicit-cli:{family_scope}",
-                    authoritative_index_scope=(family_scope if has_authoritative_index else None),
-                    authoritative_index_expected_total=(expected_total if has_authoritative_index else None),
-                    authoritative_index_paths=(authoritative_index_paths if has_authoritative_index else ()),
+                    scope=family_scope,
+                    expected_total=expected_total,
+                    paths=authoritative_index_paths,
+                    supports_index_authority=_pattern == SAFETENSORS_SHARD_PATTERN,
+                    initial_index_proof=initial_index_proof,
                 )
     return groups
 
@@ -3336,7 +3458,7 @@ def _scan_local_or_downloaded_path(
         explicit_family,
         path_state.safetensors_index_context,
     )
-    authority_required = explicit_family is not None and explicit_family.authoritative_index_scope is not None
+    authority_required = explicit_family is not None and explicit_family.initial_index_proof is not None
     pre_scan_shard_target = (
         _snapshot_validated_shard_target(
             actual_path,
@@ -5113,6 +5235,7 @@ def scan_command(
 
     _complete_progress_tracking(progress_tracker, verbose=verbose)
     _cleanup_progress_reporters(progress_reporters)
+    path_state.revalidate_explicit_shard_targets(audit_result)
     _reconcile_cross_directory_shard_coverage(
         audit_result,
         path_state.validated_shard_targets,

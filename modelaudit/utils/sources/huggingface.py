@@ -9,6 +9,7 @@ import posixpath
 import re
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -3400,16 +3401,16 @@ def _refuse_metadata_only_hf_onnx_sidecar_ambiguity(
         str(scanner_id).lower() for scanner_id in scannable_scanner_ids
     }:
         return
-    onnx_files = [filename for filename in selected_files if PurePosixPath(filename).suffix.lower() == ".onnx"]
-    if not onnx_files:
+    candidate_files = list(dict.fromkeys(selected_files))
+    if not candidate_files:
         return
-    preview = ", ".join(onnx_files[:3])
-    if len(onnx_files) > 3:
+    preview = ", ".join(candidate_files[:3])
+    if len(candidate_files) > 3:
         preview = f"{preview}, ..."
     raise ValueError(
         "Hugging Face metadata-only dry-run selection incomplete: "
-        f"dry-run refuses for {repo_id} because selected ONNX files may declare external_data companions "
-        f"that cannot be proven without artifact content probing: {preview}"
+        f"dry-run refuses for {repo_id} because selected files may be content-routed to ONNX models that "
+        f"declare external_data companions that cannot be proven without artifact content probing: {preview}"
     )
 
 
@@ -3541,54 +3542,79 @@ def _validate_remote_safetensors_indexes(
             or len(index_prefix) > MAX_SAFETENSORS_SHARD_INDEX_BYTES
             or (index_size is None and len(index_prefix) == MAX_SAFETENSORS_SHARD_INDEX_BYTES + 1)
         ):
-            if not strongly_relevant:
-                continue
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
                 f"SafeTensors index {repo_id}/{index_file} exceeds bounded parse limit"
             )
-        try:
-            index_doc = json.loads(index_prefix.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            if not strongly_relevant:
-                continue
+        (
+            index_doc,
+            _duplicate_keys,
+            duplicate_key_count,
+            _duplicate_key_utf8_bytes,
+            _duplicate_key_preview_truncated_count,
+            parse_error,
+        ) = _loads_json_without_duplicate_keys(index_prefix)
+        if parse_error is not None or duplicate_key_count:
+            if duplicate_key_count:
+                reason = "contains duplicate JSON object keys"
+            elif parse_error == "SafeTensors index exceeds JSON object/value limit":
+                reason = "exceeds JSON object/value limit"
+            else:
+                reason = "is malformed"
             raise ValueError(
-                f"Hugging Face selective filtering incomplete: SafeTensors index {repo_id}/{index_file} is malformed"
-            ) from exc
-        if not isinstance(index_doc, dict) or not isinstance(index_doc.get("weight_map"), dict):
-            if not strongly_relevant:
-                continue
+                f"Hugging Face selective filtering incomplete: SafeTensors index {repo_id}/{index_file} {reason}"
+            )
+        if (
+            not isinstance(index_doc, dict)
+            or not isinstance(index_doc.get("weight_map"), dict)
+            or not index_doc["weight_map"]
+        ):
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
                 f"SafeTensors index {repo_id}/{index_file} has no valid weight_map"
             )
+        if len(index_doc["weight_map"]) > _MAX_HF_SAFETENSORS_INDEX_TENSORS:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} exceeds tensor occurrence limit"
+            )
 
         raw_targets = list(index_doc["weight_map"].values())
-        scoped_target_families: set[tuple[str, str, int]] = set()
-        for raw_target in raw_targets:
-            if not isinstance(raw_target, str):
-                continue
-            try:
-                scoped_target = _safe_remote_safetensors_index_target(index_file, raw_target)
-            except ValueError:
-                continue
-            scoped_target_path = PurePosixPath(scoped_target)
-            scoped_parts = _remote_safetensors_shard_parts(scoped_target)
-            if scoped_parts is None:
-                continue
-            scoped_stem, _scoped_index, scoped_total = scoped_parts
-            if scoped_total > 0:
-                scoped_target_families.add((scoped_target_path.parent.as_posix(), scoped_stem, scoped_total))
-        if selected_family_keys.isdisjoint(scoped_target_families) and (
-            scoped_target_families or not strongly_relevant
-        ):
-            continue
         if not all(isinstance(target, str) for target in raw_targets):
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
                 f"SafeTensors index {repo_id}/{index_file} has non-string shard targets"
             )
-        target_files = sorted({_safe_remote_safetensors_index_target(index_file, target) for target in raw_targets})
+        parsed_targets: dict[str, tuple[str, int, int]] = {}
+        for raw_target in raw_targets:
+            try:
+                scoped_target = _safe_remote_safetensors_index_target(index_file, raw_target)
+            except ValueError as exc:
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: "
+                    f"SafeTensors index {repo_id}/{index_file} references an unsafe shard target"
+                ) from exc
+            scoped_parts = _remote_safetensors_shard_parts(scoped_target)
+            if scoped_parts is None:
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: "
+                    f"SafeTensors index {repo_id}/{index_file} references a non-SafeTensors shard target"
+                )
+            _scoped_stem, _scoped_index, scoped_total = scoped_parts
+            if scoped_total <= 0:
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: "
+                    f"SafeTensors index {repo_id}/{index_file} references an invalid shard target"
+                )
+            parsed_targets[scoped_target] = scoped_parts
+        scoped_target_families = {
+            (PurePosixPath(target).parent.as_posix(), parts[0], parts[2]) for target, parts in parsed_targets.items()
+        }
+        if selected_family_keys.isdisjoint(scoped_target_families) and (
+            scoped_target_families or not strongly_relevant
+        ):
+            continue
+        target_files = sorted(parsed_targets)
 
         target_indices: set[int] = set()
         expected_total: int | None = None
@@ -3597,18 +3623,7 @@ def _validate_remote_safetensors_indexes(
             if target_number % 128 == 0:
                 probe_budget.check_deadline(repo_id)
             target_path = PurePosixPath(target_file)
-            shard_parts = _remote_safetensors_shard_parts(target_file)
-            if shard_parts is None:
-                raise ValueError(
-                    "Hugging Face selective filtering incomplete: "
-                    f"SafeTensors index {repo_id}/{index_file} references a non-SafeTensors shard target"
-                )
-            shard_stem, shard_index, shard_total = shard_parts
-            if shard_total <= 0:
-                raise ValueError(
-                    "Hugging Face selective filtering incomplete: "
-                    f"SafeTensors index {repo_id}/{index_file} references an invalid shard target"
-                )
+            shard_stem, shard_index, shard_total = parsed_targets[target_file]
             if expected_total is None:
                 expected_total = shard_total
             elif shard_total != expected_total:
@@ -4452,6 +4467,75 @@ def _build_huggingface_download_path(cache_dir: Path, namespace: str, repo_name:
     return resolved_download_path
 
 
+def _stat_huggingface_cache_path(path: Path) -> os.stat_result:
+    """Return one non-following cache-path observation."""
+    return os.stat(path, follow_symlinks=False)
+
+
+def _filtered_huggingface_cache_trust_supported() -> bool:
+    """Return whether this platform exposes the ownership checks required for destructive reuse."""
+    return os.name != "nt"
+
+
+def _is_trusted_huggingface_filtered_download_path(cache_root: Path, download_path: Path) -> bool:
+    """Return whether a filtered-cache hierarchy and its anchor resist cross-user replacement."""
+    try:
+        resolved_cache_root = cache_root.resolve(strict=True)
+        lexical_download_path = Path(os.path.abspath(download_path))
+        if not _is_within_directory(resolved_cache_root, lexical_download_path):
+            return False
+
+        effective_uid: int | None = None
+        if os.name != "nt":
+            get_effective_uid = getattr(os, "geteuid", None)
+            if not callable(get_effective_uid):
+                return False
+            effective_uid = get_effective_uid()
+
+        current = lexical_download_path
+        cache_root_stat: os.stat_result | None = None
+        while True:
+            current_stat = _stat_huggingface_cache_path(current)
+            if not stat.S_ISDIR(current_stat.st_mode):
+                return False
+            if effective_uid is not None and (
+                current_stat.st_uid != effective_uid or stat.S_IMODE(current_stat.st_mode) & 0o022
+            ):
+                return False
+            if current == resolved_cache_root:
+                cache_root_stat = current_stat
+                break
+            if current == current.parent:
+                return False
+            current = current.parent
+
+        if effective_uid is None:
+            return True
+        assert cache_root_stat is not None
+        protected_child_stat = cache_root_stat
+        current = resolved_cache_root.parent
+        while True:
+            current_stat = _stat_huggingface_cache_path(current)
+            if not stat.S_ISDIR(current_stat.st_mode):
+                return False
+            current_mode = stat.S_IMODE(current_stat.st_mode)
+            if current_mode & 0o022:
+                if (
+                    not current_mode & stat.S_ISVTX
+                    or current_stat.st_uid not in {0, effective_uid}
+                    or protected_child_stat.st_uid not in {0, effective_uid}
+                ):
+                    return False
+            elif current_stat.st_uid not in {0, effective_uid}:
+                return False
+            if current == current.parent:
+                return True
+            protected_child_stat = current_stat
+            current = current.parent
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _build_huggingface_filtered_download_path(
     cache_root: Path,
     namespace: str,
@@ -4463,6 +4547,8 @@ def _build_huggingface_filtered_download_path(
     scannable_scanner_ids: Collection[str] | None,
 ) -> Path:
     """Return a non-symlink selection-specific directory under a trusted cache root."""
+    if not _filtered_huggingface_cache_trust_supported():
+        raise ValueError("Filtered Hugging Face cache ownership cannot be established on Windows; use streaming mode")
     resolved_cache_root = cache_root.resolve()
     selection_key = hashlib.sha256(
         json.dumps(
@@ -4490,7 +4576,11 @@ def _build_huggingface_filtered_download_path(
     if repo_name:
         selection_path = selection_path / repo_name
     selection_path = selection_path / selection_key
-    if not _is_within_directory(resolved_cache_root, selection_path) or not _ensure_secure_directory(selection_path):
+    if (
+        not _is_within_directory(resolved_cache_root, selection_path)
+        or not _ensure_secure_directory(selection_path)
+        or not _is_trusted_huggingface_filtered_download_path(resolved_cache_root, selection_path)
+    ):
         raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
     return selection_path
 
@@ -5508,6 +5598,7 @@ def download_model(
     download_path = None
     disk_check_path = None
     download_path_preexisting = False
+    filtered_cache_root: Path | None = None
 
     if cache_dir is not None and not selection_is_filtered:
         # Create a structured, containment-checked cache directory.
@@ -5517,7 +5608,11 @@ def download_model(
         disk_check_path = download_path
     else:
         disk_check_path = cache_dir / "huggingface" if cache_dir is not None else _get_hf_cache_root()
-        disk_check_path.mkdir(parents=True, exist_ok=True)
+        if selection_is_filtered:
+            if not _ensure_secure_directory(disk_check_path):
+                raise ValueError(f"Unable to create a safe filtered Hugging Face cache root for {repo_id}")
+        else:
+            disk_check_path.mkdir(parents=True, mode=0o700, exist_ok=True)
 
     try:
         # Configure progress display based on environment
@@ -5600,7 +5695,9 @@ def download_model(
         if selection_is_filtered:
             # A filtered view must not trust prior local-dir metadata or bytes.
             download_kwargs["force_download"] = True
-            assert download_path is not None
+            assert download_path is not None and filtered_cache_root is not None
+            if not _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path):
+                raise ValueError(f"Filtered Hugging Face cache path became unsafe for {repo_id}")
             _prune_huggingface_filtered_download_path(download_path, model_files)
 
         if download_path is not None:
@@ -5612,6 +5709,11 @@ def download_model(
             pass
 
         download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
+
+        if selection_is_filtered:
+            assert download_path is not None and filtered_cache_root is not None
+            if not _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path):
+                raise ValueError(f"Filtered Hugging Face cache path became unsafe for {repo_id}")
 
         local_path = _run_huggingface_download_with_deadline(
             "snapshot_download",
@@ -5691,6 +5793,10 @@ def download_model(
                         f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}"
                     )
             download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
+            if selection_is_filtered:
+                assert download_path is not None and filtered_cache_root is not None
+                if not _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path):
+                    raise ValueError(f"Filtered Hugging Face cache path became unsafe for {repo_id}")
             local_path = _run_huggingface_download_with_deadline(
                 "snapshot_download",
                 download_kwargs,

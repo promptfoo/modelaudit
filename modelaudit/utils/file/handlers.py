@@ -58,6 +58,8 @@ MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
 MAX_SAFETENSORS_SHARD_INDEX_FILES = 256
 MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_SAFETENSORS_SHARD_INDEX_DIRECTORIES = 256
+MAX_SAFETENSORS_SHARD_INDEX_TENSORS = 250_000
+MAX_SAFETENSORS_SHARD_INDEX_JSON_TOKENS = (2 * MAX_SAFETENSORS_SHARD_INDEX_TENSORS) + 4096
 _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY = "_trusted_safetensors_index_inspection_context"
 
 ValidatedShardTargets = dict[str, dict[str, int | str]]
@@ -137,12 +139,18 @@ class _SafetensorsIndexInspectionContext:
                 self.failure = "safetensors index inspection limit exceeded"
             return self.failure
 
-    def reserve_observation(self, observation: tuple[Any, ...], size: int) -> str | None:
-        """Charge bytes only for a newly observed stable lexical generation."""
+    def reserve_observation(
+        self,
+        observation: tuple[Any, ...],
+        size: int,
+        *,
+        force: bool = False,
+    ) -> str | None:
+        """Charge bounded bytes for a new observation or required content revalidation."""
         with self.lock:
             if self.failure is not None:
                 return self.failure
-            if observation in self.charged_observations:
+            if observation in self.charged_observations and not force:
                 return None
             if self.bytes_read + size > MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES:
                 self.failure = "safetensors index aggregate byte limit exceeded"
@@ -191,6 +199,50 @@ _CURRENT_SAFETENSORS_INDEX_CONTEXT: ContextVar[_SafetensorsIndexInspectionContex
     "modelaudit_safetensors_index_context",
     default=None,
 )
+
+
+def _safetensors_index_requires_content_revalidation() -> bool:
+    """Return whether stat identity cannot safely prove unchanged index content."""
+    return os.name == "nt"
+
+
+def _safetensors_index_observation_prefix(
+    index_path: Path,
+    resolved_index: Path,
+    index_stat: os.stat_result,
+) -> tuple[Any, ...]:
+    """Build the stable stat identity used by the parsed-index cache."""
+    return (
+        _normalized_absolute_path(index_path),
+        _normalized_absolute_path(resolved_index),
+        index_stat.st_dev,
+        index_stat.st_ino,
+        index_stat.st_mode,
+        index_stat.st_size,
+        index_stat.st_mtime_ns,
+        index_stat.st_ctime_ns,
+    )
+
+
+def _load_safetensors_index_json(raw: bytes) -> Any:
+    """Parse a bounded index document while rejecting ambiguous duplicate keys."""
+    from ...scanners.safetensors_scanner import _validate_json_structural_token_limit
+
+    _validate_json_structural_token_limit(
+        raw,
+        MAX_SAFETENSORS_SHARD_INDEX_JSON_TOKENS,
+        "SafeTensors index",
+    )
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError("safetensors index contains duplicate JSON object keys")
+            parsed[key] = value
+        return parsed
+
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
 
 
 def _activate_safetensors_index_inspection_context(
@@ -743,6 +795,8 @@ class ShardedModelDetector:
         pattern: str,
         expected_total: int | None,
         inspection_context: _SafetensorsIndexInspectionContext,
+        *,
+        force_content_revalidation: bool = False,
     ) -> _SafetensorsShardIndexInventory:
         """Parse one SafeTensors index, returning its shard inventory or a validation error."""
         expected_paths: set[str] = set()
@@ -763,16 +817,7 @@ class ShardedModelDetector:
                 raise ValueError("safetensors index is not a regular file")
             if pre_read_stat.st_size > MAX_SAFETENSORS_SHARD_INDEX_BYTES:
                 raise ValueError("safetensors index exceeds bounded parse limit")
-            observation_prefix = (
-                _normalized_absolute_path(index_path),
-                _normalized_absolute_path(resolved_index),
-                pre_read_stat.st_dev,
-                pre_read_stat.st_ino,
-                pre_read_stat.st_mode,
-                pre_read_stat.st_size,
-                pre_read_stat.st_mtime_ns,
-                pre_read_stat.st_ctime_ns,
-            )
+            observation_prefix = _safetensors_index_observation_prefix(index_path, resolved_index, pre_read_stat)
             cache_key = (
                 _normalized_absolute_path(index_dir),
                 pattern,
@@ -780,7 +825,10 @@ class ShardedModelDetector:
                 *observation_prefix,
             )
             cached = inspection_context.cached_inventory(cache_key)
-            if cached is not None:
+            revalidate_cached_content = (
+                cached is not None and force_content_revalidation and _safetensors_index_requires_content_revalidation()
+            )
+            if cached is not None and not revalidate_cached_content:
                 cached_observation = (*observation_prefix, cached.fingerprint)
                 observed_cached = inspection_context.observe_cached_inventory(
                     cache_key,
@@ -789,29 +837,49 @@ class ShardedModelDetector:
                 )
                 assert observed_cached is not None
                 return observed_cached
-            budget_error = inspection_context.reserve_observation(cache_key, pre_read_stat.st_size)
+            budget_error = inspection_context.reserve_observation(
+                cache_key,
+                pre_read_stat.st_size,
+                force=revalidate_cached_content,
+            )
             if budget_error is not None:
                 raise ValueError(budget_error)
             with resolved_index.open("rb") as index_file:
                 opened_stat = os.fstat(index_file.fileno())
                 if not os.path.samestat(pre_read_stat, opened_stat):
                     raise ValueError("safetensors index changed while opening")
-                index_bytes = index_file.read(MAX_SAFETENSORS_SHARD_INDEX_BYTES + 1)
+                index_bytes = index_file.read(pre_read_stat.st_size)
             if len(index_bytes) > MAX_SAFETENSORS_SHARD_INDEX_BYTES:
                 raise ValueError("safetensors index exceeds bounded parse limit")
             post_read_stat = os.stat(resolved_index, follow_symlinks=False)
-            if not os.path.samestat(pre_read_stat, post_read_stat) or any(
-                getattr(pre_read_stat, field) != getattr(post_read_stat, field)
-                for field in ("st_size", "st_mtime_ns", "st_ctime_ns")
+            if (
+                len(index_bytes) != pre_read_stat.st_size
+                or not os.path.samestat(
+                    pre_read_stat,
+                    post_read_stat,
+                )
+                or any(
+                    getattr(pre_read_stat, field) != getattr(post_read_stat, field)
+                    for field in ("st_size", "st_mtime_ns", "st_ctime_ns")
+                )
             ):
                 raise ValueError("safetensors index changed while reading")
             index_fingerprint = hashlib.sha256(index_bytes).hexdigest()
-            index_doc = json.loads(index_bytes.decode("utf-8"))
+            if cached is not None and cached.fingerprint == index_fingerprint:
+                return inspection_context.record_inventory(
+                    cache_key,
+                    index_path,
+                    (*observation_prefix, index_fingerprint),
+                    cached,
+                )
+            index_doc = _load_safetensors_index_json(index_bytes)
             if not isinstance(index_doc, dict):
                 raise ValueError("safetensors index root must be an object")
             weight_map = index_doc.get("weight_map")
             if not isinstance(weight_map, dict) or not weight_map:
                 raise ValueError("safetensors index weight_map must be a non-empty object")
+            if len(weight_map) > MAX_SAFETENSORS_SHARD_INDEX_TENSORS:
+                raise ValueError("safetensors index exceeds tensor occurrence limit")
 
             target_indices: set[int] = set()
             index_expected_total: int | None = expected_total
@@ -971,6 +1039,8 @@ class ShardedModelDetector:
         current_file: Path,
         index_search_root: Path,
         inspection_context: _SafetensorsIndexInspectionContext,
+        *,
+        force_content_revalidation: bool = False,
     ) -> _SafetensorsShardIndexInventory | None:
         """Load a governing SafeTensors index inventory or captured validation error."""
         if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
@@ -1031,6 +1101,7 @@ class ShardedModelDetector:
                     pattern,
                     None,
                     inspection_context,
+                    force_content_revalidation=force_content_revalidation,
                 )
                 if inventory.error is not None:
                     normalized_current = _normalized_absolute_path(current_file)
@@ -1066,6 +1137,58 @@ class ShardedModelDetector:
         return None
 
     @classmethod
+    def refresh_safetensors_index_proof(
+        cls,
+        file_path: str,
+        *,
+        index_search_root: str | os.PathLike[str] | None = None,
+        index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
+        force_content_revalidation: bool = False,
+    ) -> tuple[tuple[str, str, str, int] | None, bool]:
+        """Return current governing index proof and whether relevant authority is present."""
+        shard_match = cls.match_safetensors_shard_filename(Path(file_path).name)
+        if shard_match is None:
+            return None, False
+        expected_total = shard_match.get("expected_total_shards")
+        if not isinstance(expected_total, int) or isinstance(expected_total, bool):
+            return None, False
+        dir_path = Path(file_path).parent
+        effective_search_root = Path(index_search_root) if index_search_root is not None else dir_path.absolute()
+        inspection_context = (
+            index_inspection_context or _CURRENT_SAFETENSORS_INDEX_CONTEXT.get() or _SafetensorsIndexInspectionContext()
+        )
+        inventory = cls._load_safetensors_index_inventory(
+            dir_path,
+            SAFETENSORS_SHARD_PATTERN,
+            expected_total,
+            Path(file_path),
+            effective_search_root,
+            inspection_context,
+            force_content_revalidation=force_content_revalidation,
+        )
+        if inventory is None:
+            return None, False
+        if (
+            inventory.error is not None
+            or inventory.index_base not in {"zero", "one"}
+            or not isinstance(inventory.fingerprint, str)
+            or not inventory.fingerprint
+            or not isinstance(inventory.generation, int)
+            or isinstance(inventory.generation, bool)
+            or inventory.generation <= 0
+        ):
+            return None, True
+        return (
+            (
+                inventory.index_base,
+                _normalized_absolute_path(inventory.index_path),
+                inventory.fingerprint,
+                inventory.generation,
+            ),
+            True,
+        )
+
+    @classmethod
     def detect_shards(
         cls,
         file_path: str,
@@ -1074,6 +1197,7 @@ class ShardedModelDetector:
         allowed_targets: ValidatedShardTargets | None = None,
         index_search_root: str | os.PathLike[str] | None = None,
         index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
+        force_index_content_revalidation: bool = False,
     ) -> dict[str, Any] | None:
         """
         Detect if a file is part of a sharded model.
@@ -1139,6 +1263,7 @@ class ShardedModelDetector:
                     Path(file_path),
                     effective_index_search_root,
                     inspection_context,
+                    force_content_revalidation=force_index_content_revalidation,
                 )
                 if index_inventory is not None:
                     shard_info["safetensors_index_path"] = str(index_inventory.index_path)
@@ -2208,6 +2333,7 @@ class AdvancedFileHandler:
                 allowed_paths=self.allowed_shard_paths,
                 allowed_targets=self.allowed_shard_targets,
                 index_search_root=self.index_search_root,
+                force_index_content_revalidation=True,
             )
             if current_shard_info != self.detected_shard_info:
                 return _preserve_findings_with_shard_boundary_failure(
@@ -2709,8 +2835,12 @@ def scan_advanced_large_file(
             build_cache_version_context(version_config)
         )
 
+        cache_miss_executed = False
+
         # Create wrapper function for cache manager
         def cached_advanced_scan_wrapper(fpath: str) -> dict:
+            nonlocal cache_miss_executed
+            cache_miss_executed = True
             result = _scan_advanced_large_file_internal(
                 fpath,
                 scanner,
@@ -2763,6 +2893,7 @@ def scan_advanced_large_file(
             allowed_paths=allowed_shard_paths,
             allowed_targets=allowed_shard_targets,
             index_search_root=index_search_root,
+            force_index_content_revalidation=not cache_miss_executed,
         )
         if post_scan_shard_info != shard_info:
             return _preserve_findings_with_shard_boundary_failure(

@@ -1,5 +1,6 @@
 """Tests for advanced file handler."""
 
+import builtins
 import hashlib
 import json
 import os
@@ -9,7 +10,7 @@ import tempfile
 from collections import Counter
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -422,6 +423,171 @@ class TestShardedModelDetector:
         assert second["safetensors_index_generation"] == 2
         assert restored["safetensors_index_generation"] == 3
         assert restored["safetensors_index_fingerprint"] == first["safetensors_index_fingerprint"]
+
+    def test_safetensors_index_context_revalidates_content_when_stat_identity_is_unreliable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A same-stat rewrite must not reuse stale index authority on Windows."""
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"zero")
+        index_path = tmp_path / "model.safetensors.index.json"
+        payload_a = json.dumps({"weight_map": {"a": shard.name}}, sort_keys=True).encode()
+        payload_b = json.dumps({"weight_map": {"b": shard.name}}, sort_keys=True).encode()
+        assert len(payload_a) == len(payload_b)
+        index_path.write_bytes(payload_a)
+        context = _SafetensorsIndexInspectionContext()
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._safetensors_index_requires_content_revalidation",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._safetensors_index_observation_prefix",
+            lambda *_args: ("stable-stat-identity",),
+        )
+
+        first = ShardedModelDetector.detect_shards(str(shard), index_inspection_context=context)
+        index_path.write_bytes(payload_b)
+        cached = ShardedModelDetector.detect_shards(str(shard), index_inspection_context=context)
+        second = ShardedModelDetector.detect_shards(
+            str(shard),
+            index_inspection_context=context,
+            force_index_content_revalidation=True,
+        )
+
+        assert first is not None and cached is not None and second is not None
+        assert cached["safetensors_index_generation"] == first["safetensors_index_generation"]
+        assert cached["safetensors_index_fingerprint"] == first["safetensors_index_fingerprint"]
+        assert second["safetensors_index_generation"] == first["safetensors_index_generation"] + 1
+        assert second["safetensors_index_fingerprint"] != first["safetensors_index_fingerprint"]
+        assert context.bytes_read == len(payload_a) + len(payload_b)
+
+    def test_safetensors_index_rejects_duplicate_json_keys(self, tmp_path: Path) -> None:
+        """Ambiguous duplicate tensor keys cannot make local authority parser-dependent."""
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"zero")
+        (tmp_path / "model.safetensors.index.json").write_bytes(
+            b'{"weight_map":{"tensor":"missing-00000-of-00001.safetensors",'
+            b'"tensor":"model-00000-of-00001.safetensors"}}'
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard))
+
+        assert shard_info is not None
+        assert "duplicate JSON object keys" in shard_info["safetensors_index_error"]
+        assert "safetensors_index_fingerprint" not in shard_info
+
+    def test_safetensors_index_enforces_tensor_occurrence_limit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A bounded local index cannot materialize an unbounded weight map."""
+        from modelaudit.utils.file import handlers as handlers_module
+
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"zero")
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"tensor-a": shard.name, "tensor-b": shard.name}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(handlers_module, "MAX_SAFETENSORS_SHARD_INDEX_TENSORS", 1)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard))
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "safetensors index exceeds tensor occurrence limit"
+
+    def test_safetensors_index_enforces_json_structure_limit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Container-heavy local indexes fail before JSON graph materialization."""
+        from modelaudit.utils.file import handlers as handlers_module
+
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"zero")
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"tensor": shard.name}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(handlers_module, "MAX_SAFETENSORS_SHARD_INDEX_JSON_TOKENS", 1)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard))
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "SafeTensors index exceeds JSON object/value limit"
+
+    def test_safetensors_index_context_bounds_actual_bytes_after_growth(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An index that grows after pre-stat cannot consume uncharged bytes."""
+        nested = tmp_path / "nested"
+        nested.mkdir()
+        shard = nested / "model-00001-of-00001.safetensors"
+        shard.write_bytes(b"one")
+        candidate = tmp_path / "candidate.safetensors.index.json"
+        candidate.write_bytes(b"{")
+
+        payload = b"{" + (b"x" * 39)
+        original_path_open = Path.open
+        grew = False
+        actual_bytes_read = 0
+
+        class CountingReader:
+            def __init__(self, delegate: Any) -> None:
+                self.delegate = delegate
+
+            def __enter__(self) -> "CountingReader":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+                self.delegate.close()
+
+            def fileno(self) -> int:
+                return cast(int, self.delegate.fileno())
+
+            def read(self, *args: Any, **kwargs: Any) -> bytes:
+                nonlocal actual_bytes_read
+                data = cast(bytes, self.delegate.read(*args, **kwargs))
+                actual_bytes_read += len(data)
+                return data
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.delegate, name)
+
+        def grow_before_open(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            nonlocal grew
+            if "r" in mode and self == candidate and not grew:
+                with builtins.open(self, "wb") as handle:
+                    handle.write(payload)
+                grew = True
+            delegate = original_path_open(self, mode, *args, **kwargs)
+            return CountingReader(delegate) if "r" in mode and self == candidate else delegate
+
+        aggregate_limit = 32
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers.MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES",
+            aggregate_limit,
+        )
+        monkeypatch.setattr(Path, "open", grow_before_open)
+        context = _SafetensorsIndexInspectionContext()
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shard),
+            index_search_root=tmp_path,
+            index_inspection_context=context,
+        )
+
+        assert shard_info is not None
+        assert grew is True
+        assert actual_bytes_read == 1
+        assert actual_bytes_read <= aggregate_limit
+        assert context.bytes_read == actual_bytes_read
 
     def test_safetensors_index_context_enforces_aggregate_candidates_across_ancestors(self, tmp_path: Path) -> None:
         """The 256-candidate cap applies once to the full ancestor walk."""
@@ -2601,8 +2767,16 @@ class TestAdvancedFileHandler:
             allowed_paths: list[str] | None = None,
             allowed_targets: ValidatedShardTargets | None = None,
             index_search_root: str | os.PathLike[str] | None = None,
+            force_index_content_revalidation: bool = False,
         ) -> dict[str, Any]:
-            del cls, file_path, allowed_paths, allowed_targets, index_search_root
+            del (
+                cls,
+                file_path,
+                allowed_paths,
+                allowed_targets,
+                index_search_root,
+                force_index_content_revalidation,
+            )
             return {
                 "pattern": r"checkpoint_(\d+)\.pt",
                 "current_file": str(shard_one),

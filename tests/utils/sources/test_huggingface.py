@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import textwrap
 import time
 import zipfile
@@ -54,6 +55,7 @@ from modelaudit.utils.sources.huggingface import (
     _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
     _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
     _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
+    _build_huggingface_filtered_download_path,
     _build_huggingface_model_info,
     _check_hf_acquisition_interrupted,
     _combine_remote_safetensors_shard_details,
@@ -104,6 +106,28 @@ from tests.helpers.file_creators import malicious_pickle_bytes, valid_jpeg_bytes
 
 _HF_TEST_REVISION = "a" * 40
 _MINIMAL_ONNX_MODEL_PROTO = b"\x08\x08"  # Parseable ModelProto with ir_version=8 and no external data.
+
+
+@pytest.fixture(autouse=True)
+def _trusted_system_temp_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model the normal root-owned sticky system temp directory on this non-sticky test host."""
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    if os.name == "nt":
+        monkeypatch.setattr(huggingface_module, "_filtered_huggingface_cache_trust_supported", lambda: True)
+        return
+    original_stat = huggingface_module._stat_huggingface_cache_path
+    system_temp = Path(tempfile.gettempdir()).resolve()
+
+    def stat_with_sticky_system_temp(path: Path) -> os.stat_result:
+        result = original_stat(path)
+        if path.absolute() != system_temp:
+            return result
+        values = list(result)
+        values[0] = result.st_mode | 0o1000
+        return os.stat_result(values)
+
+    monkeypatch.setattr(huggingface_module, "_stat_huggingface_cache_path", stat_with_sticky_system_temp)
 
 
 def test_hf_acquisition_interrupt_check_honors_global_cancel_and_deadline(
@@ -1207,9 +1231,12 @@ class TestModelDownload:
 
     def test_download_model_filtered_cache_isolates_stale_unselected_files(self, tmp_path: Path) -> None:
         """A filtered persistent snapshot must not expose files from an earlier broader download."""
+        tmp_path.chmod(0o700)
         cache_dir = tmp_path / "cache"
         broad_download_path = cache_dir / "huggingface" / "test" / "model"
         broad_download_path.mkdir(parents=True)
+        cache_dir.chmod(0o755)
+        (cache_dir / "huggingface").chmod(0o755)
         stale = broad_download_path / "stale.safetensors"
         stale.write_bytes(b"stale")
 
@@ -1250,6 +1277,171 @@ class TestModelDownload:
         assert (result / "model.onnx").is_file()
         assert {path.name for path in result.iterdir()} == {"model.onnx"}
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
+    @pytest.mark.parametrize("ancestor_mode", [0o700, 0o755])
+    def test_build_filtered_cache_accepts_owned_nonwritable_hierarchy(
+        self,
+        tmp_path: Path,
+        ancestor_mode: int,
+    ) -> None:
+        """Owner-controlled cache ancestors remain valid with private or read-only sharing modes."""
+        tmp_path.chmod(0o700)
+        cache_root = tmp_path / "hf-cache"
+        selection_parent = cache_root / ".modelaudit-selections" / "test"
+        selection_parent.mkdir(parents=True)
+        cache_root.chmod(0o755)
+        (cache_root / ".modelaudit-selections").chmod(0o755)
+        selection_parent.chmod(ancestor_mode)
+
+        selection_path = _build_huggingface_filtered_download_path(
+            cache_root,
+            "test",
+            "model",
+            "test/model",
+            _HF_TEST_REVISION,
+            ["model.onnx"],
+            {".onnx"},
+            {"onnx"},
+        )
+
+        assert selection_path.is_dir()
+        assert selection_path.is_relative_to(cache_root)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
+    @pytest.mark.parametrize("ancestor_mode", [0o770, 0o777])
+    def test_download_model_filtered_cache_rejects_writable_ancestor_before_pruning(
+        self,
+        tmp_path: Path,
+        ancestor_mode: int,
+    ) -> None:
+        """A shared-user-replaceable selection hierarchy must fail before local mutation or download."""
+        cache_dir = tmp_path / "cache"
+        unsafe_parent = cache_dir / "huggingface" / ".modelaudit-selections" / "test"
+        unsafe_parent.mkdir(parents=True)
+        (cache_dir / "huggingface").chmod(0o755)
+        (cache_dir / "huggingface" / ".modelaudit-selections").chmod(0o755)
+        unsafe_parent.chmod(ancestor_mode)
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
+            ),
+            patch("modelaudit.utils.sources.huggingface._prune_huggingface_filtered_download_path") as mock_prune,
+            patch("huggingface_hub.snapshot_download") as mock_snapshot_download,
+            pytest.raises(Exception, match="safe filtered Hugging Face cache path"),
+        ):
+            download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        mock_prune.assert_not_called()
+        mock_snapshot_download.assert_not_called()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
+    @pytest.mark.parametrize(
+        ("parent_mode", "foreign_owner"),
+        [(0o777, False), (0o1777, True)],
+        ids=["non-sticky-writable", "attacker-owned-sticky"],
+    )
+    def test_build_filtered_cache_rejects_replaceable_cache_root_anchor(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        parent_mode: int,
+        foreign_owner: bool,
+    ) -> None:
+        """A private cache root is unsafe when another user can replace it through its parent."""
+        shared_parent = tmp_path / "shared"
+        cache_root = shared_parent / "huggingface"
+        cache_root.mkdir(parents=True, mode=0o700)
+        cache_root.chmod(0o700)
+        shared_parent.chmod(parent_mode)
+        if foreign_owner:
+            from modelaudit.utils.sources import huggingface as huggingface_module
+
+            original_stat = huggingface_module._stat_huggingface_cache_path
+
+            def stat_with_foreign_shared_owner(path: Path) -> os.stat_result:
+                result = original_stat(path)
+                if path.absolute() != shared_parent:
+                    return result
+                values = list(result)
+                values[4] = os.geteuid() + 1
+                return os.stat_result(values)
+
+            monkeypatch.setattr(huggingface_module, "_stat_huggingface_cache_path", stat_with_foreign_shared_owner)
+
+        with pytest.raises(ValueError, match="safe filtered Hugging Face cache path"):
+            _build_huggingface_filtered_download_path(
+                cache_root,
+                "test",
+                "model",
+                "test/model",
+                _HF_TEST_REVISION,
+                ["model.onnx"],
+                {".onnx"},
+                {"onnx"},
+            )
+
+    def test_build_filtered_cache_rejects_symlink_component(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A selection hierarchy cannot traverse a pre-existing symlink or junction-like component."""
+        del requires_symlinks
+        cache_root = tmp_path / "hf-cache"
+        selection_root = cache_root / ".modelaudit-selections"
+        selection_root.mkdir(parents=True)
+        cache_root.chmod(0o755)
+        selection_root.chmod(0o755)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (selection_root / "test").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="safe filtered Hugging Face cache path"):
+            _build_huggingface_filtered_download_path(
+                cache_root,
+                "test",
+                "model",
+                "test/model",
+                _HF_TEST_REVISION,
+                ["model.onnx"],
+                {".onnx"},
+                {"onnx"},
+            )
+
+    def test_build_filtered_cache_fails_closed_without_platform_ownership_proof(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Destructive deterministic cache reuse is unavailable without an owner/ACL trust proof."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        monkeypatch.setattr(huggingface_module, "_filtered_huggingface_cache_trust_supported", lambda: False)
+
+        with pytest.raises(ValueError, match="cannot be established on Windows; use streaming mode"):
+            _build_huggingface_filtered_download_path(
+                tmp_path / "hf-cache",
+                "test",
+                "model",
+                "test/model",
+                _HF_TEST_REVISION,
+                ["model.onnx"],
+                {".onnx"},
+                {"onnx"},
+            )
+
     def test_download_model_filtered_cache_preserves_symlink_target_on_failure(
         self,
         tmp_path: Path,
@@ -1261,6 +1453,8 @@ class TestModelDownload:
         cache_root = cache_dir / "huggingface"
         repository_path = cache_root / "test" / "model"
         repository_path.parent.mkdir(parents=True)
+        cache_dir.chmod(0o755)
+        cache_root.chmod(0o755)
         legacy_target = tmp_path / "outside-legacy-cache"
         legacy_target.mkdir()
         repository_path.symlink_to(legacy_target, target_is_directory=True)
@@ -1292,9 +1486,12 @@ class TestModelDownload:
 
     def test_download_model_filtered_default_cache_uses_selection_directory(self, tmp_path: Path) -> None:
         """Default-cache filtering must not expose stale files from a broader snapshot."""
+        tmp_path.chmod(0o700)
         cache_root = tmp_path / "hf-cache" / "hub"
         stale_snapshot = cache_root / "models--test--model" / "snapshots" / _HF_TEST_REVISION
         stale_snapshot.mkdir(parents=True)
+        cache_root.parent.chmod(0o755)
+        cache_root.chmod(0o755)
         stale = stale_snapshot / "stale.pkl"
         stale.write_bytes(b"stale")
 
@@ -4495,13 +4692,34 @@ class TestModelDownloadStreaming:
             ),
             patch("modelaudit.utils.sources.huggingface._get_huggingface_path_sizes") as mock_get_sizes,
             patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect,
-            pytest.raises(ValueError, match="ONNX files may declare external_data companions"),
+            pytest.raises(ValueError, match="content-routed to ONNX models"),
         ):
             plan_huggingface_model_download(
                 "https://huggingface.co/test/model",
                 allow_content_probes=False,
                 scannable_extensions={".onnx"},
                 scannable_scanner_ids={"onnx"},
+            )
+
+        mock_get_sizes.assert_not_called()
+        mock_detect.assert_not_called()
+
+    def test_model_plan_metadata_only_refuses_content_routed_onnx_sidecar_ambiguity(self) -> None:
+        """A selected renamed ONNX candidate can still declare bookkeeping-named external data."""
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["renamed.bin", ".gitattributes"], _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._get_huggingface_path_sizes") as mock_get_sizes,
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect,
+            pytest.raises(ValueError, match="content-routed to ONNX models"),
+        ):
+            plan_huggingface_model_download(
+                "https://huggingface.co/test/model",
+                allow_content_probes=False,
+                scannable_extensions={".bin", ".onnx"},
+                scannable_scanner_ids={"pickle", "onnx"},
             )
 
         mock_get_sizes.assert_not_called()
@@ -4583,8 +4801,8 @@ class TestModelDownloadStreaming:
 
     @pytest.mark.parametrize(
         "index_state",
-        ["complete", "missing", "malformed"],
-        ids=["benign-complete", "malicious-missing", "malicious-malformed"],
+        ["complete", "missing"],
+        ids=["benign-complete", "benign-missing"],
     )
     def test_remote_safetensors_validation_ignores_unrelated_same_parent_family(
         self,
@@ -4602,13 +4820,9 @@ class TestModelDownloadStreaming:
             repo_files = ["adapter.safetensors.index.json", selected_shard, adapter_targets[0]]
         selected_files = [selected_shard]
         budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
-        payload = (
-            b"{malformed"
-            if index_state == "malformed"
-            else json.dumps(
-                {"weight_map": {f"adapter-{index}": target for index, target in enumerate(adapter_targets)}}
-            ).encode()
-        )
+        payload = json.dumps(
+            {"weight_map": {f"adapter-{index}": target for index, target in enumerate(adapter_targets)}}
+        ).encode()
 
         with patch("requests.get", return_value=_FakeRangeResponse(payload)) as mock_requests_get:
             result = _validate_remote_safetensors_indexes(
@@ -4622,8 +4836,24 @@ class TestModelDownloadStreaming:
         assert result == selected_files
         mock_requests_get.assert_called_once()
 
-    def test_remote_safetensors_validation_ignores_malformed_unrelated_ancestor_index(self) -> None:
-        """An unscoped malformed root index must not reject a selected nested family."""
+    @pytest.mark.parametrize(
+        ("payload", "error_pattern"),
+        [
+            (b"{malformed", "is malformed"),
+            (
+                b'{"weight_map":{"missing":"adapter/model-00000-of-00002.safetensors"},'
+                b'"weight_map":{"selected":"adapter/model-00000-of-00001.safetensors"}}',
+                "contains duplicate JSON object keys",
+            ),
+        ],
+        ids=["malformed", "duplicate-weight-map"],
+    )
+    def test_remote_safetensors_validation_rejects_ambiguous_ancestor_index(
+        self,
+        payload: bytes,
+        error_pattern: str,
+    ) -> None:
+        """An invalid ancestor index cannot prove that it is unrelated to a nested family."""
         repo_files = [
             "model.safetensors.index.json",
             "adapter/model-00000-of-00001.safetensors",
@@ -4634,16 +4864,17 @@ class TestModelDownloadStreaming:
         ]
         budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
 
-        with patch("requests.get", return_value=_FakeRangeResponse(b"{malformed")):
-            result = _validate_remote_safetensors_indexes(
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(payload)),
+            pytest.raises(ValueError, match=error_pattern),
+        ):
+            _validate_remote_safetensors_indexes(
                 "test/model",
                 repo_files,
                 _HF_TEST_REVISION,
                 selected_files,
                 budget,
             )
-
-        assert result == selected_files
 
     def test_remote_safetensors_validation_rejects_malformed_same_directory_index(self) -> None:
         """A malformed index beside the selected family remains authoritative and fail-closed."""
@@ -4663,6 +4894,81 @@ class TestModelDownloadStreaming:
                 repo_files,
                 _HF_TEST_REVISION,
                 selected_files,
+                budget,
+            )
+
+    def test_remote_safetensors_validation_rejects_duplicate_json_keys(self) -> None:
+        """Standard downloads reject parser-dependent duplicate index assignments."""
+        repo_files = [
+            "adapter/model.safetensors.index.json",
+            "adapter/model-00000-of-00001.safetensors",
+        ]
+        selected_files = ["adapter/model-00000-of-00001.safetensors"]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = (
+            b'{"weight_map":{"tensor":"adapter/missing-00000-of-00001.safetensors",'
+            b'"tensor":"model-00000-of-00001.safetensors"}}'
+        )
+
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(payload)),
+            pytest.raises(ValueError, match="contains duplicate JSON object keys"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                selected_files,
+                budget,
+            )
+
+    def test_remote_safetensors_validation_enforces_tensor_occurrence_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Standard download planning bounds tensor assignments independently of byte size."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        shard = "adapter/model-00000-of-00001.safetensors"
+        repo_files = ["adapter/model.safetensors.index.json", shard]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps({"weight_map": {"tensor-a": shard, "tensor-b": shard}}).encode()
+        monkeypatch.setattr(huggingface_module, "_MAX_HF_SAFETENSORS_INDEX_TENSORS", 1)
+
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(payload)),
+            pytest.raises(ValueError, match="exceeds tensor occurrence limit"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                [shard],
+                budget,
+            )
+
+    def test_remote_safetensors_validation_enforces_json_structure_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Standard download planning rejects container-heavy indexes before JSON decoding."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        shard = "adapter/model-00000-of-00001.safetensors"
+        repo_files = ["adapter/model.safetensors.index.json", shard]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps({"weight_map": {"tensor": shard}}).encode()
+        monkeypatch.setattr(huggingface_module, "_MAX_HF_SAFETENSORS_INDEX_JSON_TOKENS", 1)
+
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(payload)),
+            pytest.raises(ValueError, match="exceeds JSON object/value limit"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                [shard],
                 budget,
             )
 

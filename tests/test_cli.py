@@ -11,6 +11,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import types
 import zipfile
 from collections.abc import Iterator
@@ -50,6 +51,25 @@ from modelaudit.utils.repository_context import (
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
+
+
+@pytest.fixture(autouse=True)
+def _trusted_system_temp_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model the normal root-owned sticky system temp directory on this non-sticky test host."""
+    if os.name == "nt":
+        return
+    original_stat = cli_module._stat_explicit_shard_scope_path
+    system_temp = Path(tempfile.gettempdir()).resolve()
+
+    def stat_with_sticky_system_temp(path: Path) -> os.stat_result:
+        result = original_stat(path)
+        if path.absolute() != system_temp:
+            return result
+        values = list(result)
+        values[0] = result.st_mode | stat.S_ISVTX
+        return os.stat_result(values)
+
+    monkeypatch.setattr(cli_module, "_stat_explicit_shard_scope_path", stat_with_sticky_system_temp)
 
 
 def test_local_txt_zip_prefilter_uses_bounded_zip_probe(
@@ -140,7 +160,14 @@ def test_track_huggingface_stream_acquisition_preserves_precomputed_result_tuple
 
 def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
     """Create a shard parent without inheriting group-write test umasks."""
+    missing_parents: list[Path] = []
+    current = path
+    while parents and not current.exists():
+        missing_parents.append(current)
+        current = current.parent
     path.mkdir(parents=parents)
+    for created_parent in missing_parents:
+        created_parent.chmod(0o755)
     path.chmod(0o755)
 
 
@@ -1114,6 +1141,148 @@ def test_scan_multiple_cross_directory_shards_refreshes_index_authority(
         assert "missing_model_shards" in coverage_reasons
 
 
+def test_scan_multiple_cross_directory_shards_revalidate_authority_before_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal index mutation cannot reuse targets recorded after individual scans."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def create_shard(parent: str, index: int) -> Path:
+        shard_dir = tmp_path / parent
+        _make_trusted_shard_parent(shard_dir)
+        shard = shard_dir / f"model-{index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        return shard
+
+    selected_shards = [create_shard("a", 0), create_shard("b", 1)]
+    decoy_shards = [create_shard("c", 0), create_shard("d", 1)]
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def write_index(shards: list[Path]) -> None:
+        index_path.write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        f"tensor-{index}": shard.relative_to(tmp_path).as_posix() for index, shard in enumerate(shards)
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_index(selected_shards)
+    original_path_open = Path.open
+    index_reads = 0
+
+    def count_index_reads(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        nonlocal index_reads
+        if self == index_path and mode == "rb":
+            index_reads += 1
+        return original_path_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", count_index_reads)
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._safetensors_index_requires_content_revalidation",
+        lambda: True,
+    )
+    original_complete_progress = cli_module._complete_progress_tracking
+
+    def replace_index_before_reconciliation(*args: Any, **kwargs: Any) -> None:
+        original_complete_progress(*args, **kwargs)
+        write_index(decoy_shards)
+
+    monkeypatch.setattr(cli_module, "_complete_progress_tracking", replace_index_before_reconciliation)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *(str(shard) for shard in selected_shards),
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in output_payload["checks"]
+    )
+    assert set(json.loads(index_path.read_text(encoding="utf-8"))["weight_map"].values()) == {
+        shard.relative_to(tmp_path).as_posix() for shard in decoy_shards
+    }
+    assert index_reads == 2
+
+
+@pytest.mark.parametrize("create_index_before_reconciliation", [False, True], ids=["stable-unindexed", "new-index"])
+def test_scan_multiple_cross_directory_shards_recheck_unindexed_authority_before_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    create_index_before_reconciliation: bool,
+) -> None:
+    """An initially unindexed explicit family fails if conflicting authority appears at the terminal boundary."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def create_shard(parent: str, index: int) -> Path:
+        shard_dir = tmp_path / parent
+        _make_trusted_shard_parent(shard_dir)
+        shard = shard_dir / f"model-{index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        return shard
+
+    selected_shards = [create_shard("a", 1), create_shard("b", 2)]
+    decoy_zero = create_shard("c", 0)
+    index_path = tmp_path / "model.safetensors.index.json"
+    original_complete_progress = cli_module._complete_progress_tracking
+
+    def create_index_after_scans(*args: Any, **kwargs: Any) -> None:
+        original_complete_progress(*args, **kwargs)
+        if create_index_before_reconciliation:
+            index_path.write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "tensor-zero": decoy_zero.relative_to(tmp_path).as_posix(),
+                            "tensor-one": selected_shards[0].relative_to(tmp_path).as_posix(),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(cli_module, "_complete_progress_tracking", create_index_after_scans)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *(str(shard) for shard in selected_shards),
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    expected_exit_code = 2 if create_index_before_reconciliation else 0
+    assert result.exit_code == expected_exit_code, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is (not create_index_before_reconciliation)
+    assert index_path.is_file() is create_index_before_reconciliation
+    assert (
+        any(
+            check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+            for check in output_payload["checks"]
+        )
+        is create_index_before_reconciliation
+    )
+
+
 def test_scan_same_directory_shards_rejects_split_index_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1466,6 +1635,42 @@ def test_explicit_shard_family_groups_reject_publicly_writable_parents(tmp_path:
         shard_paths.append(str(shard_path))
 
     assert _explicit_local_shard_family_groups(tuple(shard_paths)) == {}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes are required")
+@pytest.mark.parametrize("indexed", [False, True], ids=["unindexed", "indexed"])
+def test_explicit_shard_family_groups_reject_replaceable_scope_ancestor(
+    tmp_path: Path,
+    indexed: bool,
+) -> None:
+    """A private common scope remains untrusted when another user can replace it through its parent."""
+    tmp_path.chmod(0o700)
+    shared_parent = tmp_path / "shared"
+    scope = shared_parent / "scope"
+    scope.mkdir(parents=True, mode=0o700)
+    shared_parent.chmod(0o777)
+    scope.chmod(0o700)
+    shard_indices = range(2) if indexed else range(1, 3)
+    shards: list[Path] = []
+    for shard_index in shard_indices:
+        shard_parent = scope / f"part-{shard_index}"
+        _make_trusted_shard_parent(shard_parent)
+        shard = shard_parent / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard.write_bytes(b"shard")
+        shards.append(shard)
+    if indexed:
+        (scope / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        f"tensor-{index}": shard.relative_to(scope).as_posix() for index, shard in enumerate(shards)
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    assert _explicit_local_shard_family_groups(tuple(str(shard) for shard in shards)) == {}
 
 
 def test_scan_multiple_cross_directory_shards_requires_explicit_family_opt_in(tmp_path: Path) -> None:
@@ -6190,7 +6395,7 @@ def test_scan_huggingface_standard_dry_run_refuses_onnx_sidecar_ambiguity() -> N
         )
 
     assert result.exit_code == 2
-    assert "ONNX files may declare external_data companions" in result.output
+    assert "content-routed to ONNX models" in result.output
     mock_get_model_info.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
@@ -6563,6 +6768,8 @@ def test_scan_huggingface_standard_dry_run_uses_standard_selection_not_streaming
             [
                 "scan",
                 "--dry-run",
+                "--scanners",
+                "safetensors",
                 "--format",
                 "json",
                 "hf://test/model",
