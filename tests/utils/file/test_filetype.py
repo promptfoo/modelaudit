@@ -83,6 +83,14 @@ def _encoded_pickle_after_benign_candidate_budget(word: bytes = b"license") -> b
     return b"MIT License\n" + ((word + b" ") * 4096) + b"\n" + base64.b64encode(b"cb\nx\n.")
 
 
+def _overlapping_global_candidate_in_legal_text() -> bytes:
+    return b"MIT License\n# comment\ncposix\nsystem\n(S'id'\ntR."
+
+
+def _oversized_encoded_execution_after_probe() -> bytes:
+    return b"MIT License\n" + base64.b64encode((b"A" * (1024 * 1024 + 1)) + b"eval(")
+
+
 def _large_zero_fill_base64_legal_text() -> bytes:
     return b"MIT License " + (b"A" * 1_468_008)
 
@@ -3929,6 +3937,11 @@ def test_next_buffer_callback_precedes_eof() -> None:
             id="comment-prefixed-GLOBAL",
         ),
         pytest.param(
+            _overlapping_global_candidate_in_legal_text(),
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="overlapping-comment-GLOBAL",
+        ),
+        pytest.param(
             _long_global_operand_in_legal_text(),
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="truncated-GLOBAL-operand",
@@ -3988,6 +4001,20 @@ def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_pa
         pytest.param(b"MIT License\n63620a\t780a2e\n", "pickle", id="hex-intra-line-tab"),
         pytest.param(base64.b64encode(b"S'id'\nQ."), "pickle", id="base64-BINPERSID"),
         pytest.param(binascii.hexlify(b"S'id'\nQ."), "pickle", id="hex-BINPERSID"),
+        pytest.param(b"MIT License\n" + base64.b64encode(b"\x82\x01"), "pickle", id="base64-sole-EXT1"),
+        pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), "pickle", id="base64-sole-NEXT_BUFFER"),
+        pytest.param(b"MIT License\nggE =\n", "pickle", id="base64-whitespace-padded-EXT1"),
+        pytest.param(b"MIT License\nlw ==\n", "pickle", id="base64-whitespace-padded-NEXT_BUFFER"),
+        pytest.param(
+            b"MIT License\n" + base64.b64encode(b"# comment\ncposix\nsystem\n(S'id'\ntR."),
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="base64-overlapping-comment-GLOBAL",
+        ),
+        pytest.param(
+            _oversized_encoded_execution_after_probe(),
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="base64-execution-after-decoded-limit",
+        ),
         pytest.param(
             _encoded_pickle_after_benign_candidate_budget(),
             "pickle",
@@ -4043,6 +4070,10 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
         pytest.param(
             b"MIT License\nFOR ANY PARTICULAR PURPOSE OR THAT THE USE OF PYTHON WILL NOT\n",
             id="base64-shaped-uppercase-prose",
+        ),
+        pytest.param(
+            b"MIT License\ncopyright\ncopyright\nconditions\ninclude\n",
+            id="overlapping-global-inst-prose-lines",
         ),
         pytest.param(_large_zero_fill_base64_legal_text(), id="oversized-zero-fill-base64-prose"),
     ],

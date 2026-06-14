@@ -213,6 +213,14 @@ def _encoded_pickle_after_benign_candidate_budget(word: bytes = b"license") -> b
     return b"MIT License\n" + ((word + b" ") * 4096) + b"\n" + base64.b64encode(b"cb\nx\n.")
 
 
+def _overlapping_global_candidate_in_legal_text() -> bytes:
+    return b"MIT License\n# comment\ncposix\nsystem\n(S'id'\ntR."
+
+
+def _oversized_encoded_execution_after_probe() -> bytes:
+    return b"MIT License\n" + base64.b64encode((b"A" * (1024 * 1024 + 1)) + b"eval(")
+
+
 def _large_zero_fill_base64_legal_text() -> bytes:
     return b"MIT License " + (b"A" * 1_468_008)
 
@@ -11281,6 +11289,7 @@ class TestZipScanner:
                 2,
                 id="comment-prefixed-GLOBAL",
             ),
+            pytest.param(_overlapping_global_candidate_in_legal_text(), 2, id="overlapping-comment-GLOBAL"),
             pytest.param(b"MIT License\nY2IK eAou\n", 1, id="base64-intra-line-whitespace"),
             pytest.param(b"MIT License\n63620a 780a2e\n", 1, id="hex-intra-line-whitespace"),
             pytest.param(b"MIT License\nY 2IKeAou\n", 1, id="base64-unaligned-intra-line-whitespace"),
@@ -11291,6 +11300,16 @@ class TestZipScanner:
             pytest.param(b"MIT License\n63620a\t780a2e\n", 1, id="hex-intra-line-tab"),
             pytest.param(base64.b64encode(b"S'id'\nQ."), 1, id="base64-BINPERSID"),
             pytest.param(binascii.hexlify(b"S'id'\nQ."), 1, id="hex-BINPERSID"),
+            pytest.param(b"MIT License\n" + base64.b64encode(b"\x82\x01"), 1, id="base64-sole-EXT1"),
+            pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), 1, id="base64-sole-NEXT_BUFFER"),
+            pytest.param(b"MIT License\nggE =\n", 1, id="base64-whitespace-padded-EXT1"),
+            pytest.param(b"MIT License\nlw ==\n", 1, id="base64-whitespace-padded-NEXT_BUFFER"),
+            pytest.param(
+                b"MIT License\n" + base64.b64encode(b"# comment\ncposix\nsystem\n(S'id'\ntR."),
+                2,
+                id="base64-overlapping-comment-GLOBAL",
+            ),
+            pytest.param(_oversized_encoded_execution_after_probe(), 2, id="base64-execution-after-decoded-limit"),
             pytest.param(
                 _encoded_pickle_after_benign_candidate_budget(),
                 1,
@@ -11354,6 +11373,10 @@ class TestZipScanner:
             pytest.param(
                 b"MIT License\nFOR ANY PARTICULAR PURPOSE OR THAT THE USE OF PYTHON WILL NOT\n",
                 id="base64-shaped-uppercase-prose",
+            ),
+            pytest.param(
+                b"MIT License\ncopyright\ncopyright\nconditions\ninclude\n",
+                id="overlapping-global-inst-prose-lines",
             ),
             pytest.param(_large_zero_fill_base64_legal_text(), id="oversized-zero-fill-base64-prose"),
         ],
