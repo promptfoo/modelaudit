@@ -280,6 +280,17 @@ def test_dockerfiles_verify_pinned_rustup_init_instead_of_streaming_shell() -> N
         )
 
 
+@pytest.mark.parametrize("dockerfile", ("Dockerfile", "Dockerfile.full"))
+def test_dockerfiles_fallback_to_native_architecture_without_buildkit(dockerfile: str) -> None:
+    lines = _dockerfile_lines(dockerfile)
+    content = "\n".join(lines)
+    architecture_case = 'case "${TARGETARCH:=$(dpkg --print-architecture)}" in'
+
+    assert lines.count("ARG TARGETARCH") == 1
+    assert not any(line.startswith("ARG TARGETARCH=") for line in lines)
+    assert architecture_case in content
+
+
 def test_docker_success_job_waits_for_all_image_results() -> None:
     workflow = _load_docker_workflow()
 

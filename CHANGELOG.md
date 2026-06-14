@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preserve native-architecture Rust installer selection for Docker builds that do not expose BuildKit's `TARGETARCH` argument
 - stream Hugging Face SafeTensors shard headers with bounded range reads instead of downloading tensor payload bodies
 - keep JIT alias replay linear, including multiline builtin-helper continuations, as alias state grows while preserving bounded analysis for attacker-controlled model content
 - inspect oversized ONNX protobuf structure from descriptor-bound, memory- and result-bounded file-backed reads; preserve external-data security checks while explicitly reporting deferred schema, raw-detector, weight-analysis, and content-hash coverage
