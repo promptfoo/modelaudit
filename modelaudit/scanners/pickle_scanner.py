@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import binascii
 import hashlib
@@ -11,13 +12,17 @@ import re
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from itertools import islice, pairwise
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar, TextIO, cast
 
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
-from modelaudit.detectors.network_comm import NetworkCommDetector, redact_url_for_finding
+from modelaudit.detectors.network_comm import (
+    _is_doc_only_network_reference,
+    _trim_source_literal_url,
+)
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
@@ -56,6 +61,9 @@ _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
 _CALL_TOKEN_SEPARATOR_SCAN_LIMIT_BYTES = 4096
 _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS = 8192
+_MAX_PICKLE_LITERAL_URL_CONTEXT_CHARS = 16 * 1024
+_MAX_PICKLE_URL_SUFFIX_PROBE_CHARS = 512
+_MAX_PICKLE_LITERAL_URLS = 1024
 _MAX_CVE_PICKLE_STREAMS = 64
 _CVE_PICKLE_STREAM_PADDING = frozenset(b"\x00\t\n\x0b\x0c\r ")
 _PYTORCH_LEGACY_MAGIC_NUMBER = 0x1950A86A20F9469CFC6C
@@ -91,27 +99,6 @@ _PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES = {
     "ShortStorage": 2,
     "UntypedStorage": 1,
 }
-_BASE64_CODE_EXECUTION_SEEDS: tuple[bytes, ...] = (
-    b"ZXZhbCg",  # eval(
-    b"ZXhlYyg",  # exec(
-    b"b3Muc3lzdGVt",  # os.system
-    b"c3VicHJvY2Vzcw",  # subprocess
-    b"X19pbXBvcnRfXw",  # __import__
-)
-_HEX_CODE_EXECUTION_SEEDS: tuple[bytes, ...] = (
-    b"6576616c28",  # eval(
-    b"6578656328",  # exec(
-    b"6f732e73797374656d",  # os.system
-    b"73756270726f63657373",  # subprocess
-    b"5f5f696d706f72745f5f",  # __import__
-)
-
-
-def _hex_token_has_execution_seed(token: bytes) -> bool:
-    token_lower = token.lower()
-    return any(seed in token_lower for seed in _HEX_CODE_EXECUTION_SEEDS)
-
-
 _ENCODED_CODE_EXECUTION_PATTERNS: tuple[tuple[bytes, str], ...] = (
     (b"eval(", "eval"),
     (b"exec(", "exec"),
@@ -119,6 +106,17 @@ _ENCODED_CODE_EXECUTION_PATTERNS: tuple[tuple[bytes, str], ...] = (
     (b"subprocess", "subprocess"),
     (b"__import__", "__import__"),
 )
+_BASE64_CODE_EXECUTION_SEEDS = tuple(
+    base64.b64encode(pattern).rstrip(b"=") for pattern, _ in _ENCODED_CODE_EXECUTION_PATTERNS
+)
+_HEX_CODE_EXECUTION_SEEDS = tuple(binascii.hexlify(pattern) for pattern, _ in _ENCODED_CODE_EXECUTION_PATTERNS)
+
+
+def _hex_token_has_execution_seed(token: bytes) -> bool:
+    token_lower = token.lower()
+    return any(seed in token_lower for seed in _HEX_CODE_EXECUTION_SEEDS)
+
+
 _RAW_READ_CHUNK_BYTES = 1024 * 1024
 _BINARY_TAIL_SCAN_BYTES = 1024 * 1024
 _BINARY_TAIL_SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
@@ -281,91 +279,13 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"websocket",
     b"zombie",
 )
-_PICKLE_LITERAL_URL_RE = re.compile(
-    rb"(?i)(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?)://"
-    rb"(?:[A-Za-z0-9\-._~:/?#[\]@!$&()*+,;=%-]|"
-    rb"'(?=[A-Za-z0-9\-._~:/?#[\]@!$&*+,=%-]))+"
+_PICKLE_LITERAL_URL_PATTERN = (
+    r"(?i)(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?)://"
+    r"(?:[A-Za-z0-9\-._~:/?#[\]@!$&()*+,;=%-]|'(?=[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%-]))+"
 )
-_PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS = tuple(NetworkCommDetector.NETWORK_FUNCTIONS)
-_EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
-    b"__import__",
-    b"cloudpickle.load",
-    b"dill.load",
-    b"download_file(",
-    b"download_url_to_file",
-    b"eval(",
-    b"exec(",
-    b"gethostbyname",
-    b"getaddrinfo",
-    b"hf_hub_download(",
-    b"http.request",
-    b"httpx.",
-    b"aiohttp.",
-    b"joblib.load",
-    b"load_state_dict_from_url",
-    b"os.popen",
-    b"os.system",
-    b"pickle.load",
-    b"requests.",
-    b"shell=true",
-    b"socket.",
-    b"snapshot_download(",
-    b"subprocess",
-    b"torch.hub.download_url_to_file",
-    b"torch.hub.load",
-    b"urllib.",
-    b"urlopen",
-    b"urlretrieve",
-    b"yaml.load",
-)
-_EXECUTABLE_NETWORK_LITERAL_COMMAND_RE = re.compile(
-    rb"(?i)(?<![A-Za-z0-9_./-])(?:bash|curl|nc|netcat|pwsh|powershell|sh|wget)(?:\.exe)?"
-    rb"(?=$|[\s;&|'\")]|\$\{IFS\})"
-)
-_PYTHON_IDENTIFIER_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*")
-_NETWORK_IMPORT_STATEMENT_RE = re.compile(rb"(?i)(?<![A-Za-z0-9_.])import\s+(?P<imports>[^;\r\n]+)")
-_NETWORK_FROM_IMPORT_RE = re.compile(
-    rb"(?i)(?<![A-Za-z0-9_.])from\s+"
-    rb"(?P<module>requests|httpx|aiohttp|socket|urllib\.request|http\.client)\s+import\s+"
-    rb"(?P<imports>[^;\r\n]+)"
-)
-_NETWORK_IMPORTABLE_MODULE_CALLS: dict[bytes, tuple[bytes, ...]] = {
-    b"aiohttp": (b"delete", b"get", b"head", b"options", b"patch", b"post", b"put", b"request"),
-    b"http.client": (b"connect", b"request", b"send"),
-    b"httpx": (b"delete", b"get", b"head", b"options", b"patch", b"post", b"put", b"request", b"stream"),
-    b"requests": (b"delete", b"get", b"head", b"options", b"patch", b"post", b"put", b"request", b"session"),
-    b"socket": (b"connect", b"create_connection", b"getaddrinfo", b"gethostbyaddr", b"gethostbyname", b"socket"),
-    b"urllib": (b"urlopen", b"urlretrieve"),
-    b"urllib.request": (b"urlopen", b"urlretrieve"),
-}
-_EXECUTABLE_PICKLE_GLOBAL_FULL_NAMES = frozenset(
-    {
-        "huggingface_hub.hf_hub_download",
-        "huggingface_hub.snapshot_download",
-        "torch.hub.download_url_to_file",
-        "torch.hub.load",
-        "torch.hub.load_state_dict_from_url",
-        "torch.utils.model_zoo.load_url",
-    }
-)
-_EXECUTABLE_PICKLE_GLOBAL_MODULE_PREFIXES = (
-    "aiohttp",
-    "httpx",
-    "requests",
-    "urllib",
-)
-_EXECUTABLE_PICKLE_GLOBAL_NAMES = frozenset(
-    {
-        "download_file",
-        "download_url_to_file",
-        "hf_hub_download",
-        "load_state_dict_from_url",
-        "load_url",
-        "snapshot_download",
-        "urlopen",
-        "urlretrieve",
-    }
-)
+_PICKLE_LITERAL_URL_RE = re.compile(_PICKLE_LITERAL_URL_PATTERN.encode("ascii"))
+_PICKLE_LITERAL_URL_TEXT_RE = re.compile(_PICKLE_LITERAL_URL_PATTERN)
+_PICKLE_ADJACENT_SHELL_BOUNDARY_RE = re.compile(r"^[\s\"']*(?:\||&&?|\|\||;|\$\(|[<>+\-/%*])")
 _SECRET_ASSIGNMENT_SHAPE_RE = re.compile(
     rb"(?i)\b[a-z0-9_.-]{0,64}(?:api[_-]?key|secret|token|password|passwd|pwd|credential|access[_-]?key)"
     rb"[a-z0-9_.-]{0,64}\s*[:=]\s*['\"]?[A-Za-z0-9_./+=:-]{8,}"
@@ -395,7 +315,6 @@ _PICKLE_LITERAL_OPCODE_NAMES = frozenset(
         "BYTEARRAY8",
     }
 )
-_PICKLE_LITERAL_RECORD_MAX_OPCODES = 250_000
 _PICKLE_STRING_OPCODE_NAMES = frozenset(
     {
         "STRING",
@@ -540,32 +459,6 @@ class _PickleCveStream:
     payload: bytes
     offset: int
     parse_incomplete: bool
-
-
-@dataclass(frozen=True)
-class _PickleLiteralRecord:
-    start: int
-    end: int
-    literal: bytes
-    executable_consumer: bool = False
-
-
-@dataclass
-class _PickleLiteralRecordBuilder:
-    start: int
-    end: int
-    literal: bytes
-    executable_consumer: bool = False
-
-
-@dataclass(frozen=True)
-class _PickleStackValue:
-    text: str | None = None
-    record_indexes: tuple[int, ...] = ()
-    global_module: str | None = None
-    global_name: str | None = None
-    opaque_callable: bool = False
-    build_state_consumer: bool = False
 
 
 @dataclass(frozen=True)
@@ -1528,644 +1421,165 @@ def _literal_arg_text(arg: object) -> str | None:
     if isinstance(arg, str):
         return arg
     if isinstance(arg, bytes):
-        return arg.decode("utf-8", errors="ignore")
-    return None
-
-
-def _pickle_literal_memo_index(arg: object) -> int | None:
-    if isinstance(arg, bool):
-        return None
-    if isinstance(arg, int):
-        return arg if arg >= 0 else None
-    if isinstance(arg, str):
         try:
-            index = int(arg)
-        except ValueError:
+            return arg.decode("utf-8")
+        except UnicodeDecodeError:
             return None
-        return index if index >= 0 else None
     return None
 
 
-def _pickle_literal_record_value(*values: _PickleStackValue) -> _PickleStackValue:
-    seen: set[int] = set()
-    indexes: list[int] = []
-    for value in values:
-        for index in value.record_indexes:
-            if index in seen:
-                continue
-            seen.add(index)
-            indexes.append(index)
-    return _PickleStackValue(record_indexes=tuple(indexes))
+def _strip_urls(data: bytes, text: str | None, start: int, end: int, out: bytearray, limit: int) -> int | None:
+    raw_matches = list(islice(_PICKLE_LITERAL_URL_RE.finditer(data, start, end), limit + 1))
+    if not raw_matches:
+        return limit
+    if len(raw_matches) > limit or text is None:
+        return None
+    text_matches = list(islice(_PICKLE_LITERAL_URL_TEXT_RE.finditer(text), len(raw_matches) + 1))
+    if len(raw_matches) != len(text_matches):
+        return None
+    for raw_match, text_match in zip(raw_matches, text_matches, strict=True):
+        prefix = text[max(0, text_match.start() - _MAX_PICKLE_URL_SUFFIX_PROBE_CHARS) : text_match.start()]
+        suffix = text[text_match.end() : text_match.end() + _MAX_PICKLE_URL_SUFFIX_PROBE_CHARS]
+        quote = text[text_match.start() - 1] if text_match.start() and text[text_match.start() - 1] in "'\"" else None
+        url = _trim_source_literal_url(
+            text_match.group(), quote, suffix, prefix, fail_closed_ambiguous_shell_boundary=True
+        )
+        if not url or raw_match.group().decode("ascii") != text_match.group():
+            return None
+        if _pickle_literal_url_is_proven_inert(text, text_match.start(), text_match.start() + len(url)):
+            out[raw_match.start() : raw_match.start() + len(url)] = b" " * len(url)
+    return limit - len(raw_matches)
 
 
-def _pickle_stack_value_is_executable_network_consumer(value: _PickleStackValue) -> bool:
-    if value.opaque_callable:
-        return True
-    if value.global_module is None or value.global_name is None:
-        return False
+def _trim_repeated_literal_padding(text: str) -> str:
+    return "" if len(text) >= 16 and text[0].isascii() and text[0].isalnum() and text == text[0] * len(text) else text
 
-    module = value.global_module.strip()
-    name = value.global_name.strip()
-    lowered_module = module.lower()
-    lowered_name = name.lower()
-    lowered_full_name = f"{lowered_module}.{lowered_name}"
 
-    if module == "__main__":
-        return True
-    if is_suspicious_global(module, name):
-        return True
-    if lowered_full_name in _EXECUTABLE_PICKLE_GLOBAL_FULL_NAMES:
-        return True
-    if any(
-        lowered_module == prefix or lowered_module.startswith(f"{prefix}.")
-        for prefix in _EXECUTABLE_PICKLE_GLOBAL_MODULE_PREFIXES
+def _has_active_shell_substitution(text: str) -> bool:
+    in_single_quote = in_double_quote = False
+    for token in re.finditer(r"""\\.|['"`]|\$\(""", text):
+        value = token.group()
+        if value == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+        elif not in_double_quote and (value == "'" or (in_single_quote and value == "\\'")):
+            if in_single_quote:
+                in_single_quote = False
+            else:
+                index = token.end() - 1
+                before, after = text[index - 1 : index], text[index + 1 : index + 2]
+                in_single_quote = not (before.isalnum() and after.isalnum())
+        elif not in_single_quote and value in {"`", "$("}:
+            return True
+    return False
+
+
+def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int) -> bool:
+    if (
+        max(url_start, len(text) - url_end) > _MAX_PICKLE_LITERAL_URL_CONTEXT_CHARS
+        or url_end - url_start > _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS
+        or _has_active_shell_substitution(text)
     ):
+        return False
+    scan_text = (
+        _trim_repeated_literal_padding(text[:url_start])
+        + "https://example.invalid/"
+        + _trim_repeated_literal_padding(text[url_end:])
+    )
+    if len(scan_text) > _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS:
+        return False
+    adjacent = _PICKLE_ADJACENT_SHELL_BOUNDARY_RE.match(text[url_end:]) is not None
+    if not adjacent and _PICKLE_LITERAL_URL_TEXT_RE.fullmatch(scan_text.strip()) is not None:
         return True
-    return lowered_name in _EXECUTABLE_PICKLE_GLOBAL_NAMES
+    try:
+        tree = ast.parse(scan_text)
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
+        if adjacent:
+            return False
+        prose = b" " + scan_text.encode("utf-8")
+        return all(
+            _is_doc_only_network_reference(
+                prose,
+                match_index=match.start(),
+                token_len=len(match.group()),
+                context="pickle-metadata.txt",
+                requires_call=False,
+                requires_explicit_prefix=True,
+            )
+            for match in _PICKLE_LITERAL_URL_RE.finditer(prose)
+        )
+    return not any(isinstance(node, ast.Call) for node in ast.walk(tree))
 
 
-def _pickle_stack_value_is_build_state_consumer(value: _PickleStackValue) -> bool:
-    return value.build_state_consumer or _pickle_stack_value_is_executable_network_consumer(value)
+def _inert_literal_url_stripped_scan_view(data: bytes) -> bytes:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    stripped = bytearray(data)
+    remaining = _strip_urls(data, text, 0, len(data), stripped, _MAX_PICKLE_LITERAL_URLS)
+    return data if remaining is None else bytes(stripped)
 
 
-def _pickle_constructed_object_value(callable_value: _PickleStackValue) -> _PickleStackValue:
-    return _PickleStackValue(
-        text=callable_value.text,
-        global_module=callable_value.global_module,
-        global_name=callable_value.global_name,
-        opaque_callable=callable_value.opaque_callable,
-        build_state_consumer=_pickle_stack_value_is_build_state_consumer(callable_value),
-    )
+def _pickle_literal_url_stripped_scan_view(data: bytes, *, allow_filtering: bool) -> bytes:
+    if not allow_filtering or _PICKLE_LITERAL_URL_RE.search(data) is None:
+        return data
+    streams, limit_exceeded = _pickle_cve_streams(data)
+    if limit_exceeded or any(stream.parse_incomplete for stream in streams):
+        return data
 
+    stripped = bytearray(data)
+    remaining = _MAX_PICKLE_LITERAL_URLS
+    covered = 0
+    budget = _PYTORCH_LEGACY_MAX_CONTROL_OPCODES
+    for stream in streams:
+        if stream.offset < covered or data[covered : stream.offset].strip(b"\x00\t\n\x0b\x0c\r "):
+            return data
+        covered = stream.offset + len(stream.payload)
+        try:
+            operations = list(islice(pickletools.genops(stream.payload), budget + 1))
+        except Exception:
+            return data
+        if not operations or len(operations) > budget or operations[-1][0].name != "STOP":
+            return data
+        budget -= len(operations)
+        for (opcode, arg, position), (_, _, next_position) in pairwise(operations):
+            if opcode.name in _PICKLE_LITERAL_OPCODE_NAMES:
+                if not isinstance(position, int) or not isinstance(next_position, int):
+                    return data
+                next_remaining = _strip_urls(
+                    data,
+                    _literal_arg_text(arg),
+                    stream.offset + position,
+                    stream.offset + next_position,
+                    stripped,
+                    remaining,
+                )
+                if next_remaining is None:
+                    return data
+                remaining = next_remaining
 
-def _pickle_literal_parse_exception_is_truncation(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return (
-        "pickle exhausted before seeing stop" in message
-        or "not enough data" in message
-        or ("expected " in message and " only " in message and " remain" in message)
-    )
+    if data[covered:].strip(b"\x00\t\n\x0b\x0c\r "):
+        return data
+    return bytes(stripped)
 
 
 def _documentation_literal_spans(data: bytes) -> tuple[tuple[int, int], ...]:
+    try:
+        operations = list(pickletools.genops(data))
+    except Exception:
+        return ()
+
     spans: list[tuple[int, int]] = []
-    for record in _pickle_literal_records(data):
-        if not _is_primarily_documentation(record.literal):
+    for index, (opcode, arg, position) in enumerate(operations):
+        if position is None or opcode.name not in _PICKLE_LITERAL_OPCODE_NAMES:
             continue
-        spans.append((record.start, record.end))
+        literal = _literal_arg_bytes(arg)
+        if literal is None or not _is_primarily_documentation(literal):
+            continue
+        next_position = operations[index + 1][2] if index + 1 < len(operations) else None
+        end_position = next_position if isinstance(next_position, int) and next_position > position else len(data)
+        spans.append((position, end_position))
     return tuple(spans)
-
-
-def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
-    marker = object()
-    unknown = _PickleStackValue()
-    stack: list[_PickleStackValue | object] = []
-    memo: dict[int, _PickleStackValue] = {}
-    overflow_memo_value = _PickleStackValue()
-    builders: list[_PickleLiteralRecordBuilder] = []
-    last_literal_index: int | None = None
-
-    def finish_previous_literal(position: int | None) -> None:
-        nonlocal last_literal_index
-        if last_literal_index is None or not isinstance(position, int):
-            return
-        previous = builders[last_literal_index]
-        if position > previous.start:
-            previous.end = position
-        last_literal_index = None
-
-    def pop_value() -> _PickleStackValue:
-        while stack:
-            value = stack.pop()
-            if isinstance(value, _PickleStackValue):
-                return value
-            return unknown
-        return unknown
-
-    def pop_to_mark() -> tuple[_PickleStackValue, ...]:
-        values: list[_PickleStackValue] = []
-        while stack:
-            value = stack.pop()
-            if value is marker:
-                values.reverse()
-                return tuple(values)
-            if isinstance(value, _PickleStackValue):
-                values.append(value)
-        return tuple(reversed(values))
-
-    def push(value: _PickleStackValue) -> None:
-        stack.append(value)
-
-    def push_container(values: tuple[_PickleStackValue, ...]) -> None:
-        push(_pickle_literal_record_value(*values))
-
-    def mark_executable_consumer(value: _PickleStackValue) -> None:
-        for index in value.record_indexes:
-            if 0 <= index < len(builders):
-                builders[index].executable_consumer = True
-
-    def mark_literal_result_consumers(*values: _PickleStackValue) -> None:
-        mark_executable_consumer(_pickle_literal_record_value(*values))
-
-    def mark_unresolved_records_executable_consumers() -> None:
-        stack_values = tuple(value for value in stack if isinstance(value, _PickleStackValue))
-        mark_literal_result_consumers(*stack_values, *memo.values(), overflow_memo_value)
-
-    def build_records() -> tuple[_PickleLiteralRecord, ...]:
-        return tuple(
-            _PickleLiteralRecord(
-                builder.start,
-                builder.end,
-                builder.literal,
-                executable_consumer=builder.executable_consumer,
-            )
-            for builder in builders
-        )
-
-    opcode_count = 0
-    parsed_streams = 0
-    stream = io.BytesIO(data)
-    offset = 0
-    while offset < len(data):
-        while offset < len(data) and (
-            data[offset] in _CVE_PICKLE_STREAM_PADDING or data[offset] not in _PICKLE_OPCODE_PREFIX_BYTES
-        ):
-            offset += 1
-        if offset >= len(data):
-            break
-
-        stack = []
-        memo = {}
-        overflow_memo_value = _PickleStackValue()
-        stream_builder_start = len(builders)
-        stream_complete = False
-        saw_opcode = False
-        stream.seek(offset)
-        try:
-            for opcode, arg, position in pickletools.genops(stream):
-                opcode_count += 1
-                if opcode_count > _PICKLE_LITERAL_RECORD_MAX_OPCODES:
-                    finish_previous_literal(position)
-                    mark_unresolved_records_executable_consumers()
-                    return build_records()
-
-                saw_opcode = True
-                finish_previous_literal(position)
-                opcode_name = opcode.name
-
-                if opcode_name == "MARK":
-                    stack.append(marker)
-                    continue
-
-                if opcode_name in _PICKLE_LITERAL_OPCODE_NAMES:
-                    literal = _literal_arg_bytes(arg)
-                    if literal is None or not isinstance(position, int):
-                        push(unknown)
-                        continue
-                    index = len(builders)
-                    builders.append(_PickleLiteralRecordBuilder(position, len(data), literal))
-                    last_literal_index = index
-                    push(_PickleStackValue(text=_literal_arg_text(arg), record_indexes=(index,)))
-                    continue
-
-                if opcode_name == "GLOBAL":
-                    parts = _global_parts(arg)
-                    if parts is None:
-                        push(unknown)
-                    else:
-                        module, name = parts
-                        push(_PickleStackValue(text=f"{module}.{name}", global_module=module, global_name=name))
-                    continue
-
-                if opcode_name == "STACK_GLOBAL":
-                    name_value = pop_value()
-                    module_value = pop_value()
-                    if module_value.text is None or name_value.text is None:
-                        push(unknown)
-                    else:
-                        push(
-                            _PickleStackValue(
-                                text=f"{module_value.text}.{name_value.text}",
-                                global_module=module_value.text,
-                                global_name=name_value.text,
-                            )
-                        )
-                    continue
-
-                if opcode_name in {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}:
-                    if stack and isinstance(stack[-1], _PickleStackValue):
-                        memo_index = len(memo) if opcode_name == "MEMOIZE" else _pickle_literal_memo_index(arg)
-                        if memo_index is not None:
-                            if memo_index in memo or len(memo) < _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
-                                memo[memo_index] = stack[-1]
-                            else:
-                                overflow_memo_value = _pickle_literal_record_value(overflow_memo_value, stack[-1])
-                    continue
-
-                if opcode_name in {"GET", "BINGET", "LONG_BINGET"}:
-                    lookup_index = _pickle_literal_memo_index(arg)
-                    if lookup_index is None:
-                        push(unknown)
-                    elif lookup_index in memo:
-                        push(memo[lookup_index])
-                    elif overflow_memo_value.record_indexes:
-                        push(overflow_memo_value)
-                    else:
-                        push(unknown)
-                    continue
-
-                if opcode_name == "POP":
-                    pop_value()
-                    continue
-
-                if opcode_name == "POP_MARK":
-                    pop_to_mark()
-                    continue
-
-                if opcode_name == "DUP":
-                    push(stack[-1] if stack and isinstance(stack[-1], _PickleStackValue) else unknown)
-                    continue
-
-                if opcode_name in {"EMPTY_TUPLE", "EMPTY_LIST", "EMPTY_DICT", "EMPTY_SET"}:
-                    push(unknown)
-                    continue
-
-                if opcode_name in {"TUPLE", "LIST", "DICT", "SET", "FROZENSET"}:
-                    push_container(pop_to_mark())
-                    continue
-
-                if opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
-                    arity = int(opcode_name[-1])
-                    if len(stack) < arity:
-                        push(unknown)
-                        continue
-                    tuple_values = [pop_value() for _ in range(arity)]
-                    tuple_values.reverse()
-                    push_container(tuple(tuple_values))
-                    continue
-
-                if opcode_name == "APPEND":
-                    item = pop_value()
-                    target = pop_value()
-                    push_container((target, item))
-                    continue
-
-                if opcode_name == "SETITEM":
-                    value = pop_value()
-                    key = pop_value()
-                    target = pop_value()
-                    push_container((target, key, value))
-                    continue
-
-                if opcode_name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
-                    marked_values = pop_to_mark()
-                    target = pop_value() if stack and isinstance(stack[-1], _PickleStackValue) else unknown
-                    push_container((target, *marked_values))
-                    continue
-
-                if opcode_name == "REDUCE":
-                    args = pop_value()
-                    callable_value = pop_value()
-                    if _pickle_stack_value_is_executable_network_consumer(callable_value):
-                        mark_literal_result_consumers(args)
-                    push(_pickle_constructed_object_value(callable_value))
-                    continue
-
-                if opcode_name == "NEWOBJ":
-                    args = pop_value()
-                    callable_value = pop_value()
-                    if _pickle_stack_value_is_executable_network_consumer(callable_value):
-                        mark_literal_result_consumers(args)
-                    push(_pickle_constructed_object_value(callable_value))
-                    continue
-
-                if opcode_name == "NEWOBJ_EX":
-                    kwargs = pop_value()
-                    args = pop_value()
-                    callable_value = pop_value()
-                    if _pickle_stack_value_is_executable_network_consumer(callable_value):
-                        mark_literal_result_consumers(args, kwargs)
-                    push(_pickle_constructed_object_value(callable_value))
-                    continue
-
-                if opcode_name == "OBJ":
-                    obj_values = pop_to_mark()
-                    callable_value = obj_values[0] if obj_values else unknown
-                    if _pickle_stack_value_is_executable_network_consumer(callable_value):
-                        mark_literal_result_consumers(*obj_values[1:])
-                    push(_pickle_constructed_object_value(callable_value))
-                    continue
-
-                if opcode_name == "INST":
-                    inst_values = pop_to_mark()
-                    inst_global = unknown
-                    parts = _global_parts(arg)
-                    if parts is not None:
-                        module, name = parts
-                        inst_global = _PickleStackValue(global_module=module, global_name=name)
-                    if _pickle_stack_value_is_executable_network_consumer(inst_global):
-                        mark_literal_result_consumers(*inst_values)
-                    push(_pickle_constructed_object_value(inst_global))
-                    continue
-
-                if opcode_name == "BINPERSID":
-                    mark_literal_result_consumers(pop_value())
-                    push(_PickleStackValue(opaque_callable=True))
-                    continue
-
-                if opcode_name == "PERSID":
-                    push(_PickleStackValue(opaque_callable=True))
-                    continue
-
-                if opcode_name == "BUILD":
-                    state = pop_value()
-                    target = stack[-1] if stack and isinstance(stack[-1], _PickleStackValue) else unknown
-                    if _pickle_stack_value_is_build_state_consumer(target):
-                        mark_literal_result_consumers(state)
-                    continue
-
-                if opcode_name in {"EXT1", "EXT2", "EXT4"}:
-                    push(_PickleStackValue(opaque_callable=True))
-                    continue
-
-                if opcode_name in {
-                    "BINBYTES",
-                    "BINBYTES8",
-                    "BINFLOAT",
-                    "BININT",
-                    "BININT1",
-                    "BININT2",
-                    "BYTEARRAY8",
-                    "FLOAT",
-                    "INT",
-                    "LONG",
-                    "LONG1",
-                    "LONG4",
-                    "NEWFALSE",
-                    "NEWTRUE",
-                    "NEXT_BUFFER",
-                    "NONE",
-                    "READONLY_BUFFER",
-                    "SHORT_BINBYTES",
-                }:
-                    push(unknown)
-                    continue
-
-                if opcode_name == "STOP":
-                    stream_complete = True
-                    break
-
-        except Exception as exc:
-            if _pickle_literal_parse_exception_is_truncation(exc):
-                mark_unresolved_records_executable_consumers()
-                break
-            if parsed_streams == 0:
-                mark_unresolved_records_executable_consumers()
-                break
-            del builders[stream_builder_start:]
-            last_literal_index = None
-            break
-
-        if not saw_opcode:
-            offset += 1
-            continue
-        parsed_streams += 1
-        if not stream_complete:
-            break
-        offset = max(offset + 1, stream.tell())
-
-    return build_records()
-
-
-def _pickle_network_from_import_aliases(context: bytes) -> set[bytes]:
-    aliases: set[bytes] = set()
-    for match in _NETWORK_FROM_IMPORT_RE.finditer(context):
-        module = match.group("module").lower()
-        call_names = _NETWORK_IMPORTABLE_MODULE_CALLS.get(module, ())
-        for raw_import in match.group("imports").split(b","):
-            words = raw_import.strip().split()
-            if not words:
-                continue
-            imported_name = words[0].strip(b"()").lower()
-            if imported_name == b"*":
-                aliases.update(call_names)
-                continue
-            if imported_name not in call_names:
-                continue
-            alias = imported_name
-            if len(words) >= 3 and words[1].lower() == b"as":
-                alias = words[2].strip(b"()").lower()
-            if _PYTHON_IDENTIFIER_RE.fullmatch(alias):
-                aliases.add(alias)
-    return aliases
-
-
-def _pickle_network_module_import_aliases(context: bytes) -> dict[bytes, tuple[bytes, ...]]:
-    aliases: dict[bytes, tuple[bytes, ...]] = {}
-    for match in _NETWORK_IMPORT_STATEMENT_RE.finditer(context):
-        for raw_import in match.group("imports").split(b","):
-            words = raw_import.strip().split()
-            if len(words) < 3 or words[1].lower() != b"as":
-                continue
-            module = words[0].strip(b"()").lower()
-            alias = words[2].strip(b"()").lower()
-            call_names = _NETWORK_IMPORTABLE_MODULE_CALLS.get(module)
-            if call_names is None or _PYTHON_IDENTIFIER_RE.fullmatch(alias) is None:
-                continue
-            aliases[alias] = call_names
-    return aliases
-
-
-def _pickle_literal_contains_imported_network_alias_call(context: bytes) -> bool:
-    for alias in _pickle_network_from_import_aliases(context):
-        if re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*\(", context):
-            return True
-
-    for alias, call_names in _pickle_network_module_import_aliases(context).items():
-        escaped_calls = b"|".join(re.escape(call_name) for call_name in call_names)
-        if re.search(
-            rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*\.\s*(?:" + escaped_calls + rb")\s*\(",
-            context,
-        ):
-            return True
-    return False
-
-
-def _pickle_literal_has_executable_network_context(literal: bytes) -> bool:
-    context = re.sub(rb"\\\r?\n[ \t]*", b"", _PICKLE_LITERAL_URL_RE.sub(b" ", literal))
-    lowered = context.lower()
-    compact = re.sub(rb"\s+", b"", lowered)
-    if any(seed in lowered or seed in compact for seed in _EXECUTABLE_NETWORK_LITERAL_SEEDS):
-        return True
-    if _pickle_literal_contains_imported_network_alias_call(lowered):
-        return True
-    return _EXECUTABLE_NETWORK_LITERAL_COMMAND_RE.search(context) is not None
-
-
-def _position_is_within_pickle_literal_url_span(data: bytes, record: _PickleLiteralRecord, position: int) -> bool:
-    return any(
-        match.start() <= position < match.end()
-        for match in _PICKLE_LITERAL_URL_RE.finditer(data, record.start, record.end)
-    )
-
-
-def _network_finding_is_inert_pickle_literal_network_evidence(
-    finding: dict[str, Any],
-    literal_records: tuple[_PickleLiteralRecord, ...],
-    data: bytes,
-) -> bool:
-    finding_type = finding.get("type")
-    if finding_type == "explicit_network_pattern":
-        if finding.get("pattern_type") != "url":
-            return False
-    elif finding_type == "url_detected":
-        pass
-    elif finding_type not in {"network_function", "network_library"}:
-        return False
-    position = finding.get("position")
-    if not isinstance(position, int):
-        return False
-    for record in literal_records:
-        if record.start <= position < record.end:
-            if record.executable_consumer:
-                return False
-            if _pickle_literal_has_executable_network_context(record.literal):
-                return False
-            return _position_is_within_pickle_literal_url_span(data, record, position)
-    return False
-
-
-def executable_pickle_literal_network_findings(
-    data: bytes,
-    *,
-    context: str,
-    literal_records: tuple[_PickleLiteralRecord, ...],
-    position_offset: int = 0,
-) -> list[dict[str, Any]]:
-    findings: list[dict[str, Any]] = []
-    seen: set[tuple[int, str]] = set()
-    for record in literal_records:
-        if not record.executable_consumer:
-            continue
-        for match in _PICKLE_LITERAL_URL_RE.finditer(data, record.start, record.end):
-            absolute_position = position_offset + match.start()
-            raw_url = match.group().decode("utf-8", errors="ignore")
-            if not raw_url:
-                continue
-            matched_text = redact_url_for_finding(raw_url)
-            key = (absolute_position, matched_text)
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(
-                {
-                    "type": "explicit_network_pattern",
-                    "severity": "CRITICAL",
-                    "confidence": 0.95,
-                    "message": f"Executable pickle call argument contains URL: {matched_text[:100]}",
-                    "pattern_type": "url",
-                    "matched_text": matched_text[:200],
-                    "position": absolute_position,
-                    "context": context,
-                    "source": "pickle_executable_literal_consumer",
-                }
-            )
-    return findings
-
-
-def _network_finding_dedupe_key(finding: dict[str, Any]) -> tuple[Any, ...]:
-    return (
-        finding.get("type"),
-        finding.get("pattern_type"),
-        finding.get("matched_text"),
-        finding.get("url"),
-        finding.get("position"),
-        finding.get("context"),
-    )
-
-
-def unique_network_findings(
-    findings: list[dict[str, Any]],
-    *,
-    existing_findings: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    seen = {_network_finding_dedupe_key(finding) for finding in existing_findings or []}
-    unique_findings: list[dict[str, Any]] = []
-    for finding in findings:
-        key = _network_finding_dedupe_key(finding)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_findings.append(finding)
-    return unique_findings
-
-
-def extend_unique_network_findings(findings: list[dict[str, Any]], additions: list[dict[str, Any]]) -> None:
-    findings.extend(unique_network_findings(additions, existing_findings=findings))
-
-
-def offset_network_finding_positions(findings: list[dict[str, Any]], position_offset: int) -> list[dict[str, Any]]:
-    if position_offset <= 0:
-        return findings
-    adjusted: list[dict[str, Any]] = []
-    for finding in findings:
-        position = finding.get("position")
-        if not isinstance(position, int):
-            adjusted.append(finding)
-            continue
-        adjusted.append({**finding, "position": position_offset + position})
-    return adjusted
-
-
-def filter_inert_pickle_literal_network_findings(
-    findings: list[dict[str, Any]],
-    data: bytes,
-    *,
-    literal_records: tuple[_PickleLiteralRecord, ...],
-) -> list[dict[str, Any]]:
-    """Drop URL-only critical network findings for inert pickle literals."""
-    if not findings:
-        return findings
-    if not literal_records:
-        return findings
-    return [
-        finding
-        for finding in findings
-        if not _network_finding_is_inert_pickle_literal_network_evidence(finding, literal_records, data)
-    ]
-
-
-def _literal_url_contains_network_function_text(url: bytes) -> bool:
-    lowered = url.lower()
-    return any(token in lowered for token in _PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS)
-
-
-def _pickle_literal_url_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
-    return _pickle_literal_records(data) if _PICKLE_LITERAL_URL_RE.search(data) else ()
-
-
-def _pickle_literal_url_stripped_scan_view(
-    data: bytes,
-    *,
-    network_functions_only: bool = False,
-    literal_records: tuple[_PickleLiteralRecord, ...] | None = None,
-) -> bytes:
-    records = _pickle_literal_url_records(data) if literal_records is None else literal_records
-    if not records:
-        return data
-    stripped: bytearray | None = None
-    for record in records:
-        if record.executable_consumer:
-            continue
-        if _pickle_literal_has_executable_network_context(record.literal):
-            continue
-        for match in _PICKLE_LITERAL_URL_RE.finditer(data, record.start, record.end):
-            if network_functions_only and not _literal_url_contains_network_function_text(match.group()):
-                continue
-            if stripped is None:
-                stripped = bytearray(data)
-            stripped[match.start() : match.end()] = b" " * (match.end() - match.start())
-    return data if stripped is None else bytes(stripped)
 
 
 def _pickle_literal_strings(data: bytes) -> tuple[str, ...]:
@@ -4508,12 +3922,36 @@ class PickleScanner(BaseScanner):
         if not data:
             return
 
+        coverage = result.metadata.get("pickle_coverage")
+        allow_url_filtering = (
+            position_offset == 0
+            and self._rust_scan_completed_cleanly(result)
+            and isinstance(coverage, Mapping)
+            and coverage.get("bytes_scanned") == len(data)
+            and coverage.get("bytes_total") == len(data)
+            and coverage.get("raw_scan_complete") is True
+            and coverage.get("opcode_scan_complete") is True
+        )
+        raw_scan_data = _pickle_literal_url_stripped_scan_view(data, allow_filtering=allow_url_filtering)
         lower_data = data.lower()
         present_bytes = frozenset(lower_data)
+        raw_scan_lower = raw_scan_data.lower()
+        raw_scan_present_bytes = frozenset(raw_scan_lower)
 
-        raw_scan_data = _pickle_literal_url_stripped_scan_view(data)
-        self._scan_raw_text_indicators(data, raw_scan_data, result, source, lower_data, present_bytes)
-        self._scan_encoded_text_indicators(raw_scan_data, result, source)
+        self._scan_raw_text_indicators(
+            data,
+            result,
+            source,
+            scan_data=raw_scan_data,
+            lower_data=raw_scan_lower,
+            present_bytes=raw_scan_present_bytes,
+        )
+        self._scan_encoded_text_indicators(
+            raw_scan_data,
+            result,
+            source,
+            allow_url_filtering=allow_url_filtering,
+        )
         self._analyze_cve_patterns(
             data,
             result,
@@ -4542,6 +3980,7 @@ class PickleScanner(BaseScanner):
             result.metadata["pickle_expensive_raw_detector_skip_reason"] = "disabled"
             return
         expensive_data = data[:expensive_limit]
+        network_scan_data = raw_scan_data[:expensive_limit]
         if len(expensive_data) == len(data):
             expensive_lower = lower_data
             expensive_present_bytes = present_bytes
@@ -4566,36 +4005,12 @@ class PickleScanner(BaseScanner):
         else:
             result.metadata["pickle_jit_raw_detector_skipped"] = True
 
-        if _contains_any_seed_lowered(expensive_lower, _NETWORK_SCAN_SEEDS, expensive_present_bytes) or (
-            _has_domain_or_ip_shape(expensive_data)
-        ):
-            literal_records = _pickle_literal_url_records(expensive_data)
-            network_scan_data = _pickle_literal_url_stripped_scan_view(
-                expensive_data,
-                network_functions_only=True,
-                literal_records=literal_records,
-            )
-            network_findings = self.collect_network_communication_findings(
-                network_scan_data,
-                context=source,
-                result=result,
-            )
-            network_findings = filter_inert_pickle_literal_network_findings(
-                network_findings,
-                expensive_data,
-                literal_records=literal_records,
-            )
-            network_findings = offset_network_finding_positions(network_findings, position_offset)
-            extend_unique_network_findings(
-                network_findings,
-                executable_pickle_literal_network_findings(
-                    expensive_data,
-                    context=source,
-                    position_offset=position_offset,
-                    literal_records=literal_records,
-                ),
-            )
-            self.add_network_communication_findings(network_findings, result, context=source)
+        if _contains_any_seed_lowered(
+            expensive_lower,
+            _NETWORK_SCAN_SEEDS,
+            expensive_present_bytes,
+        ) or _has_domain_or_ip_shape(expensive_data):
+            self.check_for_network_communication(network_scan_data, result, context=source)
         else:
             result.metadata["pickle_network_raw_detector_skipped"] = True
 
@@ -4878,21 +4293,19 @@ class PickleScanner(BaseScanner):
     def _scan_raw_text_indicators(
         self,
         data: bytes,
-        scan_data: bytes,
         result: ScanResult,
         source: str,
+        *,
+        scan_data: bytes | None = None,
         lower_data: bytes | None = None,
         present_bytes: frozenset[int] | None = None,
     ) -> None:
-        if scan_data is data:
-            lower = data.lower() if lower_data is None else lower_data
-        else:
-            lower = scan_data.lower()
-            present_bytes = None
+        indicator_data = data if scan_data is None else scan_data
+        lower = indicator_data.lower() if lower_data is None else lower_data
         if present_bytes is None:
             present_bytes = frozenset(lower)
         if not _has_raw_text_indicator_shape(
-            scan_data,
+            indicator_data,
             lower,
             rust_clean=self._rust_scan_completed_cleanly(result),
             present_bytes=present_bytes,
@@ -4927,9 +4340,9 @@ class PickleScanner(BaseScanner):
                 and _contains_non_documentation_token(lower, b"import ", documentation_spans)
             ):
                 _append_raw_indicator(indicators, "importlib")
-        if _raw_call_token_should_report(scan_data, lower, b"eval", documentation_spans):
+        if _raw_call_token_should_report(data, lower, b"eval", documentation_spans):
             _append_raw_indicator(indicators, "eval", "builtins.eval")
-        if _raw_call_token_should_report(scan_data, lower, b"exec", documentation_spans):
+        if _raw_call_token_should_report(data, lower, b"exec", documentation_spans):
             _append_raw_indicator(indicators, "exec", "builtins.exec")
         if _contains_module_attr(lower, b"webbrowser", b"open", documentation_spans):
             _append_raw_indicator(indicators, "webbrowser.open")
@@ -5024,97 +4437,113 @@ class PickleScanner(BaseScanner):
                 rule_code="S201",
             )
 
-    def _scan_encoded_text_indicators(self, data: bytes, result: ScanResult, source: str) -> None:
-        seen_tokens: set[bytes] = set()
-        decoded_budget = _MAX_RAW_ENCODED_BYTES
-        token_count = 0
+    @staticmethod
+    def _mark_encoded_text_scan_limit(
+        result: ScanResult,
+        source: str,
+        encoding: str,
+        limit_type: str,
+        tokens_analyzed: int,
+        decoded_budget: int,
+    ) -> None:
+        reason = "pickle_encoded_text_scan_limit_exceeded"
+        mark_inconclusive_scan_result(result, reason)
+        result.metadata[reason] = True
+        result.add_check(
+            name="Pickle Encoded Text Coverage",
+            passed=False,
+            message=f"{encoding} encoded-text analysis exceeded its bounded {limit_type} limit",
+            severity=IssueSeverity.INFO,
+            location=source,
+            details={
+                "encoding": encoding,
+                "limit_type": limit_type,
+                "tokens_analyzed": tokens_analyzed,
+                "max_tokens": _MAX_RAW_ENCODED_TOKENS,
+                "decoded_bytes_analyzed": _MAX_RAW_ENCODED_BYTES - decoded_budget,
+                "max_decoded_bytes": _MAX_RAW_ENCODED_BYTES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
 
-        for match in _BASE64_TOKEN_RE.finditer(data):
-            if token_count >= _MAX_RAW_ENCODED_TOKENS or decoded_budget <= 0:
-                return
-
-            token = match.group(0)
-            if token in seen_tokens:
-                continue
-            seen_tokens.add(token)
-            token_count += 1
-            if len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not any(
-                seed in token for seed in _BASE64_CODE_EXECUTION_SEEDS
-            ):
-                continue
-
-            padded_token = token + (b"=" * ((4 - (len(token) % 4)) % 4))
-            try:
-                decoded = base64.b64decode(padded_token, validate=True)
-            except (binascii.Error, ValueError):
-                continue
-
-            if not decoded or len(decoded) > decoded_budget:
-                continue
-            decoded_budget -= len(decoded)
-            decoded_lower = decoded.lower()
-            for pattern, label in _ENCODED_CODE_EXECUTION_PATTERNS:
-                if pattern not in decoded_lower:
+    def _scan_encoded_text_indicators(
+        self,
+        data: bytes,
+        result: ScanResult,
+        source: str,
+        *,
+        allow_url_filtering: bool,
+    ) -> None:
+        for encoding, token_pattern in (("base64", _BASE64_TOKEN_RE), ("hex", _HEX_TOKEN_RE)):
+            seen_tokens: set[bytes] = set()
+            decoded_budget = _MAX_RAW_ENCODED_BYTES
+            token_count = 0
+            for match in token_pattern.finditer(data):
+                token = match.group(0)
+                if encoding == "base64" and len(token) % 2 == 0 and _HEX_TOKEN_RE.fullmatch(token) is not None:
                     continue
-                result.add_check(
-                    name="Encoded Code Execution Pattern Detection",
-                    passed=False,
-                    message=f"Encoded pickle content decodes to dangerous code pattern: {label}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=source,
-                    details={
-                        "encoding": "base64",
-                        "pattern": label,
-                        "source": "bounded_raw_pickle_window",
-                        "decoded_size": len(decoded),
-                        "legacy_rule_aliases": ["S104"],
-                    },
-                    rule_code="S604",
-                )
-                return
-
-        for match in _HEX_TOKEN_RE.finditer(data):
-            if token_count >= _MAX_RAW_ENCODED_TOKENS or decoded_budget <= 0:
-                return
-
-            token = match.group(0)
-            if token in seen_tokens:
-                continue
-            seen_tokens.add(token)
-            token_count += 1
-            if len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not _hex_token_has_execution_seed(token):
-                continue
-
-            if len(token) % 2 != 0:
-                continue
-            try:
-                decoded = binascii.unhexlify(token)
-            except (binascii.Error, ValueError):
-                continue
-
-            if not decoded or len(decoded) > decoded_budget:
-                continue
-            decoded_budget -= len(decoded)
-            decoded_lower = decoded.lower()
-            for pattern, label in _ENCODED_CODE_EXECUTION_PATTERNS:
-                if pattern not in decoded_lower:
+                if token in seen_tokens:
                     continue
-                result.add_check(
-                    name="Encoded Code Execution Pattern Detection",
-                    passed=False,
-                    message=f"Encoded Python code detected in pickle content: {label}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=source,
-                    details={
-                        "encoding": "hex",
-                        "pattern": label,
-                        "source": "bounded_raw_pickle_window",
-                        "decoded_size": len(decoded),
-                        "legacy_rule_aliases": ["S104"],
-                    },
-                    rule_code="S604",
+                if token_count >= _MAX_RAW_ENCODED_TOKENS:
+                    self._mark_encoded_text_scan_limit(result, source, encoding, "token", token_count, decoded_budget)
+                    break
+                seen_tokens.add(token)
+                token_count += 1
+                has_seed = (
+                    any(seed in token for seed in _BASE64_CODE_EXECUTION_SEEDS)
+                    if encoding == "base64"
+                    else _hex_token_has_execution_seed(token)
                 )
-                return
+                if len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not has_seed:
+                    continue
+
+                try:
+                    if encoding == "base64":
+                        padded_token = token + (b"=" * ((4 - (len(token) % 4)) % 4))
+                        decoded = base64.b64decode(padded_token, validate=True)
+                    elif len(token) % 2 == 0:
+                        decoded = binascii.unhexlify(token)
+                    else:
+                        continue
+                except (binascii.Error, ValueError):
+                    continue
+                if not decoded:
+                    continue
+                if len(decoded) > decoded_budget:
+                    self._mark_encoded_text_scan_limit(
+                        result, source, encoding, "decoded_byte", token_count, decoded_budget
+                    )
+                    break
+                decoded_budget -= len(decoded)
+                decoded_scan_data = _inert_literal_url_stripped_scan_view(decoded) if allow_url_filtering else decoded
+                decoded_lower = decoded_scan_data.lower()
+                for pattern, label in _ENCODED_CODE_EXECUTION_PATTERNS:
+                    if pattern not in decoded_lower:
+                        continue
+                    message = (
+                        f"Encoded pickle content decodes to dangerous code pattern: {label}"
+                        if encoding == "base64"
+                        else f"Encoded Python code detected in pickle content: {label}"
+                    )
+                    result.add_check(
+                        name="Encoded Code Execution Pattern Detection",
+                        passed=False,
+                        message=message,
+                        severity=IssueSeverity.CRITICAL,
+                        location=source,
+                        details={
+                            "encoding": encoding,
+                            "pattern": label,
+                            "source": "bounded_raw_pickle_window",
+                            "decoded_size": len(decoded),
+                            "legacy_rule_aliases": ["S104"],
+                        },
+                        rule_code="S604",
+                    )
+                    return
 
     def _analyze_cve_patterns(
         self,

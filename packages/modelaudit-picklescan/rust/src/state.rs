@@ -45,7 +45,11 @@ use crate::stack::{
 };
 use crate::strings::{
     is_repeated_single_byte, is_suspicious_magic_method, suspicious_string_matches,
+    BASE64_ALIGNMENT_AMBIGUITY_SENTINEL, BASE64_SCAN_LIMIT_SENTINEL, BASE64_WORK_LIMIT_SENTINEL,
+    MAX_BASE64_TOTAL_SCAN_CHARS, MAX_STRIPPED_URL_SPANS, URL_CONTEXT_INCOMPLETE_SENTINEL,
+    URL_SCAN_LIMIT_SENTINEL,
 };
+use crate::strings_policy::MAX_BASE64_TEXT_CANDIDATES;
 
 const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
@@ -6194,6 +6198,45 @@ impl<'a> ScanState<'a> {
         suppress_hex_escape: bool,
     ) {
         for matched_pattern in suspicious_string_matches(value) {
+            let scan_limit = match matched_pattern.as_str() {
+                URL_SCAN_LIMIT_SENTINEL => Some((
+                    "URL stripping scan exceeded its bounded span limit",
+                    "url_scan_limit_exceeded",
+                    "max_url_spans",
+                    MAX_STRIPPED_URL_SPANS,
+                )),
+                URL_CONTEXT_INCOMPLETE_SENTINEL => Some((
+                    "URL stripping could not prove bounded lexical context",
+                    "url_context_proof_incomplete",
+                    "bounded_context_proof",
+                    1,
+                )),
+                BASE64_SCAN_LIMIT_SENTINEL => Some((
+                    "Base64 text scan exceeded its bounded candidate limit",
+                    "base64_text_scan_limit_exceeded",
+                    "max_base64_candidates",
+                    MAX_BASE64_TEXT_CANDIDATES,
+                )),
+                BASE64_WORK_LIMIT_SENTINEL => Some((
+                    "Base64 text scan exhausted its bounded total work budget",
+                    "base64_text_work_limit_exceeded",
+                    "max_base64_scan_chars",
+                    MAX_BASE64_TOTAL_SCAN_CHARS,
+                )),
+                BASE64_ALIGNMENT_AMBIGUITY_SENTINEL => Some((
+                    "Base64 text has an ambiguous whitespace-delimited alignment",
+                    "base64_text_alignment_ambiguous",
+                    "ambiguous_alignment",
+                    1,
+                )),
+                _ => None,
+            };
+            if let Some((message, code, limit_name, limit)) = scan_limit {
+                self.record_string_subscan_truncated(
+                    op_name, position, message, code, limit_name, limit,
+                );
+                continue;
+            }
             if suppress_hex_escape && matched_pattern == "hex escape" {
                 continue;
             }
@@ -7647,6 +7690,34 @@ impl<'a> ScanState<'a> {
                     "max_string_literal_scan_chars".to_string(),
                     DetailValue::UInt(self.options.max_string_literal_scan_chars as u64),
                 ),
+                ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+            ],
+        });
+    }
+
+    fn record_string_subscan_truncated(
+        &mut self,
+        op_name: &'static str,
+        position: usize,
+        message: &'static str,
+        code: &'static str,
+        limit_name: &'static str,
+        limit: usize,
+    ) {
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
+        self.add_notice(Notice {
+            message: message.to_string(),
+            severity: "info",
+            location: Some(format!("{} (pos {})", self.source, position)),
+            code: Some(code),
+            details: vec![
+                (
+                    "opcode".to_string(),
+                    DetailValue::String(op_name.to_string()),
+                ),
+                (limit_name.to_string(), DetailValue::UInt(limit as u64)),
                 ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
             ],
         });

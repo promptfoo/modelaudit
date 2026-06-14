@@ -99,9 +99,12 @@ _KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
 )
 _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
 _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`()"
+_PROVEN_BARE_QUERY_COMPONENTS = frozenset({"_debug", "debug"})
+_PROVEN_BARE_PROSE_COMPONENTS = frozenset({"section"})
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
+_URL_SHELL_COMPONENT_BOUNDARY_PATTERN = re.compile(r"[&;]")
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
 _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES = frozenset(
     {"aws4-hmac-sha256", "basic", "bearer", "digest", "negotiate", "oauth"}
@@ -940,33 +943,83 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
 def _source_quote_before_url(data: bytes, url_start: int) -> str | None:
     if url_start <= 0 or data[url_start - 1] not in {ord("'"), ord('"')}:
         return None
+    if url_start > 1 and data[url_start - 2] not in b"\t\r\n" and not 0x20 <= data[url_start - 2] <= 0x7E:
+        return None
     return chr(data[url_start - 1])
 
 
-def _trim_source_literal_url(url: str, source_quote: str | None = None) -> str:
+def _trim_source_literal_url(
+    url: str,
+    source_quote: str | None = None,
+    source_suffix: str = "",
+    source_prefix: str = "",
+    *,
+    fail_closed_ambiguous_shell_boundary: bool = False,
+) -> str:
     """Remove a closing quote only when the URL came from that source literal."""
-    if source_quote != "'":
-        return url
-
-    authority_start = url.find("://") + 3
-    authority_end = len(url)
-    if authority_start >= 3:
+    if source_quote == "'":
+        authority_start = url.find("://") + 3
         authority_end = min(
             (index for delimiter in "/?#" if (index := url.find(delimiter, authority_start)) >= 0),
             default=len(url),
         )
+        escaped = False
+        for index, character in enumerate(url):
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == source_quote:
+                if authority_start <= index < authority_end and url[index + 1 :].startswith("@"):
+                    continue
+                return url[:index]
+        return url
 
-    escaped = False
-    for index, character in enumerate(url):
-        if escaped:
-            escaped = False
-        elif character == "\\":
-            escaped = True
-        elif character == source_quote:
-            if authority_start <= index < authority_end and url[index + 1 :].startswith("@"):
-                continue
-            return url[:index]
-    return url
+    if fail_closed_ambiguous_shell_boundary:
+        explicit_prose = bool(_EXPLICIT_PROSE_PREFIX_PATTERN.match(source_prefix.encode("ascii", errors="ignore")))
+        prose_suffix = re.fullmatch(r"\s+for details[.!]?\s*", source_suffix, re.IGNORECASE)
+        query_start = url.find("?")
+        cursor = 0
+        while (boundary := _URL_SHELL_COMPONENT_BOUNDARY_PATTERN.search(url, cursor)) is not None:
+            component_start = boundary.end()
+            next_boundary = _URL_SHELL_COMPONENT_BOUNDARY_PATTERN.search(url, component_start)
+            component_end = len(url) if next_boundary is None else next_boundary.start()
+            component = url[component_start:component_end]
+            key, assignment, _value = component.partition("=")
+            shaped = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*(?:=[^&;]*)?", component) is not None
+            assignment_is_url = bool(assignment) and (
+                not source_suffix.strip() or (explicit_prose and prose_suffix is not None)
+            )
+            bare_component = (
+                boundary.group() == "&"
+                and 0 <= query_start < boundary.start()
+                and key.lower() in _PROVEN_BARE_QUERY_COMPONENTS
+            ) or (explicit_prose and prose_suffix is not None and key.lower() in _PROVEN_BARE_PROSE_COMPONENTS)
+            if not shaped or not (assignment_is_url or bare_component):
+                url = url[: boundary.start()]
+                break
+            cursor = component_end
+
+    code_boundary = re.search(
+        r"""&&|[&;](?=[\t\r\n \\"'!%(])|\$\(|'(?=[+\-/%*|](?:\(*[A-Za-z_][A-Za-z0-9_.]*)\()""",
+        url + source_suffix[:_MAX_PROSE_LINE_CONTEXT_BYTES],
+    )
+    if code_boundary is not None and code_boundary.start() < len(url):
+        url = url[: code_boundary.start()]
+    if url.endswith(")") and re.search(r"\$\([^)]*$", source_prefix) is not None:
+        url = url[:-1]
+    return url.rstrip("'")
+
+
+def _trim_matched_source_url(data: bytes, match: re.Match[bytes]) -> str:
+    prefix = data[max(0, match.start() - _MAX_PROSE_LINE_CONTEXT_BYTES) : match.start()]
+    suffix = data[match.end() : match.end() + _MAX_PROSE_LINE_CONTEXT_BYTES]
+    return _trim_source_literal_url(
+        match.group().decode("utf-8", errors="ignore"),
+        _source_quote_before_url(data, match.start()),
+        re.split(rb"[^\t\r\n\x20-\x7e]", suffix, maxsplit=1)[0].decode("ascii"),
+        re.split(rb"[^\t\x20-\x7e]", prefix)[-1].decode("ascii"),
+    )
 
 
 def redact_url_for_finding(url: str) -> str:
@@ -1200,9 +1253,7 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
     uri_spans: list[tuple[int, int]] = []
     for url_match in _URI_IN_BYTES_PATTERN.finditer(data, scan_start, scan_end):
         uri_spans.append((url_match.start(), url_match.end()))
-        raw_url = url_match.group().decode("utf-8", errors="ignore")
-        source_quote = _source_quote_before_url(data, url_match.start())
-        trimmed_url = _trim_source_literal_url(raw_url, source_quote)
+        trimmed_url = _trim_matched_source_url(data, url_match)
         trimmed_url_end = url_match.start() + len(trimmed_url.encode("utf-8"))
         if not _is_url_associated_with_match(
             data,
@@ -1267,9 +1318,7 @@ def _uri_text_bounds_containing_offset(
         if match.end() == scan_end and scan_end < len(data) and data[scan_end] not in _URL_TEXT_BOUNDARY_BYTES:
             return None
 
-        raw_url = match.group().decode("utf-8", errors="ignore")
-        source_quote = _source_quote_before_url(data, match.start())
-        url = _trim_source_literal_url(raw_url, source_quote)
+        url = _trim_matched_source_url(data, match)
         if offset >= match.start() + len(url.encode("utf-8")):
             return None
         return url, match.start()
@@ -1488,9 +1537,7 @@ def _is_split_sensitive_url_value(data: bytes, match_start: int) -> bool:
     if (not source_composition and not path_continuation) or not continuation_evidence:
         return False
 
-    raw_url = preceding_url_match.group().decode("utf-8", errors="ignore")
-    source_quote = _source_quote_before_url(data, preceding_url_match.start())
-    url = _trim_source_literal_url(raw_url, source_quote)
+    url = _trim_matched_source_url(data, preceding_url_match)
     return _url_path_awaits_sensitive_value(url)
 
 
@@ -1674,8 +1721,13 @@ _PROSE_MARKERS: tuple[str, ...] = (
     " mentions",
     " includes",
 )
+_EXPLICIT_PROSE_PREFIX_PATTERN = re.compile(
+    rb"^\s*#?\s*(?:see|use|docs?|documentation|readme|description|metadata|author(?:'s|s')?\s+docs?)\b",
+    re.IGNORECASE,
+)
 _MAX_PROSE_LINE_CONTEXT_BYTES = 512
 _WORD_PATTERN = re.compile(rb"[A-Za-z]{2,}")
+_CALL_SYNTAX_SUFFIX_PATTERN = re.compile(rb"(?:[\s)]|#[^\n]*\n)*\(")
 _CODE_LINE_PREFIXES: tuple[bytes, ...] = (
     b"import ",
     b"from ",
@@ -1687,6 +1739,10 @@ _CODE_LINE_MARKERS: tuple[bytes, ...] = (
     b"=",
     b";",
     b"lambda ",
+)
+_DOWNLOADER_COMMAND_TOKEN_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9_.-])(?:curl|wget)(?:\.exe)?(?![A-Za-z0-9_.-])",
+    re.IGNORECASE,
 )
 _INLINE_COMPOUND_STATEMENT_PATTERN = re.compile(
     rb"^\s*(?:if|elif|else|for|while|with|try|except|finally|match|case)\b[^#\n]*:\s*\S"
@@ -1728,16 +1784,6 @@ def _is_metadata_context(context: str) -> bool:
     return any(segment in _DOC_CONTEXT_SEGMENTS for segment in context_segments[:-1])
 
 
-def _extract_line(data: bytes, match_index: int) -> bytes:
-    """Extract the line containing a matched network token."""
-    line_start = max(data.rfind(b"\n", 0, match_index) + 1, match_index - _MAX_PROSE_LINE_CONTEXT_BYTES)
-    line_end = data.find(b"\n", match_index)
-    if line_end == -1:
-        line_end = len(data)
-    line_end = min(line_end, match_index + _MAX_PROSE_LINE_CONTEXT_BYTES)
-    return data[line_start:line_end]
-
-
 def _iter_pattern_matches(data: bytes, pattern: bytes) -> Iterator[int]:
     """Yield non-overlapping match positions for a byte pattern."""
     start = 0
@@ -1752,9 +1798,8 @@ def _iter_pattern_matches(data: bytes, pattern: bytes) -> Iterator[int]:
 def _has_call_syntax(data: bytes, match_index: int, token_len: int) -> bool:
     """Return whether a token is followed by call syntax after optional whitespace."""
     cursor = match_index + token_len
-    while cursor < len(data) and data[cursor : cursor + 1] in {b" ", b"\t", b"\r", b"\n"}:
-        cursor += 1
-    return cursor < len(data) and data[cursor : cursor + 1] == b"("
+    suffix = data[cursor : cursor + _MAX_PROSE_LINE_CONTEXT_BYTES]
+    return _CALL_SYNTAX_SUFFIX_PATTERN.match(suffix) is not None
 
 
 def _is_version_literal_context(surrounding_bytes: bytes, token: bytes) -> bool:
@@ -1773,16 +1818,37 @@ def _is_doc_only_network_reference(
     token_len: int,
     context: str,
     requires_call: bool,
+    requires_explicit_prefix: bool = False,
 ) -> bool:
     """Return whether a raw network token appears in prose instead of executable code."""
     if requires_call and _has_call_syntax(data, match_index, token_len):
         return False
 
-    line = _extract_line(data, match_index)
+    source_line_start = data.rfind(b"\n", 0, match_index) + 1
+    source_line_end = data.find(b"\n", match_index)
+    if source_line_end < 0:
+        source_line_end = len(data)
+    continued_prefix = data[max(0, source_line_start - 3) : source_line_start]
+    continued_suffix = data[match_index + token_len : source_line_end].rstrip()
+    if (
+        match_index - source_line_start > _MAX_PROSE_LINE_CONTEXT_BYTES
+        or source_line_end - (match_index + token_len) > _MAX_PROSE_LINE_CONTEXT_BYTES
+        or continued_prefix.endswith((b"\\\n", b"\\\r\n"))
+        or continued_suffix.endswith(b"\\")
+    ):
+        return False
+
+    line = data[source_line_start:source_line_end]
     line_lower = line.lower()
     stripped = line_lower.lstrip()
     word_count = len(_WORD_PATTERN.findall(line))
     metadata_context = _is_metadata_context(context)
+    match_offset = match_index - source_line_start
+    line_without_match = line[:match_offset] + b" " + line[match_offset + token_len :]
+    prefix_before_match = line[:match_offset].strip()
+    explicit_prefix = _EXPLICIT_PROSE_PREFIX_PATTERN.match(prefix_before_match) is not None
+    if requires_explicit_prefix and prefix_before_match and not explicit_prefix:
+        return False
 
     if any(stripped.startswith(prefix) for prefix in _CODE_LINE_PREFIXES):
         return False
@@ -1790,11 +1856,15 @@ def _is_doc_only_network_reference(
         return False
     if any(marker in line_lower for marker in _CODE_LINE_MARKERS):
         return False
+    if _DOWNLOADER_COMMAND_TOKEN_PATTERN.search(line_without_match):
+        return False
     if metadata_context and stripped.startswith(_STRUCTURED_METADATA_PREFIXES):
         return False
 
     text = line.decode("utf-8", errors="ignore").lower()
-    has_prose_marker = any(marker in text for marker in _PROSE_MARKERS)
+    has_prose_marker = (requires_explicit_prefix and explicit_prefix) or any(
+        marker in text for marker in _PROSE_MARKERS
+    )
     if not has_prose_marker:
         return False
     return (metadata_context and word_count >= 4) or word_count >= 6
@@ -2284,18 +2354,14 @@ class NetworkCommDetector:
     @staticmethod
     def _iter_url_contexts(data: bytes) -> Iterator[tuple[int, int, str]]:
         for match in _URL_IN_BYTES_PATTERN.finditer(data):
-            raw_url = match.group().decode("utf-8", errors="ignore")
-            source_quote = _source_quote_before_url(data, match.start())
-            url = _trim_source_literal_url(raw_url, source_quote)
+            url = _trim_matched_source_url(data, match)
             yield match.start(), match.start() + len(url.encode("utf-8")), url
 
     @classmethod
     def _iter_generic_url_contexts(cls, data: bytes) -> Iterator[tuple[int, int, str]]:
         """Yield only schemes handled by generic URL findings."""
         for match in cls.URL_PATTERN.finditer(data):
-            raw_url = match.group().decode("utf-8", errors="ignore")
-            source_quote = _source_quote_before_url(data, match.start())
-            url = _trim_source_literal_url(raw_url, source_quote)
+            url = _trim_matched_source_url(data, match)
             yield match.start(), match.start() + len(url.encode("utf-8")), url
 
     def _is_redacted_url_value(self, data: bytes, match_start: int, value: str) -> bool:
@@ -2825,7 +2891,7 @@ class NetworkCommDetector:
                         match_index=match_index,
                         token_len=len(pattern),
                         context=context,
-                        requires_call=False,
+                        requires_call=not pattern.startswith((b"import ", b"from ")),
                     ):
                         continue
 
@@ -3016,32 +3082,33 @@ class NetworkCommDetector:
                 # Check if this looks like legitimate text (not binary weights)
                 try:
                     context_str = context_data.decode("utf-8", errors="strict")
-                    # If we can decode it as UTF-8, it's likely text-based and suspicious
                     printable_ratio = sum(c.isprintable() for c in context_str) / len(context_str)
-
-                    if printable_ratio > 0.7:  # High ratio of printable characters
-                        raw_matched_text = match.group().decode("utf-8", errors="ignore")
-                        if pattern_type == "url":
-                            source_quote = _source_quote_before_url(data, match.start())
-                            raw_matched_text = _trim_source_literal_url(raw_matched_text, source_quote)
-                        matched_text = _redact_network_evidence(raw_matched_text)
-                        if not self._record_finding(
-                            {
-                                "type": "explicit_network_pattern",
-                                "severity": "CRITICAL",
-                                "confidence": 0.95,
-                                "message": f"Explicit network pattern in ML model: {matched_text[:100]}",
-                                "pattern_type": pattern_type,
-                                "matched_text": matched_text[:200],
-                                "position": match.start(),
-                                "context": context,
-                            }
-                        ):
-                            return
                 except UnicodeDecodeError:
-                    # If it can't be decoded as UTF-8, it's likely binary data
-                    # Skip to avoid false positives in model weights
+                    printable_ratio = sum(byte in b"\t\n\r" or 32 <= byte < 127 for byte in context_data) / len(
+                        context_data
+                    )
+
+                if printable_ratio <= 0.7:
                     continue
+                raw_matched_text = (
+                    _trim_matched_source_url(data, match)
+                    if pattern_type == "url"
+                    else match.group().decode("utf-8", errors="ignore")
+                )
+                matched_text = _redact_network_evidence(raw_matched_text)
+                if not self._record_finding(
+                    {
+                        "type": "explicit_network_pattern",
+                        "severity": "CRITICAL",
+                        "confidence": 0.95,
+                        "message": f"Explicit network pattern in ML model: {matched_text[:100]}",
+                        "pattern_type": pattern_type,
+                        "matched_text": matched_text[:200],
+                        "position": match.start(),
+                        "context": context,
+                    }
+                ):
+                    return
 
     def _check_blacklist(self, data: bytes, context: str) -> None:
         """Check against blacklisted domains/IPs."""

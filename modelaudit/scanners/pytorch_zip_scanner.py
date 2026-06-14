@@ -48,15 +48,7 @@ from .archive_member_security import (
     probe_executable_archive_member_signature,
 )
 from .base import BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
-from .pickle_scanner import (
-    PickleScanner,
-    _pickle_literal_url_records,
-    _pickle_literal_url_stripped_scan_view,
-    executable_pickle_literal_network_findings,
-    extend_unique_network_findings,
-    filter_inert_pickle_literal_network_findings,
-    unique_network_findings,
-)
+from .pickle_scanner import PickleScanner, _pickle_literal_url_stripped_scan_view
 from .picklescan_adapter import apply_pickle_member_context
 from .pytorch_zip_support import (
     RelaxedZipCrcTracker,
@@ -528,7 +520,7 @@ class PyTorchZipScanner(BaseScanner):
                 self._check_pytorch_vulnerabilities(zip_file, safe_entries, result, path)
 
                 # Scan all discovered pickle files
-                bytes_scanned = self._scan_pickle_files(
+                bytes_scanned, clean_pickle_entry_ids = self._scan_pickle_files(
                     zip_file,
                     pickle_files,
                     result,
@@ -544,7 +536,13 @@ class PyTorchZipScanner(BaseScanner):
                 self._validate_tensor_metadata_consistency(zip_file, safe_entries, pickle_files, result, path)
 
                 # Check for JIT/Script code execution risks
-                bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
+                bytes_scanned += self._scan_for_jit_patterns(
+                    zip_file,
+                    safe_entries,
+                    result,
+                    path,
+                    clean_pickle_entry_ids=clean_pickle_entry_ids,
+                )
 
                 # Detect suspicious non-pickle files
                 self._detect_suspicious_files(
@@ -2018,9 +2016,10 @@ class PyTorchZipScanner(BaseScanner):
         path: str,
         *,
         trusted_pytorch_storage_persistent_id_data_pkl_members: dict[str, set[str]],
-    ) -> int:
+    ) -> tuple[int, set[int]]:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
+        clean_pickle_entry_ids: set[int] = set()
 
         # Get the original ZIP file size for proper density calculations
         # This is crucial for CVE-2025-32434 detection to avoid false positives
@@ -2107,6 +2106,13 @@ class PyTorchZipScanner(BaseScanner):
             trusted_storage_keys = trusted_pytorch_storage_persistent_id_data_pkl_members.get(name)
             if trusted_storage_keys is not None:
                 self._downgrade_trusted_storage_persistent_ids(sub_result, trusted_storage_keys)
+            if (
+                sub_result.success is True
+                and self.pickle_scanner._rust_scan_completed_cleanly(sub_result)
+                and not self.pickle_scanner._has_warning_or_critical_findings(sub_result)
+                and not sub_result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+            ):
+                clean_pickle_entry_ids.add(id(info))
 
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
@@ -2124,7 +2130,7 @@ class PyTorchZipScanner(BaseScanner):
                 result.metadata.pop("file_size", None)
             self._record_pickle_member_outcome(result, name, sub_result, location=pickle_source)
 
-        return bytes_scanned
+        return bytes_scanned, clean_pickle_entry_ids
 
     @staticmethod
     def _pickle_member_max_severity(member_result: ScanResult) -> str | None:
@@ -2896,6 +2902,8 @@ class PyTorchZipScanner(BaseScanner):
         safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
+        *,
+        clean_pickle_entry_ids: set[int],
     ) -> int:
         """Check for JIT/Script code execution risks and network communication patterns"""
         bytes_scanned = 0
@@ -2959,29 +2967,14 @@ class PyTorchZipScanner(BaseScanner):
                         )
                         all_jit_findings.extend(jit_findings)
                     if check_net:
-                        literal_records = _pickle_literal_url_records(file_data)
                         network_file_data = _pickle_literal_url_stripped_scan_view(
                             file_data,
-                            network_functions_only=True,
-                            literal_records=literal_records,
+                            allow_filtering=id(entry) in clean_pickle_entry_ids,
                         )
                         network_findings = self.collect_network_communication_findings(
                             network_file_data,
                             context=f"{path}:{name}",
                             result=result,
-                        )
-                        network_findings = filter_inert_pickle_literal_network_findings(
-                            network_findings,
-                            file_data,
-                            literal_records=literal_records,
-                        )
-                        extend_unique_network_findings(
-                            network_findings,
-                            executable_pickle_literal_network_findings(
-                                file_data,
-                                context=f"{path}:{name}",
-                                literal_records=literal_records,
-                            ),
                         )
                         all_network_findings.extend(network_findings)
 
@@ -3055,10 +3048,7 @@ class PyTorchZipScanner(BaseScanner):
                 all_network_findings or (not entry_limit_exceeded and not raw_member_coverage_incomplete)
             ):
                 self.add_network_communication_findings(
-                    unique_network_findings(
-                        all_network_findings,
-                        existing_findings=[issue.details for issue in result.issues if isinstance(issue.details, dict)],
-                    ),
+                    all_network_findings,
                     result,
                     context=path,
                 )
