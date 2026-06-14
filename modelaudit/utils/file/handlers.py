@@ -52,7 +52,9 @@ _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
 _PREVALIDATED_SHARD_INFO_CONFIG_KEY = "_trusted_prevalidated_shard_info"
 SAFETENSORS_SHARD_PATTERN = r"model-(\d+)-of-(\d+)\.safetensors"
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
+SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
+MAX_SAFETENSORS_SHARD_INDEX_FILES = 256
 
 ValidatedShardTargets = dict[str, dict[str, int | str]]
 ExpectedShardIndices = range | frozenset[int]
@@ -752,6 +754,32 @@ class ShardedModelDetector:
         expected_parents = {os.path.dirname(source_path) for source_path in inventory.expected_source_paths}
         return current_parent in expected_parents
 
+    @staticmethod
+    def _safetensors_index_candidates(index_dir: Path) -> tuple[list[Path], bool]:
+        """Return bounded local index candidates, preferring the canonical name."""
+        canonical_path = index_dir / SAFETENSORS_INDEX_NAME
+        candidates: list[Path] = []
+        if canonical_path.exists() or canonical_path.is_symlink():
+            candidates.append(canonical_path)
+        try:
+            for candidate in index_dir.iterdir():
+                if candidate == canonical_path:
+                    continue
+                basename = candidate.name
+                if len(basename) <= len(SAFETENSORS_INDEX_SUFFIX) or not basename.lower().endswith(
+                    SAFETENSORS_INDEX_SUFFIX
+                ):
+                    continue
+                candidates.append(candidate)
+                if len(candidates) > MAX_SAFETENSORS_SHARD_INDEX_FILES:
+                    return candidates, True
+        except OSError:
+            return candidates, False
+        candidates.sort(
+            key=lambda path: (path != canonical_path, path.name.casefold(), path.name),
+        )
+        return candidates, False
+
     @classmethod
     def _load_safetensors_index_inventory(
         cls,
@@ -781,15 +809,42 @@ class ShardedModelDetector:
 
         index_dir = absolute_dir
         while True:
-            index_path = index_dir / SAFETENSORS_INDEX_NAME
-            if index_path.exists() or index_path.is_symlink():
+            index_candidates, candidate_limit_exceeded = cls._safetensors_index_candidates(index_dir)
+            if candidate_limit_exceeded:
+                return _SafetensorsShardIndexInventory(
+                    index_path=index_candidates[0],
+                    expected_source_paths=frozenset(),
+                    expected_indices=cls._expected_index_range(expected_total, zero_based=False),
+                    index_base="invalid",
+                    error="safetensors index inspection limit exceeded",
+                )
+            governing_inventory: _SafetensorsShardIndexInventory | None = None
+            for index_path in index_candidates:
                 inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, None)
-                if inventory.error is not None and _normalized_absolute_path(index_dir) == _normalized_absolute_path(
-                    absolute_dir
-                ):
-                    return inventory
-                if cls._safetensors_inventory_governs_file(inventory, current_file, pattern, expected_total):
-                    return inventory
+                if inventory.error is not None:
+                    normalized_current = _normalized_absolute_path(current_file)
+                    same_directory_canonical_stem = (
+                        _normalized_absolute_path(index_dir) == _normalized_absolute_path(absolute_dir)
+                        and index_path.name.casefold() == SAFETENSORS_INDEX_NAME
+                    )
+                    if normalized_current in inventory.expected_source_paths or same_directory_canonical_stem:
+                        return inventory
+                    continue
+                if not cls._safetensors_inventory_governs_file(inventory, current_file, pattern, expected_total):
+                    continue
+                if governing_inventory is not None:
+                    return _SafetensorsShardIndexInventory(
+                        index_path=index_path,
+                        expected_source_paths=(
+                            governing_inventory.expected_source_paths | inventory.expected_source_paths
+                        ),
+                        expected_indices=cls._expected_index_range(expected_total, zero_based=False),
+                        index_base="invalid",
+                        error="multiple safetensors indexes govern selected shard",
+                    )
+                governing_inventory = inventory
+            if governing_inventory is not None:
+                return governing_inventory
             if _normalized_absolute_path(index_dir) == normalized_search_root:
                 break
             index_dir = index_dir.parent

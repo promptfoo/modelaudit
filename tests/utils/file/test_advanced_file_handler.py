@@ -163,9 +163,14 @@ def _validated_target(path: Path) -> dict[str, int | str]:
     }
 
 
-def _write_safetensors_index(directory: Path, targets: list[str]) -> Path:
+def _write_safetensors_index(
+    directory: Path,
+    targets: list[str],
+    *,
+    index_name: str = "model.safetensors.index.json",
+) -> Path:
     """Write a deterministic SafeTensors index that maps one tensor per target."""
-    index_path = directory / "model.safetensors.index.json"
+    index_path = directory / index_name
     index_path.write_text(
         json.dumps(
             {
@@ -246,6 +251,58 @@ class TestShardedModelDetector:
         assert shard_info["shard_index_base"] == expected_base
         assert "missing_shard_count" not in shard_info
         assert "unexpected_shard_count" not in shard_info
+        assert result.success is True
+
+    @pytest.mark.parametrize(
+        "index_name",
+        ["MODEL.SAFETENSORS.INDEX.JSON", "weights.safetensors.index.json"],
+        ids=["uppercase", "prefixed"],
+    )
+    def test_detect_zero_based_safetensors_with_noncanonical_index_name(
+        self,
+        tmp_path: Path,
+        index_name: str,
+    ) -> None:
+        """Accepted remote index names must retain zero-based authority locally."""
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"zero")
+        index_path = _write_safetensors_index(tmp_path, [shard.name], index_name=index_name)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard))
+        result = AdvancedFileHandler(str(shard), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_path"] == str(index_path)
+        assert shard_info["shard_index_base"] == "zero"
+        assert shard_info["shards"] == [str(shard)]
+        assert "missing_shard_count" not in shard_info
+        assert "unexpected_shard_count" not in shard_info
+        assert result.success is True
+
+    @pytest.mark.parametrize(
+        "index_payload",
+        [
+            json.dumps({"weight_map": {"adapter": "adapter-00000-of-00001.safetensors"}}),
+            "{malformed",
+        ],
+        ids=["benign-complete", "malicious-malformed"],
+    )
+    def test_detect_safetensors_ignores_unrelated_prefixed_same_directory_index(
+        self,
+        tmp_path: Path,
+        index_payload: str,
+    ) -> None:
+        """A co-located adapter index must not claim an independent model family."""
+        shard = tmp_path / "model-00001-of-00001.safetensors"
+        shard.write_bytes(b"one")
+        (tmp_path / "adapter.safetensors.index.json").write_text(index_payload, encoding="utf-8")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard))
+        result = AdvancedFileHandler(str(shard), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert "safetensors_index_path" not in shard_info
+        assert shard_info["shards"] == [str(shard)]
         assert result.success is True
 
     def test_direct_nested_shard_does_not_follow_ancestor_index(self, tmp_path: Path) -> None:

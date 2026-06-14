@@ -726,6 +726,58 @@ class TestModelDownload:
             "nested/adapter/model.safetensors.index.json",
         ]
 
+    @pytest.mark.parametrize(
+        "index_name",
+        ["MODEL.SAFETENSORS.INDEX.JSON", "weights.safetensors.index.json"],
+        ids=["uppercase", "prefixed"],
+    )
+    def test_downloaded_noncanonical_safetensors_index_retains_local_authority(
+        self,
+        tmp_path: Path,
+        index_name: str,
+    ) -> None:
+        """Remote-accepted index identity must govern the materialized local family."""
+        shard_name = "model-00000-of-00001.safetensors"
+        repo_files = [index_name, shard_name]
+        index_payload = json.dumps({"weight_map": {"tensor": shard_name}}).encode()
+        header = b'{"__metadata__":{"format":"pt"}}'
+        shard_payload = struct.pack("<Q", len(header)) + header
+
+        def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
+            download_path = Path(local_dir)
+            download_path.mkdir(parents=True, exist_ok=True)
+            (download_path / index_name).write_bytes(index_payload)
+            (download_path / shard_name).write_bytes(shard_payload)
+            return str(download_path)
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"}),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch("requests.get", return_value=_FakeRangeResponse(index_payload)),
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect),
+        ):
+            download_path = download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "cache",
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+
+        result = scan_model_directory_or_file(
+            str(download_path),
+            cache_enabled=False,
+            scanners=["safetensors"],
+        )
+
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert "safetensors" in result.scanner_names
+        assert set(result.scanner_names) <= {"safetensors", "scanner_selection"}
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
     @patch(
@@ -4247,6 +4299,70 @@ class TestModelDownloadStreaming:
             )
 
         assert result == selected_files
+
+    def test_remote_safetensors_validation_does_not_probe_indexes_for_unsharded_selection(self) -> None:
+        """Selecting one unsharded model must not make same-parent adapter indexes authoritative."""
+        repo_files = [
+            "model.safetensors",
+            "adapter.safetensors.index.json",
+            "adapter-00000-of-00001.safetensors",
+        ]
+        selected_files = ["model.safetensors"]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps({"weight_map": {"adapter": "adapter-00000-of-00001.safetensors"}}).encode()
+
+        with patch("requests.get", return_value=_FakeRangeResponse(payload)) as mock_requests_get:
+            result = _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                selected_files,
+                budget,
+            )
+
+        assert result == selected_files
+        mock_requests_get.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "index_state",
+        ["complete", "missing", "malformed"],
+        ids=["benign-complete", "malicious-missing", "malicious-malformed"],
+    )
+    def test_remote_safetensors_validation_ignores_unrelated_same_parent_family(
+        self,
+        index_state: str,
+    ) -> None:
+        """A disjoint adapter inventory must neither expand nor fail a selected model family."""
+        selected_shard = "model-00001-of-00001.safetensors"
+        adapter_targets = ["adapter-00000-of-00001.safetensors"]
+        repo_files = ["adapter.safetensors.index.json", selected_shard, *adapter_targets]
+        if index_state == "missing":
+            adapter_targets = [
+                "adapter-00000-of-00002.safetensors",
+                "adapter-00001-of-00002.safetensors",
+            ]
+            repo_files = ["adapter.safetensors.index.json", selected_shard, adapter_targets[0]]
+        selected_files = [selected_shard]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = (
+            b"{malformed"
+            if index_state == "malformed"
+            else json.dumps(
+                {"weight_map": {f"adapter-{index}": target for index, target in enumerate(adapter_targets)}}
+            ).encode()
+        )
+
+        with patch("requests.get", return_value=_FakeRangeResponse(payload)) as mock_requests_get:
+            result = _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                selected_files,
+                budget,
+            )
+
+        assert result == selected_files
+        mock_requests_get.assert_called_once()
 
     def test_remote_safetensors_validation_ignores_malformed_unrelated_ancestor_index(self) -> None:
         """An unscoped malformed root index must not reject a selected nested family."""

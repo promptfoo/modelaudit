@@ -64,6 +64,7 @@ _HF_SAFETENSORS_SHARD_PATTERN = re.compile(
     r"(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors",
     re.IGNORECASE,
 )
+_HF_SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 _HF_SAFETENSORS_SHARD_SHAPE_PATTERN = re.compile(
     r".+-\d+-of-\d+\.safetensors",
     re.IGNORECASE,
@@ -1476,11 +1477,19 @@ def _skip_hf_safetensors_probe_candidate(
     return filename.lower().endswith(".safetensors")
 
 
+def _hf_safetensors_index_stem(filename: str) -> str | None:
+    """Return the non-empty stem of a standard or prefixed SafeTensors index."""
+    basename = PurePosixPath(filename).name
+    if len(basename) <= len(_HF_SAFETENSORS_INDEX_SUFFIX) or not basename.lower().endswith(
+        _HF_SAFETENSORS_INDEX_SUFFIX
+    ):
+        return None
+    return basename[: -len(_HF_SAFETENSORS_INDEX_SUFFIX)]
+
+
 def _is_hf_safetensors_index_filename(filename: str) -> bool:
     """Return whether a remote path names a standard or prefixed SafeTensors index."""
-    basename = PurePosixPath(filename).name.lower()
-    suffix = ".safetensors.index.json"
-    return len(basename) > len(suffix) and basename.endswith(suffix)
+    return _hf_safetensors_index_stem(filename) is not None
 
 
 def _select_huggingface_model_files(
@@ -1715,22 +1724,30 @@ def _validate_remote_safetensors_indexes(
     updated_model_files = list(model_files)
     if not allow_index_expansion:
         return updated_model_files
-    selected_safetensors_paths = [
-        PurePosixPath(filename) for filename in selected_files if filename.lower().endswith(".safetensors")
+    selected_safetensors_shard_paths = [
+        PurePosixPath(filename) for filename in selected_files if _remote_safetensors_shard_parts(filename) is not None
     ]
-    selected_safetensors_parents = {path.parent for path in selected_safetensors_paths}
+    selected_safetensors_parents = {path.parent for path in selected_safetensors_shard_paths}
     selected_safetensors_ancestor_dirs = {
-        ancestor.as_posix() for path in selected_safetensors_paths for ancestor in path.parents
+        ancestor.as_posix() for path in selected_safetensors_shard_paths for ancestor in path.parents
     }
     selected_family_keys = set(_remote_safetensors_family_files(selected_files))
+    selected_named_family_parents = {(parent, stem.casefold()) for parent, stem, _total in selected_family_keys}
     repo_family_files = _remote_safetensors_family_files(repo_files)
+    repo_named_family_parents = {(parent, stem.casefold()) for parent, stem, _total in repo_family_files}
     relevant_index_files: list[str] = []
     strongly_relevant_index_files: set[str] = set()
     for index_file in repo_files:
         if not _is_hf_safetensors_index_filename(index_file):
             continue
         index_parent = PurePosixPath(index_file).parent
-        strongly_relevant = index_parent in selected_safetensors_parents
+        index_stem = _hf_safetensors_index_stem(index_file)
+        assert index_stem is not None
+        index_named_family_parent = (index_parent.as_posix(), index_stem.casefold())
+        strongly_relevant = index_parent in selected_safetensors_parents and (
+            index_named_family_parent in selected_named_family_parents
+            or index_named_family_parent not in repo_named_family_parents
+        )
         if strongly_relevant or index_parent.as_posix() in selected_safetensors_ancestor_dirs:
             relevant_index_files.append(index_file)
             if strongly_relevant:
@@ -1784,24 +1801,25 @@ def _validate_remote_safetensors_indexes(
             )
 
         raw_targets = list(index_doc["weight_map"].values())
-        if not strongly_relevant:
-            scoped_target_families: set[tuple[str, str, int]] = set()
-            for raw_target in raw_targets:
-                if not isinstance(raw_target, str):
-                    continue
-                try:
-                    scoped_target = _safe_remote_safetensors_index_target(index_file, raw_target)
-                except ValueError:
-                    continue
-                scoped_target_path = PurePosixPath(scoped_target)
-                scoped_parts = _remote_safetensors_shard_parts(scoped_target)
-                if scoped_parts is None:
-                    continue
-                scoped_stem, _scoped_index, scoped_total = scoped_parts
-                if scoped_total > 0:
-                    scoped_target_families.add((scoped_target_path.parent.as_posix(), scoped_stem, scoped_total))
-            if selected_family_keys.isdisjoint(scoped_target_families):
+        scoped_target_families: set[tuple[str, str, int]] = set()
+        for raw_target in raw_targets:
+            if not isinstance(raw_target, str):
                 continue
+            try:
+                scoped_target = _safe_remote_safetensors_index_target(index_file, raw_target)
+            except ValueError:
+                continue
+            scoped_target_path = PurePosixPath(scoped_target)
+            scoped_parts = _remote_safetensors_shard_parts(scoped_target)
+            if scoped_parts is None:
+                continue
+            scoped_stem, _scoped_index, scoped_total = scoped_parts
+            if scoped_total > 0:
+                scoped_target_families.add((scoped_target_path.parent.as_posix(), scoped_stem, scoped_total))
+        if selected_family_keys.isdisjoint(scoped_target_families) and (
+            scoped_target_families or not strongly_relevant
+        ):
+            continue
         if not all(isinstance(target, str) for target in raw_targets):
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
