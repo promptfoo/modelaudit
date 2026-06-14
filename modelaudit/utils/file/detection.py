@@ -5862,6 +5862,26 @@ def _decode_base64_route_token(token: bytes) -> bytes:
     return base64.b64decode(token + padding, altchars=b"-_", validate=True)
 
 
+def _normalized_alphabetic_base64_has_pickle_signal(token: bytes) -> bool:
+    try:
+        decoded = _decode_base64_route_token(token)
+    except (binascii.Error, ValueError):
+        return False
+    if _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(decoded) is not None:
+        return True
+    if not decoded:
+        return False
+    opcode = _PICKLE_OPCODE_BY_BYTE.get(decoded[0])
+    if opcode is None:
+        return False
+    suffix_offset = _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.get(opcode.name)
+    return (
+        suffix_offset is not None
+        and len(decoded) >= suffix_offset
+        and all(value == ord(".") or value in PROTO0_1_IGNORABLE_TRAILING_BYTES for value in decoded[suffix_offset:])
+    )
+
+
 def _iter_encoded_route_tokens(
     payload: bytes,
     token_re: re.Pattern[bytes],
@@ -5882,7 +5902,9 @@ def _iter_encoded_route_tokens(
                 and b"=" not in encoded_line
                 and encoded_line.isalpha()
             )
-            if encoded_line != line and not normalized_alphabetic_prose:
+            if encoded_line != line and (
+                not normalized_alphabetic_prose or _normalized_alphabetic_base64_has_pickle_signal(encoded_line)
+            ):
                 yield encoded_line
             if encoded_line == line or not normalized_alphabetic_prose or block_lines:
                 block.extend(encoded_line)

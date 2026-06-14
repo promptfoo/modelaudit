@@ -4086,6 +4086,11 @@ def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_pa
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="base64-alpha-prefixed-PERSID",
         ),
+        pytest.param(
+            b"MIT License\nWF Bp ZA ou\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="base64-spaced-alpha-prefixed-PERSID",
+        ),
         pytest.param(b"MIT License\nggE =\n", "pickle", id="base64-whitespace-padded-EXT1"),
         pytest.param(b"MIT License\nlw ==\n", "pickle", id="base64-whitespace-padded-NEXT_BUFFER"),
         pytest.param(b"MIT License\ngwEA\n", "pickle", id="base64-unpadded-alphabetic-EXT2"),

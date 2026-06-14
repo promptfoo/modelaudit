@@ -938,6 +938,7 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         pytest.param(b"MIT License\n" + base64.b64encode(b"\x82\x01"), 1, id="base64-sole-EXT1"),
         pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), 1, id="base64-sole-NEXT_BUFFER"),
         pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),
+        pytest.param(b"MIT License\nWF Bp ZA ou\n", 2, id="base64-spaced-alpha-prefixed-PERSID"),
         pytest.param(b"MIT License\nggE =\n", 1, id="base64-whitespace-padded-EXT1"),
         pytest.param(b"MIT License\nlw ==\n", 1, id="base64-whitespace-padded-NEXT_BUFFER"),
         pytest.param(b"MIT License\ngwEA\n", 1, id="base64-unpadded-alphabetic-EXT2"),
