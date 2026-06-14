@@ -461,8 +461,8 @@ _LEGAL_TEXT_SIGNAL_RE = re.compile(
 _LEGAL_TEXT_BASE64_CHUNK_RE = re.compile(rb"[A-Za-z0-9+/_-]+={0,2}")
 _LEGAL_TEXT_HEX_CHUNK_RE = re.compile(rb"[A-Fa-f0-9]+")
 _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE = re.compile(
-    rb"(?=(?<![3-9A-Za-z_])(?:"
-    rb"[ci][^\x00-\x20\x7f-\x9f\r\n]+\n[^\x00-\x20\x7f-\x9f\r\n]+\n|"
+    rb"(?=(?:"
+    rb"(?<![3-9A-Za-z_])[ci][^\x00-\x20\x7f-\x9f\r\n]+\n[^\x00-\x20\x7f-\x9f\r\n]+\n|"
     rb"P[^\x00-\x20\x7f-\x9f\r\n]+\n"
     rb"))"
 )
@@ -1535,12 +1535,13 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
     path: str | Path,
     keys: frozenset[str],
     *,
+    allow_renamed_path: bool = False,
     scan_nested_templates: bool = False,
     require_jax_identity_value: bool = False,
 ) -> bool:
     """Return whether bounded tokenizer JSON exposes decoded route-key evidence."""
     file_path = Path(path)
-    if not _is_hf_tokenizer_json_route_candidate_path(file_path):
+    if not allow_renamed_path and not _is_hf_tokenizer_json_route_candidate_path(file_path):
         return False
     try:
         if not file_path.is_file():
@@ -1771,13 +1772,18 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
     return sample_is_prefix and has_tokenizer_root_evidence()
 
 
-def huggingface_tokenizer_json_has_template_route_evidence(path: str | Path) -> bool:
+def huggingface_tokenizer_json_has_template_route_evidence(
+    path: str | Path,
+    *,
+    allow_renamed_path: bool = False,
+) -> bool:
     """Return whether bounded tokenizer JSON evidence should route to Jinja scanning."""
     if is_huggingface_tokenizer_json_file(path):
         return False
     return _hf_tokenizer_json_has_decoded_route_evidence(
         path,
         _HF_TOKENIZER_TEMPLATE_KEYS,
+        allow_renamed_path=allow_renamed_path,
         scan_nested_templates=True,
     )
 
@@ -5403,10 +5409,16 @@ def _decoded_pickle_events_are_meaningful(
 def _meaningful_pickle_events(
     events: list[tuple[int, str, bool]],
     *,
+    allow_embedded_persid: bool,
     embedded: bool,
 ) -> list[tuple[int, str, bool]]:
     meaningful = [event for event in events if event[2]]
-    if embedded and meaningful and all(name == "PERSID" for _index, name, _flag in meaningful):
+    if (
+        embedded
+        and not allow_embedded_persid
+        and meaningful
+        and all(name == "PERSID" for _index, name, _flag in meaningful)
+    ):
         return []
     return meaningful
 
@@ -5422,7 +5434,11 @@ def _incomplete_pickle_security_route(
     pre_stack_inst: bool,
     security_events: list[tuple[int, str, bool]],
 ) -> str | None:
-    meaningful_events = _meaningful_pickle_events(security_events, embedded=embedded)
+    meaningful_events = _meaningful_pickle_events(
+        security_events,
+        allow_embedded_persid=decoded,
+        embedded=embedded,
+    )
     if pre_stack_inst and not any(name == "INST" for _index, name, _meaningful in meaningful_events):
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if not embedded and stream_start == 0 else None
     if not meaningful_events:
@@ -5531,7 +5547,11 @@ def _classify_bounded_pickle_candidate(
                 if opcode_name != "STOP":
                     continue
 
-                meaningful_events = _meaningful_pickle_events(events, embedded=embedded)
+                meaningful_events = _meaningful_pickle_events(
+                    events,
+                    allow_embedded_persid=decoded,
+                    embedded=embedded,
+                )
                 if meaningful_events and (
                     not decoded
                     or _decoded_pickle_events_are_meaningful(
@@ -5895,8 +5915,7 @@ def _encoded_pickle_route(
             route = _bounded_pickle_candidate_route(
                 decoded,
                 budget=budget,
-                # Alphabetic legal words are valid base64; require their decoded stream to start at byte zero.
-                scan_embedded=not plain_alphabetic_token,
+                scan_embedded=True,
                 allow_weak_decoded_side_effects=not plain_alphabetic_token,
                 decoded=True,
             )
@@ -9619,6 +9638,8 @@ def _resolve_legal_text_sidecar_route(
     signature_model = _detect_content_routed_signature_model(file_path, file_size, prefix)
     if signature_model is not None:
         return signature_model
+    if huggingface_tokenizer_json_has_template_route_evidence(file_path, allow_renamed_path=True):
+        return "jinja2_template"
     if _could_be_content_routed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
     if not file_path.suffix:

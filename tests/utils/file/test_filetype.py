@@ -3962,6 +3962,11 @@ def test_next_buffer_callback_precedes_eof() -> None:
             id="embedded-GLOBAL-punctuation",
         ),
         pytest.param(b"Pid\nApache License\n", "pickle", id="whole-PERSID"),
+        pytest.param(
+            b"MIT License\nXPid\n)R.\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="adjacent-embedded-PERSID",
+        ),
         pytest.param(b"\x82\x01", "pickle", id="sole-EXT1"),
         pytest.param(b"\x97", "pickle", id="sole-NEXT_BUFFER"),
         pytest.param("cmódulo\nthing\n.".encode(), "pickle", id="unicode-GLOBAL-operand"),
@@ -4053,6 +4058,11 @@ def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_pa
         pytest.param(binascii.hexlify(b"S'id'\nQ."), "pickle", id="hex-BINPERSID"),
         pytest.param(b"MIT License\n" + base64.b64encode(b"\x82\x01"), "pickle", id="base64-sole-EXT1"),
         pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), "pickle", id="base64-sole-NEXT_BUFFER"),
+        pytest.param(
+            b"MIT License\nWFBpZAou\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="base64-alpha-prefixed-PERSID",
+        ),
         pytest.param(b"MIT License\nggE =\n", "pickle", id="base64-whitespace-padded-EXT1"),
         pytest.param(b"MIT License\nlw ==\n", "pickle", id="base64-whitespace-padded-NEXT_BUFFER"),
         pytest.param(
@@ -4399,6 +4409,11 @@ def test_structured_xml_model_named_license_precedes_legal_text_fallback(
             ).encode(),
             "jax_checkpoint",
             id="jax-json",
+        ),
+        pytest.param(
+            b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+            "jinja2_template",
+            id="renamed-tokenizer-template",
         ),
     ],
 )

@@ -1354,7 +1354,9 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         return with_safetensors_overlap(result)
 
     header_format_override = (
-        trusted_content_format if trusted_content_format in {"hdf5", "mxnet", "text", "xgboost"} else None
+        trusted_content_format
+        if trusted_content_format in {"hdf5", "jinja2_template", "mxnet", "text", "xgboost"}
+        else None
     )
     try:
         scanner_id = _select_nested_scanner_id(path, header_format_override, config)

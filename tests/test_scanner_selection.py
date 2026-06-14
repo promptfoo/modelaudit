@@ -665,6 +665,25 @@ def test_nested_physical_license_with_mxnet_structure_preserves_model_ownership(
     assert result.metadata["node_count"] == 1
 
 
+def test_nested_legal_tokenizer_template_preserves_jinja_ownership(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "member"
+    extracted_member.write_bytes(
+        b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}'
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        config={"cache_enabled": False, LOGICAL_SCAN_PATH_CONFIG_KEY: "LICENSE"},
+    )
+
+    assert result.scanner_name == "jinja2_template"
+    assert result.has_errors is True
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_embedded_pickle_helpers_honor_selection_policy(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt", malicious=True)
 
@@ -865,6 +884,7 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         pytest.param(b"MIT License\nPid\n)R.", 2, id="embedded-PERSID"),
         pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
         pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
+        pytest.param(b"MIT License\nXPid\n)R.\n", 2, id="adjacent-embedded-PERSID"),
         pytest.param(b"\x82\x01", 1, id="sole-EXT1"),
         pytest.param(b"\x97", 1, id="sole-NEXT_BUFFER"),
         pytest.param("cmódulo\nthing\n.".encode(), 1, id="unicode-GLOBAL-operand"),
@@ -898,6 +918,7 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         pytest.param(binascii.hexlify(b"S'id'\nQ."), 1, id="hex-BINPERSID"),
         pytest.param(b"MIT License\n" + base64.b64encode(b"\x82\x01"), 1, id="base64-sole-EXT1"),
         pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), 1, id="base64-sole-NEXT_BUFFER"),
+        pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),
         pytest.param(b"MIT License\nggE =\n", 1, id="base64-whitespace-padded-EXT1"),
         pytest.param(b"MIT License\nlw ==\n", 1, id="base64-whitespace-padded-NEXT_BUFFER"),
         pytest.param(

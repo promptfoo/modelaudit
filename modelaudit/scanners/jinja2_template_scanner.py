@@ -825,7 +825,10 @@ class Jinja2TemplateScanner(BaseScanner):
         if ext == ".gguf":
             context.file_type = "gguf"
             context.confidence += 2
-        elif "tokenizer" in filename:
+        elif "tokenizer" in filename or huggingface_tokenizer_json_has_template_route_evidence(
+            path,
+            allow_renamed_path=True,
+        ):
             context.file_type = "tokenizer_config"
             context.is_tokenizer = True
             context.confidence += 2

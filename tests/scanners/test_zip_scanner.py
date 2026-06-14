@@ -10963,6 +10963,22 @@ class TestZipScanner:
         )
         assert not any(issue.rule_code in {"S901", "S902"} for issue in result.issues)
 
+    def test_scan_zip_routes_legal_tokenizer_template_to_jinja_scanner(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "legal_tokenizer_template.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(
+                "LICENSE",
+                b'{"license":"MIT","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+            )
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
     @pytest.mark.parametrize(
         "member_name",
         ["LICENSE", "LICENSE.markdown", "NOTICE.markdown", r"docs\LICENSE"],
@@ -11276,6 +11292,7 @@ class TestZipScanner:
             pytest.param(b"MIT License\nPid\n)R.", 2, id="embedded-PERSID"),
             pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
             pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
+            pytest.param(b"MIT License\nXPid\n)R.\n", 2, id="adjacent-embedded-PERSID"),
             pytest.param(b"\x82\x01", 1, id="sole-EXT1"),
             pytest.param(b"\x97", 1, id="sole-NEXT_BUFFER"),
             pytest.param("cmódulo\nthing\n.".encode(), 1, id="unicode-GLOBAL-operand"),
@@ -11309,6 +11326,7 @@ class TestZipScanner:
             pytest.param(binascii.hexlify(b"S'id'\nQ."), 1, id="hex-BINPERSID"),
             pytest.param(b"MIT License\n" + base64.b64encode(b"\x82\x01"), 1, id="base64-sole-EXT1"),
             pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), 1, id="base64-sole-NEXT_BUFFER"),
+            pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),
             pytest.param(b"MIT License\nggE =\n", 1, id="base64-whitespace-padded-EXT1"),
             pytest.param(b"MIT License\nlw ==\n", 1, id="base64-whitespace-padded-NEXT_BUFFER"),
             pytest.param(
