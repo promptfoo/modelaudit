@@ -13,6 +13,7 @@ _DEPENDENCIES = "needs.changes.outputs.dependencies == 'true'"
 _PICKLESCAN = "needs.changes.outputs.picklescan == 'true'"
 _CORE_PYTHON = f"{_INTEGRATION} || {_PYTHON} || {_WORKFLOWS}"
 _DEPENDENCY_SURFACE = f"{_INTEGRATION} || {_DEPENDENCIES} || {_WORKFLOWS}"
+_OPTIONAL_DEPENDENCY_LANES = f"{_INTEGRATION} || {_DEPENDENCIES}"
 _VENDORED_PROTOS = f"{_INTEGRATION} || {_PYTHON} || {_DEPENDENCIES}"
 _BUILD = f"{_INTEGRATION} || {_PYTHON} || {_DEPENDENCIES} || {_WORKFLOWS}"
 _PICKLESCAN_SURFACE = f"{_INTEGRATION} || {_PICKLESCAN} || {_WORKFLOWS}"
@@ -102,10 +103,10 @@ def test_python_ci_merge_group_fail_closed_scheduling_covers_integration_surface
         "windows-tests": _CORE_PYTHON,
         "test": _CORE_PYTHON,
         "coverage": f"{_INTEGRATION} || {_WORKFLOWS}",
-        "test-numpy-compatibility": f"{_INTEGRATION} || {_DEPENDENCIES}",
+        "test-numpy-compatibility": _OPTIONAL_DEPENDENCY_LANES,
         "test-vendored-protos": _VENDORED_PROTOS,
         "test-proto-reproducibility": _VENDORED_PROTOS,
-        "test-extras-smoke": f"{_INTEGRATION} || {_DEPENDENCIES}",
+        "test-extras-smoke": _OPTIONAL_DEPENDENCY_LANES,
         "build": _BUILD,
         "picklescan-package": _PICKLESCAN_SURFACE,
     }
@@ -183,9 +184,13 @@ def test_python_ci_success_requires_expected_jobs_to_report_exact_success() -> N
         )
         in gate_script
     )
+    assert _github_output_assignment("EXPECT_OPTIONAL_DEPENDENCY_LANES", _OPTIONAL_DEPENDENCY_LANES) in gate_script
     assert _github_output_assignment("EXPECT_COVERAGE", f"{_INTEGRATION} || {_WORKFLOWS}") in gate_script
     assert 'require_success "$EXPECT_CORE_PYTHON" "$TEST_RESULT" "test"' in gate_script
     assert 'require_success "$EXPECT_COVERAGE" "$COVERAGE_RESULT" "coverage"' in gate_script
-    assert 'require_success "$EXPECT_DEPENDENCY_SURFACE" "$NUMPY_RESULT" "test-numpy-compatibility"' in gate_script
+    assert (
+        'require_success "$EXPECT_OPTIONAL_DEPENDENCY_LANES" "$NUMPY_RESULT" "test-numpy-compatibility"' in gate_script
+    )
     assert 'require_success "$EXPECT_BUILD" "$BUILD_RESULT" "build"' in gate_script
     assert 'require_success "$EXPECT_PICKLESCAN" "$PICKLESCAN_RESULT" "picklescan-package"' in gate_script
+    assert 'require_success "$EXPECT_OPTIONAL_DEPENDENCY_LANES" "$EXTRAS_RESULT" "test-extras-smoke"' in gate_script
