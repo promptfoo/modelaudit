@@ -16,6 +16,7 @@ import tarfile
 import unicodedata
 import zipfile
 import zlib
+from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -461,8 +462,7 @@ _LEGAL_TEXT_BASE64_CHUNK_RE = re.compile(rb"[A-Za-z0-9+/_-]+={0,2}")
 _LEGAL_TEXT_HEX_CHUNK_RE = re.compile(rb"[A-Fa-f0-9]+")
 _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE = re.compile(
     rb"(?=(?<![3-9A-Za-z_])(?:"
-    rb"[ci][A-Za-z0-9_\x80-\xff](?:[A-Za-z0-9_.$\x80-\xff-]*[A-Za-z0-9_\x80-\xff])?\n"
-    rb"[A-Za-z0-9_\x80-\xff](?:[A-Za-z0-9_.$\x80-\xff-]*[A-Za-z0-9_\x80-\xff])?\n|"
+    rb"[ci][^\x00-\x20\x7f-\x9f\r\n]+\n[^\x00-\x20\x7f-\x9f\r\n]+\n|"
     rb"P[^\x00-\x20\x7f-\x9f\r\n]+\n"
     rb"))"
 )
@@ -2629,7 +2629,6 @@ _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES: frozenset[str] = frozenset(
     {"EXT1", "EXT2", "EXT4", "GLOBAL", "NEXT_BUFFER", "PERSID"}
 )
 _PICKLE_DECODED_ENTRY_OPCODES: frozenset[str] = _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES | {"INST", "PROTO"}
-_PICKLE_IMPORT_OPERAND_PUNCTUATION: frozenset[str] = frozenset("._-$")
 _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS: dict[str, int] = {"EXT1": 2, "EXT2": 3, "EXT4": 5, "NEXT_BUFFER": 1}
 _PROTOCOLLESS_BINARY_PICKLE_OPCODES: frozenset[str] = frozenset(
     {
@@ -2678,6 +2677,13 @@ _PROTOCOLLESS_BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES = _BINARY_PICKLE_PRE_STOP_
 _PICKLE_OPCODE_BY_BYTE = {ord(opcode.code): opcode for opcode in pickletools.opcodes}
 _PICKLE_SECURITY_OPCODE_BYTES: frozenset[int] = frozenset(
     value for value, opcode in _PICKLE_OPCODE_BY_BYTE.items() if opcode.name in _BINARY_PICKLE_SECURITY_OPCODES
+)
+_PICKLE_CONTEXT_REQUIRED_SECURITY_OPCODE_BYTES: frozenset[int] = frozenset(
+    value
+    for value, opcode in _PICKLE_OPCODE_BY_BYTE.items()
+    if opcode.name in _BINARY_PICKLE_SECURITY_OPCODES
+    and opcode.name not in _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES
+    and opcode.name != "INST"
 )
 _PICKLE_LINE_PAIR_OPCODES: frozenset[str] = frozenset({"GLOBAL", "INST"})
 _PICKLE_VARIABLE_LENGTH_HEADER_BYTES: dict[int, int] = {-2: 1, -3: 4, -4: 4, -5: 8}
@@ -5351,11 +5357,8 @@ def _plausible_pickle_import_operand(value: str | bytes) -> bool:
             value = value.decode("utf-8")
         except UnicodeDecodeError:
             return False
-    return (
-        bool(value)
-        and (value[0].isalnum() or value[0] == "_")
-        and (value[-1].isalnum() or value[-1] == "_")
-        and all(character.isalnum() or character in _PICKLE_IMPORT_OPERAND_PUNCTUATION for character in value)
+    return bool(value) and not any(
+        character.isspace() or ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in value
     )
 
 
@@ -5571,6 +5574,9 @@ def _classify_bounded_pickle_candidate(
         if stream.tell() <= stream_start:
             return incomplete_route(stream_start, pre_inst, protocol, line_pair_only, events)
         if stream.tell() == len(sample):
+            route = incomplete_route(stream_start, pre_inst, protocol, line_pair_only, events)
+            if route is not None:
+                return route
             break
 
     if sample_is_prefix:
@@ -5620,6 +5626,19 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
     return 0 <= payload_size <= len(payload) - offset - 1 - header_size
 
 
+def _iter_nonblank_line_starts(payload: bytes) -> Iterator[int]:
+    line_start = 0
+    for line_end in range(len(payload) + 1):
+        if line_end < len(payload) and payload[line_end] not in b"\r\n":
+            continue
+        candidate_start = line_start
+        while candidate_start < line_end and payload[candidate_start] in b" \t":
+            candidate_start += 1
+        if candidate_start < line_end:
+            yield candidate_start
+        line_start = line_end + 1
+
+
 def _iter_pickle_candidate_offsets(
     payload: bytes,
     *,
@@ -5660,8 +5679,13 @@ def _iter_pickle_candidate_offsets(
         if opcode_name in _PICKLE_LINE_PAIR_OPCODES:
             first_line_end = payload.find(b"\n", offset + 1)
             second_line_end = payload.find(b"\n", first_line_end + 1)
-            operands = payload[offset + 1 : first_line_end] + payload[first_line_end + 1 : second_line_end]
-            require_continuation = require_continuation and not any(value in b".$-" for value in operands)
+            operands = (
+                payload[offset + 1 : first_line_end],
+                payload[first_line_end + 1 : second_line_end],
+            )
+            require_continuation = require_continuation and all(
+                operand.isalpha() and operand.islower() for operand in operands
+            )
         yield from maybe_add(
             offset,
             prevalidated=True,
@@ -5669,17 +5693,22 @@ def _iter_pickle_candidate_offsets(
         )
 
     if is_plain_text:
+        recent_line_starts: deque[int] = deque()
+        for candidate_start in _iter_nonblank_line_starts(payload):
+            while recent_line_starts and candidate_start - recent_line_starts[0] > PROTO0_1_MAX_PROBE_BYTES:
+                recent_line_starts.popleft()
+            if payload[candidate_start] in _PICKLE_CONTEXT_REQUIRED_SECURITY_OPCODE_BYTES:
+                for context_start in recent_line_starts:
+                    yield from maybe_add(context_start)
+                recent_line_starts.clear()
+            if _is_plausible_pickle_candidate(payload, candidate_start):
+                recent_line_starts.append(candidate_start)
+                if len(recent_line_starts) > _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES + 1:
+                    recent_line_starts.popleft()
         return
 
-    line_start = 0
-    for line_end in range(len(payload) + 1):
-        if line_end < len(payload) and payload[line_end] not in b"\r\n":
-            continue
-        candidate_start = line_start
-        while candidate_start < line_end and payload[candidate_start] in b" \t":
-            candidate_start += 1
+    for candidate_start in _iter_nonblank_line_starts(payload):
         yield from maybe_add(candidate_start)
-        line_start = line_end + 1
 
     plain_controls = b"\t\n\r\f"
     for offset, value in enumerate(payload):

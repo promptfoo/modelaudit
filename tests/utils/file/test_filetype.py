@@ -3787,6 +3787,31 @@ def test_protocol0_import_side_effect_precedes_invalid_continuation(
     assert len(constructor_calls) == expected_constructor_calls
 
 
+def test_protocol0_global_compact_punctuation_operand_calls_import_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_import = builtins.__import__
+    import_calls: list[str] = []
+
+    def tracking_import(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        if name == "evil/module":
+            import_calls.append(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", tracking_import)
+
+    with pytest.raises(ModuleNotFoundError):
+        pickle.loads(b"cevil/module\nthing\nMIT License\n")
+
+    assert import_calls == ["evil/module"]
+
+
 def test_initial_inst_import_side_effect_precedes_missing_mark_in_pure_python_unpickler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3829,6 +3854,20 @@ def test_protocol0_persid_callback_precedes_invalid_continuation() -> None:
 
     with pytest.raises(pickle.UnpicklingError):
         TrackingUnpickler(io.BytesIO(b"Pid\nApache License\n")).load()
+
+    assert persistent_ids == ["id"]
+
+
+def test_protocol0_binpersid_callback_precedes_invalid_continuation() -> None:
+    persistent_ids: list[str] = []
+
+    class TrackingUnpickler(pickle.Unpickler):
+        def persistent_load(self, pid: str) -> object:
+            persistent_ids.append(pid)
+            return object()
+
+    with pytest.raises(pickle.UnpicklingError):
+        TrackingUnpickler(io.BytesIO(b"S'id'\nQApache License\n")).load()
 
     assert persistent_ids == ["id"]
 
@@ -3926,6 +3965,17 @@ def test_next_buffer_callback_precedes_eof() -> None:
         pytest.param(b"\x82\x01", "pickle", id="sole-EXT1"),
         pytest.param(b"\x97", "pickle", id="sole-NEXT_BUFFER"),
         pytest.param("cmódulo\nthing\n.".encode(), "pickle", id="unicode-GLOBAL-operand"),
+        pytest.param(b"cevil/module\nthing\nMIT License\n", "pickle", id="GLOBAL-slash-operand"),
+        pytest.param(
+            b"MIT License\ncmystery_module\nThing\nApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-import-only-GLOBAL",
+        ),
+        pytest.param(
+            b"MIT License\nS'id'\nQApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-BINPERSID",
+        ),
         pytest.param(
             b"MIT License\nprefix cposix\nsystem\n(S'id'\ntR.",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -4074,6 +4124,10 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
         pytest.param(
             b"MIT License\ncopyright\ncopyright\nconditions\ninclude\n",
             id="overlapping-global-inst-prose-lines",
+        ),
+        pytest.param(
+            b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
+            id="context-opcode-leading-prose-lines",
         ),
         pytest.param(_large_zero_fill_base64_legal_text(), id="oversized-zero-fill-base64-prose"),
     ],

@@ -11279,6 +11279,13 @@ class TestZipScanner:
             pytest.param(b"\x82\x01", 1, id="sole-EXT1"),
             pytest.param(b"\x97", 1, id="sole-NEXT_BUFFER"),
             pytest.param("cmódulo\nthing\n.".encode(), 1, id="unicode-GLOBAL-operand"),
+            pytest.param(b"cevil/module\nthing\nMIT License\n", 1, id="GLOBAL-slash-operand"),
+            pytest.param(
+                b"MIT License\ncmystery_module\nThing\nApache License\n",
+                2,
+                id="embedded-import-only-GLOBAL",
+            ),
+            pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
             pytest.param(
                 b"MIT License\nprefix cposix\nsystem\n(S'id'\ntR.",
                 2,
@@ -11377,6 +11384,10 @@ class TestZipScanner:
             pytest.param(
                 b"MIT License\ncopyright\ncopyright\nconditions\ninclude\n",
                 id="overlapping-global-inst-prose-lines",
+            ),
+            pytest.param(
+                b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
+                id="context-opcode-leading-prose-lines",
             ),
             pytest.param(_large_zero_fill_base64_legal_text(), id="oversized-zero-fill-base64-prose"),
         ],
