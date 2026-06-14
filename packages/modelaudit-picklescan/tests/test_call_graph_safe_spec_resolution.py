@@ -29,7 +29,7 @@ from importlib.machinery import (
     SourcelessFileLoader,
 )
 from pathlib import Path
-from types import BuiltinFunctionType, FunctionType, ModuleType
+from types import BuiltinFunctionType, FunctionType, ModuleType, SimpleNamespace
 from typing import Any, cast
 from zipimport import zipimporter
 
@@ -1623,6 +1623,37 @@ def test_zipimporter_identity_accepts_bounded_launcher_prefix_and_trailer(
         spec = call_graph._find_standard_filesystem_spec(module)
 
     assert type(spec) is ModuleSpec
+
+
+def test_bounded_zip_directory_accepts_path_only_executable_mode_bits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "launcher.exe"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    archive_path.chmod(0o755)
+    original_fstat = os.fstat
+
+    def fstat_without_executable_bits(file_descriptor: int) -> os.stat_result:
+        file_stat = original_fstat(file_descriptor)
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=file_stat.st_dev,
+                st_ino=file_stat.st_ino,
+                st_mode=file_stat.st_mode & ~0o111,
+                st_size=file_stat.st_size,
+                st_mtime_ns=file_stat.st_mtime_ns,
+                st_ctime_ns=file_stat.st_ctime_ns,
+            ),
+        )
+
+    monkeypatch.setattr(os, "fstat", fstat_without_executable_bits)
+
+    names = call_graph._zipimport_bounded_central_directory_names(str(archive_path), archive_path.stat())
+
+    assert names is not None
+    assert b"trusted_module.py" in names
 
 
 def test_zipimporter_directory_shape_accepts_implicit_directory_sentinels() -> None:

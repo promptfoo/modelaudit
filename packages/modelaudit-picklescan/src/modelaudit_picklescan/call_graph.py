@@ -3793,6 +3793,18 @@ def _stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, 
     )
 
 
+def _cross_view_file_stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    # Windows path stat derives executable bits from the suffix; descriptor stat cannot.
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        stat.S_IFMT(file_stat.st_mode),
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
 def _zipimport_bounded_central_directory_names(
     archive: str,
     expected_stat: os.stat_result,
@@ -3804,7 +3816,10 @@ def _zipimport_bounded_central_directory_names(
         return None
     try:
         opened = os.fstat(file_descriptor)
-        if _stat_identity(expected_stat) != _stat_identity(opened) or opened.st_size < _ZIP_END_RECORD_SIZE:
+        if (
+            _cross_view_file_stat_identity(expected_stat) != _cross_view_file_stat_identity(opened)
+            or opened.st_size < _ZIP_END_RECORD_SIZE
+        ):
             return None
 
         tail_size = min(opened.st_size, _ZIP_END_RECORD_SIZE + _ZIP_MAX_COMMENT_BYTES)
@@ -3875,10 +3890,12 @@ def _zipimport_bounded_central_directory_names(
                 break
             return None
         finished = os.fstat(file_descriptor)
+        path_after = os.stat(archive)
         if (
             position != len(central_directory)
             or entry_count != expected_entries
             or _stat_identity(opened) != _stat_identity(finished)
+            or _stat_identity(expected_stat) != _stat_identity(path_after)
         ):
             return None
         return frozenset(entry_names)

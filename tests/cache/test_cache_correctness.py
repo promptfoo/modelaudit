@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import struct
 import sys
 import tempfile
 import time
@@ -2103,50 +2102,7 @@ def test_windows_console_launcher_zipimporter_cache_can_exclude_stdlib() -> None
         pytest.skip("pytest.exe is not cached as a zipimporter")
 
     cache_key, finder = launcher_entries[0]
-    state = object.__getattribute__(finder, "__dict__")
-    archive = dict.get(state, "archive")
-    prefix = dict.get(state, "prefix")
-    assert type(archive) is str and type(prefix) is str, state
-    files = picklescan_call_graph._zipimport_directory_cache_files(archive)
-    archive_stat = os.stat(archive)
-    assert archive_stat.st_size <= picklescan_call_graph._MAX_ZIPIMPORT_ARCHIVE_BYTES
-    archive_bytes = Path(archive).read_bytes()
-    end_offset = archive_bytes.rfind(b"PK\x05\x06")
-    end_fields = (
-        struct.unpack_from("<4H2LH", archive_bytes, end_offset + 4)
-        if 0 <= end_offset <= len(archive_bytes) - 22
-        else None
-    )
-    central_directory_size = end_fields[4] if end_fields is not None else 0
-    central_directory_start = max(0, end_offset - central_directory_size)
-    physical_names = picklescan_call_graph._zipimport_bounded_central_directory_names(
-        archive,
-        archive_stat,
-    )
-    details = {
-        "archive_size": len(archive_bytes),
-        "bounded_names": None if physical_names is None else sorted(physical_names),
-        "cache_entries": len(files) if type(files) is dict else None,
-        "cache_is_finder_files": dict.get(state, "_files", files) is files,
-        "cache_key": cache_key,
-        "central_directory": archive_bytes[central_directory_start:end_offset].hex(),
-        "central_directory_start": central_directory_start,
-        "central_directory_offsets": [
-            offset for offset in range(len(archive_bytes)) if archive_bytes.startswith(b"PK\x01\x02", offset)
-        ],
-        "end_fields": end_fields,
-        "end_offset": end_offset,
-        "end_offsets": [
-            offset for offset in range(len(archive_bytes)) if archive_bytes.startswith(b"PK\x05\x06", offset)
-        ],
-        "expected_prefix": picklescan_call_graph._zipimport_expected_prefix(archive, cache_key),
-        "prefix": prefix,
-        "state_keys": sorted(state),
-        "trailing_bytes": len(archive_bytes) - end_offset - 22 if end_offset >= 0 else None,
-    }
-
-    if not picklescan_call_graph._cached_bounded_zipimporter_excludes_module(finder, "linecache", cache_key):
-        pytest.fail("\n".join(f"{key}={value!r}" for key, value in details.items()), pytrace=False)
+    assert picklescan_call_graph._cached_bounded_zipimporter_excludes_module(finder, "linecache", cache_key)
 
 
 def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
