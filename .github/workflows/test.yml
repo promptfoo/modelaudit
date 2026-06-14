@@ -457,9 +457,8 @@ jobs:
     # Only run if Python files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    # The main-branch Python 3.12 step runs the fast suite under branch
-    # coverage, which costs ~3x the uninstrumented lanes (~25 min); the
-    # tracer overhead concentrates in CPU-bound detector replay tests.
+    # Coverage runs in dedicated shards below. Keep enough time here for the
+    # full uninstrumented matrix and the Python 3.12 slow/integration step.
     timeout-minutes: 75
     strategy:
       matrix:
@@ -502,13 +501,8 @@ jobs:
         run: |
           uv sync --extra all-ci
 
-      - name: Run fast tests with fail-fast (PRs, Python 3.12 with coverage)
-        if: github.event_name == 'pull_request' && matrix.python-version == '3.12'
-        run: |
-          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --cov=modelaudit --cov-report=xml --tb=short --durations=15
-
-      - name: Run fast tests with fail-fast (PRs, non-3.12)
-        if: github.event_name == 'pull_request' && matrix.python-version != '3.12'
+      - name: Run fast tests with fail-fast (PRs)
+        if: github.event_name == 'pull_request'
         run: |
           uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
@@ -521,13 +515,8 @@ jobs:
           echo "Running slow/integration tests due to 'run-slow-tests' label"
           uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
 
-      - name: Run fast tests with coverage (main branch only)
-        if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
-        run: |
-          uv run pytest tests -n auto -m "not slow and not integration and not performance" --cov=modelaudit --cov-report=xml --tb=short --durations=15
-
-      - name: Run fast tests without coverage (main branch, non-3.12)
-        if: github.ref == 'refs/heads/main' && matrix.python-version != '3.12'
+      - name: Run fast tests (main branch)
+        if: github.ref == 'refs/heads/main'
         run: |
           uv run pytest tests -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
@@ -541,12 +530,73 @@ jobs:
           # Run all slow, integration, and performance tests
           uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
 
-      - name: Upload coverage to Codecov
-        if: matrix.python-version == '3.12'
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6
+  coverage:
+    name: Coverage (${{ matrix.shard }})
+    needs: changes
+    # Prove workflow changes on their PR, but avoid adding five expensive jobs
+    # to ordinary Python PRs. Main always receives the sharded coverage gate.
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.workflows == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    # Branch coverage is CPU-bound on the hosted runner. Keep every test
+    # instrumented, but distribute stable node-ID shards across runners.
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Python dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-py3.12-
+            ${{ runner.os }}-uv-
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci
+
+      - name: Run branch coverage shard
+        run: |
+          uv run pytest tests -n auto \
+            -m "not slow and not integration and not performance" \
+            --modelaudit-shard-count 5 --modelaudit-shard-index ${{ matrix.shard }} \
+            --cov=modelaudit --cov-report=xml:coverage.xml --tb=short --durations=15
+          test -s coverage.xml
+
+      # Codecov automatically merges separate reports for the same commit.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          name: python-coverage-${{ matrix.shard }}
           files: ./coverage.xml
-          fail_ci_if_error: false
+          fail_ci_if_error: true
+          use_oidc: true
           verbose: true
 
   test-numpy-compatibility:
@@ -1015,6 +1065,7 @@ jobs:
         type-check,
         windows-tests,
         test,
+        coverage,
         test-numpy-compatibility,
         test-vendored-protos,
         test-proto-reproducibility,
@@ -1027,8 +1078,8 @@ jobs:
     steps:
       - name: Check if all jobs succeeded
         run: |
-          # A job is considered successful if it either succeeded or was skipped
-          # (skipped means the job's conditions weren't met, which is fine)
+          # Most jobs may be skipped when their path conditions are not met.
+          # Jobs required for the current event are checked separately below.
           QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
           LINT_RESULT="${{ needs.lint.result }}"
           DEPENDENCY_AUDIT_RESULT="${{ needs.dependency-audit.result }}"
@@ -1037,6 +1088,7 @@ jobs:
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           TEST_RESULT="${{ needs.test.result }}"
+          COVERAGE_RESULT="${{ needs.coverage.result }}"
           NUMPY_RESULT="${{ needs.test-numpy-compatibility.result }}"
           PROTOS_RESULT="${{ needs.test-vendored-protos.result }}"
           PROTO_REPRO_RESULT="${{ needs.test-proto-reproducibility.result }}"
@@ -1060,6 +1112,7 @@ jobs:
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
+          echo "  coverage: $COVERAGE_RESULT"
           echo "  test-numpy-compatibility: $NUMPY_RESULT"
           echo "  test-vendored-protos: $PROTOS_RESULT"
           echo "  test-proto-reproducibility: $PROTO_REPRO_RESULT"
@@ -1081,6 +1134,12 @@ jobs:
           [[ "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]] && FAILED=true
 
           # Conditional jobs: only fail if they should have run
+          # Coverage is mandatory on main and for workflow changes. Requiring
+          # exact success prevents a skipped shard matrix from passing the gate.
+          if [[ "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
+            [[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true
+          fi
+
           # License/lock checks run on main or when dependencies change
           if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
             [[ "$LICENSE_RESULT" == "failure" || "$LICENSE_RESULT" == "cancelled" ]] && FAILED=true
