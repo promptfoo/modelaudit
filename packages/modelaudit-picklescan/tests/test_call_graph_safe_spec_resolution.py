@@ -1793,6 +1793,99 @@ def test_loaded_package_cached_untrusted_importer_is_not_unresolved_trusted(
     assert calls == []
 
 
+def test_metadata_pathfinder_hook_removal_keeps_startup_distribution_roots_stable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if "find_distributions" not in type.__getattribute__(PathFinder, "__dict__"):
+        pytest.skip("PathFinder has no stdlib distribution hook")
+    trusted_root = call_graph._TRUSTED_SITE_PACKAGE_PATHS[0]
+    metadata_path = trusted_root / "probe.dist-info"
+    runtime_distribution_calls: list[str] = []
+
+    def hostile_distribution(name: str) -> object:
+        runtime_distribution_calls.append(name)
+        raise AssertionError("runtime distribution discovery was executed")
+
+    monkeypatch.setattr(
+        call_graph,
+        "_STARTUP_DISTRIBUTION_ROOTS",
+        {"probe": ((metadata_path, tmp_path.resolve()),)},
+    )
+    monkeypatch.setattr(call_graph, "distribution", hostile_distribution)
+    monkeypatch.delattr(PathFinder, "find_distributions")
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._interpreter_import_runtime_is_trusted() is True
+        assert call_graph._installed_distribution_roots("probe") == (tmp_path.resolve(),)
+        report = package_api.scan_bytes(b"cbuiltins\nprint\n.", source="metadata-finder-removed.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert runtime_distribution_calls == []
+    assert report.status == ScanStatus.COMPLETE
+    assert not any(error.category == "call_graph_analysis_error" for error in report.errors)
+
+
+def test_startup_distribution_root_capture_bounds_and_deduplicates_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = call_graph._TRUSTED_SITE_PACKAGE_PATHS[0]
+    distribution_calls: list[str] = []
+
+    class FakeDistribution:
+        _path = trusted_root / "shared.dist-info"
+
+        @staticmethod
+        def locate_file(_name: str) -> Path:
+            return tmp_path
+
+    monkeypatch.setattr(
+        call_graph,
+        "packages_distributions",
+        lambda: {"first": ["shared"], "second": ["shared"], "ignored": ["third"]},
+    )
+
+    def fake_distribution(name: str) -> FakeDistribution:
+        distribution_calls.append(name)
+        return FakeDistribution()
+
+    monkeypatch.setattr(call_graph, "distribution", fake_distribution)
+    monkeypatch.setattr(call_graph, "_MAX_STARTUP_DISTRIBUTION_NAMES", 2)
+
+    captured = call_graph._capture_startup_distribution_roots()
+
+    assert tuple(captured) == ("first", "second")
+    assert captured["first"] == captured["second"] == ((FakeDistribution._path, tmp_path.resolve()),)
+    assert distribution_calls == ["shared"]
+
+
+def test_replaced_metadata_pathfinder_hook_blocks_without_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if "find_distributions" not in type.__getattribute__(PathFinder, "__dict__"):
+        pytest.skip("PathFinder has no stdlib distribution hook")
+    calls: list[object] = []
+
+    def hostile_find_distributions(*args: object, **kwargs: object) -> tuple[()]:
+        del kwargs
+        calls.extend(args)
+        raise AssertionError("mutated metadata finder was executed")
+
+    monkeypatch.setattr(PathFinder, "find_distributions", hostile_find_distributions)
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._interpreter_import_runtime_is_trusted() is False
+        assert call_graph._trusted_module_origin_kind("statistics") is None
+    finally:
+        _clear_call_graph_caches()
+
+    assert calls == []
+
+
 def test_added_import_runtime_type_hook_blocks_resolution_without_execution() -> None:
     calls: list[str] = []
 

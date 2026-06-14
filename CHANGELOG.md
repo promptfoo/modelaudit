@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- keep result-cache resolution fingerprints aligned with cached misses, loaded-package importer contexts, bounded `FileFinder` summaries, and archive-validated `zipimporter` state so shared scans cannot reuse stale origin trust
+- keep result-cache resolution fingerprints aligned with cached misses, loaded-package importer contexts, bounded `FileFinder` summaries, archive-validated `zipimporter` state, and startup-frozen distribution roots so shared scans cannot reuse stale origin trust or fail on metadata-only finder removal
 - stream Hugging Face SafeTensors shard headers with bounded range reads instead of downloading tensor payload bodies
 - keep JIT alias replay linear, including multiline builtin-helper continuations, as alias state grows while preserving bounded analysis for attacker-controlled model content
 - inspect oversized ONNX protobuf structure from descriptor-bound, memory- and result-bounded file-backed reads; preserve external-data security checks while explicitly reporting deferred schema, raw-detector, weight-analysis, and content-hash coverage

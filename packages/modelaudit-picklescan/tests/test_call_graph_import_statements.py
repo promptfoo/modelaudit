@@ -579,20 +579,32 @@ def test_call_graph_report_avoids_runtime_distribution_discovery_during_benign_c
     monkeypatch.syspath_prepend(path_entry)
     monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
     importlib.invalidate_caches()
-    _clear_call_graph_caches()
     payload = _global_call_payload("builtins", "print", _unicode_operand("echo benign"))
     real_startup_findings = api_module.find_startup_hook_write_call_graphs
     cache_populated = False
     runtime_distribution_discovery_calls = 0
+    trusted_root = call_graph._TRUSTED_SITE_PACKAGE_PATHS[0]
 
     def runtime_packages_distributions() -> dict[str, list[str]]:
         nonlocal runtime_distribution_discovery_calls
         runtime_distribution_discovery_calls += 1
         return {}
 
+    def runtime_distribution(_name: str) -> object:
+        nonlocal runtime_distribution_discovery_calls
+        runtime_distribution_discovery_calls += 1
+        return object()
+
     # Distribution discovery can lazily import helper modules. It must remain
     # outside the report snapshot so benign initialization cannot churn it.
     monkeypatch.setattr(call_graph, "packages_distributions", runtime_packages_distributions)
+    monkeypatch.setattr(call_graph, "distribution", runtime_distribution)
+    monkeypatch.setattr(
+        call_graph,
+        "_STARTUP_DISTRIBUTION_ROOTS",
+        {"probe": ((trusted_root / "probe.dist-info", tmp_path.resolve()),)},
+    )
+    _clear_call_graph_caches()
 
     def populate_before_later_subpass(
         import_references: object,
@@ -608,7 +620,7 @@ def test_call_graph_report_avoids_runtime_distribution_discovery_during_benign_c
                 FileFinder(path_entry, *call_graph._STANDARD_FILE_FINDER_LOADER_DETAILS),
             )
             cache_populated = True
-        call_graph._installed_package_distributions()
+        assert call_graph._installed_distribution_roots("probe") == (tmp_path.resolve(),)
         return real_startup_findings(
             import_references,
             callable_invocations,

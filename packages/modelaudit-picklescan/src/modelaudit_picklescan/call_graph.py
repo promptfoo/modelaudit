@@ -53,12 +53,59 @@ from types import (
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
 
-try:
-    _STARTUP_PACKAGE_DISTRIBUTIONS: Mapping[str, tuple[str, ...]] = MappingProxyType(
-        {name: tuple(distributions) for name, distributions in packages_distributions().items()}
-    )
-except Exception:
-    _STARTUP_PACKAGE_DISTRIBUTIONS = MappingProxyType({})
+_MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
+_MAX_STARTUP_DISTRIBUTION_NAMES = 4096
+
+
+def _capture_startup_distribution_roots() -> Mapping[str, tuple[tuple[Path, Path], ...]]:
+    try:
+        discovered = packages_distributions()
+    except Exception:
+        return MappingProxyType({})
+
+    distribution_roots: dict[str, tuple[tuple[Path, Path], ...]] = {}
+    roots_by_distribution: dict[str, tuple[Path, Path] | None] = {}
+    for top_level_name, distribution_names in discovered.items():
+        if len(distribution_roots) >= _MAX_STARTUP_DISTRIBUTION_NAMES:
+            break
+        if type(top_level_name) is not str:
+            continue
+        bounded_names: list[str] = []
+        for distribution_name in distribution_names:
+            if len(bounded_names) >= _MAX_DISTRIBUTIONS_PER_TOP_LEVEL:
+                break
+            if type(distribution_name) is str:
+                bounded_names.append(distribution_name)
+
+        roots: list[tuple[Path, Path]] = []
+        for distribution_name in bounded_names:
+            if distribution_name not in roots_by_distribution:
+                if len(roots_by_distribution) >= _MAX_STARTUP_DISTRIBUTION_NAMES:
+                    continue
+                try:
+                    installed_distribution = distribution(distribution_name)
+                    metadata_location = getattr(installed_distribution, "_path", None)
+                    candidate = (
+                        (
+                            Path(str(metadata_location)).resolve(),
+                            Path(str(installed_distribution.locate_file(""))).resolve(),
+                        )
+                        if metadata_location is not None
+                        else None
+                    )
+                except Exception:
+                    candidate = None
+                roots_by_distribution[distribution_name] = candidate
+            candidate = roots_by_distribution[distribution_name]
+            if candidate is None:
+                continue
+            if candidate not in roots:
+                roots.append(candidate)
+        distribution_roots[top_level_name] = tuple(roots)
+    return MappingProxyType(distribution_roots)
+
+
+_STARTUP_DISTRIBUTION_ROOTS = _capture_startup_distribution_roots()
 
 # Bound per-pass import/callable fan-out for untrusted inputs. The 32-reference
 # cap has kept call-graph enrichment useful while preventing pathological scan
@@ -129,7 +176,6 @@ _MAX_INHERITED_CLASS_METHODS = 128
 _MAX_WILDCARD_IMPORTS = 16
 _MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
-_MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
 _MAX_TRUSTED_PTH_FILES = 64
 _MAX_TRUSTED_PTH_BYTES = 64 * 1024
 _MAX_TRUSTED_PTH_PATHS = 64
@@ -437,6 +483,9 @@ _IMPORT_RUNTIME_TYPES = tuple(
         )
     )
 )
+_SAFE_REMOVABLE_IMPORT_RUNTIME_TYPE_MEMBERS: Mapping[type[object], frozenset[str]] = MappingProxyType(
+    {PathFinder: frozenset({"find_distributions"})}
+)
 _IMPORT_RUNTIME_MODULE_SNAPSHOTS = (
     ("_imp", _imp, _module_namespace_snapshot(_imp)),
     (
@@ -542,12 +591,20 @@ def _namespace_matches_snapshot(
 
 
 def _type_namespace_matches_snapshot(
+    class_: type[object],
     namespace: Mapping[str, object],
     expected: Mapping[str, _RuntimeValueSnapshot],
 ) -> bool:
-    return _namespace_matches_snapshot(namespace, expected) and all(
-        name in expected or not _runtime_type_member_is_executable(value) for name, value in namespace.items()
-    )
+    safe_removals = _SAFE_REMOVABLE_IMPORT_RUNTIME_TYPE_MEMBERS.get(class_, frozenset())
+    return all(
+        (name in safe_removals and name not in namespace)
+        or (
+            name in namespace
+            and namespace[name] is expected_value[0]
+            and _runtime_value_matches_snapshot(namespace[name], expected_value)
+        )
+        for name, expected_value in expected.items()
+    ) and all(name in expected or not _runtime_type_member_is_executable(value) for name, value in namespace.items())
 
 
 def _interpreter_import_runtime_is_trusted() -> bool:
@@ -571,7 +628,7 @@ def _interpreter_import_runtime_is_trusted() -> bool:
             return False
     for class_, expected_namespace in _IMPORT_RUNTIME_TYPE_SNAPSHOTS:
         namespace = type.__getattribute__(class_, "__dict__")
-        if not _type_namespace_matches_snapshot(namespace, expected_namespace):
+        if not _type_namespace_matches_snapshot(class_, namespace, expected_namespace):
             return False
     return True
 
@@ -1587,25 +1644,11 @@ def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunct
     return function
 
 
-def _installed_package_distributions() -> Mapping[str, tuple[str, ...]]:
-    return _STARTUP_PACKAGE_DISTRIBUTIONS
-
-
 @_register_source_sensitive_cache
 @lru_cache(maxsize=256)
 def _installed_distribution_roots(top_level_name: str) -> tuple[Path, ...]:
     roots: list[Path] = []
-    distribution_names = _installed_package_distributions().get(top_level_name, ())
-    for distribution_name in distribution_names[:_MAX_DISTRIBUTIONS_PER_TOP_LEVEL]:
-        try:
-            installed_distribution = distribution(distribution_name)
-            metadata_location = getattr(installed_distribution, "_path", None)
-            if metadata_location is None:
-                continue
-            metadata_path = Path(str(metadata_location)).resolve()
-            root = Path(str(installed_distribution.locate_file(""))).resolve()
-        except Exception:
-            continue
+    for metadata_path, root in _STARTUP_DISTRIBUTION_ROOTS.get(top_level_name, ()):
         if not _path_is_in_trusted_package_environment(metadata_path):
             continue
         if root not in roots:
