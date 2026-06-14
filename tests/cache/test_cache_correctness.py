@@ -1802,6 +1802,54 @@ def test_cache_resolution_context_matches_picklescan_metadata() -> None:
     }
 
 
+def test_resolution_context_distinguishes_missing_and_cached_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path_entry = str(tmp_path.absolute())
+    monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
+    monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
+
+    missing_context = _source_resolution_context()
+    assert missing_context["path_importers"] == list(_picklescan_source_resolution_context()[2])
+
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, None)
+    cached_none_context = _source_resolution_context()
+
+    assert cached_none_context["path_importers"] == list(_picklescan_source_resolution_context()[2])
+    assert cached_none_context != missing_context
+    assert any(identity == f"{path_entry}=cached-none" for identity in cached_none_context["path_importers"])
+
+
+def test_resolution_context_tracks_standard_file_finder_cache_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "cache_context_module"
+    (tmp_path / f"{module_name}.py").write_text("value = 1\n", encoding="utf-8")
+    path_entry = str(tmp_path.absolute())
+    finder = FileFinder(
+        path_entry,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    assert finder.find_spec(module_name) is not None
+    monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+
+    populated_context = _source_resolution_context()
+    assert populated_context["path_importers"] == list(_picklescan_source_resolution_context()[2])
+
+    finder_state = object.__getattribute__(finder, "__dict__")
+    finder_state["_path_cache"] = set()
+    finder_state["_relaxed_path_cache"] = set()
+    poisoned_context = _source_resolution_context()
+
+    assert poisoned_context["path_importers"] == list(_picklescan_source_resolution_context()[2])
+    assert poisoned_context != populated_context
+
+
 def test_resolution_context_rejects_mutated_zipimporter_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1815,8 +1863,8 @@ def test_resolution_context_rejects_mutated_zipimporter_state(
     monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
     monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
 
-    assert not _source_resolution_context()["path_importers"]
-    assert not _picklescan_source_resolution_context()[2]
+    assert not any(path_entry in identity for identity in _source_resolution_context()["path_importers"])
+    assert not any(path_entry in identity for identity in _picklescan_source_resolution_context()[2])
 
     object.__getattribute__(finder, "__dict__")["archive"] = str(tmp_path / "other.zip")
 

@@ -463,6 +463,38 @@ def test_loaded_filesystem_reference_replacement_cannot_reuse_cached_origin(
     )
 
 
+def test_loaded_trusted_reference_ignores_untrusted_cached_path_finder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = "argparse"
+    name = "Namespace"
+    baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get((module, name))
+    if baseline is None:
+        pytest.skip("argparse.Namespace was not loaded before the call-graph trust snapshot")
+    assert sys.modules[module] is baseline[0][1]
+    calls: list[str] = []
+    evil_entry = str(tmp_path / "loaded-module-evil-importer")
+    importer_cache: dict[Any, Any] = dict(sys.path_importer_cache)
+    importer_cache[evil_entry] = _FailIfExecutedFinder(calls)
+
+    monkeypatch.setattr(sys, "path", [evil_entry, *sys.path])
+    monkeypatch.setattr(sys, "path_importer_cache", importer_cache)
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._trusted_module_origin_kind(module) == "stdlib"
+        report = package_api.scan_bytes(
+            f"c{module}\n{name}\n.".encode(),
+            source="loaded-module-untrusted-path.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert calls == []
+
+
 def test_forged_loaded_filesystem_reference_is_not_trusted_on_first_use(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1276,6 +1308,65 @@ def test_cached_stdlib_importer_miss_with_later_untrusted_finder_fails_closed(
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
         for finding in report.findings
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize("cache_transition", ["missing_to_none", "file_finder_to_poisoned"])
+def test_shared_cache_refreshes_when_path_importer_semantics_change(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_transition: str,
+) -> None:
+    module = "fractions"
+    name = "Fraction"
+    stdlib_path = sysconfig.get_path("stdlib")
+    assert stdlib_path is not None
+    loader_details = _standard_file_finder_loader_details()
+    calls: list[str] = []
+    evil_entry = str(Path(stdlib_path) / "later-shared-cache-evil-importer")
+    importer_cache: dict[Any, Any] = dict(sys.path_importer_cache)
+    importer_cache.pop(stdlib_path, None)
+    stdlib_finder: FileFinder | None = None
+    if cache_transition == "file_finder_to_poisoned":
+        stdlib_finder = FileFinder(stdlib_path, *loader_details)
+        assert stdlib_finder.find_spec(module) is not None
+        importer_cache[stdlib_path] = stdlib_finder
+    importer_cache[evil_entry] = _FailIfExecutedFinder(calls)
+
+    monkeypatch.delitem(sys.modules, module, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, PathFinder])
+    monkeypatch.setattr(sys, "path_hooks", [zipimporter, FileFinder.path_hook(*loader_details)])
+    monkeypatch.setattr(sys, "path", [stdlib_path, evil_entry])
+    monkeypatch.setattr(sys, "path_importer_cache", importer_cache)
+    _clear_call_graph_caches()
+
+    try:
+        with call_graph.shared_source_sensitive_caches():
+            trusted_report = package_api.scan_bytes(
+                f"c{module}\n{name}\n.".encode(),
+                source="shared-cache-trusted.pkl",
+                enrich_call_graph=False,
+            )
+            if stdlib_finder is None:
+                importer_cache[stdlib_path] = None
+            else:
+                finder_state = object.__getattribute__(stdlib_finder, "__dict__")
+                finder_state["_path_mtime"] = os.stat(stdlib_path).st_mtime
+                finder_state["_path_cache"] = set()
+                finder_state["_relaxed_path_cache"] = set()
+            blocked_report = package_api.scan_bytes(
+                f"c{module}\n{name}\n.".encode(),
+                source="shared-cache-blocked.pkl",
+                enrich_call_graph=False,
+            )
+    finally:
+        _clear_call_graph_caches()
+
+    assert trusted_report.verdict == SafetyVerdict.CLEAN
+    assert blocked_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in blocked_report.findings
     )
     assert calls == []
 

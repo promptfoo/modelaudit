@@ -2919,9 +2919,11 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
         standard_spec = _find_standard_filesystem_spec(module_name)
     except Exception:
         return None
-    if isinstance(standard_spec, _UnsafePathResolution):
-        return None
     loaded, _, loaded_spec = _loaded_module_state_without_hooks(module_name)
+    if isinstance(standard_spec, _UnsafePathResolution):
+        if not loaded:
+            return None
+        standard_spec = None
     spec: ModuleSpec | None
     if loaded:
         if loaded_spec is None or _module_spec_claims_builtin_or_frozen_identity(loaded_spec):
@@ -3703,8 +3705,48 @@ def _file_finder_loaders_are_standard(loaders: object) -> bool:
     )
 
 
+def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | None:
+    if type(finder) is not FileFinder or not _path_importer_methods_are_trusted(
+        FileFinder,
+        _TRUSTED_FILE_FINDER_METHODS,
+    ):
+        return None
+    try:
+        instance_state = object.__getattribute__(finder, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    if type(instance_state) is not dict:
+        return None
+    finder_path = dict.get(instance_state, "path")
+    loaders = dict.get(instance_state, "_loaders")
+    path_mtime = dict.get(instance_state, "_path_mtime")
+    path_cache = dict.get(instance_state, "_path_cache")
+    relaxed_path_cache = dict.get(instance_state, "_relaxed_path_cache")
+    if not (
+        set(instance_state) == {"_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache"}
+        and type(finder_path) is str
+        and os.path.abspath(finder_path) == os.path.abspath(cache_key)
+        and _file_finder_loaders_are_standard(loaders)
+        and type(path_mtime) in {int, float}
+        and _file_finder_cache_is_safe(path_cache)
+        and _file_finder_cache_is_safe(relaxed_path_cache)
+    ):
+        return None
+    state_identity = _string_sequence_identity(
+        (
+            finder_path,
+            repr(path_mtime),
+            _string_sequence_identity(sorted(cast(set[str], path_cache))),
+            _string_sequence_identity(sorted(cast(set[str], relaxed_path_cache))),
+        )
+    )
+    return f"trusted:importlib.machinery.FileFinder:{state_identity}"
+
+
 def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
-    if type(finder) not in {FileFinder, zipimporter}:
+    if type(finder) is FileFinder:
+        return _file_finder_resolution_identity(finder, cache_key) is not None
+    if type(finder) is not zipimporter:
         return False
     try:
         instance_state = object.__getattribute__(finder, "__dict__")
@@ -3716,47 +3758,30 @@ def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
         or any(type(key) is not str for key in instance_state)
     ):
         return False
-    if type(finder) is zipimporter:
-        if not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
-            return False
-        try:
-            expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
-        except (AttributeError, ImportError, OSError, TypeError):
-            return False
-        if (
-            type(expected_state) is not dict
-            or len(expected_state) > 5
-            or any(type(key) is not str for key in expected_state)
-        ):
-            return False
-        archive = dict.get(instance_state, "archive")
-        prefix = dict.get(instance_state, "prefix")
-        files = _zipimport_directory_cache_files(archive) if type(archive) is str else None
-        return (
-            set(instance_state) == set(expected_state)
-            and type(archive) is str
-            and archive == dict.get(expected_state, "archive")
-            and type(prefix) is str
-            and prefix == dict.get(expected_state, "prefix")
-            and dict.get(instance_state, "_files", files) is files
-            and dict.get(expected_state, "_files", files) is files
-            and _zipimport_files_are_safe(files)
-        )
-    if not _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
+    if not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
         return False
-    finder_path = dict.get(instance_state, "path")
-    loaders = dict.get(instance_state, "_loaders")
-    path_mtime = dict.get(instance_state, "_path_mtime")
-    path_cache = dict.get(instance_state, "_path_cache")
-    relaxed_path_cache = dict.get(instance_state, "_relaxed_path_cache")
+    try:
+        expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
+    except (AttributeError, ImportError, OSError, TypeError):
+        return False
+    if (
+        type(expected_state) is not dict
+        or len(expected_state) > 5
+        or any(type(key) is not str for key in expected_state)
+    ):
+        return False
+    archive = dict.get(instance_state, "archive")
+    prefix = dict.get(instance_state, "prefix")
+    files = _zipimport_directory_cache_files(archive) if type(archive) is str else None
     return (
-        set(instance_state) == {"_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache"}
-        and type(finder_path) is str
-        and os.path.abspath(finder_path) == os.path.abspath(cache_key)
-        and _file_finder_loaders_are_standard(loaders)
-        and type(path_mtime) in {int, float}
-        and _file_finder_cache_is_safe(path_cache)
-        and _file_finder_cache_is_safe(relaxed_path_cache)
+        set(instance_state) == set(expected_state)
+        and type(archive) is str
+        and archive == dict.get(expected_state, "archive")
+        and type(prefix) is str
+        and prefix == dict.get(expected_state, "prefix")
+        and dict.get(instance_state, "_files", files) is files
+        and dict.get(expected_state, "_files", files) is files
+        and _zipimport_files_are_safe(files)
     )
 
 
@@ -3780,17 +3805,28 @@ def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tupl
     if search_path is None or meta_path is None or path_hooks is None or path_importer_cache is None:
         unavailable = (_UNREUSABLE_HOOK_STATE_IDENTITY,)
         return unavailable, unavailable, unavailable
-    nonstandard_importers = []
+    path_importers = []
     for entry in search_path:
         cache_key = entry or os.getcwd()
-        finder = dict.get(path_importer_cache, cache_key)
-        if finder is None or _is_trusted_standard_path_importer(finder, cache_key):
+        if not dict.__contains__(path_importer_cache, cache_key):
             continue
-        nonstandard_importers.append(f"{Path(cache_key).absolute()}={_import_hook_identity(finder)}")
+        finder = dict.__getitem__(path_importer_cache, cache_key)
+        absolute_cache_key = Path(cache_key).absolute()
+        if finder is None:
+            path_importers.append(f"{absolute_cache_key}=cached-none")
+            continue
+        if type(finder) is FileFinder:
+            file_finder_identity = _file_finder_resolution_identity(finder, cache_key)
+            identity = file_finder_identity or _import_hook_identity(finder)
+            path_importers.append(f"{absolute_cache_key}={identity}")
+            continue
+        if _is_trusted_standard_path_importer(finder, cache_key):
+            continue
+        path_importers.append(f"{absolute_cache_key}={_import_hook_identity(finder)}")
     return (
         tuple(_meta_path_finder_resolution_identity(finder) for finder in meta_path),
         tuple(_path_hook_resolution_identity(hook) for hook in path_hooks),
-        tuple(nonstandard_importers),
+        tuple(path_importers),
     )
 
 
