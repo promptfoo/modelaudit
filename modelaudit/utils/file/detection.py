@@ -5449,7 +5449,6 @@ def _incomplete_pickle_security_route(
     require_strong_continuation: bool,
     stream_start: int,
     pre_stack_inst: bool,
-    candidate_at_eof: bool,
     parsed_opcodes: int,
     security_events: list[tuple[int, str, bool]],
 ) -> str | None:
@@ -5459,12 +5458,12 @@ def _incomplete_pickle_security_route(
         allow_embedded_persid=allow_embedded_persid,
         embedded=embedded,
     )
-    if pre_stack_inst and not any(name == "INST" for _index, name, _meaningful in meaningful_events):
-        return (
-            PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-            if (not embedded and stream_start == 0) or (not require_continuation and candidate_at_eof)
-            else None
-        )
+    if (
+        pre_stack_inst
+        and not require_strong_continuation
+        and not any(name == "INST" for _index, name, _meaningful in meaningful_events)
+    ):
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     if not meaningful_events:
         return None
     if require_continuation and only_text_line_side_effects:
@@ -5523,11 +5522,9 @@ def _classify_bounded_pickle_candidate(
         text_line_side_effects_only: bool,
         events: list[tuple[int, str, bool]],
     ) -> str | None:
-        if (
-            not sample_is_prefix
-            and stream.tell() == len(sample)
-            and sum(name == "PERSID" for _index, name, _meaningful in events) == 1
-        ):
+        if (not require_continuation or (not sample_is_prefix and stream.tell() == len(sample))) and sum(
+            name == "PERSID" for _index, name, _meaningful in events
+        ) == 1:
             events = [(index, name, meaningful or name == "PERSID") for index, name, meaningful in events]
         return _incomplete_pickle_security_route(
             embedded=embedded,
@@ -5538,7 +5535,6 @@ def _classify_bounded_pickle_candidate(
             require_strong_continuation=require_strong_continuation,
             stream_start=stream_start,
             pre_stack_inst=pre_inst,
-            candidate_at_eof=not sample_is_prefix and stream.tell() == len(sample),
             parsed_opcodes=parsed_opcodes,
             security_events=events,
         )
@@ -5697,11 +5693,18 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
             lines.append(payload[cursor:line_end])
             cursor = line_end + 1
         if opcode.name in {"GLOBAL", "INST"}:
-            return all(_plausible_pickle_import_operand(line) for line in lines)
+            operands = (lines[0], lines[1])
+            return all(_plausible_pickle_import_operand(line) for line in operands) and (
+                _has_structural_pickle_continuation(payload, cursor) or _has_pickle_import_signal(operands)
+            )
         if opcode.name == "PERSID":
             return _is_compact_pickle_line(lines[0]) or (
-                (cursor == len(payload) and _has_terminal_persid_signal(lines[0]))
-                or (offset == 0 and cursor < len(payload) and payload[cursor] in _PICKLE_OPCODE_BY_BYTE)
+                _has_terminal_persid_signal(lines[0])
+                and (
+                    cursor == len(payload)
+                    or _has_structural_pickle_continuation(payload, cursor)
+                    or _has_single_invalid_pickle_tail(payload, cursor)
+                )
             )
         if opcode.name == "STRING":
             value = lines[0]
@@ -5759,6 +5762,11 @@ def _has_structural_pickle_continuation(payload: bytes, offset: int) -> bool:
     return opcode is not None and opcode.name not in _PICKLE_LINE_PAIR_OPCODES
 
 
+def _has_single_invalid_pickle_tail(payload: bytes, offset: int) -> bool:
+    tail = payload[offset:].strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+    return len(tail) == 1 and tail[0] not in _PICKLE_OPCODE_BY_BYTE
+
+
 @lru_cache(maxsize=128)
 def _is_importable_top_level_module(module: str) -> bool:
     if module in sys.builtin_module_names or module in sys.stdlib_module_names:
@@ -5769,11 +5777,15 @@ def _is_importable_top_level_module(module: str) -> bool:
         return False
 
 
-def _has_terminal_pickle_import_signal(operands: tuple[bytes, bytes]) -> bool:
-    """Reject lowercase prose pairs while retaining import-shaped terminal operands."""
-    module, _name = operands
+def _has_pickle_import_signal(operands: tuple[bytes, bytes]) -> bool:
+    """Reject lowercase prose pairs while retaining import-shaped operands."""
     if not all(operand.isalpha() and operand.islower() for operand in operands):
         return True
+    return _has_importable_pickle_module(operands)
+
+
+def _has_importable_pickle_module(operands: tuple[bytes, bytes]) -> bool:
+    module, _name = operands
     try:
         top_level_module = module.decode("utf-8").partition(".")[0]
     except UnicodeDecodeError:
@@ -5822,6 +5834,15 @@ def _iter_pickle_candidate_offsets(
             line_end = payload.find(b"\n", offset + 1)
             trailing = payload[line_end + 1 :] if line_end >= 0 else b""
             require_continuation = require_continuation and bool(trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES))
+            if (
+                require_continuation
+                and line_start == offset
+                and (
+                    _has_structural_pickle_continuation(payload, line_end + 1)
+                    or _has_single_invalid_pickle_tail(payload, line_end + 1)
+                )
+            ):
+                require_continuation = False
         if opcode_name in _PICKLE_LINE_PAIR_OPCODES:
             first_line_end = payload.find(b"\n", offset + 1)
             second_line_end = payload.find(b"\n", first_line_end + 1)
@@ -5837,16 +5858,23 @@ def _iter_pickle_candidate_offsets(
                 payload[offset + 1 : first_line_end],
                 payload[first_line_end + 1 : second_line_end],
             )
-            require_continuation = require_continuation and (
-                has_nontrivial_prefix or all(operand.isalpha() and operand.islower() for operand in operands)
+            continuation_offset = second_line_end + 1
+            has_structural_continuation = _has_structural_pickle_continuation(payload, continuation_offset)
+            has_import_boundary = not has_nontrivial_prefix or payload[offset - 1] in b" \t#;:="
+            has_nonstructural_import_signal = (
+                has_import_boundary
+                and _has_pickle_import_signal(operands)
+                and (
+                    opcode_name == "GLOBAL"
+                    or continuation_offset == len(payload)
+                    or _has_importable_pickle_module(operands)
+                    or _has_single_invalid_pickle_tail(payload, continuation_offset)
+                    or (has_trivial_prefix and ord("(") in payload[line_start:offset])
+                )
             )
-            if require_continuation and not _has_structural_pickle_continuation(payload, second_line_end + 1):
-                if (
-                    has_nontrivial_prefix
-                    or second_line_end + 1 != len(payload)
-                    or not _has_terminal_pickle_import_signal(operands)
-                ):
-                    continue
+            if require_continuation and not (has_structural_continuation or has_nonstructural_import_signal):
+                continue
+            if require_continuation:
                 require_continuation = False
         if (opcode_name in {"GLOBAL", "INST"} and line_start < offset) or (
             opcode_name == "PERSID" and has_trivial_prefix
@@ -5854,7 +5882,7 @@ def _iter_pickle_candidate_offsets(
             yield from maybe_add(
                 line_start,
                 require_continuation=require_continuation,
-                require_strong_continuation=adjacent_word_prefix,
+                require_strong_continuation=has_nontrivial_prefix,
             )
         if opcode_name == "GLOBAL" and line_start > 0:
             previous_line_end = line_start - 1
@@ -5864,13 +5892,13 @@ def _iter_pickle_candidate_offsets(
             yield from maybe_add(
                 previous_line_start,
                 require_continuation=require_continuation,
-                require_strong_continuation=adjacent_word_prefix,
+                require_strong_continuation=has_nontrivial_prefix,
             )
         yield from maybe_add(
             offset,
-            prevalidated=True,
+            prevalidated=_is_plausible_pickle_candidate(payload, offset),
             require_continuation=require_continuation,
-            require_strong_continuation=adjacent_word_prefix,
+            require_strong_continuation=has_nontrivial_prefix,
         )
 
     if is_plain_text:
@@ -5889,12 +5917,20 @@ def _iter_pickle_candidate_offsets(
                 recent_line_starts.clear()
                 lookbehind_truncated = False
             plausible_candidate = _is_plausible_pickle_candidate(payload, candidate_start)
-            if (
-                plausible_candidate
-                and payload[candidate_start] == ord("P")
-                and payload.find(b"\n", candidate_start + 1) == len(payload) - 1
-            ):
-                yield from maybe_add(candidate_start, prevalidated=True)
+            if plausible_candidate and payload[candidate_start] == ord("P"):
+                line_end = payload.find(b"\n", candidate_start + 1)
+                trailing = payload[line_end + 1 :] if line_end >= 0 else b""
+                require_continuation = candidate_start > 0 and bool(trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES))
+                if require_continuation and (
+                    _has_structural_pickle_continuation(payload, line_end + 1)
+                    or _has_single_invalid_pickle_tail(payload, line_end + 1)
+                ):
+                    require_continuation = False
+                yield from maybe_add(
+                    candidate_start,
+                    prevalidated=True,
+                    require_continuation=require_continuation,
+                )
             if plausible_candidate:
                 recent_line_starts.append(candidate_start)
                 if len(recent_line_starts) > _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES + 1:

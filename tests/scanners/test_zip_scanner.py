@@ -11395,6 +11395,31 @@ class TestZipScanner:
             ),
             pytest.param(b"MIT License\ncposix\nsystem\n", 2, id="embedded-terminal-GLOBAL"),
             pytest.param(b"MIT License\nimystery_module\nThing\n", 2, id="embedded-terminal-INST"),
+            pytest.param(
+                b"MIT License\ncposix\nsystem\nA",
+                2,
+                id="embedded-GLOBAL-before-invalid-tail",
+            ),
+            pytest.param(
+                b"MIT License\nios\nsystem\n.",
+                2,
+                id="embedded-INST-before-missing-MARK",
+            ),
+            pytest.param(
+                b"MIT License\nimystery_module\nThing\nA",
+                2,
+                id="embedded-INST-before-invalid-tail",
+            ),
+            pytest.param(
+                b"MIT License\nPid\nA",
+                2,
+                id="embedded-PERSID-before-invalid-tail",
+            ),
+            pytest.param(
+                b"MIT License\nPMIT License\nA",
+                2,
+                id="embedded-spaced-PERSID-before-invalid-tail",
+            ),
             pytest.param(b"MIT License\ncnumpy\narray\n", 2, id="embedded-terminal-third-party-GLOBAL"),
             pytest.param(b"MIT License\ninumpy\narray\n", 2, id="embedded-terminal-third-party-INST"),
             pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
@@ -11487,6 +11512,21 @@ class TestZipScanner:
                 b"MIT License\n" + binascii.hexlify(b"\x82\x01A"),
                 1,
                 id="hex-EXT1-before-invalid-continuation",
+            ),
+            pytest.param(
+                b"MIT License\n" + base64.b64encode(b"cposix\nsystem\nA"),
+                1,
+                id="base64-GLOBAL-before-invalid-tail",
+            ),
+            pytest.param(
+                b"MIT License\n" + binascii.hexlify(b"imystery_module\nThing\nA"),
+                2,
+                id="hex-INST-before-invalid-tail",
+            ),
+            pytest.param(
+                b"MIT License\n" + base64.b64encode(b"Pid\nA"),
+                1,
+                id="base64-PERSID-before-invalid-tail",
             ),
             pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),
             pytest.param(b"MIT License\nWF Bp ZA ou\n", 2, id="base64-spaced-alpha-prefixed-PERSID"),
@@ -11594,6 +11634,7 @@ class TestZipScanner:
                 b"MIT License\ncopyright\nconditions\n",
                 id="terminal-lowercase-global-shaped-prose",
             ),
+            pytest.param(b"copyright\nnotice\n", id="offset-zero-lowercase-global-shaped-prose"),
             pytest.param(
                 b"MIT License\nPermission is\ngranted to\nall users\n",
                 id="multiline-spaced-alphabetic-prose",
