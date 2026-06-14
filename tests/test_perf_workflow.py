@@ -403,6 +403,7 @@ def test_dependency_audit_runs_for_source_reachability_changes() -> None:
     assert "needs.changes.outputs.python == 'true'" in condition
     assert "needs.changes.outputs.picklescan == 'true'" in condition
 
+
 def test_python_ci_triggers_merge_group_and_cancels_superseded_main_runs() -> None:
     workflow = _load_workflow("test.yml")
     triggers = _workflow_triggers(workflow)
