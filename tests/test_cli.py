@@ -5246,6 +5246,64 @@ def test_scan_huggingface_standard_revalidates_index_proof_after_local_scan(
     assert "SafeTensors index proof mismatch" in result.output
 
 
+def test_scan_huggingface_index_proof_revalidation_shares_scan_deadline(tmp_path: Path) -> None:
+    """Pre/post proof walks and the local scan consume one absolute timeout budget."""
+    from modelaudit.utils.sources.huggingface import HuggingFaceSafetensorsIndexProof
+
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    proof = HuggingFaceSafetensorsIndexProof(
+        index_file="model.safetensors.index.json",
+        fingerprint="0" * 64,
+        target_files=("model-00001-of-00001.safetensors",),
+        index_base="one",
+    )
+    observed_deadlines: list[float] = []
+
+    def download_with_proof(*_args: Any, **kwargs: Any) -> Path:
+        kwargs["safetensors_index_proofs"].append(proof)
+        return downloaded_dir
+
+    def verify_with_timeout(*_args: Any, deadline: float | None = None, **_kwargs: Any) -> None:
+        assert deadline is not None
+        observed_deadlines.append(deadline)
+        if len(observed_deadlines) == 2:
+            raise TimeoutError("proof verification timed out")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch("modelaudit.cli.download_model", side_effect=download_with_proof),
+        patch(
+            "modelaudit.cli.verify_downloaded_huggingface_safetensors_index_proofs",
+            side_effect=verify_with_timeout,
+        ),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ) as mock_scan,
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--quiet",
+                "--no-cache",
+                "--timeout",
+                "1",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2, result.output
+    assert len(observed_deadlines) == 2
+    assert observed_deadlines[0] == observed_deadlines[1]
+    assert mock_scan.call_args.kwargs["timeout"] == 1
+
+
 def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> None:
     downloaded_dir = tmp_path / "downloaded"
     downloaded_dir.mkdir()

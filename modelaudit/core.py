@@ -126,15 +126,22 @@ from modelaudit.utils.file.detection import (
     validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
+    _DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY,
     _PREVALIDATED_SHARD_INFO_CONFIG_KEY,
     _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY,
     _SHARD_ALREADY_PINNED_CONFIG_KEY,
     MAX_RECORDED_MISSING_SHARD_INDICES,
+    MAX_SAFETENSORS_SHARD_INDEX_BYTES,
+    MAX_SAFETENSORS_SHARD_INDEX_DIRECTORIES,
+    MAX_SAFETENSORS_SHARD_INDEX_FILES,
+    MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES,
+    SAFETENSORS_INDEX_SUFFIX,
     ShardedModelDetector,
     ValidatedShardTargets,
     _activate_safetensors_index_inspection_context,
     _count_expected_shard_indices,
     _deactivate_safetensors_index_inspection_context,
+    _load_safetensors_index_json,
     _open_windows_shard_guard_fd,
     _pinned_shard_scan_path,
     _preserve_findings_with_shard_boundary_failure,
@@ -2078,6 +2085,7 @@ def _terminal_safetensors_shard_boundary_failures(
     index_search_root: str | os.PathLike[str],
     index_inspection_context: _SafetensorsIndexInspectionContext,
     deleted_paths: Collection[str] = (),
+    force_content_revalidation: bool = True,
 ) -> dict[str, str]:
     """Return final SafeTensors index or target changes across all shard parents."""
     normalized_deleted_paths = {os.path.normcase(os.path.normpath(os.path.abspath(path))) for path in deleted_paths}
@@ -2120,6 +2128,7 @@ def _terminal_safetensors_shard_boundary_failures(
         terminal_families.setdefault(family_key, []).append(source_path)
         expected_proofs[family_key] = expected_proof
 
+    late_proof_sources: dict[tuple[int, str, str, str, int], list[str]] = {}
     for family_key, family_sources in terminal_families.items():
         expected_proof = expected_proofs[family_key]
         expected_total = family_key[1]
@@ -2129,21 +2138,47 @@ def _terminal_safetensors_shard_boundary_failures(
             expected_total=expected_total,
             index_search_root=index_search_root,
             index_inspection_context=index_inspection_context,
-            force_content_revalidation=True,
+            force_content_revalidation=force_content_revalidation,
+            require_declared_files=expected_proof is None,
         )
-        expected_index_deleted = bool(
-            expected_proof is not None
-            and os.path.normcase(os.path.normpath(os.path.abspath(expected_proof[1]))) in normalized_deleted_paths
-        )
-        expected_index_still_absent = bool(expected_proof is not None and not os.path.lexists(expected_proof[1]))
-        authority_stable = (
-            refreshed_proof == expected_proof and authority_present == (expected_proof is not None)
-        ) or (
-            expected_index_deleted and expected_index_still_absent and refreshed_proof is None and not authority_present
-        )
+        if expected_proof is None and refreshed_proof is not None and authority_present:
+            late_proof_sources.setdefault((expected_total, *refreshed_proof), []).extend(family_sources)
+            continue
+        authority_stable = refreshed_proof == expected_proof and authority_present == (expected_proof is not None)
         if not authority_stable:
             for family_source in family_sources:
                 failures[family_source] = "shard_index_changed_after_scan"
+
+    for late_proof, grouped_sources in late_proof_sources.items():
+        expected_total, refreshed_base, refreshed_path, refreshed_fingerprint, refreshed_generation = late_proof
+        family_sources = list(dict.fromkeys(grouped_sources))
+        observed_indices: set[int] = set()
+        for family_source in family_sources:
+            source_match = ShardedModelDetector.match_safetensors_shard_filename(Path(family_source).name)
+            source_index = source_match.get("current_shard_index") if source_match is not None else None
+            if not isinstance(source_index, int) or isinstance(source_index, bool):
+                observed_indices.clear()
+                break
+            observed_indices.add(source_index)
+        expected_start = 0 if refreshed_base == "zero" else 1
+        late_authority_is_consistent = (
+            len(family_sources) == expected_total
+            and len(observed_indices) == expected_total
+            and all(expected_start <= index < expected_start + expected_total for index in observed_indices)
+        )
+        if not late_authority_is_consistent:
+            for family_source in family_sources:
+                failures[family_source] = "shard_index_changed_after_scan"
+            continue
+        for family_source in family_sources:
+            validated_targets[family_source].update(
+                {
+                    "authoritative_shard_index_base": refreshed_base,
+                    "authoritative_shard_index_path": refreshed_path,
+                    "authoritative_shard_index_fingerprint": refreshed_fingerprint,
+                    "authoritative_shard_index_generation": refreshed_generation,
+                }
+            )
 
     for source_path, expected_target in validated_targets.items():
         if source_path in failures:
@@ -7707,14 +7742,24 @@ def scan_model_streaming(
     nearby_license_cache: dict[str, list[str]] = {}
     pending_delete_failures: dict[Path, Exception] = {}
     deleted_streamed_sources: set[str] = set()
+    deleted_streamed_index_candidates: set[tuple[str, str]] = set()
+    deferred_streamed_index_deletions: dict[Path, tuple[_FileIdentitySnapshot, str, bool]] = {}
+    observed_streamed_safetensors_shard_parents: set[str] = set()
     validated_shard_targets: ValidatedShardTargets = {}
     stream_windows_shard_guards: _WindowsShardGuards = []
     preserved_openvino_companion_snapshots: dict[Path, _FileIdentitySnapshot] = {}
     deferred_openvino_sidecars: dict[Path, Path] = {}
     consumed_openvino_companions: set[Path] = set()
     preserve_shard_reconciliation_errors = False
+    deleted_streamed_index_tracking_incomplete = False
+    streamed_safetensors_scope_tracking_incomplete = False
+    streamed_index_document_probe_bytes = 0
+    streamed_index_cleanup_verification_bytes = 0
+    deferred_streamed_index_bytes = 0
+    streamed_index_retention_failed = False
     streamed_item_count = 0
     received_pretransferred_bytes = False
+    stream_generator_closed = False
 
     def streaming_repository_inventory_context() -> RepositoryFileInventory:
         nonlocal repository_inventory_context
@@ -7731,16 +7776,497 @@ def scan_model_streaming(
 
         return repository_inventory_context
 
-    def delete_streamed_source(source_path: Path, context: str) -> None:
-        if not delete_after_scan or not (source_path.exists() or source_path.is_symlink()):
+    def normalized_stream_path(source_path: str | os.PathLike[str]) -> str:
+        return os.path.normcase(os.path.normpath(os.path.abspath(source_path)))
+
+    def canonical_stream_directory(directory: str | os.PathLike[str]) -> str:
+        """Return one stable resolved directory identity, falling back to its absolute path."""
+        directory_path = Path(directory)
+        try:
+            directory_path = directory_path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            directory_path = directory_path.absolute()
+        return os.path.normcase(os.path.normpath(str(directory_path)))
+
+    def canonical_stream_parent(source_path: str | os.PathLike[str]) -> str:
+        return canonical_stream_directory(Path(source_path).absolute().parent)
+
+    def index_parent_can_govern_stream_parent(index_parent: str, shard_parent: str) -> bool:
+        """Return whether canonical parents share the selected shard's ancestor search scope."""
+        search_root = canonical_stream_index_search_root or shard_parent
+        try:
+            return (
+                os.path.commonpath([index_parent, shard_parent]) == index_parent
+                and os.path.commonpath([index_parent, search_root]) == search_root
+            )
+        except ValueError:
+            return False
+
+    def classify_structural_safetensors_index(
+        source_path: Path,
+        *,
+        charge_budget: bool = True,
+    ) -> tuple[bool | None, _FileIdentitySnapshot | None]:
+        """Return True for an index, False for proven non-index content, or None when indeterminate."""
+        nonlocal streamed_index_document_probe_bytes
+
+        source_identity = _snapshot_file_identity(source_path)
+        if source_identity is None or source_identity.stat is None or not stat.S_ISREG(source_identity.stat[2]):
+            return None, source_identity
+        source_size = _snapshot_file_size(source_identity)
+        open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        index_fd: int | None = None
+        try:
+            index_fd = os.open(source_path, open_flags)
+            opened_stat = os.fstat(index_fd)
+            opened_identity = (
+                opened_stat.st_dev,
+                opened_stat.st_ino,
+                opened_stat.st_mode,
+                opened_stat.st_size,
+                opened_stat.st_mtime_ns,
+                opened_stat.st_ctime_ns,
+            )
+            if opened_identity != source_identity.stat or not stat.S_ISREG(opened_stat.st_mode):
+                return None, None
+            prefix_limit = min(source_size + 1, 4096)
+            index_bytes = os.read(index_fd, prefix_limit)
+            stripped_prefix = index_bytes.lstrip()
+            prefix_is_complete = len(index_bytes) == source_size
+            if (stripped_prefix and not stripped_prefix.startswith(b"{")) or (
+                prefix_is_complete and not stripped_prefix
+            ):
+                post_read_stat = os.fstat(index_fd)
+                if not os.path.samestat(opened_stat, post_read_stat):
+                    return None, None
+                return (
+                    (False, source_identity)
+                    if _snapshot_file_identity(source_path) == source_identity
+                    else (None, None)
+                )
+            if source_size > MAX_SAFETENSORS_SHARD_INDEX_BYTES or (
+                charge_budget
+                and streamed_index_document_probe_bytes + source_size > MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES
+            ):
+                return None, source_identity
+            if charge_budget:
+                streamed_index_document_probe_bytes += source_size
+            remaining = source_size + 1 - len(index_bytes)
+            index_buffer = bytearray(index_bytes)
+            while remaining > 0:
+                chunk = os.read(index_fd, min(remaining, 64 * 1024))
+                if not chunk:
+                    break
+                index_buffer.extend(chunk)
+                remaining -= len(chunk)
+            index_bytes = bytes(index_buffer)
+            post_read_stat = os.fstat(index_fd)
+            if not os.path.samestat(opened_stat, post_read_stat):
+                return None, None
+        except (BlockingIOError, OSError):
+            return None, None
+        finally:
+            if index_fd is not None:
+                os.close(index_fd)
+        if len(index_bytes) != source_size or _snapshot_file_identity(source_path) != source_identity:
+            return None, None
+        if not index_bytes.lstrip().startswith(b"{"):
+            return False, source_identity
+        try:
+            index_doc = _load_safetensors_index_json(index_bytes)
+        except Exception:
+            return None, source_identity
+        if not isinstance(index_doc, dict) or getattr(index_doc, "has_duplicate_keys", False):
+            return None, source_identity
+        if "weight_map" not in index_doc:
+            return False, source_identity
+        weight_map = index_doc["weight_map"]
+        if (
+            not isinstance(weight_map, dict)
+            or not weight_map
+            or not all(isinstance(target, str) for target in weight_map.values())
+        ):
+            return None, source_identity
+        return True, source_identity
+
+    def is_retained_authoritative_index(
+        source_path: Path,
+        structural_index_classification: bool | None,
+    ) -> bool:
+        """Return whether shard validation may still depend on this index path."""
+        return (
+            structural_index_classification is True
+            or streamed_safetensors_scope_tracking_incomplete
+            or any(
+                index_parent_can_govern_stream_parent(canonical_stream_parent(source_path), shard_parent)
+                for shard_parent in observed_streamed_safetensors_shard_parents
+            )
+        )
+
+    def record_streamed_index_retention_failure(
+        source_path: Path,
+        message: str,
+        *,
+        reason: str = "safetensors_index_retention_limit_exceeded",
+    ) -> None:
+        """Make a retention-budget failure durable even when cleanup succeeds."""
+        nonlocal aggregate_hash_complete, preserve_shard_reconciliation_errors, streamed_index_retention_failed
+
+        aggregate_hash_complete = False
+        preserve_shard_reconciliation_errors = True
+        results.has_errors = True
+        results.success = False
+        if streamed_index_retention_failed:
+            return
+        streamed_index_retention_failed = True
+        _add_issue_to_model(
+            results,
+            message,
+            severity=IssueSeverity.INFO.value,
+            location=str(source_path),
+            details={
+                "analysis_incomplete": True,
+                "operational_error": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": reason,
+            },
+        )
+
+    def delete_streamed_index_candidate(
+        source_path: Path,
+        context: str,
+        *,
+        track_candidate: bool,
+        expected_identity: _FileIdentitySnapshot | None,
+        expected_content_hash: str | None,
+        require_proven_non_index: bool,
+        require_content_hash: bool,
+    ) -> None:
+        """Move one bound index generation aside before validating and unlinking it."""
+        nonlocal deleted_streamed_index_tracking_incomplete, streamed_index_cleanup_verification_bytes
+
+        parent_fd: int | None = None
+        tombstone_fd: int | None = None
+        tombstone_path: Path | None = None
+        moved_source = False
+        try:
+            canonical_parent = canonical_stream_parent(source_path)
+            use_directory_fd = os.name != "nt"
+            if use_directory_fd:
+                parent_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_DIRECTORY", 0)
+                parent_fd = os.open(source_path.parent, parent_flags)
+                bound_parent_stat = os.fstat(parent_fd)
+                canonical_parent = canonical_stream_parent(source_path)
+                if not os.path.samestat(bound_parent_stat, os.stat(canonical_parent)):
+                    raise OSError("SafeTensors index parent changed before cleanup")
+            tombstone_fd, raw_tombstone_path = tempfile.mkstemp(
+                prefix=".modelaudit-index-delete-",
+                dir=canonical_parent,
+            )
+            tombstone_path = Path(raw_tombstone_path)
+            os.close(tombstone_fd)
+            tombstone_fd = None
+            if parent_fd is not None:
+                os.unlink(tombstone_path.name, dir_fd=parent_fd)
+                os.rename(
+                    source_path.name,
+                    tombstone_path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            else:
+                os.replace(source_path, tombstone_path)
+            moved_source = True
+            moved_identity = _snapshot_file_identity(tombstone_path)
+            moved_classification: bool | None = None
+            if require_proven_non_index:
+                moved_classification, _moved_receipt = classify_structural_safetensors_index(
+                    tombstone_path,
+                    charge_budget=False,
+                )
+            moved_generation_matches = bool(
+                expected_identity is not None
+                and moved_identity is not None
+                and moved_identity.lstat[:5] == expected_identity.lstat[:5]
+                and (
+                    (moved_identity.stat is None and expected_identity.stat is None)
+                    or (
+                        moved_identity.stat is not None
+                        and expected_identity.stat is not None
+                        and moved_identity.stat[:5] == expected_identity.stat[:5]
+                    )
+                )
+            )
+            if expected_identity is not None and not moved_generation_matches:
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index candidate changed before cleanup.",
+                    reason="safetensors_index_changed_before_cleanup",
+                )
+            if require_proven_non_index and moved_classification is not False:
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index candidate changed before content-routed cleanup.",
+                    reason="safetensors_index_changed_before_cleanup",
+                )
+            if require_content_hash:
+                moved_size = _snapshot_file_size(moved_identity)
+                if moved_size <= MAX_SAFETENSORS_SHARD_INDEX_BYTES and (
+                    streamed_index_cleanup_verification_bytes + moved_size <= MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES
+                ):
+                    streamed_index_cleanup_verification_bytes += moved_size
+                    moved_content_hash = compute_sha256_hash(tombstone_path)
+                    content_hash_changed = expected_content_hash is None or moved_content_hash != expected_content_hash
+                else:
+                    content_hash_changed = require_proven_non_index is False
+                if content_hash_changed:
+                    record_streamed_index_retention_failure(
+                        source_path,
+                        "Content-routed index candidate changed after scanning.",
+                        reason="safetensors_index_changed_before_cleanup",
+                    )
+            if track_candidate:
+                normalized_source = normalized_stream_path(source_path)
+                candidate_receipt = (normalized_source, canonical_parent)
+                if (
+                    candidate_receipt in deleted_streamed_index_candidates
+                    or len(deleted_streamed_index_candidates) < MAX_SAFETENSORS_SHARD_INDEX_FILES
+                ):
+                    deleted_streamed_index_candidates.add(candidate_receipt)
+                else:
+                    deleted_streamed_index_tracking_incomplete = True
+            if parent_fd is not None:
+                os.unlink(tombstone_path.name, dir_fd=parent_fd)
+            else:
+                os.unlink(tombstone_path)
+            try:
+                if parent_fd is not None:
+                    os.stat(source_path.name, dir_fd=parent_fd, follow_symlinks=False)
+                else:
+                    os.lstat(Path(canonical_parent) / source_path.name)
+                source_recreated = True
+            except FileNotFoundError:
+                source_recreated = False
+            if source_recreated:
+                recreated_path = Path(canonical_parent) / source_path.name
+                error = OSError("SafeTensors index path was recreated during cleanup")
+                pending_delete_failures[recreated_path] = error
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index path was recreated during cleanup.",
+                    reason="safetensors_index_recreated_during_cleanup",
+                )
+            else:
+                deleted_streamed_sources.add(normalized_stream_path(source_path))
+            logger.debug("Deleted %s %s after identity-bound quarantine", source_path, context)
+        except Exception as error:
+            logger.warning("Failed to delete %s %s: %s", source_path, context, error)
+            pending_delete_failures[tombstone_path if moved_source and tombstone_path is not None else source_path] = (
+                error
+            )
+            record_streamed_index_retention_failure(
+                source_path,
+                "SafeTensors index cleanup could not bind and remove the selected generation.",
+                reason="safetensors_index_cleanup_failed",
+            )
+        finally:
+            if tombstone_fd is not None:
+                os.close(tombstone_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
+            if not moved_source and tombstone_path is not None:
+                with suppress(OSError):
+                    os.unlink(tombstone_path)
+
+    def delete_streamed_source(
+        source_path: Path,
+        context: str,
+        *,
+        defer_safetensors_index: bool = True,
+        track_safetensors_index_candidate: bool = True,
+        structural_index_classification: bool | None = None,
+        structural_index_identity: _FileIdentitySnapshot | None = None,
+        expected_content_hash: str | None = None,
+        structural_index_classification_complete: bool = False,
+        quarantine_proven_non_index: bool = False,
+        require_content_hash: bool = False,
+    ) -> None:
+        nonlocal deferred_streamed_index_bytes
+
+        is_index_suffix = source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
+        if not (source_path.exists() or source_path.is_symlink()):
+            if is_index_suffix and structural_index_classification_complete:
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index candidate disappeared before cleanup.",
+                    reason="safetensors_index_disappeared_before_cleanup",
+                )
+            return
+        if not delete_after_scan and not is_index_suffix:
+            return
+        if defer_safetensors_index and is_index_suffix:
+            if not structural_index_classification_complete:
+                structural_index_classification, structural_index_identity = classify_structural_safetensors_index(
+                    source_path
+                )
+            should_retain_index = is_retained_authoritative_index(
+                source_path,
+                structural_index_classification,
+            ) or (not delete_after_scan and structural_index_classification is not False)
+        else:
+            should_retain_index = False
+        if should_retain_index:
+            retained_source_path = Path(canonical_stream_parent(source_path)) / source_path.name
+            source_identity = _snapshot_file_identity(retained_source_path)
+            if source_identity is None:
+                error = OSError("SafeTensors index could not be bound for deferred deletion")
+                pending_delete_failures[retained_source_path] = error
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index could not be bound for deferred deletion.",
+                    reason="safetensors_index_disappeared_before_retention",
+                )
+                return
+            if source_identity.stat is None or not stat.S_ISREG(source_identity.stat[2]):
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index candidate is not a regular file; terminal validation is incomplete.",
+                )
+                delete_streamed_source(
+                    source_path,
+                    context,
+                    defer_safetensors_index=False,
+                    track_safetensors_index_candidate=False,
+                )
+                return
+            source_size = _snapshot_file_size(source_identity)
+            existing_receipt = deferred_streamed_index_deletions.get(retained_source_path)
+            existing_identity = existing_receipt[0] if existing_receipt is not None else None
+            projected_retained_bytes = (
+                deferred_streamed_index_bytes + source_size
+                if existing_identity is None
+                else deferred_streamed_index_bytes - _snapshot_file_size(existing_identity) + source_size
+            )
+            if existing_identity != source_identity and (
+                (
+                    existing_identity is None
+                    and len(deferred_streamed_index_deletions) >= MAX_SAFETENSORS_SHARD_INDEX_FILES
+                )
+                or source_size > MAX_SAFETENSORS_SHARD_INDEX_BYTES
+                or projected_retained_bytes > MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES
+            ):
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index retention limit exceeded; terminal shard validation is incomplete.",
+                )
+                if existing_identity is not None:
+                    deferred_streamed_index_bytes -= _snapshot_file_size(existing_identity)
+                    deferred_streamed_index_deletions.pop(retained_source_path, None)
+                delete_streamed_source(
+                    retained_source_path,
+                    context,
+                    defer_safetensors_index=False,
+                    track_safetensors_index_candidate=False,
+                    structural_index_identity=source_identity,
+                )
+                return
+            retained_content_hash = expected_content_hash or compute_sha256_hash(retained_source_path)
+            if existing_identity is not None and existing_identity != source_identity:
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index changed while retained for terminal validation.",
+                    reason="safetensors_index_changed_while_retained",
+                )
+            existing_content_hash = existing_receipt[1] if existing_receipt is not None else None
+            if existing_content_hash is not None and existing_content_hash != retained_content_hash:
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index content changed while retained for terminal validation.",
+                    reason="safetensors_index_changed_while_retained",
+                )
+            if existing_identity != source_identity or existing_content_hash != retained_content_hash:
+                deferred_streamed_index_bytes = projected_retained_bytes
+                deferred_streamed_index_deletions[retained_source_path] = (
+                    source_identity,
+                    retained_content_hash,
+                    delete_after_scan,
+                )
+            return
+        if not delete_after_scan:
+            return
+        if is_index_suffix:
+            delete_streamed_index_candidate(
+                source_path,
+                context,
+                track_candidate=track_safetensors_index_candidate,
+                expected_identity=structural_index_identity,
+                expected_content_hash=expected_content_hash,
+                require_proven_non_index=quarantine_proven_non_index,
+                require_content_hash=require_content_hash or quarantine_proven_non_index,
+            )
             return
         try:
             source_path.unlink()
-            deleted_streamed_sources.add(os.path.normcase(os.path.normpath(os.path.abspath(source_path))))
+            normalized_source = normalized_stream_path(source_path)
+            deleted_streamed_sources.add(normalized_source)
             logger.debug(f"Deleted {source_path} {context}")
         except Exception as e:
             logger.warning(f"Failed to delete {source_path} {context}: {e}")
             pending_delete_failures[source_path] = e
+
+    def delete_deferred_streamed_indexes(context: str) -> None:
+        """Delete only the exact index generations retained through terminal validation."""
+        nonlocal streamed_index_cleanup_verification_bytes
+
+        for source_path, (expected_identity, expected_content_hash, should_delete) in tuple(
+            deferred_streamed_index_deletions.items()
+        ):
+            current_identity = _snapshot_file_identity(source_path)
+            if current_identity != expected_identity:
+                error = OSError("SafeTensors index changed before deferred deletion")
+                if should_delete:
+                    pending_delete_failures[source_path] = error
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index changed before terminal verification; validation is incomplete.",
+                    reason="safetensors_index_changed_before_deferred_deletion",
+                )
+                continue
+            if not should_delete:
+                source_size = _snapshot_file_size(current_identity)
+                if (
+                    source_size > MAX_SAFETENSORS_SHARD_INDEX_BYTES
+                    or streamed_index_cleanup_verification_bytes + source_size > MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES
+                ):
+                    record_streamed_index_retention_failure(
+                        source_path,
+                        "SafeTensors index terminal verification limit exceeded.",
+                    )
+                    continue
+                streamed_index_cleanup_verification_bytes += source_size
+                try:
+                    current_content_hash = compute_sha256_hash(source_path)
+                    content_identity = _snapshot_file_identity(source_path)
+                except OSError:
+                    current_content_hash = None
+                    content_identity = None
+                if current_content_hash != expected_content_hash or content_identity != current_identity:
+                    record_streamed_index_retention_failure(
+                        source_path,
+                        "SafeTensors index content changed before terminal verification.",
+                        reason="safetensors_index_changed_before_deferred_deletion",
+                    )
+                continue
+            delete_streamed_source(
+                source_path,
+                context,
+                defer_safetensors_index=False,
+                track_safetensors_index_candidate=False,
+                structural_index_identity=expected_identity,
+                expected_content_hash=expected_content_hash,
+                require_content_hash=True,
+            )
+        deferred_streamed_index_deletions.clear()
 
     def adjusted_streamed_bytes(bytes_scanned: object, source_bytes_preaccounted: int) -> int:
         """Return an item's new byte contribution after exact-once source accounting."""
@@ -7836,6 +8362,33 @@ def scan_model_streaming(
                 },
             )
         )
+
+    def close_streaming_generator() -> None:
+        """Close source-owned resources before terminal authority validation."""
+        nonlocal stream_generator_closed
+
+        if stream_generator_closed:
+            return
+        stream_generator_closed = True
+        close_generator = getattr(file_generator, "close", None)
+        if not callable(close_generator):
+            return
+        try:
+            close_generator()
+        except Exception as e:
+            logger.warning(f"Failed to close streaming file generator: {e}")
+            results.has_errors = True
+            results.success = False
+            _add_issue_to_model(
+                results,
+                f"Failed to close streaming file generator: {e}",
+                severity=IssueSeverity.INFO.value,
+                details={
+                    "analysis_incomplete": True,
+                    "operational_error": True,
+                    "exception_type": type(e).__name__,
+                },
+            )
 
     def record_openvino_companion_stability_failure(
         xml_path: Path,
@@ -7975,6 +8528,9 @@ def scan_model_streaming(
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     configured_index_search_root = _shard_index_search_root_from_config(scan_kwargs)
     stream_index_search_root = configured_index_search_root or (str(base_dir) if base_dir is not None else None)
+    canonical_stream_index_search_root = (
+        canonical_stream_directory(stream_index_search_root) if stream_index_search_root is not None else None
+    )
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
     scanner_selection_skip_extensions = (
@@ -8100,6 +8656,11 @@ def scan_model_streaming(
             openvino_sidecar_needs_independent_scan = False
             independent_openvino_sidecar_result: ScanResult | None = None
             independent_openvino_sidecar_path: Path | None = None
+            file_hash: str | None = None
+            structural_index_classification: bool | None = None
+            structural_index_identity: _FileIdentitySnapshot | None = None
+            structural_index_classification_complete = False
+            content_routed_safetensors_index_payload = False
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -8305,6 +8866,15 @@ def scan_model_streaming(
                     **scan_kwargs,
                 }
                 safetensors_shard_match = ShardedModelDetector.match_safetensors_shard_filename(source_path.name)
+                if safetensors_shard_match is not None:
+                    shard_parent = canonical_stream_parent(source_path)
+                    if (
+                        shard_parent in observed_streamed_safetensors_shard_parents
+                        or len(observed_streamed_safetensors_shard_parents) < MAX_SAFETENSORS_SHARD_INDEX_DIRECTORIES
+                    ):
+                        observed_streamed_safetensors_shard_parents.add(shard_parent)
+                    else:
+                        streamed_safetensors_scope_tracking_incomplete = True
                 source_safetensors_shard_info = (
                     ShardedModelDetector.detect_shards(
                         str(source_path),
@@ -8313,6 +8883,17 @@ def scan_model_streaming(
                     if safetensors_shard_match is not None
                     else None
                 )
+                if safetensors_shard_match is not None and (
+                    deleted_streamed_index_tracking_incomplete
+                    or any(
+                        index_parent_can_govern_stream_parent(deleted_parent, shard_parent)
+                        for _deleted_path, deleted_parent in deleted_streamed_index_candidates
+                    )
+                ):
+                    record_terminal_shard_boundary_failure(
+                        str(source_path),
+                        "safetensors_index_deleted_before_shard_validation",
+                    )
                 is_single_safetensors_stream = bool(
                     safetensors_shard_match is not None and safetensors_shard_match.get("expected_total_shards") == 1
                 )
@@ -8352,6 +8933,8 @@ def scan_model_streaming(
                     and not isinstance(source_safetensors_shard_info.get("safetensors_index_generation"), bool)
                     else None
                 )
+                if authoritative_shard_index_path is not None:
+                    scan_config[_DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY] = True
                 scan_repository_inventory_context = streaming_repository_inventory_context()
                 if scan_repository_inventory_context.files:
                     scan_config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = scan_repository_inventory_context
@@ -8546,6 +9129,16 @@ def scan_model_streaming(
                 scan_result = scan_file(
                     str(scan_path),
                     config=scan_config,
+                )
+                if source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX):
+                    structural_index_classification, structural_index_identity = classify_structural_safetensors_index(
+                        source_path
+                    )
+                    structural_index_classification_complete = True
+                content_routed_safetensors_index_payload = bool(
+                    source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
+                    and scan_result.scanner_name not in {None, "metadata", "safetensors", "scanner_selection"}
+                    and structural_index_classification is False
                 )
                 if pinned_scan_context is not None:
                     _rebase_pinned_shard_result(scan_result, str(scan_path), report_path)
@@ -8772,18 +9365,32 @@ def scan_model_streaming(
                     pinned_scan_context.__exit__(None, None, None)
                 # Delete file after scanning if requested
                 if not preserve_source_after_scan:
-                    delete_streamed_source(source_path, "after scanning")
+                    delete_streamed_source(
+                        source_path,
+                        "after scanning",
+                        defer_safetensors_index=not content_routed_safetensors_index_payload,
+                        track_safetensors_index_candidate=not content_routed_safetensors_index_payload,
+                        structural_index_classification=structural_index_classification,
+                        structural_index_identity=structural_index_identity,
+                        expected_content_hash=file_hash,
+                        structural_index_classification_complete=structural_index_classification_complete,
+                        quarantine_proven_non_index=content_routed_safetensors_index_payload,
+                    )
                 if openvino_scan_companion_path is not None and openvino_scan_companion_key is not None:
                     delete_streamed_source(openvino_scan_companion_path, "after OpenVINO XML scan")
                     consumed_openvino_companions.add(openvino_scan_companion_key)
                     deferred_openvino_sidecars.pop(openvino_scan_companion_key, None)
                     preserved_openvino_companion_snapshots.pop(openvino_scan_companion_key, None)
 
+        # Source-owned cleanup may mutate retained artifacts. Run it before the
+        # final authority proof and leave the outer finally as an exception fallback.
+        close_streaming_generator()
+
         for guard_fd, guarded_source, guarded_target in stream_windows_shard_guards:
             if not _windows_shard_guard_is_stable(guard_fd, guarded_target):
                 record_terminal_shard_boundary_failure(guarded_source, "shard_target_changed_after_scan")
 
-        def revalidate_terminal_streamed_shards() -> None:
+        def revalidate_terminal_streamed_shards(*, force_content_revalidation: bool) -> None:
             search_root = stream_index_search_root
             if search_root is None and validated_shard_targets:
                 first_source = next(iter(validated_shard_targets))
@@ -8795,18 +9402,22 @@ def scan_model_streaming(
                 index_search_root=search_root,
                 index_inspection_context=index_inspection_context,
                 deleted_paths=deleted_streamed_sources,
+                force_content_revalidation=force_content_revalidation,
             )
             for source_path, reason in failures.items():
                 record_terminal_shard_boundary_failure(source_path, reason)
 
+        # Promote a complete late index proof before reconciliation consumes
+        # the family metadata, then revalidate once more to close the final
+        # proof-to-reconciliation swap window.
+        revalidate_terminal_streamed_shards(force_content_revalidation=False)
         _reconcile_cross_directory_shard_coverage(
             results,
             validated_shard_targets,
             missing_shard_errors_only=not preserve_shard_reconciliation_errors,
         )
-        # Reconciliation consumes the stored family proof. Validate it once,
-        # immediately afterward, so a final swap cannot certify unscanned bytes.
-        revalidate_terminal_streamed_shards()
+        revalidate_terminal_streamed_shards(force_content_revalidation=True)
+        delete_deferred_streamed_indexes("after terminal SafeTensors authority validation")
 
         # Compute aggregate hash from all file hashes
         if file_hashes and aggregate_hash_complete:
@@ -8822,26 +9433,10 @@ def scan_model_streaming(
         results.has_errors = True
         raise
     finally:
+        close_streaming_generator()
+        delete_deferred_streamed_indexes("during streaming cleanup")
         _close_windows_shard_guards(stream_windows_shard_guards)
         _deactivate_safetensors_index_inspection_context(index_context_token)
-        close_generator = getattr(file_generator, "close", None)
-        if callable(close_generator):
-            try:
-                close_generator()
-            except Exception as e:
-                logger.warning(f"Failed to close streaming file generator: {e}")
-                results.has_errors = True
-                results.success = False
-                _add_issue_to_model(
-                    results,
-                    f"Failed to close streaming file generator: {e}",
-                    severity=IssueSeverity.INFO.value,
-                    details={
-                        "analysis_incomplete": True,
-                        "operational_error": True,
-                        "exception_type": type(e).__name__,
-                    },
-                )
         for source_path, delete_error in pending_delete_failures.items():
             if not (source_path.exists() or source_path.is_symlink()):
                 continue

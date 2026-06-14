@@ -674,7 +674,7 @@ class TestShardedModelDetector:
         monkeypatch.setattr(
             ShardedModelDetector,
             "_safetensors_index_candidates",
-            staticmethod(lambda _directory: ([partial], True)),
+            staticmethod(lambda _directory, _context=None: ([partial], True)),
         )
 
         shard_info = ShardedModelDetector.detect_shards(str(shard))
@@ -746,7 +746,7 @@ class TestShardedModelDetector:
         monkeypatch.setattr(
             ShardedModelDetector,
             "_safetensors_index_candidates",
-            staticmethod(lambda _directory: next(responses)),
+            staticmethod(lambda _directory, _context=None: next(responses)),
         )
         context = _SafetensorsIndexInspectionContext()
 
@@ -1086,6 +1086,234 @@ class TestShardedModelDetector:
         assert shard_info["unvalidated_shards"] == [str(index_path)]
         assert result.success is False
         assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        "raw_target",
+        [
+            "C:/outside/model-00001-of-00002.safetensors",
+            "D:../outside/model-00001-of-00002.safetensors",
+            "inside/model-00001-of-00002.safetensors:alternate",
+        ],
+        ids=["drive-absolute", "drive-relative", "alternate-data-stream"],
+    )
+    def test_detect_safetensors_windows_drive_target_fails_closed(
+        self,
+        tmp_path: Path,
+        raw_target: str,
+    ) -> None:
+        """Drive-qualified and alternate-stream targets are unsafe on every platform."""
+        shard = tmp_path / "model-00001-of-00002.safetensors"
+        shard.write_bytes(b"one")
+        index_path = tmp_path / "model.safetensors.index.json"
+        index_path.write_text(
+            json.dumps({"weight_map": {"unsafe": raw_target}}),
+            encoding="utf-8",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(shard),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "unsafe safetensors index target path"
+        assert shard_info["unvalidated_shards"] == [str(index_path)]
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_directory_entry_limit_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-index entries count toward bounded index-directory inspection work."""
+        shard = tmp_path / "model-00001-of-00002.safetensors"
+        shard.write_bytes(b"one")
+        (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+        (tmp_path / "b.txt").write_text("b", encoding="utf-8")
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers.MAX_SAFETENSORS_SHARD_INDEX_DIRECTORY_ENTRIES",
+            2,
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(shard),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "safetensors index directory enumeration incomplete"
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_safetensors_index_context_enforces_aggregate_directory_entry_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated directory work shares one fail-closed scan-wide entry budget."""
+        shard = tmp_path / "model-00001-of-00001.safetensors"
+        shard.write_bytes(b"one")
+        _write_safetensors_index(tmp_path, [shard.name])
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers.MAX_SAFETENSORS_SHARD_INDEX_TOTAL_DIRECTORY_ENTRIES",
+            1,
+        )
+        context = _SafetensorsIndexInspectionContext()
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shard),
+            index_inspection_context=context,
+        )
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == ("safetensors index aggregate directory entry limit exceeded")
+        assert context.failure == "safetensors index aggregate directory entry limit exceeded"
+        assert context.directory_entries_inspected == 1
+
+    def test_safetensors_index_context_charges_repeated_directory_listings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated shard proofs remain inside one aggregate physical-entry budget."""
+        shards = [tmp_path / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        for shard in shards:
+            shard.write_bytes(shard.name.encode())
+        _write_safetensors_index(tmp_path, [shard.name for shard in shards])
+        original_candidates = ShardedModelDetector._safetensors_index_candidates
+        enumeration_count = 0
+
+        def counting_candidates(
+            directory: Path,
+            inspection_context: _SafetensorsIndexInspectionContext | None = None,
+        ) -> tuple[list[Path], bool]:
+            nonlocal enumeration_count
+            enumeration_count += 1
+            return original_candidates(directory, inspection_context)
+
+        monkeypatch.setattr(
+            ShardedModelDetector,
+            "_safetensors_index_candidates",
+            staticmethod(counting_candidates),
+        )
+        context = _SafetensorsIndexInspectionContext()
+
+        first = ShardedModelDetector.detect_shards(
+            str(shards[0]),
+            index_inspection_context=context,
+        )
+        second = ShardedModelDetector.detect_shards(
+            str(shards[1]),
+            index_inspection_context=context,
+        )
+
+        assert first is not None and first.get("safetensors_index_error") is None
+        assert second is not None and second.get("safetensors_index_error") is None
+        assert enumeration_count == 4
+        assert context.directory_entries_inspected == 12
+
+    def test_safetensors_index_context_bounds_unrelated_directory_churn(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unrelated directory churn is re-enumerated and charged without hiding authority."""
+        shard = tmp_path / "model-00001-of-00001.safetensors"
+        shard.write_bytes(b"one")
+        _write_safetensors_index(tmp_path, [shard.name])
+        original_candidates = ShardedModelDetector._safetensors_index_candidates
+        enumeration_count = 0
+
+        def counting_candidates(
+            directory: Path,
+            inspection_context: _SafetensorsIndexInspectionContext | None = None,
+        ) -> tuple[list[Path], bool]:
+            nonlocal enumeration_count
+            enumeration_count += 1
+            return original_candidates(directory, inspection_context)
+
+        monkeypatch.setattr(
+            ShardedModelDetector,
+            "_safetensors_index_candidates",
+            staticmethod(counting_candidates),
+        )
+        context = _SafetensorsIndexInspectionContext()
+        initial = ShardedModelDetector.detect_shards(str(shard), index_inspection_context=context)
+        (tmp_path / "irrelevant.txt").write_text("changed", encoding="utf-8")
+
+        current = ShardedModelDetector.detect_shards(str(shard), index_inspection_context=context)
+
+        assert initial is not None and initial.get("safetensors_index_error") is None
+        assert current is not None and current.get("safetensors_index_error") is None
+        assert context.failure is None
+        assert enumeration_count == 4
+        assert context.directory_entries_inspected == 10
+
+    @pytest.mark.parametrize(
+        ("mutation", "expected_error", "expected_context_failure"),
+        [
+            (
+                "add-competing",
+                "safetensors index directory enumeration incomplete",
+                "safetensors index directory enumeration incomplete",
+            ),
+            ("replace", "safetensors index changed during inspection", None),
+        ],
+    )
+    def test_safetensors_candidate_listing_rejects_post_read_mutation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mutation: str,
+        expected_error: str,
+        expected_context_failure: str | None,
+    ) -> None:
+        """Candidate names and bytes remain stable through inventory consumption."""
+        shard = tmp_path / "model-00001-of-00001.safetensors"
+        shard.write_bytes(b"one")
+        index_path = _write_safetensors_index(tmp_path, [shard.name])
+        context = _SafetensorsIndexInspectionContext()
+        initial = ShardedModelDetector.detect_shards(str(shard), index_inspection_context=context)
+        assert initial is not None and initial.get("safetensors_index_error") is None
+
+        original_read_inventory = ShardedModelDetector._read_safetensors_index_inventory
+        mutated = False
+
+        def mutate_during_inventory_read(*args: Any, **kwargs: Any) -> Any:
+            nonlocal mutated
+            result = original_read_inventory(*args, **kwargs)
+            if not mutated:
+                mutated = True
+                replacement_path = (
+                    tmp_path / "alternate.safetensors.index.json" if mutation == "add-competing" else index_path
+                )
+                replacement_path.write_text(
+                    json.dumps({"weight_map": {"replacement": shard.name}}),
+                    encoding="utf-8",
+                )
+            return result
+
+        monkeypatch.setattr(
+            ShardedModelDetector,
+            "_read_safetensors_index_inventory",
+            staticmethod(mutate_during_inventory_read),
+        )
+
+        current = ShardedModelDetector.detect_shards(
+            str(shard),
+            index_inspection_context=context,
+            force_index_content_revalidation=True,
+        )
+
+        assert mutated is True
+        assert current is not None
+        assert current["safetensors_index_error"] == expected_error
+        assert context.failure == expected_context_failure
 
     def test_detect_safetensors_unparseable_ancestor_index_fails_closed(self, tmp_path: Path) -> None:
         """An ancestor whose target scope was not parsed cannot be assumed unrelated."""

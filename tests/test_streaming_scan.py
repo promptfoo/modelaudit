@@ -1315,6 +1315,58 @@ def test_scan_model_streaming_zero_based_family_uses_validated_index(tmp_path: P
     )
 
 
+@pytest.mark.parametrize("start_index", [0, 1], ids=["zero-based", "one-based"])
+@pytest.mark.parametrize("delete_after_scan", [False, True], ids=["preserve-source", "delete-source"])
+def test_scan_model_streaming_accepts_late_cross_directory_index(
+    tmp_path: Path,
+    start_index: int,
+    delete_after_scan: bool,
+) -> None:
+    """One late proof coalesces exact members observed under different parents."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shards: list[Path] = []
+    for offset, shard_index in enumerate(range(start_index, start_index + 2)):
+        shard = tmp_path / f"part-{offset}" / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard.parent.mkdir()
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        shards.append(shard)
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def late_index_stream() -> Iterator[tuple[Path, bool]]:
+        yield shards[0], False
+        yield shards[1], False
+        index_path.write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        f"tensor-{index}": shard.relative_to(tmp_path).as_posix() for index, shard in enumerate(shards)
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        yield index_path, True
+
+    result = scan_model_streaming(
+        file_generator=late_index_stream(),
+        timeout=30,
+        delete_after_scan=delete_after_scan,
+        scan_root=str(tmp_path),
+        shard_family_group="trusted-stream:model-a",
+        _trusted_shard_family_root=_make_trusted_stream_shard_root(str(tmp_path)),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not any(
+        check.details.get("scan_outcome_reason") in {"missing_model_shards", "unexpected_model_shards"}
+        for check in result.checks
+    )
+    assert index_path.exists() is (not delete_after_scan)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows retained shard guard prevents the fixture rewrite")
 def test_scan_model_streaming_revalidates_preserved_family_members_before_reconciliation(tmp_path: Path) -> None:
     """A previously scanned shard replaced between streamed items cannot certify the final family."""
@@ -1703,6 +1755,119 @@ def test_scan_model_streaming_rechecks_unindexed_authority_after_final_yield(
     )
 
 
+@pytest.mark.parametrize("delete_after_scan", [False, True], ids=["preserve-source", "delete-source"])
+def test_scan_model_streaming_accepts_late_consistent_index(
+    tmp_path: Path,
+    delete_after_scan: bool,
+) -> None:
+    """A complete index arriving after its shard is accepted when it declares the same family."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def late_index_stream() -> Iterator[tuple[Path, bool]]:
+        yield shard, False
+        index_path.write_text(
+            json.dumps({"weight_map": {"tensor": shard.name}}),
+            encoding="utf-8",
+        )
+        yield index_path, True
+
+    result = scan_model_streaming(
+        file_generator=late_index_stream(),
+        timeout=30,
+        delete_after_scan=delete_after_scan,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+    assert index_path.exists() is (not delete_after_scan)
+
+
+@pytest.mark.parametrize("delete_after_scan", [False, True], ids=["preserve-source", "delete-source"])
+def test_scan_model_streaming_accepts_late_consistent_zero_based_index(
+    tmp_path: Path,
+    delete_after_scan: bool,
+) -> None:
+    """A complete late index promotes zero-based authority before reconciliation."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shards = [tmp_path / f"model-{index:05d}-of-00002.safetensors" for index in range(2)]
+    for shard in shards:
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def late_index_stream() -> Iterator[tuple[Path, bool]]:
+        yield shards[0], False
+        yield shards[1], False
+        index_path.write_text(
+            json.dumps({"weight_map": {f"tensor-{index}": shard.name for index, shard in enumerate(shards)}}),
+            encoding="utf-8",
+        )
+        yield index_path, True
+
+    result = scan_model_streaming(
+        file_generator=late_index_stream(),
+        timeout=30,
+        delete_after_scan=delete_after_scan,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not any(
+        check.details.get("scan_outcome_reason") in {"missing_model_shards", "unexpected_model_shards"}
+        for check in result.checks
+    )
+    assert index_path.exists() is (not delete_after_scan)
+
+
+def test_scan_model_streaming_closes_generator_before_terminal_index_validation(tmp_path: Path) -> None:
+    """Generator cleanup cannot recreate contradictory authority after terminal checks."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(json.dumps({"weight_map": {"tensor": shard.name}}), encoding="utf-8")
+
+    class RecreatingIndexIterator(Iterator[tuple[Path, bool]]):
+        def __init__(self) -> None:
+            self.items = iter([(index_path, False), (shard, True)])
+            self.closed = False
+
+        def __next__(self) -> tuple[Path, bool]:
+            return next(self.items)
+
+        def close(self) -> None:
+            self.closed = True
+            index_path.write_text(
+                json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+                encoding="utf-8",
+            )
+
+    stream = RecreatingIndexIterator()
+    result = scan_model_streaming(
+        file_generator=stream,
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert stream.closed is True
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
 @pytest.mark.parametrize("recreate_index", [False, True], ids=["remains-deleted", "recreated-unrelated"])
 def test_scan_model_streaming_revalidates_program_deleted_index(
     tmp_path: Path,
@@ -1750,6 +1915,985 @@ def test_scan_model_streaming_revalidates_program_deleted_index(
     assert (
         any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
         is recreate_index
+    )
+
+
+def test_scan_model_streaming_rejects_swapped_index_before_program_deletion(tmp_path: Path) -> None:
+    """Deleting a replacement index cannot make stale shard authority look stable."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00000-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps({"weight_map": {"initial": shard.name}}),
+        encoding="utf-8",
+    )
+
+    def shard_stream() -> Iterator[tuple[Path, bool]]:
+        yield shard, False
+        index_path.write_text(
+            json.dumps({"weight_map": {"replacement": shard.name}}),
+            encoding="utf-8",
+        )
+        yield index_path, True
+
+    result = scan_model_streaming(
+        file_generator=shard_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert not index_path.exists()
+    assert any(
+        check.name == "Sharded Model Boundary Check"
+        and check.location == str(shard)
+        and check.details.get("reason") == "shard_index_changed_after_scan"
+        and check.details.get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in result.checks
+    )
+
+
+def test_scan_model_streaming_deletes_non_index_payload_with_index_suffix_immediately(tmp_path: Path) -> None:
+    """Content-routed payloads do not accumulate merely because their names resemble indexes."""
+    payloads = [tmp_path / f"evil-{index}.safetensors.index.json" for index in range(2)]
+    for payload in payloads:
+        payload.write_bytes(b"not a SafeTensors index")
+    first_deleted_before_second_yield = False
+
+    def payload_stream() -> Iterator[tuple[Path, bool]]:
+        nonlocal first_deleted_before_second_yield
+        yield payloads[0], False
+        first_deleted_before_second_yield = not payloads[0].exists()
+        yield payloads[1], True
+
+    result = scan_model_streaming(
+        file_generator=payload_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata"],
+    )
+
+    assert result.success is True
+    assert first_deleted_before_second_yield is True
+    assert not any(payload.exists() for payload in payloads)
+
+
+def test_scan_model_streaming_deletes_content_routed_index_suffix_beside_unrelated_shard(tmp_path: Path) -> None:
+    """A shard-shaped neighbor cannot retain positively content-routed model payloads."""
+    payload = create_external_onnx_payload(tmp_path)
+    payloads = [tmp_path / f"evil-{index}.safetensors.index.json" for index in range(2)]
+    for payload_path in payloads:
+        payload_path.write_bytes(payload)
+    (tmp_path / "unrelated-00001-of-00001.safetensors").write_bytes(b"unrelated")
+    first_deleted_before_second_yield = False
+
+    def payload_stream() -> Iterator[tuple[Path, bool]]:
+        nonlocal first_deleted_before_second_yield
+        yield payloads[0], False
+        first_deleted_before_second_yield = not payloads[0].exists()
+        yield payloads[1], True
+
+    scan_model_streaming(
+        file_generator=payload_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["onnx"],
+    )
+
+    assert first_deleted_before_second_yield is True
+    assert not any(payload_path.exists() for payload_path in payloads)
+
+
+@pytest.mark.parametrize("mutation", ["replacement", "same-inode-rewrite"])
+def test_scan_model_streaming_rejects_index_swap_at_content_routed_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Atomic quarantine cannot erase an index swapped in after content classification."""
+    import modelaudit.core as core_module
+
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    graph = helper.make_graph(
+        [helper.make_node("Relu", ["input"], ["output"])],
+        "cleanup_swap_graph" * 64,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
+    )
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_bytes(helper.make_model(graph).SerializeToString())
+    replacement = tmp_path / "replacement-index.json"
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    original_rename = core_module.os.rename
+    original_replace = core_module.os.replace
+    swapped = False
+
+    def install_replacement() -> None:
+        nonlocal swapped
+        if not swapped:
+            if mutation == "replacement":
+                replacement.write_text(
+                    json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+                    encoding="utf-8",
+                )
+                original_replace(replacement, index_path)
+            else:
+                original_stat = index_path.stat()
+                malicious_pickle = pickle.dumps(_StreamingMaliciousPicklePayload())
+                assert len(malicious_pickle) <= original_stat.st_size
+                index_path.write_bytes(malicious_pickle.ljust(original_stat.st_size, b"\0"))
+                os.utime(index_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            swapped = True
+
+    def swap_before_bound_rename(*args: Any, **kwargs: Any) -> None:
+        source_name = os.fspath(args[0]) if args else ""
+        if source_name == index_path.name:
+            install_replacement()
+        original_rename(*args, **kwargs)
+
+    def swap_before_fallback_replace(*args: Any, **kwargs: Any) -> None:
+        source_path = Path(args[0]) if args else Path()
+        if source_path == index_path:
+            install_replacement()
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(core_module.os, "rename", swap_before_bound_rename)
+    monkeypatch.setattr(core_module.os, "replace", swap_before_fallback_replace)
+
+    def payload_then_shard() -> Iterator[tuple[Path, bool]]:
+        yield index_path, False
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        yield shard, True
+
+    result = scan_model_streaming(
+        file_generator=payload_then_shard(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["onnx", "safetensors"],
+    )
+
+    assert swapped is True
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_changed_before_cleanup"
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_tracks_present_invalid_weight_map_before_shard(tmp_path: Path) -> None:
+    """A present malformed weight_map is not proven unrelated content."""
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "version": [1, 7, 4],
+                "learner": {"gradient_booster": {}},
+                "weight_map": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def payload_then_shard() -> Iterator[tuple[Path, bool]]:
+        yield index_path, False
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        yield shard, True
+
+    result = scan_model_streaming(
+        file_generator=payload_then_shard(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(
+        check.details.get("reason") == "safetensors_index_deleted_before_shard_validation" for check in result.checks
+    )
+
+
+def test_scan_model_streaming_bounds_structural_index_probe_after_growth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Index classification cannot allocate bytes added after its size snapshot."""
+    import modelaudit.core as core_module
+
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps({"weight_map": {"tensor": "model-00001-of-00001.safetensors"}}),
+        encoding="utf-8",
+    )
+    initial_size = index_path.stat().st_size
+    original_scan_file = core_module.scan_file
+    original_os_read = os.read
+    classification_armed = False
+    grew = False
+    read_sizes: list[int] = []
+
+    def arm_after_scan(*args: Any, **kwargs: Any) -> ScanResult:
+        nonlocal classification_armed
+        result = original_scan_file(*args, **kwargs)
+        classification_armed = True
+        return result
+
+    def grow_before_classification_read(file_descriptor: int, size: int) -> bytes:
+        nonlocal grew
+        if classification_armed and not grew:
+            with index_path.open("ab") as handle:
+                handle.write(b"x" * (1024 * 1024))
+            grew = True
+            read_sizes.append(size)
+        return original_os_read(file_descriptor, size)
+
+    monkeypatch.setattr(core_module, "scan_file", arm_after_scan)
+    monkeypatch.setattr(core_module.os, "read", grow_before_classification_read)
+
+    scan_model_streaming(
+        file_generator=iter([(index_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata"],
+    )
+
+    assert grew is True
+    assert read_sizes == [initial_size + 1]
+    assert not index_path.exists()
+
+
+def test_scan_model_streaming_index_retention_overflow_is_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful cleanup cannot erase an index-retention resource failure."""
+    from modelaudit import core as core_module
+
+    monkeypatch.setattr(core_module, "MAX_SAFETENSORS_SHARD_INDEX_FILES", 1)
+    indexes = [tmp_path / f"model-{index}.safetensors.index.json" for index in range(2)]
+    for index_path in indexes:
+        index_path.write_text(
+            json.dumps({"weight_map": {"tensor": "model-00001-of-00001.safetensors"}}),
+            encoding="utf-8",
+        )
+
+    result = scan_model_streaming(
+        file_generator=iter((path, index == len(indexes) - 1) for index, path in enumerate(indexes)),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata"],
+    )
+
+    assert not any(path.exists() for path in indexes)
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_retention_limit_exceeded"
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_rejects_index_disappearing_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A classified index disappearing before cleanup remains a durable failure."""
+    import modelaudit.utils.helpers.assets as assets_module
+
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+        encoding="utf-8",
+    )
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    original_asset_from_scan_result = assets_module.asset_from_scan_result
+    removed = False
+
+    def remove_after_classification(*args: Any, **kwargs: Any) -> Any:
+        nonlocal removed
+        asset = original_asset_from_scan_result(*args, **kwargs)
+        if Path(str(args[0])) == index_path and index_path.exists():
+            index_path.unlink()
+            removed = True
+        return asset
+
+    def stream() -> Iterator[tuple[Path, bool]]:
+        yield index_path, False
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        yield shard, True
+
+    monkeypatch.setattr(assets_module, "asset_from_scan_result", remove_after_classification)
+    result = scan_model_streaming(
+        file_generator=stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata", "safetensors"],
+    )
+
+    assert removed is True
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_disappeared_before_cleanup"
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_rejects_index_disappearing_while_binding_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure to bind the classified index generation cannot become a clean scan."""
+    import modelaudit.core as core_module
+
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+        encoding="utf-8",
+    )
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    original_snapshot = core_module._snapshot_file_identity
+    index_snapshot_calls = 0
+    removed = False
+
+    def remove_on_retention_bind(path: Path) -> Any:
+        nonlocal index_snapshot_calls, removed
+        if Path(path) == index_path:
+            index_snapshot_calls += 1
+            if index_snapshot_calls == 4:
+                index_path.unlink()
+                removed = True
+        return original_snapshot(path)
+
+    def stream() -> Iterator[tuple[Path, bool]]:
+        yield index_path, False
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        yield shard, True
+
+    monkeypatch.setattr(core_module, "_snapshot_file_identity", remove_on_retention_bind)
+    result = scan_model_streaming(
+        file_generator=stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata", "safetensors"],
+    )
+
+    assert removed is True
+    assert index_snapshot_calls >= 4
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_disappeared_before_retention"
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_preserved_index_cannot_disappear_before_later_shard(tmp_path: Path) -> None:
+    """Preserved index authority remains bound until all streamed shards are reconciled."""
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+        encoding="utf-8",
+    )
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def stream() -> Iterator[tuple[Path, bool]]:
+        yield index_path, False
+        index_path.unlink()
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        yield shard, True
+
+    result = scan_model_streaming(
+        file_generator=stream(),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata", "safetensors"],
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_changed_before_deferred_deletion"
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_large_non_json_index_suffix_deletes_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded prefix can prove large non-JSON content is not index authority."""
+    from modelaudit import core as core_module
+
+    monkeypatch.setattr(core_module, "MAX_SAFETENSORS_SHARD_INDEX_BYTES", 8)
+    payload = tmp_path / "large.safetensors.index.json"
+    payload.write_bytes(b"X" * 32)
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata"],
+    )
+
+    assert not payload.exists()
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+
+
+def test_scan_model_streaming_indeterminate_index_probe_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe exhaustion cannot turn a later governing index into content-routed cleanup."""
+    from modelaudit import core as core_module
+
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    unrelated_index = tmp_path / "adapter.safetensors.index.json"
+    governing_index = tmp_path / "model.safetensors.index.json"
+    unrelated_payload = json.dumps({"weight_map": {"adapter": "adapter.safetensors"}})
+    governing_payload = json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}})
+    monkeypatch.setattr(
+        core_module,
+        "MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES",
+        len(unrelated_payload.encode()) + 1,
+    )
+
+    def delayed_indexes() -> Iterator[tuple[Path, bool]]:
+        yield shard, False
+        unrelated_index.write_text(unrelated_payload, encoding="utf-8")
+        yield unrelated_index, False
+        governing_index.write_text(governing_payload, encoding="utf-8")
+        yield governing_index, True
+
+    result = scan_model_streaming(
+        file_generator=delayed_indexes(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_retention_limit_exceeded"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(os.name == "nt" or not hasattr(os, "mkfifo"), reason="POSIX FIFO semantics required")
+def test_scan_model_streaming_index_suffix_fifo_fails_promptly(tmp_path: Path) -> None:
+    """Index classification never performs a blocking read from a special file."""
+    fifo_path = tmp_path / "fifo.safetensors.index.json"
+    os.mkfifo(fifo_path)
+    started = time.monotonic()
+
+    result = scan_model_streaming(
+        file_generator=iter([(fifo_path, True)]),
+        timeout=1,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata"],
+    )
+
+    assert time.monotonic() - started < 2
+    assert not fifo_path.exists()
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+
+
+@pytest.mark.parametrize("index_first", [False, True], ids=["shard-first", "index-first"])
+@pytest.mark.parametrize("delete_after_scan", [False, True], ids=["preserve-source", "delete-source"])
+def test_scan_model_streaming_retains_contradictory_index_through_terminal_validation(
+    tmp_path: Path,
+    index_first: bool,
+    delete_after_scan: bool,
+) -> None:
+    """Cleanup cannot erase an index that disproves the streamed shard family."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+        encoding="utf-8",
+    )
+    ordered_paths = [index_path, shard] if index_first else [shard, index_path]
+
+    result = scan_model_streaming(
+        file_generator=iter((path, index == len(ordered_paths) - 1) for index, path in enumerate(ordered_paths)),
+        timeout=30,
+        delete_after_scan=delete_after_scan,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert index_path.exists() is (not delete_after_scan)
+    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
+def test_scan_model_streaming_fails_if_deleted_index_suffix_precedes_created_shard(tmp_path: Path) -> None:
+    """A later shard cannot silently benefit from an already-cleaned index candidate."""
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_bytes(b"not a SafeTensors index")
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    index_deleted_before_shard = False
+
+    def delayed_shard_stream() -> Iterator[tuple[Path, bool]]:
+        nonlocal index_deleted_before_shard
+        yield index_path, False
+        index_deleted_before_shard = not index_path.exists()
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        yield shard, True
+
+    result = scan_model_streaming(
+        file_generator=delayed_shard_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert index_deleted_before_shard is True
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(
+        check.details.get("reason") == "safetensors_index_deleted_before_shard_validation"
+        and check.details.get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in result.checks
+    )
+
+
+def test_scan_model_streaming_tracks_deleted_index_scope_through_symlink(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Deleted index receipts and later shard scopes use the same resolved parent."""
+    real_root = tmp_path / "real"
+    alias_root = tmp_path / "alias"
+    real_root.mkdir()
+    alias_root.symlink_to(real_root, target_is_directory=True)
+    index_path = alias_root / "model.safetensors.index.json"
+    index_path.write_bytes(b"not a SafeTensors index")
+    shard = alias_root / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    index_deleted_before_shard = False
+
+    def delayed_shard_stream() -> Iterator[tuple[Path, bool]]:
+        nonlocal index_deleted_before_shard
+        yield index_path, False
+        index_deleted_before_shard = not index_path.exists()
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        yield shard, True
+
+    result = scan_model_streaming(
+        file_generator=delayed_shard_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(alias_root),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert index_deleted_before_shard is True
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(
+        check.details.get("reason") == "safetensors_index_deleted_before_shard_validation" for check in result.checks
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory descriptor semantics required")
+def test_scan_model_streaming_preserves_reused_symlink_parent_receipts(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Reusing one lexical path cannot overwrite an earlier physical scope receipt."""
+    roots = [tmp_path / name for name in ("a", "b")]
+    for root in roots:
+        root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(roots[0], target_is_directory=True)
+    index_path = alias / "model.safetensors.index.json"
+    shard = alias / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def reused_alias_stream() -> Iterator[tuple[Path, bool]]:
+        (roots[0] / index_path.name).write_bytes(b"not an index")
+        yield index_path, False
+        alias.unlink()
+        alias.symlink_to(roots[1], target_is_directory=True)
+        (roots[1] / index_path.name).write_bytes(b"still not an index")
+        yield index_path, False
+        alias.unlink()
+        alias.symlink_to(roots[0], target_is_directory=True)
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        yield shard, True
+
+    result = scan_model_streaming(
+        file_generator=reused_alias_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata", "safetensors"],
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(
+        check.details.get("reason") == "safetensors_index_deleted_before_shard_validation" for check in result.checks
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory descriptor semantics required")
+def test_scan_model_streaming_defers_same_lexical_index_in_distinct_symlink_parents(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Deferred cleanup is keyed by physical parent rather than a reused alias spelling."""
+    roots = [tmp_path / name for name in ("a", "b")]
+    for root in roots:
+        root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(roots[0], target_is_directory=True)
+    index_path = alias / "model.safetensors.index.json"
+    payload = json.dumps({"weight_map": {"tensor": "model-00001-of-00001.safetensors"}})
+
+    def reused_alias_stream() -> Iterator[tuple[Path, bool]]:
+        (roots[0] / index_path.name).write_text(payload, encoding="utf-8")
+        yield index_path, False
+        alias.unlink()
+        alias.symlink_to(roots[1], target_is_directory=True)
+        (roots[1] / index_path.name).write_text(payload, encoding="utf-8")
+        yield index_path, True
+        alias.unlink()
+        alias.symlink_to(roots[0], target_is_directory=True)
+
+    result = scan_model_streaming(
+        file_generator=reused_alias_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata"],
+    )
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not any((root / index_path.name).exists() for root in roots)
+
+
+def test_scan_model_streaming_retains_valid_index_symlink_before_shard(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Index-first cleanup supports a stable in-root symlinked authority."""
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_blob = tmp_path / "index-blob.json"
+    index_blob.write_text(
+        json.dumps({"weight_map": {"tensor": shard.name}}),
+        encoding="utf-8",
+    )
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.symlink_to(index_blob.name)
+
+    result = scan_model_streaming(
+        file_generator=iter([(index_path, False), (shard, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not index_path.exists()
+    assert index_blob.exists()
+
+
+def test_scan_model_streaming_retains_index_created_after_deleted_shard(tmp_path: Path) -> None:
+    """A later contradictory index remains available for terminal shard validation."""
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+    shard_deleted_before_index = False
+
+    def delayed_index_stream() -> Iterator[tuple[Path, bool]]:
+        nonlocal shard_deleted_before_index
+        yield shard, False
+        shard_deleted_before_index = not shard.exists()
+        index_path.write_text(
+            json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+            encoding="utf-8",
+        )
+        yield index_path, True
+
+    result = scan_model_streaming(
+        file_generator=delayed_index_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert shard_deleted_before_index is True
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert not index_path.exists()
+    assert any(
+        check.details.get("reason") == "shard_index_changed_after_scan"
+        and check.details.get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in result.checks
+    )
+
+
+def test_scan_model_streaming_rejects_retained_index_deleted_after_final_yield(tmp_path: Path) -> None:
+    """A retained authority disappearing before terminal cleanup is a durable failure."""
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def disappearing_index_stream() -> Iterator[tuple[Path, bool]]:
+        yield shard, False
+        index_path.write_text(
+            json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+            encoding="utf-8",
+        )
+        yield index_path, True
+        index_path.unlink()
+
+    result = scan_model_streaming(
+        file_generator=disappearing_index_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_changed_before_deferred_deletion"
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_rejects_retained_index_rewrite_at_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deferred cleanup verifies index bytes after an equal-size in-place rewrite."""
+    import modelaudit.core as core_module
+
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+    original_payload = json.dumps({"weight_map": {"tensor": shard.name}}, sort_keys=True)
+    replacement_payload = json.dumps(
+        {"weight_map": {"tensor": "model-00000-of-00001.safetensors"}},
+        sort_keys=True,
+    )
+    assert len(original_payload) == len(replacement_payload)
+    index_path.write_text(original_payload, encoding="utf-8")
+    original_stat = index_path.stat()
+    original_rename = core_module.os.rename
+    original_replace = core_module.os.replace
+    rewritten = False
+
+    def rewrite_index() -> None:
+        nonlocal rewritten
+        if not rewritten:
+            index_path.write_text(replacement_payload, encoding="utf-8")
+            os.utime(index_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            rewritten = True
+
+    def rewrite_before_bound_rename(*args: Any, **kwargs: Any) -> None:
+        if args and os.fspath(args[0]) == index_path.name:
+            rewrite_index()
+        original_rename(*args, **kwargs)
+
+    def rewrite_before_fallback_replace(*args: Any, **kwargs: Any) -> None:
+        if args and Path(args[0]) == index_path:
+            rewrite_index()
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(core_module.os, "rename", rewrite_before_bound_rename)
+    monkeypatch.setattr(core_module.os, "replace", rewrite_before_fallback_replace)
+
+    result = scan_model_streaming(
+        file_generator=iter([(index_path, False), (shard, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert rewritten is True
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_changed_before_cleanup"
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_rejects_index_recreated_during_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement appearing after tombstone deletion cannot restore clean authority."""
+    import modelaudit.core as core_module
+
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps({"weight_map": {"tensor": shard.name}}),
+        encoding="utf-8",
+    )
+    original_unlink = core_module.os.unlink
+    tombstone_unlinks = 0
+    recreated = False
+
+    def recreate_after_tombstone_unlink(*args: Any, **kwargs: Any) -> None:
+        nonlocal recreated, tombstone_unlinks
+        target_name = Path(os.fspath(args[0])).name if args else ""
+        original_unlink(*args, **kwargs)
+        if target_name.startswith(".modelaudit-index-delete-"):
+            tombstone_unlinks += 1
+            final_unlink_count = 1 if os.name == "nt" else 2
+            if tombstone_unlinks == final_unlink_count:
+                index_path.write_text(
+                    json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+                    encoding="utf-8",
+                )
+                recreated = True
+
+    monkeypatch.setattr(core_module.os, "unlink", recreate_after_tombstone_unlink)
+
+    result = scan_model_streaming(
+        file_generator=iter([(index_path, False), (shard, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert recreated is True
+    assert index_path.exists()
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_recreated_during_cleanup"
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_quarantine_rename_failure_is_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed bound rename cannot disappear with its cleaned tombstone."""
+    import modelaudit.core as core_module
+
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_bytes(b"not an index")
+    original_rename = core_module.os.rename
+    original_replace = core_module.os.replace
+
+    def fail_bound_rename(*args: Any, **kwargs: Any) -> None:
+        if args and os.fspath(args[0]) == index_path.name:
+            raise OSError("forced bound rename failure")
+        original_rename(*args, **kwargs)
+
+    def fail_fallback_replace(*args: Any, **kwargs: Any) -> None:
+        if args and Path(args[0]) == index_path:
+            raise OSError("forced fallback rename failure")
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(core_module.os, "rename", fail_bound_rename)
+    monkeypatch.setattr(core_module.os, "replace", fail_fallback_replace)
+
+    result = scan_model_streaming(
+        file_generator=iter([(index_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata"],
+    )
+
+    assert index_path.exists()
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.details.get("scan_outcome_reason") == "safetensors_index_cleanup_failed" for issue in result.issues
     )
 
 

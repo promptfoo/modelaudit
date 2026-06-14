@@ -4,6 +4,7 @@ import contextlib
 import errno
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -3601,6 +3602,18 @@ def _scan_local_or_downloaded_path(
     if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
         return
 
+    proof_deadline = (
+        time.monotonic() + runtime.timeout if source_result.safetensors_index_proofs and runtime.timeout > 0 else None
+    )
+
+    def remaining_scan_timeout() -> int:
+        if proof_deadline is None:
+            return runtime.timeout
+        remaining = proof_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Hugging Face SafeTensors index proof verification exceeded the scan timeout")
+        return math.ceil(remaining)
+
     spinner = None
     if runtime.show_styled_output and should_show_spinner():
         spinner_text = f"Scanning {style_text(display_path, fg='cyan')}"
@@ -3615,6 +3628,7 @@ def _scan_local_or_downloaded_path(
                 source_result.source_model_id or display_path,
                 Path(actual_path),
                 source_result.safetensors_index_proofs,
+                deadline=proof_deadline,
             )
 
     try:
@@ -3637,7 +3651,7 @@ def _scan_local_or_downloaded_path(
             file_generator = iterate_files_streaming(actual_path)
             streaming_result = scan_model_streaming(
                 file_generator=file_generator,
-                timeout=runtime.timeout,
+                timeout=remaining_scan_timeout(),
                 delete_after_scan=False,
                 scan_root=actual_path,
                 progress_callback=progress_callback,
@@ -3704,7 +3718,7 @@ def _scan_local_or_downloaded_path(
         scan_results: ModelAuditResultModel = scan_model_directory_or_file(
             actual_path,
             blacklist_patterns=list(blacklist) if blacklist else None,
-            timeout=runtime.timeout,
+            timeout=remaining_scan_timeout(),
             max_file_size=runtime.max_file_size,
             max_total_size=runtime.max_total_size,
             strict_license=runtime.strict_license,

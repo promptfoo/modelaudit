@@ -3185,23 +3185,6 @@ def _detect_huggingface_content_route_format(
     return _detect_huggingface_flax_msgpack_route(repo_id, filename, revision, budget, prefix)
 
 
-def _skip_hf_safetensors_probe_candidate(
-    filename: str,
-    *,
-    allow_index_expansion: bool,
-    selected_route_scanner_ids: set[str] | None,
-    selected_route_formats: set[str] | None,
-) -> bool:
-    """Skip index metadata only when no selected content route can claim it."""
-    if not _is_hf_safetensors_index_filename(filename):
-        return False
-    del allow_index_expansion
-    return _hf_safetensors_routes_excluded_by_selection(
-        selected_route_scanner_ids,
-        selected_route_formats,
-    )
-
-
 def _hf_safetensors_index_stem(filename: str) -> str | None:
     """Return the non-empty stem of a standard or prefixed SafeTensors index."""
     basename = PurePosixPath(filename).name
@@ -3287,14 +3270,6 @@ def _select_huggingface_model_files(
                 filename
                 for filename in _metadata_only_hf_content_probe_candidates(repo_files, model_files)
                 if filename not in exact_openvino_companion_candidates
-                if not _skip_hf_safetensors_probe_candidate(
-                    filename,
-                    # Without content reads an unselected relevant index cannot
-                    # be proven disjoint from the selected shard family.
-                    allow_index_expansion=False,
-                    selected_route_scanner_ids=selected_route_scanner_ids,
-                    selected_route_formats=selected_route_formats,
-                )
                 if (
                     not _is_hf_safetensors_index_filename(filename)
                     or not allow_safetensors_index_expansion
@@ -3321,13 +3296,6 @@ def _select_huggingface_model_files(
         if _is_huggingface_repo_bookkeeping_file(filename):
             continue
         if filename in exact_openvino_companion_candidates:
-            continue
-        if _skip_hf_safetensors_probe_candidate(
-            filename,
-            allow_index_expansion=allow_safetensors_index_expansion,
-            selected_route_scanner_ids=selected_route_scanner_ids,
-            selected_route_formats=selected_route_formats,
-        ):
             continue
         if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
             raise ValueError(
@@ -4031,25 +3999,6 @@ def _hf_route_scanner_ids_for_formats(format_names: frozenset[str]) -> frozenset
     return frozenset(scanner_ids)
 
 
-def _hf_safetensors_routes_excluded_by_selection(
-    selected_route_scanner_ids: set[str] | None,
-    selected_route_formats: set[str] | None,
-) -> bool:
-    """Return whether the selected routes cannot consume SafeTensors content."""
-
-    # SafeTensors content routes intentionally include overlap-capable scanners
-    # such as pickle and compressed, not only the SafeTensors scanner itself.
-    safetensors_route_scanner_ids = _hf_safetensors_route_scanner_ids()
-    if selected_route_scanner_ids is not None:
-        selected_safetensors_routes = selected_route_scanner_ids.intersection(safetensors_route_scanner_ids)
-        return not selected_safetensors_routes
-    if selected_route_formats is None:
-        return False
-
-    selected_format_route_scanner_ids = _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
-    return not selected_format_route_scanner_ids.intersection(safetensors_route_scanner_ids)
-
-
 def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
     match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(filename)
     if match is None:
@@ -4324,11 +4273,6 @@ def _select_streamable_hf_files(
             exact_openvino_companion_candidates,
         ):
             if _is_safetensors_index_file(file_name):
-                if _hf_safetensors_routes_excluded_by_selection(
-                    selected_route_scanner_ids,
-                    selected_route_formats,
-                ):
-                    continue
                 deferred_index_route_scanner_ids = (
                     selected_route_scanner_ids
                     if selected_route_scanner_ids is not None
@@ -5301,11 +5245,18 @@ def verify_downloaded_huggingface_safetensors_index_proofs(
     repo_id: str,
     downloaded_path: Path,
     proofs: Collection[HuggingFaceSafetensorsIndexProof],
+    *,
+    deadline: float | None = None,
 ) -> None:
     """Require downloaded indexes to match the immutable bytes validated during planning."""
     from modelaudit.utils.file.handlers import MAX_SAFETENSORS_SHARD_INDEX_BYTES
 
+    def check_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"Hugging Face SafeTensors index proof verification timed out for {repo_id}")
+
     for proof in proofs:
+        check_deadline()
         _validate_huggingface_repo_filename(repo_id, proof.index_file)
         lexical_path = downloaded_path / proof.index_file
         try:
@@ -5354,6 +5305,7 @@ def verify_downloaded_huggingface_safetensors_index_proofs(
             )
 
         for target_file in proof.target_files:
+            check_deadline()
             _validate_huggingface_repo_filename(repo_id, target_file)
             lexical_target = downloaded_path / target_file
             try:
@@ -5379,6 +5331,7 @@ def verify_downloaded_huggingface_safetensors_index_proofs(
                 raise ValueError(
                     f"Hugging Face SafeTensors index proof mismatch: downloaded shard is invalid: {target_file}"
                 )
+        check_deadline()
 
 
 def _should_cleanup_hf_streaming_context_file(
@@ -6097,6 +6050,7 @@ def download_model(
             repo_id,
             downloaded_path,
             plan.safetensors_index_proofs,
+            deadline=deadline,
         )
         if safetensors_index_proofs is not None:
             safetensors_index_proofs[:] = plan.safetensors_index_proofs

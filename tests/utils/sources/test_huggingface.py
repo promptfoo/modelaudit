@@ -102,6 +102,7 @@ from modelaudit.utils.sources.huggingface import (
     plan_huggingface_model_download,
     plan_huggingface_streaming_download,
     redact_huggingface_url_for_display,
+    verify_downloaded_huggingface_safetensors_index_proofs,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 from tests.helpers import create_mock_coreml, create_mock_onnx
@@ -884,6 +885,38 @@ class TestModelDownload:
         assert plan.selected_files == repo_files
         mock_detect.assert_called_once()
 
+    @pytest.mark.parametrize("streaming", [False, True], ids=["standard", "streaming"])
+    def test_exact_onnx_policy_content_routes_index_suffixed_payloads(self, streaming: bool) -> None:
+        """An index-like suffix cannot bypass selected content-route inspection."""
+        repo_files = ["benign.onnx", "evil.safetensors.index.json"]
+        sizes = dict.fromkeys(repo_files, 10)
+
+        def detect_route(_repo: str, filename: str, _revision: str, _budget: Any) -> str | None:
+            return "onnx" if filename == "evil.safetensors.index.json" else None
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                side_effect=detect_route,
+            ) as mock_detect,
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=(sizes, _HF_TEST_REVISION),
+            ),
+        ):
+            planner = plan_huggingface_streaming_download if streaming else plan_huggingface_model_download
+            plan = planner(
+                "https://huggingface.co/test/model",
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert plan.selected_files == repo_files
+        assert "evil.safetensors.index.json" in {call.args[1] for call in mock_detect.call_args_list}
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
     @patch(
@@ -1239,8 +1272,10 @@ class TestModelDownload:
 
         assert result == Path(mock_snapshot_download.call_args.kwargs["local_dir"])
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.onnx"]
-        mock_requests_get.assert_called_once()
-        assert "model-00000-of-00001.safetensors" in mock_requests_get.call_args.args[0]
+        assert mock_requests_get.call_count == 2
+        requested_urls = {call.args[0] for call in mock_requests_get.call_args_list}
+        assert any("model.safetensors.index.json" in url for url in requested_urls)
+        assert any("model-00000-of-00001.safetensors" in url for url in requested_urls)
 
     @pytest.mark.parametrize(
         ("extensions", "detected_format", "expected_files"),
@@ -1414,6 +1449,23 @@ class TestModelDownload:
             assert proofs[0].target_files == (shard_file,)
             assert proofs[0].index_base == "one"
             assert proofs[0].fingerprint == hashlib.sha256(remote_index).hexdigest()
+
+    def test_downloaded_safetensors_index_proof_verification_honors_deadline(self, tmp_path: Path) -> None:
+        """Post-download proof walks remain inside the acquisition deadline."""
+        proof = HuggingFaceSafetensorsIndexProof(
+            index_file="model.safetensors.index.json",
+            target_files=("model-00001-of-00001.safetensors",),
+            index_base="one",
+            fingerprint="0" * 64,
+        )
+
+        with pytest.raises(TimeoutError, match="proof verification timed out"):
+            verify_downloaded_huggingface_safetensors_index_proofs(
+                "test/model",
+                tmp_path,
+                [proof],
+                deadline=time.monotonic() - 1,
+            )
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
     @pytest.mark.parametrize("ancestor_mode", [0o700, 0o755])
@@ -8545,7 +8597,10 @@ class TestModelDownloadStreaming:
                 scannable_scanner_ids={"onnx"},
             )
 
-        assert [call.args[1] for call in mock_detect_content.call_args_list] == ["model-00000-of-00001.safetensors"]
+        assert [call.args[1] for call in mock_detect_content.call_args_list] == [
+            "model.safetensors.index.json",
+            "model-00000-of-00001.safetensors",
+        ]
 
     def test_select_streamable_hf_files_probes_unindexed_zero_based_shard(self) -> None:
         """A zero-based name may be excluded only after its content proves SafeTensors."""
