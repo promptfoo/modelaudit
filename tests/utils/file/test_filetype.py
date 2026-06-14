@@ -4117,6 +4117,11 @@ def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_pa
             id="base64-alphabetic-protocol-STACK_GLOBAL",
         ),
         pytest.param(
+            b"MIT License\nZXZhbCg\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="base64-alphabetic-execution-syntax",
+        ),
+        pytest.param(
             b"MIT License\nAA AA\ng g\nE\n",
             "pickle",
             id="base64-split-weak-side-effect-alignment-collision",
@@ -4176,6 +4181,7 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
         pytest.param(b"MIT License\ngroups\n", id="standalone-base64-word-groups"),
         pytest.param(b"MIT License\nCopyright grou ps\n", id="same-line-base64-word-groups"),
         pytest.param(b"MIT License\ngAROLg\n", id="base64-alphabetic-benign-protocol"),
+        pytest.param(b"MIT License\nZXZhbA\n", id="base64-alphabetic-execution-near-match"),
         pytest.param(
             b"MIT License\nAA AA\ng r o u\np s\n",
             id="base64-split-word-groups-alignment-collision",

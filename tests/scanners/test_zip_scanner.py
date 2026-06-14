@@ -11396,6 +11396,7 @@ class TestZipScanner:
                 1,
                 id="base64-alphabetic-protocol-STACK_GLOBAL",
             ),
+            pytest.param(b"MIT License\nZXZhbCg\n", 2, id="base64-alphabetic-execution-syntax"),
             pytest.param(
                 b"MIT License\nAA AA\ng g\nE\n",
                 1,
@@ -11460,6 +11461,7 @@ class TestZipScanner:
             pytest.param(b"MIT License\ngroups\n", id="standalone-base64-word-groups"),
             pytest.param(b"MIT License\nCopyright grou ps\n", id="same-line-base64-word-groups"),
             pytest.param(b"MIT License\ngAROLg\n", id="base64-alphabetic-benign-protocol"),
+            pytest.param(b"MIT License\nZXZhbA\n", id="base64-alphabetic-execution-near-match"),
             pytest.param(
                 b"MIT License\nAA AA\ng r o u\np s\n",
                 id="base64-split-word-groups-alignment-collision",

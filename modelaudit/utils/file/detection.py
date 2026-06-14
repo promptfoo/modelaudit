@@ -2636,7 +2636,7 @@ _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES: frozenset[str] = frozenset(
 )
 _PICKLE_DECODED_ENTRY_OPCODES: frozenset[str] = _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES | {"INST", "PROTO"}
 _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS: dict[str, int] = {"EXT1": 2, "EXT2": 3, "EXT4": 5, "NEXT_BUFFER": 1}
-_WEAK_DECODED_BASE64_MAX_CHARS = 4 * ((max(_PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.values()) + 2) // 3)
+_RECENT_EXACT_BASE64_MAX_CHARS = 4 * ((max(_PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.values()) + 2) // 3)
 _PROTOCOLLESS_BINARY_PICKLE_OPCODES: frozenset[str] = frozenset(
     {
         "ADDITEMS",
@@ -5922,6 +5922,7 @@ def _decoded_base64_has_line_or_protocol_pickle_signal(decoded: bytes) -> bool:
     return (
         _looks_like_binary_pickle_protocol(decoded[:4])
         or _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(decoded) is not None
+        or _LEGAL_TEXT_ENCODED_EXECUTION_RE.search(decoded) is not None
     )
 
 
@@ -5934,13 +5935,6 @@ def _decoded_alphabetic_base64_has_pickle_signal(decoded: bytes) -> bool:
 def _alphabetic_base64_has_pickle_signal(token: bytes) -> bool:
     try:
         return _decoded_alphabetic_base64_has_pickle_signal(_decode_base64_route_token(token))
-    except (binascii.Error, ValueError):
-        return False
-
-
-def _alphabetic_base64_has_exact_weak_pickle_signal(token: bytes) -> bool:
-    try:
-        return _decoded_base64_has_exact_weak_pickle_signal(_decode_base64_route_token(token))
     except (binascii.Error, ValueError):
         return False
 
@@ -5967,13 +5961,13 @@ def _iter_encoded_route_tokens(
         if trusted_start is not None:
             yield bytes(block[trusted_start:])
         if alphabetic_whitespace_is_prose:
-            for start in recent_starts:
-                token = bytes(block[start:])
-                if _alphabetic_base64_has_exact_weak_pickle_signal(token):
-                    yield token
             # One earliest line start per base64 alignment covers every later
             # start with bounded linear work instead of testing every suffix.
             for start in alphabetic_starts.values():
+                token = bytes(block[start:])
+                if _alphabetic_base64_has_pickle_signal(token):
+                    yield token
+            for start in recent_starts:
                 token = bytes(block[start:])
                 if _alphabetic_base64_has_pickle_signal(token):
                     yield token
@@ -6015,7 +6009,7 @@ def _iter_encoded_route_tokens(
                     token = bytes(block[start:])
                     if _alphabetic_base64_has_line_or_protocol_pickle_signal(token):
                         yield token
-                while recent_starts and len(block) - recent_starts[0] > _WEAK_DECODED_BASE64_MAX_CHARS:
+                while recent_starts and len(block) - recent_starts[0] > _RECENT_EXACT_BASE64_MAX_CHARS:
                     recent_starts.popleft()
             if b"=" not in encoded_line:
                 continue

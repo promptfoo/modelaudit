@@ -978,6 +978,7 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         pytest.param(b"MIT License\nggE\n", 1, id="base64-unpadded-alphabetic-EXT1"),
         pytest.param(b"MIT License\nlw\n", 1, id="base64-unpadded-alphabetic-NEXT_BUFFER"),
         pytest.param(b"MIT License\ngASMAWGMAWGTLg\n", 1, id="base64-alphabetic-protocol-STACK_GLOBAL"),
+        pytest.param(b"MIT License\nZXZhbCg\n", 2, id="base64-alphabetic-execution-syntax"),
         pytest.param(
             b"MIT License\nAA AA\ng g\nE\n",
             1,
@@ -1129,6 +1130,7 @@ def test_scan_file_keeps_benign_encoded_execution_word_on_text_route(
         pytest.param(b"MIT License\ngroups\n", id="standalone-base64-word-groups"),
         pytest.param(b"MIT License\nCopyright grou ps\n", id="same-line-base64-word-groups"),
         pytest.param(b"MIT License\ngAROLg\n", id="base64-alphabetic-benign-protocol"),
+        pytest.param(b"MIT License\nZXZhbA\n", id="base64-alphabetic-execution-near-match"),
         pytest.param(
             b"MIT License\nAA AA\ng r o u\np s\n",
             id="base64-split-word-groups-alignment-collision",
