@@ -63,7 +63,7 @@ _HF_SAFETENSORS_REMOTE_OVERLAP_REASON = "remote_safetensors_overlap_coverage_inc
 _MAX_HF_SAFETENSORS_RETAINED_RESULTS = 512
 _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES = 65_536
 _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES = 32 * 1024 * 1024
-_HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES = 64 * 1024
+_HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES = 256 * 1024
 _HF_SAFETENSORS_RESULT_BUDGET_REASON = "remote_safetensors_result_budget_exceeded"
 _MAX_HF_STREAMING_ONNX_EXTERNAL_DATA_FILES = 256
 _MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES = 128
@@ -599,8 +599,9 @@ def _remote_safetensors_result_budget_failure_result(
     """Replace an over-budget result with one bounded operational failure."""
     from ...scanners.base import IssueSeverity
 
-    declared_size = candidate_result.metadata.get("remote_declared_size")
-    bytes_transferred = candidate_result.metadata.get("remote_bytes_transferred", candidate_result.bytes_scanned)
+    candidate_metadata = candidate_result.metadata if isinstance(candidate_result.metadata, dict) else {}
+    declared_size = candidate_metadata.get("remote_declared_size")
+    bytes_transferred = candidate_metadata.get("remote_bytes_transferred", candidate_result.bytes_scanned)
     security_severities = [
         getattr(getattr(record, "severity", None), "value", None)
         for record in [*candidate_result.issues, *candidate_result.checks]
@@ -620,6 +621,40 @@ def _remote_safetensors_result_budget_failure_result(
         reason=_HF_SAFETENSORS_RESULT_BUDGET_REASON,
         error=ValueError("repository retained SafeTensors result budget exceeded"),
     )
+    raw_candidate_scope = candidate_metadata.get("analysis_scope")
+    candidate_scope = raw_candidate_scope if isinstance(raw_candidate_scope, str) else None
+    if candidate_scope is not None:
+        result.metadata["analysis_scope"] = candidate_scope
+    if candidate_metadata.get("remote_index_only") is True:
+        result.metadata.pop("remote_header_only", None)
+        result.metadata["remote_index_only"] = True
+        index_reconciliation = candidate_metadata.get("remote_index_reconciliation")
+        if isinstance(index_reconciliation, dict):
+            summary: dict[str, Any] = {}
+            string_limits = {
+                "index_manifest": _MAX_HF_REPOSITORY_PATH_CHARS,
+                "index_incomplete_reason": 256,
+                "index_error_type": 256,
+            }
+            for key, limit in string_limits.items():
+                value = index_reconciliation.get(key)
+                if isinstance(value, str):
+                    summary[key] = value[:limit]
+            for key in (
+                "index_bytes_transferred",
+                "index_declared_size",
+                "index_weight_map_tensor_count",
+                "index_referenced_shard_count",
+                "index_missing_shard_count",
+                "index_unselected_shard_count",
+                "index_invalid_entry_count",
+                "index_duplicate_json_key_count",
+                "index_manifest_count",
+            ):
+                value = index_reconciliation.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    summary[key] = value
+            result.metadata["remote_index_reconciliation"] = summary
     budget_details = {
         **budget_details,
         "candidate_issue_count": len(candidate_result.issues),
@@ -1363,8 +1398,9 @@ def _remote_safetensors_index_details_by_file(
     *,
     deadline: float | None,
     max_transferred_bytes: int | None,
+    retain_unscoped_failure: Callable[[str, dict[str, Any]], bool] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]]]:
-    """Return per-shard details from bounded SafeTensors index manifests."""
+    """Return per-shard details, stopping when an optional failure retainer rejects a result."""
     selected_files = set(model_files)
     repo_file_set = set(repo_files)
     if not selected_files:
@@ -1376,12 +1412,15 @@ def _remote_safetensors_index_details_by_file(
     def attach_details(filename: str, details: dict[str, Any]) -> None:
         details_by_file[filename] = _merge_remote_index_details(details_by_file.get(filename), details)
 
-    def record_failure(index_filename: str, details: dict[str, Any], scoped_files: Collection[str]) -> None:
+    def record_failure(index_filename: str, details: dict[str, Any], scoped_files: Collection[str]) -> bool:
         if scoped_files:
             for filename in scoped_files:
                 attach_details(filename, details)
-        else:
-            unscoped_failures[index_filename] = dict(details)
+            return True
+        if retain_unscoped_failure is not None:
+            return retain_unscoped_failure(index_filename, details)
+        unscoped_failures[index_filename] = dict(details)
+        return True
 
     total_index_bytes = 0
     acquired_index_bytes: dict[str, bytes] = {}
@@ -1398,21 +1437,25 @@ def _remote_safetensors_index_details_by_file(
         index_size = path_sizes.get(index_filename)
         if index_size is None:
             failure = _index_failure_details(index_filename, "missing_index_size")
-            record_failure(index_filename, failure, filename_family)
+            if not record_failure(index_filename, failure, filename_family):
+                break
             continue
         if index_size > _MAX_HF_SAFETENSORS_INDEX_BYTES:
             failure = _index_failure_details(index_filename, "index_exceeds_limit", index_size=index_size)
-            record_failure(index_filename, failure, filename_family)
+            if not record_failure(index_filename, failure, filename_family):
+                break
             continue
         if total_index_bytes + index_size > _MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES:
             failure = _index_failure_details(
                 index_filename, "aggregate_index_bytes_exceed_limit", index_size=index_size
             )
-            record_failure(index_filename, failure, filename_family)
+            if not record_failure(index_filename, failure, filename_family):
+                break
             continue
         if max_transferred_bytes is not None and total_index_bytes + index_size > max_transferred_bytes:
             failure = _index_failure_details(index_filename, "index_exceeds_max_size_budget", index_size=index_size)
-            record_failure(index_filename, failure, filename_family)
+            if not record_failure(index_filename, failure, filename_family):
+                break
             continue
 
         index_bytes_transferred = 0
@@ -1463,7 +1506,8 @@ def _remote_safetensors_index_details_by_file(
                 index_size=index_size,
                 error=exc,
             )
-            record_failure(index_filename, failure, filename_family)
+            if not record_failure(index_filename, failure, filename_family):
+                break
             continue
 
         referenced_by_file: dict[str, list[str]] = {}
@@ -1490,7 +1534,8 @@ def _remote_safetensors_index_details_by_file(
                 index_size=index_size,
             )
             scoped_files = filename_family.union(referenced_by_file).intersection(selected_files)
-            record_failure(index_filename, failure, scoped_files)
+            if not record_failure(index_filename, failure, scoped_files):
+                break
             continue
 
         referenced_files = set(referenced_by_file)
@@ -1527,7 +1572,8 @@ def _remote_safetensors_index_details_by_file(
                 bytes_transferred=index_range.bytes_transferred,
                 index_size=index_size,
             )
-            record_failure(index_filename, failure, filename_family.union(selected_referenced))
+            if not record_failure(index_filename, failure, filename_family.union(selected_referenced)):
+                break
             continue
 
         if deadline is not None and time.monotonic() >= deadline:
@@ -1537,7 +1583,8 @@ def _remote_safetensors_index_details_by_file(
                 bytes_transferred=index_range.bytes_transferred,
                 index_size=index_size,
             )
-            record_failure(index_filename, failure, filename_family.union(selected_referenced))
+            if not record_failure(index_filename, failure, filename_family.union(selected_referenced)):
+                break
             continue
 
         index_complete = (
@@ -1590,8 +1637,8 @@ def _remote_safetensors_index_details_by_file(
             if duplicate_keys or invalid_entries or invalid_total_size or not selected_referenced
             else selected_referenced
         )
-        if not attach_filenames and not index_complete:
-            unscoped_failures[index_filename] = dict(common_details)
+        if not attach_filenames and not index_complete and not record_failure(index_filename, common_details, ()):
+            break
         for filename in attach_filenames:
             details = dict(common_details)
             tensors = referenced_by_file.get(filename, [])
@@ -1646,6 +1693,7 @@ def _remote_safetensors_shard_details_by_file(
     *,
     deadline: float | None,
     max_transferred_bytes: int | None,
+    retain_unscoped_failure: Callable[[str, dict[str, Any]], bool] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]]]:
     """Return per-shard remote coverage details from filenames and index manifests."""
     filename_details = _remote_safetensors_filename_shard_details_by_file(model_files, repo_files)
@@ -1657,6 +1705,7 @@ def _remote_safetensors_shard_details_by_file(
         path_sizes,
         deadline=deadline,
         max_transferred_bytes=max_transferred_bytes,
+        retain_unscoped_failure=retain_unscoped_failure,
     )
     return (
         _combine_remote_safetensors_shard_details(filename_details, index_details),
@@ -5372,11 +5421,46 @@ def download_model_streaming(
         content_probe_bytes_transferred = plan.probe_bytes_transferred
         if content_probe_budget is not None:
             content_probe_bytes_transferred += content_probe_budget.transferred_bytes
+        safetensors_retention_budget = _HuggingFaceSafeTensorsRetentionBudget()
+        retained_index_failure_results: list[tuple[str, Any]] = []
+        index_result_budget_exhausted = False
+
+        def apply_safetensors_retention_budget(filename: str, candidate_result: Any) -> tuple[Any, bool]:
+            budget_failure = safetensors_retention_budget.retain(candidate_result)
+            if budget_failure is None:
+                return candidate_result, False
+            return (
+                _remote_safetensors_result_budget_failure_result(
+                    repo_id,
+                    filename,
+                    download_revision,
+                    candidate_result,
+                    budget_failure,
+                ),
+                True,
+            )
+
+        def retain_unscoped_index_failure(index_filename: str, failure_details: dict[str, Any]) -> bool:
+            nonlocal index_result_budget_exhausted
+
+            candidate_result = _remote_safetensors_index_failure_result(
+                repo_id,
+                index_filename,
+                download_revision,
+                failure_details,
+            )
+            retained_result, index_result_budget_exhausted = apply_safetensors_retention_budget(
+                index_filename,
+                candidate_result,
+            )
+            retained_index_failure_results.append((index_filename, retained_result))
+            return not index_result_budget_exhausted
+
         (
             shard_details_by_file,
             remote_index_bytes_transferred,
             acquired_index_bytes,
-            unscoped_index_failures,
+            _,
         ) = _remote_safetensors_shard_details_by_file(
             repo_id,
             sorted(safetensors_header_files),
@@ -5385,6 +5469,7 @@ def download_model_streaming(
             path_sizes,
             deadline=deadline,
             max_transferred_bytes=(size_limit - content_probe_bytes_transferred if size_limit is not None else None),
+            retain_unscoped_failure=retain_unscoped_index_failure,
         )
         openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
@@ -5431,7 +5516,6 @@ def download_model_streaming(
         pending_pretransferred_bytes = (
             content_probe_bytes_transferred + remote_index_bytes_transferred if _include_scan_results else 0
         )
-        safetensors_retention_budget = _HuggingFaceSafeTensorsRetentionBudget()
 
         def make_streamed_item(
             filename: str,
@@ -5721,15 +5805,10 @@ def download_model_streaming(
             return downloaded_file, onnx_external_data_cleanup_paths
 
         try:
-            failure_items = sorted(unscoped_index_failures.items())
-            for failure_index, (index_filename, failure_details) in enumerate(failure_items):
-                failure_result = _remote_safetensors_index_failure_result(
-                    repo_id,
-                    index_filename,
-                    download_revision,
-                    failure_details,
+            for failure_index, (index_filename, failure_result) in enumerate(retained_index_failure_results):
+                is_last_failure = failure_index == len(retained_index_failure_results) - 1 and (
+                    index_result_budget_exhausted or not has_future_yield(-1)
                 )
-                is_last_failure = failure_index == len(failure_items) - 1 and not has_future_yield(-1)
                 yield make_streamed_item(
                     index_filename,
                     Path(index_filename),
@@ -5737,6 +5816,8 @@ def download_model_streaming(
                     failure_result,
                     source_bytes_preaccounted=failure_result.bytes_scanned,
                 )
+            if index_result_budget_exhausted:
+                return
 
             for idx, filename in enumerate(model_files):
                 if filename in consumed_filenames:
@@ -5744,18 +5825,15 @@ def download_model_streaming(
 
                 if filename in safetensors_header_files:
                     scan_result = scan_remote_safetensors(filename)
-                    budget_failure = safetensors_retention_budget.retain(scan_result)
-                    if budget_failure is not None:
-                        scan_result = _remote_safetensors_result_budget_failure_result(
-                            repo_id,
-                            filename,
-                            download_revision,
-                            scan_result,
-                            budget_failure,
-                        )
-                        yield make_streamed_item(filename, Path(filename), True, scan_result)
+                    scan_result, result_budget_exhausted = apply_safetensors_retention_budget(filename, scan_result)
+                    yield make_streamed_item(
+                        filename,
+                        Path(filename),
+                        result_budget_exhausted or not has_future_yield(idx),
+                        scan_result,
+                    )
+                    if result_budget_exhausted:
                         return
-                    yield make_streamed_item(filename, Path(filename), not has_future_yield(idx), scan_result)
                     continue
 
                 if filename in openvino_xml_by_companion:

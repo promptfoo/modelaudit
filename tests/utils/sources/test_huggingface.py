@@ -45,7 +45,9 @@ from modelaudit.utils.sources._huggingface_download_worker import _run_operation
 from modelaudit.utils.sources.huggingface import (
     _HF_CONTENT_SNIFF_BYTES,
     _HF_CONTENT_SNIFF_MAX_FILES,
+    _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES,
     _HF_SAFETENSORS_RESULT_BUDGET_REASON,
+    _MAX_HF_REPOSITORY_PATH_CHARS,
     _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
     _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
     _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
@@ -68,6 +70,7 @@ from modelaudit.utils.sources.huggingface import (
     _remote_safetensors_filename_shard_details_by_file,
     _remote_safetensors_index_details_by_file,
     _remote_safetensors_index_failure_result,
+    _remote_safetensors_result_budget_failure_result,
     _run_huggingface_download_with_deadline,
     _scan_remote_huggingface_safetensors_header,
     _select_streamable_hf_files,
@@ -8224,6 +8227,76 @@ class TestModelDownloadStreaming:
         assert rejection is not None
         assert rejection["exceeded"] == [dimension]
 
+    def test_remote_safetensors_budget_failure_bounds_index_reconciliation_summary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        oversized_entry = "x" * (2 * 1024 * 1024)
+        candidate = _remote_safetensors_index_failure_result(
+            "test/model",
+            "model.safetensors.index.json",
+            _HF_TEST_REVISION,
+            {
+                "index_manifest": "model.safetensors.index.json",
+                "index_bytes_transferred": 1,
+                "index_declared_size": len(oversized_entry),
+                "index_incomplete_reason": "invalid_index_relationships",
+                "index_invalid_entry_count": 1,
+                "index_invalid_entries": [oversized_entry],
+            },
+        )
+        monkeypatch.setattr(
+            huggingface_module,
+            "_MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES",
+            2 * _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES,
+        )
+        rejection = _HuggingFaceSafeTensorsRetentionBudget().retain(candidate)
+
+        assert rejection is not None
+        failure = _remote_safetensors_result_budget_failure_result(
+            "test/model",
+            "model.safetensors.index.json",
+            _HF_TEST_REVISION,
+            candidate,
+            rejection,
+        )
+        summary = failure.metadata["remote_index_reconciliation"]
+        serialized = json.dumps(failure.to_dict(), ensure_ascii=False, separators=(",", ":")).encode()
+
+        assert len(serialized) < _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES
+        assert summary["index_incomplete_reason"] == "invalid_index_relationships"
+        assert summary["index_invalid_entry_count"] == 1
+        assert "index_invalid_entries" not in summary
+        assert oversized_entry.encode() not in serialized
+
+    def test_remote_safetensors_budget_failure_reserve_covers_maximum_multibyte_path(self) -> None:
+        suffix = ".safetensors.index.json"
+        index_filename = ("😀" * (_MAX_HF_REPOSITORY_PATH_CHARS - len(suffix))) + suffix
+        candidate = _remote_safetensors_index_failure_result(
+            "test/model",
+            index_filename,
+            _HF_TEST_REVISION,
+            {
+                "index_manifest": index_filename,
+                "index_bytes_transferred": 0,
+                "index_incomplete_reason": "missing_index_size",
+            },
+        )
+
+        failure = _remote_safetensors_result_budget_failure_result(
+            "test/model",
+            index_filename,
+            _HF_TEST_REVISION,
+            candidate,
+            {"exceeded": ["result_count"]},
+        )
+        serialized = json.dumps(failure.to_dict(), ensure_ascii=False, separators=(",", ":")).encode()
+
+        assert len(index_filename) == _MAX_HF_REPOSITORY_PATH_CHARS
+        assert len(serialized) < _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES
+
     @pytest.mark.parametrize(
         "candidate_security_finding",
         [False, True],
@@ -8321,6 +8394,270 @@ class TestModelDownloadStreaming:
         assert determine_exit_code(aggregate) == 2
         assert sum(len(asset.tensors or []) for asset in aggregate.assets) == 2
         mock_cache_store.assert_not_called()
+
+    @pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
+    @pytest.mark.parametrize(
+        ("malformed_index_count", "expected_budget_scope"),
+        [
+            (_MAX_HF_SAFETENSORS_RETAINED_RESULTS - 2, None),
+            (_MAX_HF_SAFETENSORS_RETAINED_RESULTS - 1, "header"),
+            (600, "index"),
+        ],
+        ids=[
+            "below-budget-indexes-plus-header",
+            "index-results-exhaust-budget-on-header",
+            "six-hundred-indexes-plus-header",
+        ],
+    )
+    def test_unscoped_index_result_retention_is_bounded_before_header_scan(
+        self,
+        malformed_index_count: int,
+        expected_budget_scope: str | None,
+    ) -> None:
+        """Index reconciliation must share the source-native result budget with headers."""
+        repo_root = Path(__file__).resolve().parents[3]
+        script = textwrap.dedent(
+            """
+            import json
+            import resource
+            import struct
+            import sys
+            from pathlib import Path
+            from unittest.mock import patch
+
+            from modelaudit.core import determine_exit_code, scan_model_streaming
+            from modelaudit.utils.sources.huggingface import (
+                _HF_SAFETENSORS_RESULT_BUDGET_REASON,
+                download_model_streaming,
+            )
+
+            index_count = int(sys.argv[1])
+            revision = "a" * 40
+            index_names = [f"broken-{index:04d}.safetensors.index.json" for index in range(index_count)]
+            header_name = "weights.safetensors"
+            filenames = [*index_names, header_name]
+            index_payload = b"{"
+            header = {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}
+            header_bytes = json.dumps(header, separators=(",", ":")).encode()
+            frame = struct.pack("<Q", len(header_bytes)) + header_bytes + b"\\x00"
+            sizes = {**dict.fromkeys(index_names, len(index_payload)), header_name: len(frame)}
+
+            class Response:
+                def __init__(self, payload, total_size, start, url):
+                    self.payload = payload
+                    self.status_code = 206
+                    self.url = url
+                    self.headers = {
+                        "Content-Range": f"bytes {start}-{start + len(payload) - 1}/{total_size}",
+                        "Content-Length": str(len(payload)),
+                        "ETag": '"stable"',
+                    }
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+                def raise_for_status(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def iter_content(self, chunk_size):
+                    for start in range(0, len(self.payload), chunk_size):
+                        yield self.payload[start : start + chunk_size]
+
+            def hub_url(*, repo_id, filename, revision):
+                return f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
+
+            def range_response(url, *, headers, **_kwargs):
+                filename = url.rsplit("/", 1)[-1]
+                payload = index_payload if filename.endswith(".index.json") else frame
+                range_header = headers.get("Range")
+                if range_header is None:
+                    start, end = 0, len(payload) - 1
+                else:
+                    start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+                    start = int(start_text)
+                    end = min(int(end_text), len(payload) - 1)
+                return Response(payload[start : end + 1], len(payload), start, url)
+
+            with (
+                patch(
+                    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                    return_value=(filenames, revision, None),
+                ),
+                patch(
+                    "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                    return_value=(sizes, revision),
+                ),
+                patch(
+                    "huggingface_hub.utils.build_hf_headers",
+                    side_effect=lambda *, token=None, headers=None: headers or {},
+                ),
+                patch("huggingface_hub.hf_hub_url", side_effect=hub_url),
+                patch("huggingface_hub.hf_hub_download") as mock_download,
+                patch("requests.get", side_effect=range_response) as mock_get,
+                patch("modelaudit.cache.scan_results_cache.ScanResultsCache.store_result") as mock_cache_store,
+                patch("modelaudit.core.scan_file") as mock_scan_file,
+            ):
+                before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                streamed = list(
+                    download_model_streaming(
+                        f"hf://test/model?revision={revision}",
+                        max_size=64 * 1024 * 1024,
+                        scannable_extensions={".safetensors"},
+                        scannable_filenames=set(),
+                        scannable_scanner_ids={"safetensors"},
+                        _include_scan_results=True,
+                    )
+                )
+                source_results = [item[2] for item in streamed]
+                aggregate = scan_model_streaming(
+                    iter(streamed),
+                    timeout=60,
+                    delete_after_scan=False,
+                    cache_enabled=True,
+                    scanners=["safetensors"],
+                    skip_file_types=False,
+                )
+                after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+            budget_results = [
+                result
+                for result in source_results
+                if _HF_SAFETENSORS_RESULT_BUDGET_REASON in result.metadata.get("scan_outcome_reasons", [])
+            ]
+            source_paths = {result.metadata["source_path"] for result in source_results}
+            scale = 1 if sys.platform == "darwin" else 1024
+            print(
+                json.dumps(
+                    {
+                        "streamed_results": len(streamed),
+                        "files_scanned": aggregate.files_scanned,
+                        "range_requests": mock_get.call_count,
+                        "download_calls": mock_download.call_count,
+                        "cache_store_calls": mock_cache_store.call_count,
+                        "scan_file_calls": mock_scan_file.call_count,
+                        "budget_results": len(budget_results),
+                        "budget_checks": sum(
+                            check.name == "Hugging Face SafeTensors Retained Result Budget"
+                            for result in source_results
+                            for check in result.checks
+                        ),
+                        "index_scope_results": sum(
+                            result.metadata.get("analysis_scope") == "safetensors_index_reconciliation"
+                            for result in source_results
+                        ),
+                        "header_scope_results": sum(
+                            result.metadata.get("analysis_scope") == "safetensors_header_and_metadata"
+                            for result in source_results
+                        ),
+                        "source_native_metadata": set(aggregate.file_metadata) == source_paths,
+                        "source_result_bytes": sum(result.bytes_scanned for result in source_results),
+                        "bytes_scanned": aggregate.bytes_scanned,
+                        "has_errors": aggregate.has_errors,
+                        "success": aggregate.success,
+                        "exit_code": determine_exit_code(aggregate),
+                        "content_hash": aggregate.content_hash,
+                        "serialized_bytes": len(aggregate.model_dump_json().encode()),
+                        "peak_delta_bytes": (after - before) * scale,
+                        "last_path": str(Path(streamed[-1][0])),
+                        "last_is_last": bool(streamed[-1][1]),
+                        "last_marker_count": sum(bool(item[1]) for item in streamed),
+                        "last_result_success": source_results[-1].success,
+                        "budget_filename": (
+                            budget_results[0].metadata.get("hf_filename") if budget_results else None
+                        ),
+                        "budget_is_index_only": (
+                            budget_results[0].metadata.get("remote_index_only") if budget_results else None
+                        ),
+                        "budget_has_header_only": (
+                            "remote_header_only" in budget_results[0].metadata if budget_results else None
+                        ),
+                        "budget_index_reason": (
+                            budget_results[0]
+                            .metadata.get("remote_index_reconciliation", {})
+                            .get("index_incomplete_reason")
+                            if budget_results
+                            else None
+                        ),
+                        "budget_details": (
+                            budget_results[0].metadata.get("remote_result_retention_budget")
+                            if budget_results
+                            else None
+                        ),
+                    }
+                )
+            )
+            """
+        )
+        env = {**os.environ, "PYTHONPATH": str(repo_root), "PROMPTFOO_DISABLE_TELEMETRY": "1"}
+
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(malformed_index_count)],
+            check=False,
+            capture_output=True,
+            env=env,
+            text=True,
+            timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
+        metrics = json.loads(completed.stdout.strip().splitlines()[-1])
+
+        expected_results = min(malformed_index_count + 1, _MAX_HF_SAFETENSORS_RETAINED_RESULTS)
+        expected_range_requests = (
+            _MAX_HF_SAFETENSORS_RETAINED_RESULTS if expected_budget_scope == "index" else malformed_index_count + 2
+        )
+        assert metrics["streamed_results"] == expected_results
+        assert metrics["files_scanned"] == expected_results
+        assert metrics["range_requests"] == expected_range_requests
+        assert metrics["download_calls"] == 0
+        assert metrics["cache_store_calls"] == 0
+        assert metrics["scan_file_calls"] == 0
+        assert metrics["source_native_metadata"] is True
+        assert metrics["bytes_scanned"] == metrics["source_result_bytes"]
+        assert metrics["has_errors"] is True
+        assert metrics["success"] is False
+        assert metrics["exit_code"] == 2
+        assert metrics["content_hash"] is None
+        assert metrics["serialized_bytes"] < _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES
+        assert metrics["peak_delta_bytes"] < 64 * 1024 * 1024
+        assert metrics["last_is_last"] is True
+        assert metrics["last_marker_count"] == 1
+
+        if expected_budget_scope is not None:
+            assert metrics["budget_results"] == 1
+            assert metrics["budget_checks"] == 1
+            assert metrics["last_result_success"] is False
+            assert metrics["budget_filename"] == metrics["last_path"]
+            assert metrics["budget_details"]["exceeded"] == ["result_count"]
+            assert metrics["budget_details"]["retained_results"] == expected_results - 1
+            assert metrics["budget_details"]["projected_results"] == expected_results
+            if expected_budget_scope == "index":
+                assert metrics["index_scope_results"] == expected_results
+                assert metrics["header_scope_results"] == 0
+                assert metrics["last_path"] == "broken-0511.safetensors.index.json"
+                assert metrics["budget_is_index_only"] is True
+                assert metrics["budget_has_header_only"] is False
+                assert metrics["budget_index_reason"] == "index_read_or_parse_failed"
+            else:
+                assert metrics["index_scope_results"] == malformed_index_count
+                assert metrics["header_scope_results"] == 1
+                assert metrics["last_path"] == "weights.safetensors"
+                assert metrics["budget_is_index_only"] is None
+                assert metrics["budget_has_header_only"] is True
+                assert metrics["budget_index_reason"] is None
+        else:
+            assert metrics["budget_results"] == 0
+            assert metrics["budget_checks"] == 0
+            assert metrics["index_scope_results"] == malformed_index_count
+            assert metrics["header_scope_results"] == 1
+            assert metrics["last_path"] == "weights.safetensors"
+            assert metrics["last_result_success"] is True
+            assert metrics["budget_details"] is None
 
     @pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
     def test_remote_safetensors_max_cardinality_repository_retention_is_measured_and_bounded(self) -> None:
