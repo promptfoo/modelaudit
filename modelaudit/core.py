@@ -9,7 +9,7 @@ import shutil
 import stat
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -2072,6 +2072,101 @@ def _results_have_retained_incomplete_outcome(results: ModelAuditResultModel) ->
     )
 
 
+def _terminal_safetensors_shard_boundary_failures(
+    validated_targets: ValidatedShardTargets,
+    *,
+    index_search_root: str | os.PathLike[str],
+    index_inspection_context: _SafetensorsIndexInspectionContext,
+    deleted_paths: Collection[str] = (),
+) -> dict[str, str]:
+    """Return final SafeTensors index or target changes across all shard parents."""
+    normalized_deleted_paths = {os.path.normcase(os.path.normpath(os.path.abspath(path))) for path in deleted_paths}
+    terminal_families: dict[tuple[Any, ...], list[str]] = {}
+    expected_proofs: dict[tuple[Any, ...], tuple[str, str, str, int] | None] = {}
+    failures: dict[str, str] = {}
+
+    for source_path, expected_target in validated_targets.items():
+        shard_match = ShardedModelDetector.match_safetensors_shard_filename(Path(source_path).name)
+        if shard_match is None:
+            continue
+        expected_total = shard_match.get("expected_total_shards")
+        if not isinstance(expected_total, int) or isinstance(expected_total, bool) or expected_total <= 0:
+            failures[source_path] = "shard_index_changed_after_scan"
+            continue
+        index_base = expected_target.get("authoritative_shard_index_base")
+        index_path = expected_target.get("authoritative_shard_index_path")
+        index_fingerprint = expected_target.get("authoritative_shard_index_fingerprint")
+        index_generation = expected_target.get("authoritative_shard_index_generation")
+        expected_proof: tuple[str, str, str, int] | None = None
+        if (
+            isinstance(index_base, str)
+            and index_base in {"zero", "one"}
+            and isinstance(index_path, str)
+            and index_path
+            and isinstance(index_fingerprint, str)
+            and index_fingerprint
+            and isinstance(index_generation, int)
+            and not isinstance(index_generation, bool)
+            and index_generation > 0
+        ):
+            expected_proof = (index_base, index_path, index_fingerprint, index_generation)
+            family_key: tuple[Any, ...] = ("proof", expected_total, *expected_proof)
+        else:
+            family_key = (
+                "unindexed",
+                expected_total,
+                os.path.normcase(os.path.normpath(os.path.abspath(Path(source_path).parent))),
+            )
+        terminal_families.setdefault(family_key, []).append(source_path)
+        expected_proofs[family_key] = expected_proof
+
+    for family_key, family_sources in terminal_families.items():
+        expected_proof = expected_proofs[family_key]
+        expected_total = family_key[1]
+        assert isinstance(expected_total, int)
+        refreshed_proof, authority_present = ShardedModelDetector.refresh_safetensors_index_proofs(
+            family_sources,
+            expected_total=expected_total,
+            index_search_root=index_search_root,
+            index_inspection_context=index_inspection_context,
+            force_content_revalidation=True,
+        )
+        expected_index_deleted = bool(
+            expected_proof is not None
+            and os.path.normcase(os.path.normpath(os.path.abspath(expected_proof[1]))) in normalized_deleted_paths
+        )
+        expected_index_still_absent = bool(expected_proof is not None and not os.path.lexists(expected_proof[1]))
+        authority_stable = (
+            refreshed_proof == expected_proof and authority_present == (expected_proof is not None)
+        ) or (
+            expected_index_deleted and expected_index_still_absent and refreshed_proof is None and not authority_present
+        )
+        if not authority_stable:
+            for family_source in family_sources:
+                failures[family_source] = "shard_index_changed_after_scan"
+
+    for source_path, expected_target in validated_targets.items():
+        if source_path in failures:
+            continue
+        normalized_source = os.path.normcase(os.path.normpath(os.path.abspath(source_path)))
+        if normalized_source in normalized_deleted_paths and not os.path.lexists(source_path):
+            continue
+        resolved_path = expected_target.get("resolved_path")
+        current_target = _snapshot_validated_shard_target(
+            source_path,
+            resolved_path=resolved_path if isinstance(resolved_path, str) else None,
+        )
+        current_identity = current_target.get(source_path)
+        if current_identity is not None and all(
+            current_identity.get(field) == expected_target.get(field)
+            for field in ("resolved_path", "device", "inode", "size", "mtime_ns", "ctime_ns", "nlink")
+        ):
+            continue
+        failures[source_path] = "shard_target_changed_after_scan"
+
+    return failures
+
+
 def _reconcile_cross_directory_shard_coverage(
     results: ModelAuditResultModel,
     validated_targets: ValidatedShardTargets,
@@ -3757,6 +3852,7 @@ def scan_model_directory_or_file(
     nearby_license_cache: dict[str, list[str]] = {}
     pickle_source_snapshot_stack = ExitStack()
     windows_shard_guards: _WindowsShardGuards = []
+    directory_shard_targets: ValidatedShardTargets = {}
 
     phase_timings: dict[str, float] | None = {} if bool(kwargs.get("profile_timings")) else None
 
@@ -4480,6 +4576,30 @@ def scan_model_directory_or_file(
                                     validated_targets: ValidatedShardTargets = {}
                                     detected_targets = shard_info.get("shard_targets")
                                     expected_total_shards = shard_info.get("expected_total_shards")
+                                    index_base = shard_info.get("shard_index_base")
+                                    index_path = shard_info.get("safetensors_index_path")
+                                    index_fingerprint = shard_info.get("safetensors_index_fingerprint")
+                                    index_generation = shard_info.get("safetensors_index_generation")
+                                    authoritative_index_fields: dict[str, int | str] = {}
+                                    if (
+                                        isinstance(index_base, str)
+                                        and index_base in {"zero", "one"}
+                                        and isinstance(index_path, str)
+                                        and index_path
+                                        and isinstance(index_fingerprint, str)
+                                        and index_fingerprint
+                                        and isinstance(index_generation, int)
+                                        and not isinstance(index_generation, bool)
+                                        and index_generation > 0
+                                    ):
+                                        authoritative_index_fields = {
+                                            "authoritative_shard_index_base": index_base,
+                                            "authoritative_shard_index_path": os.path.normcase(
+                                                os.path.normpath(os.path.abspath(index_path))
+                                            ),
+                                            "authoritative_shard_index_fingerprint": index_fingerprint,
+                                            "authoritative_shard_index_generation": index_generation,
+                                        }
                                     for shard_path in shard_info.get("shards", []):
                                         if not isinstance(shard_path, str) or not isinstance(detected_targets, dict):
                                             continue
@@ -4517,11 +4637,22 @@ def scan_model_directory_or_file(
                                                     shard_repository_member
                                                 )
                                             validated_targets[lexical_shard_path] = {
-                                                key: value
-                                                for key, value in detected_target.items()
-                                                if key
-                                                in {"resolved_path", "device", "inode", "size", "mtime_ns", "ctime_ns"}
-                                                and isinstance(value, (int, str))
+                                                **authoritative_index_fields,
+                                                **{
+                                                    key: value
+                                                    for key, value in detected_target.items()
+                                                    if key
+                                                    in {
+                                                        "resolved_path",
+                                                        "device",
+                                                        "inode",
+                                                        "size",
+                                                        "mtime_ns",
+                                                        "ctime_ns",
+                                                        "nlink",
+                                                    }
+                                                    and isinstance(value, (int, str))
+                                                },
                                             }
                                         else:
                                             _add_path_traversal_issue_once(
@@ -4531,6 +4662,7 @@ def scan_model_directory_or_file(
                                                 reported_targets=reported_traversal_targets,
                                             )
                                     shard_family_targets[shard_family_key] = validated_targets
+                                    directory_shard_targets.update(validated_targets)
                                     incomplete_count_keys = (
                                         "missing_shard_count",
                                         "unreadable_shard_count",
@@ -5643,6 +5775,39 @@ def scan_model_directory_or_file(
                         details={
                             "path": guarded_path,
                             "reason": "shard_target_changed_after_scan",
+                            "analysis_incomplete": True,
+                            "operational_error": True,
+                            "scan_outcome": "inconclusive",
+                            "scan_outcome_reason": "shard_boundary_changed",
+                        },
+                    )
+                )
+            directory_boundary_failures = _terminal_safetensors_shard_boundary_failures(
+                directory_shard_targets,
+                index_search_root=base_dir,
+                index_inspection_context=index_inspection_context,
+            )
+            for failed_path, failure_reason in directory_boundary_failures.items():
+                if any(
+                    check.name == "Sharded Model Boundary Check"
+                    and check.location == failed_path
+                    and check.details.get("reason") == failure_reason
+                    for check in results.checks
+                ):
+                    continue
+                aggregate_hash_complete = False
+                scan_metadata["success"] = False
+                scan_metadata["has_operational_errors"] = True
+                results.checks.append(
+                    Check(
+                        name="Sharded Model Boundary Check",
+                        status=CheckStatus.FAILED,
+                        message="Validated directory shard authority changed after scanning.",
+                        severity=IssueSeverity.INFO,
+                        location=failed_path,
+                        details={
+                            "path": failed_path,
+                            "reason": failure_reason,
                             "analysis_incomplete": True,
                             "operational_error": True,
                             "scan_outcome": "inconclusive",
@@ -8618,84 +8783,30 @@ def scan_model_streaming(
             if not _windows_shard_guard_is_stable(guard_fd, guarded_target):
                 record_terminal_shard_boundary_failure(guarded_source, "shard_target_changed_after_scan")
 
-        terminal_index_families: dict[tuple[Any, ...], list[str]] = {}
-        expected_index_proofs: dict[tuple[Any, ...], tuple[str, str, str, int] | None] = {}
-        for validated_source_path, expected_target in validated_shard_targets.items():
-            shard_match = ShardedModelDetector.match_safetensors_shard_filename(Path(validated_source_path).name)
-            if shard_match is None:
-                continue
-            index_base = expected_target.get("authoritative_shard_index_base")
-            index_path = expected_target.get("authoritative_shard_index_path")
-            index_fingerprint = expected_target.get("authoritative_shard_index_fingerprint")
-            index_generation = expected_target.get("authoritative_shard_index_generation")
-            expected_proof: tuple[str, str, str, int] | None = None
-            if (
-                isinstance(index_base, str)
-                and index_base in {"zero", "one"}
-                and isinstance(index_path, str)
-                and index_path
-                and isinstance(index_fingerprint, str)
-                and index_fingerprint
-                and isinstance(index_generation, int)
-                and not isinstance(index_generation, bool)
-                and index_generation > 0
-            ):
-                expected_proof = (index_base, index_path, index_fingerprint, index_generation)
-                family_key: tuple[Any, ...] = ("proof", *expected_proof)
-            else:
-                family_key = (
-                    "unindexed",
-                    os.path.normcase(os.path.normpath(os.path.abspath(Path(validated_source_path).parent))),
-                    shard_match["expected_total_shards"],
-                )
-            terminal_index_families.setdefault(family_key, []).append(validated_source_path)
-            expected_index_proofs[family_key] = expected_proof
-
-        for family_key, family_sources in terminal_index_families.items():
-            expected_proof = expected_index_proofs[family_key]
-            refreshed_proof, authority_present = ShardedModelDetector.refresh_safetensors_index_proof(
-                family_sources[0],
-                index_search_root=stream_index_search_root or Path(family_sources[0]).absolute().parent,
+        def revalidate_terminal_streamed_shards() -> None:
+            search_root = stream_index_search_root
+            if search_root is None and validated_shard_targets:
+                first_source = next(iter(validated_shard_targets))
+                search_root = str(Path(first_source).absolute().parent)
+            if search_root is None:
+                return
+            failures = _terminal_safetensors_shard_boundary_failures(
+                validated_shard_targets,
+                index_search_root=search_root,
                 index_inspection_context=index_inspection_context,
-                force_content_revalidation=True,
+                deleted_paths=deleted_streamed_sources,
             )
-            expected_index_deleted = bool(
-                expected_proof is not None
-                and os.path.normcase(os.path.normpath(os.path.abspath(expected_proof[1]))) in deleted_streamed_sources
-            )
-            expected_index_still_absent = bool(expected_proof is not None and not os.path.lexists(expected_proof[1]))
-            if (refreshed_proof == expected_proof and authority_present == (expected_proof is not None)) or (
-                expected_index_deleted
-                and expected_index_still_absent
-                and refreshed_proof is None
-                and not authority_present
-            ):
-                continue
-            for family_source in family_sources:
-                record_terminal_shard_boundary_failure(family_source, "shard_index_changed_after_scan")
-
-        for validated_source_path, expected_target in list(validated_shard_targets.items()):
-            normalized_source = os.path.normcase(os.path.normpath(os.path.abspath(validated_source_path)))
-            if normalized_source in deleted_streamed_sources and not os.path.lexists(validated_source_path):
-                continue
-            validated_resolved_path = expected_target.get("resolved_path")
-            current_target = _snapshot_validated_shard_target(
-                validated_source_path,
-                resolved_path=validated_resolved_path if isinstance(validated_resolved_path, str) else None,
-            )
-            current_identity = current_target.get(validated_source_path)
-            if current_identity is not None and all(
-                current_identity.get(field) == expected_target.get(field)
-                for field in ("resolved_path", "device", "inode", "size", "mtime_ns", "ctime_ns", "nlink")
-            ):
-                continue
-            record_terminal_shard_boundary_failure(validated_source_path, "shard_target_changed_after_scan")
+            for source_path, reason in failures.items():
+                record_terminal_shard_boundary_failure(source_path, reason)
 
         _reconcile_cross_directory_shard_coverage(
             results,
             validated_shard_targets,
             missing_shard_errors_only=not preserve_shard_reconciliation_errors,
         )
+        # Reconciliation consumes the stored family proof. Validate it once,
+        # immediately afterward, so a final swap cannot certify unscanned bytes.
+        revalidate_terminal_streamed_shards()
 
         # Compute aggregate hash from all file hashes
         if file_hashes and aggregate_hash_complete:

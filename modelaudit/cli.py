@@ -1913,7 +1913,7 @@ class _ScanPathState:
                 _record_shard_boundary_failure(scan_result, source_path)
 
     def revalidate_explicit_shard_targets(self, audit_result: ModelAuditResultModel) -> None:
-        """Recheck explicit shard identity and index authority immediately before reconciliation."""
+        """Recheck explicit shard identity and index authority at the terminal boundary."""
         refreshed_states: dict[
             tuple[str, str, int],
             tuple[bool, tuple[str, str, str, int] | None, bool],
@@ -3107,7 +3107,9 @@ def _resolve_scan_runtime_config(
         selected_scanner_filenames(scanner_policy, conservative=True) if scanner_policy.active else None
     )
     scannable_scanner_ids = scanner_policy.enabled_scanner_ids if scanner_policy.active else None
-    hf_stream_include_all_files = not scanner_policy.active or scannable_extensions is None
+    # Exact scanner policies use the bounded Hugging Face content router for
+    # header matches; they must not silently widen into an all-file download.
+    hf_stream_include_all_files = not scanner_policy.active
 
     return _ScanRuntimeConfig(
         config=config_values,
@@ -4134,9 +4136,21 @@ def _resolve_scan_source_for_path(
                 scannable_filenames=runtime.scannable_filenames,
                 scannable_scanner_ids=runtime.scannable_scanner_ids,
             )
-            owned_filtered_temp_path = (
-                str(temporary_download_paths[0]) if runtime.cache_enabled and temporary_download_paths else None
-            )
+            owned_filtered_temp_path = str(temporary_download_paths[0]) if temporary_download_paths else None
+            if temp_dir is not None and owned_filtered_temp_path is not None:
+                try:
+                    filtered_path_covered_by_temp_root = (
+                        Path(owned_filtered_temp_path).resolve().is_relative_to(Path(temp_dir).resolve())
+                    )
+                except (OSError, RuntimeError):
+                    filtered_path_covered_by_temp_root = False
+                if not filtered_path_covered_by_temp_root:
+                    path_state.defer_temp_cleanup(
+                        owned_filtered_temp_path,
+                        cache_enabled=runtime.cache_enabled,
+                        verbose=verbose,
+                        owned=True,
+                    )
             download_duration = time.time() - download_start
             try:
                 download_size = sum(
@@ -4154,7 +4168,7 @@ def _resolve_scan_source_for_path(
             return _SourceDispatchResult(
                 actual_path=str(download_path),
                 temp_path=temp_dir or owned_filtered_temp_path,
-                temp_path_owned=owned_filtered_temp_path is not None,
+                temp_path_owned=owned_filtered_temp_path is not None and temp_dir is None,
                 source_model_id=source_model_id,
                 source_model_source=source_model_source,
                 repository_file_inventory=tuple(download_repository_file_inventory),
@@ -5404,12 +5418,14 @@ def scan_command(
         _complete_progress_tracking(progress_tracker, verbose=verbose)
         _cleanup_progress_reporters(progress_reporters)
         path_state.revalidate_windows_shard_guards(audit_result)
-        path_state.revalidate_explicit_shard_targets(audit_result)
         _reconcile_cross_directory_shard_coverage(
             audit_result,
             path_state.validated_shard_targets,
             missing_shard_errors_only=not path_state.has_errors_outside_reconciled_shards,
         )
+        # Reconciliation consumes the stored family proof. Validate it once,
+        # immediately afterward, so a final swap cannot certify unscanned bytes.
+        path_state.revalidate_explicit_shard_targets(audit_result)
     finally:
         path_state.close_windows_shard_guards()
     audit_result.finalize_statistics()

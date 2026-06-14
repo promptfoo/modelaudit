@@ -4320,6 +4320,50 @@ def test_directory_scan_sharded_family_cache_fingerprint_tracks_sibling_shards(
     assert first_fingerprint != second_fingerprint
 
 
+def test_directory_scan_rechecks_safetensors_index_after_family_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A governing index changed after handler return must fail the directory scan."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shards = [tmp_path / f"model-{index:05d}-of-00002.safetensors" for index in range(2)]
+    for shard in shards:
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def write_index(prefix: str) -> None:
+        index_path.write_text(
+            json.dumps({"weight_map": {f"{prefix}-{index}": shard.name for index, shard in enumerate(shards)}}),
+            encoding="utf-8",
+        )
+
+    write_index("initial")
+    original_scan_file = core_module.scan_file
+    mutation_count = 0
+
+    def mutate_index_after_family_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal mutation_count
+        result = original_scan_file(path, config)
+        if Path(path).suffix.lower() == ".safetensors":
+            mutation_count += 1
+            write_index("replacement")
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", mutate_index_after_family_scan)
+
+    result = core_module.scan_model_directory_or_file(
+        str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert mutation_count == 1
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows shard guard denies the fixture's in-place rewrite")
 def test_directory_scan_deferred_shard_hash_rejects_same_size_rewrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

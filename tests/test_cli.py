@@ -18,7 +18,7 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from click.testing import CliRunner
@@ -1393,6 +1393,77 @@ def test_scan_multiple_cross_directory_shards_revalidate_authority_before_reconc
     assert index_reads == 2
 
 
+def test_scan_multiple_cross_directory_shards_rechecks_authority_after_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An index swapped during reconciliation cannot certify unscanned final targets."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+
+    def create_shard(parent: str, index: int) -> Path:
+        shard_dir = tmp_path / parent
+        _make_trusted_shard_parent(shard_dir)
+        shard = shard_dir / f"model-{index:05d}-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        return shard
+
+    selected_shards = [create_shard("a", 0), create_shard("b", 1)]
+    decoy_shards = [create_shard("c", 0), create_shard("d", 1)]
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def write_index(shards: list[Path]) -> None:
+        index_path.write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        f"tensor-{index}": shard.relative_to(tmp_path).as_posix() for index, shard in enumerate(shards)
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        index_path.chmod(0o644)
+
+    write_index(selected_shards)
+    original_reconcile = cli_module._reconcile_cross_directory_shard_coverage
+    reconciliation_count = 0
+
+    def replace_index_after_reconciliation(*args: Any, **kwargs: Any) -> bool:
+        nonlocal reconciliation_count
+        result = original_reconcile(*args, **kwargs)
+        reconciliation_count += 1
+        write_index(decoy_shards)
+        return result
+
+    monkeypatch.setattr(
+        cli_module,
+        "_reconcile_cross_directory_shard_coverage",
+        replace_index_after_reconciliation,
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *(str(shard) for shard in selected_shards),
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert reconciliation_count == 1
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in output_payload["checks"]
+    )
+
+
 @pytest.mark.parametrize("create_index_before_reconciliation", [False, True], ids=["stable-unindexed", "new-index"])
 def test_scan_multiple_cross_directory_shards_recheck_unindexed_authority_before_reconciliation(
     tmp_path: Path,
@@ -1530,7 +1601,7 @@ def test_scan_same_directory_shards_rejects_split_index_authority(
         None,
     )
     assert boundary_check is not None, output_payload["checks"]
-    assert boundary_check["details"]["reason"] == "shard_target_changed_during_scan"
+    assert boundary_check["details"]["reason"] == "shard_family_changed_during_scan"
 
 
 @pytest.mark.parametrize("assume_shard_family", [False, True], ids=["default", "assumed-family"])
@@ -4865,6 +4936,45 @@ def test_scan_huggingface_filtered_cache_cleans_owned_staging_after_scan(
     mock_rmtree.assert_called_once_with(str(selection_dir))
 
 
+@patch("modelaudit.cli.is_huggingface_url", return_value=True)
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("tempfile.mkdtemp")
+@patch("shutil.rmtree")
+def test_scan_huggingface_no_cache_cleans_external_filtered_staging(
+    mock_rmtree: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    _mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """A private filtered view outside the no-cache root must be cleaned separately."""
+    temporary_cache = tmp_path / "temporary-cache"
+    temporary_cache.mkdir()
+    selection_dir = tmp_path / "local-app-data" / "modelaudit-hf-selection"
+    selection_dir.mkdir(parents=True)
+    (selection_dir / "model.onnx").write_bytes(b"onnx")
+    mock_mkdtemp.return_value = str(temporary_cache)
+
+    def download_side_effect(*_args: object, **kwargs: object) -> Path:
+        temporary_paths = cast(list[Path], kwargs["temporary_download_paths"])
+        temporary_paths.append(selection_dir)
+        return selection_dir
+
+    mock_download.side_effect = download_side_effect
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--quiet", "--no-cache", "--scanners", "onnx", "hf://test/model"],
+    )
+
+    assert result.exit_code == 0, result.output
+    mock_scan.assert_called_once()
+    mock_rmtree.assert_has_calls([call(str(selection_dir)), call(str(temporary_cache))], any_order=True)
+
+
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
@@ -5840,18 +5950,23 @@ def test_scan_huggingface_streaming_dry_run_gated_json_reports_acquisition_error
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.download_file_from_hf")
 @patch("modelaudit.utils.sources.huggingface.get_model_info")
-def test_scan_huggingface_streaming_dry_run_exact_zip_include_all_overflow_reports_live_bound(
+def test_scan_huggingface_streaming_dry_run_exact_zip_does_not_implicitly_include_all(
     mock_get_model_info: MagicMock,
     mock_download_file: MagicMock,
     mock_download_model: MagicMock,
     mock_download_streaming: MagicMock,
     mock_plan_streaming: MagicMock,
 ) -> None:
-    """Exact generic stream dry-run should report the live include-all overflow."""
-    mock_plan_streaming.side_effect = RuntimeError(
-        "Refusing to stream-download unfiltered files from test/model: repository listing exceeds the bounded "
-        "unfiltered candidate limit (128); streaming coverage is incomplete"
-    )
+    """Exact header-routed policies must probe candidates instead of selecting every file."""
+    mock_plan_streaming.return_value = types.SimpleNamespace(deadline=None, selected_files=["archive.zip"])
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 10,
+        "file_count": 1,
+        "inventory_status": "complete",
+        "inaccessible_gated_bytes": 0,
+        "unknown_size_count": 0,
+    }
 
     result = CliRunner().invoke(
         cli,
@@ -5859,14 +5974,12 @@ def test_scan_huggingface_streaming_dry_run_exact_zip_include_all_overflow_repor
     )
 
     parsed = parse_click_json_output(result.output)
-    assert result.exit_code == 2
-    assert "repository listing exceeds the bounded unfiltered candidate limit (128)" in result.output
-    assert "No metadata-routed Hugging Face files match" not in result.output
-    assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
+    assert result.exit_code == 0, result.output
+    assert parsed["selected_file_count"] == 1
     mock_plan_streaming.assert_called_once()
     assert mock_plan_streaming.call_args.kwargs["allow_content_probes"] is False
-    assert mock_plan_streaming.call_args.kwargs["include_all_files"] is True
-    mock_get_model_info.assert_not_called()
+    assert mock_plan_streaming.call_args.kwargs["include_all_files"] is False
+    mock_get_model_info.assert_called_once()
     mock_download_file.assert_not_called()
     mock_download_model.assert_not_called()
     mock_download_streaming.assert_not_called()
@@ -7983,7 +8096,10 @@ def test_scan_huggingface_streaming_passes_selected_scanner_extensions(
     assert "include_all_files" not in mock_download_streaming.call_args.kwargs
 
 
-@pytest.mark.parametrize("scanner_args", [[], ["--scanners", "zip"]])
+@pytest.mark.parametrize(
+    ("scanner_args", "expected_include_all"),
+    [([], True), (["--scanners", "zip"], False)],
+)
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
@@ -7992,8 +8108,9 @@ def test_scan_huggingface_streaming_preserves_header_routed_unknown_suffixes(
     mock_download_streaming: MagicMock,
     mock_is_hf_url: MagicMock,
     scanner_args: list[str],
+    expected_include_all: bool,
 ) -> None:
-    """Default and header-routed scans should request bounded unknown-suffix coverage."""
+    """Default scans include all; exact header policies use bounded content routing."""
     mock_is_hf_url.return_value = True
     mock_download_streaming.return_value = iter(())
     mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
@@ -8002,7 +8119,10 @@ def test_scan_huggingface_streaming_preserves_header_routed_unknown_suffixes(
     result = runner.invoke(cli, ["scan", "--stream", *scanner_args, "--quiet", "hf://test/model"])
 
     assert result.exit_code == 0
-    assert mock_download_streaming.call_args.kwargs["include_all_files"] is True
+    if expected_include_all:
+        assert mock_download_streaming.call_args.kwargs["include_all_files"] is True
+    else:
+        assert "include_all_files" not in mock_download_streaming.call_args.kwargs
     if scanner_args:
         assert "scannable_extensions" not in mock_download_streaming.call_args.kwargs
 

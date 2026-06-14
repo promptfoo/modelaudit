@@ -3232,14 +3232,22 @@ def _select_huggingface_model_files(
     validated_index_proofs: list[HuggingFaceSafetensorsIndexProof] | None = None,
 ) -> list[str]:
     """Select extension matches, bounded content routes, and validated SafeTensors index families."""
+    selected_extensions = {str(extension).lower() for extension in model_extensions}
     selected_filenames = (
         set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
     )
+    if scannable_scanner_ids is not None:
+        policy_extensions, policy_filenames = _get_hf_scanner_policy_initial_routes(scannable_scanner_ids)
+        selected_extensions.intersection_update(policy_extensions)
+        if scannable_filenames is None:
+            selected_filenames = policy_filenames
+        else:
+            selected_filenames.intersection_update(policy_filenames)
     model_files = list(
         dict.fromkeys(
             filename
             for filename in repo_files
-            if _is_scannable_hf_file(filename, model_extensions)
+            if _is_scannable_hf_file(filename, selected_extensions)
             or PurePosixPath(filename).name.lower() in selected_filenames
         )
     )
@@ -3472,10 +3480,7 @@ def _safe_remote_safetensors_index_target(index_file: str, raw_target: str) -> s
 
 def _remote_safetensors_shard_parts(filename: str) -> tuple[str, int, int] | None:
     """Parse an arbitrary-stem remote SafeTensors shard name."""
-    match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(PurePosixPath(filename).name)
-    if match is None:
-        return None
-    return match.group("stem"), int(match.group("index")), int(match.group("total"))
+    return _parse_hf_safetensors_shard_shape(PurePosixPath(filename).name)
 
 
 def _remote_safetensors_family_files(filenames: Collection[str]) -> dict[tuple[str, str, int], set[str]]:
@@ -3924,6 +3929,35 @@ def _get_default_hf_streaming_filenames() -> set[str]:
     return filenames
 
 
+def _get_hf_scanner_policy_initial_routes(
+    scannable_scanner_ids: Collection[str],
+) -> tuple[set[str], set[str]]:
+    """Return direct suffix and basename routes owned by exact scanner policy."""
+    from ...scanner_registry_metadata import get_scanner_registry_metadata
+
+    scanner_metadata = get_scanner_registry_metadata()
+    extensions: set[str] = set()
+    filenames: set[str] = set()
+    for scanner_id in {str(value).lower() for value in scannable_scanner_ids}:
+        scanner_info = scanner_metadata.get(scanner_id, {})
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            extensions.update(
+                extension_text
+                for extension in scanner_info.get(key, [])
+                if (extension_text := str(extension).lower()) not in remote_excluded_extensions
+            )
+        filenames.update(
+            filename_text
+            for filename in scanner_info.get("content_routed_filenames", [])
+            if (filename_text := str(filename).lower())
+            and PurePosixPath(filename_text).suffix.lower() not in remote_excluded_extensions
+        )
+    return extensions, filenames
+
+
 def _get_hf_content_route_formats() -> set[str]:
     """Return every format the bounded Hugging Face content probe may emit."""
     from modelaudit.utils.file.detection import (
@@ -4186,18 +4220,38 @@ def _select_streamable_hf_files(
         filenames = (
             set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
         )
+    if scannable_scanner_ids is not None:
+        policy_extensions, policy_filenames = _get_hf_scanner_policy_initial_routes(scannable_scanner_ids)
+        extensions.intersection_update(policy_extensions)
+        if scannable_filenames is None:
+            filenames = policy_filenames
+        else:
+            filenames.intersection_update(policy_filenames)
     model_files: list[str] = []
     content_route_formats: dict[str, str] = {}
     extensionless_count = 0
     include_all_extra_count = 0
     seen_files: set[str] = set()
+    allow_safetensors_index_expansion = _allows_safetensors_index_expansion(
+        scannable_extensions,
+        scannable_scanner_ids,
+        include_all_files=include_all_files,
+    )
+    normalized_scanner_ids = (
+        None if scannable_scanner_ids is None else {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}
+    )
+    include_safetensors_index_metadata = (
+        allow_safetensors_index_expansion and scannable_extensions is None and normalized_scanner_ids == {"safetensors"}
+    )
 
     for file_name in repo_files:
         if file_name in seen_files:
             continue
         seen_files.add(file_name)
 
-        if _is_scannable_hf_file(file_name, extensions):
+        if _is_scannable_hf_file(file_name, extensions) or (
+            include_safetensors_index_metadata and _is_hf_safetensors_index_filename(file_name)
+        ):
             model_files.append(file_name)
             continue
 
@@ -4319,11 +4373,6 @@ def _select_streamable_hf_files(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
             deadline=deadline,
         )
-    allow_safetensors_index_expansion = _allows_safetensors_index_expansion(
-        scannable_extensions,
-        scannable_scanner_ids,
-        include_all_files=include_all_files,
-    )
     validated_safetensors_indexes: list[str] = []
     if not defer_safetensors_index_validation:
         model_files = _validate_remote_safetensors_indexes(
@@ -4548,9 +4597,37 @@ def _stat_huggingface_cache_path(path: Path) -> os.stat_result:
     return os.stat(path, follow_symlinks=False)
 
 
-def _filtered_huggingface_cache_trust_supported() -> bool:
-    """Return whether per-invocation filtered staging is available."""
-    return True
+def _is_windows_platform() -> bool:
+    """Return whether Windows path and ACL semantics apply."""
+    return os.name == "nt"
+
+
+def _get_windows_huggingface_filtered_staging_root() -> Path | None:
+    """Return Windows' canonical per-user Local AppData directory."""
+    if not _is_windows_platform():
+        return None
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32_768)
+        windll = getattr(ctypes, "windll", None)
+        shell32 = getattr(windll, "shell32", None)
+        get_folder_path = getattr(shell32, "SHGetFolderPathW", None)
+        if get_folder_path is None or get_folder_path(None, 0x001C, None, 0, buffer) != 0:
+            return None
+        local_app_data = buffer.value
+        if not local_app_data:
+            return None
+        return Path(os.path.abspath(local_app_data))
+    except Exception:
+        return None
+
+
+def _is_windows_reparse_point_stat(path_stat: os.stat_result) -> bool:
+    """Return whether a non-following stat identifies a Windows reparse point."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    return bool(reparse_flag and file_attributes & reparse_flag)
 
 
 def _is_trusted_huggingface_filtered_download_path(cache_root: Path, download_path: Path) -> bool:
@@ -4561,8 +4638,19 @@ def _is_trusted_huggingface_filtered_download_path(cache_root: Path, download_pa
         if not _is_lexically_within_directory(lexical_cache_root, lexical_download_path):
             return False
 
+        windows_platform = _is_windows_platform()
+        if windows_platform:
+            windows_staging_root = _get_windows_huggingface_filtered_staging_root()
+            if (
+                windows_staging_root is None
+                or os.path.normcase(os.path.abspath(windows_staging_root))
+                != os.path.normcase(os.path.abspath(lexical_cache_root))
+                or lexical_download_path.parent != lexical_cache_root
+            ):
+                return False
+
         effective_uid: int | None = None
-        if os.name != "nt":
+        if not windows_platform:
             get_effective_uid = getattr(os, "geteuid", None)
             if not callable(get_effective_uid):
                 return False
@@ -4572,7 +4660,9 @@ def _is_trusted_huggingface_filtered_download_path(cache_root: Path, download_pa
         cache_root_stat: os.stat_result | None = None
         while True:
             current_stat = _stat_huggingface_cache_path(current)
-            if not stat.S_ISDIR(current_stat.st_mode):
+            if not stat.S_ISDIR(current_stat.st_mode) or (
+                windows_platform and _is_windows_reparse_point_stat(current_stat)
+            ):
                 return False
             if effective_uid is not None and (
                 current_stat.st_uid != effective_uid or stat.S_IMODE(current_stat.st_mode) & 0o022
@@ -4585,8 +4675,15 @@ def _is_trusted_huggingface_filtered_download_path(cache_root: Path, download_pa
                 return False
             current = current.parent
 
-        if effective_uid is None:
-            return True
+        if windows_platform:
+            current = lexical_cache_root.parent
+            while True:
+                current_stat = _stat_huggingface_cache_path(current)
+                if not stat.S_ISDIR(current_stat.st_mode) or _is_windows_reparse_point_stat(current_stat):
+                    return False
+                if current == current.parent:
+                    return True
+                current = current.parent
         assert cache_root_stat is not None
         protected_child_stat = cache_root_stat
         current = lexical_cache_root.parent
@@ -4617,35 +4714,27 @@ def _build_huggingface_filtered_download_path(
     namespace: str,
     repo_name: str,
     repo_id: str,
-    revision: str,
-    filenames: Collection[str],
-    scannable_extensions: Collection[str] | None,
-    scannable_scanner_ids: Collection[str] | None,
 ) -> Path:
     """Return an exclusive non-symlink staging directory under a trusted cache root."""
     lexical_cache_root = Path(os.path.abspath(cache_root))
-    selection_key = hashlib.sha256(
-        json.dumps(
-            {
-                "schema": "modelaudit-hf-selection-v1",
-                "repo": repo_id,
-                "revision": revision,
-                "filenames": sorted(set(filenames)),
-                "extensions": (
-                    None
-                    if scannable_extensions is None
-                    else sorted(str(value).lower() for value in scannable_extensions)
-                ),
-                "scanners": (
-                    None
-                    if scannable_scanner_ids is None
-                    else sorted(str(value).lower() for value in scannable_scanner_ids)
-                ),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
+    if _is_windows_platform():
+        windows_staging_root = _get_windows_huggingface_filtered_staging_root()
+        if (
+            windows_staging_root is None
+            or os.path.normcase(os.path.abspath(windows_staging_root))
+            != os.path.normcase(os.path.abspath(lexical_cache_root))
+            or not _ensure_secure_directory(lexical_cache_root)
+        ):
+            raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
+        try:
+            selection_path = Path(tempfile.mkdtemp(prefix="modelaudit-hf-", dir=lexical_cache_root))
+            if not _is_trusted_huggingface_filtered_download_path(lexical_cache_root, selection_path):
+                selection_path.rmdir()
+                raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
+        except OSError as exc:
+            raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}") from exc
+        return selection_path
+
     selection_parent = lexical_cache_root / ".modelaudit-selections" / namespace
     if repo_name:
         selection_parent = selection_parent / repo_name
@@ -4656,36 +4745,13 @@ def _build_huggingface_filtered_download_path(
     ):
         raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
     try:
-        selection_path = Path(tempfile.mkdtemp(prefix=f"{selection_key}-", dir=selection_parent))
+        selection_path = Path(tempfile.mkdtemp(prefix="selection-", dir=selection_parent))
         if not _is_trusted_huggingface_filtered_download_path(lexical_cache_root, selection_path):
             selection_path.rmdir()
             raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
     except OSError as exc:
         raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}") from exc
     return selection_path
-
-
-def _prune_huggingface_filtered_download_path(download_path: Path, selected_files: Collection[str]) -> None:
-    """Remove stale unselected leaves from one ModelAudit-owned filtered view."""
-    selected = set(selected_files)
-    for root, directories, filenames in os.walk(download_path, topdown=False, followlinks=False):
-        root_path = Path(root)
-        for filename in filenames:
-            candidate = root_path / filename
-            relative = candidate.relative_to(download_path).as_posix()
-            if PurePosixPath(relative).parts[:2] == (".cache", "huggingface") or relative in selected:
-                continue
-            candidate.unlink()
-        for directory in directories:
-            candidate = root_path / directory
-            relative_parts = candidate.relative_to(download_path).parts
-            if relative_parts[:2] == (".cache", "huggingface"):
-                continue
-            if candidate.is_symlink():
-                candidate.unlink()
-            else:
-                with suppress(OSError):
-                    candidate.rmdir()
 
 
 def _list_repo_files_with_timeout(
@@ -5769,6 +5835,12 @@ def download_model(
     disk_check_path = None
     download_path_preexisting = False
     filtered_cache_root: Path | None = None
+    filtered_staging_handed_off = False
+    windows_filtered_staging_root = (
+        _get_windows_huggingface_filtered_staging_root() if selection_is_filtered and _is_windows_platform() else None
+    )
+    if selection_is_filtered and _is_windows_platform() and windows_filtered_staging_root is None:
+        raise ValueError(f"Unable to identify a private filtered Hugging Face staging root for {repo_id}")
 
     if cache_dir is not None and not selection_is_filtered:
         # Create a structured, containment-checked cache directory.
@@ -5777,7 +5849,9 @@ def download_model(
         download_path.mkdir(parents=True, exist_ok=True)
         disk_check_path = download_path
     else:
-        disk_check_path = cache_dir / "huggingface" if cache_dir is not None else _get_hf_cache_root()
+        disk_check_path = windows_filtered_staging_root or (
+            cache_dir / "huggingface" if cache_dir is not None else _get_hf_cache_root()
+        )
         if selection_is_filtered:
             if not _ensure_secure_directory(disk_check_path):
                 raise ValueError(f"Unable to create a safe filtered Hugging Face cache root for {repo_id}")
@@ -5813,16 +5887,14 @@ def download_model(
             repository_file_inventory[:] = plan.repo_files
 
         if selection_is_filtered:
-            filtered_cache_root = cache_dir / "huggingface" if cache_dir is not None else _get_hf_cache_root()
+            filtered_cache_root = windows_filtered_staging_root or (
+                cache_dir / "huggingface" if cache_dir is not None else _get_hf_cache_root()
+            )
             download_path = _build_huggingface_filtered_download_path(
                 filtered_cache_root,
                 namespace,
                 repo_name,
                 repo_id,
-                plan.download_revision,
-                model_files,
-                scannable_extensions,
-                scannable_scanner_ids,
             )
             # Each filtered view is exclusive to this invocation and must be
             # retained only until its caller finishes scanning it.
@@ -5882,7 +5954,7 @@ def download_model(
         def verified_downloaded_path(local_path: str) -> Path:
             """Bind a filtered SDK result to the exclusive staging path we created."""
             downloaded = Path(local_path)
-            if not selection_is_filtered or temporary_download_paths is None:
+            if not selection_is_filtered:
                 return downloaded
             assert download_path is not None and filtered_cache_root is not None
             if os.path.normcase(os.path.abspath(downloaded)) != os.path.normcase(
@@ -6021,12 +6093,14 @@ def download_model(
         if selection_is_filtered and temporary_download_paths is not None:
             temporary_download_paths.append(downloaded_path)
 
+        filtered_staging_handed_off = selection_is_filtered
         return Path(local_path)
-    except Exception as e:
+    except BaseException as e:
         # A filtered view is always exclusive to this invocation. Remove it on
         # acquisition failure; successful callers retain it through scanning.
         if (
             selection_is_filtered
+            and not filtered_staging_handed_off
             and filtered_cache_root is not None
             and download_path is not None
             and download_path.exists()
@@ -6035,13 +6109,16 @@ def download_model(
             with suppress(OSError):
                 shutil.rmtree(download_path)
         elif (
-            cache_dir is not None
+            not selection_is_filtered
+            and cache_dir is not None
             and download_path is not None
             and not download_path_preexisting
             and download_path.exists()
             and _is_within_directory(cache_dir / "huggingface", download_path)
         ):
             shutil.rmtree(download_path)
+        if not isinstance(e, Exception):
+            raise
         raise Exception(
             f"Failed to download model from {display_url}: {redact_huggingface_urls_in_text(str(e))}"
         ) from e

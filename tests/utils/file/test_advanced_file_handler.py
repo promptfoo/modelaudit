@@ -1198,6 +1198,32 @@ class TestShardedModelDetector:
         assert result.success is True
         assert determine_exit_code(result) == 0
 
+    def test_advanced_handler_rechecks_index_authority_for_every_shard_parent(self, tmp_path: Path) -> None:
+        """A closer index appearing under a later shard parent must invalidate the root proof."""
+        header = b'{"__metadata__":{"format":"pt"}}'
+        first = tmp_path / "a" / "model-00000-of-00002.safetensors"
+        second = tmp_path / "b" / "model-00001-of-00002.safetensors"
+        for shard in (first, second):
+            shard.parent.mkdir()
+            shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        _write_safetensors_index(
+            tmp_path, [first.relative_to(tmp_path).as_posix(), second.relative_to(tmp_path).as_posix()]
+        )
+        handler = AdvancedFileHandler(str(first), CompletingShardScanner(), index_search_root=tmp_path)
+
+        replacement = second.parent / "c" / "model-00000-of-00002.safetensors"
+        replacement.parent.mkdir()
+        replacement.write_bytes(struct.pack("<Q", len(header)) + header)
+        _write_safetensors_index(
+            second.parent,
+            [replacement.relative_to(second.parent).as_posix(), second.name],
+        )
+
+        result = handler.scan()
+
+        assert result.success is False
+        assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
+
     def test_detect_safetensors_nested_index_rejects_symlink_outside_root(
         self,
         tmp_path: Path,
@@ -1244,7 +1270,12 @@ class TestShardedModelDetector:
 
         class IndexSwappingScanner(CompletingShardScanner):
             def scan(self, shard_path: str) -> ScanResult:
-                _write_safetensors_index(tmp_path, [family_b.relative_to(tmp_path).as_posix()])
+                replacement_index = _write_safetensors_index(
+                    tmp_path,
+                    [family_b.relative_to(tmp_path).as_posix()],
+                    index_name="replacement.json",
+                )
+                replacement_index.replace(index_path)
                 return super().scan(shard_path)
 
         result = AdvancedFileHandler(
@@ -2894,6 +2925,7 @@ class TestAdvancedFileHandler:
             allowed_paths: list[str] | None = None,
             allowed_targets: ValidatedShardTargets | None = None,
             index_search_root: str | os.PathLike[str] | None = None,
+            index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
             force_index_content_revalidation: bool = False,
         ) -> dict[str, Any]:
             del (
@@ -2902,6 +2934,7 @@ class TestAdvancedFileHandler:
                 allowed_paths,
                 allowed_targets,
                 index_search_root,
+                index_inspection_context,
                 force_index_content_revalidation,
             )
             return {

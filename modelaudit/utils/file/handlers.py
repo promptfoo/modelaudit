@@ -1577,6 +1577,7 @@ class ShardedModelDetector:
                             "size": shard_size,
                             "mtime_ns": shard_stat.st_mtime_ns,
                             "ctime_ns": shard_stat.st_ctime_ns,
+                            "nlink": shard_stat.st_nlink,
                         }
                         total_size += shard_size
                         if file_match.lastindex:
@@ -1708,6 +1709,58 @@ class ShardedModelDetector:
                 return str(config_path)
 
         return None
+
+
+def _safetensors_shard_info_authority_is_stable(
+    shard_info: dict[str, Any] | None,
+    *,
+    index_search_root: str | os.PathLike[str] | None,
+    index_inspection_context: _SafetensorsIndexInspectionContext,
+    force_content_revalidation: bool,
+) -> bool:
+    """Require every SafeTensors shard parent to retain one agreed index proof."""
+    if not isinstance(shard_info, dict) or shard_info.get("pattern") != SAFETENSORS_SHARD_PATTERN:
+        return True
+    expected_total = shard_info.get("expected_total_shards")
+    raw_shards = shard_info.get("shards")
+    if (
+        not isinstance(expected_total, int)
+        or isinstance(expected_total, bool)
+        or expected_total <= 0
+        or not isinstance(raw_shards, list)
+        or not raw_shards
+        or not all(isinstance(path, str) for path in raw_shards)
+    ):
+        return False
+
+    index_base = shard_info.get("shard_index_base")
+    index_path = shard_info.get("safetensors_index_path")
+    index_fingerprint = shard_info.get("safetensors_index_fingerprint")
+    index_generation = shard_info.get("safetensors_index_generation")
+    authority_present = isinstance(index_path, str) and bool(index_path)
+    expected_proof: tuple[str, str, str, int] | None = None
+    if (
+        isinstance(index_base, str)
+        and index_base in {"zero", "one"}
+        and isinstance(index_path, str)
+        and bool(index_path)
+        and isinstance(index_fingerprint, str)
+        and bool(index_fingerprint)
+        and isinstance(index_generation, int)
+        and not isinstance(index_generation, bool)
+        and index_generation > 0
+    ):
+        expected_proof = (index_base, _normalized_absolute_path(index_path), index_fingerprint, index_generation)
+
+    shard_paths = [path for path in raw_shards if isinstance(path, str)]
+    refreshed_proof, refreshed_authority_present = ShardedModelDetector.refresh_safetensors_index_proofs(
+        shard_paths,
+        expected_total=expected_total,
+        index_search_root=index_search_root or Path(shard_paths[0]).absolute().parent,
+        index_inspection_context=index_inspection_context,
+        force_content_revalidation=force_content_revalidation,
+    )
+    return (refreshed_proof, refreshed_authority_present) == (expected_proof, authority_present)
 
 
 def _grouped_shard_boundary_error(
@@ -2441,6 +2494,14 @@ class AdvancedFileHandler:
         self.timeout = timeout
         self.start_time = time.time()
         scanner_config = getattr(scanner, "config", {})
+        configured_index_context = (
+            scanner_config.get(_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY) if isinstance(scanner_config, dict) else None
+        )
+        self.index_inspection_context = (
+            configured_index_context
+            if isinstance(configured_index_context, _SafetensorsIndexInspectionContext)
+            else _CURRENT_SAFETENSORS_INDEX_CONTEXT.get() or _SafetensorsIndexInspectionContext()
+        )
         prevalidated_shard_info = (
             scanner_config.get(_PREVALIDATED_SHARD_INFO_CONFIG_KEY) if isinstance(scanner_config, dict) else None
         )
@@ -2470,6 +2531,7 @@ class AdvancedFileHandler:
                     allowed_paths=allowed_shard_paths,
                     allowed_targets=allowed_shard_targets,
                     index_search_root=index_search_root,
+                    index_inspection_context=self.index_inspection_context,
                 )
             )
         )
@@ -2512,14 +2574,20 @@ class AdvancedFileHandler:
             result = handler.scan()
 
         if not self.uses_prevalidated_shard_info:
+            authority_stable = _safetensors_shard_info_authority_is_stable(
+                self.detected_shard_info,
+                index_search_root=self.index_search_root,
+                index_inspection_context=self.index_inspection_context,
+                force_content_revalidation=not self.defers_safetensors_index_content_revalidation,
+            )
             current_shard_info = ShardedModelDetector.detect_shards(
                 self.file_path,
                 allowed_paths=self.allowed_shard_paths,
                 allowed_targets=self.allowed_shard_targets,
                 index_search_root=self.index_search_root,
-                force_index_content_revalidation=not self.defers_safetensors_index_content_revalidation,
+                index_inspection_context=self.index_inspection_context,
             )
-            if current_shard_info != self.detected_shard_info:
+            if not authority_stable or current_shard_info != self.detected_shard_info:
                 return _preserve_findings_with_shard_boundary_failure(
                     result,
                     self.scanner.name,
@@ -2889,6 +2957,12 @@ def scan_advanced_large_file(
     """
     # Check if caching is enabled in scanner config
     config = getattr(scanner, "config", {})
+    configured_index_context = config.get(_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY)
+    index_inspection_context = (
+        configured_index_context
+        if isinstance(configured_index_context, _SafetensorsIndexInspectionContext)
+        else _CURRENT_SAFETENSORS_INDEX_CONTEXT.get() or _SafetensorsIndexInspectionContext()
+    )
     cache_enabled = config.get("cache_enabled", True)
     cache_dir = config.get("cache_dir")
     prevalidated_shard_info = config.get(_PREVALIDATED_SHARD_INFO_CONFIG_KEY)
@@ -2909,6 +2983,7 @@ def scan_advanced_large_file(
             allowed_paths=allowed_shard_paths,
             allowed_targets=allowed_shard_targets,
             index_search_root=index_search_root,
+            index_inspection_context=index_inspection_context,
         )
     )
     if (
@@ -3040,6 +3115,7 @@ def scan_advanced_large_file(
                 allowed_paths=allowed_shard_paths,
                 allowed_targets=allowed_shard_targets,
                 index_search_root=index_search_root,
+                index_inspection_context=index_inspection_context,
             )
             if current_shard_info != shard_info:
                 result = _preserve_findings_with_shard_boundary_failure(
@@ -3073,14 +3149,20 @@ def scan_advanced_large_file(
 
         result = scan_result_from_dict(result_dict)
 
+        authority_stable = _safetensors_shard_info_authority_is_stable(
+            shard_info,
+            index_search_root=index_search_root,
+            index_inspection_context=index_inspection_context,
+            force_content_revalidation=not cache_miss_executed and not defer_index_content_revalidation,
+        )
         post_scan_shard_info = ShardedModelDetector.detect_shards(
             file_path,
             allowed_paths=allowed_shard_paths,
             allowed_targets=allowed_shard_targets,
             index_search_root=index_search_root,
-            force_index_content_revalidation=not cache_miss_executed and not defer_index_content_revalidation,
+            index_inspection_context=index_inspection_context,
         )
-        if post_scan_shard_info != shard_info:
+        if not authority_stable or post_scan_shard_info != shard_info:
             return _preserve_findings_with_shard_boundary_failure(
                 result,
                 scanner.name,

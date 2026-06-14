@@ -1517,6 +1517,106 @@ def test_scan_model_streaming_revalidates_index_content_when_stat_identity_is_un
     assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
 
 
+def test_scan_model_streaming_rechecks_index_authority_for_every_shard_parent(tmp_path: Path) -> None:
+    """A closer index appearing under a later streamed parent must invalidate the root proof."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    first = tmp_path / "a" / "model-00000-of-00002.safetensors"
+    second = tmp_path / "b" / "model-00001-of-00002.safetensors"
+    for shard in (first, second):
+        shard.parent.mkdir()
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "first": first.relative_to(tmp_path).as_posix(),
+                    "second": second.relative_to(tmp_path).as_posix(),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def shard_stream() -> Iterator[tuple[Path, bool]]:
+        yield first, False
+        yield second, True
+        replacement = second.parent / "c" / "model-00000-of-00002.safetensors"
+        replacement.parent.mkdir()
+        replacement.write_bytes(struct.pack("<Q", len(header)) + header)
+        (second.parent / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "replacement": replacement.relative_to(second.parent).as_posix(),
+                        "second": second.name,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    result = scan_model_streaming(
+        file_generator=shard_stream(),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
+def test_scan_model_streaming_rechecks_index_after_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A final index swap during reconciliation cannot certify previously scanned shards."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shards = [tmp_path / f"model-{index:05d}-of-00002.safetensors" for index in range(2)]
+    for shard in shards:
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+    index_path = tmp_path / "model.safetensors.index.json"
+
+    def write_index(prefix: str) -> None:
+        index_path.write_text(
+            json.dumps({"weight_map": {f"{prefix}-{index}": shard.name for index, shard in enumerate(shards)}}),
+            encoding="utf-8",
+        )
+
+    write_index("initial")
+    original_reconcile = _reconcile_cross_directory_shard_coverage
+    reconciliation_count = 0
+
+    def replace_index_after_reconciliation(*args: Any, **kwargs: Any) -> bool:
+        nonlocal reconciliation_count
+        result = original_reconcile(*args, **kwargs)
+        reconciliation_count += 1
+        write_index("replacement")
+        return result
+
+    monkeypatch.setattr(
+        "modelaudit.core._reconcile_cross_directory_shard_coverage",
+        replace_index_after_reconciliation,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert reconciliation_count == 1
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
 def test_scan_model_streaming_stable_windows_index_uses_one_terminal_revalidation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

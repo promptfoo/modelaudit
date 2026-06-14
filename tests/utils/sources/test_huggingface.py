@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -116,7 +117,6 @@ def _trusted_system_temp_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
     from modelaudit.utils.sources import huggingface as huggingface_module
 
     if os.name == "nt":
-        monkeypatch.setattr(huggingface_module, "_filtered_huggingface_cache_trust_supported", lambda: True)
         return
     original_stat = huggingface_module._stat_huggingface_cache_path
     system_temp = Path(tempfile.gettempdir()).resolve()
@@ -820,6 +820,70 @@ class TestExtractModelIdFromPath:
 
 
 class TestModelDownload:
+    @pytest.mark.parametrize("streaming", [False, True], ids=["standard", "streaming"])
+    def test_exact_flax_policy_does_not_select_unrelated_known_extensions(
+        self,
+        streaming: bool,
+    ) -> None:
+        """Header routing must not widen exact scanner policy into every known suffix."""
+        repo_files = ["flax_model.msgpack", "huge.onnx", "README.md"]
+        sizes = {"flax_model.msgpack": 10, "huge.onnx": 1_000, "README.md": 500}
+
+        def detect_route(_repo: str, filename: str, _revision: str, _budget: Any) -> str | None:
+            return "onnx" if filename == "huge.onnx" else None
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                side_effect=detect_route,
+            ) as mock_detect,
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=(sizes, _HF_TEST_REVISION),
+            ),
+        ):
+            planner = plan_huggingface_streaming_download if streaming else plan_huggingface_model_download
+            plan = planner(
+                "https://huggingface.co/test/model",
+                max_size=100,
+                scannable_scanner_ids={"flax_msgpack"},
+            )
+
+        assert plan.selected_files == ["flax_model.msgpack"]
+        assert {call.args[1] for call in mock_detect.call_args_list} == {"huge.onnx", "README.md"}
+
+    @pytest.mark.parametrize("streaming", [False, True], ids=["standard", "streaming"])
+    def test_exact_flax_policy_content_routes_renamed_payloads(self, streaming: bool) -> None:
+        """Narrow initial routes must retain bounded positive header discovery."""
+        repo_files = ["flax_model.msgpack", "renamed.bin"]
+        sizes = dict.fromkeys(repo_files, 10)
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                return_value="flax_msgpack",
+            ) as mock_detect,
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=(sizes, _HF_TEST_REVISION),
+            ),
+        ):
+            planner = plan_huggingface_streaming_download if streaming else plan_huggingface_model_download
+            plan = planner(
+                "https://huggingface.co/test/model",
+                scannable_scanner_ids={"flax_msgpack"},
+            )
+
+        assert plan.selected_files == repo_files
+        mock_detect.assert_called_once()
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
     @patch(
@@ -1154,10 +1218,13 @@ class TestModelDownload:
         tmp_path: Path,
     ) -> None:
         """An ONNX-only download must content-prove a SafeTensors-named data file before excluding it."""
-        download_path = tmp_path / "download"
-        download_path.mkdir()
-        (download_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
-        mock_snapshot_download.return_value = str(download_path)
+
+        def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
+            download_path = Path(local_dir)
+            (download_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
+            return str(download_path)
+
+        mock_snapshot_download.side_effect = snapshot_side_effect
         safetensors_header = b'{"__metadata__":{"format":"pt"}}'
         mock_requests_get.return_value = _FakeRangeResponse(
             struct.pack("<Q", len(safetensors_header)) + safetensors_header
@@ -1170,7 +1237,7 @@ class TestModelDownload:
             scannable_scanner_ids={"onnx"},
         )
 
-        assert result == download_path
+        assert result == Path(mock_snapshot_download.call_args.kwargs["local_dir"])
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.onnx"]
         mock_requests_get.assert_called_once()
         assert "model-00000-of-00001.safetensors" in mock_requests_get.call_args.args[0]
@@ -1369,10 +1436,6 @@ class TestModelDownload:
             "test",
             "model",
             "test/model",
-            _HF_TEST_REVISION,
-            ["model.onnx"],
-            {".onnx"},
-            {"onnx"},
         )
 
         assert selection_path.is_dir()
@@ -1380,12 +1443,12 @@ class TestModelDownload:
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
     @pytest.mark.parametrize("ancestor_mode", [0o770, 0o777])
-    def test_download_model_filtered_cache_rejects_writable_ancestor_before_pruning(
+    def test_download_model_filtered_cache_rejects_writable_ancestor_before_download(
         self,
         tmp_path: Path,
         ancestor_mode: int,
     ) -> None:
-        """A shared-user-replaceable selection hierarchy must fail before local mutation or download."""
+        """A shared-user-replaceable selection hierarchy must fail before download."""
         cache_dir = tmp_path / "cache"
         unsafe_parent = cache_dir / "huggingface" / ".modelaudit-selections" / "test"
         unsafe_parent.mkdir(parents=True)
@@ -1403,7 +1466,6 @@ class TestModelDownload:
                 "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
                 return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
             ),
-            patch("modelaudit.utils.sources.huggingface._prune_huggingface_filtered_download_path") as mock_prune,
             patch("huggingface_hub.snapshot_download") as mock_snapshot_download,
             pytest.raises(Exception, match="safe filtered Hugging Face cache path"),
         ):
@@ -1414,7 +1476,6 @@ class TestModelDownload:
                 scannable_scanner_ids={"onnx"},
             )
 
-        mock_prune.assert_not_called()
         mock_snapshot_download.assert_not_called()
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
@@ -1457,10 +1518,6 @@ class TestModelDownload:
                 "test",
                 "model",
                 "test/model",
-                _HF_TEST_REVISION,
-                ["model.onnx"],
-                {".onnx"},
-                {"onnx"},
             )
 
     def test_build_filtered_cache_rejects_symlink_component(
@@ -1485,10 +1542,6 @@ class TestModelDownload:
                 "test",
                 "model",
                 "test/model",
-                _HF_TEST_REVISION,
-                ["model.onnx"],
-                {".onnx"},
-                {"onnx"},
             )
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
@@ -1497,10 +1550,8 @@ class TestModelDownload:
         tmp_path: Path,
         requires_symlinks: None,
     ) -> None:
-        """A cache root replaced during remote planning cannot redirect pruning or download."""
+        """A cache root replaced during remote planning cannot redirect staging or download."""
         del requires_symlinks
-        from modelaudit.utils.sources import huggingface as huggingface_module
-
         cache_dir = tmp_path / "cache"
         cache_root = cache_dir / "huggingface"
         cache_root.mkdir(parents=True, mode=0o700)
@@ -1511,10 +1562,6 @@ class TestModelDownload:
             "test",
             "model",
             "test/model",
-            _HF_TEST_REVISION,
-            ["model.onnx"],
-            {".onnx"},
-            {"onnx"},
         )
         sentinel = victim_selection / "sentinel.secret"
         sentinel.write_bytes(b"keep")
@@ -1536,10 +1583,6 @@ class TestModelDownload:
                 "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
                 return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
             ),
-            patch(
-                "modelaudit.utils.sources.huggingface._prune_huggingface_filtered_download_path",
-                wraps=huggingface_module._prune_huggingface_filtered_download_path,
-            ) as mock_prune,
             patch("huggingface_hub.snapshot_download") as mock_snapshot_download,
             pytest.raises(Exception, match="safe filtered Hugging Face cache path"),
         ):
@@ -1551,44 +1594,142 @@ class TestModelDownload:
             )
 
         assert sentinel.read_bytes() == b"keep"
-        mock_prune.assert_not_called()
         mock_snapshot_download.assert_not_called()
 
-    def test_build_filtered_cache_uses_exclusive_staging_without_platform_ownership_proof(
+    def test_build_filtered_cache_uses_exclusive_staging(
         self,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Exclusive non-destructive staging remains available without POSIX ownership APIs."""
-        from modelaudit.utils.sources import huggingface as huggingface_module
-
-        monkeypatch.setattr(huggingface_module, "_filtered_huggingface_cache_trust_supported", lambda: False)
-
+        """Equivalent acquisitions receive separate non-destructive staging directories."""
         first = _build_huggingface_filtered_download_path(
             tmp_path / "hf-cache",
             "test",
             "model",
             "test/model",
-            _HF_TEST_REVISION,
-            ["model.onnx"],
-            {".onnx"},
-            {"onnx"},
         )
         second = _build_huggingface_filtered_download_path(
             tmp_path / "hf-cache",
             "test",
             "model",
             "test/model",
-            _HF_TEST_REVISION,
-            ["model.onnx"],
-            {".onnx"},
-            {"onnx"},
         )
 
         assert first.is_dir()
         assert second.is_dir()
         assert first != second
         assert first.parent == second.parent
+
+    def test_build_filtered_cache_windows_requires_direct_private_staging(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Windows filtered views must not inherit a caller-supplied shared cache hierarchy."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        private_root = tmp_path / "local-app-data"
+        shared_root = tmp_path / "shared-cache"
+        monkeypatch.setattr(huggingface_module, "_is_windows_platform", lambda: True)
+        monkeypatch.setattr(
+            huggingface_module,
+            "_get_windows_huggingface_filtered_staging_root",
+            lambda: private_root,
+        )
+
+        with pytest.raises(ValueError, match="safe filtered Hugging Face cache path"):
+            _build_huggingface_filtered_download_path(shared_root, "test", "model", "test/model")
+
+        staging_path = _build_huggingface_filtered_download_path(
+            private_root,
+            "test",
+            "model",
+            "test/model",
+        )
+
+        assert staging_path.parent == private_root
+        assert staging_path.name.startswith("modelaudit-hf-")
+
+    def test_filtered_cache_windows_rejects_reparse_component(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A Windows junction or other reparse point cannot anchor filtered staging."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        private_root = tmp_path / "local-app-data"
+        private_root.mkdir()
+        staging_path = Path(tempfile.mkdtemp(prefix="modelaudit-hf-", dir=private_root))
+        original_stat = huggingface_module._stat_huggingface_cache_path
+
+        def reparse_root_stat(path: Path) -> Any:
+            path_stat = original_stat(path)
+            if path == private_root:
+                return SimpleNamespace(
+                    st_mode=path_stat.st_mode,
+                    st_file_attributes=getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400),
+                )
+            return path_stat
+
+        monkeypatch.setattr(huggingface_module, "_is_windows_platform", lambda: True)
+        monkeypatch.setattr(
+            huggingface_module,
+            "_get_windows_huggingface_filtered_staging_root",
+            lambda: private_root,
+        )
+        monkeypatch.setattr(huggingface_module, "_stat_huggingface_cache_path", reparse_root_stat)
+
+        assert not huggingface_module._is_trusted_huggingface_filtered_download_path(
+            private_root,
+            staging_path,
+        )
+
+    def test_download_model_windows_filtered_selection_ignores_custom_cache_for_staging(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A custom Windows cache cannot become the trust anchor for filtered bytes."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        private_root = tmp_path / "local-app-data"
+        custom_cache = tmp_path / "shared-cache"
+        temporary_paths: list[Path] = []
+
+        def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
+            download_path = Path(local_dir)
+            (download_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
+            return str(download_path)
+
+        monkeypatch.setattr(huggingface_module, "_is_windows_platform", lambda: True)
+        monkeypatch.setattr(
+            huggingface_module,
+            "_get_windows_huggingface_filtered_staging_root",
+            lambda: private_root,
+        )
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
+            ),
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect) as mock_snapshot,
+        ):
+            result = download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=custom_cache,
+                temporary_download_paths=temporary_paths,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert result.parent == private_root
+        assert temporary_paths == [result]
+        assert Path(mock_snapshot.call_args.kwargs["local_dir"]).parent == private_root
+        assert not custom_cache.exists()
 
     def test_download_model_filtered_cache_preserves_symlink_target_on_failure(
         self,
@@ -1635,6 +1776,50 @@ class TestModelDownload:
         assert selection_parent.is_dir()
         assert list(selection_parent.iterdir()) == []
 
+    @pytest.mark.parametrize(
+        "interrupt",
+        [KeyboardInterrupt(), SystemExit(130)],
+        ids=["keyboard-interrupt", "system-exit"],
+    )
+    def test_download_model_filtered_interrupt_cleans_unclaimed_staging(
+        self,
+        tmp_path: Path,
+        interrupt: BaseException,
+    ) -> None:
+        """Non-Exception exits must clean exclusive staging before ownership handoff."""
+        cache_dir = tmp_path / "cache"
+        temporary_paths: list[Path] = []
+
+        def interrupted_snapshot(*, local_dir: str, **_kwargs: object) -> str:
+            (Path(local_dir) / "partial.onnx").write_bytes(b"partial")
+            raise interrupt
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.onnx"], _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
+            ),
+            patch("huggingface_hub.snapshot_download", side_effect=interrupted_snapshot),
+            pytest.raises(type(interrupt)),
+        ):
+            download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                temporary_download_paths=temporary_paths,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert temporary_paths == []
+        selection_parent = cache_dir / "huggingface" / ".modelaudit-selections" / "test" / "model"
+        assert selection_parent.is_dir()
+        assert list(selection_parent.iterdir()) == []
+
     def test_download_model_filtered_default_cache_uses_selection_directory(self, tmp_path: Path) -> None:
         """Default-cache filtering must not expose stale files from a broader snapshot."""
         tmp_path.chmod(0o700)
@@ -1677,7 +1862,7 @@ class TestModelDownload:
             other_policy_result = download_model(
                 "https://huggingface.co/test/model",
                 scannable_extensions={".onnx"},
-                scannable_scanner_ids={"safetensors"},
+                scannable_scanner_ids={"onnx", "metadata"},
             )
 
         assert result.parent == cache_root / ".modelaudit-selections" / "test" / "model"
@@ -1695,13 +1880,18 @@ class TestModelDownload:
             len(_MINIMAL_ONNX_MODEL_PROTO),
         ]
 
-    def test_download_model_cleanup_contract_rejects_unexpected_return_path(self, tmp_path: Path) -> None:
-        """A call-owned filtered view cannot redirect deferred cleanup outside its staging path."""
+    @pytest.mark.parametrize("report_cleanup", [False, True], ids=["no-cleanup-report", "cleanup-report"])
+    def test_download_model_rejects_unexpected_filtered_return_path(
+        self,
+        tmp_path: Path,
+        report_cleanup: bool,
+    ) -> None:
+        """Filtered path binding must not depend on whether the caller requests cleanup metadata."""
         cache_dir = tmp_path / "cache"
         outside = tmp_path / "outside"
         outside.mkdir()
         (outside / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
-        temporary_paths: list[Path] = []
+        temporary_paths: list[Path] | None = [] if report_cleanup else None
 
         with (
             patch(
@@ -1724,7 +1914,8 @@ class TestModelDownload:
                 scannable_scanner_ids={"onnx"},
             )
 
-        assert temporary_paths == []
+        if temporary_paths is not None:
+            assert temporary_paths == []
         assert (outside / "model.onnx").is_file()
         selection_parent = cache_dir / "huggingface" / ".modelaudit-selections" / "test" / "model"
         assert selection_parent.is_dir()
@@ -1779,9 +1970,17 @@ class TestModelDownload:
 
     def test_download_model_standard_onnx_discovery_receives_deadline_check(self, tmp_path: Path) -> None:
         """Standard ONNX companion parsing must remain inside the acquisition deadline."""
-        download_path = tmp_path / "download"
-        download_path.mkdir()
-        (download_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
+
+        def download_with_deadline(
+            _operation: str,
+            download_kwargs: dict[str, Any],
+            _deadline: float | None,
+            _repo_id: str,
+            **_kwargs: object,
+        ) -> str:
+            download_path = Path(cast(str, download_kwargs["local_dir"]))
+            (download_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
+            return str(download_path)
 
         def discover_with_expired_deadline(
             _path: Path,
@@ -1801,7 +2000,7 @@ class TestModelDownload:
             ),
             patch(
                 "modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline",
-                return_value=str(download_path),
+                side_effect=download_with_deadline,
             ),
             patch(
                 "modelaudit.utils.sources.huggingface._discover_hf_onnx_external_data_files",
@@ -1971,12 +2170,11 @@ class TestModelDownload:
         scanner_id: str,
     ) -> None:
         """Overlap scanners must content-route payloads hidden behind SafeTensors names."""
-        download_path = tmp_path / "download"
-        download_path.mkdir()
-        mock_snapshot_download = MagicMock(return_value=str(download_path))
+        mock_snapshot_download = MagicMock()
 
         def snapshot_side_effect(**kwargs: object) -> str:
             allow_patterns = cast(list[str], kwargs["allow_patterns"])
+            download_path = Path(cast(str, kwargs["local_dir"]))
             for filename in allow_patterns:
                 (download_path / filename).write_bytes(payload)
             return str(download_path)
@@ -2001,7 +2199,7 @@ class TestModelDownload:
                 scannable_scanner_ids={scanner_id},
             )
 
-        assert result == download_path
+        assert result == Path(cast(str, mock_snapshot_download.call_args.kwargs["local_dir"]))
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == [filename]
         mock_requests_get.assert_called_once()
 
@@ -4845,10 +5043,12 @@ class TestModelDownloadStreaming:
     def test_download_model_preserves_selected_extensionless_filename_routes(self, tmp_path: Path) -> None:
         """Standard downloads must retain exact filename routes from scanner selection."""
         repo_files = ["README", "model_card", "weights.safetensors"]
-        download_path = tmp_path / "download"
-        download_path.mkdir()
-        for filename in ("README", "model_card"):
-            (download_path / filename).write_text(filename, encoding="utf-8")
+
+        def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
+            download_path = Path(local_dir)
+            for filename in ("README", "model_card"):
+                (download_path / filename).write_text(filename, encoding="utf-8")
+            return str(download_path)
 
         with (
             patch(
@@ -4856,7 +5056,7 @@ class TestModelDownloadStreaming:
                 return_value=(repo_files, _HF_TEST_REVISION, None),
             ),
             patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect,
-            patch("huggingface_hub.snapshot_download", return_value=str(download_path)) as mock_snapshot_download,
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect) as mock_snapshot_download,
         ):
             result = download_model(
                 "https://huggingface.co/test/model",
@@ -4866,7 +5066,7 @@ class TestModelDownloadStreaming:
                 scannable_scanner_ids={"metadata"},
             )
 
-        assert result == download_path
+        assert result == Path(mock_snapshot_download.call_args.kwargs["local_dir"])
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["README", "model_card"]
         mock_detect.assert_not_called()
 
@@ -5258,6 +5458,101 @@ class TestModelDownloadStreaming:
 
         assert result == [*shard_files, index_file]
 
+    @pytest.mark.parametrize(
+        "shard_files",
+        [
+            ["model-1-of-2.safetensors", "model-2-of-2.safetensors"],
+            ["nested/custom-0-of-1.safetensors"],
+        ],
+        ids=["one-based-arbitrary-width", "zero-based-total-one"],
+    )
+    def test_remote_safetensors_validation_accepts_arbitrary_width_families(
+        self,
+        shard_files: list[str],
+    ) -> None:
+        """Remote index authority must use the same arbitrary-width shard grammar as local scans."""
+        shard_parent = PurePosixPath(shard_files[0]).parent
+        index_file = (
+            "model.safetensors.index.json"
+            if str(shard_parent) == "."
+            else f"{shard_parent.as_posix()}/custom.safetensors.index.json"
+        )
+        repo_files = [index_file, *shard_files]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps(
+            {"weight_map": {f"tensor-{index}": PurePosixPath(shard).name for index, shard in enumerate(shard_files)}}
+        ).encode()
+
+        with patch("requests.get", return_value=_FakeRangeResponse(payload)) as mock_requests_get:
+            result = _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                [shard_files[0]],
+                budget,
+            )
+
+        assert result[0] == shard_files[0]
+        assert set(result) == {*shard_files, index_file}
+        mock_requests_get.assert_called_once()
+
+    @pytest.mark.parametrize("streaming", [False, True], ids=["standard", "streaming"])
+    def test_arbitrary_width_safetensors_family_rejects_malformed_governing_index(
+        self,
+        streaming: bool,
+    ) -> None:
+        """Arbitrary-width shard names cannot bypass malformed governing index authority."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "model-1-of-2.safetensors",
+            "model-2-of-2.safetensors",
+        ]
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("requests.get", return_value=_FakeRangeResponse(b"{malformed")) as mock_requests_get,
+            pytest.raises(ValueError, match="is malformed"),
+        ):
+            planner = plan_huggingface_streaming_download if streaming else plan_huggingface_model_download
+            planner(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+
+        mock_requests_get.assert_called_once()
+
+    @pytest.mark.parametrize("streaming", [False, True], ids=["standard", "streaming"])
+    def test_arbitrary_width_safetensors_metadata_only_refuses_unread_index(
+        self,
+        streaming: bool,
+    ) -> None:
+        """Metadata-only planning must not silently ignore arbitrary-width index authority."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "model-1-of-2.safetensors",
+            "model-2-of-2.safetensors",
+        ]
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("requests.get") as mock_requests_get,
+            pytest.raises(ValueError, match="metadata-only dry-run selection incomplete"),
+        ):
+            planner = plan_huggingface_streaming_download if streaming else plan_huggingface_model_download
+            planner(
+                "https://huggingface.co/test/model",
+                allow_content_probes=False,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+
+        mock_requests_get.assert_not_called()
+
     def test_remote_safetensors_validation_rejects_missing_prefixed_index_target(self) -> None:
         """Prefixed SafeTensors indexes must not bypass missing-target validation."""
         index_file = "diffusion_pytorch_model.safetensors.index.json"
@@ -5467,11 +5762,11 @@ class TestModelDownloadStreaming:
 
     @patch(
         "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
-        return_value=({"config.json": 4}, _HF_TEST_REVISION),
+        return_value=({"config.yaml": 4}, _HF_TEST_REVISION),
     )
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-        return_value=(["config.json", "model.safetensors"], _HF_TEST_REVISION, None),
+        return_value=(["config.yaml", "model.safetensors"], _HF_TEST_REVISION, None),
     )
     def test_streaming_dry_run_plan_combines_selected_files_with_header_minimum(
         self,
@@ -5480,7 +5775,7 @@ class TestModelDownloadStreaming:
     ) -> None:
         """Ordinary selected bytes and minimum SafeTensors reads share one dry-run budget."""
         plan_kwargs: dict[str, Any] = {
-            "scannable_extensions": {".json", ".safetensors"},
+            "scannable_extensions": {".yaml", ".safetensors"},
             "scannable_scanner_ids": {"metadata", "safetensors"},
             "allow_content_probes": False,
             "_stream_safetensors_headers": True,
@@ -5491,8 +5786,8 @@ class TestModelDownloadStreaming:
 
         plan = plan_huggingface_streaming_download("hf://test/model", max_size=12, **plan_kwargs)
 
-        assert plan.selected_files == ["config.json", "model.safetensors"]
-        assert plan.selected_sizes == {"config.json": 4}
+        assert plan.selected_files == ["config.yaml", "model.safetensors"]
+        assert plan.selected_sizes == {"config.yaml": 4}
         assert mock_get_path_sizes.call_count == 2
 
     def test_streaming_dry_run_plan_reserves_competing_route_content_probe(
@@ -6184,14 +6479,14 @@ class TestModelDownloadStreaming:
         return_value=(["openvino/model.xml", "openvino/model.bin"], _HF_TEST_REVISION, None),
     )
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_yields_openvino_bin_when_openvino_not_selected(
+    def test_download_model_streaming_excludes_openvino_xml_when_openvino_not_selected(
         self,
         mock_hf_hub_download: MagicMock,
         _mock_list_repo_files: MagicMock,
         mock_detect_content: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Selected .bin files must not be consumed as OpenVINO companions when OpenVINO is excluded."""
+        """Exact pickle policy keeps .bin while routing and excluding the OpenVINO XML."""
 
         def download_side_effect(*, filename: str, **_kwargs: object) -> str:
             path = tmp_path / "huggingface" / "test" / "model" / filename
@@ -6203,6 +6498,7 @@ class TestModelDownloadStreaming:
             return str(path)
 
         mock_hf_hub_download.side_effect = download_side_effect
+        mock_detect_content.return_value = "openvino"
 
         results = list(
             download_model_streaming(
@@ -6214,12 +6510,9 @@ class TestModelDownloadStreaming:
         )
 
         download_root = tmp_path / "huggingface" / "test" / "model" / "openvino"
-        assert results == [(download_root / "model.xml", False), (download_root / "model.bin", True)]
-        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
-            "openvino/model.xml",
-            "openvino/model.bin",
-        ]
-        mock_detect_content.assert_not_called()
+        assert results == [(download_root / "model.bin", True)]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == ["openvino/model.bin"]
+        mock_detect_content.assert_called_once()
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch(
@@ -6848,7 +7141,7 @@ class TestModelDownloadStreaming:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_prefetched_selected_onnx_sidecar_reserves_budget_for_later_context(
+    def test_download_model_streaming_downloaded_onnx_sidecar_reserves_budget_for_later_context(
         self,
         mock_hf_hub_download: MagicMock,
         mock_get_paths_info: MagicMock,
@@ -6857,7 +7150,7 @@ class TestModelDownloadStreaming:
         _mock_detect_content: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Prefetched selected sidecars should count before later context-only sidecar caps."""
+        """Downloaded sidecars should count before later context-only sidecar caps."""
         selected_sidecar_bytes = b"s" * 64
         context_sidecar_bytes = b"c" * 4
         a_payload = _make_external_onnx_payload(tmp_path, external_path="selected.onnx_data")
@@ -6881,8 +7174,8 @@ class TestModelDownloadStreaming:
             [
                 SimpleNamespace(path="onnx/a.onnx", size=len(a_payload)),
                 SimpleNamespace(path="onnx/b.onnx", size=len(b_payload)),
-                SimpleNamespace(path="onnx/selected.onnx_data", size=len(selected_sidecar_bytes)),
             ],
+            [SimpleNamespace(path="onnx/selected.onnx_data", size=len(selected_sidecar_bytes))],
             [SimpleNamespace(path="onnx/context.bin", size=len(context_sidecar_bytes))],
         ]
 
@@ -6892,7 +7185,7 @@ class TestModelDownloadStreaming:
                     "https://huggingface.co/test/model",
                     cache_dir=tmp_path / "cache",
                     max_size=len(a_payload) + len(b_payload) + len(selected_sidecar_bytes),
-                    scannable_extensions={".onnx", ".onnx_data"},
+                    scannable_extensions={".onnx"},
                     scannable_scanner_ids={"onnx"},
                 )
             )
@@ -9526,7 +9819,7 @@ class TestModelDownloadStreaming:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A normal selected file shares the exact runtime budget with probe and header reads."""
-        config_name = "config.json"
+        config_name = "config.pkl"
         filename = "model.safetensors"
         config_payload = b"{}\n"
         frame, _header_len = _make_safetensors_frame(
@@ -9577,7 +9870,7 @@ class TestModelDownloadStreaming:
                 download_model_streaming(
                     f"hf://test/model?revision={_HF_TEST_REVISION}",
                     max_size=max_size,
-                    scannable_extensions={".json", ".safetensors"},
+                    scannable_extensions={".pkl", ".safetensors"},
                     scannable_scanner_ids={"pickle", "safetensors"},
                     _include_scan_results=True,
                 )
@@ -13780,11 +14073,11 @@ class TestModelDownloadStreaming:
         mock_hf_hub_download.assert_not_called()
         mock_detect_content.assert_called_once_with("test/model", "renamed.jpg", _HF_TEST_REVISION, ANY)
 
-    def test_download_model_streaming_honors_safetensors_scanner_exclusion(
+    def test_download_model_streaming_rejects_safetensors_scanner_exclusion(
         self,
         tmp_path: Path,
     ) -> None:
-        """A selected suffix must not run a scanner excluded by explicit policy."""
+        """A caller suffix cannot widen exact metadata policy into a SafeTensors download."""
         downloaded_path = tmp_path / "model.safetensors"
         downloaded_path.write_bytes(b"downloaded")
 
@@ -13799,8 +14092,9 @@ class TestModelDownloadStreaming:
             ) as mock_scan_header,
             patch("huggingface_hub.hf_hub_download", return_value=str(downloaded_path)) as mock_hf_hub_download,
             patch("requests.get") as mock_requests_get,
+            pytest.raises(Exception, match="no recognized ModelAudit-scannable files"),
         ):
-            results = list(
+            list(
                 download_model_streaming(
                     "https://huggingface.co/test/model",
                     scannable_extensions={".safetensors"},
@@ -13809,14 +14103,9 @@ class TestModelDownloadStreaming:
                 )
             )
 
-        assert results == [(downloaded_path, True)]
         mock_requests_get.assert_not_called()
         mock_scan_header.assert_not_called()
-        mock_hf_hub_download.assert_called_once_with(
-            repo_id="test/model",
-            filename="model.safetensors",
-            revision=_HF_TEST_REVISION,
-        )
+        mock_hf_hub_download.assert_not_called()
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")
@@ -14127,9 +14416,11 @@ class TestModelSizeAndDiskSpace:
     def test_download_model_filtered_selection_checks_only_selected_disk_size(self, tmp_path: Path) -> None:
         """Scanner-filtered downloads must not require space for unrelated repository artifacts."""
         repo_files = ["model.onnx", "model-00000-of-00001.safetensors"]
-        download_path = tmp_path / "download"
-        download_path.mkdir()
-        (download_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
+
+        def snapshot_side_effect(*, local_dir: str, **_kwargs: object) -> str:
+            download_path = Path(local_dir)
+            (download_path / "model.onnx").write_bytes(_MINIMAL_ONNX_MODEL_PROTO)
+            return str(download_path)
 
         with (
             patch(
@@ -14149,7 +14440,7 @@ class TestModelSizeAndDiskSpace:
                 "modelaudit.utils.sources.huggingface.check_disk_space",
                 return_value=(True, "sufficient selected space"),
             ) as mock_check_disk_space,
-            patch("huggingface_hub.snapshot_download", return_value=str(download_path)),
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect),
         ):
             result = download_model(
                 "https://huggingface.co/test/model",
@@ -14158,7 +14449,7 @@ class TestModelSizeAndDiskSpace:
                 scannable_scanner_ids={"onnx"},
             )
 
-        assert result == download_path
+        assert result.is_dir()
         mock_repo_size.assert_not_called()
         assert mock_get_sizes.call_args.args[1] == ["model.onnx"]
         mock_check_disk_space.assert_called_once()
