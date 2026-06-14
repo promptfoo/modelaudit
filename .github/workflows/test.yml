@@ -21,9 +21,9 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Source-head PR runs can be superseded, but exact integration SHAs on main
-  # and merge_group should run to completion once scheduled.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # PR merge-ref and main runs can be superseded; merge_group candidates run
+  # to completion so the exact queued integration SHA is always validated.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
 
 jobs:
   # First, determine what changed to optimize subsequent jobs

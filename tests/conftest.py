@@ -271,7 +271,6 @@ def pytest_runtest_setup(item):
             "test_hooks_egress.py",  # progress hook egress allowlist regressions
             "test_release_workflow.py",  # release workflow regression tests
             "test_docker_workflow.py",  # Docker workflow regression tests
-            "test_python_ci_workflow.py",  # Python CI merge-group and gating workflow regression tests
             "test_sbom_symlink_containment.py",  # SBOM symlink containment regression tests
             "test_sbom_url_fixes.py",  # SBOM URL handling and credential-redaction regressions
         ]

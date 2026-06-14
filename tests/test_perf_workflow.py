@@ -396,6 +396,7 @@ def test_dependency_audit_runs_for_source_reachability_changes() -> None:
     assert isinstance(job, dict)
 
     condition = job["if"]
+    assert "github.event_name == 'merge_group'" in condition
     assert "github.event_name == 'pull_request'" in condition
     assert "needs.changes.outputs.dependencies == 'true'" in condition
     assert "needs.changes.outputs.workflows == 'true'" in condition
@@ -413,7 +414,43 @@ def test_python_ci_triggers_merge_group_and_cancels_superseded_main_runs() -> No
     concurrency = workflow["concurrency"]
     assert isinstance(concurrency, dict)
     assert concurrency["group"] == "${{ github.workflow }}-${{ github.ref }}"
-    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+    assert concurrency["cancel-in-progress"] == (
+        "${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}"
+    )
+
+    changes_job = _jobs(workflow)["changes"]
+    assert isinstance(changes_job, dict)
+    assert changes_job["outputs"]["integration"] == "${{ steps.classify.outputs.integration }}"
+    changes_steps = changes_job["steps"]
+    assert isinstance(changes_steps, list)
+    classify_run = _step_by_name(changes_steps, "Classify CI event")["run"]
+    assert '[[ "$GITHUB_REF" == "refs/heads/main" || "$GITHUB_EVENT_NAME" == "merge_group" ]]' in classify_run
+    assert 'echo "integration=true" >> "$GITHUB_OUTPUT"' in classify_run
+    assert 'echo "integration=false" >> "$GITHUB_OUTPUT"' in classify_run
+
+
+def test_python_ci_integration_scheduling_covers_remaining_job_surface() -> None:
+    jobs = _jobs(_load_workflow("test.yml"))
+    integration = "needs.changes.outputs.integration == 'true'"
+    python = "needs.changes.outputs.python == 'true'"
+    dependencies = "needs.changes.outputs.dependencies == 'true'"
+    workflows = "needs.changes.outputs.workflows == 'true'"
+    picklescan = "needs.changes.outputs.picklescan == 'true'"
+    expected_conditions = {
+        "lint": f"{integration} || {python} || {workflows}",
+        "license-check": f"{integration} || {dependencies} || {workflows}",
+        "uv-lock-check": f"{integration} || {dependencies} || {workflows}",
+        "type-check": f"{integration} || {python} || {workflows}",
+        "test-numpy-compatibility": f"{integration} || {dependencies}",
+        "test-vendored-protos": f"{integration} || {python} || {dependencies}",
+        "test-proto-reproducibility": f"{integration} || {python} || {dependencies}",
+        "test-extras-smoke": f"{integration} || {dependencies}",
+        "build": f"{integration} || {python} || {dependencies} || {workflows}",
+        "picklescan-package": f"{integration} || {picklescan} || {workflows}",
+    }
+
+    for job_name, expected_condition in expected_conditions.items():
+        assert jobs[job_name]["if"] == expected_condition
 
 
 def test_python_ci_keeps_quick_feedback_pr_only() -> None:
@@ -564,20 +601,40 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     ci_success_steps = ci_success_job["steps"]
     assert isinstance(ci_success_steps, list)
     gate_script = _step_by_name(ci_success_steps, "Check if all jobs succeeded")["run"]
-    assert (
-        "EXPECT_COVERAGE=\"${{ needs.changes.outputs.integration == 'true' || "
-        "needs.changes.outputs.workflows == 'true' }}\"" in gate_script
-    )
-    assert (
-        "EXPECT_DEPENDENCY_AUDIT=\"${{ github.event_name == 'merge_group' || (github.event_name == 'pull_request' && ("
-        "needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || "
-        "needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')) }}\"" in gate_script
-    )
-    assert (
-        "EXPECT_OPTIONAL_DEPENDENCY_LANES=\"${{ needs.changes.outputs.integration == 'true' || "
-        "needs.changes.outputs.dependencies == 'true' }}\"" in gate_script
-    )
-    assert 'require_success "$EXPECT_COVERAGE" "$COVERAGE_RESULT" "coverage"' in gate_script
-    assert 'require_success "$EXPECT_CORE_FAST" "$TEST_RESULT" "test"' in gate_script
-    assert 'require_success "$EXPECT_CORE_FAST" "$WINDOWS_RESULT" "windows-tests"' in gate_script
-    assert 'require_success "$EXPECT_SLOW" "$SLOW_RESULT" "slow-tests"' in gate_script
+    expected_assignments = {
+        "EXPECT_QUICK_FEEDBACK": jobs["quick-feedback"]["if"],
+        "EXPECT_CORE_FAST": jobs["test"]["if"],
+        "EXPECT_SLOW": jobs["slow-tests"]["if"],
+        "EXPECT_DEPENDENCY_AUDIT": jobs["dependency-audit"]["if"],
+        "EXPECT_DEPENDENCY_SURFACE": jobs["license-check"]["if"],
+        "EXPECT_OPTIONAL_DEPENDENCY_LANES": jobs["test-numpy-compatibility"]["if"],
+        "EXPECT_VENDORED_PROTOS": jobs["test-vendored-protos"]["if"],
+        "EXPECT_BUILD": jobs["build"]["if"],
+        "EXPECT_PICKLESCAN": jobs["picklescan-package"]["if"],
+        "EXPECT_COVERAGE": jobs["coverage"]["if"],
+    }
+    for expectation, condition in expected_assignments.items():
+        assert f'{expectation}="${{{{ {condition} }}}}"' in gate_script
+
+    assert 'if [[ "$expected" == "true" && "$result" != "success" ]]; then' in gate_script
+    assert '[[ "$CHANGES_RESULT" == "success" ]] || FAILED=true' in gate_script
+    expected_results = [
+        ("EXPECT_QUICK_FEEDBACK", "QUICK_FEEDBACK_RESULT"),
+        ("EXPECT_CORE_FAST", "LINT_RESULT"),
+        ("EXPECT_DEPENDENCY_AUDIT", "DEPENDENCY_AUDIT_RESULT"),
+        ("EXPECT_DEPENDENCY_SURFACE", "LICENSE_RESULT"),
+        ("EXPECT_DEPENDENCY_SURFACE", "UV_LOCK_RESULT"),
+        ("EXPECT_CORE_FAST", "TYPE_CHECK_RESULT"),
+        ("EXPECT_CORE_FAST", "WINDOWS_RESULT"),
+        ("EXPECT_CORE_FAST", "TEST_RESULT"),
+        ("EXPECT_SLOW", "SLOW_RESULT"),
+        ("EXPECT_COVERAGE", "COVERAGE_RESULT"),
+        ("EXPECT_OPTIONAL_DEPENDENCY_LANES", "NUMPY_RESULT"),
+        ("EXPECT_VENDORED_PROTOS", "PROTOS_RESULT"),
+        ("EXPECT_VENDORED_PROTOS", "PROTO_REPRO_RESULT"),
+        ("EXPECT_OPTIONAL_DEPENDENCY_LANES", "EXTRAS_RESULT"),
+        ("EXPECT_BUILD", "BUILD_RESULT"),
+        ("EXPECT_PICKLESCAN", "PICKLESCAN_RESULT"),
+    ]
+    for expectation, result in expected_results:
+        assert f'require_success "${expectation}" "${result}"' in gate_script
