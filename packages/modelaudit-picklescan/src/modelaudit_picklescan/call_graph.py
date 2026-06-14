@@ -3950,7 +3950,14 @@ def _zipimport_names_exclude_module(
     module_name: str,
 ) -> bool:
     leaf_name = module_name.rsplit(".", maxsplit=1)[-1]
-    if not leaf_name or not leaf_name.isascii() or "/" in leaf_name or "\\" in leaf_name or "\0" in leaf_name:
+    if (
+        not prefix.isascii()
+        or not leaf_name
+        or not leaf_name.isascii()
+        or "/" in leaf_name
+        or "\\" in leaf_name
+        or "\0" in leaf_name
+    ):
         return False
     candidate = f"{prefix}{leaf_name}".encode()
     for name in names:
