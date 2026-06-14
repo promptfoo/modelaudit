@@ -261,6 +261,8 @@ _STANDARD_DATA_LINEAGE_INPUT_INDEXES: dict[str, frozenset[int]] = {
     "ConstantOfShape": frozenset(),
     "CumSum": frozenset({0}),
     "Expand": frozenset({0}),
+    "Gather": frozenset({0}),
+    "LayerNormalization": frozenset({0}),
     "Pad": frozenset({0}),
     "Resize": frozenset({0}),
     "Slice": frozenset({0}),
@@ -1126,6 +1128,13 @@ class _OnnxWeightQuantization:
 
 
 @dataclass(frozen=True)
+class _OnnxConstantProofSummary:
+    all_zero: bool
+    scalar_number: float | None
+    all_positive: bool
+
+
+@dataclass(frozen=True)
 class _OnnxWeightLineage:
     initializer_index: int
     shape: tuple[int, ...] | None
@@ -1240,6 +1249,50 @@ def _onnx_tensor_uses_external_storage(initializer: Any, *, onnx: Any) -> bool:
     if getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL:
         return True
     return bool(getattr(initializer, "external_data", ())) and _onnx_inline_storage_nbytes(initializer) == 0
+
+
+def _normalized_onnx_quantization_parameter_shape(
+    parameter_shape: tuple[int, ...],
+    *,
+    target_shape: tuple[int, ...],
+    axis: int | None,
+    kind: str,
+) -> tuple[int, ...] | None:
+    """Return the safe broadcast shape for a quantization parameter."""
+    if any(dimension < 0 for dimension in parameter_shape):
+        return None
+    if math.prod(parameter_shape) == 1:
+        return ()
+    if axis is None or axis < 0 or axis >= len(target_shape):
+        return None
+
+    normalized_shape = parameter_shape
+    if kind == "ConvInteger":
+        channel_count = int(target_shape[0])
+        spatial_rank = max(len(target_shape) - 2, 0)
+        if parameter_shape not in {
+            (channel_count,),
+            (channel_count, *([1] * spatial_rank)),
+            (1, channel_count, *([1] * spatial_rank)),
+        }:
+            return None
+        normalized_shape = (channel_count,)
+
+    if len(normalized_shape) == 1:
+        if normalized_shape[0] != target_shape[axis]:
+            return None
+        broadcast_shape = [1] * len(target_shape)
+        broadcast_shape[axis] = int(target_shape[axis])
+        return tuple(broadcast_shape)
+
+    if kind not in {"MatMulInteger", "QLinearMatMul"} or len(normalized_shape) != len(target_shape):
+        return None
+    if axis not in {len(target_shape) - 2, len(target_shape) - 1}:
+        return None
+    contraction_axis = len(target_shape) - 1 if axis == len(target_shape) - 2 else len(target_shape) - 2
+    expected_shape = list(target_shape)
+    expected_shape[contraction_axis] = 1
+    return normalized_shape if normalized_shape == tuple(expected_shape) else None
 
 
 def _configured_onnx_weight_array_limit(value: Any) -> int | None:
@@ -1435,7 +1488,7 @@ def _build_onnx_weight_analysis_plan(
     np: Any,
     max_array_size: int | None,
     pre_materialization_check: Callable[[Any, str, int], bool] | None = None,
-    retain_array_check: Callable[[str, int], bool] | None = None,
+    adjust_array_reservation: Callable[[str, int], bool] | None = None,
 ) -> _OnnxWeightAnalysisPlan:
     """Build a bounded, semantically oriented plan for ONNX weight analysis."""
     plan = _OnnxWeightAnalysisPlan()
@@ -1567,6 +1620,21 @@ def _build_onnx_weight_analysis_plan(
         )
         if hasattr(onnx.TensorProto, name)
     }
+    zero_preserving_cast_types = (
+        floating_types
+        | quantized_integer_types
+        | {
+            int(getattr(onnx.TensorProto, name))
+            for name in (
+                "BOOL",
+                "COMPLEX64",
+                "COMPLEX128",
+                "INT64",
+                "UINT64",
+            )
+            if hasattr(onnx.TensorProto, name)
+        }
+    )
 
     def lineage_could_be_weight(lineage: _OnnxWeightLineage) -> bool:
         return (lineage.data_type is None or lineage.data_type in floating_types) and (
@@ -1620,9 +1688,11 @@ def _build_onnx_weight_analysis_plan(
     consumer_sample_count = 0
     node_counter = 0
     edge_counter = 0
+    reserved_node_count = 0
+    reserved_edge_count = 0
     graph_counter = 0
     schema_cache: dict[tuple[str, str, int], bool] = {}
-    bounded_constant_array_cache: dict[int, tuple[Any, Any | None]] = {}
+    constant_proof_summary_cache: dict[int, tuple[Any, _OnnxConstantProofSummary | None]] = {}
 
     def register_initializer(
         initializer: Any,
@@ -1781,6 +1851,7 @@ def _build_onnx_weight_analysis_plan(
             if (
                 producer is not None
                 and getattr(producer, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and _operator_identifier(producer) not in functions
                 and producer.op_type == "DynamicQuantizeLinear"
                 and len(producer.output) > 1
                 and str(producer.output[1]) == value_name
@@ -1789,6 +1860,7 @@ def _build_onnx_weight_analysis_plan(
             if (
                 producer is None
                 or getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
+                or _operator_identifier(producer) in functions
                 or producer.op_type not in {"Identity", "Mul"}
             ):
                 return None
@@ -1856,6 +1928,7 @@ def _build_onnx_weight_analysis_plan(
                     for consumer in consumers_by_value.get(value_name, [])
                     if not (
                         getattr(consumer, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                        and _operator_identifier(consumer) not in functions
                         and consumer.op_type in _METADATA_ONLY_LINEAGE_OPERATORS
                     )
                     and any(str(output_name) in live_values for output_name in consumer.output if output_name)
@@ -1892,6 +1965,7 @@ def _build_onnx_weight_analysis_plan(
                 if (
                     visited_nodes > _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT
                     or getattr(consumer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    or _operator_identifier(consumer) in functions
                 ):
                     return None, "unresolved_quantized_weight_scale"
                 next_values = [
@@ -1935,11 +2009,21 @@ def _build_onnx_weight_analysis_plan(
                                 for consumer in downstream_consumers
                                 if is_post_bias_scale_mul(consumer, bias_outputs)
                             ]
-                            if not scale_consumers:
+                            if not downstream_consumers:
                                 reached_terminal = True
                                 continue
-                            if len(scale_consumers) != len(downstream_consumers):
-                                return None, "unresolved_quantized_weight_scale"
+                            if scale_consumers:
+                                if len(scale_consumers) != len(downstream_consumers):
+                                    return None, "unresolved_quantized_weight_scale"
+                            else:
+                                post_bias_ops = {str(downstream.op_type) for downstream in downstream_consumers}
+                                if post_bias_ops <= {"Abs", "Relu", "Mul"} or (
+                                    post_bias_ops & {"Cast", "Identity"} and len(downstream_consumers) != 1
+                                ):
+                                    return None, "unresolved_quantized_weight_scale"
+                                if not post_bias_ops & {"Cast", "Identity"}:
+                                    reached_terminal = True
+                                    continue
                     elif consumer.op_type == "Cast":
                         cast_data_type = _onnx_int_attribute(consumer, "to", -1)
                         if cast_data_type not in floating_types:
@@ -1947,7 +2031,7 @@ def _build_onnx_weight_analysis_plan(
                         current_data_type = cast_data_type
                         if not retain_narrowest_output_data_type(current_data_type):
                             return None, "unresolved_quantized_weight_scale"
-                    queue.extend((output_name, depth + 1) for output_name in next_values)
+                    queue.extend((output_name, depth) for output_name in next_values)
                     continue
                 if (
                     consumer.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
@@ -1959,6 +2043,9 @@ def _build_onnx_weight_analysis_plan(
                     reached_terminal = True
                     continue
                 if consumer.op_type != "Mul":
+                    return None, "unresolved_quantized_weight_scale"
+                mul_inputs = [str(source) for source in consumer.input if source]
+                if mul_inputs.count(value_name) != 1 or len(mul_inputs) < 2:
                     return None, "unresolved_quantized_weight_scale"
                 if scale_data_type is not None and scale_data_type != current_data_type:
                     return None, "unresolved_quantized_weight_scale"
@@ -1988,32 +2075,18 @@ def _build_onnx_weight_analysis_plan(
                     shape = tuple(int(dimension) for dimension in tensor.dims)
                 except (AttributeError, TypeError, ValueError):
                     return None, "unresolved_quantized_weight_scale"
-                if math.prod(shape) == 1:
-                    continue
                 if lineage.shape is None or axis is None or not 0 <= axis < len(lineage.shape):
                     return None, "unresolved_quantized_weight_scale"
-                if node.op_type == "ConvInteger":
-                    channel_count = int(lineage.shape[0])
-                    spatial_rank = max(len(lineage.shape) - 2, 0)
-                    valid_shapes = {
-                        (channel_count, *([1] * spatial_rank)),
-                        (1, channel_count, *([1] * spatial_rank)),
-                    }
-                    if tuple(shape) in valid_shapes:
-                        non_scalar_names.append(candidate_name)
-                        continue
+                normalized_shape = _normalized_onnx_quantization_parameter_shape(
+                    shape,
+                    target_shape=lineage.shape,
+                    axis=axis,
+                    kind=str(node.op_type),
+                )
+                if normalized_shape is None:
                     return None, "unresolved_quantized_weight_scale"
-                if node.op_type != "MatMulInteger":
-                    return None, "unresolved_quantized_weight_scale"
-                expected_shape = list(lineage.shape)
-                contraction_axis = len(expected_shape) - 1 if input_index == 0 else len(expected_shape) - 2
-                expected_shape[contraction_axis] = 1
-                if tuple(shape) == tuple(expected_shape) or (
-                    input_index == 1 and len(shape) == 1 and int(shape[0]) == int(lineage.shape[axis])
-                ):
+                if normalized_shape:
                     non_scalar_names.append(candidate_name)
-                    continue
-                return None, "unresolved_quantized_weight_scale"
             unique_non_scalar_names = tuple(dict.fromkeys(non_scalar_names))
             if len(unique_non_scalar_names) > 1:
                 return None, "unresolved_quantized_weight_scale"
@@ -2348,6 +2421,19 @@ def _build_onnx_weight_analysis_plan(
         )
 
     def bounded_lineages(lineages: dict[int, _OnnxWeightLineage]) -> dict[int, _OnnxWeightLineage]:
+        activation_provenance = [
+            (initializer_index, lineage)
+            for initializer_index, lineage in lineages.items()
+            if lineage.activation_derived and not lineage.metadata_derived
+        ]
+        if len(activation_provenance) > 1:
+            representative = min(activation_provenance)
+            lineages = {
+                initializer_index: lineage
+                for initializer_index, lineage in lineages.items()
+                if not lineage.activation_derived or lineage.metadata_derived
+            }
+            lineages[representative[0]] = representative[1]
         if len(lineages) <= _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:
             return lineages
         plan.record_coverage_gap(
@@ -2398,47 +2484,77 @@ def _build_onnx_weight_analysis_plan(
                 zero_proof_depth=max(existing.zero_proof_depth, lineage.zero_proof_depth),
             )
 
-    def bounded_constant_array(tensor: Any) -> Any | None:
+    def constant_proof_summary(tensor: Any) -> _OnnxConstantProofSummary | None:
         cache_key = id(tensor)
-        cached = bounded_constant_array_cache.get(cache_key)
+        cached = constant_proof_summary_cache.get(cache_key)
         if cached is not None and cached[0] is tensor:
             return cached[1]
+        summary: _OnnxConstantProofSummary | None = None
+        charged_bytes = 0
         try:
             if _onnx_tensor_uses_external_storage(tensor, onnx=onnx):
-                array = None
-            else:
-                estimated_bytes = _onnx_tensor_expected_storage_nbytes(tensor, onnx=onnx)
-                proof_limit = _ONNX_GENERATED_VALUE_PROOF_MAX_BYTES
-                if max_array_size is not None and max_array_size > 0:
-                    proof_limit = min(proof_limit, max_array_size)
-                if estimated_bytes < 0 or estimated_bytes > proof_limit:
-                    array = None
-                else:
-                    array = onnx.numpy_helper.to_array(tensor)
-                    if int(array.nbytes) > proof_limit:
-                        array = None
+                raise ValueError("external constant storage")
+            expected_bytes = _onnx_tensor_expected_storage_nbytes(tensor, onnx=onnx)
+            inline_bytes = _onnx_inline_storage_nbytes(tensor)
+            estimated_bytes = max(expected_bytes, inline_bytes)
+            proof_limit = _ONNX_GENERATED_VALUE_PROOF_MAX_BYTES
+            if max_array_size is not None and max_array_size > 0:
+                proof_limit = min(proof_limit, max_array_size)
+            if estimated_bytes < 0 or estimated_bytes > proof_limit:
+                raise ValueError("constant proof exceeds per-array limit")
+            bounded_name, _, _ = _bounded_onnx_metadata_text(plan, getattr(tensor, "name", "constant"))
+            if pre_materialization_check is not None and not pre_materialization_check(
+                tensor,
+                bounded_name,
+                estimated_bytes,
+            ):
+                raise ValueError("constant proof exceeds materialization limit")
+            if adjust_array_reservation is not None:
+                if not adjust_array_reservation(bounded_name, estimated_bytes):
+                    raise ValueError("constant proof exceeds cumulative array limit")
+                charged_bytes = estimated_bytes
+            array = onnx.numpy_helper.to_array(tensor)
+            actual_bytes = int(array.nbytes)
+            if actual_bytes > proof_limit:
+                raise ValueError("decoded constant proof exceeds per-array limit")
+            if adjust_array_reservation is not None and not adjust_array_reservation(
+                bounded_name,
+                actual_bytes - charged_bytes,
+            ):
+                raise ValueError("decoded constant proof exceeds cumulative array limit")
+            charged_bytes = actual_bytes if adjust_array_reservation is not None else 0
+            scalar_number = None
+            if int(array.size) == 1:
+                with suppress(OverflowError, TypeError, ValueError):
+                    scalar_number = float(array.reshape(-1)[0])
+            try:
+                all_zero = bool(np.all(np.equal(array, 0)))
+                all_finite = bool(np.all(np.isfinite(array)))
+                all_positive = all_finite and bool(np.all(array > 0))
+            except (TypeError, ValueError):
+                all_zero = False
+                all_finite = False
+                all_positive = False
+            summary = _OnnxConstantProofSummary(
+                all_zero=all_zero,
+                scalar_number=scalar_number,
+                all_positive=all_positive,
+            )
         except Exception:
-            array = None
-        bounded_constant_array_cache[cache_key] = (tensor, array)
-        return array
+            summary = None
+        finally:
+            if charged_bytes and adjust_array_reservation is not None:
+                adjust_array_reservation(bounded_name, -charged_bytes)
+        constant_proof_summary_cache[cache_key] = (tensor, summary)
+        return summary
 
     def constant_is_all_zero(tensor: Any) -> bool:
-        array = bounded_constant_array(tensor)
-        if array is None:
-            return False
-        try:
-            return bool(np.all(np.equal(array, 0)))
-        except (TypeError, ValueError):
-            return False
+        summary = constant_proof_summary(tensor)
+        return summary is not None and summary.all_zero
 
     def constant_scalar_number(tensor: Any) -> float | None:
-        array = bounded_constant_array(tensor)
-        if array is None or int(array.size) != 1:
-            return None
-        try:
-            return float(array.reshape(-1)[0])
-        except (OverflowError, TypeError, ValueError):
-            return None
+        summary = constant_proof_summary(tensor)
+        return summary.scalar_number if summary is not None else None
 
     def value_is_proven_zero(
         name: str,
@@ -2495,6 +2611,8 @@ def _build_onnx_weight_analysis_plan(
             tensor = constants.get(name)
             return constant_scalar_number(tensor) if tensor is not None else None
 
+        if node.op_type == "Cast" and _onnx_int_attribute(node, "to", -1) not in zero_preserving_cast_types:
+            return False
         if node.op_type in _ZERO_PRESERVING_DATA_OPERATORS:
             data_indexes = _STANDARD_DATA_LINEAGE_INPUT_INDEXES.get(node.op_type, frozenset({0}))
             return bool(data_indexes) and all(input_is_zero(input_index) for input_index in data_indexes)
@@ -2557,34 +2675,16 @@ def _build_onnx_weight_analysis_plan(
         def parameter_shape_is_valid(parameter: Any) -> bool:
             try:
                 shape = tuple(int(dimension) for dimension in parameter.dims)
-                if any(dimension < 0 for dimension in shape):
-                    return False
-                if math.prod(shape) == 1:
-                    return True
-                target_shape = lineage.shape
-                axis = quantization.axis
-                if target_shape is None or axis is None or axis < 0 or axis >= len(target_shape):
-                    return False
-                if quantization.kind == "ConvInteger":
-                    channel_count = int(target_shape[0])
-                    spatial_rank = max(len(target_shape) - 2, 0)
-                    if shape in {
-                        (channel_count, *([1] * spatial_rank)),
-                        (1, channel_count, *([1] * spatial_rank)),
-                    }:
-                        shape = (channel_count,)
-                if len(shape) > 1:
-                    if (
-                        quantization.kind not in {"MatMulInteger", "QLinearMatMul"}
-                        or len(shape) != len(target_shape)
-                        or axis not in {len(target_shape) - 2, len(target_shape) - 1}
-                    ):
-                        return False
-                    contraction_axis = len(target_shape) - 1 if axis == len(target_shape) - 2 else len(target_shape) - 2
-                    expected_shape = list(target_shape)
-                    expected_shape[contraction_axis] = 1
-                    return shape == tuple(expected_shape)
-                return len(shape) == 1 and shape[0] == target_shape[axis]
+                return (
+                    lineage.shape is not None
+                    and _normalized_onnx_quantization_parameter_shape(
+                        shape,
+                        target_shape=lineage.shape,
+                        axis=quantization.axis,
+                        kind=quantization.kind,
+                    )
+                    is not None
+                )
             except (AttributeError, TypeError, ValueError):
                 return False
 
@@ -2606,18 +2706,14 @@ def _build_onnx_weight_analysis_plan(
             return False
         for scale_name in scale_names:
             scale = constants.get(scale_name)
-            scale_array = bounded_constant_array(scale) if scale is not None else None
+            scale_summary = constant_proof_summary(scale) if scale is not None else None
             if (
                 scale is None
                 or int(scale.data_type) not in floating_types
                 or not parameter_shape_is_valid(scale)
-                or scale_array is None
+                or scale_summary is None
+                or not scale_summary.all_positive
             ):
-                return False
-            try:
-                if not bool(np.all(np.isfinite(scale_array))) or bool(np.any(scale_array <= 0)):
-                    return False
-            except (TypeError, ValueError):
                 return False
         return True
 
@@ -2667,7 +2763,13 @@ def _build_onnx_weight_analysis_plan(
         ]
         | None = None,
     ) -> tuple[list[dict[int, _OnnxWeightLineage]], list[bool]]:
-        nonlocal edge_counter, graph_counter, node_counter, total_consumer_count
+        nonlocal \
+            edge_counter, \
+            graph_counter, \
+            node_counter, \
+            reserved_edge_count, \
+            reserved_node_count, \
+            total_consumer_count
         current_graph_index = graph_counter
         graph_counter += 1
         if root_graph:
@@ -2706,19 +2808,25 @@ def _build_onnx_weight_analysis_plan(
                 known_value_shapes[name] = tuple(int(dimension) for dimension in constant.dims)
             except (AttributeError, TypeError, ValueError):
                 continue
-        graph_nodes = tuple(getattr(current_graph, "node", ()))
-        if len(graph_nodes) > _ONNX_WEIGHT_NODE_VISIT_LIMIT - node_counter:
+        graph_nodes_source = getattr(current_graph, "node", ())
+        graph_node_count = len(graph_nodes_source)
+        if graph_node_count > _ONNX_WEIGHT_NODE_VISIT_LIMIT - reserved_node_count:
             plan.record_coverage_gap("node_visit_limit")
             return [], []
+        indexed_edge_count = sum(
+            sum(1 for input_name in graph_node.input if input_name)
+            + sum(1 for output_name in graph_node.output if output_name)
+            for graph_node in graph_nodes_source
+        )
+        if indexed_edge_count > _ONNX_WEIGHT_EDGE_VISIT_LIMIT - reserved_edge_count:
+            plan.record_coverage_gap("edge_visit_limit")
+            return [], []
+        reserved_node_count += graph_node_count
+        reserved_edge_count += indexed_edge_count
+        graph_nodes = tuple(graph_nodes_source)
         consumers_by_value: dict[str, list[Any]] = {}
         producers_by_value: dict[str, Any] = {}
-        indexed_edge_count = 0
         for graph_node in graph_nodes:
-            indexed_edge_count += sum(1 for input_name in graph_node.input if input_name)
-            indexed_edge_count += sum(1 for output_name in graph_node.output if output_name)
-            if indexed_edge_count > _ONNX_WEIGHT_EDGE_VISIT_LIMIT - edge_counter:
-                plan.record_coverage_gap("edge_visit_limit")
-                return [], []
             for input_name in graph_node.input:
                 if input_name:
                     consumers_by_value.setdefault(str(input_name), []).append(graph_node)
@@ -2779,38 +2887,36 @@ def _build_onnx_weight_analysis_plan(
                 dynamic_values.add(name)
 
         for local_node_index, node in enumerate(graph_nodes):
-            if node_counter >= _ONNX_WEIGHT_NODE_VISIT_LIMIT:
-                plan.record_coverage_gap("node_visit_limit")
-                break
             current_node_index = node_counter
             node_counter += 1
             edge_counter += len([input_name for input_name in node.input if input_name])
             edge_counter += len([output_name for output_name in node.output if output_name])
-            if edge_counter > _ONNX_WEIGHT_EDGE_VISIT_LIMIT:
-                plan.record_coverage_gap("edge_visit_limit")
-                break
             function_key = (
                 str(getattr(node, "domain", "")),
                 str(getattr(node, "op_type", "")),
                 str(getattr(node, "overload", "")),
             )
             is_model_local_function = function_key in functions
-            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
-                node,
-                opset_versions,
+            is_registered_standard_operator = not is_model_local_function and has_registered_standard_operator(
+                node, opset_versions
             )
-            supported_transform = getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type in {
-                "Cast",
-                "DequantizeLinear",
-                "DynamicQuantizeLinear",
-                "Flatten",
-                "Identity",
-                "QuantizeLinear",
-                "Reshape",
-                "Squeeze",
-                "Transpose",
-                "Unsqueeze",
-            }
+            supported_transform = (
+                not is_model_local_function
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type
+                in {
+                    "Cast",
+                    "DequantizeLinear",
+                    "DynamicQuantizeLinear",
+                    "Flatten",
+                    "Identity",
+                    "QuantizeLinear",
+                    "Reshape",
+                    "Squeeze",
+                    "Transpose",
+                    "Unsqueeze",
+                }
+            )
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
             terminal_weight_lineages: set[int] = set()
             activation_input_lineages: set[int] = set()
@@ -3249,77 +3355,93 @@ def _build_onnx_weight_analysis_plan(
                         or weight_computing_lineage
                     )
                 )
-                unknown_operator_lineage = (
-                    not is_registered_standard_operator
-                    or getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
+                elementwise_output_shape = (
+                    broadcast_shapes(known_value_shapes.get(input_name) for input_name in input_names)
+                    if same_type_elementwise or same_type_unary_elementwise or pow_operator
+                    else known_value_shapes.get(input_names[0])
+                    if clip_operator and input_names
+                    else declared_output_shape
+                    if unmodeled_standard_operator_lineage or metadata_only_lineage
+                    else None
                 )
-                propagates_lineage = (
-                    same_type_elementwise
-                    or same_type_unary_elementwise
-                    or clip_operator
-                    or pow_operator
-                    or prelu_data_is_activation
-                    or weight_computing_lineage
-                    or unknown_operator_lineage
-                    or unmodeled_standard_operator_lineage
-                    or metadata_only_lineage
+                gather_activation_lineages = (
+                    set(value_lineages.get(str(node.input[0]), {}))
+                    if node.input and registered_standard_operator and node.op_type == "Gather" and has_dynamic_input
+                    else set()
                 )
-                if propagates_lineage:
-                    elementwise_output_shape = (
-                        broadcast_shapes(known_value_shapes.get(input_name) for input_name in input_names)
-                        if same_type_elementwise or same_type_unary_elementwise or pow_operator
-                        else known_value_shapes.get(input_names[0])
-                        if clip_operator and input_names
-                        else declared_output_shape
-                        if unmodeled_standard_operator_lineage or metadata_only_lineage
-                        else None
+                data_input_indexes = _STANDARD_DATA_LINEAGE_INPUT_INDEXES.get(
+                    node.op_type,
+                    frozenset(range(len(node.input))),
+                )
+                data_input_lineages = {
+                    initializer_index
+                    for input_index in data_input_indexes
+                    if input_index < len(node.input)
+                    for initializer_index in value_lineages.get(str(node.input[input_index]), {})
+                }
+                activation_seed_lineages = (terminal_weight_lineages & data_input_lineages) | gather_activation_lineages
+                carries_dynamic_activation = bool(activation_seed_lineages) and has_dynamic_input
+                carries_dynamic_activation |= prelu_data_is_activation
+                has_existing_activation_lineage = any(
+                    lineage.activation_derived for lineage in all_input_lineages.values()
+                )
+                carries_dynamic_activation |= has_existing_activation_lineage
+                carries_dynamic_activation |= (
+                    registered_standard_operator and has_dynamic_input and not metadata_only_lineage
+                )
+                for initializer_index, lineage in all_input_lineages.items():
+                    if initializer_index in activation_input_lineages:
+                        continue
+                    lineage_is_activation = lineage.activation_derived or (
+                        has_dynamic_input
+                        and initializer_index in activation_seed_lineages
+                        and not lineage.generated_value
                     )
-                    gather_activation_lineages = (
-                        set(value_lineages.get(str(node.input[0]), {}))
-                        if node.input
-                        and registered_standard_operator
-                        and node.op_type == "Gather"
-                        and has_dynamic_input
-                        else set()
-                    )
-                    activation_seed_lineages = terminal_weight_lineages | gather_activation_lineages
-                    carries_dynamic_activation = bool(activation_seed_lineages) and has_dynamic_input
-                    carries_dynamic_activation |= prelu_data_is_activation
-                    carries_dynamic_activation |= any(
-                        lineage.activation_derived for lineage in all_input_lineages.values()
-                    )
-                    for initializer_index, lineage in all_input_lineages.items():
-                        if initializer_index in activation_input_lineages:
-                            continue
-                        if (
-                            carries_dynamic_activation
-                            and initializer_index not in activation_seed_lineages
-                            and not lineage.activation_derived
-                        ):
-                            continue
-                        unresolved_reason = lineage.unresolved_reason
-                        if metadata_only_lineage:
-                            unresolved_reason = "metadata_derived_lineage"
-                        elif carries_dynamic_activation:
-                            unresolved_reason = "dynamic_activation_lineage"
-                        elif unresolved_reason is None:
-                            unresolved_reason = (
-                                "dynamic_input_lineage" if has_dynamic_input else "unsupported_lineage_operator"
+                    lineage_is_activation |= bool(
+                        carries_dynamic_activation
+                        and not lineage.metadata_derived
+                        and not lineage.generated_value
+                        and lineage.unresolved_reason is None
+                        and lineage.shape is not None
+                        and (
+                            prelu_data_is_activation
+                            or (
+                                len(lineage.shape) < 2
+                                and (same_type_elementwise or node.op_type in {"Gather", "LayerNormalization"})
                             )
-                        output_lineages[initializer_index] = replace(
-                            lineage,
-                            shape=elementwise_output_shape,
-                            data_type=(
-                                int(onnx.TensorProto.INT64)
-                                if metadata_only_lineage
-                                else lineage.data_type
-                                if same_type_elementwise or same_type_unary_elementwise or clip_operator
-                                else None
-                            ),
-                            unresolved_reason=unresolved_reason,
-                            activation_derived=carries_dynamic_activation and not metadata_only_lineage,
-                            metadata_derived=metadata_only_lineage or lineage.metadata_derived,
+                            or activation_seed_lineages
+                            or has_existing_activation_lineage
                         )
+                    )
+                    unresolved_reason = lineage.unresolved_reason
+                    if metadata_only_lineage:
+                        unresolved_reason = "metadata_derived_lineage"
+                    elif carries_dynamic_activation and not lineage_is_activation:
+                        unresolved_reason = unresolved_reason or "dynamic_input_lineage"
+                    elif lineage_is_activation:
+                        unresolved_reason = (
+                            "dynamic_activation_lineage"
+                            if lineage.activation_derived or initializer_index in activation_seed_lineages
+                            else unresolved_reason or "dynamic_input_lineage"
+                        )
+                    elif unresolved_reason is None:
+                        unresolved_reason = (
+                            "dynamic_input_lineage" if has_dynamic_input else "unsupported_lineage_operator"
+                        )
+                    output_lineages[initializer_index] = replace(
+                        lineage,
+                        shape=elementwise_output_shape,
+                        data_type=(
+                            int(onnx.TensorProto.INT64)
+                            if metadata_only_lineage
+                            else lineage.data_type
+                            if same_type_elementwise or same_type_unary_elementwise or clip_operator
+                            else None
+                        ),
+                        unresolved_reason=unresolved_reason,
+                        activation_derived=lineage_is_activation and not metadata_only_lineage,
+                        metadata_derived=metadata_only_lineage or lineage.metadata_derived,
+                    )
 
             if (
                 is_registered_standard_operator
@@ -3758,7 +3880,7 @@ def _build_onnx_weight_analysis_plan(
         *,
         name: str | None,
         role: str,
-    ) -> Any:
+    ) -> tuple[Any, int]:
         if initializer_index is None:
             raise ValueError(f"Quantized weight {role} initializer is unavailable")
         parameter = initializers[initializer_index]
@@ -3766,7 +3888,7 @@ def _build_onnx_weight_analysis_plan(
             raise ValueError(f"Quantized weight {role} initializer uses external data")
         numel = math.prod(int(dimension) for dimension in parameter.dims)
         itemsize = int(_tensor_data_type_to_np_dtype(parameter.data_type).itemsize)
-        estimated_bytes = numel * itemsize
+        estimated_bytes = max(numel * itemsize, _onnx_inline_storage_nbytes(parameter))
         bounded_name, _, _ = _bounded_onnx_metadata_text(plan, name or parameter.name)
         if (
             estimated_bytes < 0
@@ -3777,40 +3899,73 @@ def _build_onnx_weight_analysis_plan(
             )
         ):
             raise ValueError(f"Quantized weight {role} initializer exceeds analysis budget")
-        return onnx.numpy_helper.to_array(parameter)
+        charged_bytes = 0
+        try:
+            if adjust_array_reservation is not None:
+                if not adjust_array_reservation(bounded_name, estimated_bytes):
+                    raise ValueError(f"Quantized weight {role} initializer exceeds retained array budget")
+                charged_bytes = estimated_bytes
+            array = onnx.numpy_helper.to_array(parameter)
+            actual_bytes = int(array.nbytes)
+            if adjust_array_reservation is not None and not adjust_array_reservation(
+                bounded_name,
+                actual_bytes - charged_bytes,
+            ):
+                raise ValueError(f"Quantized weight {role} initializer exceeds retained array budget")
+            return array, actual_bytes if adjust_array_reservation is not None else 0
+        except Exception:
+            if charged_bytes and adjust_array_reservation is not None:
+                adjust_array_reservation(bounded_name, -charged_bytes)
+            raise
 
     def reshape_quantization_parameter(
         parameter: Any,
         *,
         axis: int | None,
         target_shape: tuple[int, ...],
+        kind: str,
         role: str,
-        analysis_dtype: Any,
-        allow_multidirectional_broadcast: bool,
     ) -> Any:
-        parameter = np.asarray(parameter, dtype=analysis_dtype)
+        parameter = np.asarray(parameter)
         if role == "scale" and (not np.all(np.isfinite(parameter)) or bool(np.any(parameter <= 0))):
             raise ValueError("Quantized weight scale must be finite and positive")
-        if parameter.size == 1:
-            return parameter.reshape(())
-        if axis is None or axis < 0 or axis >= len(target_shape):
-            raise ValueError(f"Quantized weight {role} axis is invalid")
-        if parameter.ndim > 1:
-            if not allow_multidirectional_broadcast:
-                raise ValueError(f"Quantized weight {role} must be scalar or one-dimensional")
-            if parameter.ndim != len(target_shape) or axis not in {len(target_shape) - 2, len(target_shape) - 1}:
-                raise ValueError(f"Quantized weight {role} shape is incompatible with weight shape")
-            contraction_axis = len(target_shape) - 1 if axis == len(target_shape) - 2 else len(target_shape) - 2
-            expected_shape = list(target_shape)
-            expected_shape[contraction_axis] = 1
-            if tuple(int(dimension) for dimension in parameter.shape) != tuple(expected_shape):
-                raise ValueError(f"Quantized weight {role} shape is incompatible with weight shape")
-            return parameter
-        if parameter.ndim != 1 or int(parameter.shape[0]) != int(target_shape[axis]):
-            raise ValueError(f"Quantized weight {role} shape is incompatible with weight axis")
-        broadcast_shape = [1] * len(target_shape)
-        broadcast_shape[axis] = int(target_shape[axis])
-        return parameter.reshape(tuple(broadcast_shape))
+        broadcast_shape = _normalized_onnx_quantization_parameter_shape(
+            tuple(int(dimension) for dimension in parameter.shape),
+            target_shape=target_shape,
+            axis=axis,
+            kind=kind,
+        )
+        if broadcast_shape is None:
+            raise ValueError(f"Quantized weight {role} shape is incompatible with weight shape")
+        return parameter.reshape(broadcast_shape)
+
+    def reshape_weight_array(array: Any, shape: tuple[int, ...], name: str, *, allow_copy: bool) -> Any:
+        may_copy = not array.flags.c_contiguous
+        reserved_bytes = 0
+        if may_copy and adjust_array_reservation is not None:
+            reserved_bytes = int(array.nbytes)
+            if not adjust_array_reservation(name, reserved_bytes):
+                raise ValueError("ONNX weight reshape exceeds retained array budget")
+        try:
+            reshaped = np.reshape(array, shape)
+            copied = bool(reshaped.size and not np.shares_memory(array, reshaped))
+            if copied and not allow_copy:
+                raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
+            if (
+                reserved_bytes
+                and adjust_array_reservation is not None
+                and not adjust_array_reservation(
+                    name,
+                    (int(reshaped.nbytes) if copied else 0) - reserved_bytes,
+                )
+            ):
+                raise ValueError("ONNX weight reshape exceeds retained array budget")
+            reserved_bytes = int(reshaped.nbytes) if copied and adjust_array_reservation is not None else 0
+            return reshaped
+        except Exception:
+            if reserved_bytes and adjust_array_reservation is not None:
+                adjust_array_reservation(name, -reserved_bytes)
+            raise
 
     def materialize_quantized_weights(weights: Any, quantization: _OnnxWeightQuantization) -> Any:
         if quantization.scale_name is None and quantization.kind not in {"ConvInteger", "MatMulInteger"}:
@@ -3819,7 +3974,6 @@ def _build_onnx_weight_analysis_plan(
         analysis_dtype = np.dtype(
             _tensor_data_type_to_np_dtype(quantization.output_data_type or int(onnx.TensorProto.FLOAT))
         )
-        allow_multidirectional_broadcast = quantization.kind in {"MatMulInteger", "QLinearMatMul"}
         scale_factor_pairs = (
             list(zip(quantization.scale_factor_names, quantization.scale_factor_initializer_indexes, strict=True))
             if quantization.scale_factor_names
@@ -3827,75 +3981,87 @@ def _build_onnx_weight_analysis_plan(
             if quantization.scale_name is not None
             else []
         )
-        raw_scales = [
-            load_quantization_parameter(initializer_index, name=name, role="scale")
-            for name, initializer_index in scale_factor_pairs
-        ]
-        if quantization.kind == "ConvInteger":
-            channel_count = int(target_shape[0])
-            spatial_rank = max(len(target_shape) - 2, 0)
-            valid_scale_shapes = {
-                (channel_count, *([1] * spatial_rank)),
-                (1, channel_count, *([1] * spatial_rank)),
-            }
-            raw_scales = [
-                np.asarray(raw_scale).reshape((channel_count,))
-                if np.asarray(raw_scale).shape in valid_scale_shapes
-                else raw_scale
+        parameter_charges: list[int] = []
+        output_charge = 0
+        try:
+            raw_scales = []
+            for name, initializer_index in scale_factor_pairs:
+                raw_scale, charged_bytes = load_quantization_parameter(
+                    initializer_index,
+                    name=name,
+                    role="scale",
+                )
+                raw_scales.append(raw_scale)
+                parameter_charges.append(charged_bytes)
+            raw_zero_point = None
+            if quantization.zero_point_name is not None:
+                raw_zero_point, charged_bytes = load_quantization_parameter(
+                    quantization.zero_point_initializer_index,
+                    name=quantization.zero_point_name,
+                    role="zero_point",
+                )
+                parameter_charges.append(charged_bytes)
+            for _, scale_initializer_index in scale_factor_pairs:
+                if scale_initializer_index is None:
+                    raise ValueError("Quantized weight scale initializer is unavailable")
+                if int(initializers[scale_initializer_index].data_type) not in floating_types:
+                    raise ValueError("Quantized weight scale must use a floating-point data type")
+            if quantization.zero_point_initializer_index is not None and quantization.input_data_type is not None:
+                zero_point_initializer = initializers[quantization.zero_point_initializer_index]
+                if int(zero_point_initializer.data_type) != int(quantization.input_data_type):
+                    raise ValueError("Quantized weight zero point must match the weight data type")
+            if (
+                quantization.kind in {"DequantizeLinear", "QLinearConv", "QLinearMatMul"}
+                and raw_scales
+                and raw_zero_point is not None
+                and np.asarray(raw_scales[0]).shape != np.asarray(raw_zero_point).shape
+            ):
+                raise ValueError("Quantized weight scale and zero point must have matching shapes")
+            scales = [
+                reshape_quantization_parameter(
+                    raw_scale,
+                    axis=quantization.axis,
+                    target_shape=target_shape,
+                    kind=quantization.kind,
+                    role="scale",
+                )
                 for raw_scale in raw_scales
             ]
-        raw_zero_point = (
-            load_quantization_parameter(
-                quantization.zero_point_initializer_index,
-                name=quantization.zero_point_name,
-                role="zero_point",
-            )
-            if quantization.zero_point_name is not None
-            else None
-        )
-        for _, scale_initializer_index in scale_factor_pairs:
-            if scale_initializer_index is None:
-                raise ValueError("Quantized weight scale initializer is unavailable")
-            scale_initializer = initializers[scale_initializer_index]
-            if int(scale_initializer.data_type) not in floating_types:
-                raise ValueError("Quantized weight scale must use a floating-point data type")
-        if quantization.zero_point_initializer_index is not None and quantization.input_data_type is not None:
-            zero_point_initializer = initializers[quantization.zero_point_initializer_index]
-            if int(zero_point_initializer.data_type) != int(quantization.input_data_type):
-                raise ValueError("Quantized weight zero point must match the weight data type")
-        if (
-            quantization.kind in {"DequantizeLinear", "QLinearConv", "QLinearMatMul"}
-            and raw_scales
-            and raw_zero_point is not None
-            and np.asarray(raw_scales[0]).shape != np.asarray(raw_zero_point).shape
-        ):
-            raise ValueError("Quantized weight scale and zero point must have matching shapes")
-        scales = [
-            reshape_quantization_parameter(
-                raw_scale,
-                axis=quantization.axis,
-                target_shape=target_shape,
-                role="scale",
-                analysis_dtype=analysis_dtype,
-                allow_multidirectional_broadcast=allow_multidirectional_broadcast,
-            )
-            for raw_scale in raw_scales
-        ]
-        dequantized = weights.astype(analysis_dtype, copy=True)
-        if raw_zero_point is not None:
-            zero_point = reshape_quantization_parameter(
-                raw_zero_point,
-                axis=quantization.axis,
-                target_shape=target_shape,
-                role="zero_point",
-                analysis_dtype=analysis_dtype,
-                allow_multidirectional_broadcast=allow_multidirectional_broadcast,
-            )
-            np.subtract(dequantized, zero_point, out=dequantized, casting="unsafe")
-        for scale in scales:
-            with np.errstate(over="ignore", invalid="ignore"):
-                np.multiply(dequantized, scale, out=dequantized, casting="unsafe")
-        return dequantized
+            bounded_name = "quantized weight"
+            output_bytes = int(weights.size) * int(analysis_dtype.itemsize)
+            if adjust_array_reservation is not None:
+                if not adjust_array_reservation(bounded_name, output_bytes):
+                    raise ValueError("Quantized weight dequantization exceeds retained array budget")
+                output_charge = output_bytes
+            dequantized = weights.astype(analysis_dtype, copy=True)
+            actual_bytes = int(dequantized.nbytes)
+            if adjust_array_reservation is not None and not adjust_array_reservation(
+                bounded_name,
+                actual_bytes - output_charge,
+            ):
+                raise ValueError("Quantized weight dequantization exceeds retained array budget")
+            output_charge = actual_bytes if adjust_array_reservation is not None else 0
+            if raw_zero_point is not None:
+                zero_point = reshape_quantization_parameter(
+                    raw_zero_point,
+                    axis=quantization.axis,
+                    target_shape=target_shape,
+                    kind=quantization.kind,
+                    role="zero_point",
+                )
+                np.subtract(dequantized, zero_point, out=dequantized, casting="unsafe")
+            for scale in scales:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    np.multiply(dequantized, scale, out=dequantized, casting="unsafe")
+            return dequantized
+        except Exception:
+            if output_charge and adjust_array_reservation is not None:
+                adjust_array_reservation(bounded_name, -output_charge)
+            raise
+        finally:
+            if adjust_array_reservation is not None:
+                for charged_bytes in parameter_charges:
+                    adjust_array_reservation(bounded_name, -charged_bytes)
 
     analyzed_initializer_indexes: set[int] = set()
     eligible_metadata: list[dict[str, Any]] = []
@@ -3939,8 +4105,19 @@ def _build_onnx_weight_analysis_plan(
                 plan.oversized_initializers_skipped += 1
                 continue
 
+            array_estimated_bytes = max(numel * itemsize, _onnx_inline_storage_nbytes(initializer))
+            if adjust_array_reservation is not None and not adjust_array_reservation(
+                bounded_name,
+                array_estimated_bytes,
+            ):
+                plan.oversized_initializers_skipped += 1
+                continue
             array = onnx.numpy_helper.to_array(initializer)
-            if retain_array_check is not None and not retain_array_check(bounded_name, int(array.nbytes)):
+            if adjust_array_reservation is not None and not adjust_array_reservation(
+                bounded_name,
+                int(array.nbytes) - array_estimated_bytes,
+            ):
+                adjust_array_reservation(bounded_name, -array_estimated_bytes)
                 plan.oversized_initializers_skipped += 1
                 continue
 
@@ -3959,33 +4136,19 @@ def _build_onnx_weight_analysis_plan(
                                 continue
                             if transform.kind == "DequantizeLinear":
                                 transformed = materialize_quantized_weights(transformed, consumer_group.quantization)
-                                if retain_array_check is not None and not retain_array_check(
-                                    bounded_name,
-                                    int(transformed.nbytes),
-                                ):
-                                    raise ValueError("Quantized weight dequantization exceeds retained array budget")
                                 quantization_applied = True
                                 continue
-                            transform_input = transformed
                             if transform.kind == "Transpose":
                                 transformed = np.transpose(transformed, axes=transform.parameters)
                             elif transform.kind == "Reshape":
-                                transformed = np.reshape(transformed, transform.parameters)
-                            if transformed.size and not np.shares_memory(transform_input, transformed):
-                                if not quantization_applied:
-                                    raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
-                                if retain_array_check is not None and not retain_array_check(
+                                transformed = reshape_weight_array(
+                                    transformed,
+                                    transform.parameters,
                                     bounded_name,
-                                    int(transformed.nbytes),
-                                ):
-                                    raise ValueError("Post-dequantization transform exceeds retained array budget")
+                                    allow_copy=quantization_applied,
+                                )
                         if not quantization_applied:
                             transformed = materialize_quantized_weights(transformed, consumer_group.quantization)
-                            if retain_array_check is not None and not retain_array_check(
-                                bounded_name,
-                                int(transformed.nbytes),
-                            ):
-                                raise ValueError("Quantized weight dequantization exceeds retained array budget")
                         quantized_views[quantized_key] = transformed
                     analysis_materialization = "bounded_quantized_dequantize_copy"
                     analysis_storage_shares_memory = False
@@ -3999,7 +4162,12 @@ def _build_onnx_weight_analysis_plan(
                             if transform.kind == "Transpose":
                                 transformed = np.transpose(transformed, axes=transform.parameters)
                             elif transform.kind == "Reshape":
-                                transformed = np.reshape(transformed, transform.parameters)
+                                transformed = reshape_weight_array(
+                                    transformed,
+                                    transform.parameters,
+                                    bounded_name,
+                                    allow_copy=False,
+                                )
                             if transformed.size and not np.shares_memory(array, transformed):
                                 raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
                         transformed_views[consumer_group.lineage.transforms] = transformed
@@ -6666,11 +6834,15 @@ class OnnxScanner(BaseScanner):
         )
         retained_array_bytes = 0
 
-        def retained_array_fits_budget(_name: str, retained_bytes: int) -> bool:
+        def adjust_retained_array(_name: str, retained_bytes: int) -> bool:
             nonlocal retained_array_bytes
-            if retained_array_budget is not None and retained_array_bytes + retained_bytes > retained_array_budget:
+            if (
+                retained_bytes > 0
+                and retained_array_budget is not None
+                and retained_array_bytes + retained_bytes > retained_array_budget
+            ):
                 return False
-            retained_array_bytes += retained_bytes
+            retained_array_bytes = max(retained_array_bytes + retained_bytes, 0)
             return True
 
         plan = _build_onnx_weight_analysis_plan(
@@ -6679,7 +6851,7 @@ class OnnxScanner(BaseScanner):
             np=np,
             max_array_size=max_array_size,
             pre_materialization_check=inline_storage_fits_budget,
-            retain_array_check=retained_array_fits_budget,
+            adjust_array_reservation=adjust_retained_array,
         )
         result.metadata["onnx_weight_distribution_semantics"] = plan.metadata
 

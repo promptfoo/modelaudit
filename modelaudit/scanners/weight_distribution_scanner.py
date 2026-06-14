@@ -1592,18 +1592,24 @@ class WeightDistributionScanner(BaseScanner):
                     tensor_nbytes=estimated_bytes,
                 )
 
+            def adjust_array_reservation(name: str, nbytes: int) -> bool:
+                if nbytes <= 0:
+                    self.retained_tensor_bytes = max(self.retained_tensor_bytes + nbytes, 0)
+                    return True
+                return self._tensor_fits_budget(
+                    "onnx_initializer_size_limit",
+                    name,
+                    tensor_nbytes=nbytes,
+                    retain=True,
+                )
+
             plan = _build_onnx_weight_analysis_plan(
                 model,
                 onnx=onnx,
                 np=np,
                 max_array_size=None,
                 pre_materialization_check=pre_materialization_check,
-                retain_array_check=lambda name, nbytes: self._tensor_fits_budget(
-                    "onnx_initializer_size_limit",
-                    name,
-                    tensor_nbytes=nbytes,
-                    retain=True,
-                ),
+                adjust_array_reservation=adjust_array_reservation,
             )
         except Exception as exc:
             logger.warning("Failed to build semantic ONNX weight plan for %s (%s)", path, type(exc).__name__)

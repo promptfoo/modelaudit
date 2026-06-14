@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import json
 import os
@@ -5,6 +6,7 @@ import struct
 import sys
 import time
 import tracemalloc
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,11 @@ def _make_external_tensor(name: str, data_type: int, dims: list[int], external_p
     entry.value = external_path
     tensor.external_data.append(entry)
     return tensor
+
+
+def _save_checked_onnx_model(model: Any, path: Path) -> None:
+    onnx.checker.check_model(model)
+    onnx.save(model, str(path))
 
 
 def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
@@ -180,6 +187,48 @@ def create_onnx_weight_model(
     return path
 
 
+def create_external_onnx_weight_package(root: Path, weights: np.ndarray) -> Path:
+    root.mkdir(parents=True)
+    weight_tensor = _make_external_tensor("W", TensorProto.FLOAT, list(weights.shape), "weights.bin")
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["X", "W"], ["Y"])],
+        "external_weight_graph",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, weights.shape[0]])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, weights.shape[1]])],
+        initializer=[weight_tensor],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = root / "model.onnx"
+    onnx.save(model, str(path))
+    (root / "weights.bin").write_bytes(weights.astype(np.float32, copy=False).tobytes())
+    return path
+
+
+def create_multiple_weight_model(tmp_path: Path, *, weight_count: int) -> Path:
+    initializers = []
+    nodes = []
+    outputs = []
+    for index in range(weight_count):
+        weight_name = f"W_{index}"
+        output_name = f"Y_{index}"
+        initializers.append(onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name=weight_name))
+        nodes.append(helper.make_node("MatMul", ["X", weight_name], [output_name]))
+        outputs.append(helper.make_tensor_value_info(output_name, TensorProto.FLOAT, [1, 10]))
+    graph = helper.make_graph(
+        nodes,
+        "multiple_weights",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        outputs,
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / f"multiple-weights-{weight_count}.onnx"
+    _save_checked_onnx_model(model, path)
+    return path
+
+
 def create_transformed_onnx_weight_model(
     tmp_path: Path,
     analysis_weights: np.ndarray,
@@ -267,9 +316,8 @@ def create_transformed_onnx_weight_model(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"{transform.lower()}-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -336,9 +384,8 @@ def create_training_transformed_weight_model(tmp_path: Path, *, transform: str) 
     )
     model.ir_version = 8
     model.training_info.append(training_info)
-    onnx.checker.check_model(model)
     path = tmp_path / f"training-{transform.lower()}-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -370,9 +417,8 @@ def create_nonweight_transformed_matmul_model(tmp_path: Path, *, transform: str)
     graph = helper.make_graph(nodes, "nonweight_transform", graph_inputs, graph_outputs, initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"nonweight-{transform.lower()}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -400,9 +446,8 @@ def create_zipmap_classifier_model(tmp_path: Path) -> Path:
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
     )
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "zipmap-classifier.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -452,9 +497,8 @@ def create_training_info_weight_model(tmp_path: Path) -> Path:
     )
     model.ir_version = 8
     model.training_info.append(training_info)
-    onnx.checker.check_model(model)
     path = tmp_path / "training-info-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -518,9 +562,8 @@ def create_cross_training_info_weight_model(tmp_path: Path) -> Path:
     )
     model.ir_version = 8
     model.training_info.extend([first_training_info, second_training_info])
-    onnx.checker.check_model(model)
     path = tmp_path / "cross-training-info-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -554,9 +597,8 @@ def create_training_initialization_reset_model(tmp_path: Path) -> Path:
     model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     model.training_info.append(training_info)
-    onnx.checker.check_model(model)
     path = tmp_path / "training-initialization-reset.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -582,9 +624,8 @@ def create_read_only_main_initializer_training_model(tmp_path: Path) -> Path:
     model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     model.training_info.append(training_info)
-    onnx.checker.check_model(model)
     path = tmp_path / "read-only-main-initializer-training.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -649,9 +690,8 @@ def create_non_weight_training_update_model(
     model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", opset_version)])
     model.ir_version = 8
     model.training_info.append(training_info)
-    onnx.checker.check_model(model)
     path = tmp_path / f"non-weight-{op_type.lower()}-training-update.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -689,9 +729,8 @@ def create_flat_training_initialization_reset_model(tmp_path: Path) -> Path:
     model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     model.training_info.append(training_info)
-    onnx.checker.check_model(model)
     path = tmp_path / "flat-training-initialization-reset.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -733,9 +772,8 @@ def create_recurrent_weight_model(
     graph = helper.make_graph([node], f"{op_type.lower()}_weight_graph", [X], [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"{op_type.lower()}-{target_input_index}-{distributed_near_match}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -752,9 +790,8 @@ def create_broadcast_dynamic_weight_model(tmp_path: Path) -> Path:
     graph = helper.make_graph(nodes, "broadcast_dynamic_weight_graph", [X, delta], [Y], initializer=[vector])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "broadcast-dynamic-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -771,9 +808,8 @@ def create_computed_weight_model(tmp_path: Path) -> Path:
     graph = helper.make_graph(nodes, "computed_weight_graph", [X], [Y], initializer=[left, right])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "computed-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -790,9 +826,8 @@ def create_dynamic_left_weight_model(tmp_path: Path) -> Path:
     graph = helper.make_graph(nodes, "dynamic_left_weight_graph", [delta], [Y], initializer=[left, right])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "dynamic-left-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -809,9 +844,8 @@ def create_left_weight_stack_model(tmp_path: Path) -> Path:
     graph = helper.make_graph(nodes, "left_weight_stack", [X], [Y], initializer=[first, second])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "left-weight-stack.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -828,9 +862,8 @@ def create_left_weight_gemm_stack_model(tmp_path: Path) -> Path:
     graph = helper.make_graph(nodes, "left_weight_gemm_stack", [X], [Y], initializer=[first, second])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "left-weight-gemm-stack.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -859,9 +892,8 @@ def create_attention_score_model(tmp_path: Path) -> Path:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "attention-score.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -885,9 +917,8 @@ def create_einsum_attention_score_model(tmp_path: Path) -> Path:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "einsum-attention-score.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -914,9 +945,8 @@ def create_recurrent_dynamic_weight_model(tmp_path: Path) -> Path:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "recurrent-dynamic-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -942,9 +972,8 @@ def create_projected_dynamic_matmul_weight_model(tmp_path: Path, *, left: bool) 
     graph = helper.make_graph(nodes, "projected_dynamic_weight_graph", [seed, X], [Y], initializer=[projection])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"projected-dynamic-matmul-weight-{left}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -970,9 +999,8 @@ def create_mixed_activation_and_raw_lineage_model(tmp_path: Path) -> Path:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "mixed-activation-raw-lineage.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -991,9 +1019,8 @@ def create_batched_matmul_weight_model(tmp_path: Path, weights: np.ndarray, *, l
     graph = helper.make_graph([node], "batched_matmul_graph", [X], [Y], initializer=[weight_tensor])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / ("batched-left-matmul.onnx" if left else "batched-right-matmul.onnx")
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1034,9 +1061,8 @@ def create_collision_named_weight_model(tmp_path: Path) -> Path:
     graph = helper.make_graph(nodes, "collision_graph", [right_input, left_input], outputs, initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "collision-named-weights.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1061,9 +1087,8 @@ def create_many_consumer_weight_model(tmp_path: Path, *, consumer_count: int) ->
     graph = helper.make_graph(nodes, "many_consumer_graph", [X], [Y], initializer=[initializer])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "many-consumer-weights.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1106,9 +1131,8 @@ def create_left_equivalent_linear_model(
     graph = helper.make_graph(nodes, "left_equivalent_graph", [X], [Y], initializer=[weight_tensor])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"left-equivalent-{op_type.lower()}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1132,9 +1156,8 @@ def create_onnx_conv_weight_model(
     graph = helper.make_graph([node], "conv_weight_graph", [X], [Y], initializer=[weight_tensor])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / filename
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1225,9 +1248,8 @@ def create_control_flow_captured_weight_model(
     graph = helper.make_graph([control_node], "control_graph", graph_inputs, graph_outputs, initializer=[weight_tensor])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"captured-{control_flow_op.lower()}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1267,9 +1289,8 @@ def create_control_flow_shadowed_weight_model(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "shadowed-captured-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1304,9 +1325,8 @@ def create_control_flow_returned_weight_model(tmp_path: Path, weights: np.ndarra
     graph = helper.make_graph(nodes, "returned_weight_graph", [condition, X], [Y], initializer=[initializer])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "returned-control-flow-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1351,9 +1371,8 @@ def create_loop_carried_weight_model(tmp_path: Path, weights: np.ndarray) -> Pat
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "loop-carried-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1398,9 +1417,8 @@ def create_einsum_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
     graph = helper.make_graph([node], "einsum_weight_graph", [X], [Y], initializer=[initializer])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "einsum-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1781,9 +1799,8 @@ def create_matmul_integer_scale_chain_model(
         opset_imports.append(helper.make_opsetid("modelaudit.test", 1))
     model = helper.make_model(graph, functions=functions, opset_imports=opset_imports)
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"matmul-integer-scale-chain-{integer_op_boundary}-{'left' if weight_on_left else 'right'}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -1794,9 +1811,11 @@ def create_dynamic_matmul_integer_bias_model(
     metadata_sink_domain: str = "",
     metadata_sink_from_bias_output: bool = False,
     post_bias_scale: bool = False,
+    post_bias_operator: str | None = None,
     integer_op_boundary: str = "direct",
 ) -> Path:
     assert integer_op_boundary in {"direct", "function", "if_subgraph"}
+    assert post_bias_operator in {None, "Abs", "Cast", "Identity", "Relu", "dynamic_mul", "local_identity", "self_mul"}
     weights = np.ones((100, 10), dtype=np.int8)
     weight_scale = np.ones(10, dtype=np.float32)
     if malicious:
@@ -1903,7 +1922,34 @@ def create_dynamic_matmul_integer_bias_model(
             output_name=bias_output,
         )
     if post_bias_scale:
-        nodes.append(helper.make_node("Mul", [bias_output, "W_scale_1"], ["Y"]))
+        post_bias_input = bias_output
+        if post_bias_operator in {"Abs", "Identity", "Relu"}:
+            nodes.append(helper.make_node(post_bias_operator, [post_bias_input], ["Y_post_bias"]))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "Cast":
+            nodes.append(helper.make_node("Cast", [post_bias_input], ["Y_post_bias"], to=TensorProto.FLOAT))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "dynamic_mul":
+            inputs.append(helper.make_tensor_value_info("post_bias_gate", TensorProto.FLOAT, [1, 10]))
+            nodes.append(helper.make_node("Mul", [post_bias_input, "post_bias_gate"], ["Y_post_bias"]))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "self_mul":
+            nodes.append(helper.make_node("Mul", [post_bias_input, post_bias_input], ["Y_post_bias"]))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "local_identity":
+            functions.append(
+                helper.make_function(
+                    "",
+                    "Identity",
+                    ["local_input"],
+                    ["local_output"],
+                    [helper.make_node("Relu", ["local_input"], ["local_output"])],
+                    [helper.make_opsetid("", 13)],
+                )
+            )
+            nodes.append(helper.make_node("Identity", [post_bias_input], ["Y_post_bias"]))
+            post_bias_input = "Y_post_bias"
+        nodes.append(helper.make_node("Mul", [post_bias_input, "W_scale_1"], ["Y"]))
     elif integer_op_boundary != "direct":
         nodes.append(helper.make_node("Identity", [bias_output], ["Y"]))
     metadata_sink_input = bias_output if metadata_sink_from_bias_output else "Y"
@@ -1940,6 +1986,117 @@ def create_dynamic_matmul_integer_bias_model(
     return path
 
 
+def create_graph_input_activation_model(
+    tmp_path: Path,
+    *,
+    prelude: str,
+    malicious_scale: bool,
+    distinct_weight_lineage: bool = False,
+    distinct_metadata_lineage: bool = False,
+) -> Path:
+    assert prelude in {"Add", "Gather", "LayerNormalization"}
+    assert not (distinct_weight_lineage and distinct_metadata_lineage)
+    weights = np.ones((100, 10), dtype=np.int8)
+    weight_scale = np.ones(10, dtype=np.float32)
+    if malicious_scale:
+        weight_scale[3] = 100.0
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W_quantized"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="W_zero_point"),
+        onnx.numpy_helper.from_array(weight_scale, name="W_scale"),
+    ]
+    inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])]
+    activation_name = "activation"
+    value_info: list[Any] = []
+    if prelude == "Add":
+        nodes = []
+        if distinct_metadata_lineage:
+            initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(np.zeros((1, 100), dtype=np.float32), name="metadata_source"),
+                    onnx.numpy_helper.from_array(np.asarray([50], dtype=np.int64), name="metadata_repeats"),
+                ]
+            )
+            nodes.extend(
+                [
+                    helper.make_node("Shape", ["metadata_source"], ["metadata_shape"]),
+                    helper.make_node("Cast", ["metadata_shape"], ["metadata_values"], to=TensorProto.FLOAT),
+                    helper.make_node("Tile", ["metadata_values", "metadata_repeats"], ["addend"]),
+                ]
+            )
+            value_info.extend(
+                [
+                    helper.make_tensor_value_info("metadata_shape", TensorProto.INT64, [2]),
+                    helper.make_tensor_value_info("metadata_values", TensorProto.FLOAT, [2]),
+                    helper.make_tensor_value_info("addend", TensorProto.FLOAT, [100]),
+                ]
+            )
+        else:
+            addend = (
+                np.zeros((1, 100), dtype=np.float32) if distinct_weight_lineage else np.zeros(100, dtype=np.float32)
+            )
+            initializers.append(onnx.numpy_helper.from_array(addend, name="addend"))
+        nodes.append(helper.make_node("Add", ["X", "addend"], [activation_name]))
+        activation_shape = [1, 100]
+    elif prelude == "Gather":
+        initializers.append(onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int64), name="index"))
+        nodes = [helper.make_node("Gather", ["X", "index"], [activation_name], axis=0)]
+        activation_shape = [100]
+    else:
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.ones(100, dtype=np.float32), name="layer_norm_scale"),
+                onnx.numpy_helper.from_array(np.zeros(100, dtype=np.float32), name="layer_norm_bias"),
+            ]
+        )
+        nodes = [
+            helper.make_node(
+                "LayerNormalization",
+                ["X", "layer_norm_scale", "layer_norm_bias"],
+                [activation_name],
+            )
+        ]
+        activation_shape = [1, 100]
+    nodes.extend(
+        [
+            helper.make_node(
+                "DynamicQuantizeLinear",
+                [activation_name],
+                ["X_quantized", "X_scale", "X_zero_point"],
+            ),
+            helper.make_node(
+                "MatMulInteger",
+                ["X_quantized", "W_quantized", "X_zero_point", "W_zero_point"],
+                ["Y_integer"],
+            ),
+            helper.make_node("Cast", ["Y_integer"], ["Y_cast"], to=TensorProto.FLOAT),
+            helper.make_node("Mul", ["Y_cast", "X_scale"], ["Y_activation_scaled"]),
+            helper.make_node("Mul", ["Y_activation_scaled", "W_scale"], ["Y"]),
+        ]
+    )
+    output_shape = [10] if prelude == "Gather" else [1, 10]
+    graph = helper.make_graph(
+        nodes,
+        "graph_input_activation",
+        inputs,
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, output_shape)],
+        initializer=initializers,
+        value_info=[*value_info, helper.make_tensor_value_info(activation_name, TensorProto.FLOAT, activation_shape)],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    suffix = (
+        "distinct-weight"
+        if distinct_weight_lineage
+        else "distinct-metadata"
+        if distinct_metadata_lineage
+        else "activation"
+    )
+    path = tmp_path / f"graph-input-{prelude.lower()}-{suffix}-{'malicious' if malicious_scale else 'benign'}.onnx"
+    _save_checked_onnx_model(model, path)
+    return path
+
+
 def create_declared_shape_metadata_model(tmp_path: Path) -> Path:
     graph = helper.make_graph(
         [
@@ -1957,9 +2114,8 @@ def create_declared_shape_metadata_model(tmp_path: Path) -> Path:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "declared-shape-metadata.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2122,9 +2278,8 @@ def create_generated_zero_adjacent_transform_model(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"generated-zero-{op_type.lower()}-{parameter}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2161,9 +2316,8 @@ def create_generated_value_parameter_model(tmp_path: Path) -> Path:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "generated-value-parameter.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2197,9 +2351,8 @@ def create_generated_zero_matmul_integer_model(tmp_path: Path, *, malicious_zero
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"generated-zero-matmul-integer-{'malicious' if malicious_zero_point else 'benign'}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2223,9 +2376,8 @@ def create_dynamic_pad_fill_weight_model(tmp_path: Path, *, fill_value: float) -
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"dynamic-pad-fill-{fill_value}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2278,9 +2430,8 @@ def create_shape_derived_weight_model(tmp_path: Path, *, op_type: str, malicious
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"{op_type.lower()}-derived-{'malicious' if malicious else 'benign'}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2290,10 +2441,12 @@ def create_typed_constant_of_shape_weight_model(
     data_type: int,
     fill_value: float | int,
     malformed: bool = False,
+    typed_field_repetitions: int = 0,
 ) -> Path:
     fill = helper.make_tensor("fill", data_type, [1], [fill_value])
     if malformed:
         fill.int32_data.append(0)
+    fill.int32_data.extend([0] * typed_field_repetitions)
     quantized = data_type == TensorProto.INT8
     consumer = "MatMulInteger" if quantized else "MatMul"
     output_type = TensorProto.INT32 if quantized else data_type
@@ -2310,7 +2463,7 @@ def create_typed_constant_of_shape_weight_model(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    if not malformed:
+    if not malformed and not typed_field_repetitions:
         onnx.checker.check_model(model)
     path = tmp_path / f"typed-constant-of-shape-{data_type}-{fill_value}-{'bad' if malformed else 'valid'}.onnx"
     onnx.save(model, str(path))
@@ -2358,9 +2511,33 @@ def create_shared_zero_proof_fanout_model(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"shared-zero-proof-{'generated' if generated_source else 'dynamic'}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
+    return path
+
+
+def create_generated_zero_cast_weight_model(tmp_path: Path, *, target_data_type: int) -> Path:
+    graph = helper.make_graph(
+        [
+            helper.make_node("ConstantOfShape", ["weight_shape"], ["generated_zero"]),
+            helper.make_node("Cast", ["generated_zero"], ["cast_zero"], to=target_data_type),
+            helper.make_node("Cast", ["cast_zero"], ["W"], to=TensorProto.FLOAT),
+            helper.make_node("MatMul", ["X", "W"], ["Y"]),
+        ],
+        "generated_zero_cast_weight",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="weight_shape")],
+        value_info=[
+            helper.make_tensor_value_info("generated_zero", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("cast_zero", target_data_type, [100, 10]),
+            helper.make_tensor_value_info("W", TensorProto.FLOAT, [100, 10]),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 23)])
+    model.ir_version = 10
+    path = tmp_path / f"generated-zero-cast-{target_data_type}.onnx"
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2392,9 +2569,8 @@ def create_registered_standard_weight_transform_model(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"{op_type.lower()}-weight-lineage-{'malicious' if malicious else 'benign'}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2419,9 +2595,8 @@ def create_batched_matmul_integer_weight_model(tmp_path: Path) -> Path:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "batched-matmul-integer-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2656,9 +2831,8 @@ def create_custom_dynamic_quantize_name_collision_model(tmp_path: Path) -> Path:
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("com.test", 1)],
     )
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "custom-dynamic-quantize-name-collision.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2689,9 +2863,8 @@ def create_qlinear_matmul_left_weight_model(tmp_path: Path, *, malicious: bool) 
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
     model.ir_version = 10
-    onnx.checker.check_model(model)
     path = tmp_path / f"qlinear-matmul-left-{'malicious' if malicious else 'benign'}.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2816,9 +2989,8 @@ def create_concat_weight_lineage_model(tmp_path: Path, *, dynamic_right: bool = 
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "concat-weight-lineage.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2841,9 +3013,8 @@ def create_flat_concat_weight_lineage_model(tmp_path: Path) -> Path:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "flat-concat-weight-lineage.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2866,9 +3037,8 @@ def create_qdq_transposed_weight_model(tmp_path: Path, *, malicious: bool = Fals
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "qdq-transposed-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -2925,9 +3095,8 @@ def create_qlinear_matmul_nd_scale_model(tmp_path: Path, *, malicious: bool = Fa
     graph = helper.make_graph([node], "qlinear_matmul_nd_scale_graph", [X], [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
     model.ir_version = 10
-    onnx.checker.check_model(model)
     path = tmp_path / "qlinear-matmul-nd-scale.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -3033,9 +3202,8 @@ def create_qlinear_matmul_group_fanout_model(tmp_path: Path, *, consumer_count: 
     graph = helper.make_graph(nodes, "qlinear_group_fanout", [X], [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
     model.ir_version = 10
-    onnx.checker.check_model(model)
     path = tmp_path / "qlinear-group-fanout.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -3073,9 +3241,8 @@ def create_sparse_weight_model(tmp_path: Path) -> Path:
     graph = helper.make_graph([node], "sparse_weight_graph", [X], [Y], sparse_initializer=[sparse_weight])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "sparse-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -3090,9 +3257,8 @@ def create_constant_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
     graph = helper.make_graph(nodes, "constant_weight_graph", [X], [Y])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "constant-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -3117,9 +3283,8 @@ def create_local_function_weight_model(tmp_path: Path, weights: np.ndarray) -> P
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid(domain, 1)],
     )
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "local-function-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -3158,9 +3323,8 @@ def create_local_function_default_weight_model(tmp_path: Path, weights: np.ndarr
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid(domain, 1)],
     )
     model.ir_version = 9
-    onnx.checker.check_model(model)
     path = tmp_path / "local-function-default-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -3203,9 +3367,8 @@ def create_repeated_local_function_default_weight_model(tmp_path: Path, weights:
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid(domain, 1)],
     )
     model.ir_version = 9
-    onnx.checker.check_model(model)
     path = tmp_path / "repeated-local-function-default-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -3267,9 +3430,8 @@ def create_many_local_function_weight_overrides_model(tmp_path: Path, *, call_co
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid(domain, 1)],
     )
     model.ir_version = 9
-    onnx.checker.check_model(model)
     path = tmp_path / "many-local-function-weight-overrides.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -3311,9 +3473,37 @@ def create_many_if_branch_weight_model(tmp_path: Path, *, branch_count: int = 20
     graph = helper.make_graph(nodes, "many_if_branch_weights", [condition, X], [Y])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / "many-if-branch-weights.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
+    return path
+
+
+def create_nested_index_budget_model(tmp_path: Path, *, nested_node_count: int) -> Path:
+    nested_nodes = []
+    input_name = "X"
+    for index in range(nested_node_count):
+        output_name = f"nested_{index}"
+        nested_nodes.append(helper.make_node("Identity", [input_name], [output_name]))
+        input_name = output_name
+    nested_graph = helper.make_graph(
+        nested_nodes,
+        "nested_index_graph",
+        [],
+        [helper.make_tensor_value_info(input_name, TensorProto.FLOAT, [1])],
+    )
+    graph = helper.make_graph(
+        [helper.make_node("NestedCarrier", ["X"], ["Y"], domain="modelaudit.test", body=nested_graph)],
+        "nested_index_budget",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("modelaudit.test", 1)],
+    )
+    model.ir_version = 8
+    path = tmp_path / f"nested-index-budget-{nested_node_count}.onnx"
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -3363,9 +3553,8 @@ def create_static_shape_transform_weight_model(
     graph = helper.make_graph(nodes, "static_shape_transform_graph", [X], [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     path = tmp_path / f"{transform.lower()}-weight.onnx"
-    onnx.save(model, str(path))
+    _save_checked_onnx_model(model, path)
     return path
 
 
@@ -4934,9 +5123,8 @@ def test_onnx_scanner_registered_onnx_ml_static_data_stays_clean(tmp_path: Path)
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
     )
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "onnx-ml-static-data.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -4965,9 +5153,8 @@ def test_onnx_scanner_static_onnx_ml_output_used_as_weight_fails_closed(tmp_path
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
     )
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "onnx-ml-static-weight-path.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -4996,9 +5183,8 @@ def test_onnx_scanner_onnx_ml_bookkeeping_initializer_stays_clean(tmp_path: Path
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
     )
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "array-feature-extractor.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5038,9 +5224,8 @@ def test_onnx_scanner_transformed_onnx_ml_bookkeeping_initializer_stays_clean(
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
     )
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "transformed-array-feature-extractor.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5071,9 +5256,8 @@ def test_onnx_scanner_onnx_ml_selector_does_not_taint_downstream_weights(tmp_pat
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
     )
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "feature-selection-matmul.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5228,9 +5412,8 @@ def test_onnx_scanner_dynamic_prelu_slope_stays_clean(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "dynamic-prelu-slope.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5270,9 +5453,8 @@ def test_onnx_scanner_malicious_matrix_prelu_slope_remains_detected(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "malicious-matrix-prelu-slope.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5313,9 +5495,8 @@ def test_onnx_scanner_prelu_singleton_axes_do_not_duplicate_findings(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "prelu-singleton-axes.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5345,9 +5526,8 @@ def test_onnx_scanner_matrix_clip_bound_fails_closed(tmp_path: Path) -> None:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "matrix-clip-bound.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5376,9 +5556,8 @@ def test_onnx_scanner_transformed_non_scalar_clip_bound_fails_closed(tmp_path: P
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "transformed-non-scalar-clip-bound.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5417,9 +5596,8 @@ def test_onnx_scanner_static_matrix_unary_output_used_as_weight_fails_closed(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset_version)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / f"static-{op_type.lower()}-weight-path.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5449,9 +5627,8 @@ def test_onnx_scanner_random_like_dtype_override_used_as_weight_fails_closed(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 22)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / f"{op_type.lower()}-weight-path.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5478,9 +5655,8 @@ def test_onnx_scanner_pow_exponent_dtype_override_used_as_weight_fails_closed(tm
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    onnx.checker.check_model(model)
     model_path = tmp_path / "pow-exponent-weight-path.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -5546,8 +5722,7 @@ def test_onnx_scanner_combined_training_initializer_collision_fails_closed(tmp_p
         initializer=[onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="W")],
     )
     model.training_info[0].algorithm.CopyFrom(colliding_algorithm)
-    onnx.checker.check_model(model)
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -6211,9 +6386,8 @@ def test_onnx_scanner_function_default_graph_python_op_still_flagged(tmp_path: P
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
     )
     model.ir_version = 9
-    onnx.checker.check_model(model)
     model_path = tmp_path / "function_default_graph_python_op.onnx"
-    onnx.save(model, str(model_path))
+    _save_checked_onnx_model(model, model_path)
 
     result = OnnxScanner().scan(str(model_path))
 
@@ -8508,6 +8682,112 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert semantics["eligible"][0]["quantization_scale_factor_names"] == ["W_scale_0", "W_scale_1"]
 
+    @pytest.mark.parametrize("post_bias_operator", ["Identity", "Cast"])
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])
+    def test_dynamic_matmul_integer_traces_authoritative_post_bias_copies(
+        self,
+        tmp_path: Path,
+        post_bias_operator: str,
+        malicious: bool,
+    ) -> None:
+        model_path = create_dynamic_matmul_integer_bias_model(
+            tmp_path,
+            malicious=malicious,
+            post_bias_scale=True,
+            post_bias_operator=post_bias_operator,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is True
+        assert len(checks) == int(malicious)
+        assert semantics["eligible"][0]["quantization_scale_factor_names"] == ["W_scale_0", "W_scale_1"]
+
+    @pytest.mark.parametrize("post_bias_operator", ["Abs", "Relu", "dynamic_mul", "self_mul", "local_identity"])
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])
+    def test_dynamic_matmul_integer_fails_closed_on_ambiguous_post_bias_consumers(
+        self,
+        tmp_path: Path,
+        post_bias_operator: str,
+        malicious: bool,
+    ) -> None:
+        model_path = create_dynamic_matmul_integer_bias_model(
+            tmp_path,
+            malicious=malicious,
+            post_bias_scale=True,
+            post_bias_operator=post_bias_operator,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+
+    @pytest.mark.parametrize("prelude", ["Add", "Gather", "LayerNormalization"])
+    @pytest.mark.parametrize("malicious_scale", [False, True], ids=["benign-scale", "malicious-scale"])
+    def test_graph_input_activation_provenance_reaches_dynamic_integer_weights(
+        self,
+        tmp_path: Path,
+        prelude: str,
+        malicious_scale: bool,
+    ) -> None:
+        model_path = create_graph_input_activation_model(
+            tmp_path,
+            prelude=prelude,
+            malicious_scale=malicious_scale,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is True
+        anomaly_checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert len(anomaly_checks) == int(malicious_scale)
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize("malicious_scale", [False, True], ids=["benign-scale", "malicious-scale"])
+    @pytest.mark.parametrize("lineage_kind", ["raw", "metadata"])
+    def test_activation_mixing_preserves_distinct_weight_lineage(
+        self,
+        tmp_path: Path,
+        malicious_scale: bool,
+        lineage_kind: str,
+    ) -> None:
+        model_path = create_graph_input_activation_model(
+            tmp_path,
+            prelude="Add",
+            malicious_scale=malicious_scale,
+            distinct_weight_lineage=lineage_kind == "raw",
+            distinct_metadata_lineage=lineage_kind == "metadata",
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        assert semantics["unresolved_lineage_samples"][0]["initializer"] == (
+            "addend" if lineage_kind == "raw" else "metadata_source"
+        )
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == (
+            "dynamic_input_lineage" if lineage_kind == "raw" else "metadata_derived_lineage"
+        )
+
     @pytest.mark.parametrize("integer_op_boundary", ["function", "if_subgraph"])
     def test_dynamic_matmul_integer_typed_bias_fails_closed_at_non_root_boundary(
         self,
@@ -8892,6 +9172,60 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 0
         assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
 
+    def test_constant_of_shape_bounds_typed_storage_before_decode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_typed_constant_of_shape_weight_model(
+            tmp_path,
+            data_type=TensorProto.INT8,
+            fill_value=0,
+            typed_field_repetitions=300_000,
+        )
+        original_to_array = onnx.numpy_helper.to_array
+        decoded_fill = False
+
+        def recording_to_array(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal decoded_fill
+            decoded_fill |= tensor.name == "fill"
+            return original_to_array(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", recording_to_array)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert decoded_fill is False
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+
+    @pytest.mark.parametrize(
+        ("target_data_type", "expected_success"),
+        [
+            pytest.param(TensorProto.FLOAT16, True, id="float16-preserves-zero"),
+            pytest.param(TensorProto.FLOAT8E8M0, False, id="float8-e8m0-has-no-zero"),
+        ],
+    )
+    def test_generated_zero_cast_proof_is_dtype_aware(
+        self,
+        tmp_path: Path,
+        target_data_type: int,
+        expected_success: bool,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(create_generated_zero_cast_weight_model(tmp_path, target_data_type=target_data_type))
+        )
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is expected_success
+        assert semantics["analyzed_initializer_count"] == 0
+        if expected_success:
+            assert semantics["coverage_gaps"] == {}
+        else:
+            assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+            assert semantics["unresolved_lineage_samples"][0]["reason"] == "dtype_changing_cast_lineage"
+
     @pytest.mark.parametrize("generated_source", [False, True], ids=["no-generated-source", "generated-source"])
     def test_generated_zero_proof_decodes_shared_large_constant_at_most_once(
         self,
@@ -8901,20 +9235,37 @@ class TestWeightDistributionSemantics:
     ) -> None:
         model_path = create_shared_zero_proof_fanout_model(tmp_path, generated_source=generated_source)
         original_to_array = onnx.numpy_helper.to_array
+        original_equal = np.equal
         shared_zero_decodes = 0
+        shared_zero_comparisons = 0
+        shared_zero_array_id: int | None = None
+        shared_zero_array_ref: weakref.ReferenceType[Any] | None = None
 
         def counted_to_array(tensor: Any, *args: Any, **kwargs: Any) -> Any:
-            nonlocal shared_zero_decodes
+            nonlocal shared_zero_array_id, shared_zero_array_ref, shared_zero_decodes
+            array = original_to_array(tensor, *args, **kwargs)
             if tensor.name == "shared_zero":
                 shared_zero_decodes += 1
-            return original_to_array(tensor, *args, **kwargs)
+                shared_zero_array_id = id(array)
+                shared_zero_array_ref = weakref.ref(array)
+            return array
+
+        def counted_equal(left: Any, right: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal shared_zero_comparisons
+            if id(left) == shared_zero_array_id:
+                shared_zero_comparisons += 1
+            return original_equal(left, right, *args, **kwargs)
 
         monkeypatch.setattr(onnx.numpy_helper, "to_array", counted_to_array)
+        monkeypatch.setattr(np, "equal", counted_equal)
 
         result = OnnxScanner().scan(str(model_path))
+        gc.collect()
 
         assert result.success is True
         assert shared_zero_decodes == int(generated_source)
+        assert shared_zero_comparisons == int(generated_source)
+        assert shared_zero_array_ref is None or shared_zero_array_ref() is None
 
     def test_reverse_liveness_expands_wide_producer_once(self) -> None:
         class CountingInputs:
@@ -9333,6 +9684,36 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_initializer_count"] == 0
 
+    @pytest.mark.parametrize("weight_count", [1, 2], ids=["within-budget", "cumulative-overflow"])
+    def test_cumulative_array_budget_reserves_before_weight_materialization(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        weight_count: int,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_WEIGHT_RETAINED_ARRAY_BUDGET_MULTIPLIER", 1)
+        model_path = create_multiple_weight_model(tmp_path, weight_count=weight_count)
+        original_to_array = onnx.numpy_helper.to_array
+        decoded_weights: list[str] = []
+
+        def recording_to_array(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            if tensor.name.startswith("W_"):
+                decoded_weights.append(str(tensor.name))
+            return original_to_array(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", recording_to_array)
+
+        result = OnnxScanner({"max_array_size": 4_001}).scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert decoded_weights == ["W_0"]
+        assert result.success is (weight_count == 1)
+        assert semantics["analyzed_initializer_count"] == 1
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert len(coverage) == int(weight_count == 2)
+        if coverage:
+            assert coverage[0].details["oversized_initializers_skipped"] == 1
+
     @pytest.mark.parametrize("malicious", [False, True])
     def test_qlinear_matmul_nd_scale_broadcast_is_analyzed(
         self,
@@ -9552,6 +9933,31 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 40
         assert semantics["analyzed_layer_count"] == 40
+
+    @pytest.mark.parametrize("budget_exhausted", [False, True], ids=["fits", "nested-index-overflow"])
+    def test_nested_graph_indexes_reserve_before_retention(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        budget_exhausted: bool,
+    ) -> None:
+        nested_node_count = 8
+        model_path = create_nested_index_budget_model(tmp_path, nested_node_count=nested_node_count)
+        monkeypatch.setattr(
+            onnx_scanner_module,
+            "_ONNX_WEIGHT_NODE_VISIT_LIMIT",
+            nested_node_count if budget_exhausted else nested_node_count + 1,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if budget_exhausted:
+            assert semantics["coverage_gaps"] == {"node_visit_limit": 1}
+            assert semantics["node_visit_count"] == 1
+        else:
+            assert semantics["coverage_gaps"] == {}
+            assert semantics["node_visit_count"] == nested_node_count + 1
 
     @pytest.mark.parametrize("transform", ["Flatten", "ReshapeValueInts", "Squeeze", "Unsqueeze"])
     @pytest.mark.parametrize("malicious", [False, True])
@@ -9966,6 +10372,12 @@ class TestWeightDistributionSemantics:
             template.model_copy(update={"location": str(first if index % 2 == 0 else second)}, deep=True)
             for index in range(issue_count)
         ]
+        metadata_type = type(aggregate.file_metadata[str(first)])
+
+        def reject_metadata_serialization(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("cluster finalization must not serialize full file metadata")
+
+        monkeypatch.setattr(metadata_type, "model_dump", reject_metadata_serialization)
         cluster_key_call_count = 0
         original_cluster_key = modelaudit_core._onnx_weight_anomaly_cluster_key
 
@@ -10033,6 +10445,107 @@ class TestWeightDistributionSemantics:
             if metadata.file_hashes is not None
         } == {compute_sha256_hash(positive), compute_sha256_hash(negative)}
 
+    @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
+    @pytest.mark.parametrize("same_sidecar", [False, True], ids=["distinct-sidecars", "identical-package"])
+    def test_external_onnx_clustering_uses_complete_package_identity(
+        self,
+        tmp_path: Path,
+        streaming: bool,
+        same_sidecar: bool,
+    ) -> None:
+        first_weights = np.zeros((100, 10), dtype=np.float32)
+        first_weights[50:55, 3] = 10.0
+        second_weights = first_weights.copy()
+        if not same_sidecar:
+            second_weights[50:55, 3] = 20.0
+        first = create_external_onnx_weight_package(tmp_path / "first", first_weights)
+        second = create_external_onnx_weight_package(tmp_path / "second", second_weights)
+        assert compute_sha256_hash(first) == compute_sha256_hash(second)
+
+        aggregate = (
+            scan_model_streaming(
+                iter([(first, False), (second, True)]),
+                delete_after_scan=False,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
+            if streaming
+            else scan_model_directory_or_file(
+                str(tmp_path),
+                recursive=True,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
+        )
+
+        metadata = [aggregate.file_metadata[str(path)] for path in (first, second)]
+        assert all(getattr(item, "onnx_package_hash_complete", None) is True for item in metadata)
+        package_hashes = {getattr(item, "content_hash", None) for item in metadata}
+        assert len(package_hashes) == (1 if same_sidecar else 2)
+        template_dir = tmp_path / "template"
+        template_dir.mkdir()
+        template_path = create_onnx_weight_model(
+            template_dir,
+            first_weights,
+            op_type="MatMul",
+            filename="template.onnx",
+        )
+        template_result = scan_model_directory_or_file(str(template_path), scanners=["onnx"], cache_enabled=False)
+        templates = [
+            issue
+            for issue in template_result.issues
+            if issue.type == "onnx_check"
+            and ("affected_neurons" in issue.details or "outlier_neurons" in issue.details)
+        ]
+        aggregate.issues = [
+            template.model_copy(update={"location": str(path)}, deep=True)
+            for path in (first, second)
+            for template in templates
+        ]
+        modelaudit_core._cluster_onnx_weight_anomaly_issues(aggregate)
+        clustered = [issue for issue in aggregate.issues if issue.details.get("clustered_onnx_weight_anomaly") is True]
+        if same_sidecar:
+            assert clustered
+            assert {issue.details["cluster_size"] for issue in clustered} == {2}
+        else:
+            assert clustered == []
+
+    @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
+    def test_incomplete_external_data_discovery_disables_onnx_clustering(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        streaming: bool,
+    ) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        first = create_onnx_weight_model(tmp_path, weights, op_type="MatMul", filename="incomplete-a.onnx")
+        second = tmp_path / "incomplete-b.onnx"
+        second.write_bytes(first.read_bytes())
+        monkeypatch.setattr(modelaudit_core, "_streamed_onnx_external_data_hash_paths", lambda *_args, **_kwargs: None)
+
+        aggregate = (
+            scan_model_streaming(
+                iter([(first, False), (second, True)]),
+                delete_after_scan=False,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
+            if streaming
+            else scan_model_directory_or_file(
+                str(tmp_path),
+                recursive=False,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
+        )
+
+        assert all(
+            getattr(aggregate.file_metadata[str(path)], "onnx_package_hash_complete", None) is False
+            for path in (first, second)
+        )
+        assert not any(issue.details.get("clustered_onnx_weight_anomaly") is True for issue in aggregate.issues)
+
     def test_aggregate_preserves_distinct_analysis_groups_within_one_file(self, tmp_path: Path) -> None:
         model_path = create_qlinear_matmul_group_fanout_model(tmp_path, consumer_count=2)
 
@@ -10052,6 +10565,20 @@ class TestWeightDistributionSemantics:
         ]
         assert len(weight_issues) == 4
         assert {issue.details["quantization_scale"] for issue in weight_issues} == {"W_scale_0", "W_scale_1"}
+
+    def test_weight_distribution_aggregate_preserves_distinct_onnx_contexts(self, tmp_path: Path) -> None:
+        model_path = create_qlinear_matmul_group_fanout_model(tmp_path, consumer_count=2)
+
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["weight_distribution"],
+            cache_enabled=False,
+        )
+
+        issues = [issue for issue in aggregate.issues if issue.type == "weight_distribution_check"]
+        assert len(issues) == 4
+        assert {issue.details["analysis_id"] for issue in issues} == {0, 1}
+        assert {issue.details["quantization_scale"] for issue in issues} == {"W_scale_0", "W_scale_1"}
 
     @pytest.mark.integration
     def test_hf_minilm_pinned_quantized_export_has_bounded_lineage_coverage(self, tmp_path: Path) -> None:

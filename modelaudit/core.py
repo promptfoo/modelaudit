@@ -1922,15 +1922,14 @@ def _file_content_hash(results: ModelAuditResultModel, location: str | None) -> 
     metadata = results.file_metadata.get(location)
     if metadata is None:
         return None
-    metadata_dict = metadata.model_dump(mode="python") if hasattr(metadata, "model_dump") else dict(metadata)
-    content_hash = metadata_dict.get("content_hash")
+    if getattr(metadata, "onnx_package_hash_complete", None) is False:
+        return None
+    content_hash = getattr(metadata, "content_hash", None)
     if isinstance(content_hash, str) and content_hash:
         return content_hash
-    file_hashes = metadata_dict.get("file_hashes")
-    if isinstance(file_hashes, dict):
-        sha256 = file_hashes.get("sha256")
-        return sha256 if isinstance(sha256, str) and sha256 else None
-    return None
+    file_hashes = getattr(metadata, "file_hashes", None)
+    sha256 = file_hashes.get("sha256") if isinstance(file_hashes, dict) else getattr(file_hashes, "sha256", None)
+    return sha256 if isinstance(sha256, str) and sha256 else None
 
 
 def _onnx_weight_anomaly_provenance(results: ModelAuditResultModel, issue: Issue) -> dict[str, Any]:
@@ -4601,6 +4600,7 @@ def scan_model_directory_or_file(
                 onnx_external_data_sources_by_path: dict[str, list[str]] = {}
                 onnx_external_data_sizes_by_path: dict[str, int] = {}
                 onnx_external_data_routing_paths: dict[str, str] = {}
+                onnx_package_hash_complete_by_path: dict[str, bool] = {}
                 scan_entry_target_keys: set[_FileTargetIdentityKey] = set()
                 for (
                     _representative_file,
@@ -4636,7 +4636,11 @@ def scan_model_directory_or_file(
                             with suppress(OSError):
                                 hash_budget_bytes += os.path.getsize(hash_source)
                     representative_hash_source = hash_source_by_path.get(representative_file)
-                    if not scanner_selection.allows("onnx") or representative_hash_source is None:
+                    if (
+                        not scanner_selection.allows("onnx")
+                        or representative_hash_source is None
+                        or not _is_streamed_onnx_external_data_hash_candidate(Path(representative_file))
+                    ):
                         continue
                     representative_hash_deferred = should_defer_hash_for_file_backed_onnx(
                         representative_hash_source,
@@ -4644,6 +4648,7 @@ def scan_model_directory_or_file(
                     )
                     if representative_hash_deferred:
                         aggregate_hash_complete = False
+                    onnx_package_hash_complete_by_path[representative_file] = not representative_hash_deferred
                     if not _should_defer_hash_for_max_file_size(representative_hash_source, config):
                         representative_external_sources: list[str] = []
                         representative_external_bytes = 0
@@ -4653,6 +4658,7 @@ def scan_model_directory_or_file(
                         )
                         if discovered_external_data_paths is None:
                             aggregate_hash_complete = False
+                            onnx_package_hash_complete_by_path[representative_file] = False
                         for external_data_path in discovered_external_data_paths or ():
                             external_data_identity = _snapshot_file_identity(external_data_path)
                             external_data_target_key = _file_target_identity_key(
@@ -4663,17 +4669,30 @@ def scan_model_directory_or_file(
                                 external_data_target_key is not None
                                 and external_data_target_key in scan_entry_target_keys
                             ):
+                                if external_data_identity is None:
+                                    onnx_package_hash_complete_by_path[representative_file] = False
+                                else:
+                                    representative_external_sources.append(
+                                        str(
+                                            Path(external_data_identity.resolved_path)
+                                            if external_data_identity.resolved_path is not None
+                                            else external_data_path
+                                        )
+                                    )
                                 continue
                             if _should_defer_hash_for_max_file_size(str(external_data_path), config):
                                 aggregate_hash_complete = False
+                                onnx_package_hash_complete_by_path[representative_file] = False
                                 continue
                             if external_data_identity is None:
                                 aggregate_hash_complete = False
+                                onnx_package_hash_complete_by_path[representative_file] = False
                                 continue
                             external_data_size = _snapshot_file_size(external_data_identity)
                             representative_external_bytes += external_data_size
                             if max_total_size > 0 and hash_budget_bytes + external_data_size > max_total_size:
                                 aggregate_hash_complete = False
+                                onnx_package_hash_complete_by_path[representative_file] = False
                                 continue
                             external_data_source = str(
                                 Path(external_data_identity.resolved_path)
@@ -4694,6 +4713,8 @@ def scan_model_directory_or_file(
                             onnx_external_data_sources_by_path[representative_file] = representative_external_sources
                         if representative_external_bytes:
                             onnx_external_data_sizes_by_path[representative_file] = representative_external_bytes
+                    else:
+                        onnx_package_hash_complete_by_path[representative_file] = False
 
                 if (
                     directory_owner_class is not None
@@ -5086,9 +5107,51 @@ def scan_model_directory_or_file(
                         for external_data_source in external_data_sources
                     ):
                         aggregate_hash_complete = False
+                from .utils.helpers.secure_hasher import compute_aggregate_hash
+
+                onnx_package_hashes_by_path: dict[str, str] = {}
+                for representative_file, external_data_sources in onnx_external_data_sources_by_path.items():
+                    package_complete = onnx_package_hash_complete_by_path.get(representative_file, False)
+                    model_hash = content_hashes.get(representative_file)
+                    external_hashes = [hashes_by_source.get(source) for source in external_data_sources]
+                    package_complete &= bool(
+                        model_hash
+                        and not _is_incomplete_aggregate_hash_placeholder(model_hash)
+                        and all(
+                            isinstance(external_hash, str)
+                            and not _is_incomplete_aggregate_hash_placeholder(external_hash)
+                            for external_hash in external_hashes
+                        )
+                    )
+                    onnx_package_hash_complete_by_path[representative_file] = package_complete
+                    if package_complete and model_hash is not None:
+                        onnx_package_hashes_by_path[representative_file] = compute_aggregate_hash(
+                            [
+                                model_hash,
+                                *(external_hash for external_hash in external_hashes if external_hash is not None),
+                            ]
+                        )
+                for representative_file, package_complete in tuple(onnx_package_hash_complete_by_path.items()):
+                    if representative_file in onnx_package_hashes_by_path or not package_complete:
+                        continue
+                    model_hash = content_hashes.get(representative_file)
+                    if model_hash and not _is_incomplete_aggregate_hash_placeholder(model_hash):
+                        onnx_package_hashes_by_path[representative_file] = model_hash
+                    else:
+                        onnx_package_hash_complete_by_path[representative_file] = False
                 _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
+                cluster_content_hashes = dict(content_hashes)
+                for representative_file, scanned_file_paths, _shard_family_key, _repository_member in scan_entries:
+                    package_hash_complete = onnx_package_hash_complete_by_path.get(representative_file)
+                    if package_hash_complete is None:
+                        continue
+                    for scanned_file_path in scanned_file_paths:
+                        if package_hash_complete:
+                            cluster_content_hashes[scanned_file_path] = onnx_package_hashes_by_path[representative_file]
+                        else:
+                            cluster_content_hashes.pop(scanned_file_path, None)
                 duplicate_paths_by_hash: dict[str, list[str]] = {}
-                for file_path, content_hash in content_hashes.items():
+                for file_path, content_hash in cluster_content_hashes.items():
                     if not content_hash.startswith("unhashable_"):
                         duplicate_paths_by_hash.setdefault(content_hash, []).append(file_path)
                 if len(scan_entries) > 1:
@@ -5268,8 +5331,20 @@ def scan_model_directory_or_file(
                                     combined_metadata["file_size"] = os.path.getsize(scanned_file_path)
                             path_content_hash = content_hashes.get(scanned_file_path)
                             if path_content_hash is not None:
-                                combined_metadata["content_hash"] = path_content_hash
-                                duplicate_files = duplicate_paths_by_hash.get(path_content_hash, [])
+                                package_hash_complete = onnx_package_hash_complete_by_path.get(representative_file)
+                                if package_hash_complete is not None:
+                                    combined_metadata["onnx_package_hash_complete"] = package_hash_complete
+                                identity_hash = (
+                                    onnx_package_hashes_by_path[representative_file]
+                                    if package_hash_complete
+                                    else path_content_hash
+                                )
+                                combined_metadata["content_hash"] = identity_hash
+                                duplicate_files = (
+                                    duplicate_paths_by_hash.get(identity_hash, [])
+                                    if package_hash_complete is not False
+                                    else []
+                                )
                                 combined_metadata["duplicate_files"] = (
                                     duplicate_files if len(duplicate_files) > 1 else None
                                 )
@@ -7475,6 +7550,8 @@ def scan_model_streaming(
             openvino_companion_bytes_scanned = 0
             onnx_external_data_pre_scan_identities: dict[Path, _FileIdentitySnapshot] = {}
             onnx_external_data_bytes_scanned = 0
+            onnx_external_data_hashes: list[str] = []
+            onnx_package_hash_complete: bool | None = None
             suppress_consumed_onnx_external_data_accounting = False
             openvino_sidecar_needs_independent_scan = False
             independent_openvino_sidecar_result: ScanResult | None = None
@@ -7713,16 +7790,21 @@ def scan_model_streaming(
                         openvino_scan_companion_path,
                         scan_config,
                     )
-                if scanner_selection.allows("onnx") and not _should_defer_hash_for_max_file_size(
+                onnx_package_candidate = scanner_selection.allows(
+                    "onnx"
+                ) and _is_streamed_onnx_external_data_hash_candidate(scan_path)
+                if onnx_package_candidate and not _should_defer_hash_for_max_file_size(
                     str(scan_path),
                     scan_config,
                 ):
+                    onnx_package_hash_complete = file_hash is not None and not defer_hash_for_file_backed_onnx
                     discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(
                         scan_path,
                         deadline=start_time + timeout,
                     )
                     if discovered_external_data_paths is None:
                         aggregate_hash_complete = False
+                        onnx_package_hash_complete = False
                     for onnx_external_data_path in discovered_external_data_paths or ():
                         external_data_key = Path(os.path.abspath(onnx_external_data_path))
                         external_data_identity = _snapshot_file_identity(onnx_external_data_path)
@@ -7759,10 +7841,12 @@ def scan_model_streaming(
                         if not external_data_was_stream_source and not external_data_already_hashed:
                             if external_data_identity is None:
                                 aggregate_hash_complete = False
+                                onnx_package_hash_complete = False
                                 continue
                             external_data_size = _snapshot_file_size(external_data_identity)
                             if max_total_size > 0 and top_level_hashed_bytes + external_data_size > max_total_size:
                                 aggregate_hash_complete = False
+                                onnx_package_hash_complete = False
                                 continue
                         external_data_hash = None
                         if not defer_hash_for_file_backed_onnx:
@@ -7773,10 +7857,16 @@ def scan_model_streaming(
                                 skip_if_stream_source_seen=True,
                                 skip_if_stream_target_seen=True,
                             )
+                        if external_data_hash is None:
+                            onnx_package_hash_complete = False
+                        else:
+                            onnx_external_data_hashes.append(external_data_hash)
                         if external_data_target_key is not None and (
                             defer_hash_for_file_backed_onnx or external_data_hash is not None
                         ):
                             consumed_onnx_external_data_aliases[external_data_key] = external_data_target_key
+                elif onnx_package_candidate:
+                    onnx_package_hash_complete = False
 
                 # Scan the file
                 if progress_callback:
@@ -7815,6 +7905,7 @@ def scan_model_streaming(
                     for onnx_external_data_path, pre_scan_identity in onnx_external_data_pre_scan_identities.items()
                 ):
                     aggregate_hash_complete = False
+                    onnx_package_hash_complete = False
                 if openvino_sidecar_needs_independent_scan and openvino_scan_companion_path is not None:
                     independent_openvino_sidecar_path = openvino_scan_companion_path
                     independent_openvino_sidecar_result = scan_file(
@@ -7833,6 +7924,14 @@ def scan_model_streaming(
                     if report_path != resolved_report_path:
                         metadata_dict.setdefault("source_path", report_path)
                         metadata_dict.setdefault("resolved_path", selected_resolved_path)
+                    if onnx_package_hash_complete is not None:
+                        metadata_dict["onnx_package_hash_complete"] = onnx_package_hash_complete
+                        if onnx_package_hash_complete and file_hash is not None:
+                            metadata_dict["content_hash"] = (
+                                compute_aggregate_hash([file_hash, *onnx_external_data_hashes])
+                                if onnx_external_data_hashes
+                                else file_hash
+                            )
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
                     if operational_scan_failure:
                         preserve_shard_reconciliation_errors = True
