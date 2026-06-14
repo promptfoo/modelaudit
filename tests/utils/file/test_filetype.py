@@ -1,4 +1,6 @@
 import base64
+import binascii
+import builtins
 import bz2
 import gzip
 import importlib
@@ -3667,6 +3669,17 @@ def test_detect_file_format_keeps_global_shaped_non_pickle_prose_on_text_route(t
     assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
+def test_detect_file_format_keeps_unreachable_inst_prose_on_text_route(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(
+        b"Apache License\nThe documentation includes these literal lines:\nimystery_module\nThing\nApache License\n"
+    )
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
+
+
 def test_legal_text_global_collision_is_a_valid_pickle(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = b"copyright\nnotice\n.\nMIT License\n"
     module = types.ModuleType("opyright")
@@ -3675,6 +3688,52 @@ def test_legal_text_global_collision_is_a_valid_pickle(monkeypatch: pytest.Monke
     monkeypatch.setitem(sys.modules, "opyright", module)
 
     assert pickle.loads(payload) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_constructor_calls"),
+    [
+        pytest.param(b"cmystery_module\nthing\nApache License\n", 0, id="GLOBAL"),
+        pytest.param(b"(imystery_module\nThing\nApache License\n", 1, id="INST"),
+    ],
+)
+def test_protocol0_import_side_effect_precedes_invalid_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    expected_constructor_calls: int,
+) -> None:
+    module = types.ModuleType("mystery_module")
+    module.__dict__["thing"] = object()
+    constructor_calls: list[str] = []
+
+    class Thing:
+        def __new__(cls) -> "Thing":
+            constructor_calls.append(cls.__name__)
+            return super().__new__(cls)
+
+    module.__dict__["Thing"] = Thing
+    monkeypatch.setitem(sys.modules, "mystery_module", module)
+    real_import = builtins.__import__
+    import_calls: list[str] = []
+
+    def tracking_import(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        if name == "mystery_module":
+            import_calls.append(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", tracking_import)
+
+    with pytest.raises(pickle.UnpicklingError):
+        pickle.loads(payload)
+
+    assert import_calls == ["mystery_module"]
+    assert len(constructor_calls) == expected_constructor_calls
 
 
 @pytest.mark.parametrize(
@@ -3703,6 +3762,62 @@ def test_complete_protocol0_import_named_license_retains_pickle_ownership(
     assert detect_file_format(str(path)) == "pickle"
     assert detect_file_format_from_magic(str(path)) == "pickle"
     assert detect_file_format_for_skip_filter(str(path)) == "pickle"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_format"),
+    [
+        pytest.param(b"cmystery_module\nthing\nApache License\n", "pickle", id="GLOBAL"),
+        pytest.param(
+            b"(imystery_module\nThing\nApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="INST",
+        ),
+    ],
+)
+def test_protocol0_import_before_invalid_continuation_does_not_route_as_text(
+    tmp_path: Path,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(path)) == expected_format
+
+
+@pytest.mark.parametrize(
+    "encoder",
+    [
+        pytest.param(base64.b64encode, id="base64"),
+        pytest.param(binascii.hexlify, id="hex"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("payload", "expected_format"),
+    [
+        pytest.param(b"cmystery_module\nthing\nApache License\n", "pickle", id="GLOBAL"),
+        pytest.param(
+            b"(imystery_module\nThing\nApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="INST",
+        ),
+    ],
+)
+def test_encoded_protocol0_import_before_invalid_continuation_does_not_route_as_text(
+    tmp_path: Path,
+    encoder: Callable[[bytes], bytes],
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(encoder(payload))
+
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(path)) == expected_format
 
 
 @pytest.mark.parametrize(

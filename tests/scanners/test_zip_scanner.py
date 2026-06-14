@@ -11300,6 +11300,11 @@ class TestZipScanner:
                 id="complete-prefix-with-trailing-prose",
             ),
             pytest.param(
+                b"cmystery_module\nthing\nApache License\n",
+                "mystery_module.thing",
+                id="import-before-invalid-continuation",
+            ),
+            pytest.param(
                 b"copyright\nnotice\n.\nMIT License\n",
                 "opyright.notice",
                 id="legal-looking-GLOBAL-operands",
@@ -11331,6 +11336,20 @@ class TestZipScanner:
             and issue.details.get("import_reference") == expected_import_reference
             for issue in result.issues
         )
+
+    def test_scan_zip_fails_closed_for_inst_before_invalid_continuation(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "inst_before_invalid_continuation.zip"
+        member_name = r"docs\LICENSE"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            _writestr_preserving_member_name(
+                archive,
+                member_name,
+                b"(imystery_module\nThing\nApache License\n",
+            )
+
+        result = self.scanner.scan(str(archive_path))
+
+        _assert_inconclusive_pickle_member(result, archive_path, member_name)
 
     def test_scan_zip_routes_lightgbm_in_backslash_license_member_before_text(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "lightgbm_license.zip"

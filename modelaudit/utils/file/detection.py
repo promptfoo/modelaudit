@@ -5356,16 +5356,7 @@ def _pickletools_global_argument(argument: object) -> tuple[str, str] | None:
     return module, name
 
 
-def _is_suspicious_pickle_global(module: str, name: str) -> bool:
-    try:
-        from modelaudit.scanners.pickle_scanner import is_suspicious_global
-
-        return is_suspicious_global(module, name)
-    except Exception:
-        return True
-
-
-def _initial_proto0_global_argument(candidate: bytes) -> tuple[str, str] | None:
+def _initial_proto0_import_argument(candidate: bytes) -> tuple[str, str] | None:
     if not candidate or candidate[:1] not in {b"c", b"i"}:
         return None
     lines = candidate[1:].split(b"\n", 2)
@@ -5378,33 +5369,18 @@ def _initial_proto0_global_argument(candidate: bytes) -> tuple[str, str] | None:
         return None
 
 
-def _proto0_global_continuation_looks_pickled(candidate: bytes) -> bool:
-    lines = candidate[1:].split(b"\n", 2)
-    if len(lines) < 3:
-        return True
-    continuation = lines[2].lstrip(b" \t\r\n")
-    if not continuation:
-        return True
-    # A suspicious protocol-0 GLOBAL followed by any registered pickle opcode
-    # remains pickle-shaped even when the bounded stream is incomplete. Derive
-    # this from pickletools so newly added or uncommon continuations cannot
-    # silently fall through to legal prose classification.
-    return continuation[0] in _PICKLE_OPCODE_BY_BYTE
-
-
 def _embedded_proto0_global_continuation_has_stack_evidence(candidate: bytes) -> bool:
     """Return whether an embedded GLOBAL continuation can execute on its result.
 
-    Parsing failures remain suspicious because a bounded candidate may end in a
-    completable opcode argument. Only reject a continuation when pickletools can
-    parse it and the existing stack simulator proves that it immediately
-    underflows or otherwise cannot consume the GLOBAL-only stack.
+    A non-opcode continuation needs separate lookbehind proof that the GLOBAL is
+    reachable from an earlier pickle start. Truncated opcode operands remain
+    ambiguous, while a parsed continuation must consume the GLOBAL-only stack.
     """
     try:
         operations = pickletools.genops(candidate)
         global_opcode, global_argument, _ = next(operations)
         if global_opcode.name != "GLOBAL":
-            return True
+            return False
         continuation_opcode, continuation_argument, _ = next(operations)
         stack: list[Any] = []
         memo: dict[Any, Any] = {}
@@ -5424,7 +5400,9 @@ def _embedded_proto0_global_continuation_has_stack_evidence(candidate: bytes) ->
             memo,
             hashability_cache,
         )
-    except (StopIteration, UnicodeError, ValueError):
+    except ValueError as exc:
+        return "opcode" not in str(exc)
+    except (StopIteration, UnicodeError):
         return True
     except (MemoryError, RecursionError):
         return True
@@ -5432,34 +5410,29 @@ def _embedded_proto0_global_continuation_has_stack_evidence(candidate: bytes) ->
         return True
 
 
-def _probe_embedded_proto0_stream_through_global(
+def _probe_embedded_proto0_stream_through_import(
     candidate: bytes,
     *,
-    global_offset: int,
+    import_offset: int,
     budget: _LegalTextEmbeddedPickleProbeBudget,
 ) -> bool | None:
-    """Classify one bounded lookbehind path through a target suspicious GLOBAL."""
+    """Classify one bounded lookbehind path through a target import opcode."""
     stack: list[Any] = []
     memo: dict[Any, Any] = {}
     hashability_cache: dict[int, tuple[Any, bool]] = {}
-    reached_suspicious_global = False
     try:
         for opcode, argument, position in pickletools.genops(candidate):
             if budget.remaining_opcodes <= 0:
                 return None
             budget.remaining_opcodes -= 1
             opcode_position = 0 if position is None else position
-            if not reached_suspicious_global and opcode_position > global_offset:
+            if opcode_position > import_offset:
                 return False
-            if opcode_position == global_offset:
+            is_target_import = opcode_position == import_offset
+            if is_target_import:
                 global_argument = _pickletools_global_argument(argument)
-                if (
-                    opcode.name != "GLOBAL"
-                    or global_argument is None
-                    or not _is_suspicious_pickle_global(*global_argument)
-                ):
+                if opcode.name not in {"GLOBAL", "INST"} or global_argument is None:
                     return False
-                reached_suspicious_global = True
             if not _apply_pickle_stack_effect(
                 opcode,
                 argument,
@@ -5468,60 +5441,55 @@ def _probe_embedded_proto0_stream_through_global(
                 hashability_cache,
             ):
                 return False
+            if is_target_import:
+                return True
             if opcode.name == "STOP":
-                return reached_suspicious_global
+                return False
     except ValueError as exc:
         error_message = str(exc)
-        if not reached_suspicious_global:
-            truncated_at_global = (
-                global_offset < len(candidate)
-                and candidate[global_offset] in {ord("c"), ord("i")}
-                and error_message.startswith(PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES)
-            )
-            return None if truncated_at_global else False
-        position_match = re.search(r"(?:at )?position (\d+)", error_message)
-        return not (position_match is not None and "opcode" in error_message)
+        truncated_at_import = (
+            import_offset < len(candidate)
+            and candidate[import_offset] in {ord("c"), ord("i")}
+            and error_message.startswith(PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES)
+        )
+        return None if truncated_at_import else False
     except (MemoryError, RecursionError):
-        return None if reached_suspicious_global else False
+        return False
     except Exception:
-        return None if reached_suspicious_global else False
-    return reached_suspicious_global
+        return False
+    return False
 
 
 def _embedded_proto0_lookbehind_has_stack_evidence(
     payload: bytes,
     *,
-    global_offset: int,
+    import_offset: int,
     budget: _LegalTextEmbeddedPickleProbeBudget,
 ) -> bool | None:
-    """Probe plausible protocol-0 starts before an embedded GLOBAL."""
-    earliest_start = max(0, global_offset - PROTO0_1_MAX_PROBE_BYTES)
-    for start in range(global_offset - 1, earliest_start - 1, -1):
+    """Probe plausible protocol-0 starts before an embedded import opcode."""
+    earliest_start = max(0, import_offset - PROTO0_1_MAX_PROBE_BYTES)
+    for start in range(import_offset - 1, earliest_start - 1, -1):
         if payload[start] not in PROTO0_1_START_BYTES:
             continue
         if budget.remaining_candidates <= 0:
             return None
         budget.remaining_candidates -= 1
         candidate_end = min(len(payload), start + PROTO0_1_MAX_PROBE_BYTES)
-        if global_offset >= candidate_end:
+        if import_offset >= candidate_end:
             return None
-        state = _probe_embedded_proto0_stream_through_global(
+        state = _probe_embedded_proto0_stream_through_import(
             payload[start:candidate_end],
-            global_offset=global_offset - start,
+            import_offset=import_offset - start,
             budget=budget,
         )
         if state is not False:
             return state
     if earliest_start > 0:
-        global_candidate = payload[global_offset : global_offset + PROTO0_1_MAX_PROBE_BYTES]
-        global_argument = _initial_proto0_global_argument(global_candidate)
-        if (
-            global_argument is not None
-            and _is_suspicious_pickle_global(*global_argument)
-            and _proto0_global_continuation_looks_pickled(global_candidate)
-        ):
+        global_candidate = payload[import_offset : import_offset + PROTO0_1_MAX_PROBE_BYTES]
+        global_argument = _initial_proto0_import_argument(global_candidate)
+        if global_argument is not None:
             continuation_state = _bounded_proto0_continuation_requires_prior_context(
-                payload[earliest_start:global_offset],
+                payload[earliest_start:import_offset],
                 budget=budget,
             )
             if continuation_state is not False:
@@ -5529,7 +5497,7 @@ def _embedded_proto0_lookbehind_has_stack_evidence(
             boundary_state = _embedded_proto0_line_operand_suffix_has_stack_evidence(
                 payload,
                 earliest_start=earliest_start,
-                global_offset=global_offset,
+                import_offset=import_offset,
                 budget=budget,
             )
             if boundary_state is not False:
@@ -5613,17 +5581,16 @@ def _bounded_proto0_continuation_requires_prior_context(
     return saw_opcode and required_prior_context
 
 
-def _probe_embedded_proto0_suffix_through_global(
+def _probe_embedded_proto0_suffix_through_import(
     candidate: bytes,
     *,
-    global_offset: int,
+    import_offset: int,
     budget: _LegalTextEmbeddedPickleProbeBudget,
 ) -> bool | None:
-    """Probe an argument-boundary suffix using context rooted before GLOBAL."""
+    """Probe an argument-boundary suffix using context rooted before an import."""
     stack: list[Any] = []
     memo: dict[Any, Any] = {}
     hashability_cache: dict[int, tuple[Any, bool]] = {}
-    reached_suspicious_global = False
     required_prior_context = False
     try:
         for opcode, argument, position in pickletools.genops(candidate):
@@ -5631,23 +5598,15 @@ def _probe_embedded_proto0_suffix_through_global(
                 return None if required_prior_context else False
             budget.remaining_opcodes -= 1
             opcode_position = 0 if position is None else position
-            if not reached_suspicious_global and opcode_position > global_offset:
+            if opcode_position > import_offset:
                 return False
-            if opcode_position == global_offset:
+            is_target_import = opcode_position == import_offset
+            if is_target_import:
                 global_argument = _pickletools_global_argument(argument)
-                if (
-                    opcode.name != "GLOBAL"
-                    or global_argument is None
-                    or not _is_suspicious_pickle_global(*global_argument)
-                ):
+                if opcode.name not in {"GLOBAL", "INST"} or global_argument is None:
                     return False
-                reached_suspicious_global = True
-            elif not reached_suspicious_global and _seed_pickle_prior_context(opcode, argument, stack, memo):
+            elif _seed_pickle_prior_context(opcode, argument, stack, memo):
                 required_prior_context = True
-            elif reached_suspicious_global and required_prior_context:
-                # Bottom inserts here represent deeper values from the already
-                # established pre-slice stack, not new post-GLOBAL context.
-                _seed_pickle_prior_context(opcode, argument, stack, memo)
             if not _apply_pickle_stack_effect(
                 opcode,
                 argument,
@@ -5656,44 +5615,40 @@ def _probe_embedded_proto0_suffix_through_global(
                 hashability_cache,
             ):
                 return False
+            if is_target_import:
+                return required_prior_context
             if opcode.name == "STOP":
-                return reached_suspicious_global and required_prior_context
-    except ValueError as exc:
-        if not reached_suspicious_global:
-            return False
-        error_message = str(exc)
-        position_match = re.search(r"(?:at )?position (\d+)", error_message)
-        if position_match is not None and "opcode" in error_message:
-            return False
-        return required_prior_context
+                return False
+    except ValueError:
+        return False
     except (MemoryError, RecursionError):
-        return None if reached_suspicious_global and required_prior_context else False
+        return None if required_prior_context else False
     except Exception:
-        return None if reached_suspicious_global and required_prior_context else False
-    return reached_suspicious_global and required_prior_context
+        return None if required_prior_context else False
+    return False
 
 
 def _embedded_proto0_line_operand_suffix_has_stack_evidence(
     payload: bytes,
     *,
     earliest_start: int,
-    global_offset: int,
+    import_offset: int,
     budget: _LegalTextEmbeddedPickleProbeBudget,
 ) -> bool | None:
     """Recover bounded opcode suffixes after protocol-0 line operands."""
-    newline_offset = payload.rfind(b"\n", earliest_start, global_offset)
+    newline_offset = payload.rfind(b"\n", earliest_start, import_offset)
     while newline_offset >= earliest_start:
         start = newline_offset + 1
-        if start < global_offset and payload[start] in _PICKLE_OPCODE_BY_BYTE:
+        if start < import_offset and payload[start] in _PICKLE_OPCODE_BY_BYTE:
             if budget.remaining_candidates <= 0:
                 return None
             budget.remaining_candidates -= 1
             candidate_end = min(len(payload), start + PROTO0_1_MAX_PROBE_BYTES)
-            if global_offset >= candidate_end:
+            if import_offset >= candidate_end:
                 return None
-            state = _probe_embedded_proto0_suffix_through_global(
+            state = _probe_embedded_proto0_suffix_through_import(
                 payload[start:candidate_end],
-                global_offset=global_offset - start,
+                import_offset=import_offset - start,
                 budget=budget,
             )
             if state is not False:
@@ -5737,18 +5692,16 @@ def _legal_text_pickle_prefix_route(
 ) -> str | None:
     details = _validated_pickle_prefix_details(candidate)
     if details is None:
-        global_argument = _initial_proto0_global_argument(candidate)
-        if (
-            global_argument is None
-            or not _is_suspicious_pickle_global(*global_argument)
-            or not _proto0_global_continuation_looks_pickled(candidate)
-        ):
+        global_argument = _initial_proto0_import_argument(candidate)
+        if global_argument is None:
             return None
-        if embedded and not _embedded_proto0_global_continuation_has_stack_evidence(candidate):
+        if embedded and (
+            candidate[:1] != b"c" or not _embedded_proto0_global_continuation_has_stack_evidence(candidate)
+        ):
             return None
         route = _classify_pickle_security_payload(candidate)
         if route is None:
-            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+            return None
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if embedded else route
 
     opcodes, global_arguments, stop_end = details
@@ -5788,7 +5741,7 @@ def _structural_legal_text_pickle_route(payload: bytes) -> str | None:
         if offset != 0:
             lookbehind_state = _embedded_proto0_lookbehind_has_stack_evidence(
                 payload,
-                global_offset=parse_offset,
+                import_offset=parse_offset,
                 budget=budget,
             )
             if lookbehind_state is not False:

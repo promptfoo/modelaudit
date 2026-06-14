@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import pickle
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -707,6 +709,11 @@ def test_scan_file_keeps_ordinary_copyright_notice_on_text_route(tmp_path: Path)
             id="complete-prefix-with-trailing-prose",
         ),
         pytest.param(
+            b"cmystery_module\nthing\nApache License\n",
+            "mystery_module.thing",
+            id="import-before-invalid-continuation",
+        ),
+        pytest.param(
             b"copyright\nnotice\n.\nMIT License\n",
             "opyright.notice",
             id="legal-looking-GLOBAL-operands",
@@ -730,6 +737,49 @@ def test_scan_file_reports_import_only_global_in_protocol0_license(
         and issue.details.get("import_reference") == expected_import_reference
         for issue in result.issues
     )
+
+
+def test_scan_file_fails_closed_for_inst_before_invalid_continuation(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"(imystery_module\nThing\nApache License\n")
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    _assert_incomplete_pickle_routing(result, path)
+
+
+@pytest.mark.parametrize(
+    "encoder",
+    [
+        pytest.param(base64.b64encode, id="base64"),
+        pytest.param(binascii.hexlify, id="hex"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("payload", "expected_exit_code"),
+    [
+        pytest.param(b"cmystery_module\nthing\nApache License\n", 1, id="GLOBAL"),
+        pytest.param(b"(imystery_module\nThing\nApache License\n", 2, id="INST"),
+    ],
+)
+def test_scan_file_rejects_encoded_import_before_invalid_continuation(
+    tmp_path: Path,
+    encoder: Callable[[bytes], bytes],
+    payload: bytes,
+    expected_exit_code: int,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(encoder(payload))
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert determine_exit_code(result) == expected_exit_code
+    if expected_exit_code == 1:
+        assert result.scanner_names == ["pickle"]
+        assert any(issue.rule_code == "S901" for issue in result.issues)
+    else:
+        assert result.success is False
+        assert any(check.name == "Pickle Routing" for check in result.checks)
 
 
 def test_scan_file_keeps_allowlisted_import_only_global_on_pickle_route(tmp_path: Path) -> None:
