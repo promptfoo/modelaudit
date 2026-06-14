@@ -33,6 +33,7 @@ from modelaudit_picklescan.call_graph import (
 )
 from modelaudit_picklescan.call_graph import _source_resolution_context as _picklescan_source_resolution_context
 
+import modelaudit.cache.scan_results_cache as scan_results_cache
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.batch_operations import BatchCacheOperations
 from modelaudit.cache.optimized_config import (
@@ -45,8 +46,6 @@ from modelaudit.cache.scan_results_cache import (
     _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
     AncestorIdentity,
     ScanResultsCache,
-    _import_hook_identity,
-    _path_hook_resolution_identity,
     _path_importer_resolution_context,
     _source_resolution_context,
 )
@@ -97,13 +96,14 @@ def _call_graph_fingerprint_metadata(
             module_name: list(_path_importer_resolution_context(search_path))
             for module_name, search_path in package_paths.items()
         },
+        "namespace_package_resolution_contexts": {},
         "fingerprints": fingerprints or {},
         "read_fingerprints": read_fingerprints or {},
     }
 
 
-def _source_independent_call_graph_fingerprint_metadata() -> dict[str, Any]:
-    return {
+def _source_independent_call_graph_fingerprint_metadata(*, critical_references: bool = False) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
         "reusable": True,
         "source_independent": True,
         "fingerprints": {},
@@ -112,6 +112,9 @@ def _source_independent_call_graph_fingerprint_metadata() -> dict[str, Any]:
         "loaded_module_sources": {},
         "loaded_package_paths": {},
     }
+    if critical_references:
+        metadata["critical_references_covered"] = True
+    return metadata
 
 
 def _identity_kwargs(cache: ScanResultsCache, file_path: str) -> dict[str, Any]:
@@ -1628,31 +1631,25 @@ def test_import_hook_identity_distinguishes_same_qualname_closures() -> None:
     bytecode_hook = FileFinder.path_hook((SourcelessFileLoader, BYTECODE_SUFFIXES))
 
     assert source_hook.__qualname__ == bytecode_hook.__qualname__
-    assert _import_hook_identity(source_hook) == _import_hook_identity(equivalent_source_hook)
-    assert _import_hook_identity(source_hook) != _import_hook_identity(bytecode_hook)
+    assert _picklescan_import_hook_identity(source_hook) == _picklescan_import_hook_identity(equivalent_source_hook)
+    assert _picklescan_import_hook_identity(source_hook) != _picklescan_import_hook_identity(bytecode_hook)
 
 
 def test_import_hook_identity_tracks_function_defaults_and_keyword_defaults() -> None:
     def hook(_path: str, target: str = "safe", *, mode: str = "source") -> tuple[str, str]:
         return target, mode
 
-    identity_functions = (_import_hook_identity, _picklescan_import_hook_identity)
-    initial_identities = tuple(identity(hook) for identity in identity_functions)
+    initial_identity = _picklescan_import_hook_identity(hook)
 
     hook.__defaults__ = ("malicious",)
 
-    assert all(
-        identity(hook) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(hook) != initial_identity
 
     hook.__defaults__ = ("safe",)
-    default_restored_identities = tuple(identity(hook) for identity in identity_functions)
+    default_restored_identity = _picklescan_import_hook_identity(hook)
     hook.__kwdefaults__ = {"mode": "bytecode"}
 
-    assert all(
-        identity(hook) != initial
-        for identity, initial in zip(identity_functions, default_restored_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(hook) != default_restored_identity
 
 
 def test_import_hook_identity_tracks_referenced_global_state() -> None:
@@ -1660,14 +1657,11 @@ def test_import_hook_identity_tracks_referenced_global_state() -> None:
     exec("def hook(_path):\n    return target\n", namespace)
     hook = namespace["hook"]
     assert isinstance(hook, FunctionType)
-    identity_functions = (_import_hook_identity, _picklescan_import_hook_identity)
-    initial_identities = tuple(identity(hook) for identity in identity_functions)
+    initial_identity = _picklescan_import_hook_identity(hook)
 
     namespace["target"] = "malicious"
 
-    assert all(
-        identity(hook) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(hook) != initial_identity
 
 
 def test_import_hook_identity_tracks_class_method_state() -> None:
@@ -1681,32 +1675,23 @@ def test_import_hook_identity_tracks_class_method_state() -> None:
     )
     finder_type: Any = namespace["Finder"]
     finder = finder_type()
-    identity_functions = (_import_hook_identity, _picklescan_import_hook_identity)
-
-    initial_identities = tuple(identity(finder) for identity in identity_functions)
+    initial_identity = _picklescan_import_hook_identity(finder)
     finder_type.root = "malicious"
-    assert all(
-        identity(finder) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(finder) != initial_identity
 
     finder_type.root = "safe"
-    restored_identities = tuple(identity(finder) for identity in identity_functions)
+    restored_identity = _picklescan_import_hook_identity(finder)
     finder_type.find_spec.__defaults__ = ("bytecode",)
-    assert all(
-        identity(finder) != restored for identity, restored in zip(identity_functions, restored_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(finder) != restored_identity
 
     finder_type.find_spec.__defaults__ = ("source",)
-    defaults_restored_identities = tuple(identity(finder) for identity in identity_functions)
+    defaults_restored_identity = _picklescan_import_hook_identity(finder)
     namespace["target"] = "malicious"
-    assert all(
-        identity(finder) != restored
-        for identity, restored in zip(identity_functions, defaults_restored_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(finder) != defaults_restored_identity
 
     finder_type.__module__ = PathFinder.__module__
     finder_type.__qualname__ = PathFinder.__qualname__
-    assert all(":unreusable:" in identity(finder_type) for identity in identity_functions)
+    assert ":unreusable:" in _picklescan_import_hook_identity(finder_type)
 
 
 def test_standard_file_finder_hook_identity_invalidates_when_methods_change(
@@ -1717,20 +1702,16 @@ def test_standard_file_finder_hook_identity_invalidates_when_methods_change(
         for hook in sys.path_hooks
         if _picklescan_path_hook_resolution_identity(hook) == "trusted:importlib.machinery.FileFinder.path_hook"
     )
-    initial_cache_identity = _path_hook_resolution_identity(standard_hook)
-    initial_picklescan_identity = _picklescan_path_hook_resolution_identity(standard_hook)
+    initial_identity = _picklescan_path_hook_resolution_identity(standard_hook)
 
     def changed_find_spec(self: FileFinder, _fullname: str, _target: object = None) -> None:
         return None
 
     monkeypatch.setattr(FileFinder, "find_spec", changed_find_spec)
 
-    changed_cache_identity = _path_hook_resolution_identity(standard_hook)
-    changed_picklescan_identity = _picklescan_path_hook_resolution_identity(standard_hook)
-    assert changed_cache_identity != initial_cache_identity
-    assert changed_picklescan_identity != initial_picklescan_identity
-    assert ":unreusable:" in changed_cache_identity
-    assert ":unreusable:" in changed_picklescan_identity
+    changed_identity = _picklescan_path_hook_resolution_identity(standard_hook)
+    assert changed_identity != initial_identity
+    assert ":unreusable:" in changed_identity
 
 
 def test_arbitrary_startup_path_hook_is_never_trusted() -> None:
@@ -1740,9 +1721,9 @@ def test_arbitrary_startup_path_hook_is_never_trusted() -> None:
 
     hook = StartupPathHook()
 
-    for identity in (_path_hook_resolution_identity(hook), _picklescan_path_hook_resolution_identity(hook)):
-        assert not identity.startswith("trusted:")
-        assert ":unreusable:" in identity
+    identity = _picklescan_path_hook_resolution_identity(hook)
+    assert not identity.startswith("trusted:")
+    assert ":unreusable:" in identity
 
 
 def test_import_hook_identity_tracks_bound_method_state() -> None:
@@ -1754,13 +1735,11 @@ def test_import_hook_identity_tracks_bound_method_state() -> None:
             return self.target
 
     hook = StatefulHook("safe")
-    cache_identity = _import_hook_identity(hook.find_spec)
-    picklescan_identity = _picklescan_import_hook_identity(hook.find_spec)
+    initial_identity = _picklescan_import_hook_identity(hook.find_spec)
 
     hook.target = "malicious"
 
-    assert _import_hook_identity(hook.find_spec) != cache_identity
-    assert _picklescan_import_hook_identity(hook.find_spec) != picklescan_identity
+    assert _picklescan_import_hook_identity(hook.find_spec) != initial_identity
 
 
 def test_scan_cache_rejects_file_finder_subclass_importer(
@@ -1849,8 +1828,6 @@ def test_import_hook_identity_includes_descriptor_method_code(descriptor_kind: s
     equivalent_hook = type("DescriptorFinder", (), {"find_spec": descriptor(original_find_spec)})
     changed_hook = type("DescriptorFinder", (), {"find_spec": descriptor(changed_find_spec)})
 
-    assert _import_hook_identity(original_hook) == _import_hook_identity(equivalent_hook)
-    assert _import_hook_identity(original_hook) != _import_hook_identity(changed_hook)
     assert _picklescan_import_hook_identity(original_hook) == _picklescan_import_hook_identity(equivalent_hook)
     assert _picklescan_import_hook_identity(original_hook) != _picklescan_import_hook_identity(changed_hook)
 
@@ -1863,6 +1840,29 @@ def test_cache_resolution_context_matches_picklescan_metadata() -> None:
         "path_hooks": list(path_hooks),
         "path_importers": list(path_importers),
     }
+
+
+def test_scan_cache_rejects_resolution_metadata_without_current_picklescan_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": _call_graph_fingerprint_metadata()},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    monkeypatch.setattr(scan_results_cache, "_PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE", False)
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
 def test_resolution_context_rejects_mutated_zipimporter_state(
@@ -1890,6 +1890,48 @@ def test_resolution_context_rejects_mutated_zipimporter_state(
     mutated_context = _source_resolution_context()
     assert mutated_context["path_importers"] == list(_picklescan_source_resolution_context()[2])
     assert mutated_context != trusted_context
+
+
+def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "cached_namespace_package"
+    package_path = tmp_path / module_name
+    package_path.mkdir()
+    path_entry = str(package_path)
+    finder = FileFinder(
+        path_entry,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+    fingerprint_metadata = _call_graph_fingerprint_metadata()
+    fingerprint_metadata["namespace_package_resolution_contexts"] = {
+        module_name: {
+            "search_path": [path_entry],
+            "path_importers": list(_path_importer_resolution_context([path_entry])),
+        }
+    }
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, None)
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
 def test_cache_module_validation_does_not_execute_custom_path_hooks(
@@ -2395,6 +2437,52 @@ def test_scan_cache_rejects_source_independent_marker_with_source_inputs(
     )
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+@pytest.mark.parametrize(
+    ("check_module", "check_name", "expected_hit"),
+    (("posix", "system", True), ("builtins", "eval", False)),
+)
+def test_scan_cache_requires_all_critical_source_inputs_to_be_covered(
+    tmp_path: Path,
+    check_module: str,
+    check_name: str,
+    expected_hit: bool,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [
+            {
+                "status": "failed",
+                "severity": "critical",
+                "details": {
+                    "pickle_rule_code": "DANGEROUS_CALL",
+                    "module": check_module,
+                    "name": check_name,
+                },
+            }
+        ],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "malicious",
+            "import_references": [{"module": "posix", "name": "system"}],
+            "callable_invocations": [],
+        },
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _source_independent_call_graph_fingerprint_metadata(
+                critical_references=True
+            )
+        },
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+    assert (cached_result is not None) is expected_hit
 
 
 def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returning_them(

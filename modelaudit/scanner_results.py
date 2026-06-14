@@ -147,8 +147,8 @@ def _member_occurrence_from_record(record: Mapping[str, Any]) -> int:
     return 1
 
 
-def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str, Any]) -> bool:
-    return dict(metadata) == {
+def _source_independent_call_graph_fingerprint_metadata(*, critical_references: bool = False) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
         "reusable": True,
         "source_independent": True,
         "fingerprints": {},
@@ -157,96 +157,70 @@ def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str
         "loaded_module_sources": {},
         "loaded_package_paths": {},
     }
+    if critical_references:
+        metadata["critical_references_covered"] = True
+    return metadata
+
+
+def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str, Any]) -> bool:
+    normalized = dict(metadata)
+    return normalized in (
+        _source_independent_call_graph_fingerprint_metadata(),
+        _source_independent_call_graph_fingerprint_metadata(critical_references=True),
+    )
+
+
+_CALL_GRAPH_FINGERPRINT_MAPPING_KEYS = (
+    "fingerprints",
+    "read_fingerprints",
+    "module_sources",
+    "loaded_module_sources",
+    "loaded_package_paths",
+    "loaded_package_resolution_contexts",
+    "namespace_package_resolution_contexts",
+)
+
+
+def _merge_call_graph_fingerprint_mapping(
+    existing: Mapping[str, Any],
+    incoming: Mapping[str, Any],
+    key: str,
+) -> tuple[dict[str, Any], bool]:
+    existing_value = existing.get(key)
+    incoming_value = incoming.get(key)
+    merged = _deep_mutable_copy(existing_value) if isinstance(existing_value, Mapping) else {}
+    conflict = False
+    if isinstance(incoming_value, Mapping):
+        for item_key, value in incoming_value.items():
+            if item_key in merged and merged[item_key] != value:
+                conflict = True
+            else:
+                merged[item_key] = _deep_mutable_copy(value)
+    return merged, conflict
 
 
 def _merge_call_graph_source_fingerprints_metadata(
     existing: Mapping[str, Any], incoming: Mapping[str, Any]
 ) -> dict[str, Any]:
-    if _is_source_independent_call_graph_fingerprint_metadata(incoming):
+    incoming_is_source_independent = _is_source_independent_call_graph_fingerprint_metadata(incoming)
+    existing_is_source_independent = _is_source_independent_call_graph_fingerprint_metadata(existing)
+    if incoming_is_source_independent and existing_is_source_independent:
+        return _source_independent_call_graph_fingerprint_metadata(
+            critical_references=(
+                incoming.get("critical_references_covered") is True
+                or existing.get("critical_references_covered") is True
+            )
+        )
+    if incoming_is_source_independent:
         return {key: _deep_mutable_copy(value) for key, value in existing.items()}
-    if _is_source_independent_call_graph_fingerprint_metadata(existing):
+    if existing_is_source_independent:
         return {key: _deep_mutable_copy(value) for key, value in incoming.items()}
 
     merged: dict[str, Any] = _deep_mutable_copy(existing)
-    existing_fingerprints = existing.get("fingerprints")
-    incoming_fingerprints = incoming.get("fingerprints")
-    fingerprints = _deep_mutable_copy(existing_fingerprints) if isinstance(existing_fingerprints, Mapping) else {}
-    fingerprint_conflict = False
-    if isinstance(incoming_fingerprints, Mapping):
-        for path, fingerprint in incoming_fingerprints.items():
-            if path in fingerprints and fingerprints[path] != fingerprint:
-                fingerprint_conflict = True
-                continue
-            fingerprints[path] = _deep_mutable_copy(fingerprint)
-    merged["fingerprints"] = fingerprints
-
-    existing_read_fingerprints = existing.get("read_fingerprints")
-    incoming_read_fingerprints = incoming.get("read_fingerprints")
-    read_fingerprints = (
-        _deep_mutable_copy(existing_read_fingerprints) if isinstance(existing_read_fingerprints, Mapping) else {}
-    )
-    read_fingerprint_conflict = False
-    if isinstance(incoming_read_fingerprints, Mapping):
-        for path, fingerprint_record in incoming_read_fingerprints.items():
-            if path in read_fingerprints and read_fingerprints[path] != fingerprint_record:
-                read_fingerprint_conflict = True
-                continue
-            read_fingerprints[path] = _deep_mutable_copy(fingerprint_record)
-    merged["read_fingerprints"] = read_fingerprints
-
-    existing_module_sources = existing.get("module_sources")
-    incoming_module_sources = incoming.get("module_sources")
-    module_sources = _deep_mutable_copy(existing_module_sources) if isinstance(existing_module_sources, Mapping) else {}
-    module_source_conflict = False
-    if isinstance(incoming_module_sources, Mapping):
-        for module_name, source_path in incoming_module_sources.items():
-            if module_name in module_sources and module_sources[module_name] != source_path:
-                module_source_conflict = True
-                continue
-            module_sources[module_name] = _deep_mutable_copy(source_path)
-    merged["module_sources"] = module_sources
-
-    existing_loaded_sources = existing.get("loaded_module_sources")
-    incoming_loaded_sources = incoming.get("loaded_module_sources")
-    loaded_sources = _deep_mutable_copy(existing_loaded_sources) if isinstance(existing_loaded_sources, Mapping) else {}
-    loaded_source_conflict = False
-    if isinstance(incoming_loaded_sources, Mapping):
-        for module_name, source_path in incoming_loaded_sources.items():
-            if module_name in loaded_sources and loaded_sources[module_name] != source_path:
-                loaded_source_conflict = True
-                continue
-            loaded_sources[module_name] = _deep_mutable_copy(source_path)
-    merged["loaded_module_sources"] = loaded_sources
-
-    existing_loaded_package_paths = existing.get("loaded_package_paths")
-    incoming_loaded_package_paths = incoming.get("loaded_package_paths")
-    loaded_package_paths = (
-        _deep_mutable_copy(existing_loaded_package_paths) if isinstance(existing_loaded_package_paths, Mapping) else {}
-    )
-    loaded_package_path_conflict = False
-    if isinstance(incoming_loaded_package_paths, Mapping):
-        for module_name, search_path in incoming_loaded_package_paths.items():
-            if module_name in loaded_package_paths and loaded_package_paths[module_name] != search_path:
-                loaded_package_path_conflict = True
-                continue
-            loaded_package_paths[module_name] = _deep_mutable_copy(search_path)
-    merged["loaded_package_paths"] = loaded_package_paths
-
-    existing_loaded_package_contexts = existing.get("loaded_package_resolution_contexts")
-    incoming_loaded_package_contexts = incoming.get("loaded_package_resolution_contexts")
-    loaded_package_contexts = (
-        _deep_mutable_copy(existing_loaded_package_contexts)
-        if isinstance(existing_loaded_package_contexts, Mapping)
-        else {}
-    )
-    loaded_package_context_conflict = False
-    if isinstance(incoming_loaded_package_contexts, Mapping):
-        for module_name, resolution_context in incoming_loaded_package_contexts.items():
-            if module_name in loaded_package_contexts and loaded_package_contexts[module_name] != resolution_context:
-                loaded_package_context_conflict = True
-                continue
-            loaded_package_contexts[module_name] = _deep_mutable_copy(resolution_context)
-    merged["loaded_package_resolution_contexts"] = loaded_package_contexts
+    mapping_conflict = False
+    for key in _CALL_GRAPH_FINGERPRINT_MAPPING_KEYS:
+        merged[key], conflict = _merge_call_graph_fingerprint_mapping(existing, incoming, key)
+        mapping_conflict = mapping_conflict or conflict
 
     existing_search_context = existing.get("search_context")
     incoming_search_context = incoming.get("search_context")
@@ -256,25 +230,11 @@ def _merge_call_graph_source_fingerprints_metadata(
         merged["reusable"] = False
     else:
         merged["reusable"] = (
-            existing.get("reusable") is True
-            and incoming.get("reusable") is True
-            and not fingerprint_conflict
-            and not read_fingerprint_conflict
-            and not module_source_conflict
-            and not loaded_source_conflict
-            and not loaded_package_path_conflict
-            and not loaded_package_context_conflict
+            existing.get("reusable") is True and incoming.get("reusable") is True and not mapping_conflict
         )
         merged["search_context"] = existing_search_context
         merged["resolution_context"] = _deep_mutable_copy(existing_resolution_context)
-    if (
-        fingerprint_conflict
-        or read_fingerprint_conflict
-        or module_source_conflict
-        or loaded_source_conflict
-        or loaded_package_path_conflict
-        or loaded_package_context_conflict
-    ):
+    if mapping_conflict:
         merged["reusable"] = False
 
     return merged

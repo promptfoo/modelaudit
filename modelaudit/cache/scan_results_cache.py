@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from importlib.machinery import (
@@ -44,51 +45,60 @@ _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT = (
 )
 
 
-def _unavailable_import_hook_identity(_hook: object) -> str:
-    return "modelaudit_picklescan.call_graph:unreusable:unavailable"
-
-
 def _unavailable_source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     unavailable = _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
     return unavailable, unavailable, unavailable
 
 
-def _unavailable_path_importer_resolution_context(_search_path: object) -> tuple[str, ...]:
+def _unavailable_path_importer_resolution_context(_search_path: Iterable[str]) -> tuple[str, ...]:
     return _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
 
 
-def _unavailable_search_path_has_untrusted_importer(_search_path: object) -> bool:
+def _unavailable_search_path_has_untrusted_importer(_search_path: Iterable[str]) -> bool:
     return True
 
 
-# Older independently released picklescan versions do not expose these helpers.
-# Their fingerprint metadata also lacks resolution_context, so the conservative
-# fallbacks reject reuse without making the root package unimportable.
-_import_hook_identity = getattr(
-    _picklescan_call_graph,
-    "_import_hook_identity",
-    _unavailable_import_hook_identity,
+def _unavailable_resolution_context_allows_trusted_cache_population(
+    _before: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    _after: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> bool:
+    return False
+
+
+# Older independent picklescan releases must fail closed as a group instead of
+# binding an earlier, incomplete subset of the resolution helpers.
+_PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE = all(
+    callable(getattr(_picklescan_call_graph, name, None))
+    for name in (
+        "_path_importer_resolution_context",
+        "_resolution_context_allows_trusted_cache_population",
+        "_search_path_has_untrusted_importer",
+        "_source_resolution_context",
+    )
 )
-_path_hook_resolution_identity = getattr(
-    _picklescan_call_graph,
-    "_path_hook_resolution_identity",
-    _unavailable_import_hook_identity,
-)
-_path_importer_resolution_context = getattr(
-    _picklescan_call_graph,
-    "_path_importer_resolution_context",
-    _unavailable_path_importer_resolution_context,
-)
-_search_path_has_untrusted_importer = getattr(
-    _picklescan_call_graph,
-    "_search_path_has_untrusted_importer",
-    _unavailable_search_path_has_untrusted_importer,
-)
-_picklescan_source_resolution_context = getattr(
-    _picklescan_call_graph,
-    "_source_resolution_context",
-    _unavailable_source_resolution_context,
-)
+_path_importer_resolution_context: Callable[[Iterable[str]], tuple[str, ...]]
+_resolution_context_allows_trusted_cache_population: Callable[
+    [
+        tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+        tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    ],
+    bool,
+]
+_search_path_has_untrusted_importer: Callable[[Iterable[str]], bool]
+if _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE:
+    _path_importer_resolution_context = _picklescan_call_graph._path_importer_resolution_context
+    _resolution_context_allows_trusted_cache_population = (
+        _picklescan_call_graph._resolution_context_allows_trusted_cache_population
+    )
+    _search_path_has_untrusted_importer = _picklescan_call_graph._search_path_has_untrusted_importer
+    _picklescan_source_resolution_context = _picklescan_call_graph._source_resolution_context
+else:
+    _path_importer_resolution_context = _unavailable_path_importer_resolution_context
+    _resolution_context_allows_trusted_cache_population = (
+        _unavailable_resolution_context_allows_trusted_cache_population
+    )
+    _search_path_has_untrusted_importer = _unavailable_search_path_has_untrusted_importer
+    _picklescan_source_resolution_context = _unavailable_source_resolution_context
 
 AncestorEntry = tuple[str, int, int, int, int, int]
 _DARWIN_STABLE_SYMLINK_ALIASES = {
@@ -288,6 +298,37 @@ def _source_resolution_context() -> dict[str, list[str]]:
     }
 
 
+def _parse_resolution_context(
+    value: object,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None:
+    if not isinstance(value, dict):
+        return None
+    parts: list[tuple[str, ...]] = []
+    for name in ("meta_path", "path_hooks", "path_importers"):
+        raw_part = value.get(name)
+        if not isinstance(raw_part, list) or not all(isinstance(identity, str) for identity in raw_part):
+            return None
+        parts.append(tuple(raw_part))
+    return parts[0], parts[1], parts[2]
+
+
+def _path_importer_context_is_current(search_path: object, resolution_context: object) -> bool:
+    if (
+        not isinstance(search_path, list)
+        or not all(isinstance(entry, str) for entry in search_path)
+        or not isinstance(resolution_context, list)
+        or not all(isinstance(identity, str) for identity in resolution_context)
+        or _search_path_has_untrusted_importer(search_path)
+    ):
+        return False
+    expected = tuple(resolution_context)
+    current = _path_importer_resolution_context(search_path)
+    return current == expected or _resolution_context_allows_trusted_cache_population(
+        ((), (), expected),
+        ((), (), current),
+    )
+
+
 def _loaded_module_source_override(module_name: str) -> tuple[bool, str | None]:
     if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         return True, None
@@ -321,7 +362,7 @@ def _loaded_package_search_path(module_name: str) -> list[str] | None:
     raw_search_path = vars(loaded_module).get("__path__")
     if not isinstance(raw_search_path, (list, tuple)) or not all(isinstance(entry, str) for entry in raw_search_path):
         return None
-    return [str(Path(entry or os.getcwd()).absolute()) for entry in raw_search_path]
+    return [os.path.abspath(entry or os.getcwd()) for entry in raw_search_path]
 
 
 @dataclass
@@ -1439,7 +1480,7 @@ class ScanResultsCache:
 
     @staticmethod
     def _source_search_context() -> list[str]:
-        return [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path]
+        return [os.path.abspath(entry or os.getcwd()) for entry in sys.path]
 
     @staticmethod
     def _regular_file_identity_fingerprint(file_stat: os.stat_result) -> str:
@@ -1639,16 +1680,32 @@ class ScanResultsCache:
         if not isinstance(fingerprint_metadata, dict):
             return False
         if fingerprint_metadata.get("source_independent") is True:
-            return isinstance(metadata, dict) and self._source_independent_call_graph_fingerprints_are_valid(
-                fingerprint_metadata,
-                metadata,
+            return (
+                isinstance(scan_result, dict)
+                and isinstance(metadata, dict)
+                and self._source_independent_call_graph_fingerprints_are_valid(
+                    fingerprint_metadata,
+                    metadata,
+                    scan_result,
+                )
             )
+        if not _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE:
+            return False
         if fingerprint_metadata.get("reusable") is not True:
             return False
         if fingerprint_metadata.get("search_context") != self._source_search_context():
             return False
-        if fingerprint_metadata.get("resolution_context") != _source_resolution_context():
-            return False
+        expected_resolution_context = fingerprint_metadata.get("resolution_context")
+        current_resolution_context = _source_resolution_context()
+        if expected_resolution_context != current_resolution_context:
+            expected_context = _parse_resolution_context(expected_resolution_context)
+            current_context = _parse_resolution_context(current_resolution_context)
+            if (
+                expected_context is None
+                or current_context is None
+                or not _resolution_context_allows_trusted_cache_population(expected_context, current_context)
+            ):
+                return False
         module_sources = fingerprint_metadata.get("module_sources")
         if not isinstance(module_sources, dict):
             return False
@@ -1676,25 +1733,29 @@ class ScanResultsCache:
         if set(loaded_package_resolution_contexts) != set(loaded_package_paths):
             return False
         for module_name, expected_search_path in loaded_package_paths.items():
-            if not isinstance(module_name, str) or not isinstance(expected_search_path, list):
-                return False
-            if not all(isinstance(entry, str) for entry in expected_search_path):
+            if not isinstance(module_name, str):
                 return False
             current_search_path = _loaded_package_search_path(module_name)
             if current_search_path != expected_search_path:
                 return False
-            if current_search_path is None or _search_path_has_untrusted_importer(current_search_path):
-                return False
             expected_resolution_context = loaded_package_resolution_contexts.get(module_name)
-            if not isinstance(expected_resolution_context, list) or not all(
-                isinstance(identity, str) for identity in expected_resolution_context
-            ):
-                return False
-            if list(_path_importer_resolution_context(current_search_path)) != expected_resolution_context:
+            if not _path_importer_context_is_current(current_search_path, expected_resolution_context):
                 return False
         for module_name in module_sources:
             if any(
                 parent_name not in loaded_package_paths for parent_name in _loaded_parent_package_names(module_name)
+            ):
+                return False
+        namespace_package_contexts = fingerprint_metadata.get("namespace_package_resolution_contexts")
+        if not isinstance(namespace_package_contexts, dict):
+            return False
+        for module_name, raw_context in namespace_package_contexts.items():
+            if not isinstance(module_name, str) or not isinstance(raw_context, dict):
+                return False
+            search_path = raw_context.get("search_path")
+            expected_resolution_context = raw_context.get("path_importers")
+            if module_name in sys.modules or not _path_importer_context_is_current(
+                search_path, expected_resolution_context
             ):
                 return False
         fingerprints = fingerprint_metadata.get("fingerprints")
@@ -1743,8 +1804,9 @@ class ScanResultsCache:
     def _source_independent_call_graph_fingerprints_are_valid(
         fingerprint_metadata: dict[str, Any],
         metadata: dict[str, Any],
+        scan_result: dict[str, Any],
     ) -> bool:
-        if fingerprint_metadata != {
+        expected_metadata: dict[str, Any] = {
             "reusable": True,
             "source_independent": True,
             "fingerprints": {},
@@ -1752,7 +1814,11 @@ class ScanResultsCache:
             "module_sources": {},
             "loaded_module_sources": {},
             "loaded_package_paths": {},
-        }:
+        }
+        critical_references_covered = fingerprint_metadata.get("critical_references_covered") is True
+        if critical_references_covered:
+            expected_metadata["critical_references_covered"] = True
+        if fingerprint_metadata != expected_metadata:
             return False
         if not _PICKLE_RESULT_METADATA_KEYS.intersection(metadata):
             return False
@@ -1766,8 +1832,55 @@ class ScanResultsCache:
         ):
             return False
         if metadata.get("container_type") == "pytorch_zip":
-            return True
+            return not critical_references_covered or ScanResultsCache._critical_call_graph_inputs_are_covered(
+                scan_result,
+                metadata,
+            )
+        if critical_references_covered:
+            return ScanResultsCache._critical_call_graph_inputs_are_covered(scan_result, metadata)
         return not any(metadata.get(key) for key in _PICKLE_CALL_GRAPH_INPUT_KEYS)
+
+    @staticmethod
+    def _critical_call_graph_inputs_are_covered(
+        scan_result: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> bool:
+        if metadata.get("pickle_report_status") != "complete" or metadata.get("pickle_verdict") != "malicious":
+            return False
+        references: set[tuple[str, str]] = set()
+        for key in _PICKLE_CALL_GRAPH_INPUT_KEYS:
+            raw_references = metadata.get(key, [])
+            if not isinstance(raw_references, list):
+                return False
+            for raw_reference in raw_references:
+                if not isinstance(raw_reference, dict):
+                    return False
+                module = raw_reference.get("module")
+                name = raw_reference.get("name")
+                if not isinstance(module, str) or not module or not isinstance(name, str) or not name:
+                    return False
+                references.add((module, name))
+        if not references:
+            return False
+
+        critical_references: set[tuple[str, str]] = set()
+        checks = scan_result.get("checks")
+        if not isinstance(checks, list):
+            return False
+        for check in checks:
+            if not isinstance(check, dict) or check.get("status") != "failed" or check.get("severity") != "critical":
+                continue
+            details = check.get("details")
+            if not isinstance(details, dict) or details.get("pickle_rule_code") not in {
+                "DANGEROUS_CALL",
+                "DANGEROUS_GLOBAL",
+            }:
+                continue
+            module = details.get("module")
+            name = details.get("name")
+            if isinstance(module, str) and isinstance(name, str):
+                critical_references.add((module, name))
+        return references <= critical_references
 
     @staticmethod
     def _legacy_pickle_call_graph_metadata_requires_fingerprints(metadata: dict[str, Any]) -> bool:

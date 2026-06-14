@@ -288,6 +288,7 @@ def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
         "loaded_module_sources": {},
         "loaded_package_paths": {},
         "loaded_package_resolution_contexts": {},
+        "namespace_package_resolution_contexts": {},
         "fingerprints": {
             "/tmp/src/first.py": "1111",
             "/tmp/src/second.py": "2222",

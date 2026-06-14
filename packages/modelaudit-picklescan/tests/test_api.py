@@ -3912,6 +3912,9 @@ def test_merge_call_graph_source_fingerprint_metadata_marks_read_conflict_unreus
 
 def test_merge_call_graph_source_fingerprints_preserves_source_independence_only_when_all_members_are() -> None:
     source_independent = package_api._source_independent_call_graph_fingerprint_metadata()
+    critical_source_independent = package_api._source_independent_call_graph_fingerprint_metadata(
+        critical_references=True
+    )
     source_sensitive = {
         "reusable": True,
         "search_context": ["source-root"],
@@ -3936,6 +3939,14 @@ def test_merge_call_graph_source_fingerprints_preserves_source_independence_only
     assert (
         package_api._merge_call_graph_source_fingerprint_metadata(source_sensitive, source_independent)
         == source_sensitive
+    )
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(source_independent, critical_source_independent)
+        == critical_source_independent
+    )
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(critical_source_independent, source_independent)
+        == critical_source_independent
     )
 
 
@@ -11244,6 +11255,9 @@ def test_scan_bytes_skips_call_graph_enrichment_for_already_critical_references(
     assert any(
         finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
         for finding in report.findings
+    )
+    assert report.private_metadata["call_graph_source_fingerprints"] == (
+        package_api._source_independent_call_graph_fingerprint_metadata(critical_references=True)
     )
 
 
