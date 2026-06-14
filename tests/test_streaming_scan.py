@@ -42,6 +42,7 @@ from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import PICKLE_ROUTING_INCONCLUSIVE_FORMAT, SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.file.handlers import _pinned_shard_scan_path
 from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
+from modelaudit.utils.file.streaming import StreamedSourceByteAccounting
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
@@ -4298,6 +4299,99 @@ def test_scan_model_streaming_with_deletion(temp_test_files: list[Path]) -> None
     assert result.content_hash is not None
 
 
+def test_scan_model_streaming_precomputed_remote_result_does_not_delete_local_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Precomputed remote scans must not unlink same-named local files."""
+    monkeypatch.chdir(tmp_path)
+    local_match = Path("model.safetensors")
+    local_match.write_bytes(b"local file that was never streamed")
+    remote_path = "hf://test/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model.safetensors"
+    precomputed = ScanResult(scanner_name="safetensors")
+    precomputed.bytes_scanned = 32
+    precomputed.metadata.update(
+        {
+            "remote_header_only": True,
+            "remote_source_path": remote_path,
+            "source_path": remote_path,
+        }
+    )
+    precomputed.add_check(
+        name="Remote SafeTensors Header Integrity",
+        passed=True,
+        message="Remote SafeTensors header was scanned with bounded range reads",
+        severity=IssueSeverity.INFO,
+        location=remote_path,
+    )
+    precomputed.finish(success=True)
+
+    result = scan_model_streaming(
+        file_generator=iter([(local_match, True, precomputed)]),
+        timeout=30,
+        delete_after_scan=True,
+    )
+
+    assert local_match.exists()
+    assert result.files_scanned == 1
+    assert result.file_metadata[remote_path].model_dump()["remote_header_only"] is True
+    assert result.assets
+
+
+def test_scan_model_streaming_preserves_precomputed_inconclusive_failure_without_cache_write() -> None:
+    """A failed source-native result must remain an operational failure and bypass local caching."""
+    source_path = "hf://test/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model.safetensors"
+    precomputed = ScanResult(scanner_name="safetensors")
+    precomputed.bytes_scanned = 8
+    precomputed.metadata.update(
+        {
+            "remote_header_only": True,
+            "remote_source_path": source_path,
+            "source_path": source_path,
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "remote_safetensors_header_range_failed",
+            "scan_outcome_reasons": ["remote_safetensors_header_range_failed"],
+            "operational_error": True,
+            "operational_error_reason": "remote_safetensors_header_range_failed",
+        }
+    )
+    precomputed.add_check(
+        name="Remote SafeTensors Header Acquisition",
+        passed=False,
+        message="Remote SafeTensors header could not be acquired",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "remote_safetensors_header_range_failed",
+            "operational_error": True,
+        },
+    )
+    precomputed.finish(success=False)
+
+    with (
+        patch("modelaudit.core.scan_file") as mock_scan_file,
+        patch("modelaudit.cache.scan_results_cache.ScanResultsCache.store_result") as mock_cache_store,
+    ):
+        result = scan_model_streaming(
+            file_generator=iter([(Path("model.safetensors"), True, precomputed)]),
+            timeout=30,
+            delete_after_scan=True,
+            cache_enabled=True,
+        )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == 8
+    assert determine_exit_code(result) == 2
+    assert result.file_metadata[source_path].model_dump()["scan_outcome"] == "inconclusive"
+    mock_scan_file.assert_not_called()
+    mock_cache_store.assert_not_called()
+
+
 def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
     temp_test_files: list[Path],
 ) -> None:
@@ -4603,6 +4697,74 @@ def test_scan_model_streaming_does_not_hash_files_over_max_file_size(
     assert result.success is False
     assert determine_exit_code(result) == 2
     assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+
+
+def test_scan_model_streaming_preserves_pretransferred_bytes_across_max_file_size(tmp_path: Path) -> None:
+    """A selected source rejected by max-file-size must retain its earlier transfer accounting."""
+    payload = tmp_path / "selected-index.json"
+    payload.write_bytes(b"X" * 128)
+    accounting = StreamedSourceByteAccounting(
+        pretransferred_bytes=payload.stat().st_size,
+        source_bytes_preaccounted=payload.stat().st_size,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True, None, accounting)]),
+        timeout=30,
+        delete_after_scan=False,
+        max_file_size=64,
+        cache_enabled=False,
+    )
+
+    assert result.bytes_scanned == payload.stat().st_size
+    assert result.files_scanned == 1
+    assert result.success is False
+    assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+
+
+def test_scan_model_streaming_preserves_pretransferred_bytes_for_lfs_pointer(tmp_path: Path) -> None:
+    """A selected Git LFS pointer must not erase bytes transferred before local routing."""
+    payload = tmp_path / "model.safetensors.index.json"
+    payload.write_text(f"version https://git-lfs.github.com/spec/v1\noid sha256:{'a' * 64}\nsize 123456\n")
+    payload_size = payload.stat().st_size
+    accounting = StreamedSourceByteAccounting(
+        pretransferred_bytes=payload_size,
+        source_bytes_preaccounted=payload_size,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True, None, accounting)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert result.bytes_scanned == payload_size
+    assert result.files_scanned == 1
+    assert result.success is True
+    assert determine_exit_code(result) == 1
+    assert any(check.name == "Git LFS Pointer Detection" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    ("pretransferred_bytes", "source_bytes_preaccounted"),
+    [(True, 0), (-1, 0), (0, True), (0, -1)],
+)
+def test_streamed_source_byte_accounting_rejects_invalid_values(
+    pretransferred_bytes: object,
+    source_bytes_preaccounted: object,
+) -> None:
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        StreamedSourceByteAccounting(
+            pretransferred_bytes=cast(Any, pretransferred_bytes),
+            source_bytes_preaccounted=cast(Any, source_bytes_preaccounted),
+        )
+
+
+@pytest.mark.parametrize("source_path", ["", 1])
+def test_streamed_source_byte_accounting_rejects_invalid_source_path(source_path: object) -> None:
+    with pytest.raises(ValueError, match="source_path must be a non-empty string"):
+        StreamedSourceByteAccounting(source_path=cast(Any, source_path))
 
 
 def test_scan_model_streaming_fails_closed_after_max_total_size(
