@@ -758,13 +758,11 @@ class ShardedModelDetector:
     def _safetensors_index_candidates(index_dir: Path) -> tuple[list[Path], bool]:
         """Return bounded local index candidates, preferring the canonical name."""
         canonical_path = index_dir / SAFETENSORS_INDEX_NAME
+        canonical_available = canonical_path.exists() or canonical_path.is_symlink()
         candidates: list[Path] = []
-        if canonical_path.exists() or canonical_path.is_symlink():
-            candidates.append(canonical_path)
+        inventory_complete = True
         try:
             for candidate in index_dir.iterdir():
-                if candidate == canonical_path:
-                    continue
                 basename = candidate.name
                 if len(basename) <= len(SAFETENSORS_INDEX_SUFFIX) or not basename.lower().endswith(
                     SAFETENSORS_INDEX_SUFFIX
@@ -774,9 +772,27 @@ class ShardedModelDetector:
                 if len(candidates) > MAX_SAFETENSORS_SHARD_INDEX_FILES:
                     return candidates, True
         except OSError:
-            return candidates, False
+            inventory_complete = False
+        if canonical_available:
+            # Keep the actual directory entry when canonical_path is only a case-insensitive alias.
+            for candidate in candidates:
+                if candidate.name.casefold() != SAFETENSORS_INDEX_NAME:
+                    continue
+                if candidate == canonical_path:
+                    break
+                if not inventory_complete:
+                    continue
+                try:
+                    if candidate.samefile(canonical_path):
+                        break
+                except OSError:
+                    continue
+            else:
+                candidates.append(canonical_path)
+                if len(candidates) > MAX_SAFETENSORS_SHARD_INDEX_FILES:
+                    return candidates, True
         candidates.sort(
-            key=lambda path: (path != canonical_path, path.name.casefold(), path.name),
+            key=lambda path: (path.name.casefold() != SAFETENSORS_INDEX_NAME, path.name.casefold(), path.name),
         )
         return candidates, False
 

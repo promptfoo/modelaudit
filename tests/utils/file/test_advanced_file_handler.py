@@ -272,14 +272,88 @@ class TestShardedModelDetector:
         result = AdvancedFileHandler(str(shard), CompletingShardScanner()).scan()
 
         assert shard_info is not None
-        assert os.path.normcase(os.path.normpath(shard_info["safetensors_index_path"])) == os.path.normcase(
-            os.path.normpath(str(index_path))
-        )
+        assert shard_info["safetensors_index_path"] == str(index_path)
         assert shard_info["shard_index_base"] == "zero"
         assert shard_info["shards"] == [str(shard)]
         assert "missing_shard_count" not in shard_info
         assert "unexpected_shard_count" not in shard_info
         assert result.success is True
+
+    @pytest.mark.skipif(os.name == "nt", reason="simulates POSIX path comparison on a case-insensitive filesystem")
+    def test_safetensors_index_candidates_deduplicate_case_insensitive_posix_alias(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A synthetic canonical alias must not duplicate the actual directory entry."""
+        actual_index = _write_safetensors_index(
+            tmp_path,
+            ["model-00000-of-00001.safetensors"],
+            index_name="MODEL.SAFETENSORS.INDEX.JSON",
+        )
+        canonical_index = tmp_path / "model.safetensors.index.json"
+        original_exists = Path.exists
+        original_samefile = Path.samefile
+
+        def case_insensitive_exists(path: Path) -> bool:
+            if path == canonical_index:
+                return True
+            return original_exists(path)
+
+        def case_insensitive_samefile(path: Path, other_path: str | os.PathLike[str]) -> bool:
+            other = Path(other_path)
+            if (
+                path.parent == tmp_path
+                and other.parent == tmp_path
+                and path.name.casefold() == canonical_index.name
+                and other.name.casefold() == canonical_index.name
+            ):
+                return True
+            return original_samefile(path, other)
+
+        monkeypatch.setattr(Path, "exists", case_insensitive_exists)
+        monkeypatch.setattr(Path, "samefile", case_insensitive_samefile)
+
+        candidates, limit_exceeded = ShardedModelDetector._safetensors_index_candidates(tmp_path)
+
+        assert limit_exceeded is False
+        assert candidates == [actual_index]
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires case-sensitive POSIX directory entries")
+    def test_safetensors_index_candidates_keep_distinct_case_sensitive_entries(self, tmp_path: Path) -> None:
+        """Distinct real index entries must retain conflicting-authority checks."""
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        shard.write_bytes(b"zero")
+        canonical_index = _write_safetensors_index(tmp_path, [shard.name])
+        uppercase_index = _write_safetensors_index(
+            tmp_path,
+            [shard.name],
+            index_name="MODEL.SAFETENSORS.INDEX.JSON",
+        )
+        if canonical_index.samefile(uppercase_index):
+            pytest.skip("filesystem does not support distinct case-only entries")
+
+        candidates, limit_exceeded = ShardedModelDetector._safetensors_index_candidates(tmp_path)
+        shard_info = ShardedModelDetector.detect_shards(str(shard))
+
+        assert limit_exceeded is False
+        assert set(candidates) == {canonical_index, uppercase_index}
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "multiple safetensors indexes govern selected shard"
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires Windows filesystem path semantics")
+    def test_safetensors_index_candidates_preserve_actual_windows_spelling(self, tmp_path: Path) -> None:
+        """Windows alias matching must return the spelling found in the directory."""
+        actual_index = _write_safetensors_index(
+            tmp_path,
+            ["model-00000-of-00001.safetensors"],
+            index_name="MODEL.SAFETENSORS.INDEX.JSON",
+        )
+
+        candidates, limit_exceeded = ShardedModelDetector._safetensors_index_candidates(tmp_path)
+
+        assert limit_exceeded is False
+        assert candidates == [actual_index]
 
     @pytest.mark.parametrize(
         "index_payload",
