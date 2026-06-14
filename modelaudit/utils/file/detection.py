@@ -463,8 +463,8 @@ _LEGAL_TEXT_BASE64_CHUNK_RE = re.compile(rb"[A-Za-z0-9+/_-]+={0,2}")
 _LEGAL_TEXT_HEX_CHUNK_RE = re.compile(rb"[A-Fa-f0-9]+")
 _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE = re.compile(
     rb"(?=(?:"
-    rb"[ci][^\x00-\x20\x7f-\x9f\r\n]+\n[^\x00-\x20\x7f-\x9f\r\n]+\n|"
-    rb"P[^\x00-\x20\x7f-\x9f\r\n]+\n"
+    rb"[ci][^\x00-\x20\x7f-\x9f\r\n]+\r?\n[^\x00-\x20\x7f-\x9f\r\n]+\r?\n|"
+    rb"P[^\x00-\x20\x7f-\x9f\r\n]*\r?\n"
     rb"))"
 )
 _LEGAL_TEXT_MAX_DECODED_BYTES = 1024 * 1024
@@ -5371,6 +5371,7 @@ def _plausible_pickle_import_operand(value: str | bytes) -> bool:
             value = value.decode("utf-8")
         except UnicodeDecodeError:
             return False
+    value = value.removesuffix("\r")
     return bool(value) and not any(
         character.isspace() or ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in value
     )
@@ -5384,7 +5385,7 @@ def _pickle_side_effect_argument_is_meaningful(opcode_name: str, argument: Any) 
     elif opcode_name == "PERSID":
         if not isinstance(argument, str):
             return False
-        values = (argument,)
+        values = (argument.removesuffix("\r"),)
     else:
         return True
     return all(
@@ -5645,11 +5646,13 @@ def _classify_bounded_pickle_candidate(
 
 
 def _is_compact_pickle_line(value: bytes) -> bool:
+    value = value.removesuffix(b"\r")
     return bool(value) and not any(byte <= 0x20 or 0x7F <= byte <= 0x9F for byte in value)
 
 
 def _has_terminal_persid_signal(value: bytes) -> bool:
     """Distinguish a terminal identifier-like operand from a prose sentence."""
+    value = value.removesuffix(b"\r")
     if not value or value[-1:] in b".,;:!?":
         return False
     words = value.split()
@@ -5698,6 +5701,13 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
                 _has_structural_pickle_continuation(payload, cursor) or _has_pickle_import_signal(operands)
             )
         if opcode.name == "PERSID":
+            normalized_operand = lines[0].removesuffix(b"\r")
+            if not normalized_operand:
+                return (
+                    cursor == len(payload)
+                    or payload[cursor : cursor + 1] == b"."
+                    or _has_single_invalid_pickle_tail(payload, cursor)
+                )
             return _is_compact_pickle_line(lines[0]) or (
                 _has_terminal_persid_signal(lines[0])
                 and (
@@ -5779,13 +5789,15 @@ def _is_importable_top_level_module(module: str) -> bool:
 
 def _has_pickle_import_signal(operands: tuple[bytes, bytes]) -> bool:
     """Reject lowercase prose pairs while retaining import-shaped operands."""
-    if not all(operand.isalpha() and operand.islower() for operand in operands):
+    normalized_operands = (operands[0].removesuffix(b"\r"), operands[1].removesuffix(b"\r"))
+    if not all(operand.isalpha() and operand.islower() for operand in normalized_operands):
         return True
-    return _has_importable_pickle_module(operands)
+    return _has_importable_pickle_module(normalized_operands)
 
 
 def _has_importable_pickle_module(operands: tuple[bytes, bytes]) -> bool:
     module, _name = operands
+    module = module.removesuffix(b"\r")
     try:
         top_level_module = module.decode("utf-8").partition(".")[0]
     except UnicodeDecodeError:
@@ -6090,6 +6102,32 @@ def _decoded_weak_pickle_side_effect_has_single_nonstop_suffix(decoded: bytes) -
     return len(decoded) == suffix_offset + 1
 
 
+def _decoded_has_reachable_context_security_opcode(decoded: bytes) -> bool:
+    """Recognize a context-required side effect at a parsed opcode boundary."""
+    sample = decoded[:PROTO0_1_MAX_PROBE_BYTES]
+    stream = _PickleProbeStream(sample)
+    stack: list[Any] = []
+    memo: dict[Any, Any] = {}
+    hashability_cache: dict[int, tuple[Any, bool]] = {}
+    try:
+        for opcode, argument, _position in _gen_pickle_probe_ops(stream):
+            if _has_invalid_pickle_opcode_argument(opcode.name, argument) or not _apply_pickle_stack_effect(
+                opcode,
+                argument,
+                stack,
+                memo,
+                hashability_cache,
+            ):
+                return False
+            if ord(opcode.code) in _PICKLE_CONTEXT_REQUIRED_SECURITY_OPCODE_BYTES:
+                return True
+            if opcode.name == "STOP":
+                return False
+    except Exception:
+        return False
+    return False
+
+
 def _decoded_base64_has_structural_pickle_signal(decoded: bytes) -> bool:
     return (
         _looks_like_binary_pickle_protocol(decoded[:4])
@@ -6102,6 +6140,7 @@ def _decoded_base64_has_structural_pickle_signal(decoded: bytes) -> bool:
             and decoded[offset - 1] in _PICKLE_TRIVIAL_NO_ARGUMENT_PREFIX_BYTES
             for offset in range(1, len(decoded))
         )
+        or _decoded_has_reachable_context_security_opcode(decoded)
     )
 
 

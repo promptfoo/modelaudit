@@ -11420,6 +11420,9 @@ class TestZipScanner:
                 2,
                 id="embedded-spaced-PERSID-before-invalid-tail",
             ),
+            pytest.param(b"MIT License\r\nPid\r\n.", 2, id="embedded-CRLF-PERSID"),
+            pytest.param(b"P\n.MIT License\n", 1, id="initial-empty-PERSID"),
+            pytest.param(b"MIT License\nP\n.", 2, id="embedded-empty-PERSID"),
             pytest.param(b"MIT License\ncnumpy\narray\n", 2, id="embedded-terminal-third-party-GLOBAL"),
             pytest.param(b"MIT License\ninumpy\narray\n", 2, id="embedded-terminal-third-party-INST"),
             pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
@@ -11528,6 +11531,17 @@ class TestZipScanner:
                 1,
                 id="base64-PERSID-before-invalid-tail",
             ),
+            pytest.param(b"MIT License\nVQFhUQ\n", 1, id="alphabetic-base64-BINPERSID"),
+            pytest.param(
+                b"MIT License\n" + base64.b64encode(b"Pid\r\n."),
+                1,
+                id="base64-CRLF-PERSID",
+            ),
+            pytest.param(
+                b"MIT License\n" + base64.b64encode(b"P\n."),
+                1,
+                id="base64-empty-PERSID",
+            ),
             pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),
             pytest.param(b"MIT License\nWF Bp ZA ou\n", 2, id="base64-spaced-alpha-prefixed-PERSID"),
             pytest.param(
@@ -11635,6 +11649,11 @@ class TestZipScanner:
                 id="terminal-lowercase-global-shaped-prose",
             ),
             pytest.param(b"copyright\nnotice\n", id="offset-zero-lowercase-global-shaped-prose"),
+            pytest.param(b"copyright\r\nnotice\r\n", id="CRLF-lowercase-global-shaped-prose"),
+            pytest.param(
+                b"MIT License\nP\nPermission remains granted.\n",
+                id="empty-PERSID-shaped-prose",
+            ),
             pytest.param(
                 b"MIT License\nPermission is\ngranted to\nall users\n",
                 id="multiline-spaced-alphabetic-prose",

@@ -3894,6 +3894,27 @@ def test_protocol0_binpersid_callback_precedes_invalid_continuation() -> None:
     assert persistent_ids == ["id"]
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_id"),
+    [
+        pytest.param(b"Pid\r\n.", "id\r", id="crlf-PERSID"),
+        pytest.param(b"P\n.", "", id="empty-PERSID"),
+        pytest.param(b"U\x01aQ.", "a", id="short-string-BINPERSID"),
+    ],
+)
+def test_persid_callbacks_cover_line_and_binary_operands(payload: bytes, expected_id: str) -> None:
+    persistent_ids: list[str] = []
+
+    class TrackingUnpickler(pickle.Unpickler):
+        def persistent_load(self, pid: str) -> object:
+            persistent_ids.append(pid)
+            return object()
+
+    TrackingUnpickler(io.BytesIO(payload)).load()
+
+    assert persistent_ids == [expected_id]
+
+
 def test_ext1_import_precedes_eof(monkeypatch: pytest.MonkeyPatch) -> None:
     module_name = "legal_sidecar_extension_probe"
     module = types.ModuleType(module_name)
@@ -4063,6 +4084,17 @@ def test_next_buffer_callback_precedes_invalid_continuation() -> None:
             b"MIT License\nPMIT License\nA",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-spaced-PERSID-before-invalid-tail",
+        ),
+        pytest.param(
+            b"MIT License\r\nPid\r\n.",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-CRLF-PERSID",
+        ),
+        pytest.param(b"P\n.MIT License\n", "pickle", id="initial-empty-PERSID"),
+        pytest.param(
+            b"MIT License\nP\n.",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-empty-PERSID",
         ),
         pytest.param(
             b"MIT License\ncnumpy\narray\n",
@@ -4288,6 +4320,17 @@ def test_xgboost_json_legal_name_without_route_evidence_remains_unknown(tmp_path
             "pickle",
             id="base64-PERSID-before-invalid-tail",
         ),
+        pytest.param(b"MIT License\nVQFhUQ\n", "pickle", id="alphabetic-base64-BINPERSID"),
+        pytest.param(
+            b"MIT License\n" + base64.b64encode(b"Pid\r\n."),
+            "pickle",
+            id="base64-CRLF-PERSID",
+        ),
+        pytest.param(
+            b"MIT License\n" + base64.b64encode(b"P\n."),
+            "pickle",
+            id="base64-empty-PERSID",
+        ),
         pytest.param(
             b"MIT License\nWFBpZAou\n",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -4403,6 +4446,11 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
             id="terminal-lowercase-global-shaped-prose",
         ),
         pytest.param(b"copyright\nnotice\n", id="offset-zero-lowercase-global-shaped-prose"),
+        pytest.param(b"copyright\r\nnotice\r\n", id="CRLF-lowercase-global-shaped-prose"),
+        pytest.param(
+            b"MIT License\nP\nPermission remains granted.\n",
+            id="empty-PERSID-shaped-prose",
+        ),
         pytest.param(
             b"MIT License\nPermission is\ngranted to\nall users\n",
             id="multiline-spaced-alphabetic-prose",
