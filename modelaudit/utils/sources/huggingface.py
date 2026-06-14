@@ -3648,11 +3648,8 @@ def _validate_remote_safetensors_indexes(
         index_parent = PurePosixPath(index_file).parent.as_posix()
         index_stem = _hf_safetensors_index_stem(index_file)
         assert index_stem is not None
-        index_name_may_govern_selection = not scoped_target_families and any(
-            index_stem.casefold() == selected_stem.casefold()
-            and (
-                index_parent == selected_parent or index_parent == "." or selected_parent.startswith(f"{index_parent}/")
-            )
+        index_name_may_govern_selection = any(
+            index_parent == selected_parent and index_stem.casefold() == selected_stem.casefold()
             for selected_parent, selected_stem, _selected_total in selected_family_keys
         )
         if not targets_overlap_selection and not families_overlap_selection and not index_name_may_govern_selection:

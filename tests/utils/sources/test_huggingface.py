@@ -5241,6 +5241,26 @@ class TestModelDownloadStreaming:
                 budget,
             )
 
+    def test_remote_safetensors_validation_rejects_same_parent_index_retargeting(self) -> None:
+        """A same-name governing index cannot become disjoint by retargeting another family."""
+        index_file = "model.safetensors.index.json"
+        selected_shard = "model-00001-of-00001.safetensors"
+        missing_retarget = "other-00001-of-00001.safetensors"
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps({"weight_map": {"retargeted": missing_retarget}}).encode()
+
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(payload)),
+            pytest.raises(ValueError, match="references missing model shard"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                [index_file, selected_shard],
+                _HF_TEST_REVISION,
+                [selected_shard],
+                budget,
+            )
+
     def test_remote_safetensors_validation_rejects_missing_uppercase_custom_stem_target(self) -> None:
         """Case-insensitive shard routing must retain governing index validation."""
         index_file = "CUSTOM.SAFETENSORS.INDEX.JSON"
