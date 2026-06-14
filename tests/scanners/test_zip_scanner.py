@@ -11387,6 +11387,11 @@ class TestZipScanner:
             pytest.param(b"MIT License\nggE\n", 1, id="base64-unpadded-alphabetic-EXT1"),
             pytest.param(b"MIT License\nlw\n", 1, id="base64-unpadded-alphabetic-NEXT_BUFFER"),
             pytest.param(
+                b"MIT License\nAA AA\ng g\nE\n",
+                1,
+                id="base64-split-weak-side-effect-alignment-collision",
+            ),
+            pytest.param(
                 b"MIT License\n" + base64.b64encode(b"# comment\ncposix\nsystem\n(S'id'\ntR."),
                 2,
                 id="base64-overlapping-comment-GLOBAL",
@@ -11443,6 +11448,10 @@ class TestZipScanner:
                 id="base64-word-groups",
             ),
             pytest.param(b"MIT License\ngroups\n", id="standalone-base64-word-groups"),
+            pytest.param(
+                b"MIT License\nAA AA\ng r\nou ps\n",
+                id="base64-split-word-groups-alignment-collision",
+            ),
             pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),
             pytest.param(b"MIT License\n" + (b"groups " * 4096), id="candidate-budget-groups-words"),
             pytest.param(

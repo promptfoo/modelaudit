@@ -2636,6 +2636,7 @@ _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES: frozenset[str] = frozenset(
 )
 _PICKLE_DECODED_ENTRY_OPCODES: frozenset[str] = _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES | {"INST", "PROTO"}
 _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS: dict[str, int] = {"EXT1": 2, "EXT2": 3, "EXT4": 5, "NEXT_BUFFER": 1}
+_WEAK_DECODED_BASE64_MAX_CHARS = 4 * ((max(_PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.values()) + 2) // 3)
 _PROTOCOLLESS_BINARY_PICKLE_OPCODES: frozenset[str] = frozenset(
     {
         "ADDITEMS",
@@ -5903,9 +5904,7 @@ def _decode_base64_route_token(token: bytes) -> bytes:
     return base64.b64decode(token + padding, altchars=b"-_", validate=True)
 
 
-def _decoded_alphabetic_base64_has_pickle_signal(decoded: bytes) -> bool:
-    if _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(decoded) is not None:
-        return True
+def _decoded_base64_has_exact_weak_pickle_signal(decoded: bytes) -> bool:
     if not decoded:
         return False
     opcode = _PICKLE_OPCODE_BY_BYTE.get(decoded[0])
@@ -5919,9 +5918,22 @@ def _decoded_alphabetic_base64_has_pickle_signal(decoded: bytes) -> bool:
     )
 
 
+def _decoded_alphabetic_base64_has_pickle_signal(decoded: bytes) -> bool:
+    return _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(
+        decoded
+    ) is not None or _decoded_base64_has_exact_weak_pickle_signal(decoded)
+
+
 def _alphabetic_base64_has_pickle_signal(token: bytes) -> bool:
     try:
         return _decoded_alphabetic_base64_has_pickle_signal(_decode_base64_route_token(token))
+    except (binascii.Error, ValueError):
+        return False
+
+
+def _alphabetic_base64_has_exact_weak_pickle_signal(token: bytes) -> bool:
+    try:
+        return _decoded_base64_has_exact_weak_pickle_signal(_decode_base64_route_token(token))
     except (binascii.Error, ValueError):
         return False
 
@@ -5935,11 +5947,16 @@ def _iter_encoded_route_tokens(
     block = bytearray()
     trusted_start: int | None = None
     alphabetic_starts: dict[int, int] = {}
+    recent_starts: deque[int] = deque()
 
     def flush_block() -> Iterator[bytes]:
         if trusted_start is not None:
             yield bytes(block[trusted_start:])
         if alphabetic_whitespace_is_prose:
+            for start in recent_starts:
+                token = bytes(block[start:])
+                if _alphabetic_base64_has_exact_weak_pickle_signal(token):
+                    yield token
             # One earliest line start per base64 alignment covers every later
             # start with bounded linear work instead of testing every suffix.
             for start in alphabetic_starts.values():
@@ -5949,6 +5966,7 @@ def _iter_encoded_route_tokens(
 
         block.clear()
         alphabetic_starts.clear()
+        recent_starts.clear()
 
     for raw_line in payload.splitlines():
         line = raw_line.strip(b" \t")
@@ -5969,7 +5987,12 @@ def _iter_encoded_route_tokens(
                 alphabetic_starts.setdefault(line_start % 4, line_start)
             elif trusted_start is None:
                 trusted_start = line_start
+            if alphabetic_whitespace_is_prose:
+                recent_starts.append(line_start)
             block.extend(encoded_line)
+            if alphabetic_whitespace_is_prose:
+                while recent_starts and len(block) - recent_starts[0] > _WEAK_DECODED_BASE64_MAX_CHARS:
+                    recent_starts.popleft()
             if b"=" not in encoded_line:
                 continue
 
