@@ -36,7 +36,14 @@ from modelaudit.scanners.archive_dispatch import (
     scan_nested_file,
 )
 from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_source
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    LOGICAL_SCAN_PATH_CONFIG_KEY,
+    BaseScanner,
+    CheckStatus,
+    IssueSeverity,
+    ScanResult,
+)
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.zip_scanner import (
     KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
@@ -5701,6 +5708,43 @@ def test_scan_nested_file_honors_header_route_when_temp_suffix_is_rejected(
     assert result.success is True
 
 
+def test_scan_nested_file_preserves_content_routed_pickle_for_extensioned_legal_name(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "member.md"
+    extracted_member.write_bytes(base64.b64encode(b"cposix\nsystem\n(S'id'\ntR."))
+
+    assert file_detection.detect_file_format(str(extracted_member)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(extracted_member)) == "unknown"
+    assert (
+        file_detection.detect_file_format(
+            str(extracted_member),
+            logical_name="LICENSE.md",
+        )
+        == "pickle"
+    )
+    assert (
+        file_detection.detect_file_format_from_magic(
+            str(extracted_member),
+            logical_name="LICENSE.md",
+        )
+        == "pickle"
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {
+            "cache_enabled": False,
+            LOGICAL_SCAN_PATH_CONFIG_KEY: "LICENSE.md",
+        },
+    )
+
+    assert result.scanner_name == "pickle"
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert any(
+        check.name == "Standalone Pickle Error" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_nested_file_drops_header_route_when_rechecked_header_mismatches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11337,6 +11381,7 @@ class TestZipScanner:
             pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
             pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
             pytest.param(b"PMIT License\n.", 1, id="spaced-PERSID-before-STOP"),
+            pytest.param(b"PMIT License\n", 1, id="spaced-PERSID-before-EOF"),
             pytest.param(b"MIT License\nXPid\n)R.\n", 2, id="adjacent-embedded-PERSID"),
             pytest.param(b"\x82\x01", 1, id="sole-EXT1"),
             pytest.param(b"\x97", 1, id="sole-NEXT_BUFFER"),
@@ -11347,6 +11392,8 @@ class TestZipScanner:
                 2,
                 id="embedded-import-only-GLOBAL",
             ),
+            pytest.param(b"MIT License\ncposix\nsystem\n", 2, id="embedded-terminal-GLOBAL"),
+            pytest.param(b"MIT License\nimystery_module\nThing\n", 2, id="embedded-terminal-INST"),
             pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
             pytest.param(b"MIT License\n]QApache License\n", 2, id="same-line-BINPERSID"),
             pytest.param(b"MIT\nXS'id'\nQtext\n", 2, id="mid-line-STRING-before-BINPERSID"),
@@ -11395,8 +11442,29 @@ class TestZipScanner:
             pytest.param(b"MIT License\nXVEu\n", 1, id="base64-unpadded-BINPERSID"),
             pytest.param(b"MIT License\nXVE\n", 1, id="base64-unpadded-BINPERSID-before-EOF"),
             pytest.param(b"MIT License\n5d51\n", 1, id="short-hex-BINPERSID-before-EOF"),
+            pytest.param(b"MIT License\n97\n", 1, id="one-byte-hex-NEXT_BUFFER"),
             pytest.param(b"MIT License\n" + base64.b64encode(b"\x82\x01"), 1, id="base64-sole-EXT1"),
             pytest.param(b"MIT License\n" + base64.b64encode(b"\x97"), 1, id="base64-sole-NEXT_BUFFER"),
+            pytest.param(
+                b"MIT License\n" + base64.b64encode(b"\x82\x01N."),
+                1,
+                id="base64-EXT1-with-continuation",
+            ),
+            pytest.param(
+                b"MIT License\n" + binascii.hexlify(b"\x82\x01N."),
+                1,
+                id="hex-EXT1-with-continuation",
+            ),
+            pytest.param(
+                b"MIT License\n" + base64.b64encode(b"\x97\x98."),
+                1,
+                id="base64-NEXT_BUFFER-with-continuation",
+            ),
+            pytest.param(
+                b"MIT License\n" + binascii.hexlify(b"\x97\x98."),
+                1,
+                id="hex-NEXT_BUFFER-with-continuation",
+            ),
             pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),
             pytest.param(b"MIT License\nWF Bp ZA ou\n", 2, id="base64-spaced-alpha-prefixed-PERSID"),
             pytest.param(
@@ -11496,6 +11564,12 @@ class TestZipScanner:
             pytest.param(
                 b"Permission is granted to users.\nPermission remains granted.\n",
                 id="two-P-leading-prose-lines",
+            ),
+            pytest.param(b"Permission is hereby granted.\n", id="terminal-P-leading-prose-sentence"),
+            pytest.param(b"Permission is hereby granted\n", id="terminal-P-leading-unpunctuated-prose"),
+            pytest.param(
+                b"MIT License\ncopyright\nconditions\n",
+                id="terminal-lowercase-global-shaped-prose",
             ),
             pytest.param(
                 b"MIT License\nPermission is\ngranted to\nall users\n",

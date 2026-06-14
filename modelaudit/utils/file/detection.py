@@ -5406,9 +5406,14 @@ def _decoded_pickle_events_are_meaningful(
     *,
     completed: bool,
     explicit_protocol: bool,
+    parsed_opcodes: int,
 ) -> bool:
     names = {name for _index, name, _flag in events}
     if explicit_protocol or names.intersection({"GLOBAL", "INST", "PERSID", "STACK_GLOBAL"}):
+        return True
+    if any(
+        name in _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES and parsed_opcodes > index + 1 for index, name, _flag in events
+    ):
         return True
     if any(index > 0 and name not in _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES for index, name, _flag in events):
         return True
@@ -5443,6 +5448,8 @@ def _incomplete_pickle_security_route(
     require_strong_continuation: bool,
     stream_start: int,
     pre_stack_inst: bool,
+    candidate_at_eof: bool,
+    parsed_opcodes: int,
     security_events: list[tuple[int, str, bool]],
 ) -> str | None:
     allow_embedded_persid = decoded or not require_continuation or not only_text_line_side_effects
@@ -5452,7 +5459,11 @@ def _incomplete_pickle_security_route(
         embedded=embedded,
     )
     if pre_stack_inst and not any(name == "INST" for _index, name, _meaningful in meaningful_events):
-        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if not embedded and stream_start == 0 else None
+        return (
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+            if (not embedded and stream_start == 0) or (not require_continuation and candidate_at_eof)
+            else None
+        )
     if not meaningful_events:
         return None
     if require_continuation and only_text_line_side_effects:
@@ -5466,6 +5477,7 @@ def _incomplete_pickle_security_route(
         meaningful_events,
         completed=False,
         explicit_protocol=explicit_protocol,
+        parsed_opcodes=parsed_opcodes,
     ):
         return None
     if any(name == "INST" for _index, name, _meaningful in meaningful_events):
@@ -5510,6 +5522,12 @@ def _classify_bounded_pickle_candidate(
         text_line_side_effects_only: bool,
         events: list[tuple[int, str, bool]],
     ) -> str | None:
+        if (
+            not sample_is_prefix
+            and stream.tell() == len(sample)
+            and sum(name == "PERSID" for _index, name, _meaningful in events) == 1
+        ):
+            events = [(index, name, meaningful or name == "PERSID") for index, name, meaningful in events]
         return _incomplete_pickle_security_route(
             embedded=embedded,
             decoded=decoded,
@@ -5519,6 +5537,8 @@ def _classify_bounded_pickle_candidate(
             require_strong_continuation=require_strong_continuation,
             stream_start=stream_start,
             pre_stack_inst=pre_inst,
+            candidate_at_eof=not sample_is_prefix and stream.tell() == len(sample),
+            parsed_opcodes=parsed_opcodes,
             security_events=events,
         )
 
@@ -5580,6 +5600,7 @@ def _classify_bounded_pickle_candidate(
                         meaningful_events,
                         completed=True,
                         explicit_protocol=protocol,
+                        parsed_opcodes=parsed_opcodes,
                     )
                 ):
                     return _pickle_candidate_route(embedded=embedded)
@@ -5630,6 +5651,19 @@ def _is_compact_pickle_line(value: bytes) -> bool:
     return bool(value) and not any(byte <= 0x20 or 0x7F <= byte <= 0x9F for byte in value)
 
 
+def _has_terminal_persid_signal(value: bytes) -> bool:
+    """Distinguish a terminal identifier-like operand from a prose sentence."""
+    if not value or value[-1:] in b".,;:!?":
+        return False
+    words = value.split()
+    cased_words = [
+        word for word in words if any(byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" for byte in word)
+    ]
+    return bool(cased_words) and (
+        any(word.isupper() for word in cased_words) or all(word[:1].isupper() for word in cased_words)
+    )
+
+
 def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
     """Cheaply reject incomplete first operands before charging structural work."""
     if offset >= len(payload):
@@ -5665,7 +5699,11 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
             return all(_plausible_pickle_import_operand(line) for line in lines)
         if opcode.name == "PERSID":
             return _is_compact_pickle_line(lines[0]) or (
-                offset == 0 and cursor < len(payload) and payload[cursor] in _PICKLE_OPCODE_BY_BYTE
+                offset == 0
+                and (
+                    (cursor == len(payload) and _has_terminal_persid_signal(lines[0]))
+                    or (cursor < len(payload) and payload[cursor] in _PICKLE_OPCODE_BY_BYTE)
+                )
             )
         if opcode.name == "STRING":
             value = lines[0]
@@ -5723,6 +5761,18 @@ def _has_structural_pickle_continuation(payload: bytes, offset: int) -> bool:
     return opcode is not None and opcode.name not in _PICKLE_LINE_PAIR_OPCODES
 
 
+def _has_terminal_pickle_import_signal(operands: tuple[bytes, bytes]) -> bool:
+    """Reject lowercase prose pairs while retaining import-shaped terminal operands."""
+    module, _name = operands
+    if not all(operand.isalpha() and operand.islower() for operand in operands):
+        return True
+    try:
+        top_level_module = module.decode("utf-8").partition(".")[0]
+    except UnicodeDecodeError:
+        return False
+    return top_level_module in sys.builtin_module_names or top_level_module in sys.stdlib_module_names
+
+
 def _iter_pickle_candidate_offsets(
     payload: bytes,
     *,
@@ -5753,11 +5803,11 @@ def _iter_pickle_candidate_offsets(
         while line_start < offset and payload[line_start] in b" \t":
             line_start += 1
         has_trivial_prefix = _has_trivial_pickle_prefix(payload, line_start, offset)
+        has_nontrivial_prefix = line_start < offset and not has_trivial_prefix
         adjacent_word_prefix = (
             opcode_name in _PICKLE_LINE_PAIR_OPCODES
-            and line_start < offset
+            and has_nontrivial_prefix
             and payload[offset - 1] in b"3456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
-            and not has_trivial_prefix
         )
         require_continuation = offset > 0
         if opcode_name == "PERSID":
@@ -5780,10 +5830,16 @@ def _iter_pickle_candidate_offsets(
                 payload[first_line_end + 1 : second_line_end],
             )
             require_continuation = require_continuation and (
-                adjacent_word_prefix or all(operand.isalpha() and operand.islower() for operand in operands)
+                has_nontrivial_prefix or all(operand.isalpha() and operand.islower() for operand in operands)
             )
             if require_continuation and not _has_structural_pickle_continuation(payload, second_line_end + 1):
-                continue
+                if (
+                    has_nontrivial_prefix
+                    or second_line_end + 1 != len(payload)
+                    or not _has_terminal_pickle_import_signal(operands)
+                ):
+                    continue
+                require_continuation = False
         if (opcode_name in {"GLOBAL", "INST"} and line_start < offset) or (
             opcode_name == "PERSID" and has_trivial_prefix
         ):
@@ -5897,6 +5953,7 @@ def _bounded_pickle_candidate_route(
                 weak_suffix_offset is not None
                 and not exact_weak_decoded_stream
                 and last_security_offset < offset + weak_suffix_offset
+                and not _decoded_weak_pickle_side_effect_has_continuation(payload, offset)
             ):
                 continue
         if not prevalidated and not _is_plausible_pickle_candidate(payload, offset):
@@ -5939,9 +5996,23 @@ def _decoded_base64_has_exact_weak_pickle_signal(decoded: bytes) -> bool:
     )
 
 
+def _decoded_weak_pickle_side_effect_has_continuation(decoded: bytes, offset: int = 0) -> bool:
+    if offset >= len(decoded):
+        return False
+    opcode = _PICKLE_OPCODE_BY_BYTE.get(decoded[offset])
+    if opcode is None:
+        return False
+    suffix_offset = _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.get(opcode.name)
+    if suffix_offset is None or offset + suffix_offset >= len(decoded):
+        return False
+    continuation = _PICKLE_OPCODE_BY_BYTE.get(decoded[offset + suffix_offset])
+    return continuation is not None and continuation.name != "STOP"
+
+
 def _decoded_base64_has_structural_pickle_signal(decoded: bytes) -> bool:
     return (
         _looks_like_binary_pickle_protocol(decoded[:4])
+        or _decoded_weak_pickle_side_effect_has_continuation(decoded)
         or _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.search(decoded) is not None
         or _LEGAL_TEXT_ENCODED_EXECUTION_RE.search(decoded) is not None
         or any(
@@ -6097,7 +6168,7 @@ def _encoded_pickle_route(
         ),
         (
             _LEGAL_TEXT_HEX_CHUNK_RE,
-            4,
+            2,
             6,
             2 * _LEGAL_TEXT_MAX_DECODED_BYTES,
             False,

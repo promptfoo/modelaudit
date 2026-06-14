@@ -1355,7 +1355,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
 
     header_format_override = (
         trusted_content_format
-        if trusted_content_format in {"hdf5", "jinja2_template", "mxnet", "text", "xgboost"}
+        if trusted_content_format in {"hdf5", "jinja2_template", "mxnet", "pickle", "text", "xgboost"}
         else None
     )
     try:
