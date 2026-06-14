@@ -1727,6 +1727,21 @@ def _simple_priority_forwarding_usage(
     return [], frozenset()
 
 
+def _canonical_builtin_helper_aliases_in(
+    identifiers: Collection[str],
+    canonical_aliases: Mapping[str, str],
+    helper_names: Collection[str],
+    *,
+    excluded_aliases: Collection[str] = (),
+) -> set[str]:
+    """Return matching helper aliases by inspecting only identifiers in the statement."""
+    return {
+        identifier
+        for identifier in identifiers
+        if canonical_aliases.get(identifier) in helper_names and identifier not in excluded_aliases
+    }
+
+
 def _priority_alias_usage_lines(
     candidate: bytes,
     aliases: frozenset[bytes],
@@ -3749,12 +3764,13 @@ def _priority_alias_usage_lines(
                 may_bind_namespace_update = (
                     b"__dict__" in line
                     or b"vars" in line
-                    or not _python_identifier_names(line).isdisjoint(
-                        {
-                            name
-                            for name, helper_name in canonical_builtin_helper_aliases.items()
-                            if helper_name == "vars" and name not in shadowed_builtin_helper_names
-                        }
+                    or bool(
+                        _canonical_builtin_helper_aliases_in(
+                            _python_identifier_names(line),
+                            canonical_builtin_helper_aliases,
+                            {"vars"},
+                            excluded_aliases=shadowed_builtin_helper_names,
+                        )
                     )
                     or (
                         (b".update" in line or b"__ior__" in line)
@@ -4287,12 +4303,10 @@ def _priority_alias_usage_lines(
                         )
                     )
                     alias_dependencies.update(
-                        referenced_identifiers.intersection(
-                            {
-                                name
-                                for name, helper_name in canonical_builtin_helper_aliases.items()
-                                if helper_name == "vars"
-                            }
+                        _canonical_builtin_helper_aliases_in(
+                            referenced_identifiers,
+                            canonical_builtin_helper_aliases,
+                            {"vars"},
                         )
                     )
                 if descriptor_reference is not None:
@@ -4818,12 +4832,10 @@ def _priority_alias_usage_lines(
                     | builtin_dict_descriptor_setdefault_aliases
                 )
                 or bool(
-                    member_identifiers.intersection(
-                        {
-                            name
-                            for name, helper_name in canonical_builtin_helper_aliases.items()
-                            if helper_name == "setattr"
-                        }
+                    _canonical_builtin_helper_aliases_in(
+                        member_identifiers,
+                        canonical_builtin_helper_aliases,
+                        {"setattr"},
                     )
                 )
             )
@@ -4903,14 +4915,13 @@ def _priority_alias_usage_lines(
             else frozenset()
         )
         tracked_priority_aliases = aliases | priority_aliases
-        has_canonical_namespace_helper_use = has_priority_reference_syntax and not _python_identifier_names(
-            line
-        ).isdisjoint(
-            {
-                name
-                for name, helper_name in canonical_builtin_helper_aliases.items()
-                if helper_name in {"getattr", "vars"} and name not in shadowed_builtin_helper_names
-            }
+        has_canonical_namespace_helper_use = has_priority_reference_syntax and bool(
+            _canonical_builtin_helper_aliases_in(
+                _python_identifier_names(line),
+                canonical_builtin_helper_aliases,
+                {"getattr", "vars"},
+                excluded_aliases=shadowed_builtin_helper_names,
+            )
         )
         getattr_member = (
             _priority_getattr_alias_member(
@@ -8901,18 +8912,32 @@ def _line_calls_fail_closed_runpy_member(
 
 def _line_starts_continued_priority_getattr(
     code_line: bytes,
-    canonical_builtin_helper_aliases: dict[str, str] | None = None,
+    canonical_builtin_helper_aliases: Mapping[str, str] | None = None,
     shadowed_builtin_helper_names: set[str] | None = None,
 ) -> bool:
     if re.fullmatch(rb"\s*(?:builtins\s*\.\s*)?getattr\s*(?:\\\s*|\(\s*)", code_line) is not None:
         return True
+    identifiers = _python_identifier_names(code_line)
+    reference_match = re.fullmatch(rb"\s*(?P<reference>\S+?)\s*(?:\\\s*|\(\s*)", code_line)
+    if reference_match is not None:
+        try:
+            reference = reference_match.group("reference").decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            if reference.isidentifier():
+                identifiers.add(reference)
     blocked_helpers = shadowed_builtin_helper_names or set()
+    helper_aliases = _canonical_builtin_helper_aliases_in(
+        identifiers,
+        canonical_builtin_helper_aliases or {},
+        {"getattr"},
+        excluded_aliases=blocked_helpers,
+    )
     return any(
         "." not in reference
-        and helper_name == "getattr"
-        and reference not in blocked_helpers
         and re.fullmatch(rb"\s*" + re.escape(reference.encode("utf-8")) + rb"\s*(?:\\\s*|\(\s*)", code_line) is not None
-        for reference, helper_name in (canonical_builtin_helper_aliases or {}).items()
+        for reference in helper_aliases
     )
 
 
