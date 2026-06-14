@@ -1176,7 +1176,7 @@ class TarScanner(BaseScanner):
                                     f"Raw TAR traversal stopped without a two-block end marker at offset {tar.offset}"
                                 ),
                             )
-                            return False
+                            break
                         if (
                             compression_codec is not None
                             and bounded_stream is not None

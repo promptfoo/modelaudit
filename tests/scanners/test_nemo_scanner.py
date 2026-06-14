@@ -25,7 +25,14 @@ from modelaudit.core import determine_exit_code, scan_file, scan_model_directory
 from modelaudit.scanners import archive_dispatch
 from modelaudit.scanners import nemo_scanner as nemo_scanner_module
 from modelaudit.scanners import tar_scanner as tar_scanner_module
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import (
+    DEFAULT_MAX_FILE_READ_SIZE,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    Check,
+    CheckStatus,
+    IssueSeverity,
+    ScanResult,
+)
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 from modelaudit.utils.file import detection as file_detection
 
@@ -65,6 +72,27 @@ def _create_nemo_file(
 
     config_bytes = yaml.safe_dump(config_dict).encode() if HAS_YAML else b"{}"
     return _create_nemo_file_from_bytes(tmp_path, config_bytes, filename=filename, config_name=config_name, mode=mode)
+
+
+def _create_sparse_raw_nemo_with_late_invalid_header(
+    tmp_path: Path,
+    *,
+    filename: str,
+    target: str,
+) -> Path:
+    path = tmp_path / filename
+    config = f"model:\n  _target_: {target}\n".encode()
+    with path.open("wb") as archive:
+        info = tarfile.TarInfo("model_config.yaml")
+        info.size = len(config)
+        archive.write(info.tobuf())
+        archive.write(config)
+        archive.write(b"\0" * (-len(config) % tarfile.BLOCKSIZE))
+        archive.write(b"A" * tarfile.BLOCKSIZE)
+        archive.write(b"\0" * (2 * tarfile.BLOCKSIZE))
+        archive.seek(DEFAULT_MAX_FILE_READ_SIZE)
+        archive.write(b"\0")
+    return path
 
 
 def _add_tar_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
@@ -672,6 +700,74 @@ class TestNemoScannerBasic:
         assert len(scan_checks) == 1
         assert scan_checks[0].status == CheckStatus.FAILED
         assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    def test_sparse_raw_nemo_late_invalid_header_is_inconclusive_without_cache(self, tmp_path: Path) -> None:
+        path = _create_sparse_raw_nemo_with_late_invalid_header(
+            tmp_path,
+            filename="late-invalid-benign.nemo",
+            target="torch.nn.Linear",
+        )
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        assert not [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert determine_exit_code(aggregate) == 2
+
+        cache_dir = tmp_path / "late-invalid-benign-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_sparse_raw_nemo_late_invalid_header_preserves_hydra_finding_without_cache(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _create_sparse_raw_nemo_with_late_invalid_header(
+            tmp_path,
+            filename="late-invalid-malicious.nemo",
+            target="os.system",
+        )
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert hydra_checks[0].location == f"{path}:model_config.yaml"
+        assert determine_exit_code(aggregate) == 1
+
+        cache_dir = tmp_path / "late-invalid-malicious-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == 1
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_truncated_gzip_nemo_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
         """A readable TAR prefix is not enough when the outer gzip stream is incomplete."""
