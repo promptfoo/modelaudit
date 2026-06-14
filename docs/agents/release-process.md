@@ -18,6 +18,7 @@ The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-pickle
 3. **Review and merge the Release PR** — release-please tags the release and the workflow runs the matching publish jobs:
    - **For `modelaudit`** — `build` produces sdist+wheel → `publish-pypi` uploads via OIDC → `provenance` attests and uploads SBOM.
    - **For `modelaudit-picklescan`** — `build-picklescan-package` matrix builds 5 native wheels (Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows x64) + sdist → `publish-picklescan-pypi` uploads → `picklescan-provenance` attests.
+   - **When both release together** — the sibling package is published and verified on PyPI before the dependent root package is uploaded.
 
 ## Version scheme (0ver)
 

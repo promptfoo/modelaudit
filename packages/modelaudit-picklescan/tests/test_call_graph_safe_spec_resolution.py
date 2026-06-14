@@ -1890,6 +1890,67 @@ def test_zipimporter_directory_validation_bounds_entries_before_reader(
     assert calls == []
 
 
+@pytest.mark.parametrize("directory_state", ["bounded", "entry-limit", "size-limit"])
+def test_uncached_zip_directory_caps_precede_importer_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    directory_state: str,
+) -> None:
+    module = "statistics"
+    archive_path = tmp_path / f"uncached-{directory_state}.zip"
+    if directory_state == "bounded":
+        _write_zipimporter_archive(archive_path, module, include_module=False)
+    else:
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            if directory_state == "entry-limit":
+                for index in range(call_graph._MAX_SOURCE_FINGERPRINT_CANDIDATES + 1):
+                    archive.writestr(f"entry-{index}.py", "")
+            else:
+                for index in range(65):
+                    archive.writestr(f"{index:04d}-{'x' * 65_000}", "")
+    assert archive_path.stat().st_size < call_graph._MAX_ZIPIMPORT_ARCHIVE_BYTES
+    with zipfile.ZipFile(archive_path) as archive:
+        entries = archive.infolist()
+    central_directory_size = sum(
+        call_graph._ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE
+        + len(entry.filename.encode())
+        + len(entry.extra)
+        + len(entry.comment)
+        for entry in entries
+    )
+    assert (len(entries) > call_graph._MAX_SOURCE_FINGERPRINT_CANDIDATES) is (directory_state == "entry-limit")
+    assert (central_directory_size > call_graph._MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES) is (
+        directory_state == "size-limit"
+    )
+
+    path_entry = str(archive_path)
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    monkeypatch.delitem(directory_cache, path_entry, raising=False)
+    stdlib_path = sysconfig.get_path("stdlib")
+    assert stdlib_path is not None
+    fresh_calls = _record_fresh_importer_calls(monkeypatch)
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache={stdlib_path: FileFinder(stdlib_path, *_standard_file_finder_loader_details())},
+        search_path=[path_entry, stdlib_path],
+    ):
+        origin_kind = call_graph._trusted_module_origin_kind(module)
+
+    if directory_state == "bounded":
+        assert origin_kind == "stdlib"
+        assert path_entry in fresh_calls
+        files = dict.__getitem__(directory_cache, path_entry)
+        assert type(files) is dict
+        assert len(files) <= call_graph._MAX_SOURCE_FINGERPRINT_CANDIDATES
+    else:
+        assert origin_kind is None
+        assert path_entry not in fresh_calls
+        assert not dict.__contains__(directory_cache, path_entry)
+
+
 @pytest.mark.parametrize("cached", [True, False], ids=["cached", "uncached"])
 @pytest.mark.parametrize("include_module", [False, True], ids=["absent", "present"])
 @pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])

@@ -4033,7 +4033,7 @@ def _zipimport_archive_state_from_entry(
     return _UNSAFE_PATH_RESOLUTION
 
 
-def _uncached_oversized_zip_excludes_module(entry: str, module_name: str) -> bool | None:
+def _uncached_zip_excludes_module(entry: str, module_name: str) -> bool | None:
     if not _zipimport_runtime_is_trusted() or not _path_hooks_are_trusted():
         return False
     archive_state = _zipimport_archive_state_from_entry(entry)
@@ -4048,9 +4048,12 @@ def _uncached_oversized_zip_excludes_module(entry: str, module_name: str) -> boo
         return False
     if not stat.S_ISREG(archive_stat.st_mode):
         return False
+    names = _zipimport_bounded_central_directory_names(archive, archive_stat)
+    if names is None:
+        return False
     if archive_stat.st_size <= _MAX_ZIPIMPORT_ARCHIVE_BYTES:
         return None
-    if not _bounded_zip_archive_excludes_module(archive, prefix, module_name):
+    if not _zipimport_names_exclude_module(names, prefix, module_name):
         return False
     directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
     if not dict.__contains__(directory_cache, cache_key):
@@ -5533,9 +5536,9 @@ def _find_standard_path_spec(
                 return _UNSAFE_PATH_RESOLUTION
             finder = cast(FileFinder | zipimporter, cached_finder)
         else:
-            oversized_zip_excludes_module = _uncached_oversized_zip_excludes_module(cache_key, module_name)
-            if oversized_zip_excludes_module is not None:
-                if oversized_zip_excludes_module:
+            uncached_zip_excludes_module = _uncached_zip_excludes_module(cache_key, module_name)
+            if uncached_zip_excludes_module is not None:
+                if uncached_zip_excludes_module:
                     continue
                 _mark_shared_source_snapshot_unreusable()
                 return _UNSAFE_PATH_RESOLUTION
