@@ -25,8 +25,10 @@ from types import FunctionType, ModuleType
 from typing import Any
 from zipimport import zipimporter
 
-import modelaudit_picklescan.call_graph as picklescan_call_graph
 import pytest
+from modelaudit_picklescan.call_graph import (
+    _cached_bounded_zipimporter_excludes_module as _picklescan_cached_bounded_zipimporter_excludes_module,
+)
 from modelaudit_picklescan.call_graph import _import_hook_identity as _picklescan_import_hook_identity
 from modelaudit_picklescan.call_graph import _path_hook_resolution_identity as _picklescan_path_hook_resolution_identity
 from modelaudit_picklescan.call_graph import (
@@ -2102,7 +2104,7 @@ def test_windows_console_launcher_zipimporter_cache_can_exclude_stdlib() -> None
         pytest.skip("pytest.exe is not cached as a zipimporter")
 
     cache_key, finder = launcher_entries[0]
-    assert picklescan_call_graph._cached_bounded_zipimporter_excludes_module(finder, "linecache", cache_key)
+    assert _picklescan_cached_bounded_zipimporter_excludes_module(finder, "linecache", cache_key)
 
 
 def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(

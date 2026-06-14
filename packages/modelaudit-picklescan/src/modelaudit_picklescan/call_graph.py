@@ -4003,10 +4003,8 @@ def _bounded_zip_archive_excludes_module(archive: str, prefix: str, module_name:
 
 
 def _zipimport_archive_state_from_entry(entry: str) -> tuple[str, str] | None:
-    if not os.path.isabs(entry):
-        return None
     try:
-        candidate = os.path.abspath(entry)
+        candidate = entry if os.path.isabs(entry) else os.path.join(os.getcwd(), entry)
     except (OSError, ValueError):
         return None
     for _ in range(_MAX_MODULE_COMPONENTS + 1):
@@ -5304,11 +5302,17 @@ def _current_module_source_path(module_name: str) -> str | None:
 def _zipimport_archive_path(entry: str) -> Path | None:
     if not _zipimport_runtime_is_trusted():
         return None
-    try:
-        archive = zipimporter(entry).archive
-    except (ImportError, OSError):
+    archive_state = _zipimport_archive_state_from_entry(entry)
+    if archive_state is None:
         return None
-    return Path(archive).absolute()
+    archive, _prefix = archive_state
+    try:
+        archive_stat = os.stat(archive)
+    except OSError:
+        return None
+    if _zipimport_bounded_central_directory_names(archive, archive_stat) is None:
+        return None
+    return Path(archive)
 
 
 def _loaded_module_source_path(module_name: str) -> str | None:

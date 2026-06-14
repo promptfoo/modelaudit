@@ -1819,16 +1819,20 @@ def test_zipimporter_directory_validation_bounds_entries_before_reader(
 
 @pytest.mark.parametrize("cached", [True, False], ids=["cached", "uncached"])
 @pytest.mark.parametrize("include_module", [False, True], ids=["absent", "present"])
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
 def test_oversized_zip_falls_through_only_when_module_is_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cached: bool,
     include_module: bool,
+    relative: bool,
 ) -> None:
     module = "statistics"
-    archive_path = tmp_path / f"oversized-{cached}-{include_module}.zip"
+    archive_path = tmp_path / f"oversized-{cached}-{include_module}-{relative}.zip"
     _write_oversized_zipimporter_archive(archive_path, module, include_module=include_module)
-    path_entry = str(archive_path)
+    if relative:
+        monkeypatch.chdir(tmp_path)
+    path_entry = archive_path.name if relative else str(archive_path)
     stdlib_path = sysconfig.get_path("stdlib")
     assert stdlib_path is not None
     importer_cache: dict[Any, Any] = {stdlib_path: FileFinder(stdlib_path, *_standard_file_finder_loader_details())}
@@ -1853,6 +1857,48 @@ def test_oversized_zip_falls_through_only_when_module_is_absent(
 
     assert origin_kind == (None if include_module else "stdlib")
     assert path_entry not in fresh_calls
+
+
+def test_oversized_zip_candidate_tracking_does_not_construct_importer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "oversized-tracked.zip"
+    _write_oversized_zipimporter_archive(archive_path, "statistics", include_module=False)
+    monkeypatch.chdir(tmp_path)
+    calls: list[str] = []
+
+    def fail_if_constructed(entry: str) -> None:
+        calls.append(entry)
+        pytest.fail("zipimporter was constructed during candidate tracking")
+
+    monkeypatch.setattr(call_graph, "zipimporter", fail_if_constructed)
+
+    assert call_graph._zipimport_archive_path(archive_path.name) == archive_path
+    assert calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink parent traversal")
+def test_relative_zip_preflight_preserves_symlink_parent_traversal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    nested = real_parent / "nested"
+    nested.mkdir()
+    archive_path = real_parent / "modules.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    _write_zipimporter_archive(tmp_path / "modules.zip", "decoy_module", include_module=True)
+    (tmp_path / "link").symlink_to(nested, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+
+    archive_state = call_graph._zipimport_archive_state_from_entry("link/../modules.zip")
+
+    assert archive_state is not None
+    archive, prefix = archive_state
+    assert os.path.samefile(archive, archive_path)
+    assert prefix == ""
 
 
 def test_oversized_zip_absence_proof_rejects_forged_cached_module(
