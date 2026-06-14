@@ -91,17 +91,20 @@ def _step_by_name(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
 def test_dockerfiles_pin_python_base_images_by_digest() -> None:
     lightweight_image = _python_image_from_arg("Dockerfile")
     full_image = _python_image_from_arg("Dockerfile.full")
+    tensorflow_image = _python_image_from_arg("Dockerfile.tensorflow")
 
     assert full_image == lightweight_image
     _assert_pinned_python_image(lightweight_image, "3.13-slim")
+    _assert_pinned_python_image(tensorflow_image, "3.12-slim")
 
     for path in ("Dockerfile", "Dockerfile.full"):
         lines = _dockerfile_lines(path)
         assert lines.count("FROM ${PYTHON_IMAGE} AS builder") == 1
         assert lines.count("FROM ${PYTHON_IMAGE} AS runtime") == 1
 
-    tensorflow_from = _dockerfile_lines("Dockerfile.tensorflow")[0].removeprefix("FROM ")
-    _assert_pinned_python_image(tensorflow_from, "3.12-slim")
+    tensorflow_lines = _dockerfile_lines("Dockerfile.tensorflow")
+    assert tensorflow_lines.count("FROM ${PYTHON_IMAGE} AS builder") == 1
+    assert tensorflow_lines.count("FROM ${PYTHON_IMAGE} AS runtime") == 1
 
 
 def test_docker_publish_manual_dispatch_is_guarded_before_push() -> None:
@@ -264,7 +267,7 @@ def test_dockerfiles_verify_pinned_rustup_init_instead_of_streaming_shell() -> N
     assert _SHA256_RE.fullmatch(expected_amd64_sha256)
     assert _SHA256_RE.fullmatch(expected_arm64_sha256)
 
-    for path in ("Dockerfile", "Dockerfile.full"):
+    for path in ("Dockerfile", "Dockerfile.full", "Dockerfile.tensorflow"):
         content = (_REPO_ROOT / path).read_text(encoding="utf-8")
         assert "https://sh.rustup.rs" not in content
         assert "| sh" not in content
@@ -278,6 +281,17 @@ def test_dockerfiles_verify_pinned_rustup_init_instead_of_streaming_shell() -> N
         assert content.index("sha256sum -c /tmp/rustup-init.sha256") < content.index(
             "/tmp/rustup-init -y --profile minimal --default-toolchain"
         )
+
+
+def test_tensorflow_dockerfile_builds_coordinated_picklescan_wheel() -> None:
+    content = (_REPO_ROOT / "Dockerfile.tensorflow").read_text(encoding="utf-8")
+
+    assert "COPY packages/modelaudit-picklescan ./packages/modelaudit-picklescan" in content
+    assert "pip wheel --no-cache-dir --no-deps --wheel-dir /wheels" in content
+    assert "./packages/modelaudit-picklescan" in content
+    assert "COPY --from=builder /wheels /wheels" in content
+    assert "/wheels/modelaudit_picklescan-*.whl" in content
+    assert content.index("/wheels/modelaudit_picklescan-*.whl") < content.index('".[tensorflow]"')
 
 
 def test_docker_success_job_waits_for_all_image_results() -> None:
@@ -322,6 +336,11 @@ def test_full_image_ml_dependency_probe_fails_hard() -> None:
 
 def test_tensorflow_image_changes_are_built_and_probed() -> None:
     workflow = _load_docker_workflow()
+
+    changes_steps = _job_steps(workflow, "changes")
+    filter_step = next(step for step in changes_steps if step.get("id") == "filter")
+    tensorflow_filter = filter_step["with"]["filters"].split("tensorflow-image:", maxsplit=1)[1]
+    assert "'packages/modelaudit-picklescan/**'" in tensorflow_filter
 
     tensorflow_job = _jobs(workflow)["build-test-tensorflow"]
     assert isinstance(tensorflow_job, dict)

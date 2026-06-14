@@ -165,6 +165,20 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
     assert 'finding.rule_code == "DANGEROUS_CALL"' in smoke_run
 
 
+def test_release_workflow_publishes_picklescan_before_dependent_root() -> None:
+    workflow = _load_release_workflow()
+
+    job = _jobs(workflow)["publish-pypi"]
+    assert isinstance(job, dict)
+    job_condition = job["if"]
+    assert "always()" in job_condition
+    assert "needs.release-please.outputs.release_created == 'true'" in job_condition
+    assert "needs.build.result == 'success'" in job_condition
+    assert "needs.release-please.outputs.picklescan_release_created != 'true'" in job_condition
+    assert "needs.verify-picklescan-pypi.result == 'success'" in job_condition
+    assert job["needs"] == ["build", "release-please", "verify-picklescan-pypi"]
+
+
 def test_release_workflow_verifies_published_root_package_after_picklescan() -> None:
     workflow = _load_release_workflow()
 
