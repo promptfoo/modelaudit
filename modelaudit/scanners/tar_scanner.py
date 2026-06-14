@@ -860,6 +860,14 @@ class TarScanner(BaseScanner):
         except OSError:
             return False
 
+    @staticmethod
+    def _raw_tar_has_complete_end_marker(tar: tarfile.TarFile) -> bool:
+        """Validate the two zero blocks required where raw TAR traversal stopped."""
+        file_obj = cast(BinaryIO, tar.fileobj)
+        file_obj.seek(tar.offset)
+        end_marker = file_obj.read(2 * tarfile.BLOCKSIZE)
+        return end_marker == b"\0" * (2 * tarfile.BLOCKSIZE)
+
     def _add_compressed_wrapper_limit_check(
         self,
         result: ScanResult,
@@ -1160,6 +1168,15 @@ class TarScanner(BaseScanner):
                         raise
 
                     if member is None:
+                        if compression_codec is None and not self._raw_tar_has_complete_end_marker(tar):
+                            self._record_incomplete_tar_scan(
+                                result,
+                                path,
+                                tarfile.ReadError(
+                                    f"Raw TAR traversal stopped without a two-block end marker at offset {tar.offset}"
+                                ),
+                            )
+                            return False
                         if (
                             compression_codec is not None
                             and bounded_stream is not None
@@ -1457,6 +1474,24 @@ class TarScanner(BaseScanner):
                         break
 
                     if member is None:
+                        if compression_codec is None:
+                            try:
+                                raw_end_marker_valid = self._raw_tar_has_complete_end_marker(tar)
+                            except OSError as exc:
+                                scan_complete = False
+                                self._record_incomplete_tar_scan(result, path, exc)
+                                break
+                            if not raw_end_marker_valid:
+                                scan_complete = False
+                                self._record_incomplete_tar_scan(
+                                    result,
+                                    path,
+                                    tarfile.ReadError(
+                                        "Raw TAR traversal stopped without a two-block end marker "
+                                        f"at offset {tar.offset}"
+                                    ),
+                                )
+                                break
                         reached_eof = True
                         if (
                             compression_codec is not None

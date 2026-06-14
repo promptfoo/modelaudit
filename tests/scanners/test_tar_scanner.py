@@ -15,7 +15,13 @@ from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.rules import Severity
 from modelaudit.scanners import tar_scanner as tar_scanner_module
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import (
+    DEFAULT_MAX_FILE_READ_SIZE,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    CheckStatus,
+    IssueSeverity,
+    ScanResult,
+)
 from modelaudit.scanners.tar_scanner import (
     ARCHIVE_MEMBER_COPY_CHUNK_BYTES,
     DEFAULT_MAX_DECOMPRESSED_BYTES,
@@ -51,6 +57,31 @@ def _old_gnu_sparse_tar_bytes(*, extension_blocks: int, physical_size: int = 0) 
         block[504] = int(index + 1 < extension_blocks)
         extensions.append(bytes(block))
     return _with_tar_checksum(header) + b"".join(extensions) + (b"\0" * physical_size) + (b"\0" * 1024)
+
+
+def _write_sparse_raw_tar(
+    path: Path,
+    *,
+    member_name: str,
+    member_payload: bytes,
+    late_invalid_header: bool,
+) -> None:
+    """Write a >512 MiB sparse raw TAR with an optional malformed late header."""
+
+    def write_member(name: str, payload: bytes) -> None:
+        info = tarfile.TarInfo(name)
+        info.size = len(payload)
+        archive.write(info.tobuf())
+        archive.write(payload)
+        archive.write(b"\0" * (-len(payload) % tarfile.BLOCKSIZE))
+
+    with path.open("wb") as archive:
+        write_member(member_name, member_payload)
+        if late_invalid_header:
+            archive.write(b"A" * tarfile.BLOCKSIZE)
+        archive.write(b"\0" * (2 * tarfile.BLOCKSIZE))
+        archive.seek(DEFAULT_MAX_FILE_READ_SIZE)
+        archive.write(b"\0")
 
 
 def _assert_inconclusive_aggregate_not_reused(
@@ -2457,6 +2488,82 @@ class TestTarScanner:
             for issue in aggregate.issues
         )
         assert core.determine_exit_code(aggregate) == 1
+
+    def test_sparse_large_raw_tar_late_invalid_header_is_inconclusive_without_cache(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        archive_path = tmp_path / "late-invalid-benign.tar"
+        _write_sparse_raw_tar(
+            archive_path,
+            member_name="safe.txt",
+            member_payload=b"ordinary member",
+            late_invalid_header=True,
+        )
+
+        direct = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+        assert direct.scanner_name == "tar"
+        assert direct.success is False
+        assert "tar_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        assert any(entry["path"] == f"{archive_path}:safe.txt" for entry in direct.metadata["contents"])
+        _assert_inconclusive_aggregate_not_reused(
+            archive_path,
+            "tar_scan_incomplete",
+            tmp_path / "late-invalid-benign-cache",
+        )
+
+    def test_sparse_large_raw_tar_complete_end_marker_remains_successful(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "complete-end-marker.tar"
+        _write_sparse_raw_tar(
+            archive_path,
+            member_name="safe.txt",
+            member_payload=b"ordinary member",
+            late_invalid_header=False,
+        )
+
+        direct = core.scan_file(str(archive_path), config={"cache_enabled": False})
+        aggregate = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert direct.scanner_name == "tar"
+        assert direct.success is True
+        assert direct.metadata.get("scan_outcome_reasons", []) == []
+        assert direct.metadata["contents"] == [
+            {"path": f"{archive_path}:safe.txt", "type": "unknown", "size": len(b"ordinary member")}
+        ]
+        assert core.determine_exit_code(aggregate) == 0
+
+    def test_sparse_large_raw_tar_late_invalid_header_preserves_malicious_finding_without_cache(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        archive_path = tmp_path / "late-invalid-malicious.tar"
+        malicious_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+        _write_sparse_raw_tar(
+            archive_path,
+            member_name="payload.pkl",
+            member_payload=malicious_payload,
+            late_invalid_header=True,
+        )
+
+        direct = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+        assert direct.scanner_name == "tar"
+        assert direct.success is False
+        assert "tar_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.location == f"{archive_path}:payload.pkl"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system"))
+            for issue in direct.issues
+        )
+        _assert_inconclusive_aggregate_not_reused(
+            archive_path,
+            "tar_scan_incomplete",
+            tmp_path / "late-invalid-malicious-cache",
+            expected_exit_code=1,
+            expected_security_findings=True,
+        )
 
     def test_scan_skips_non_regular_tar_members(self, tmp_path: Path) -> None:
         """Non-file TAR members should be explicit incomplete coverage without hiding later files."""
