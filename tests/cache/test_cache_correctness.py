@@ -2118,6 +2118,7 @@ def test_windows_console_launcher_zipimporter_cache_can_exclude_stdlib() -> None
         else None
     )
     central_directory_size = end_fields[4] if end_fields is not None else 0
+    central_directory_start = max(0, end_offset - central_directory_size)
     physical_names = picklescan_call_graph._zipimport_bounded_central_directory_names(
         archive,
         archive_stat,
@@ -2128,22 +2129,24 @@ def test_windows_console_launcher_zipimporter_cache_can_exclude_stdlib() -> None
         "cache_entries": len(files) if type(files) is dict else None,
         "cache_is_finder_files": dict.get(state, "_files", files) is files,
         "cache_key": cache_key,
-        "central_directory_signature": archive_bytes[
-            max(0, end_offset - central_directory_size) : max(0, end_offset - central_directory_size) + 4
+        "central_directory": archive_bytes[central_directory_start:end_offset].hex(),
+        "central_directory_start": central_directory_start,
+        "central_directory_offsets": [
+            offset for offset in range(len(archive_bytes)) if archive_bytes.startswith(b"PK\x01\x02", offset)
         ],
         "end_fields": end_fields,
         "end_offset": end_offset,
+        "end_offsets": [
+            offset for offset in range(len(archive_bytes)) if archive_bytes.startswith(b"PK\x05\x06", offset)
+        ],
         "expected_prefix": picklescan_call_graph._zipimport_expected_prefix(archive, cache_key),
         "prefix": prefix,
         "state_keys": sorted(state),
         "trailing_bytes": len(archive_bytes) - end_offset - 22 if end_offset >= 0 else None,
     }
 
-    assert picklescan_call_graph._cached_bounded_zipimporter_excludes_module(
-        finder,
-        "linecache",
-        cache_key,
-    ), details
+    if not picklescan_call_graph._cached_bounded_zipimporter_excludes_module(finder, "linecache", cache_key):
+        pytest.fail("\n".join(f"{key}={value!r}" for key, value in details.items()), pytrace=False)
 
 
 def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
