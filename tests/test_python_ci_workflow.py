@@ -20,7 +20,8 @@ _SLOW = (
     "(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests'))"
 )
 _DEPENDENCY_AUDIT = (
-    f"github.event_name == 'pull_request' && ({_DEPENDENCIES} || {_WORKFLOWS} || {_PYTHON} || {_PICKLESCAN})"
+    f"github.event_name == 'merge_group' || "
+    f"(github.event_name == 'pull_request' && ({_DEPENDENCIES} || {_WORKFLOWS} || {_PYTHON} || {_PICKLESCAN}))"
 )
 _DEPENDENCY_SURFACE = f"{_INTEGRATION} || {_DEPENDENCIES} || {_WORKFLOWS}"
 _OPTIONAL_DEPENDENCY_LANES = f"{_INTEGRATION} || {_DEPENDENCIES}"
@@ -28,6 +29,7 @@ _VENDORED_PROTOS = f"{_INTEGRATION} || {_PYTHON} || {_DEPENDENCIES}"
 _BUILD = f"{_INTEGRATION} || {_PYTHON} || {_DEPENDENCIES} || {_WORKFLOWS}"
 _PICKLESCAN_SURFACE = f"{_INTEGRATION} || {_PICKLESCAN} || {_WORKFLOWS}"
 _COVERAGE = f"{_INTEGRATION} || {_WORKFLOWS}"
+_NON_PR_EXHAUSTIVE_FAST = "github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'"
 
 
 def _github_output_assignment(name: str, expression: str) -> str:
@@ -127,7 +129,7 @@ def test_python_ci_merge_group_fail_closed_scheduling_covers_integration_surface
     dependency_audit_job = jobs["dependency-audit"]
     assert isinstance(dependency_audit_job, dict)
     assert dependency_audit_job["if"] == _DEPENDENCY_AUDIT
-    assert "merge_group" not in dependency_audit_job["if"]
+    assert "merge_group" in dependency_audit_job["if"]
 
 
 def test_python_ci_merge_group_uses_sharded_fast_matrices_and_real_pytest_steps() -> None:
@@ -150,7 +152,7 @@ def test_python_ci_merge_group_uses_sharded_fast_matrices_and_real_pytest_steps(
     assert "--maxfail=1" in windows_pr_step["run"]
     assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in windows_pr_step["run"]
     windows_integration_step = _step_by_name(windows_steps, "Run exhaustive fast-test shard")
-    assert windows_integration_step["if"] == f"{_INTEGRATION} || {_WORKFLOWS}"
+    assert windows_integration_step["if"] == _NON_PR_EXHAUSTIVE_FAST
     assert "--maxfail=1" not in windows_integration_step["run"]
 
     test_job = jobs["test"]
@@ -178,7 +180,7 @@ def test_python_ci_merge_group_uses_sharded_fast_matrices_and_real_pytest_steps(
     assert "uv run pytest tests -x --maxfail=1 -n auto" in pr_fast_step["run"]
     assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in pr_fast_step["run"]
     integration_fast_step = _step_by_name(test_steps, "Run exhaustive fast-test shard")
-    assert integration_fast_step["if"] == f"{_INTEGRATION} || {_WORKFLOWS}"
+    assert integration_fast_step["if"] == _NON_PR_EXHAUSTIVE_FAST
     assert "uv run pytest tests -n auto \\" in integration_fast_step["run"]
     assert "--modelaudit-shard-index ${{ matrix.shard-index }} \\" in integration_fast_step["run"]
 
@@ -201,6 +203,15 @@ def test_python_ci_merge_group_uses_sharded_fast_matrices_and_real_pytest_steps(
             {"python-version": "3.13", "numpy-mode": "2.x"},
         ],
     ]
+
+
+def test_python_ci_non_pr_dispatches_still_execute_fast_pytest_shards() -> None:
+    workflow = _load_python_ci_workflow()
+
+    for job_name in ("windows-tests", "test"):
+        exhaustive_step = _step_by_name(_job_steps(workflow, job_name), "Run exhaustive fast-test shard")
+        assert exhaustive_step["if"] == _NON_PR_EXHAUSTIVE_FAST
+        assert "github.event_name != 'pull_request'" in exhaustive_step["if"]
 
 
 def test_python_ci_keeps_pr_label_logic_in_the_dedicated_slow_job() -> None:

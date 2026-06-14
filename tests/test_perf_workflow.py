@@ -496,9 +496,7 @@ def test_python_ci_fast_linux_matrix_proves_main_shards_without_expanding_ordina
     assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in fail_fast_run
 
     exhaustive_step = _step_by_name(steps, "Run exhaustive fast-test shard")
-    assert exhaustive_step["if"] == (
-        "needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'"
-    )
+    assert exhaustive_step["if"] == ("github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'")
     exhaustive_run = exhaustive_step["run"]
     assert "--maxfail=1" not in exhaustive_run
     assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in exhaustive_run
@@ -534,9 +532,7 @@ def test_python_ci_windows_matrix_shards_main_and_workflow_prs() -> None:
     assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in fail_fast_run
 
     exhaustive_step = _step_by_name(steps, "Run exhaustive fast-test shard")
-    assert exhaustive_step["if"] == (
-        "needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'"
-    )
+    assert exhaustive_step["if"] == ("github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'")
     exhaustive_run = exhaustive_step["run"]
     assert "--maxfail=1" not in exhaustive_run
     assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in exhaustive_run
@@ -606,9 +602,9 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
         "needs.changes.outputs.workflows == 'true' }}\"" in gate_script
     )
     assert (
-        "EXPECT_DEPENDENCY_AUDIT=\"${{ github.event_name == 'pull_request' && ("
+        "EXPECT_DEPENDENCY_AUDIT=\"${{ github.event_name == 'merge_group' || (github.event_name == 'pull_request' && ("
         "needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || "
-        "needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true') }}\"" in gate_script
+        "needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')) }}\"" in gate_script
     )
     assert (
         "EXPECT_OPTIONAL_DEPENDENCY_LANES=\"${{ needs.changes.outputs.integration == 'true' || "

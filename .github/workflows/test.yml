@@ -124,7 +124,7 @@ jobs:
   dependency-audit:
     name: Dependency Audit
     needs: changes
-    if: github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -471,7 +471,7 @@ jobs:
           uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
 
       - name: Run exhaustive fast-test shard
-        if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'
+        if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
         run: |
           uv run pytest tests -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
 
@@ -532,7 +532,7 @@ jobs:
             --tb=short --durations=15
 
       - name: Run exhaustive fast-test shard
-        if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'
+        if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
         run: |
           uv run pytest tests -n auto \
             -m "not slow and not integration and not performance" \
@@ -1167,7 +1167,7 @@ jobs:
           EXPECT_QUICK_FEEDBACK="${{ github.event_name == 'pull_request' && (needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true') }}"
           EXPECT_CORE_FAST="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true' }}"
           EXPECT_SLOW="${{ needs.changes.outputs.integration == 'true' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests')) }}"
-          EXPECT_DEPENDENCY_AUDIT="${{ github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true') }}"
+          EXPECT_DEPENDENCY_AUDIT="${{ github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')) }}"
           EXPECT_DEPENDENCY_SURFACE="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' }}"
           EXPECT_OPTIONAL_DEPENDENCY_LANES="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' }}"
           EXPECT_VENDORED_PROTOS="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' }}"
