@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- keep result-cache resolution fingerprints aligned with cached misses, bounded `FileFinder` summaries, and archive-validated `zipimporter` state so shared scans cannot reuse stale origin trust
+- keep result-cache resolution fingerprints aligned with cached misses, loaded-package importer contexts, bounded `FileFinder` summaries, and archive-validated `zipimporter` state so shared scans cannot reuse stale origin trust
 - inspect oversized ONNX protobuf structure from descriptor-bound, memory- and result-bounded file-backed reads; preserve external-data security checks while explicitly reporting deferred schema, raw-detector, weight-analysis, and content-hash coverage
 - treat dotted package versions in README and model-card pip install commands as informational without downgrading active URLs
 - bound embedded Python assignment-line probes, deduplicate exact extraction windows, and fast-path proven passive priority references without weakening incomplete-analysis reporting

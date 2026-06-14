@@ -287,6 +287,7 @@ def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
         },
         "loaded_module_sources": {},
         "loaded_package_paths": {},
+        "loaded_package_resolution_contexts": {},
         "fingerprints": {
             "/tmp/src/first.py": "1111",
             "/tmp/src/second.py": "2222",
@@ -318,6 +319,7 @@ def test_merge_scan_results_ignores_source_independent_call_graph_metadata(
         "module_sources": {"helper": "/tmp/src/helper.py"},
         "loaded_module_sources": {},
         "loaded_package_paths": {},
+        "loaded_package_resolution_contexts": {},
         "fingerprints": {"/tmp/src/helper.py": "1111"},
         "read_fingerprints": {
             "/tmp/src/helper.py": {"read_limit": 1024, "require_complete": True, "fingerprint": "aaaa"}
@@ -443,6 +445,7 @@ def test_merge_scan_results_marks_conflicting_loaded_package_paths_unreusable() 
         "module_sources": {},
         "loaded_module_sources": {},
         "loaded_package_paths": {"helper": ["/tmp/src/first"]},
+        "loaded_package_resolution_contexts": {"helper": ["/tmp/src/first=finder-first"]},
         "fingerprints": {},
     }
     result2 = ScanResult(scanner_name="pickle")
@@ -453,6 +456,7 @@ def test_merge_scan_results_marks_conflicting_loaded_package_paths_unreusable() 
         "module_sources": {},
         "loaded_module_sources": {},
         "loaded_package_paths": {"helper": ["/tmp/src/second"]},
+        "loaded_package_resolution_contexts": {"helper": ["/tmp/src/second=finder-second"]},
         "fingerprints": {},
     }
 
@@ -463,6 +467,7 @@ def test_merge_scan_results_marks_conflicting_loaded_package_paths_unreusable() 
     ]
     assert source_fingerprints["reusable"] is False
     assert source_fingerprints["loaded_package_paths"]["helper"] == ["/tmp/src/first"]
+    assert source_fingerprints["loaded_package_resolution_contexts"]["helper"] == ["/tmp/src/first=finder-first"]
 
 
 def test_blacklist_patterns(tmp_path):

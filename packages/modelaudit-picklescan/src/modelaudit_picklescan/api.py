@@ -2501,6 +2501,22 @@ def _merge_call_graph_source_fingerprint_metadata(
             loaded_package_paths[module_name] = search_path
     merged["loaded_package_paths"] = loaded_package_paths
 
+    existing_loaded_package_contexts = (
+        existing.get("loaded_package_resolution_contexts") if existing is not None else None
+    )
+    incoming_loaded_package_contexts = incoming.get("loaded_package_resolution_contexts")
+    loaded_package_contexts = (
+        dict(existing_loaded_package_contexts) if isinstance(existing_loaded_package_contexts, Mapping) else {}
+    )
+    loaded_package_context_conflict = False
+    if isinstance(incoming_loaded_package_contexts, Mapping):
+        for module_name, resolution_context in incoming_loaded_package_contexts.items():
+            if module_name in loaded_package_contexts and loaded_package_contexts[module_name] != resolution_context:
+                loaded_package_context_conflict = True
+                continue
+            loaded_package_contexts[module_name] = resolution_context
+    merged["loaded_package_resolution_contexts"] = loaded_package_contexts
+
     existing_search_context = existing.get("search_context") if existing is not None else incoming.get("search_context")
     incoming_search_context = incoming.get("search_context")
     existing_resolution_context = (
@@ -2522,6 +2538,7 @@ def _merge_call_graph_source_fingerprint_metadata(
             and not module_source_conflict
             and not loaded_source_conflict
             and not loaded_package_path_conflict
+            and not loaded_package_context_conflict
         )
         if existing is not None:
             merged["reusable"] = merged["reusable"] and existing.get("reusable") is True
@@ -2531,6 +2548,7 @@ def _merge_call_graph_source_fingerprint_metadata(
         or module_source_conflict
         or loaded_source_conflict
         or loaded_package_path_conflict
+        or loaded_package_context_conflict
     ):
         merged["reusable"] = False
     return merged

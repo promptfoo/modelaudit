@@ -53,6 +53,10 @@ def _unavailable_source_resolution_context() -> tuple[tuple[str, ...], tuple[str
     return unavailable, unavailable, unavailable
 
 
+def _unavailable_path_importer_resolution_context(_search_path: object) -> tuple[str, ...]:
+    return _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
+
+
 def _unavailable_search_path_has_untrusted_importer(_search_path: object) -> bool:
     return True
 
@@ -69,6 +73,11 @@ _path_hook_resolution_identity = getattr(
     _picklescan_call_graph,
     "_path_hook_resolution_identity",
     _unavailable_import_hook_identity,
+)
+_path_importer_resolution_context = getattr(
+    _picklescan_call_graph,
+    "_path_importer_resolution_context",
+    _unavailable_path_importer_resolution_context,
 )
 _search_path_has_untrusted_importer = getattr(
     _picklescan_call_graph,
@@ -1661,6 +1670,11 @@ class ScanResultsCache:
         loaded_package_paths = fingerprint_metadata.get("loaded_package_paths")
         if not isinstance(loaded_package_paths, dict):
             return False
+        loaded_package_resolution_contexts = fingerprint_metadata.get("loaded_package_resolution_contexts", {})
+        if not isinstance(loaded_package_resolution_contexts, dict):
+            return False
+        if set(loaded_package_resolution_contexts) != set(loaded_package_paths):
+            return False
         for module_name, expected_search_path in loaded_package_paths.items():
             if not isinstance(module_name, str) or not isinstance(expected_search_path, list):
                 return False
@@ -1670,6 +1684,13 @@ class ScanResultsCache:
             if current_search_path != expected_search_path:
                 return False
             if current_search_path is None or _search_path_has_untrusted_importer(current_search_path):
+                return False
+            expected_resolution_context = loaded_package_resolution_contexts.get(module_name)
+            if not isinstance(expected_resolution_context, list) or not all(
+                isinstance(identity, str) for identity in expected_resolution_context
+            ):
+                return False
+            if list(_path_importer_resolution_context(current_search_path)) != expected_resolution_context:
                 return False
         for module_name in module_sources:
             if any(

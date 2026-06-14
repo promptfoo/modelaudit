@@ -1563,6 +1563,49 @@ def test_invalidated_file_finder_is_normalized_before_snapshot(
         assert object.__getattribute__(finder, "__dict__")["_path_mtime"] != -1
 
 
+@pytest.mark.parametrize("transition", ["finder-to-none", "none-to-finder"])
+def test_shared_cache_refreshes_when_loaded_package_importer_semantics_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transition: str,
+) -> None:
+    parent_module = "loaded_cache_package"
+    module = f"{parent_module}.child"
+    package_path = tmp_path / "loaded-package-path"
+    package_path.mkdir()
+    (package_path / "child.py").write_text("class Entry:\n    pass\n", encoding="utf-8")
+    path_entry = str(package_path)
+    finder = FileFinder(path_entry, *_standard_file_finder_loader_details())
+    assert finder.find_spec(module) is not None
+    importer_cache: dict[Any, Any] = dict(sys.path_importer_cache)
+    importer_cache[path_entry] = finder if transition == "finder-to-none" else None
+    loaded_parent = ModuleType(parent_module)
+    loaded_parent.__path__ = [path_entry]
+    loaded_parent.__spec__ = ModuleSpec(parent_module, loader=None, is_package=True)
+    monkeypatch.setitem(sys.modules, parent_module, loaded_parent)
+
+    with (
+        _standard_import_runtime(
+            monkeypatch,
+            module=module,
+            importer_cache=importer_cache,
+            trusted_site_package_root=tmp_path,
+        ),
+        call_graph.shared_source_sensitive_caches(),
+    ):
+        first_generation = call_graph._begin_shared_source_report()
+        first_kind = call_graph._trusted_module_origin_kind(module)
+        call_graph._ensure_shared_source_snapshot_stable(first_generation)
+        importer_cache[path_entry] = None if transition == "finder-to-none" else finder
+        second_generation = call_graph._begin_shared_source_report()
+        second_kind = call_graph._trusted_module_origin_kind(module)
+        call_graph._ensure_shared_source_snapshot_stable(second_generation)
+    trusted_kind = first_kind if transition == "finder-to-none" else second_kind
+    blocked_kind = second_kind if transition == "finder-to-none" else first_kind
+    assert trusted_kind == "site_packages"
+    assert blocked_kind == "unresolved"
+
+
 def test_loaded_package_cached_untrusted_importer_is_not_unresolved_trusted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

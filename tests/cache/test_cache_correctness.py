@@ -47,6 +47,7 @@ from modelaudit.cache.scan_results_cache import (
     ScanResultsCache,
     _import_hook_identity,
     _path_hook_resolution_identity,
+    _path_importer_resolution_context,
     _source_resolution_context,
 )
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
@@ -84,13 +85,18 @@ def _call_graph_fingerprint_metadata(
     loaded_package_paths: dict[str, list[str]] | None = None,
     read_fingerprints: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    package_paths = loaded_package_paths or {}
     return {
         "reusable": True,
         "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
         "resolution_context": _source_resolution_context(),
         "module_sources": module_sources or {},
         "loaded_module_sources": loaded_module_sources or {},
-        "loaded_package_paths": loaded_package_paths or {},
+        "loaded_package_paths": package_paths,
+        "loaded_package_resolution_contexts": {
+            module_name: list(_path_importer_resolution_context(search_path))
+            for module_name, search_path in package_paths.items()
+        },
         "fingerprints": fingerprints or {},
         "read_fingerprints": read_fingerprints or {},
     }
@@ -1476,6 +1482,63 @@ def test_scan_cache_reuses_matching_loaded_parent_package_path(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     loaded_parent.__path__ = [str(second_source.parent)]
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+@pytest.mark.parametrize("transition", ["finder-to-none", "none-to-finder"])
+def test_scan_cache_invalidates_loaded_package_importer_semantics_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transition: str,
+) -> None:
+    source_path = tmp_path / "runtime" / "cache_pkg" / "child.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("def entrypoint():\n    return 1\n")
+    package_path = str(source_path.parent.absolute())
+    loaded_parent = ModuleType("cache_pkg")
+    loaded_parent.__path__ = [package_path]
+    loaded_parent.__spec__ = ModuleSpec("cache_pkg", loader=None, is_package=True)
+    monkeypatch.setitem(sys.modules, "cache_pkg", loaded_parent)
+    standard_finder = FileFinder(
+        package_path,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    assert standard_finder.find_spec("cache_pkg.child") is not None
+    monkeypatch.setitem(
+        sys.path_importer_cache,
+        package_path,
+        standard_finder if transition == "finder-to-none" else None,
+    )
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    source = str(source_path.absolute())
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
+                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+                module_sources={"cache_pkg.child": source},
+                loaded_package_paths={"cache_pkg": [package_path]},
+            )
+        },
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    monkeypatch.setitem(
+        sys.path_importer_cache,
+        package_path,
+        None if transition == "finder-to-none" else standard_finder,
+    )
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 

@@ -195,6 +195,7 @@ def test_large_handler_cache_preserves_private_metadata_for_internal_results(
         "module_sources": {},
         "loaded_module_sources": {},
         "loaded_package_paths": {},
+        "loaded_package_resolution_contexts": {},
         "fingerprints": {},
         "read_fingerprints": {},
     }

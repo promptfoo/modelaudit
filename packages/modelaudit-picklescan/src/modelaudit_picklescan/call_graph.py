@@ -1548,6 +1548,7 @@ class _SharedSourceSnapshot:
     module_sources: dict[str, str] = field(default_factory=dict)
     loaded_module_sources: dict[str, str] = field(default_factory=dict)
     loaded_package_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    loaded_package_resolution_contexts: dict[str, tuple[str, ...]] = field(default_factory=dict)
     loaded_interpreter_modules: dict[str, _LoadedInterpreterModuleState] = field(default_factory=dict)
     loaded_interpreter_references: dict[tuple[str, str], _LoadedInterpreterReferenceState] = field(default_factory=dict)
     read_fingerprints: dict[str, tuple[int, bool, bytes | None]] = field(default_factory=dict)
@@ -3948,16 +3949,14 @@ def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
     return False
 
 
-def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    search_path = _runtime_search_path_without_hooks()
-    meta_path = _runtime_meta_path_without_hooks()
-    path_hooks = _runtime_path_hooks_without_hooks()
+def _path_importer_resolution_context(search_path: Iterable[str]) -> tuple[str, ...]:
     path_importer_cache = _runtime_path_importer_cache_without_hooks()
-    if search_path is None or meta_path is None or path_hooks is None or path_importer_cache is None:
-        unavailable = (_UNREUSABLE_HOOK_STATE_IDENTITY,)
-        return unavailable, unavailable, unavailable
+    if path_importer_cache is None or type(search_path) not in {list, tuple}:
+        return (_UNREUSABLE_HOOK_STATE_IDENTITY,)
     path_importers = []
     for entry in search_path:
+        if type(entry) is not str:
+            return (_UNREUSABLE_HOOK_STATE_IDENTITY,)
         cache_key = entry or os.getcwd()
         if not dict.__contains__(path_importer_cache, cache_key):
             continue
@@ -3976,13 +3975,22 @@ def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tupl
             identity = zipimporter_identity or _import_hook_identity(finder)
             path_importers.append(f"{absolute_cache_key}={identity}")
             continue
-        if _is_trusted_standard_path_importer(finder, cache_key):
-            continue
         path_importers.append(f"{absolute_cache_key}={_import_hook_identity(finder)}")
+    return tuple(path_importers)
+
+
+def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    search_path = _runtime_search_path_without_hooks()
+    meta_path = _runtime_meta_path_without_hooks()
+    path_hooks = _runtime_path_hooks_without_hooks()
+    path_importer_cache = _runtime_path_importer_cache_without_hooks()
+    if search_path is None or meta_path is None or path_hooks is None or path_importer_cache is None:
+        unavailable = (_UNREUSABLE_HOOK_STATE_IDENTITY,)
+        return unavailable, unavailable, unavailable
     return (
         tuple(_meta_path_finder_resolution_identity(finder) for finder in meta_path),
         tuple(_path_hook_resolution_identity(hook) for hook in path_hooks),
-        tuple(path_importers),
+        _path_importer_resolution_context(search_path),
     )
 
 
@@ -4200,6 +4208,7 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.module_sources.clear()
     snapshot.loaded_module_sources.clear()
     snapshot.loaded_package_paths.clear()
+    snapshot.loaded_package_resolution_contexts.clear()
     snapshot.loaded_interpreter_modules.clear()
     snapshot.loaded_interpreter_references.clear()
     snapshot.generation += 1
@@ -4237,6 +4246,12 @@ def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
         if not is_loaded or current_search_path is None or tuple(current_search_path) != expected_search_path:
             return False
         if _search_path_has_untrusted_importer(current_search_path):
+            return False
+        expected_resolution_context = snapshot.loaded_package_resolution_contexts.get(module_name)
+        if (
+            expected_resolution_context is None
+            or _path_importer_resolution_context(current_search_path) != expected_resolution_context
+        ):
             return False
     for module_name, expected_module_state in snapshot.loaded_interpreter_modules.items():
         if not _loaded_interpreter_module_state_matches(module_name, expected_module_state):
@@ -4291,6 +4306,7 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
                 "module_sources": {},
                 "loaded_module_sources": {},
                 "loaded_package_paths": {},
+                "loaded_package_resolution_contexts": {},
                 "fingerprints": {},
                 "read_fingerprints": {},
             }
@@ -4307,6 +4323,10 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
             "loaded_package_paths": {
                 module_name: list(search_path)
                 for module_name, search_path in sorted(snapshot.loaded_package_paths.items())
+            },
+            "loaded_package_resolution_contexts": {
+                module_name: list(resolution_context)
+                for module_name, resolution_context in sorted(snapshot.loaded_package_resolution_contexts.items())
             },
             "fingerprints": {
                 path: fingerprint.hex() if isinstance(fingerprint, bytes) else fingerprint
@@ -4399,6 +4419,7 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
                 if _search_path_has_untrusted_importer(loaded_search_path):
                     _mark_shared_source_snapshot_unreusable()
                     return
+                loaded_resolution_context = _path_importer_resolution_context(loaded_search_path)
                 with snapshot.lock:
                     expected_search_path = tuple(loaded_search_path)
                     existing_search_path = snapshot.loaded_package_paths.get(qualified_name)
@@ -4406,7 +4427,16 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
                         snapshot.stable = False
                         snapshot.reusable = False
                         return
+                    existing_resolution_context = snapshot.loaded_package_resolution_contexts.get(qualified_name)
+                    if (
+                        existing_resolution_context is not None
+                        and existing_resolution_context != loaded_resolution_context
+                    ):
+                        snapshot.stable = False
+                        snapshot.reusable = False
+                        return
                     snapshot.loaded_package_paths[qualified_name] = expected_search_path
+                    snapshot.loaded_package_resolution_contexts[qualified_name] = loaded_resolution_context
                 search_path = loaded_search_path
                 continue
 

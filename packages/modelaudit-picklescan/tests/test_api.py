@@ -3921,6 +3921,7 @@ def test_merge_call_graph_source_fingerprints_preserves_source_independence_only
         "module_sources": {"source": "source.py"},
         "loaded_module_sources": {},
         "loaded_package_paths": {},
+        "loaded_package_resolution_contexts": {},
     }
 
     assert package_api._merge_call_graph_source_fingerprint_metadata(None, source_independent) == source_independent
@@ -4002,6 +4003,7 @@ def test_merge_call_graph_source_fingerprints_rejects_conflicting_read_records()
         "module_sources": {},
         "loaded_module_sources": {},
         "loaded_package_paths": {},
+        "loaded_package_resolution_contexts": {},
         "fingerprints": {},
         "read_fingerprints": {
             "/tmp/src/__pycache__": {"read_limit": 1048576, "require_complete": True, "fingerprint": "1111"}
@@ -10878,6 +10880,7 @@ def test_loaded_parent_package_path_controls_child_source_resolution(
     source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
     assert source_fingerprints["reusable"] is True
     assert source_fingerprints["loaded_package_paths"]["loaded_parent_pkg"] == (str(runtime_package.absolute()),)
+    assert "loaded_parent_pkg" in source_fingerprints["loaded_package_resolution_contexts"]
 
 
 def test_loaded_parent_package_custom_importer_fails_closed(
