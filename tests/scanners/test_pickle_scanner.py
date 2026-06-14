@@ -6,7 +6,7 @@ import os
 import pickle
 import pickletools
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import modelaudit_picklescan.api as picklescan_api
 import pytest
@@ -48,120 +48,6 @@ BYPASS_V4_REFERENCES_TEST_CASES: tuple[tuple[str, str, IssueSeverity], ...] = (
     ("logging.config", "listen", IssueSeverity.CRITICAL),
     ("zipimport", "zipimporter", IssueSeverity.CRITICAL),
 )
-
-
-def _module_resolution_diagnostics(module: str) -> dict[str, object]:
-    """Summarize private resolver state without dispatching through custom finders."""
-    import modelaudit_picklescan.call_graph as call_graph
-
-    diagnostics: dict[str, object] = {}
-
-    def capture(name: str, operation: Any) -> None:
-        try:
-            diagnostics[name] = operation()
-        except Exception as error:
-            diagnostics[name] = f"{type(error).__name__}: {error}"
-
-    capture("import_runtime_trusted", call_graph._interpreter_import_runtime_is_trusted)
-    capture("interpreter_module_trusted", lambda: call_graph._interpreter_module_resolution_is_trusted(module))
-    capture("source_unavailable_reason", lambda: call_graph._call_graph_source_unavailable_reason(module))
-    capture("resolved_source", lambda: str(call_graph._resolve_module_source(module)))
-    capture("current_source", lambda: call_graph._current_module_source_path(module))
-    capture(
-        "untrusted_meta_path_precedes",
-        lambda: call_graph._untrusted_meta_path_finder_precedes(call_graph.PathFinder, module),
-    )
-    capture("path_hooks_trusted", call_graph._path_hooks_are_trusted)
-    capture(
-        "path_hook_identities",
-        lambda: [
-            call_graph._path_hook_resolution_identity(hook)
-            for hook in call_graph._runtime_path_hooks_without_hooks() or ()
-        ],
-    )
-
-    loaded, loaded_module, loaded_spec = call_graph._loaded_module_state_without_hooks(module)
-    loaded_origin = None
-    if loaded_spec is not None:
-        loaded_origin, _loaded_loader = call_graph._module_spec_fields_without_hooks(loaded_spec)
-    diagnostics["loaded_state"] = {
-        "loaded": loaded,
-        "module_type": type(loaded_module).__name__,
-        "spec_type": type(loaded_spec).__name__,
-        "origin": loaded_origin,
-    }
-
-    filesystem_spec = call_graph._find_standard_filesystem_spec(module)
-    filesystem_origin = None
-    if type(filesystem_spec) is call_graph.ModuleSpec:
-        filesystem_origin, _filesystem_loader = call_graph._module_spec_fields_without_hooks(filesystem_spec)
-    diagnostics["filesystem_spec"] = {
-        "type": type(filesystem_spec).__name__,
-        "origin": filesystem_origin,
-    }
-
-    search_path = call_graph._runtime_search_path_without_hooks()
-    importer_cache = call_graph._runtime_path_importer_cache_without_hooks()
-    importer_diagnostics: list[dict[str, object]] = []
-    if search_path is not None and type(importer_cache) is dict:
-        for entry in search_path[:32]:
-            if type(entry) is not str:
-                importer_diagnostics.append({"entry_type": type(entry).__name__})
-                continue
-            cache_key = entry or os.getcwd()
-            present = dict.__contains__(importer_cache, cache_key)
-            finder = dict.__getitem__(importer_cache, cache_key) if present else None
-            item: dict[str, object] = {
-                "entry": entry,
-                "cache_key": cache_key,
-                "present": present,
-                "finder_type": type(finder).__name__,
-            }
-            if type(finder) is call_graph.FileFinder:
-                raw_state = object.__getattribute__(finder, "__dict__")
-                finder_path = dict.get(raw_state, "path") if type(raw_state) is dict else None
-                path_cache = dict.get(raw_state, "_path_cache") if type(raw_state) is dict else None
-                relaxed_cache = dict.get(raw_state, "_relaxed_path_cache") if type(raw_state) is dict else None
-                canonical = call_graph._canonical_file_finder_state(finder_path) if type(finder_path) is str else None
-                canonical_path_cache = canonical[1] if canonical is not None else frozenset()
-                canonical_relaxed_cache = canonical[2] if canonical is not None else frozenset()
-                path_names = (
-                    set(cast(set[object] | frozenset[object], path_cache))
-                    if type(path_cache) in {set, frozenset}
-                    else set()
-                )
-                relaxed_names = (
-                    set(cast(set[object] | frozenset[object], relaxed_cache))
-                    if type(relaxed_cache) in {set, frozenset}
-                    else set()
-                )
-                item.update(
-                    {
-                        "finder_path": finder_path,
-                        "state_keys": sorted(raw_state) if type(raw_state) is dict else None,
-                        "path_mtime": dict.get(raw_state, "_path_mtime") if type(raw_state) is dict else None,
-                        "canonical_mtime": canonical[0] if canonical is not None else None,
-                        "path_cache_size": len(path_names),
-                        "relaxed_cache_size": len(relaxed_names),
-                        "path_only_sample": sorted(str(name) for name in path_names - canonical_path_cache)[:5],
-                        "canonical_only_sample": sorted(str(name) for name in canonical_path_cache - path_names)[:5],
-                        "relaxed_only_sample": sorted(str(name) for name in relaxed_names - canonical_relaxed_cache)[
-                            :5
-                        ],
-                        "canonical_relaxed_only_sample": sorted(
-                            str(name) for name in canonical_relaxed_cache - relaxed_names
-                        )[:5],
-                        "identity": call_graph._file_finder_resolution_identity(finder, cache_key),
-                    }
-                )
-                if item["identity"] is not None:
-                    resolution = call_graph._trusted_path_importer_spec(finder, module, cache_key)
-                    item["target_resolution_type"] = type(resolution).__name__
-            elif type(finder) is call_graph.zipimporter:
-                item["identity"] = call_graph._zipimporter_resolution_identity(finder, cache_key)
-            importer_diagnostics.append(item)
-    diagnostics["path_importers"] = importer_diagnostics
-    return diagnostics
 
 
 class MaliciousPayload:
@@ -1396,8 +1282,7 @@ def test_bypass_v4_references_still_detected(
         if issue.severity == expected_severity
         and (issue.details.get("associated_global") == full_ref or full_ref in issue.message)
     ]
-    diagnostic = _module_resolution_diagnostics(module) if not result.success else None
-    assert result.success is True, f"Scan failed for {full_ref}: {result.metadata}; resolver={diagnostic}"
+    assert result.success is True, f"Scan failed for {full_ref}: {result.metadata}"
     assert matched, (
         f"Expected {expected_severity.value} finding for {full_ref}, "
         f"got: {[(issue.severity.value, issue.message, issue.details) for issue in result.issues]}"

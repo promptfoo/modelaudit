@@ -606,7 +606,7 @@ def _type_namespace_matches_snapshot(
     ) and all(name in expected or not _runtime_type_member_is_executable(value) for name, value in namespace.items())
 
 
-def _interpreter_import_runtime_is_trusted() -> bool:
+def _interpreter_import_runtime_matches_snapshot() -> bool:
     modules = _runtime_sys_modules_without_hooks()
     if modules is None or not _runtime_import_containers_are_safe():
         return False
@@ -630,6 +630,13 @@ def _interpreter_import_runtime_is_trusted() -> bool:
         if not _type_namespace_matches_snapshot(class_, namespace, expected_namespace):
             return False
     return True
+
+
+def _interpreter_import_runtime_is_trusted() -> bool:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is not None:
+        return snapshot.import_runtime_trusted
+    return _interpreter_import_runtime_matches_snapshot()
 
 
 def _interpreter_target_import_lock_state_is_safe(module_name: str) -> bool:
@@ -1623,6 +1630,8 @@ class _SourceReadTooLargeError(OSError):
 class _SharedSourceSnapshot:
     search_context: tuple[str, ...]
     resolution_context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+    import_runtime_trusted: bool
+    report_started: bool = False
     resolution_fingerprints: dict[str, bytes | str | None] = field(default_factory=dict)
     module_sources: dict[str, str] = field(default_factory=dict)
     loaded_module_sources: dict[str, str] = field(default_factory=dict)
@@ -2984,7 +2993,6 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
     parts = _bounded_module_name_parts(module_name)
     if parts is None:
         return None
-    _track_shared_source_candidates(parts)
     interpreter_trusted = _interpreter_module_resolution_is_trusted(module_name)
     if interpreter_trusted is not None:
         return "stdlib" if interpreter_trusted else None
@@ -3007,6 +3015,7 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
         if standard_spec is not None:
             standard_origin, _ = _module_spec_fields_without_hooks(standard_spec)
             if type(standard_origin) is not str or loaded_origin != standard_origin:
+                _track_shared_source_candidates(parts)
                 return None
         spec = loaded_spec
     else:
@@ -3014,9 +3023,16 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
             return None
         spec = standard_spec
     if spec is None:
+        if any(_loaded_package_search_path(".".join(parts[:index]))[0] for index in range(1, len(parts))):
+            _track_shared_source_candidates(parts)
+        else:
+            # An unresolved top-level module is never trusted. Avoid suffix
+            # fan-out and prevent its conservative result crossing reports.
+            _mark_shared_source_snapshot_unreusable()
         return "unresolved"
     if type(spec) is not ModuleSpec:
         return None
+    _track_shared_source_candidates(parts)
     spec_origin, _ = _module_spec_fields_without_hooks(spec)
     if type(spec_origin) is not str:
         return None
@@ -3097,12 +3113,14 @@ def shared_source_sensitive_caches() -> Iterator[None]:
 
     with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
         _clear_source_sensitive_caches_now()
+        import_runtime_trusted = _interpreter_import_runtime_matches_snapshot()
         resolution_context = _source_resolution_context()
         snapshot_token = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.set(
             _SharedSourceSnapshot(
                 search_context=_source_search_context(),
                 resolution_context=resolution_context,
-                reusable=_resolution_context_is_reusable(resolution_context),
+                import_runtime_trusted=import_runtime_trusted,
+                reusable=import_runtime_trusted and _resolution_context_is_reusable(resolution_context),
             )
         )
         token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(1)
@@ -3808,7 +3826,9 @@ def _zipimport_central_directory_is_bounded(archive: str, expected_stat: os.stat
                 central_directory_offset,
                 comment_size,
             ) = struct.unpack_from("<4H2LH", tail, end_offset + 4)
-            if end_offset + _ZIP_END_RECORD_SIZE + comment_size != len(tail):
+            # Windows console-script launchers embed a ZIP resource inside a PE
+            # executable, so valid non-ZIP bytes may follow the end record.
+            if end_offset + _ZIP_END_RECORD_SIZE + comment_size > len(tail):
                 continue
             if (
                 disk_number != 0
@@ -4361,6 +4381,7 @@ def _read_candidate_fingerprint(
 
 
 def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
+    snapshot.import_runtime_trusted = _interpreter_import_runtime_matches_snapshot()
     snapshot.search_context = _source_search_context()
     snapshot.resolution_context = _source_resolution_context()
     snapshot.resolution_fingerprints.clear()
@@ -4374,7 +4395,7 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.loaded_interpreter_references.clear()
     snapshot.generation += 1
     snapshot.stable = True
-    snapshot.reusable = _resolution_context_is_reusable(snapshot.resolution_context)
+    snapshot.reusable = snapshot.import_runtime_trusted and _resolution_context_is_reusable(snapshot.resolution_context)
 
 
 def _path_importer_context_allows_trusted_cache_population(
@@ -4429,6 +4450,8 @@ def _snapshot_resolution_context_is_current(snapshot: _SharedSourceSnapshot) -> 
 def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
     if (
         not snapshot.stable
+        or not snapshot.import_runtime_trusted
+        or not _interpreter_import_runtime_matches_snapshot()
         or snapshot.search_context != _source_search_context()
         or not _snapshot_resolution_context_is_current(snapshot)
     ):
@@ -4498,9 +4521,11 @@ def _begin_shared_source_report() -> int | None:
     if snapshot is None:
         return None
     with snapshot.lock:
-        if not _shared_source_snapshot_is_current(snapshot):
+        # Context creation already validated the runtime immediately before the first report.
+        if snapshot.report_started and (not snapshot.reusable or not _shared_source_snapshot_is_current(snapshot)):
             _clear_source_sensitive_caches_now()
             _reset_shared_source_snapshot(snapshot)
+        snapshot.report_started = True
         return snapshot.generation
 
 
@@ -8272,9 +8297,13 @@ def _resolve_module_source(module_name: str) -> Path | None:
     if parts is None or len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         _mark_shared_source_snapshot_unreusable()
         return None
-    _track_shared_source_candidates(parts)
     spec = _find_standard_filesystem_spec(module_name)
     loaded, _, loaded_spec = _loaded_module_state_without_hooks(module_name)
+    if type(spec) is not ModuleSpec:
+        if not loaded:
+            _mark_shared_source_snapshot_unreusable()
+        return None
+    _track_shared_source_candidates(parts)
     if loaded:
         if loaded_spec is None:
             return None

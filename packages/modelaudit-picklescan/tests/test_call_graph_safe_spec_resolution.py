@@ -432,6 +432,71 @@ def test_shared_source_snapshot_detects_interpreter_module_replacement(
             call_graph._ensure_shared_source_snapshot_stable(report_generation)
 
 
+def test_shared_source_snapshot_bounds_full_import_runtime_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_matches_snapshot = call_graph._interpreter_import_runtime_matches_snapshot
+    validation_count = 0
+
+    def counted_matches_snapshot() -> bool:
+        nonlocal validation_count
+        validation_count += 1
+        return original_matches_snapshot()
+
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_matches_snapshot", counted_matches_snapshot)
+
+    with call_graph.shared_source_sensitive_caches():
+        report_generation = call_graph._begin_shared_source_report()
+        assert call_graph._interpreter_import_runtime_is_trusted() is True
+        assert call_graph._interpreter_import_runtime_is_trusted() is True
+        call_graph._ensure_shared_source_snapshot_stable(report_generation)
+
+    assert validation_count == 2
+
+
+def test_unresolved_top_level_module_uses_report_boundary_invalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = "missing_top_level_cache_candidate"
+    path_entry = str(tmp_path)
+    original_track_candidates = call_graph._track_shared_source_candidates
+    tracked_candidates: list[tuple[str, ...]] = []
+
+    def counted_track_candidates(parts: tuple[str, ...]) -> None:
+        tracked_candidates.append(parts)
+        original_track_candidates(parts)
+
+    monkeypatch.setattr(call_graph, "_track_shared_source_candidates", counted_track_candidates)
+
+    with (
+        _standard_import_runtime(
+            monkeypatch,
+            module=module,
+            importer_cache={},
+            search_path=[path_entry],
+            trusted_site_package_root=tmp_path,
+        ),
+        call_graph.shared_source_sensitive_caches(),
+    ):
+        first_generation = call_graph._begin_shared_source_report()
+        assert call_graph._trusted_module_origin_kind(module) == "unresolved"
+        first_metadata = call_graph.shared_source_fingerprint_metadata()
+        first_candidate_tracking_count = len(tracked_candidates)
+        (tmp_path / f"{module}.py").write_text("value = 1\n", encoding="utf-8")
+        assert call_graph.import_only_module_requires_origin_review(module, "Entry") is True
+        call_graph._ensure_shared_source_snapshot_stable(first_generation)
+        second_generation = call_graph._begin_shared_source_report()
+        assert call_graph._trusted_module_origin_kind(module) == "site_packages"
+        call_graph._ensure_shared_source_snapshot_stable(second_generation)
+
+    assert first_metadata is not None
+    assert first_metadata["reusable"] is False
+    assert first_metadata["fingerprints"] == {}
+    assert second_generation != first_generation
+    assert first_candidate_tracking_count == 0
+
+
 def test_loaded_interpreter_reference_mutation_cannot_remain_allowlisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1518,6 +1583,36 @@ def test_forged_zipimporter_directory_entry_is_not_trusted(
             enrich_call_graph=False,
         )
     _assert_non_allowlisted_global(report, module, name)
+
+
+def test_zipimporter_identity_accepts_bounded_launcher_prefix_and_trailer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_path = tmp_path / "launcher-payload.zip"
+    _write_zipimporter_archive(payload_path, "trusted_module", include_module=True)
+    launcher_path = tmp_path / "launcher.exe"
+    launcher_path.write_bytes(b"MZ" + bytes(126) + payload_path.read_bytes() + b"PE-TRAILER" * 8)
+    finder = zipimporter(str(launcher_path))
+
+    assert call_graph._zipimporter_resolution_identity(finder, str(launcher_path)) is not None
+    assert type(zipimporter.find_spec(finder, "trusted_module")) is ModuleSpec
+
+    module = "statistics"
+    stdlib_path = sysconfig.get_path("stdlib")
+    assert stdlib_path is not None
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache={
+            str(launcher_path): finder,
+            stdlib_path: FileFinder(stdlib_path, *_standard_file_finder_loader_details()),
+        },
+        search_path=[str(launcher_path), stdlib_path],
+    ):
+        spec = call_graph._find_standard_filesystem_spec(module)
+
+    assert type(spec) is ModuleSpec
 
 
 def test_zipimporter_directory_shape_accepts_implicit_directory_sentinels() -> None:
