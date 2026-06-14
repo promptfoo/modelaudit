@@ -13,6 +13,7 @@ import stat
 import sys
 import sysconfig
 import threading
+import zipimport
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -98,6 +99,8 @@ _TRUSTED_ZIPIMPORTER_METHODS = tuple(
     (name, getattr(zipimporter, name))
     for name in ("__init__", "find_spec", "get_code", "get_data", "get_filename", "get_source", "is_package")
 )
+_ZIPIMPORT_NAMESPACE = ModuleType.__getattribute__(zipimport, "__dict__")
+_ZIP_DIRECTORY_CACHE = dict.get(_ZIPIMPORT_NAMESPACE, "_zip_directory_cache")
 
 
 class _UnsafePathResolution:
@@ -3665,6 +3668,20 @@ def _zipimport_files_are_safe(files: object) -> bool:
     )
 
 
+def _zipimport_directory_cache_files(archive: str) -> object:
+    modules = _runtime_sys_modules_without_hooks()
+    if modules is None or dict.get(modules, "zipimport") is not zipimport:
+        return None
+    namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    if (
+        namespace is not _ZIPIMPORT_NAMESPACE
+        or dict.get(namespace, "_zip_directory_cache") is not _ZIP_DIRECTORY_CACHE
+        or type(_ZIP_DIRECTORY_CACHE) is not dict
+    ):
+        return None
+    return dict.get(cast(dict[str, object], _ZIP_DIRECTORY_CACHE), archive)
+
+
 def _file_finder_cache_is_safe(cache: object) -> bool:
     return (
         type(cache) is set
@@ -3714,14 +3731,15 @@ def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
             return False
         archive = dict.get(instance_state, "archive")
         prefix = dict.get(instance_state, "prefix")
-        files = dict.get(instance_state, "_files")
+        files = _zipimport_directory_cache_files(archive) if type(archive) is str else None
         return (
             set(instance_state) == set(expected_state)
             and type(archive) is str
             and archive == dict.get(expected_state, "archive")
             and type(prefix) is str
             and prefix == dict.get(expected_state, "prefix")
-            and files is dict.get(expected_state, "_files")
+            and dict.get(instance_state, "_files", files) is files
+            and dict.get(expected_state, "_files", files) is files
             and _zipimport_files_are_safe(files)
         )
     if not _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
