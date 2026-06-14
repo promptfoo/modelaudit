@@ -60,7 +60,7 @@ jobs:
   lint:
     name: Lint and Format
     needs: changes
-    # Always run on main branch, otherwise only if Python files changed
+    # Always run on main and merge_group, otherwise only if Python/workflow files changed
     if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -328,7 +328,7 @@ jobs:
   type-check:
     name: Type Check
     needs: changes
-    # Only run if Python files changed
+    # Always run on main and merge_group, otherwise only if Python/workflow files changed
     if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -467,7 +467,7 @@ jobs:
   test:
     name: Fast Tests (Python ${{ matrix.python-version }}, Shard ${{ matrix.shard-name }})
     needs: changes
-    # Only run if Python files changed
+    # Always run on main and merge_group, otherwise only if Python/workflow files changed
     if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     # Coverage runs in dedicated shards below, and the Python 3.12
