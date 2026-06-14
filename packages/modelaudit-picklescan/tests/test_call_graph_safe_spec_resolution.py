@@ -2000,6 +2000,37 @@ def test_cached_none_population_rejects_regular_archive_without_constructing_imp
     assert calls == []
 
 
+def test_cached_none_population_rejects_directory_to_zip_race_without_materializing_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path_entry = tmp_path / "cached-none-race"
+    path_entry.mkdir()
+    directory_cache = call_graph._ZIP_DIRECTORY_CACHE
+    assert type(directory_cache) is dict
+    cache_key = str(path_entry)
+    monkeypatch.delitem(directory_cache, cache_key, raising=False)
+    original_archive_state = call_graph._zipimport_archive_state_from_entry
+
+    def replace_directory_after_preflight(
+        entry: str,
+    ) -> tuple[str, str, str] | call_graph._UnsafePathResolution | None:
+        archive_state = original_archive_state(entry)
+        assert archive_state is None
+        path_entry.rmdir()
+        _write_oversized_zipimporter_archive(path_entry, "statistics", include_module=False)
+        return archive_state
+
+    monkeypatch.setattr(call_graph, "_zipimport_archive_state_from_entry", replace_directory_after_preflight)
+
+    assert not call_graph._path_importer_context_allows_trusted_cache_population(
+        (),
+        (f"{path_entry}=cached-none",),
+    )
+    assert path_entry.is_file()
+    assert not dict.__contains__(directory_cache, cache_key)
+
+
 def test_oversized_zip_candidate_tracking_does_not_construct_importer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

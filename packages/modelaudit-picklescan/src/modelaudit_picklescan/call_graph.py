@@ -4653,12 +4653,13 @@ def _path_importer_context_allows_trusted_cache_population(
             return False
         if state.startswith(("trusted:importlib.machinery.FileFinder:", "trusted:zipimport.zipimporter:")):
             continue
-        if (
-            state != "cached-none"
-            or _zipimport_archive_state_from_entry(path) is not None
-            or _fresh_standard_path_importer(path) is not None
-        ):
+        if state != "cached-none" or _zipimport_archive_state_from_entry(path) is not None:
             return False
+        try:
+            os.stat(path)
+        except OSError:
+            continue
+        return False
     return before_index == len(before)
 
 
