@@ -4237,6 +4237,8 @@ class _FileFinderResolutionSummary:
     observed_path_mtime: int | float | None = None
     observed_path_cache: object | None = None
     observed_relaxed_path_cache: object | None = None
+    observed_path_cache_snapshot: frozenset[str] | None = None
+    observed_relaxed_path_cache_snapshot: frozenset[str] | None = None
     path_mtime: int | float | None = None
     path_cache: frozenset[str] | None = None
     relaxed_path_cache: frozenset[str] | None = None
@@ -4258,6 +4260,17 @@ def _file_finder_cache_names_are_strings(
     return all(type(name) is str for name in path_cache) and all(type(name) is str for name in relaxed_path_cache)
 
 
+def _file_finder_cache_matches_snapshot(
+    cache: set[object] | frozenset[object],
+    snapshot: frozenset[str] | None,
+) -> bool:
+    return (
+        snapshot is not None
+        and len(cache) == len(snapshot)
+        and all(type(name) is str and name in snapshot for name in cache)
+    )
+
+
 def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | None:
     state = _file_finder_state(finder, cache_key)
     if state is None:
@@ -4271,10 +4284,17 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
             and summary.observed_path_mtime == path_mtime
             and path_cache is summary.observed_path_cache
             and relaxed_path_cache is summary.observed_relaxed_path_cache
+            and _file_finder_cache_matches_snapshot(path_cache, summary.observed_path_cache_snapshot)
+            and _file_finder_cache_matches_snapshot(
+                relaxed_path_cache,
+                summary.observed_relaxed_path_cache_snapshot,
+            )
         ):
             return summary.identity
         if not _file_finder_cache_names_are_strings(path_cache, relaxed_path_cache):
             return None
+        observed_path_cache_snapshot = frozenset(cast(Iterable[str], path_cache))
+        observed_relaxed_path_cache_snapshot = frozenset(cast(Iterable[str], relaxed_path_cache))
         canonical_state = _canonical_file_finder_state(finder_path)
         if canonical_state is None:
             return None
@@ -4284,10 +4304,8 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
             validated_path_cache = canonical_path_cache
             validated_relaxed_path_cache = canonical_relaxed_path_cache
         else:
-            validated_path_cache = frozenset(cast(Iterable[str], path_cache)) & canonical_path_cache
-            validated_relaxed_path_cache = (
-                frozenset(cast(Iterable[str], relaxed_path_cache)) & canonical_relaxed_path_cache
-            )
+            validated_path_cache = observed_path_cache_snapshot & canonical_path_cache
+            validated_relaxed_path_cache = observed_relaxed_path_cache_snapshot & canonical_relaxed_path_cache
         state_identity = _string_sequence_identity(
             (
                 finder_path,
@@ -4301,6 +4319,8 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
         summary.observed_path_mtime = state[2]
         summary.observed_path_cache = path_cache
         summary.observed_relaxed_path_cache = relaxed_path_cache
+        summary.observed_path_cache_snapshot = observed_path_cache_snapshot
+        summary.observed_relaxed_path_cache_snapshot = observed_relaxed_path_cache_snapshot
         summary.path_mtime = path_mtime
         summary.path_cache = validated_path_cache
         summary.relaxed_path_cache = validated_relaxed_path_cache

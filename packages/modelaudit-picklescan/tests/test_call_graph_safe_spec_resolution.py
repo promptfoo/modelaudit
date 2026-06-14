@@ -1911,6 +1911,71 @@ def test_file_finder_validation_does_not_mutate_live_cache(
         call_graph._cached_file_finder_resolution_summary.cache_clear()
 
 
+@pytest.mark.parametrize("mutation", ["remove", "add"])
+def test_file_finder_identity_revalidates_in_place_cache_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    module = "in_place_cache_module"
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_source = first_root / f"{module}.py"
+    second_source = second_root / f"{module}.py"
+    first_source.write_text("value = 'benign'\n", encoding="utf-8")
+    second_source.write_text("value = 'malicious'\n", encoding="utf-8")
+    first_entry = str(first_root)
+    second_entry = str(second_root)
+    first_finder = FileFinder(first_entry, *_standard_file_finder_loader_details())
+    second_finder = FileFinder(second_entry, *_standard_file_finder_loader_details())
+    assert first_finder.find_spec(module) is not None
+    assert second_finder.find_spec(module) is not None
+    first_state = object.__getattribute__(first_finder, "__dict__")
+    path_cache = cast(set[str], first_state["_path_cache"])
+    relaxed_path_cache = cast(set[str], first_state["_relaxed_path_cache"])
+    cache_name = f"{module}.py"
+    if mutation == "add":
+        path_cache.remove(cache_name)
+        relaxed_path_cache.discard(cache_name)
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module=module,
+        importer_cache={first_entry: first_finder, second_entry: second_finder},
+        search_path=[first_entry, second_entry],
+    ):
+        initial_identity = call_graph._file_finder_resolution_identity(first_finder, first_entry)
+        initial_spec = call_graph._find_standard_filesystem_spec(module)
+        assert initial_identity is not None
+        if mutation == "remove":
+            assert type(initial_spec) is ModuleSpec
+            assert initial_spec.origin == str(first_source)
+            path_cache.remove(cache_name)
+            relaxed_path_cache.discard(cache_name)
+        else:
+            assert isinstance(initial_spec, call_graph._UnsafePathResolution)
+            path_cache.add(cache_name)
+            relaxed_path_cache.add(cache_name)
+
+        runtime_spec = PathFinder.find_spec(module, [first_entry, second_entry])
+        changed_identity = call_graph._file_finder_resolution_identity(first_finder, first_entry)
+        modelaudit_spec = call_graph._find_standard_filesystem_spec(module)
+
+    assert type(runtime_spec) is ModuleSpec
+    assert changed_identity is not None and changed_identity != initial_identity
+    if mutation == "remove":
+        assert runtime_spec.origin == str(second_source)
+        assert isinstance(modelaudit_spec, call_graph._UnsafePathResolution)
+    else:
+        assert runtime_spec.origin == str(first_source)
+        assert type(modelaudit_spec) is ModuleSpec
+        assert modelaudit_spec.origin == runtime_spec.origin
+    assert first_state["_path_cache"] is path_cache
+    assert first_state["_relaxed_path_cache"] is relaxed_path_cache
+
+
 def test_file_finder_resolution_identity_caches_bounded_state_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1923,8 +1988,10 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
     finder_state = object.__getattribute__(finder, "__dict__")
     original_identity = call_graph._string_sequence_identity
     original_type_validation = call_graph._file_finder_cache_names_are_strings
+    original_snapshot_validation = call_graph._file_finder_cache_matches_snapshot
     work_count = 0
     type_validation_count = 0
+    snapshot_validation_work = 0
 
     def counted_identity(values: Iterable[str]) -> str:
         nonlocal work_count
@@ -1940,9 +2007,18 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
         type_validation_count += 1
         return original_type_validation(path_cache, relaxed_path_cache)
 
+    def counted_snapshot_validation(
+        cache: set[object] | frozenset[object],
+        snapshot: frozenset[str] | None,
+    ) -> bool:
+        nonlocal snapshot_validation_work
+        snapshot_validation_work += len(cache)
+        return original_snapshot_validation(cache, snapshot)
+
     call_graph._cached_file_finder_resolution_summary.cache_clear()
     monkeypatch.setattr(call_graph, "_string_sequence_identity", counted_identity)
     monkeypatch.setattr(call_graph, "_file_finder_cache_names_are_strings", counted_type_validation)
+    monkeypatch.setattr(call_graph, "_file_finder_cache_matches_snapshot", counted_snapshot_validation)
     try:
         first_identity = call_graph._file_finder_resolution_identity(finder, path_entry)
         assert first_identity is not None
@@ -1953,6 +2029,9 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
         assert call_graph._file_finder_resolution_identity(finder, path_entry) == first_identity
         assert not work_count > first_work_count
         assert type_validation_count == first_type_validation_count
+        assert (
+            0 < snapshot_validation_work <= len(finder_state["_path_cache"]) + len(finder_state["_relaxed_path_cache"])
+        )
 
         replacement_work_count = work_count
         finder_state["_path_cache"] = set(finder_state["_path_cache"])
