@@ -457,9 +457,8 @@ _LEGAL_TEXT_SIGNAL_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_LEGAL_TEXT_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{10,}={0,2}(?![A-Za-z0-9+/_=-])")
-_LEGAL_TEXT_HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
-_LEGAL_TEXT_MAX_ENCODED_TOKENS = 64
+_LEGAL_TEXT_BASE64_CHUNK_RE = re.compile(rb"[A-Za-z0-9+/_-]+={0,2}")
+_LEGAL_TEXT_HEX_CHUNK_RE = re.compile(rb"[A-Fa-f0-9]+")
 _LEGAL_TEXT_MAX_DECODED_BYTES = 1024 * 1024
 _LEGAL_TEXT_ENCODED_EXECUTION_RE = re.compile(
     rb"(?:"
@@ -469,7 +468,6 @@ _LEGAL_TEXT_ENCODED_EXECUTION_RE = re.compile(
     rb")",
     re.IGNORECASE,
 )
-_LEGAL_TEXT_PROTO0_GLOBAL_RE = re.compile(rb"(?=#?[ci][A-Za-z_][A-Za-z0-9_.]{0,127}\n[A-Za-z_][A-Za-z0-9_.]{0,127}\n)")
 _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES = 4096
 
 
@@ -2298,8 +2296,8 @@ class _PickleProbeWorkBudget:
 
 
 @dataclass
-class _LegalTextEmbeddedPickleProbeBudget:
-    """Bound aggregate candidate and opcode work across legal-text lookbehind."""
+class _LegalTextPickleCandidateBudget:
+    """Bound aggregate structural work across raw and decoded candidates."""
 
     remaining_candidates: int = _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES
     remaining_opcodes: int = PROTO0_1_MAX_PROBE_OPCODES
@@ -2663,22 +2661,6 @@ _PROTOCOLLESS_BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES = _BINARY_PICKLE_PRE_STOP_
     {"EXT1", "EXT2", "EXT4"}
 )
 _PICKLE_OPCODE_BY_BYTE = {ord(opcode.code): opcode for opcode in pickletools.opcodes}
-_STACK_GLOBAL_OPCODE_BYTE = ord(next(opcode.code for opcode in pickletools.opcodes if opcode.name == "STACK_GLOBAL"))
-_PROTOCOLLESS_BINARY_IMPORT_VALUE_START_BYTES = frozenset(
-    ord(opcode.code)
-    for opcode in pickletools.opcodes
-    if opcode.name
-    in {
-        "BINBYTES",
-        "BINBYTES8",
-        "BINSTRING",
-        "BINUNICODE",
-        "BINUNICODE8",
-        "SHORT_BINBYTES",
-        "SHORT_BINSTRING",
-        "SHORT_BINUNICODE",
-    }
-)
 _PICKLE_LINE_PAIR_OPCODES: frozenset[str] = frozenset({"GLOBAL", "INST"})
 _PICKLE_VARIABLE_LENGTH_HEADER_BYTES: dict[int, int] = {-2: 1, -3: 4, -4: 4, -5: 8}
 
@@ -5038,6 +5020,20 @@ def _is_valid_pickle_global_argument(argument: Any) -> bool:
     )
 
 
+def _has_invalid_pickle_opcode_argument(opcode_name: str, argument: Any) -> bool:
+    if opcode_name == "PROTO":
+        return not isinstance(argument, int) or argument > _MAX_FORWARD_COMPAT_BINARY_PICKLE_PROTOCOL
+    if opcode_name in {"PUT", "BINPUT", "LONG_BINPUT", "GET", "BINGET", "LONG_BINGET"}:
+        if not isinstance(argument, int) or argument < 0:
+            return True
+        return opcode_name in {"PUT", "BINPUT", "LONG_BINPUT"} and argument > _PICKLE_MAX_STRUCTURAL_MEMO_INDEX
+    if opcode_name in {"EXT1", "EXT2", "EXT4"}:
+        return not isinstance(argument, int) or argument <= 0
+    if opcode_name in {"GLOBAL", "INST"}:
+        return not _is_valid_pickle_global_argument(argument)
+    return False
+
+
 def _classify_initial_pickle_security_signal(
     sample: bytes,
     *,
@@ -5130,26 +5126,12 @@ def _classify_initial_pickle_security_signal(
                 opcode_name = opcode.name
                 if opcode_name == "FRAME":
                     _work_budget.saw_frame = True
-                invalid_opcode_argument = (
-                    opcode_name == "PROTO"
-                    and (not isinstance(argument, int) or argument > _MAX_FORWARD_COMPAT_BINARY_PICKLE_PROTOCOL)
-                ) or (
-                    opcode_name in {"PUT", "BINPUT", "LONG_BINPUT", "GET", "BINGET", "LONG_BINGET"}
-                    and (not isinstance(argument, int) or argument < 0)
-                )
-                invalid_opcode_argument = invalid_opcode_argument or (
-                    opcode_name in {"PUT", "BINPUT", "LONG_BINPUT"}
-                    and isinstance(argument, int)
-                    and argument > _PICKLE_MAX_STRUCTURAL_MEMO_INDEX
-                )
-                invalid_opcode_argument = invalid_opcode_argument or (
-                    opcode_name in {"EXT1", "EXT2", "EXT4"} and (not isinstance(argument, int) or argument <= 0)
-                )
-                invalid_opcode_argument = invalid_opcode_argument or (
-                    opcode_name in {"GLOBAL", "INST"} and not _is_valid_pickle_global_argument(argument)
-                )
-                if invalid_opcode_argument:
+                if _has_invalid_pickle_opcode_argument(opcode_name, argument):
                     return True if has_reachable_security_opcode else negative_result()
+                # The pure-Python unpickler resolves INST's class before it pops
+                # MARK, so a missing MARK does not prevent its import side effect.
+                if opcode_name == "INST":
+                    has_reachable_security_opcode = True
                 if not _apply_pickle_stack_effect(
                     opcode,
                     argument,
@@ -5345,14 +5327,228 @@ def _classify_pickle_security_payload(payload: bytes) -> str | None:
     return None
 
 
-def _decoded_token_pickle_route(decoded: bytes) -> str | None:
-    if _looks_like_binary_pickle_protocol(decoded[:4]):
-        return _classify_pickle_security_payload(decoded)
-    structural_route = _structural_legal_text_pickle_route(decoded)
-    if structural_route is not None:
-        return structural_route
-    if _LEGAL_TEXT_ENCODED_EXECUTION_RE.search(decoded) is not None:
+def _compact_pickle_global_argument(argument: Any) -> bool:
+    if not _is_valid_pickle_global_argument(argument):
+        return False
+    return all(
+        value
+        and not any(
+            character.isspace() or ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in value
+        )
+        for value in argument[1:]
+    )
+
+
+def _pickle_candidate_route(*, embedded: bool) -> str:
+    if embedded:
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return "pickle"
+
+
+def _incomplete_pickle_security_route(
+    *,
+    embedded: bool,
+    stream_start: int,
+    pre_stack_inst: bool,
+    security_events: list[tuple[int, str, bool]],
+) -> str | None:
+    if pre_stack_inst:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if not embedded and stream_start == 0 else None
+    if any(name in {"GLOBAL", "INST"} and not compact_argument for _index, name, compact_argument in security_events):
+        return None
+    if not security_events:
+        return None
+    has_strong_structure = (
+        stream_start > 0
+        or len(security_events) > 1
+        or any(index > 0 or compact_argument for index, _name, compact_argument in security_events)
+    )
+    if not has_strong_structure:
+        return None
+    return _pickle_candidate_route(embedded=embedded or stream_start > 0)
+
+
+def _classify_bounded_pickle_candidate(
+    candidate: bytes,
+    *,
+    embedded: bool,
+    budget: _LegalTextPickleCandidateBudget,
+) -> str | None:
+    """Classify one raw or decoded candidate with shared structural budgets."""
+    sample = candidate[:PROTO0_1_MAX_PROBE_BYTES]
+    if not sample:
+        return None
+
+    stream = _PickleProbeStream(sample)
+    memo: dict[Any, Any] = {}
+    hashability_cache: dict[int, tuple[Any, bool]] = {}
+    sample_is_prefix = len(candidate) > len(sample)
+
+    while stream.tell() < len(sample):
+        stream_start = stream.tell()
+        stack: list[Any] = []
+        security_events: list[tuple[int, str, bool]] = []
+        parsed_opcodes = 0
+        has_nontrivial_opcode = False
+        pre_stack_inst = False
+
+        try:
+            for opcode, argument, _position in _gen_pickle_probe_ops(stream):
+                if budget.remaining_opcodes <= 0:
+                    return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if parsed_opcodes else None
+                budget.remaining_opcodes -= 1
+                opcode_name = opcode.name
+                opcode_index = parsed_opcodes
+                parsed_opcodes += 1
+
+                if _has_invalid_pickle_opcode_argument(opcode_name, argument):
+                    return _incomplete_pickle_security_route(
+                        embedded=embedded,
+                        stream_start=stream_start,
+                        pre_stack_inst=pre_stack_inst,
+                        security_events=security_events,
+                    )
+                compact_argument = opcode_name in {"GLOBAL", "INST"} and _compact_pickle_global_argument(argument)
+                if opcode_name == "INST" and compact_argument:
+                    pre_stack_inst = True
+
+                if not _apply_pickle_stack_effect(
+                    opcode,
+                    argument,
+                    stack,
+                    memo,
+                    hashability_cache,
+                ):
+                    return _incomplete_pickle_security_route(
+                        embedded=embedded,
+                        stream_start=stream_start,
+                        pre_stack_inst=pre_stack_inst,
+                        security_events=security_events,
+                    )
+
+                if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:
+                    security_events.append((opcode_index, opcode_name, compact_argument))
+                if opcode_name not in {"GLOBAL", "STOP"} and opcode_name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                    has_nontrivial_opcode = True
+                if opcode_name != "STOP":
+                    continue
+
+                if security_events or (has_nontrivial_opcode and not embedded):
+                    return _pickle_candidate_route(embedded=embedded)
+                break
+        except _PickleNumericOperandLimitExceeded:
+            route = _incomplete_pickle_security_route(
+                embedded=embedded,
+                stream_start=stream_start,
+                pre_stack_inst=pre_stack_inst,
+                security_events=security_events,
+            )
+            return route if route is not None else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        except ValueError as exc:
+            route = _incomplete_pickle_security_route(
+                embedded=embedded,
+                stream_start=stream_start,
+                pre_stack_inst=pre_stack_inst,
+                security_events=security_events,
+            )
+            if route is not None:
+                return route
+            if sample_is_prefix and parsed_opcodes and "opcode" not in str(exc):
+                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+            return None
+        except (MemoryError, RecursionError):
+            route = _incomplete_pickle_security_route(
+                embedded=embedded,
+                stream_start=stream_start,
+                pre_stack_inst=pre_stack_inst,
+                security_events=security_events,
+            )
+            return route if route is not None else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        except Exception:
+            route = _incomplete_pickle_security_route(
+                embedded=embedded,
+                stream_start=stream_start,
+                pre_stack_inst=pre_stack_inst,
+                security_events=security_events,
+            )
+            if route is not None:
+                return route
+            if sample_is_prefix and parsed_opcodes:
+                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+            return None
+
+        if stream.tell() <= stream_start:
+            return _incomplete_pickle_security_route(
+                embedded=embedded,
+                stream_start=stream_start,
+                pre_stack_inst=pre_stack_inst,
+                security_events=security_events,
+            )
+        if stream.tell() == len(sample):
+            break
+
+    if sample_is_prefix:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return None
+
+
+def _iter_pickle_candidate_offsets(payload: bytes, *, scan_embedded: bool) -> Iterator[int]:
+    seen: set[int] = set()
+
+    def maybe_add(offset: int) -> Iterator[int]:
+        if offset not in seen and offset < len(payload) and payload[offset] in _PICKLE_OPCODE_BY_BYTE:
+            seen.add(offset)
+            yield offset
+
+    yield from maybe_add(0)
+    if not scan_embedded:
+        return
+
+    line_start = 0
+    for line_end in range(len(payload) + 1):
+        if line_end < len(payload) and payload[line_end] not in b"\r\n":
+            continue
+        candidate_start = line_start
+        while candidate_start < line_end and payload[candidate_start] in b" \t":
+            candidate_start += 1
+        yield from maybe_add(candidate_start)
+        line_start = line_end + 1
+
+    plain_controls = b"\t\n\r\f"
+    for offset, value in enumerate(payload):
+        if value not in _PICKLE_OPCODE_BY_BYTE:
+            continue
+        previous = payload[offset - 1] if offset else None
+        at_binary_boundary = value >= 0x7F or (value < 0x20 and value not in plain_controls)
+        after_binary_boundary = previous is not None and (
+            previous >= 0x7F or (previous < 0x20 and previous not in plain_controls)
+        )
+        if at_binary_boundary or after_binary_boundary:
+            yield from maybe_add(offset)
+
+
+def _bounded_pickle_candidate_route(
+    payload: bytes,
+    *,
+    budget: _LegalTextPickleCandidateBudget | None = None,
+    scan_embedded: bool = True,
+) -> str | None:
+    if budget is None:
+        budget = _LegalTextPickleCandidateBudget()
+
+    for offset in _iter_pickle_candidate_offsets(payload, scan_embedded=scan_embedded):
+        if budget.remaining_candidates <= 0:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        budget.remaining_candidates -= 1
+        route = _classify_bounded_pickle_candidate(
+            payload[offset:],
+            embedded=offset != 0,
+            budget=budget,
+        )
+        if route is not None:
+            return route
+        if budget.remaining_opcodes <= 0:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     return None
 
 
@@ -5366,482 +5562,60 @@ def _is_plain_alphabetic_base64_word(token: bytes) -> bool:
     return b"=" not in token and normalized.isalpha()
 
 
-def _pickletools_global_argument(argument: object) -> tuple[str, str] | None:
-    if not isinstance(argument, str):
-        return None
-    module, separator, name = argument.partition(" ")
-    if not separator or not module or not name:
-        return None
-    return module, name
+def _iter_encoded_route_tokens(payload: bytes, token_re: re.Pattern[bytes]) -> Iterator[bytes]:
+    block = bytearray()
+    block_lines = 0
 
-
-def _initial_proto0_import_argument(candidate: bytes) -> tuple[str, str] | None:
-    if not candidate or candidate[:1] not in {b"c", b"i"}:
-        return None
-    lines = candidate[1:].split(b"\n", 2)
-    if len(lines) < 2 or not lines[0] or not lines[1]:
-        return None
-    encoding = "ascii" if candidate[:1] == b"i" else "utf-8"
-    try:
-        return lines[0].decode(encoding), lines[1].decode(encoding)
-    except UnicodeDecodeError:
-        return None
-
-
-def _embedded_proto0_global_continuation_has_stack_evidence(candidate: bytes) -> bool:
-    """Return whether an embedded GLOBAL continuation can execute on its result.
-
-    A non-opcode continuation needs separate lookbehind proof that the GLOBAL is
-    reachable from an earlier pickle start. Truncated opcode operands remain
-    ambiguous, while a parsed continuation must consume the GLOBAL-only stack.
-    """
-    try:
-        operations = pickletools.genops(candidate)
-        global_opcode, global_argument, _ = next(operations)
-        if global_opcode.name != "GLOBAL":
-            return False
-        continuation_opcode, continuation_argument, _ = next(operations)
-        stack: list[Any] = []
-        memo: dict[Any, Any] = {}
-        hashability_cache: dict[int, tuple[Any, bool]] = {}
-        if not _apply_pickle_stack_effect(
-            global_opcode,
-            global_argument,
-            stack,
-            memo,
-            hashability_cache,
-        ):
-            return True
-        return _apply_pickle_stack_effect(
-            continuation_opcode,
-            continuation_argument,
-            stack,
-            memo,
-            hashability_cache,
-        )
-    except (StopIteration, UnicodeError):
-        return True
-    except ValueError as exc:
-        return "opcode" not in str(exc)
-    except (MemoryError, RecursionError):
-        return True
-    except Exception:
-        return True
-
-
-def _probe_embedded_proto0_stream_through_import(
-    candidate: bytes,
-    *,
-    import_offset: int,
-    budget: _LegalTextEmbeddedPickleProbeBudget,
-) -> bool | None:
-    """Classify one bounded lookbehind path through a target import opcode."""
-    stack: list[Any] = []
-    memo: dict[Any, Any] = {}
-    hashability_cache: dict[int, tuple[Any, bool]] = {}
-    try:
-        for opcode, argument, position in pickletools.genops(candidate):
-            if budget.remaining_opcodes <= 0:
-                return None
-            budget.remaining_opcodes -= 1
-            opcode_position = 0 if position is None else position
-            if opcode_position > import_offset:
-                return False
-            is_target_import = opcode_position == import_offset
-            if is_target_import:
-                global_argument = _pickletools_global_argument(argument)
-                if opcode.name not in {"GLOBAL", "INST"} or global_argument is None:
-                    return False
-            if not _apply_pickle_stack_effect(
-                opcode,
-                argument,
-                stack,
-                memo,
-                hashability_cache,
-            ):
-                return False
-            if is_target_import:
-                return True
-            if opcode.name == "STOP":
-                return False
-    except ValueError as exc:
-        error_message = str(exc)
-        truncated_at_import = (
-            import_offset < len(candidate)
-            and candidate[import_offset] in {ord("c"), ord("i")}
-            and error_message.startswith(PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES)
-        )
-        return None if truncated_at_import else False
-    except (MemoryError, RecursionError):
-        return False
-    except Exception:
-        return False
-    return False
-
-
-def _embedded_proto0_lookbehind_has_stack_evidence(
-    payload: bytes,
-    *,
-    import_offset: int,
-    budget: _LegalTextEmbeddedPickleProbeBudget,
-) -> bool | None:
-    """Probe plausible protocol-0 starts before an embedded import opcode."""
-    earliest_start = max(0, import_offset - PROTO0_1_MAX_PROBE_BYTES)
-    for start in range(import_offset - 1, earliest_start - 1, -1):
-        if payload[start] not in PROTO0_1_START_BYTES:
+    for raw_line in payload.splitlines():
+        line = raw_line.strip(b" \t")
+        if line and token_re.fullmatch(line) is not None:
+            block.extend(line)
+            block_lines += 1
             continue
-        if budget.remaining_candidates <= 0:
-            return None
-        budget.remaining_candidates -= 1
-        candidate_end = min(len(payload), start + PROTO0_1_MAX_PROBE_BYTES)
-        if import_offset >= candidate_end:
-            return None
-        state = _probe_embedded_proto0_stream_through_import(
-            payload[start:candidate_end],
-            import_offset=import_offset - start,
-            budget=budget,
-        )
-        if state is not False:
-            return state
-    if earliest_start > 0:
-        global_candidate = payload[import_offset : import_offset + PROTO0_1_MAX_PROBE_BYTES]
-        global_argument = _initial_proto0_import_argument(global_candidate)
-        if global_argument is not None:
-            continuation_state = _bounded_proto0_continuation_requires_prior_context(
-                payload[earliest_start:import_offset],
-                budget=budget,
-            )
-            if continuation_state is not False:
-                return continuation_state
-            boundary_state = _embedded_proto0_line_operand_suffix_has_stack_evidence(
-                payload,
-                earliest_start=earliest_start,
-                import_offset=import_offset,
-                budget=budget,
-            )
-            if boundary_state is not False:
-                return boundary_state
-    return False
+        if block_lines > 1:
+            yield bytes(block)
+        block.clear()
+        block_lines = 0
+    if block_lines > 1:
+        yield bytes(block)
 
-
-def _seed_pickle_prior_context(
-    opcode: Any,
-    argument: Any,
-    stack: list[Any],
-    memo: dict[Any, Any],
-) -> bool:
-    """Supply symbolic stack or memo values that may precede a bounded slice."""
-    seeded = False
-    before = opcode.stack_before
-    if pickletools.markobject in before and pickletools.markobject not in stack:
-        seed = [
-            pickletools.markobject if expected is pickletools.markobject else "any"
-            for expected in before
-            if expected is not pickletools.stackslice
-        ]
-        stack[0:0] = seed
-        seeded = True
-    elif pickletools.markobject not in before:
-        required_items = len(before)
-        if len(stack) < required_items:
-            stack[0:0] = ["any"] * (required_items - len(stack))
-            seeded = True
-
-    if opcode.name in {"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"} and not stack:
-        stack.append("any")
-        seeded = True
-    elif opcode.name in {"GET", "BINGET", "LONG_BINGET"} and argument not in memo:
-        memo[argument] = "any"
-        seeded = True
-    return seeded
-
-
-def _bounded_proto0_continuation_requires_prior_context(
-    candidate: bytes,
-    *,
-    budget: _LegalTextEmbeddedPickleProbeBudget,
-) -> bool | None:
-    """Recognize a bounded opcode continuation whose stack start is out of view."""
-    stack: list[Any] = []
-    memo: dict[Any, Any] = {}
-    hashability_cache: dict[int, tuple[Any, bool]] = {}
-    saw_opcode = False
-    required_prior_context = False
-    try:
-        for opcode, argument, _ in pickletools.genops(candidate):
-            if budget.remaining_opcodes <= 0:
-                return None if saw_opcode and required_prior_context else False
-            budget.remaining_opcodes -= 1
-            saw_opcode = True
-            if opcode.name == "STOP":
-                return False
-
-            if _seed_pickle_prior_context(opcode, argument, stack, memo):
-                required_prior_context = True
-
-            if not _apply_pickle_stack_effect(
-                opcode,
-                argument,
-                stack,
-                memo,
-                hashability_cache,
-            ):
-                return False
-    except ValueError as exc:
-        error_message = str(exc)
-        position_match = re.search(r"(?:at )?position (\d+)", error_message)
-        if position_match is not None and "opcode" in error_message:
-            return False
-        return saw_opcode and required_prior_context
-    except (MemoryError, RecursionError):
-        return None if saw_opcode and required_prior_context else False
-    except Exception:
-        return None if saw_opcode and required_prior_context else False
-    return saw_opcode and required_prior_context
-
-
-def _probe_embedded_proto0_suffix_through_import(
-    candidate: bytes,
-    *,
-    import_offset: int,
-    budget: _LegalTextEmbeddedPickleProbeBudget,
-) -> bool | None:
-    """Probe an argument-boundary suffix using context rooted before an import."""
-    stack: list[Any] = []
-    memo: dict[Any, Any] = {}
-    hashability_cache: dict[int, tuple[Any, bool]] = {}
-    required_prior_context = False
-    try:
-        for opcode, argument, position in pickletools.genops(candidate):
-            if budget.remaining_opcodes <= 0:
-                return None if required_prior_context else False
-            budget.remaining_opcodes -= 1
-            opcode_position = 0 if position is None else position
-            if opcode_position > import_offset:
-                return False
-            is_target_import = opcode_position == import_offset
-            if is_target_import:
-                global_argument = _pickletools_global_argument(argument)
-                if opcode.name not in {"GLOBAL", "INST"} or global_argument is None:
-                    return False
-            elif _seed_pickle_prior_context(opcode, argument, stack, memo):
-                required_prior_context = True
-            if not _apply_pickle_stack_effect(
-                opcode,
-                argument,
-                stack,
-                memo,
-                hashability_cache,
-            ):
-                return False
-            if is_target_import:
-                return required_prior_context
-            if opcode.name == "STOP":
-                return False
-    except ValueError:
-        return False
-    except (MemoryError, RecursionError):
-        return None if required_prior_context else False
-    except Exception:
-        return None if required_prior_context else False
-    return False
-
-
-def _embedded_proto0_line_operand_suffix_has_stack_evidence(
-    payload: bytes,
-    *,
-    earliest_start: int,
-    import_offset: int,
-    budget: _LegalTextEmbeddedPickleProbeBudget,
-) -> bool | None:
-    """Recover bounded opcode suffixes after protocol-0 line operands."""
-    newline_offset = payload.rfind(b"\n", earliest_start, import_offset)
-    while newline_offset >= earliest_start:
-        start = newline_offset + 1
-        if start < import_offset and payload[start] in _PICKLE_OPCODE_BY_BYTE:
-            if budget.remaining_candidates <= 0:
-                return None
-            budget.remaining_candidates -= 1
-            candidate_end = min(len(payload), start + PROTO0_1_MAX_PROBE_BYTES)
-            if import_offset >= candidate_end:
-                return None
-            state = _probe_embedded_proto0_suffix_through_import(
-                payload[start:candidate_end],
-                import_offset=import_offset - start,
-                budget=budget,
-            )
-            if state is not False:
-                return state
-        newline_offset = payload.rfind(b"\n", earliest_start, newline_offset)
-    return False
-
-
-def _validated_pickle_prefix_details(
-    candidate: bytes,
-) -> tuple[frozenset[str], tuple[tuple[str, str], ...], int] | None:
-    opcode_names: set[str] = set()
-    global_arguments: list[tuple[str, str]] = []
-    try:
-        for opcode_count, (opcode, _arg, position) in enumerate(pickletools.genops(candidate), start=1):
-            opcode_names.add(opcode.name)
-            if (
-                opcode.name in {"GLOBAL", "INST"}
-                and (global_argument := _pickletools_global_argument(_arg)) is not None
-            ):
-                global_arguments.append(global_argument)
-            if opcode.name == "STOP":
-                stop_position = 0 if position is None else position
-                pickletools.dis(candidate[: stop_position + 1], out=StringIO())
-                return frozenset(opcode_names), tuple(global_arguments), stop_position + 1
-            if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
-                return None
-    except (UnicodeError, ValueError):
-        return None
-    except (MemoryError, RecursionError):
-        return None
-    except Exception:
-        return None
-    return None
-
-
-def _legal_text_pickle_prefix_route(
-    candidate: bytes,
-    *,
-    embedded: bool,
-) -> str | None:
-    details = _validated_pickle_prefix_details(candidate)
-    if details is None:
-        global_argument = _initial_proto0_import_argument(candidate)
-        if global_argument is None:
-            return None
-        if embedded and (
-            candidate[:1] != b"c" or not _embedded_proto0_global_continuation_has_stack_evidence(candidate)
-        ):
-            return None
-        route = _classify_pickle_security_payload(candidate)
-        if route is None:
-            return None
-        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if embedded else route
-
-    opcodes, global_arguments, stop_end = details
-    trailing = candidate[stop_end:].lstrip(b" \t\r\n")
-    if trailing:
-        if _validated_pickle_prefix_details(trailing) is not None:
-            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if embedded else "pickle"
-        trailing_opcode = _PICKLE_OPCODE_BY_BYTE.get(trailing[0])
-        if trailing_opcode is not None and trailing_opcode.name in _BINARY_PICKLE_SECURITY_OPCODES:
-            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    has_import_reference = bool(global_arguments)
-    has_invocation = bool(opcodes & _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES.difference({"GLOBAL"}))
-    has_non_global_nontrivial_opcode = any(
-        opcode != "STOP" and opcode != "GLOBAL" and opcode not in PROTO0_1_TRIVIAL_LEADING_OPCODES for opcode in opcodes
-    )
-    if has_import_reference or has_invocation or has_non_global_nontrivial_opcode:
-        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if embedded else "pickle"
-    return None
-
-
-def _structural_legal_text_pickle_route(payload: bytes) -> str | None:
-    initial_route = _legal_text_pickle_prefix_route(payload[:PROTO0_1_MAX_PROBE_BYTES], embedded=False)
-    if initial_route is not None:
-        return initial_route
-
-    budget = _LegalTextEmbeddedPickleProbeBudget()
-    for match in _LEGAL_TEXT_PROTO0_GLOBAL_RE.finditer(payload):
-        if budget.remaining_candidates <= 0:
-            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-        budget.remaining_candidates -= 1
-        offset = match.start()
-        parse_offset = offset + 1 if payload[offset : offset + 1] == b"#" else offset
-        candidate = payload[parse_offset : parse_offset + PROTO0_1_MAX_PROBE_BYTES]
-        route = _legal_text_pickle_prefix_route(candidate, embedded=offset != 0)
-        if route is not None:
-            return route
-        if offset != 0:
-            lookbehind_state = _embedded_proto0_lookbehind_has_stack_evidence(
-                payload,
-                import_offset=parse_offset,
-                budget=budget,
-            )
-            if lookbehind_state is not False:
-                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    return None
+    for match in token_re.finditer(payload):
+        yield match.group(0)
 
 
 def _encoded_pickle_route(payload: bytes) -> str | None:
-    decoded_budget = _LEGAL_TEXT_MAX_DECODED_BYTES
-    seen_tokens: set[tuple[str, bytes]] = set()
-    token_count = 0
+    budget = _LegalTextPickleCandidateBudget()
 
-    for decoder_name, token_re, decoder in (
-        ("base64", _LEGAL_TEXT_BASE64_TOKEN_RE, _decode_base64_route_token),
-        ("hex", _LEGAL_TEXT_HEX_TOKEN_RE, binascii.unhexlify),
+    for decoder_name, token_re, minimum_length, decoder in (
+        ("base64", _LEGAL_TEXT_BASE64_CHUNK_RE, 4, _decode_base64_route_token),
+        ("hex", _LEGAL_TEXT_HEX_CHUNK_RE, 6, binascii.unhexlify),
     ):
-        for match in token_re.finditer(payload):
-            token = match.group(0)
-            token_key = (decoder_name, token)
-            if token_key in seen_tokens:
+        for token in _iter_encoded_route_tokens(payload, token_re):
+            if len(token) < minimum_length:
                 continue
-            seen_tokens.add(token_key)
             try:
                 decoded = decoder(token)
             except (binascii.Error, ValueError):
                 continue
             if not decoded:
                 continue
-            route = _decoded_token_pickle_route(decoded)
+            if len(decoded) > _LEGAL_TEXT_MAX_DECODED_BYTES:
+                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+            route = _bounded_pickle_candidate_route(
+                decoded,
+                budget=budget,
+                scan_embedded=not (decoder_name == "base64" and _is_plain_alphabetic_base64_word(token)),
+            )
             if route is not None:
                 return route
-            if decoder_name == "base64" and _is_plain_alphabetic_base64_word(token):
-                continue
-            if token_count >= _LEGAL_TEXT_MAX_ENCODED_TOKENS or len(decoded) > decoded_budget:
+            if _LEGAL_TEXT_ENCODED_EXECUTION_RE.search(decoded) is not None:
                 return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-            token_count += 1
-            decoded_budget -= len(decoded)
-    return None
-
-
-def _embedded_protocolless_binary_pickle_route(payload: bytes) -> str | None:
-    """Boundedly probe binary import streams that omit the PROTO opcode."""
-    if _STACK_GLOBAL_OPCODE_BYTE not in payload:
-        return None
-    if _decode_complete_utf8_plain_text(payload) is not None:
-        return None
-
-    remaining_candidates = _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES
-    work_budget = _PickleProbeWorkBudget()
-    for offset, value in enumerate(payload):
-        if value not in _PROTOCOLLESS_BINARY_IMPORT_VALUE_START_BYTES:
-            continue
-        if remaining_candidates <= 0:
-            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-        remaining_candidates -= 1
-        candidate_end = min(len(payload), offset + PROTO0_1_MAX_PROBE_BYTES)
-        state = _classify_initial_pickle_security_signal(
-            payload[offset:candidate_end],
-            sample_is_prefix=candidate_end < len(payload),
-            available_stream_length=len(payload) - offset,
-            _work_budget=work_budget,
-        )
-        if state is True:
-            return "pickle" if offset == 0 else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-        if state is None:
-            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     return None
 
 
 def _embedded_raw_pickle_route(payload: bytes) -> str | None:
-    binary_offset = payload.find(b"\x80")
-    while binary_offset != -1:
-        if _looks_like_binary_pickle_protocol(payload[binary_offset : binary_offset + 4]):
-            return "pickle" if binary_offset == 0 else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-        binary_offset = payload.find(b"\x80", binary_offset + 1)
-
-    protocol_less_route = _embedded_protocolless_binary_pickle_route(payload)
-    if protocol_less_route is not None:
-        return protocol_less_route
-
-    return _structural_legal_text_pickle_route(payload)
+    return _bounded_pickle_candidate_route(payload)
 
 
 def _legal_text_sidecar_route_from_bytes(

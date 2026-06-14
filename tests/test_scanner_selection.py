@@ -69,6 +69,10 @@ def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
     )
 
 
+def _wrap_encoded_lines(payload: bytes, width: int) -> bytes:
+    return b"\n".join(payload[offset : offset + width] for offset in range(0, len(payload), width))
+
+
 def _malicious_lightgbm_legal_payload() -> bytes:
     return (
         b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
@@ -782,6 +786,49 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         assert any(check.name == "Pickle Routing" for check in result.checks)
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_exit_code"),
+    [
+        pytest.param(
+            b"C\tAAAAAAAAAcmystery_module\nthing\nApache License\n",
+            1,
+            id="short-binbytes-then-GLOBAL",
+        ),
+        pytest.param(b"imystery_module\nThing\nApache License\n", 2, id="initial-INST-without-MARK"),
+        pytest.param(base64.b64encode(b"cb\nx\n."), 1, id="short-base64"),
+        pytest.param(binascii.hexlify(b"cb\nx\n."), 1, id="short-hex"),
+        pytest.param(
+            _wrap_encoded_lines(base64.b64encode(b"cbuiltins\neval\n(V1+1\ntR."), 8),
+            1,
+            id="line-wrapped-base64",
+        ),
+        pytest.param(
+            _wrap_encoded_lines(binascii.hexlify(b"cbuiltins\neval\n(V1+1\ntR."), 18),
+            1,
+            id="line-wrapped-hex",
+        ),
+        pytest.param(b"MIT License\n\x82\x01)R.", 2, id="embedded-EXT1"),
+        pytest.param(b"MIT License\nPid\n)R.", 2, id="embedded-PERSID"),
+        pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
+    ],
+)
+def test_scan_file_rejects_shared_structural_pickle_bypasses(
+    tmp_path: Path,
+    payload: bytes,
+    expected_exit_code: int,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert determine_exit_code(result) == expected_exit_code
+    assert result.scanner_names == (["pickle"] if expected_exit_code == 1 else [])
+    if expected_exit_code == 2:
+        assert result.success is False
+        assert any(check.name == "Pickle Routing" for check in result.checks)
+
+
 def test_scan_file_keeps_allowlisted_import_only_global_on_pickle_route(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     path.write_bytes(b"(cbuiltins\nset\nS'MIT License'\nl.")
@@ -901,11 +948,22 @@ def test_scan_file_routes_proven_leading_pickle_before_oversized_legal_fallback(
     assert any(issue.rule_code == "S201" for issue in result.issues)
 
 
-def test_scan_file_fails_closed_for_long_embedded_protocol0_license_text_and_does_not_cache(
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(_long_embedded_protocol0_pickle_in_legal_text(), id="long-embedded-GLOBAL"),
+        pytest.param(
+            b"imystery_module\nThing\nApache License\n",
+            id="initial-INST-without-MARK",
+        ),
+    ],
+)
+def test_scan_file_fails_closed_for_structural_legal_pickle_candidate_and_does_not_cache(
     tmp_path: Path,
+    payload: bytes,
 ) -> None:
     path = tmp_path / "LICENSE"
-    path.write_bytes(_long_embedded_protocol0_pickle_in_legal_text())
+    path.write_bytes(payload)
     cache_dir = tmp_path / "cache"
 
     reset_cache_manager()

@@ -18,7 +18,6 @@ from modelaudit.detectors.secrets import SecretsDetector
 from modelaudit.scanner_registry_metadata import (
     LEGAL_TEXT_SIDECAR_BASENAMES,
     LEGAL_TEXT_SIDECAR_EXTENSIONS,
-    MAIN_OWNED_LEGAL_TEXT_FILENAMES,
     TOKENIZER_VOCABULARY_CONTENT_FILENAMES,
 )
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -817,8 +816,6 @@ class TextScanner(BaseScanner):
         """Check if this scanner can handle the given file."""
         filename = os.path.basename(path).lower()
         if cls._is_model_card_documentation_filename(filename) or cls._is_readme_documentation_filename(filename):
-            return True
-        if filename in MAIN_OWNED_LEGAL_TEXT_FILENAMES:
             return True
         if cls._is_legal_documentation_filename(filename):
             return cls._is_valid_legal_documentation_file(path)

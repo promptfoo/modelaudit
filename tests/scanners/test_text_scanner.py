@@ -200,6 +200,9 @@ def test_text_scanner_does_not_claim_misleading_pickle_suffix(tmp_path: Path) ->
     [
         ("LICENSE", b"MIT License\nCopyright \xe2\x82"),
         ("NOTICE", b"NOTICE\nCopyright\x00"),
+        ("LICENSE.txt", b"MIT License\nCopyright \xe2\x82"),
+        ("LICENSE.md", b"MIT License\nCopyright\x00"),
+        ("LICENSE.rst", b"MIT License\nCopyright\xff"),
     ],
 )
 def test_text_scanner_does_not_claim_invalid_legal_sidecar_fallback(

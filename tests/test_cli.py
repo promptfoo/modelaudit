@@ -709,6 +709,9 @@ def test_scan_cli_keeps_pickle_shaped_legal_prose_on_text_route(tmp_path: Path) 
     [
         ("LICENSE", b"MIT License\nCopyright \xe2\x82"),
         ("NOTICE", b"NOTICE\nCopyright\x00"),
+        ("LICENSE.txt", b"MIT License\nCopyright \xe2\x82"),
+        ("LICENSE.md", b"MIT License\nCopyright\x00"),
+        ("LICENSE.rst", b"MIT License\nCopyright\xff"),
         ("LICENSE.pkl", b"MIT License\nCopyright (c) Example\n"),
     ],
 )

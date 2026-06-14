@@ -1,4 +1,5 @@
 import base64
+import binascii
 import builtins
 import bz2
 import gzip
@@ -62,6 +63,10 @@ def _npy_payload() -> bytes:
     payload = io.BytesIO()
     np.save(payload, np.arange(3))
     return payload.getvalue()
+
+
+def _wrap_encoded_lines(payload: bytes, width: int) -> bytes:
+    return b"\n".join(payload[offset : offset + width] for offset in range(0, len(payload), width))
 
 
 def _assert_inconclusive_zip_aggregate_not_cached(
@@ -11222,6 +11227,81 @@ class TestZipScanner:
         _assert_inconclusive_pickle_member(result, archive_path, "LICENSE")
 
     @pytest.mark.parametrize(
+        ("payload", "expected_exit_code"),
+        [
+            pytest.param(
+                b"C\tAAAAAAAAAcmystery_module\nthing\nApache License\n",
+                1,
+                id="short-binbytes-then-GLOBAL",
+            ),
+            pytest.param(b"imystery_module\nThing\nApache License\n", 2, id="initial-INST-without-MARK"),
+            pytest.param(base64.b64encode(b"cb\nx\n."), 1, id="short-base64"),
+            pytest.param(binascii.hexlify(b"cb\nx\n."), 1, id="short-hex"),
+            pytest.param(
+                _wrap_encoded_lines(base64.b64encode(b"cbuiltins\neval\n(V1+1\ntR."), 8),
+                1,
+                id="line-wrapped-base64",
+            ),
+            pytest.param(
+                _wrap_encoded_lines(binascii.hexlify(b"cbuiltins\neval\n(V1+1\ntR."), 18),
+                1,
+                id="line-wrapped-hex",
+            ),
+            pytest.param(b"MIT License\n\x82\x01)R.", 2, id="embedded-EXT1"),
+            pytest.param(b"MIT License\nPid\n)R.", 2, id="embedded-PERSID"),
+            pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
+        ],
+    )
+    def test_scan_zip_rejects_shared_structural_pickle_bypasses(
+        self,
+        tmp_path: Path,
+        payload: bytes,
+        expected_exit_code: int,
+    ) -> None:
+        archive_path = tmp_path / "structural_pickle_bypass.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", payload)
+
+        result = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert core.determine_exit_code(result) == expected_exit_code
+        assert result.success is False
+        if expected_exit_code == 2:
+            assert any(
+                check.name == "Pickle Routing" and check.details.get("zip_entry") == "LICENSE"
+                for check in result.checks
+            )
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(b"C\tAAAAAAAAAApache License\n", id="short-binbytes-without-import"),
+            pytest.param(
+                _wrap_encoded_lines(base64.b64encode(b"hello world"), 8),
+                id="line-wrapped-benign-base64",
+            ),
+            pytest.param(
+                _wrap_encoded_lines(binascii.hexlify(b"hello world"), 18),
+                id="line-wrapped-benign-hex",
+            ),
+        ],
+    )
+    def test_scan_zip_preserves_benign_structural_pickle_near_matches(
+        self,
+        tmp_path: Path,
+        payload: bytes,
+    ) -> None:
+        archive_path = tmp_path / "benign_structural_pickle_near_match.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE.txt", payload)
+
+        result = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert core.determine_exit_code(result) == 0
+        assert result.success is True
+        assert not any(check.name == "Pickle Routing" for check in result.checks)
+
+    @pytest.mark.parametrize(
         "padding_size",
         [
             file_detection.PROTO0_1_MAX_PROBE_BYTES - 2,
@@ -11405,17 +11485,31 @@ class TestZipScanner:
         assert result.success is False
         assert any(issue.rule_code == "S201" and issue.details.get("zip_entry") == "LICENSE" for issue in result.issues)
 
-    def test_scan_zip_does_not_text_route_invalid_legal_member(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("member_name", "payload"),
+        [
+            pytest.param("LICENSE", b"MIT License\nCopyright\x00", id="extensionless"),
+            pytest.param("LICENSE.txt", b"MIT License\nCopyright\x00", id="txt"),
+            pytest.param("LICENSE.md", b"MIT License\nCopyright \xe2\x82", id="markdown"),
+            pytest.param("LICENSE.rst", b"MIT License\nCopyright\xff", id="rst"),
+        ],
+    )
+    def test_scan_zip_does_not_text_route_invalid_legal_member(
+        self,
+        tmp_path: Path,
+        member_name: str,
+        payload: bytes,
+    ) -> None:
         archive_path = tmp_path / "invalid_legal_member.zip"
         with zipfile.ZipFile(archive_path, "w") as z:
-            z.writestr("LICENSE", b"MIT License\nCopyright\x00")
+            z.writestr(member_name, payload)
 
         result = self.scanner.scan(str(archive_path))
 
         assert not any(
             check.name == "File Type Identification"
             and check.details.get("file_type") == "license"
-            and check.details.get("zip_entry") == "LICENSE"
+            and check.details.get("zip_entry") == member_name
             for check in result.checks
         )
 

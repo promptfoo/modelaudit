@@ -74,6 +74,10 @@ def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
     )
 
 
+def _wrap_encoded_lines(payload: bytes, width: int) -> bytes:
+    return b"\n".join(payload[offset : offset + width] for offset in range(0, len(payload), width))
+
+
 def _lightgbm_text_payload(*extra_lines: str) -> bytes:
     lines = [
         "tree",
@@ -3583,7 +3587,7 @@ def test_detect_file_format_does_not_treat_license_prose_as_encoded_payload_budg
     path.write_text(
         "Apache License\nCopyright 2026 Example\n"
         "Redistribution for operating systems and documentation.\n"
-        + " ".join(alpha_word(index) for index in range((file_detection._LEGAL_TEXT_MAX_ENCODED_TOKENS + 1) ** 2)),
+        + " ".join(alpha_word(index) for index in range(65**2)),
         encoding="utf-8",
     )
 
@@ -3606,10 +3610,7 @@ def test_detect_file_format_keeps_urlsafe_shaped_legal_prose_on_text_route(
         return "".join(letters)
 
     path = tmp_path / "LICENSE"
-    words = [
-        f"third{separator}party{separator}{alpha_suffix(index)}"
-        for index in range(file_detection._LEGAL_TEXT_MAX_ENCODED_TOKENS + 1)
-    ]
+    words = [f"third{separator}party{separator}{alpha_suffix(index)}" for index in range(65)]
     path.write_text(
         "MIT License\nCopyright Example\n" + " ".join(words),
         encoding="utf-8",
@@ -3734,6 +3735,172 @@ def test_protocol0_import_side_effect_precedes_invalid_continuation(
 
     assert import_calls == ["mystery_module"]
     assert len(constructor_calls) == expected_constructor_calls
+
+
+def test_initial_inst_import_side_effect_precedes_missing_mark_in_pure_python_unpickler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = types.ModuleType("mystery_module")
+
+    class Thing:
+        pass
+
+    module.__dict__["Thing"] = Thing
+    monkeypatch.setitem(sys.modules, "mystery_module", module)
+    real_import = builtins.__import__
+    import_calls: list[str] = []
+
+    def tracking_import(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        if name == "mystery_module":
+            import_calls.append(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", tracking_import)
+
+    with pytest.raises(IndexError):
+        pickle._Unpickler(io.BytesIO(b"imystery_module\nThing\nApache License\n")).load()
+
+    assert import_calls == ["mystery_module"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_format"),
+    [
+        pytest.param(
+            b"C\tAAAAAAAAAcmystery_module\nthing\nApache License\n",
+            "pickle",
+            id="short-binbytes-then-GLOBAL",
+        ),
+        pytest.param(
+            b"imystery_module\nThing\nApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="initial-INST-without-MARK",
+        ),
+        pytest.param(b"cb\nx\n.", "pickle", id="short-GLOBAL"),
+        pytest.param(
+            b"MIT License\n\x82\x01)R.",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-EXT1",
+        ),
+        pytest.param(
+            b"MIT License\nPid\n)R.",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-PERSID",
+        ),
+        pytest.param(
+            b"mit\nVb\nVx\n\x93)R.",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-STACK_GLOBAL-unicode",
+        ),
+        pytest.param(
+            b"mit\nVb\np0\nVx\np1\ng0\ng1\n\x93)R.",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-STACK_GLOBAL-memo",
+        ),
+        pytest.param(
+            b"MIT License\ncevil-module\nthing\nApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-GLOBAL-punctuation",
+        ),
+    ],
+)
+def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_paths(
+    tmp_path: Path,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(path)) == expected_format
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_format"),
+    [
+        pytest.param(base64.b64encode(b"cb\nx\n."), "pickle", id="short-base64"),
+        pytest.param(binascii.hexlify(b"cb\nx\n."), "pickle", id="short-hex"),
+        pytest.param(
+            _wrap_encoded_lines(base64.b64encode(b"cbuiltins\neval\n(V1+1\ntR."), 8),
+            "pickle",
+            id="line-wrapped-base64",
+        ),
+        pytest.param(
+            _wrap_encoded_lines(binascii.hexlify(b"cbuiltins\neval\n(V1+1\ntR."), 18),
+            "pickle",
+            id="line-wrapped-hex",
+        ),
+        pytest.param(
+            base64.b64encode(b"imystery_module\nThing\nApache License\n"),
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="base64-initial-INST",
+        ),
+        pytest.param(
+            binascii.hexlify(b"imystery_module\nThing\nApache License\n"),
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="hex-initial-INST",
+        ),
+        pytest.param(
+            base64.urlsafe_b64encode(b"\xfb\x8c\x01b\x8c\x01x\x93)R."),
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="base64-prefixed-STACK_GLOBAL",
+        ),
+    ],
+)
+def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candidates(
+    tmp_path: Path,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(path)) == expected_format
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"C\tAAAAAAAAAApache License\n", id="short-binbytes-without-import"),
+        pytest.param(
+            _wrap_encoded_lines(base64.b64encode(b"hello world"), 8),
+            id="line-wrapped-benign-base64",
+        ),
+        pytest.param(
+            _wrap_encoded_lines(binascii.hexlify(b"hello world"), 18),
+            id="line-wrapped-benign-hex",
+        ),
+    ],
+)
+def test_legal_sidecar_structural_candidate_routing_preserves_benign_near_matches(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    path = tmp_path / "LICENSE.txt"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
+
+
+def test_legal_sidecar_encoded_budget_ignores_benign_license_reference_tokens(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"MIT License\n" + b"\n".join(f"LicenseRef-2026-{index:04d}".encode() for index in range(70)))
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
 @pytest.mark.parametrize(
