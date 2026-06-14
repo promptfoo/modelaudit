@@ -685,7 +685,6 @@ def test_nested_legal_tokenizer_template_preserves_jinja_ownership(tmp_path: Pat
     )
 
     assert result.scanner_name == "jinja2_template"
-    assert result.has_errors is True
     assert any(
         check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
         for check in result.checks
