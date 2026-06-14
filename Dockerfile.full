@@ -19,7 +19,7 @@ COPY . .
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 libcap2 libssl3t64 libsystemd0 libudev1 \
     && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
-    && case "${TARGETARCH}" in \
+    && case "${TARGETARCH:=$(dpkg --print-architecture)}" in \
         amd64) rustup_target="x86_64-unknown-linux-gnu"; rustup_sha256="${RUSTUP_INIT_X86_64_UNKNOWN_LINUX_GNU_SHA256}" ;; \
         arm64) rustup_target="aarch64-unknown-linux-gnu"; rustup_sha256="${RUSTUP_INIT_AARCH64_UNKNOWN_LINUX_GNU_SHA256}" ;; \
         *) echo "Unsupported Docker build architecture: ${TARGETARCH}" >&2; exit 1 ;; \
