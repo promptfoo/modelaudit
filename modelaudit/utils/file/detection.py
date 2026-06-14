@@ -5352,12 +5352,14 @@ def _incomplete_pickle_security_route(
     pre_stack_inst: bool,
     security_events: list[tuple[int, str, bool]],
 ) -> str | None:
-    if pre_stack_inst:
+    if pre_stack_inst and not any(name == "INST" for _index, name, _compact in security_events):
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if not embedded and stream_start == 0 else None
     if any(name in {"GLOBAL", "INST"} and not compact_argument for _index, name, compact_argument in security_events):
         return None
     if not security_events:
         return None
+    if any(name == "INST" for _index, name, _compact in security_events):
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     has_strong_structure = (
         stream_start > 0
         or len(security_events) > 1

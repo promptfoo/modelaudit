@@ -3782,6 +3782,11 @@ def test_initial_inst_import_side_effect_precedes_missing_mark_in_pure_python_un
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="initial-INST-without-MARK",
         ),
+        pytest.param(
+            b"MIT License\n(imystery_module\nThing\nApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-stack-valid-INST",
+        ),
         pytest.param(b"cb\nx\n.", "pickle", id="short-GLOBAL"),
         pytest.param(
             b"MIT License\n\x82\x01)R.",

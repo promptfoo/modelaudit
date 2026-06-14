@@ -11235,6 +11235,11 @@ class TestZipScanner:
                 id="short-binbytes-then-GLOBAL",
             ),
             pytest.param(b"imystery_module\nThing\nApache License\n", 2, id="initial-INST-without-MARK"),
+            pytest.param(
+                b"MIT License\n(imystery_module\nThing\nApache License\n",
+                2,
+                id="embedded-stack-valid-INST",
+            ),
             pytest.param(base64.b64encode(b"cb\nx\n."), 1, id="short-base64"),
             pytest.param(binascii.hexlify(b"cb\nx\n."), 1, id="short-hex"),
             pytest.param(
