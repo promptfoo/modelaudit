@@ -5951,6 +5951,13 @@ def _alphabetic_base64_has_pickle_signal(token: bytes) -> bool:
         return False
 
 
+def _alphabetic_base64_has_exact_weak_pickle_signal(token: bytes) -> bool:
+    try:
+        return _decoded_base64_has_exact_weak_pickle_signal(_decode_base64_route_token(token))
+    except (binascii.Error, ValueError):
+        return False
+
+
 def _alphabetic_base64_has_line_or_protocol_pickle_signal(token: bytes) -> bool:
     try:
         return _decoded_base64_has_line_or_protocol_pickle_signal(_decode_base64_route_token(token))
@@ -5968,6 +5975,7 @@ def _iter_encoded_route_tokens(
     trusted_start: int | None = None
     alphabetic_starts: dict[int, int] = {}
     recent_starts: deque[int] = deque()
+    pending_weak_tokens: dict[int, bytes] = {}
 
     def flush_block() -> Iterator[bytes]:
         if trusted_start is not None:
@@ -5987,6 +5995,7 @@ def _iter_encoded_route_tokens(
         block.clear()
         alphabetic_starts.clear()
         recent_starts.clear()
+        pending_weak_tokens.clear()
 
     for raw_line in payload.splitlines():
         line = raw_line.strip(b" \t")
@@ -6022,7 +6031,16 @@ def _iter_encoded_route_tokens(
                     if _alphabetic_base64_has_line_or_protocol_pickle_signal(token):
                         yield token
                 while recent_starts and len(block) - recent_starts[0] > _RECENT_EXACT_BASE64_MAX_CHARS:
-                    recent_starts.popleft()
+                    expired_start = recent_starts.popleft()
+                    pending_token = pending_weak_tokens.pop(expired_start, None)
+                    if pending_token is not None:
+                        yield pending_token
+                for start in recent_starts:
+                    token = bytes(block[start:])
+                    if _alphabetic_base64_has_exact_weak_pickle_signal(token):
+                        pending_weak_tokens[start] = token
+                    else:
+                        pending_weak_tokens.pop(start, None)
             if b"=" not in encoded_line:
                 continue
 

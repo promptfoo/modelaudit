@@ -4116,6 +4116,9 @@ def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_pa
         pytest.param(b"MIT License\ngwEA\n", "pickle", id="base64-unpadded-alphabetic-EXT2"),
         pytest.param(b"MIT License\nggE\n", "pickle", id="base64-unpadded-alphabetic-EXT1"),
         pytest.param(b"MIT License\nlw\n", "pickle", id="base64-unpadded-alphabetic-NEXT_BUFFER"),
+        pytest.param(b"MIT License\ngwEA\nCopyright\n", "pickle", id="base64-EXT2-before-prose"),
+        pytest.param(b"MIT License\nggE\nCopyright\n", "pickle", id="base64-EXT1-before-prose"),
+        pytest.param(b"MIT License\nlw\nCopyright\n", "pickle", id="base64-NEXT_BUFFER-before-prose"),
         pytest.param(
             b"MIT License\ngASMAWGMAWGTLg\n",
             "pickle",
