@@ -221,3 +221,23 @@ def test_check_framework_returns_false_when_package_import_fails(
     root_conftest = _load_root_conftest()
 
     assert root_conftest._check_framework("broken_framework") is False
+
+
+def test_nodeid_sharding_is_stable_disjoint_and_exhaustive() -> None:
+    root_conftest = _load_root_conftest()
+    nodeids = [f"tests/test_example.py::test_case[{index}]" for index in range(1_000)]
+
+    first_assignment = [root_conftest._nodeid_shard(nodeid, 5) for nodeid in nodeids]
+    second_assignment = [root_conftest._nodeid_shard(nodeid, 5) for nodeid in nodeids]
+
+    assert first_assignment == second_assignment
+    assert set(first_assignment) == set(range(5))
+    for nodeid in nodeids:
+        assert sum(root_conftest._nodeid_shard(nodeid, 5) == index for index in range(5)) == 1
+
+
+def test_nodeid_sharding_rejects_non_positive_count() -> None:
+    root_conftest = _load_root_conftest()
+
+    with pytest.raises(ValueError, match="shard_count must be positive"):
+        root_conftest._nodeid_shard("tests/test_example.py::test_case", 0)
