@@ -998,10 +998,12 @@ def test_scan_multiple_cross_directory_zero_based_shards_requires_index_authorit
         shard_paths.append(str(shard_path))
         weight_map[f"tensor-{shard_index}"] = shard_path.relative_to(tmp_path).as_posix()
     if with_index:
-        (tmp_path / "model.safetensors.index.json").write_text(
+        index_path = tmp_path / "model.safetensors.index.json"
+        index_path.write_text(
             json.dumps({"weight_map": weight_map}),
             encoding="utf-8",
         )
+        index_path.chmod(0o644)
 
     result = CliRunner().invoke(
         cli,
@@ -1022,6 +1024,58 @@ def test_scan_multiple_cross_directory_zero_based_shards_requires_index_authorit
             check.get("details", {}).get("scan_outcome_reason") == "unexpected_model_shards"
             for check in output_payload["checks"]
         )
+
+
+@pytest.mark.parametrize("input_style", ["explicit", "glob"])
+def test_scan_multiple_explicit_shards_revalidates_windows_index_once_per_family(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    input_style: str,
+) -> None:
+    """Explicit and globbed members perform only one terminal index content reread."""
+    from modelaudit.utils.file import handlers as handlers_module
+
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[Path] = []
+    weight_map: dict[str, str] = {}
+    for shard_index in range(1, 4):
+        shard = tmp_path / f"model-{shard_index:05d}-of-00003.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(shard)
+        weight_map[f"tensor-{shard_index}"] = shard.name
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+    index_path.chmod(0o644)
+
+    monkeypatch.setattr(handlers_module, "_safetensors_index_requires_content_revalidation", lambda: True)
+    monkeypatch.setattr(
+        handlers_module,
+        "MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES",
+        index_path.stat().st_size * 2,
+    )
+    scan_inputs = (
+        [str(shard) for shard in shard_paths] if input_style == "explicit" else [str(tmp_path / "model-*.safetensors")]
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *scan_inputs,
+            "--assume-shard-family",
+            "--scanners",
+            "safetensors",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is True
+    assert output_payload["files_scanned"] == len(shard_paths)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode policy")
@@ -1063,6 +1117,35 @@ def test_explicit_zero_based_index_authority_requires_trusted_scope(
     assert parse_click_json_output(result.output)["success"] is (expected_exit == 0)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode policy")
+def test_explicit_index_private_parent_does_not_authorize_writable_file(tmp_path: Path) -> None:
+    """A stale descriptor can mutate a writable index even after its external hardlink is removed."""
+    scope = tmp_path / "scope"
+    scope.mkdir(mode=0o700)
+    index_path = scope / "model.safetensors.index.json"
+    index_path.write_text('{"weight_map": {}}', encoding="utf-8")
+    index_path.chmod(0o666)
+
+    assert cli_module._trusted_explicit_shard_index_authority(str(index_path), str(scope)) is False
+
+    alias_parent = tmp_path / "public"
+    alias_parent.mkdir(mode=0o777)
+    alias_parent.chmod(0o777)
+    alias_path = alias_parent / "public-index-link.json"
+    alias_path.hardlink_to(index_path)
+
+    assert index_path.stat().st_nlink == 2
+    assert cli_module._trusted_explicit_shard_index_authority(str(index_path), str(scope)) is False
+    with alias_path.open("r+b") as stale_handle:
+        alias_path.unlink()
+        assert index_path.stat().st_nlink == 1
+        assert cli_module._trusted_explicit_shard_index_authority(str(index_path), str(scope)) is False
+        stale_handle.seek(0)
+        stale_handle.write(b'{"weight_map": {"changed": "model.safetensors"}}')
+        stale_handle.truncate()
+    assert "changed" in index_path.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     ("first_index", "index_mode", "expected_exit_code"),
     [(0, "stable", 0), (0, "swap", 2), (1, "stable", 0), (1, "swap", 2), (1, "invalid", 2)],
@@ -1100,6 +1183,7 @@ def test_scan_multiple_cross_directory_shards_refreshes_index_authority(
             ),
             encoding="utf-8",
         )
+        index_path.chmod(0o644)
 
     write_index([selected_shards[0], decoy_shards[1]] if index_mode == "invalid" else selected_shards)
     original_resolve_source = cli_module._resolve_scan_source_for_path
@@ -1170,6 +1254,7 @@ def test_scan_multiple_cross_directory_shards_revalidate_authority_before_reconc
             ),
             encoding="utf-8",
         )
+        index_path.chmod(0o644)
 
     write_index(selected_shards)
     original_path_open = Path.open
@@ -1312,6 +1397,7 @@ def test_scan_same_directory_shards_rejects_split_index_authority(
             ),
             encoding="utf-8",
         )
+        index_path.chmod(0o644)
 
     write_index(selected_shards)
     original_resolve_source = cli_module._resolve_scan_source_for_path
@@ -1384,6 +1470,7 @@ def test_scan_path_state_revalidates_index_authority_for_cached_results(tmp_path
             ),
             encoding="utf-8",
         )
+        index_path.chmod(0o644)
 
     write_index(selected_shards)
     shard_paths = tuple(str(shard) for shard in selected_shards)
@@ -4478,6 +4565,46 @@ def test_scan_huggingface_standard_preserves_selected_extensionless_filenames(
     assert mock_get_model_info.call_args.kwargs["scannable_filenames"] == expected_filenames
     assert mock_download.call_args.kwargs["scannable_filenames"] == expected_filenames
     mock_rmtree.assert_called()
+
+
+def test_scan_huggingface_standard_revalidates_index_proof_after_local_scan(tmp_path: Path) -> None:
+    """A downloaded governing index cannot change between acquisition and local scan completion."""
+    from modelaudit.utils.sources.huggingface import HuggingFaceSafetensorsIndexProof
+
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    index_path = downloaded_dir / "weights.safetensors.index.json"
+    index_bytes = b'{"weight_map":{"tensor":"nested/model-00001-of-00001.safetensors"}}'
+    index_path.write_bytes(index_bytes)
+    proof = HuggingFaceSafetensorsIndexProof(
+        index_file=index_path.name,
+        fingerprint=hashlib.sha256(index_bytes).hexdigest(),
+        target_files=("nested/model-00001-of-00001.safetensors",),
+        index_base="one",
+    )
+
+    def download_with_proof(*_args: Any, **kwargs: Any) -> Path:
+        kwargs["safetensors_index_proofs"].append(proof)
+        return downloaded_dir
+
+    def mutate_index_after_scan(*_args: Any, **_kwargs: Any) -> ModelAuditResultModel:
+        index_path.write_text('{"weight_map":{"tensor":"other/model-00001-of-00001.safetensors"}}')
+        return create_mock_scan_result(files_scanned=1, issues=[])
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch("modelaudit.cli.download_model", side_effect=download_with_proof),
+        patch("modelaudit.cli.scan_model_directory_or_file", side_effect=mutate_index_after_scan),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--quiet", "--no-cache", "--scanners", "safetensors", "hf://test/model"],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2, result.output
+    assert "SafeTensors index proof mismatch" in result.output
 
 
 def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> None:

@@ -51,6 +51,7 @@ SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
 _PREVALIDATED_SHARD_INFO_CONFIG_KEY = "_trusted_prevalidated_shard_info"
+_DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY = "_trusted_defer_safetensors_index_content_revalidation"
 SAFETENSORS_SHARD_PATTERN = r"model-(\d+)-of-(\d+)\.safetensors"
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
@@ -143,19 +144,28 @@ class _SafetensorsIndexInspectionContext:
         self,
         observation: tuple[Any, ...],
         size: int,
-        *,
-        force: bool = False,
     ) -> str | None:
-        """Charge bounded bytes for a new observation or required content revalidation."""
+        """Charge bounded bytes once for one stable content observation."""
         with self.lock:
             if self.failure is not None:
                 return self.failure
-            if observation in self.charged_observations and not force:
+            if observation in self.charged_observations:
                 return None
             if self.bytes_read + size > MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES:
                 self.failure = "safetensors index aggregate byte limit exceeded"
                 return self.failure
             self.charged_observations.add(observation)
+            self.bytes_read += size
+            return None
+
+    def reserve_content_revalidation(self, size: int) -> str | None:
+        """Charge every physical reread needed when stat identity is unreliable."""
+        with self.lock:
+            if self.failure is not None:
+                return self.failure
+            if self.bytes_read + size > MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES:
+                self.failure = "safetensors index aggregate byte limit exceeded"
+                return self.failure
             self.bytes_read += size
             return None
 
@@ -837,10 +847,10 @@ class ShardedModelDetector:
                 )
                 assert observed_cached is not None
                 return observed_cached
-            budget_error = inspection_context.reserve_observation(
-                cache_key,
-                pre_read_stat.st_size,
-                force=revalidate_cached_content,
+            budget_error = (
+                inspection_context.reserve_content_revalidation(pre_read_stat.st_size)
+                if revalidate_cached_content
+                else inspection_context.reserve_observation(cache_key, pre_read_stat.st_size)
             )
             if budget_error is not None:
                 raise ValueError(budget_error)
@@ -2265,6 +2275,10 @@ class AdvancedFileHandler:
             scanner_config.get(_PREVALIDATED_SHARD_INFO_CONFIG_KEY) if isinstance(scanner_config, dict) else None
         )
         self.uses_prevalidated_shard_info = isinstance(prevalidated_shard_info, dict)
+        self.defers_safetensors_index_content_revalidation = bool(
+            isinstance(scanner_config, dict)
+            and scanner_config.get(_DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY) is True
+        )
         self.allowed_shard_paths = allowed_shard_paths
         self.allowed_shard_targets = allowed_shard_targets
         self.index_search_root = index_search_root
@@ -2333,7 +2347,7 @@ class AdvancedFileHandler:
                 allowed_paths=self.allowed_shard_paths,
                 allowed_targets=self.allowed_shard_targets,
                 index_search_root=self.index_search_root,
-                force_index_content_revalidation=True,
+                force_index_content_revalidation=not self.defers_safetensors_index_content_revalidation,
             )
             if current_shard_info != self.detected_shard_info:
                 return _preserve_findings_with_shard_boundary_failure(
@@ -2708,6 +2722,7 @@ def scan_advanced_large_file(
     cache_enabled = config.get("cache_enabled", True)
     cache_dir = config.get("cache_dir")
     prevalidated_shard_info = config.get(_PREVALIDATED_SHARD_INFO_CONFIG_KEY)
+    defer_index_content_revalidation = config.get(_DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY) is True
     boundary_error = _grouped_shard_boundary_error(file_path, allowed_shard_paths, allowed_shard_targets)
     if boundary_error is not None:
         return _shard_boundary_failure_result(scanner.name, file_path, boundary_error)
@@ -2893,7 +2908,7 @@ def scan_advanced_large_file(
             allowed_paths=allowed_shard_paths,
             allowed_targets=allowed_shard_targets,
             index_search_root=index_search_root,
-            force_index_content_revalidation=not cache_miss_executed,
+            force_index_content_revalidation=not cache_miss_executed and not defer_index_content_revalidation,
         )
         if post_scan_shard_info != shard_info:
             return _preserve_findings_with_shard_boundary_failure(

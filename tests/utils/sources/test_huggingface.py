@@ -55,6 +55,7 @@ from modelaudit.utils.sources.huggingface import (
     _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
     _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
     _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
+    HuggingFaceSafetensorsIndexProof,
     _build_huggingface_filtered_download_path,
     _build_huggingface_model_info,
     _check_hf_acquisition_interrupted,
@@ -860,7 +861,7 @@ class TestModelDownload:
             "model-00000-of-00002.safetensors",
             "model-00001-of-00002.safetensors",
         ):
-            (nested_dir / filename).write_bytes(b"{}" if filename.endswith(".json") else b"weights")
+            (nested_dir / filename).write_bytes(index_payload if filename.endswith(".json") else b"weights")
         mock_requests_get.return_value = _FakeRangeResponse(index_payload)
         mock_snapshot_download.return_value = str(download_path)
 
@@ -1277,6 +1278,71 @@ class TestModelDownload:
         assert (result / "model.onnx").is_file()
         assert {path.name for path in result.iterdir()} == {"model.onnx"}
 
+    @pytest.mark.parametrize("local_index_state", ["exact", "malformed", "retargeted"])
+    def test_download_model_verifies_planned_safetensors_index_proof(
+        self,
+        tmp_path: Path,
+        local_index_state: str,
+    ) -> None:
+        """Standard acquisition must not lose remote ancestor-index authority before local scanning."""
+        index_file = "weights.safetensors.index.json"
+        shard_file = "nested/model-00001-of-00001.safetensors"
+        repo_files = [index_file, shard_file]
+        remote_index = json.dumps({"weight_map": {"tensor": shard_file}}).encode()
+
+        def materialize_snapshot(**kwargs: Any) -> str:
+            local_dir = Path(kwargs["local_dir"])
+            (local_dir / shard_file).parent.mkdir(parents=True, exist_ok=True)
+            (local_dir / shard_file).write_bytes(b"shard")
+            local_indexes = {
+                "exact": remote_index,
+                "malformed": b"{malformed",
+                "retargeted": json.dumps({"weight_map": {"tensor": "other/model-00001-of-00001.safetensors"}}).encode(),
+            }
+            (local_dir / index_file).write_bytes(local_indexes[local_index_state])
+            return str(local_dir)
+
+        proofs: list[HuggingFaceSafetensorsIndexProof] = []
+        patches = (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._read_huggingface_prefix",
+                return_value=remote_index,
+            ),
+            patch("huggingface_hub.snapshot_download", side_effect=materialize_snapshot),
+        )
+        with patches[0], patches[1], patches[2]:
+            if local_index_state != "exact":
+                with pytest.raises(Exception, match="SafeTensors index proof mismatch"):
+                    download_model(
+                        "https://huggingface.co/test/model",
+                        cache_dir=tmp_path / "cache",
+                        scannable_extensions={".safetensors"},
+                        scannable_scanner_ids={"safetensors"},
+                        safetensors_index_proofs=proofs,
+                    )
+            else:
+                result = download_model(
+                    "https://huggingface.co/test/model",
+                    cache_dir=tmp_path / "cache",
+                    scannable_extensions={".safetensors"},
+                    scannable_scanner_ids={"safetensors"},
+                    safetensors_index_proofs=proofs,
+                )
+                assert (result / index_file).read_bytes() == remote_index
+
+        if local_index_state != "exact":
+            assert proofs == []
+        else:
+            assert len(proofs) == 1
+            assert proofs[0].index_file == index_file
+            assert proofs[0].target_files == (shard_file,)
+            assert proofs[0].index_base == "one"
+            assert proofs[0].fingerprint == hashlib.sha256(remote_index).hexdigest()
+
     @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
     @pytest.mark.parametrize("ancestor_mode", [0o700, 0o755])
     def test_build_filtered_cache_accepts_owned_nonwritable_hierarchy(
@@ -1419,6 +1485,69 @@ class TestModelDownload:
                 {".onnx"},
                 {"onnx"},
             )
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
+    def test_download_model_filtered_cache_rejects_replaced_lexical_root(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A cache root replaced during remote planning cannot redirect pruning or download."""
+        del requires_symlinks
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        cache_dir = tmp_path / "cache"
+        cache_root = cache_dir / "huggingface"
+        cache_root.mkdir(parents=True, mode=0o700)
+        victim_root = tmp_path / "victim-cache"
+        victim_root.mkdir(mode=0o700)
+        victim_selection = _build_huggingface_filtered_download_path(
+            victim_root,
+            "test",
+            "model",
+            "test/model",
+            _HF_TEST_REVISION,
+            ["model.onnx"],
+            {".onnx"},
+            {"onnx"},
+        )
+        sentinel = victim_selection / "sentinel.secret"
+        sentinel.write_bytes(b"keep")
+
+        original_root = cache_dir / "original-huggingface"
+
+        def replace_cache_root(*_args: Any, **_kwargs: Any) -> tuple[list[str], str, None]:
+            cache_root.rename(original_root)
+            cache_root.symlink_to(victim_root, target_is_directory=True)
+            return ["model.onnx"], _HF_TEST_REVISION, None
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                side_effect=replace_cache_root,
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=({"model.onnx": len(_MINIMAL_ONNX_MODEL_PROTO)}, _HF_TEST_REVISION),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._prune_huggingface_filtered_download_path",
+                wraps=huggingface_module._prune_huggingface_filtered_download_path,
+            ) as mock_prune,
+            patch("huggingface_hub.snapshot_download") as mock_snapshot_download,
+            pytest.raises(Exception, match="safe filtered Hugging Face cache path"),
+        ):
+            download_model(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+            )
+
+        assert sentinel.read_bytes() == b"keep"
+        mock_prune.assert_not_called()
+        mock_snapshot_download.assert_not_called()
 
     def test_build_filtered_cache_fails_closed_without_platform_ownership_proof(
         self,
@@ -5088,6 +5217,53 @@ class TestModelDownloadStreaming:
                 allow_content_probes=False,
             )
 
+        mock_requests_get.assert_not_called()
+
+    def test_model_plan_metadata_only_refuses_unselected_safetensors_index(self) -> None:
+        """An exact SafeTensors preview cannot omit an unparsed governing index."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "model-00000-of-00001.safetensors",
+        ]
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("requests.get") as mock_requests_get,
+            pytest.raises(ValueError, match="metadata-only dry-run selection incomplete"),
+        ):
+            plan_huggingface_model_download(
+                "https://huggingface.co/test/model",
+                allow_content_probes=False,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+
+        mock_requests_get.assert_not_called()
+
+    def test_model_plan_metadata_only_ignores_lexically_disjoint_safetensors_index(self) -> None:
+        """A sibling-directory index cannot govern the selected shard without reading its content."""
+        repo_files = [
+            "selected/model-00001-of-00001.safetensors",
+            "unrelated/model.safetensors.index.json",
+        ]
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("requests.get") as mock_requests_get,
+        ):
+            plan = plan_huggingface_model_download(
+                "https://huggingface.co/test/model",
+                allow_content_probes=False,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+
+        assert plan.selected_files == ["selected/model-00001-of-00001.safetensors"]
+        assert plan.safetensors_index_files == ()
         mock_requests_get.assert_not_called()
 
     def test_remote_safetensors_index_validation_checks_deadline_during_large_inventory(self) -> None:

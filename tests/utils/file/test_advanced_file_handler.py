@@ -438,6 +438,13 @@ class TestShardedModelDetector:
         assert len(payload_a) == len(payload_b)
         index_path.write_bytes(payload_a)
         context = _SafetensorsIndexInspectionContext()
+        from modelaudit.utils.file import handlers as handlers_module
+
+        monkeypatch.setattr(
+            handlers_module,
+            "MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES",
+            len(payload_a) * 3,
+        )
         monkeypatch.setattr(
             "modelaudit.utils.file.handlers._safetensors_index_requires_content_revalidation",
             lambda: True,
@@ -448,6 +455,16 @@ class TestShardedModelDetector:
         )
 
         first = ShardedModelDetector.detect_shards(str(shard), index_inspection_context=context)
+        stable = ShardedModelDetector.detect_shards(
+            str(shard),
+            index_inspection_context=context,
+            force_index_content_revalidation=True,
+        )
+        assert first is not None
+        assert stable is not None
+        assert stable["safetensors_index_generation"] == first["safetensors_index_generation"]
+        assert context.bytes_read == len(payload_a) * 2
+
         index_path.write_bytes(payload_b)
         cached = ShardedModelDetector.detect_shards(str(shard), index_inspection_context=context)
         second = ShardedModelDetector.detect_shards(
@@ -456,12 +473,21 @@ class TestShardedModelDetector:
             force_index_content_revalidation=True,
         )
 
-        assert first is not None and cached is not None and second is not None
+        assert cached is not None and second is not None
         assert cached["safetensors_index_generation"] == first["safetensors_index_generation"]
         assert cached["safetensors_index_fingerprint"] == first["safetensors_index_fingerprint"]
         assert second["safetensors_index_generation"] == first["safetensors_index_generation"] + 1
         assert second["safetensors_index_fingerprint"] != first["safetensors_index_fingerprint"]
-        assert context.bytes_read == len(payload_a) + len(payload_b)
+        assert context.bytes_read == len(payload_a) * 3
+
+        exhausted = ShardedModelDetector.detect_shards(
+            str(shard),
+            index_inspection_context=context,
+            force_index_content_revalidation=True,
+        )
+        assert exhausted is not None
+        assert exhausted["safetensors_index_error"] == "safetensors index aggregate byte limit exceeded"
+        assert context.bytes_read == len(payload_a) * 3
 
     def test_safetensors_index_rejects_duplicate_json_keys(self, tmp_path: Path) -> None:
         """Ambiguous duplicate tensor keys cannot make local authority parser-dependent."""

@@ -1852,6 +1852,16 @@ def _check_hf_acquisition_interrupted(repo_id: str, deadline: float | None) -> N
 
 
 @dataclass(frozen=True)
+class HuggingFaceSafetensorsIndexProof:
+    """Immutable remote index evidence required by a standard local scan."""
+
+    index_file: str
+    fingerprint: str
+    target_files: tuple[str, ...]
+    index_base: str
+
+
+@dataclass(frozen=True)
 class HuggingFaceDownloadPlan:
     namespace: str
     repo_name: str
@@ -1865,6 +1875,7 @@ class HuggingFaceDownloadPlan:
     download_revision: str
     content_route_formats: dict[str, str] = field(default_factory=dict)
     safetensors_index_files: tuple[str, ...] = ()
+    safetensors_index_proofs: tuple[HuggingFaceSafetensorsIndexProof, ...] = ()
     probe_bytes_transferred: int = 0
 
 
@@ -3216,6 +3227,8 @@ def _select_huggingface_model_files(
     scannable_scanner_ids: Collection[str] | None = None,
     restrict_content_routes_to_model_extensions: bool = False,
     deadline: float | None = None,
+    validated_index_files: list[str] | None = None,
+    validated_index_proofs: list[HuggingFaceSafetensorsIndexProof] | None = None,
 ) -> list[str]:
     """Select extension matches, bounded content routes, and validated SafeTensors index families."""
     selected_filenames = (
@@ -3264,9 +3277,16 @@ def _select_huggingface_model_files(
                 if filename not in exact_openvino_companion_candidates
                 if not _skip_hf_safetensors_probe_candidate(
                     filename,
-                    allow_index_expansion=allow_safetensors_index_expansion,
+                    # Without content reads an unselected relevant index cannot
+                    # be proven disjoint from the selected shard family.
+                    allow_index_expansion=False,
                     selected_route_scanner_ids=selected_route_scanner_ids,
                     selected_route_formats=selected_route_formats,
+                )
+                if (
+                    not _is_hf_safetensors_index_filename(filename)
+                    or not allow_safetensors_index_expansion
+                    or _metadata_only_hf_index_may_govern_selected_shard(filename, model_files)
                 )
             ]
             if content_probes_relevant
@@ -3344,6 +3364,8 @@ def _select_huggingface_model_files(
         model_files,
         probe_budget,
         allow_index_expansion=allow_safetensors_index_expansion,
+        validated_index_files=validated_index_files,
+        validated_index_proofs=validated_index_proofs,
     )
     return model_files
 
@@ -3358,6 +3380,21 @@ def _metadata_only_hf_content_probe_candidates(repo_files: list[str], selected_f
             if filename not in selected_file_set and not _is_huggingface_repo_bookkeeping_file(filename)
         )
     )
+
+
+def _metadata_only_hf_index_may_govern_selected_shard(
+    index_file: str,
+    selected_files: Collection[str],
+) -> bool:
+    """Return whether an unparsed index is colocated with or above a selected shard family."""
+    index_parent = PurePosixPath(index_file).parent
+    for selected_file in selected_files:
+        if _remote_safetensors_shard_parts(selected_file) is None:
+            continue
+        selected_parent = PurePosixPath(selected_file).parent
+        if index_parent == selected_parent or index_parent in selected_parent.parents:
+            return True
+    return False
 
 
 def _allows_safetensors_index_expansion(
@@ -3464,6 +3501,7 @@ def _validate_remote_safetensors_indexes(
     allow_content_probes: bool = True,
     validated_index_files: list[str] | None = None,
     validated_target_files: set[str] | None = None,
+    validated_index_proofs: list[HuggingFaceSafetensorsIndexProof] | None = None,
 ) -> list[str]:
     """Validate and expand selected SafeTensors shard inventories when enabled."""
     from modelaudit.utils.file.handlers import MAX_SAFETENSORS_SHARD_INDEX_BYTES
@@ -3658,9 +3696,9 @@ def _validate_remote_safetensors_indexes(
             )
         zero_based = range(0, expected_total)
         one_based = range(1, expected_total + 1)
-        if not all(index in zero_based for index in target_indices) and not all(
-            index in one_based for index in target_indices
-        ):
+        is_zero_based = all(index in zero_based for index in target_indices)
+        is_one_based = all(index in one_based for index in target_indices)
+        if not is_zero_based and not is_one_based:
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
                 f"SafeTensors index {repo_id}/{index_file} has ambiguous shard indices"
@@ -3685,6 +3723,15 @@ def _validate_remote_safetensors_indexes(
             validated_index_files.append(index_file)
         if validated_target_files is not None:
             validated_target_files.update(target_files)
+        if validated_index_proofs is not None:
+            validated_index_proofs.append(
+                HuggingFaceSafetensorsIndexProof(
+                    index_file=index_file,
+                    fingerprint=hashlib.sha256(index_prefix).hexdigest(),
+                    target_files=tuple(target_files),
+                    index_base="zero" if is_zero_based else "one",
+                )
+            )
         probe_budget.check_deadline(repo_id)
 
     return updated_model_files
@@ -4444,6 +4491,16 @@ def _is_within_directory(base_dir: Path, target: Path) -> bool:
     return target_path.is_relative_to(base_path)
 
 
+def _is_lexically_within_directory(base_dir: Path, target: Path) -> bool:
+    """Return whether an absolute lexical path is below an absolute lexical anchor."""
+    base_norm = os.path.normcase(os.path.normpath(os.path.abspath(base_dir)))
+    target_norm = os.path.normcase(os.path.normpath(os.path.abspath(target)))
+    try:
+        return os.path.commonpath([target_norm, base_norm]) == base_norm
+    except ValueError:
+        return False
+
+
 def _is_huggingface_cache_blob_target(downloaded_path: Path, target: Path) -> bool:
     """Return True when target is a Hub cache blob for the snapshot path."""
     target_path = target.resolve()
@@ -4480,9 +4537,9 @@ def _filtered_huggingface_cache_trust_supported() -> bool:
 def _is_trusted_huggingface_filtered_download_path(cache_root: Path, download_path: Path) -> bool:
     """Return whether a filtered-cache hierarchy and its anchor resist cross-user replacement."""
     try:
-        resolved_cache_root = cache_root.resolve(strict=True)
+        lexical_cache_root = Path(os.path.abspath(cache_root))
         lexical_download_path = Path(os.path.abspath(download_path))
-        if not _is_within_directory(resolved_cache_root, lexical_download_path):
+        if not _is_lexically_within_directory(lexical_cache_root, lexical_download_path):
             return False
 
         effective_uid: int | None = None
@@ -4502,7 +4559,7 @@ def _is_trusted_huggingface_filtered_download_path(cache_root: Path, download_pa
                 current_stat.st_uid != effective_uid or stat.S_IMODE(current_stat.st_mode) & 0o022
             ):
                 return False
-            if current == resolved_cache_root:
+            if current == lexical_cache_root:
                 cache_root_stat = current_stat
                 break
             if current == current.parent:
@@ -4513,7 +4570,7 @@ def _is_trusted_huggingface_filtered_download_path(cache_root: Path, download_pa
             return True
         assert cache_root_stat is not None
         protected_child_stat = cache_root_stat
-        current = resolved_cache_root.parent
+        current = lexical_cache_root.parent
         while True:
             current_stat = _stat_huggingface_cache_path(current)
             if not stat.S_ISDIR(current_stat.st_mode):
@@ -4549,7 +4606,7 @@ def _build_huggingface_filtered_download_path(
     """Return a non-symlink selection-specific directory under a trusted cache root."""
     if not _filtered_huggingface_cache_trust_supported():
         raise ValueError("Filtered Hugging Face cache ownership cannot be established on Windows; use streaming mode")
-    resolved_cache_root = cache_root.resolve()
+    lexical_cache_root = Path(os.path.abspath(cache_root))
     selection_key = hashlib.sha256(
         json.dumps(
             {
@@ -4572,14 +4629,14 @@ def _build_huggingface_filtered_download_path(
             sort_keys=True,
         ).encode()
     ).hexdigest()
-    selection_path = resolved_cache_root / ".modelaudit-selections" / namespace
+    selection_path = lexical_cache_root / ".modelaudit-selections" / namespace
     if repo_name:
         selection_path = selection_path / repo_name
     selection_path = selection_path / selection_key
     if (
-        not _is_within_directory(resolved_cache_root, selection_path)
+        not _is_lexically_within_directory(lexical_cache_root, selection_path)
         or not _ensure_secure_directory(selection_path)
-        or not _is_trusted_huggingface_filtered_download_path(resolved_cache_root, selection_path)
+        or not _is_trusted_huggingface_filtered_download_path(lexical_cache_root, selection_path)
     ):
         raise ValueError(f"Unable to create a safe filtered Hugging Face cache path for {repo_id}")
     return selection_path
@@ -5141,6 +5198,63 @@ def _get_downloaded_huggingface_file_size(repo_id: str, file_path: Path, filenam
         ) from exc
 
 
+def verify_downloaded_huggingface_safetensors_index_proofs(
+    repo_id: str,
+    downloaded_path: Path,
+    proofs: Collection[HuggingFaceSafetensorsIndexProof],
+) -> None:
+    """Require downloaded indexes to match the immutable bytes validated during planning."""
+    from modelaudit.utils.file.handlers import MAX_SAFETENSORS_SHARD_INDEX_BYTES
+
+    for proof in proofs:
+        _validate_huggingface_repo_filename(repo_id, proof.index_file)
+        lexical_path = downloaded_path / proof.index_file
+        try:
+            resolved_path = lexical_path.resolve(strict=True)
+            parent_path = lexical_path.parent.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"Hugging Face SafeTensors index proof mismatch: downloaded index is missing: {proof.index_file}"
+            ) from exc
+        if not _is_within_directory(downloaded_path, parent_path):
+            raise ValueError(
+                f"Hugging Face SafeTensors index proof mismatch: downloaded index path escaped: {proof.index_file}"
+            )
+        if not _is_within_directory(downloaded_path, resolved_path) and not _is_huggingface_cache_blob_target(
+            downloaded_path,
+            resolved_path,
+        ):
+            raise ValueError(
+                f"Hugging Face SafeTensors index proof mismatch: downloaded index target escaped: {proof.index_file}"
+            )
+
+        pre_read_stat = os.stat(resolved_path, follow_symlinks=False)
+        if not stat.S_ISREG(pre_read_stat.st_mode) or pre_read_stat.st_size > MAX_SAFETENSORS_SHARD_INDEX_BYTES:
+            raise ValueError(
+                f"Hugging Face SafeTensors index proof mismatch: downloaded index is invalid: {proof.index_file}"
+            )
+        with resolved_path.open("rb") as index_handle:
+            opened_stat = os.fstat(index_handle.fileno())
+            if not os.path.samestat(pre_read_stat, opened_stat):
+                raise ValueError(
+                    f"Hugging Face SafeTensors index proof mismatch: downloaded index changed: {proof.index_file}"
+                )
+            index_bytes = index_handle.read(pre_read_stat.st_size)
+        post_read_stat = os.stat(resolved_path, follow_symlinks=False)
+        if (
+            len(index_bytes) != pre_read_stat.st_size
+            or not os.path.samestat(pre_read_stat, post_read_stat)
+            or any(
+                getattr(pre_read_stat, field) != getattr(post_read_stat, field)
+                for field in ("st_size", "st_mtime_ns", "st_ctime_ns")
+            )
+            or hashlib.sha256(index_bytes).hexdigest() != proof.fingerprint
+        ):
+            raise ValueError(
+                f"Hugging Face SafeTensors index proof mismatch: downloaded index bytes changed: {proof.index_file}"
+            )
+
+
 def _should_cleanup_hf_streaming_context_file(
     cache_dir: Path | None,
     download_path: Path | None,
@@ -5551,6 +5665,7 @@ def download_model(
     *,
     timeout_seconds: float | None = None,
     repository_file_inventory: list[str] | None = None,
+    safetensors_index_proofs: list[HuggingFaceSafetensorsIndexProof] | None = None,
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
@@ -5564,6 +5679,7 @@ def download_model(
         max_size: Optional maximum total selected download size in bytes
         timeout_seconds: Optional end-to-end acquisition deadline in seconds
         repository_file_inventory: Optional list filled with repository member names from metadata
+        safetensors_index_proofs: Optional list filled with verified immutable SafeTensors index evidence
         scannable_extensions: Optional remote prefilter extensions from scanner selection policy
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
@@ -5828,6 +5944,14 @@ def download_model(
                     f"snapshot included {len(unexpected_model_files)} unselected file(s) for {repo_id}"
                 )
 
+        verify_downloaded_huggingface_safetensors_index_proofs(
+            repo_id,
+            downloaded_path,
+            plan.safetensors_index_proofs,
+        )
+        if safetensors_index_proofs is not None:
+            safetensors_index_proofs[:] = plan.safetensors_index_proofs
+
         return Path(local_path)
     except Exception as e:
         # Clean up only a new unfiltered custom directory owned by this call.
@@ -5889,6 +6013,8 @@ def plan_huggingface_model_download(
         if scannable_extensions is None
         else {str(extension).lower() for extension in scannable_extensions}
     )
+    validated_safetensors_indexes: list[str] = []
+    validated_safetensors_index_proofs: list[HuggingFaceSafetensorsIndexProof] = []
     model_files = _select_huggingface_model_files(
         repo_id,
         repo_files,
@@ -5905,6 +6031,8 @@ def plan_huggingface_model_download(
             scannable_scanner_ids is None and (scannable_extensions is not None or scannable_filenames is not None)
         ),
         deadline=deadline,
+        validated_index_files=validated_safetensors_indexes,
+        validated_index_proofs=validated_safetensors_index_proofs,
     )
     model_files = _include_huggingface_openvino_companions(
         repo_id,
@@ -5942,6 +6070,8 @@ def plan_huggingface_model_download(
         selected_files=model_files,
         selected_sizes=selected_sizes,
         download_revision=revision or repo_revision,
+        safetensors_index_files=tuple(validated_safetensors_indexes),
+        safetensors_index_proofs=tuple(validated_safetensors_index_proofs),
     )
 
 

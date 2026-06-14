@@ -1517,6 +1517,46 @@ def test_scan_model_streaming_revalidates_index_content_when_stat_identity_is_un
     assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
 
 
+def test_scan_model_streaming_stable_windows_index_uses_one_terminal_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid many-shard Windows family performs one bounded terminal content reread."""
+    from modelaudit.utils.file import handlers as handlers_module
+
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_count = 33
+    shards: list[Path] = []
+    weight_map: dict[str, str] = {}
+    for shard_index in range(1, shard_count + 1):
+        shard = tmp_path / f"model-{shard_index:05d}-of-{shard_count:05d}.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        shards.append(shard)
+        weight_map[f"tensor-{shard_index}"] = shard.name
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+
+    monkeypatch.setattr(handlers_module, "_safetensors_index_requires_content_revalidation", lambda: True)
+    monkeypatch.setattr(
+        handlers_module,
+        "MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES",
+        index_path.stat().st_size * 2,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
 @pytest.mark.parametrize("create_index_after_yield", [False, True], ids=["stable-unindexed", "new-index"])
 @pytest.mark.parametrize("delete_after_scan", [False, True], ids=["preserve-source", "delete-source"])
 def test_scan_model_streaming_rechecks_unindexed_authority_after_final_yield(

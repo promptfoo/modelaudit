@@ -89,6 +89,7 @@ from .telemetry import (
 )
 from .utils import resolve_dvc_file_with_metadata, should_skip_file
 from .utils.file.handlers import (
+    _DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY,
     _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY,
     SAFETENSORS_SHARD_PATTERN,
     ShardedModelDetector,
@@ -120,6 +121,7 @@ from .utils.sources.cloud_storage import (
     redact_url_for_display,
 )
 from .utils.sources.huggingface import (
+    HuggingFaceSafetensorsIndexProof,
     download_file_from_hf,
     download_model,
     extract_model_id_from_path,
@@ -130,6 +132,7 @@ from .utils.sources.huggingface import (
     parse_huggingface_url_with_revision,
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
+    verify_downloaded_huggingface_safetensors_index_proofs,
 )
 from .utils.sources.jfrog import (
     is_jfrog_url,
@@ -1692,6 +1695,7 @@ class _SourceDispatchResult:
     source_model_source: str | None = None
     repository_file_inventory: tuple[str, ...] = ()
     repository_current_file: str | None = None
+    safetensors_index_proofs: tuple[HuggingFaceSafetensorsIndexProof, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2471,7 +2475,6 @@ def _trusted_explicit_shard_index_authority(index_path: str, scope: str) -> bool
             return False
         resolved_parent.relative_to(resolved_scope)
         current = resolved_parent
-        index_parent_private = False
         while True:
             directory_stat = os.stat(current, follow_symlinks=False)
             if (
@@ -2480,10 +2483,8 @@ def _trusted_explicit_shard_index_authority(index_path: str, scope: str) -> bool
                 or stat.S_IMODE(directory_stat.st_mode) & 0o022
             ):
                 return False
-            if current == resolved_parent:
-                index_parent_private = stat.S_IMODE(directory_stat.st_mode) & 0o077 == 0
             if current == resolved_scope:
-                return not (stat.S_IMODE(index_stat.st_mode) & 0o022) or index_parent_private
+                return not bool(stat.S_IMODE(index_stat.st_mode) & 0o022)
             if current == current.parent:
                 return False
             current = current.parent
@@ -3483,7 +3484,16 @@ def _scan_local_or_downloaded_path(
     elif runtime.show_styled_output:
         click.echo(f"Scanning {display_path}...")
 
+    def revalidate_huggingface_safetensors_indexes() -> None:
+        if source_result.safetensors_index_proofs:
+            verify_downloaded_huggingface_safetensors_index_proofs(
+                source_result.source_model_id or display_path,
+                Path(actual_path),
+                source_result.safetensors_index_proofs,
+            )
+
     try:
+        revalidate_huggingface_safetensors_indexes()
         progress_callback = _create_path_progress_callback(
             spinner=spinner,
             progress_tracker=progress_tracker,
@@ -3521,6 +3531,7 @@ def _scan_local_or_downloaded_path(
             )
             path_state.record_non_shard_result_errors(streaming_result)
             audit_result.aggregate_scan_result(streaming_result.model_dump())
+            revalidate_huggingface_safetensors_indexes()
             path_state.record_dvc_coverage(actual_path, streaming_result, scanner_config=runtime.config)
             path_state.track_streaming_paths_for_sbom(streaming_result, actual_path)
 
@@ -3538,6 +3549,8 @@ def _scan_local_or_downloaded_path(
             _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
             **_scanner_selection_overrides(runtime),
         }
+        if explicit_family is not None:
+            config_overrides[_DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY] = True
         is_dvc_pointer = actual_path.lower().endswith(".dvc")
         has_prior_dvc_coverage = bool(path_state.dvc_covered_paths or path_state.dvc_covered_directories)
         if is_dvc_pointer:
@@ -3580,6 +3593,7 @@ def _scan_local_or_downloaded_path(
         else:
             path_state.record_non_shard_result_errors(scan_results)
         audit_result.aggregate_scan_result(scan_results.model_dump())
+        revalidate_huggingface_safetensors_indexes()
         if is_dvc_pointer and has_prior_dvc_coverage:
             audit_result.content_hash = None
         path_state.record_dvc_coverage(actual_path, scan_results, scanner_config=runtime.config)
@@ -3974,6 +3988,7 @@ def _resolve_scan_source_for_path(
 
             show_progress = runtime.show_styled_output and should_show_spinner()
             download_repository_file_inventory: list[str] = []
+            download_safetensors_index_proofs: list[HuggingFaceSafetensorsIndexProof] = []
             download_path = download_model(
                 path,
                 cache_dir=hf_cache_dir,
@@ -3981,6 +3996,7 @@ def _resolve_scan_source_for_path(
                 max_size=runtime.max_download_bytes,
                 timeout_seconds=runtime.timeout,
                 repository_file_inventory=download_repository_file_inventory,
+                safetensors_index_proofs=download_safetensors_index_proofs,
                 scannable_extensions=runtime.scannable_extensions,
                 scannable_filenames=runtime.scannable_filenames,
                 scannable_scanner_ids=runtime.scannable_scanner_ids,
@@ -4005,6 +4021,7 @@ def _resolve_scan_source_for_path(
                 source_model_id=source_model_id,
                 source_model_source=source_model_source,
                 repository_file_inventory=tuple(download_repository_file_inventory),
+                safetensors_index_proofs=tuple(download_safetensors_index_proofs),
             )
         except _HuggingFaceStreamInterruptedError as exc:
             if runtime.show_styled_output:
@@ -5158,7 +5175,9 @@ def scan_command(
     path_state = _ScanPathState(
         collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths),
         explicit_shard_families=(
-            _explicit_local_shard_family_groups(paths, safetensors_index_context) if assume_shard_family else {}
+            _explicit_local_shard_family_groups(tuple(expanded_paths), safetensors_index_context)
+            if assume_shard_family
+            else {}
         ),
         safetensors_index_context=safetensors_index_context,
     )

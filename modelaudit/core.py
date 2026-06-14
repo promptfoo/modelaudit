@@ -8296,7 +8296,6 @@ def scan_model_streaming(
                     post_scan_safetensors_shard_info = ShardedModelDetector.detect_shards(
                         str(source_path),
                         index_search_root=stream_index_search_root,
-                        force_index_content_revalidation=True,
                     )
                     if post_scan_safetensors_shard_info != source_safetensors_shard_info:
                         scan_result = _preserve_findings_with_shard_boundary_failure(
