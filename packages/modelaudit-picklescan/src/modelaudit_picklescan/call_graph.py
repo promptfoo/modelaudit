@@ -3930,23 +3930,16 @@ def _zipimport_directory_cache_files(archive: str) -> object:
 
 
 def _zipimport_expected_prefix(archive: str, entry: str) -> str | None:
+    archive_state = _zipimport_archive_state_from_entry(entry)
+    if archive_state is None:
+        return None
+    expected_archive, prefix = archive_state
     try:
-        archive_path = os.path.abspath(archive)
-        entry_path = os.path.abspath(entry)
+        if not os.path.samefile(archive, expected_archive):
+            return None
     except (OSError, ValueError):
         return None
-    normalized_archive = os.path.normcase(archive_path)
-    normalized_entry = os.path.normcase(entry_path)
-    if normalized_entry == normalized_archive:
-        return ""
-    archive_root = f"{normalized_archive}{os.sep}"
-    if not normalized_entry.startswith(archive_root):
-        return None
-    relative_entry = entry_path[len(archive_path) :].replace("\\", "/").strip("/")
-    parts = relative_entry.split("/")
-    if not relative_entry or any(part in {"", ".", ".."} for part in parts):
-        return None
-    return f"{'/'.join(parts)}/"
+    return prefix
 
 
 def _zipimport_names_exclude_module(
@@ -4007,6 +4000,9 @@ def _zipimport_archive_state_from_entry(entry: str) -> tuple[str, str] | None:
         candidate = entry if os.path.isabs(entry) else os.path.join(os.getcwd(), entry)
     except (OSError, ValueError):
         return None
+    if os.path.altsep:
+        candidate = candidate.replace(os.path.altsep, os.path.sep)
+    prefix_parts: list[str] = []
     for _ in range(_MAX_MODULE_COMPONENTS + 1):
         try:
             candidate_stat = os.stat(candidate)
@@ -4016,13 +4012,15 @@ def _zipimport_archive_state_from_entry(entry: str) -> tuple[str, str] | None:
             if stat.S_ISDIR(candidate_stat.st_mode):
                 return None
             if stat.S_ISREG(candidate_stat.st_mode):
-                prefix = _zipimport_expected_prefix(candidate, entry)
-                return (candidate, prefix) if prefix is not None else None
+                prefix = os.path.join(*reversed(prefix_parts)).replace("\\", "/") if prefix_parts else ""
+                return candidate, f"{prefix}/" if prefix else ""
             return None
-        parent = os.path.dirname(candidate)
+        parent, basename = os.path.split(candidate)
         if parent == candidate:
             return None
         candidate = parent
+        if basename:
+            prefix_parts.append(basename)
     return None
 
 

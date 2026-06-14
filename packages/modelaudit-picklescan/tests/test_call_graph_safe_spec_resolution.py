@@ -1901,6 +1901,34 @@ def test_relative_zip_preflight_preserves_symlink_parent_traversal(
     assert prefix == ""
 
 
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+@pytest.mark.parametrize("include_module", [False, True], ids=["near-match", "module"])
+def test_zip_preflight_preserves_literal_dot_segments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: bool,
+    include_module: bool,
+) -> None:
+    module = "statistics"
+    archive_path = tmp_path / f"dot-segments-{relative}-{include_module}.zip"
+    member = f"pkg/../evil/{module}.py" if include_module else f"evil/{module}.py"
+    with zipfile.ZipFile(archive_path, "w") as zip_archive:
+        zip_archive.writestr(member, "value = 1\n")
+    if relative:
+        monkeypatch.chdir(tmp_path)
+    root = archive_path.name if relative else str(archive_path)
+    entry = f"{root}/pkg/../evil"
+
+    archive_state = call_graph._zipimport_archive_state_from_entry(entry)
+
+    assert archive_state is not None
+    archive, prefix = archive_state
+    assert prefix == "pkg/../evil/"
+    assert call_graph._zipimport_expected_prefix(archive, entry) == prefix
+    assert call_graph._bounded_zip_archive_excludes_module(archive, prefix, module) is not include_module
+    assert (type(zipimporter.find_spec(zipimporter(entry), module)) is ModuleSpec) is include_module
+
+
 def test_oversized_zip_absence_proof_rejects_forged_cached_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
