@@ -606,6 +606,10 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
         'if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then'
         in gate_script
     )
+    assert (
+        'if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then'
+        in gate_script
+    )
     assert '[[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true' in gate_script
     assert '[[ "$TEST_RESULT" != "success" ]] && FAILED=true' in gate_script
     assert '[[ "$WINDOWS_RESULT" != "success" ]] && FAILED=true' in gate_script

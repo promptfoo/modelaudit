@@ -457,20 +457,12 @@ jobs:
       - name: Run fast tests with fail-fast
         if: github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'
         run: |
-          uv run pytest tests -x --maxfail=1 -n auto \
-            -m "not slow and not integration and not performance" \
-            --modelaudit-shard-count ${{ matrix.shard-count }} \
-            --modelaudit-shard-index ${{ matrix.shard-index }} \
-            --tb=short --durations=10
+          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
 
       - name: Run exhaustive fast-test shard
         if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
         run: |
-          uv run pytest tests -n auto \
-            -m "not slow and not integration and not performance" \
-            --modelaudit-shard-count ${{ matrix.shard-count }} \
-            --modelaudit-shard-index ${{ matrix.shard-index }} \
-            --tb=short --durations=10
+          uv run pytest tests -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
 
   test:
     name: Fast Tests (Python ${{ matrix.python-version }}, Shard ${{ matrix.shard-name }})
@@ -1219,6 +1211,9 @@ jobs:
           if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
             [[ "$LICENSE_RESULT" != "success" ]] && FAILED=true
             [[ "$UV_LOCK_RESULT" != "success" ]] && FAILED=true
+          fi
+
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
             [[ "$NUMPY_RESULT" != "success" ]] && FAILED=true
             [[ "$EXTRAS_RESULT" != "success" ]] && FAILED=true
           fi
