@@ -2267,6 +2267,7 @@ def _build_onnx_weight_analysis_plan(
                     return None, "unresolved_quantized_weight_scale"
                 if scale_data_type is not None and scale_data_type != current_data_type:
                     return None, "unresolved_quantized_weight_scale"
+                had_resolved_scale = bool(scale_names)
                 scale_data_type = current_data_type
                 if not retain_narrowest_output_data_type(current_data_type):
                     return None, "unresolved_quantized_weight_scale"
@@ -2276,7 +2277,7 @@ def _build_onnx_weight_analysis_plan(
                         if graph_outputs_are_authoritative:
                             later_scale = downstream_has_static_scale(next_values)
                             hidden_static_scale = expression_has_non_scalar_floating_constant(source_name)
-                            if later_scale is False and hidden_static_scale is False:
+                            if had_resolved_scale and later_scale is False and hidden_static_scale is False:
                                 reached_terminal = True
                                 break
                         return None, "unresolved_quantized_weight_scale"

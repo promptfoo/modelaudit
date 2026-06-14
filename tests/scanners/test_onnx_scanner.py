@@ -1576,6 +1576,7 @@ def create_matmul_integer_weight_model(
     malicious: bool = False,
     omit_scale: bool = False,
     bind_scale: bool = True,
+    dynamic_scale_input: bool = False,
     zero_scale: bool = False,
     weight_on_left: bool = False,
     dead_scale_branch: bool = False,
@@ -1598,10 +1599,19 @@ def create_matmul_integer_weight_model(
         onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="X_zero_point"),
         onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="W_zero_point"),
     ]
-    if not omit_scale:
+    if not omit_scale and not dynamic_scale_input:
         scale_value = 0.0 if zero_scale else 0.1
         initializers.append(onnx.numpy_helper.from_array(np.asarray(scale_value, dtype=np.float32), name="W_scale"))
     X = helper.make_tensor_value_info("X", TensorProto.INT8, [100, 1] if weight_on_left else [1, 100])
+    inputs = [X]
+    if dynamic_scale_input:
+        inputs.append(
+            helper.make_tensor_value_info(
+                "W_scale",
+                TensorProto.FLOAT,
+                [10, 1] if weight_on_left else [10],
+            )
+        )
     output_type = TensorProto.FLOAT if bind_scale else TensorProto.INT32
     Y = helper.make_tensor_value_info("Y", output_type, [10, 1] if weight_on_left else [1, 10])
     matmul_output = "Y_int" if bind_scale or terminal_bias_add else "Y"
@@ -1642,7 +1652,7 @@ def create_matmul_integer_weight_model(
     elif terminal_bias_add:
         initializers.append(onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int32), name="bias"))
         nodes.append(helper.make_node("Add", [matmul_output, "bias"], ["Y"]))
-    graph = helper.make_graph(nodes, "matmul_integer_weight_graph", [X], [Y], initializer=initializers)
+    graph = helper.make_graph(nodes, "matmul_integer_weight_graph", inputs, [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     if not (bind_scale and omit_scale):
@@ -8957,6 +8967,28 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 1
         assert semantics["eligible"][0]["quantization_scale"] is None
 
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
+    def test_matmul_integer_graph_input_weight_scale_fails_closed(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        model_path = create_matmul_integer_weight_model(
+            tmp_path,
+            malicious=malicious,
+            dynamic_scale_input=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        assert self._extreme_checks(result) == []
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+
     @pytest.mark.parametrize(
         ("weight_on_left", "expose_raw_output"),
         [(False, False), (True, False)],
@@ -11342,10 +11374,12 @@ class TestWeightDistributionSemantics:
         assert all(getattr(item, "onnx_package_hash_complete", None) is True for item in metadata)
         assert len({getattr(item, "content_hash", None) for item in metadata}) == 2
 
-    def test_directory_package_identity_is_invalidated_when_sidecar_changes_during_scan(
+    @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
+    def test_package_identity_is_invalidated_when_sidecar_changes_during_scan(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        streaming: bool,
     ) -> None:
         model_path = create_external_onnx_weight_package(
             tmp_path / "mutable",
@@ -11363,15 +11397,25 @@ class TestWeightDistributionSemantics:
             return original_scan_file(path, config)
 
         monkeypatch.setattr(modelaudit_core, "scan_file", mutate_sidecar_before_scan)
-        result = scan_model_directory_or_file(
-            str(model_path.parent),
-            recursive=False,
-            scanners=["onnx"],
-            cache_enabled=False,
+        result = (
+            scan_model_streaming(
+                iter([(model_path, True)]),
+                delete_after_scan=False,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
+            if streaming
+            else scan_model_directory_or_file(
+                str(model_path.parent),
+                recursive=False,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
         )
 
         assert mutated is True
-        assert result.content_hash is None
+        if not streaming:
+            assert result.content_hash is None
         assert determine_exit_code(result) == 2
         assert getattr(result.file_metadata[str(model_path)], "onnx_package_hash_complete", None) is False
         checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]

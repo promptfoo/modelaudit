@@ -240,6 +240,30 @@ _normalize_unclassified_scan_failure = core_results.normalize_unclassified_scan_
 determine_exit_code = core_results.determine_exit_code
 merge_scan_result = core_results.merge_scan_result
 
+
+def _mark_onnx_external_data_stability_failure(
+    result: ScanResult,
+    model_path: str,
+    changed_source_count: int,
+) -> None:
+    """Fail closed when ONNX external data changes during its model scan."""
+    result.add_check(
+        name="ONNX External Data Stability",
+        passed=False,
+        message="ONNX external-data sources changed during the model scan",
+        severity=IssueSeverity.INFO,
+        location=model_path,
+        details={
+            "analysis_incomplete": True,
+            "scan_outcome_reason": "onnx_external_data_changed_during_scan",
+            "changed_source_count": changed_source_count,
+        },
+    )
+    _mark_inconclusive_scan_outcome(result, "onnx_external_data_changed_during_scan")
+    _mark_operational_scan_error(result, "onnx_external_data_changed_during_scan")
+    result.finish(success=False)
+
+
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 _HF_DOWNLOAD_METADATA_MAX_BYTES = 64 * 1024
 _HF_DOWNLOAD_GIT_BOOKKEEPING_MAX_BYTES = 64 * 1024
@@ -5270,27 +5294,11 @@ def scan_model_directory_or_file(
                                 aggregate_hash_complete = False
                                 onnx_package_hash_complete_by_path[representative_file] = False
                                 onnx_package_hashes_by_path.pop(representative_file, None)
-                                file_result.add_check(
-                                    name="ONNX External Data Stability",
-                                    passed=False,
-                                    message="ONNX external-data sources changed during the model scan",
-                                    severity=IssueSeverity.INFO,
-                                    location=representative_file,
-                                    details={
-                                        "analysis_incomplete": True,
-                                        "scan_outcome_reason": "onnx_external_data_changed_during_scan",
-                                        "changed_source_count": len(changed_onnx_sidecars),
-                                    },
-                                )
-                                _mark_inconclusive_scan_outcome(
+                                _mark_onnx_external_data_stability_failure(
                                     file_result,
-                                    "onnx_external_data_changed_during_scan",
+                                    representative_file,
+                                    len(changed_onnx_sidecars),
                                 )
-                                _mark_operational_scan_error(
-                                    file_result,
-                                    "onnx_external_data_changed_during_scan",
-                                )
-                                file_result.finish(success=False)
                             file_result.bytes_scanned += covered_openvino_companion_sizes.get(
                                 _openvino_xml_companion_key(Path(representative_file)),
                                 0,
@@ -8111,12 +8119,20 @@ def scan_model_streaming(
                     )
                     preserve_shard_reconciliation_errors = True
                     aggregate_hash_complete = False
-                if any(
-                    _snapshot_file_identity(onnx_external_data_path) != pre_scan_identity
+                changed_onnx_sidecars = [
+                    onnx_external_data_path
                     for onnx_external_data_path, pre_scan_identity in onnx_external_data_pre_scan_identities.items()
-                ):
+                    if _snapshot_file_identity(onnx_external_data_path) != pre_scan_identity
+                ]
+                if changed_onnx_sidecars:
                     aggregate_hash_complete = False
                     onnx_package_hash_complete = False
+                    preserve_shard_reconciliation_errors = True
+                    _mark_onnx_external_data_stability_failure(
+                        scan_result,
+                        str(scan_path),
+                        len(changed_onnx_sidecars),
+                    )
                 if openvino_sidecar_needs_independent_scan and openvino_scan_companion_path is not None:
                     independent_openvino_sidecar_path = openvino_scan_companion_path
                     independent_openvino_sidecar_result = scan_file(
