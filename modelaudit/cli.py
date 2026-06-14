@@ -1696,6 +1696,7 @@ class _SourceDispatchResult:
     repository_file_inventory: tuple[str, ...] = ()
     repository_current_file: str | None = None
     safetensors_index_proofs: tuple[HuggingFaceSafetensorsIndexProof, ...] = ()
+    initial_shard_target: ValidatedShardTargets | None = None
 
 
 @dataclass(frozen=True)
@@ -1710,8 +1711,8 @@ class _ExplicitShardFamily:
     initial_index_proof: tuple[str, str, str, int] | None = None
 
 
-def _record_explicit_shard_boundary_failure(scan_result: ModelAuditResultModel, path: str) -> None:
-    """Preserve scan evidence while failing closed on changed explicit-family authority."""
+def _record_shard_boundary_failure(scan_result: ModelAuditResultModel, path: str) -> None:
+    """Preserve scan evidence while failing closed on changed shard identity or authority."""
     if any(check.name == "Sharded Model Boundary Check" and check.location == path for check in scan_result.checks):
         return
 
@@ -1727,6 +1728,73 @@ def _record_explicit_shard_boundary_failure(scan_result: ModelAuditResultModel, 
     scan_result.file_metadata[path] = FileMetadataModel(**merged_metadata)
     scan_result.has_errors = True
     scan_result.success = False
+
+
+def _open_windows_shard_guard_fd(path: str) -> int:
+    """Open a Windows shard for shared reads while denying writes and replacement."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    handle = create_file(
+        path,
+        generic_read,
+        file_share_read,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle_value):
+        error = ctypes_windows.get_last_error()
+        raise ctypes_windows.WinError(error)
+
+    handle_value = handle if isinstance(handle, int) else int(handle.value)
+    try:
+        msvcrt_module: Any = msvcrt
+        return int(
+            msvcrt_module.open_osfhandle(
+                handle_value,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
+            )
+        )
+    except Exception:
+        _close_windows_handle(handle_value)
+        raise
+
+
+def _shard_guard_stat_matches_target(opened_stat: os.stat_result, target: dict[str, int | str]) -> bool:
+    """Return whether a guarded file descriptor still matches its shard receipt."""
+    return stat.S_ISREG(opened_stat.st_mode) and all(
+        not isinstance(target.get(field), int) or target[field] == value
+        for field, value in (
+            ("device", opened_stat.st_dev),
+            ("inode", opened_stat.st_ino),
+            ("size", opened_stat.st_size),
+            ("mtime_ns", opened_stat.st_mtime_ns),
+            ("ctime_ns", opened_stat.st_ctime_ns),
+            ("nlink", opened_stat.st_nlink),
+        )
+    )
 
 
 @dataclass
@@ -1745,6 +1813,7 @@ class _ScanPathState:
     safetensors_index_context: _SafetensorsIndexInspectionContext = field(
         default_factory=_SafetensorsIndexInspectionContext
     )
+    windows_shard_guards: list[tuple[int, str, dict[str, int | str]]] = field(default_factory=list)
     has_errors_outside_reconciled_shards: bool = False
 
     def mark_non_shard_error(self, audit_result: ModelAuditResultModel) -> None:
@@ -1777,6 +1846,66 @@ class _ScanPathState:
         normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
         return self.explicit_shard_families.get(normalized_path)
 
+    def capture_initial_shard_target(self, path: str) -> ValidatedShardTargets | None:
+        """Capture a resolved shard identity at the source-dispatch boundary."""
+        shard_match = ShardedModelDetector.match_shard_filename(Path(path).name)
+        if (
+            shard_match is None
+            or not isinstance(shard_match.get("expected_total_shards"), int)
+            or not os.path.isfile(path)
+        ):
+            return None
+        guard_fd: int | None = None
+        try:
+            if os.name == "nt":
+                guard_fd = _open_windows_shard_guard_fd(path)
+            explicit_family = self.explicit_shard_family_for(path)
+            initial_index_proof = explicit_family.initial_index_proof if explicit_family else None
+            initial_target = _snapshot_validated_shard_target(
+                path,
+                family_group=explicit_family.group if explicit_family else None,
+                family_group_policy="explicit" if explicit_family else None,
+                authoritative_shard_index_base=(initial_index_proof[0] if initial_index_proof else None),
+                authoritative_shard_index_path=(initial_index_proof[1] if initial_index_proof else None),
+                authoritative_shard_index_fingerprint=(initial_index_proof[2] if initial_index_proof else None),
+                authoritative_shard_index_generation=(initial_index_proof[3] if initial_index_proof else None),
+            )
+            if guard_fd is None:
+                return initial_target
+            if len(initial_target) != 1:
+                return {}
+            source_path, target = next(iter(initial_target.items()))
+            resolved_path = target.get("resolved_path")
+            if (
+                not isinstance(resolved_path, str)
+                or os.path.normcase(os.path.normpath(source_path)) != os.path.normcase(os.path.normpath(resolved_path))
+                or not _shard_guard_stat_matches_target(os.fstat(guard_fd), target)
+            ):
+                return {}
+            self.windows_shard_guards.append((guard_fd, source_path, dict(target)))
+            guard_fd = None
+            return initial_target
+        finally:
+            if guard_fd is not None:
+                os.close(guard_fd)
+
+    def revalidate_windows_shard_guards(self, audit_result: ModelAuditResultModel) -> None:
+        """Fail closed if a retained Windows shard handle changed before reconciliation."""
+        for guard_fd, source_path, target in self.windows_shard_guards:
+            try:
+                stable = _shard_guard_stat_matches_target(os.fstat(guard_fd), target)
+            except OSError:
+                stable = False
+            if not stable:
+                _record_shard_boundary_failure(audit_result, source_path)
+
+    def close_windows_shard_guards(self) -> None:
+        """Release retained Windows shard handles after terminal reconciliation."""
+        for guard_fd, _source_path, _target in reversed(self.windows_shard_guards):
+            with contextlib.suppress(OSError):
+                os.close(guard_fd)
+        self.windows_shard_guards.clear()
+
     def record_validated_shard_targets(
         self,
         scan_result: ModelAuditResultModel,
@@ -1784,9 +1913,18 @@ class _ScanPathState:
         pre_scan_target: ValidatedShardTargets | None = None,
     ) -> None:
         """Record stable regular-file identities for shard assets that were scanned."""
+        expected_sources = {
+            os.path.normcase(os.path.normpath(os.path.abspath(source_path))): source_path
+            for source_path in pre_scan_target or {}
+        }
+        observed_sources: set[str] = set()
         for asset in scan_result.assets:
             if not asset.path or asset.type == "error":
                 continue
+            normalized_asset_path = os.path.normcase(os.path.normpath(os.path.abspath(asset.path)))
+            expected_source = expected_sources.get(normalized_asset_path)
+            if expected_source is not None:
+                observed_sources.add(normalized_asset_path)
             metadata = scan_result.file_metadata.get(asset.path)
             if metadata is not None and metadata.get("operational_error") is True:
                 continue
@@ -1797,7 +1935,7 @@ class _ScanPathState:
             )
             authority_required = explicit_family is not None and explicit_family.initial_index_proof is not None
             if authority_required and (not pre_scan_target or authoritative_index_proof is None):
-                _record_explicit_shard_boundary_failure(scan_result, asset.path)
+                _record_shard_boundary_failure(scan_result, asset.path)
                 continue
             post_scan_target = _snapshot_validated_shard_target(
                 asset.path,
@@ -1813,18 +1951,25 @@ class _ScanPathState:
                 ),
             )
             if not post_scan_target:
-                if authority_required:
-                    _record_explicit_shard_boundary_failure(scan_result, asset.path)
+                if authority_required or expected_source is not None:
+                    _record_shard_boundary_failure(scan_result, asset.path)
                 continue
-            if pre_scan_target:
-                common_sources = pre_scan_target.keys() & post_scan_target.keys()
-                if (authority_required and not common_sources) or any(
-                    pre_scan_target[source_path] != post_scan_target[source_path] for source_path in common_sources
-                ):
-                    if authority_required:
-                        _record_explicit_shard_boundary_failure(scan_result, asset.path)
+            if expected_source is not None and pre_scan_target is not None:
+                current_target = next(
+                    (
+                        target
+                        for source_path, target in post_scan_target.items()
+                        if os.path.normcase(os.path.normpath(os.path.abspath(source_path))) == normalized_asset_path
+                    ),
+                    None,
+                )
+                if current_target is None or pre_scan_target[expected_source] != current_target:
+                    _record_shard_boundary_failure(scan_result, asset.path)
                     continue
             self.validated_shard_targets.update(post_scan_target)
+        for normalized_source, source_path in expected_sources.items():
+            if normalized_source not in observed_sources:
+                _record_shard_boundary_failure(scan_result, source_path)
 
     def revalidate_explicit_shard_targets(self, audit_result: ModelAuditResultModel) -> None:
         """Recheck explicit shard identity and index authority immediately before reconciliation."""
@@ -1878,7 +2023,7 @@ class _ScanPathState:
             if current_target.get(source_path) == expected_target:
                 continue
             self.validated_shard_targets.pop(source_path, None)
-            _record_explicit_shard_boundary_failure(audit_result, source_path)
+            _record_shard_boundary_failure(audit_result, source_path)
 
     def track_streaming_paths_for_sbom(
         self,
@@ -3459,20 +3604,9 @@ def _scan_local_or_downloaded_path(
         explicit_family,
         path_state.safetensors_index_context,
     )
-    authority_required = explicit_family is not None and explicit_family.initial_index_proof is not None
-    pre_scan_shard_target = (
-        _snapshot_validated_shard_target(
-            actual_path,
-            family_group=explicit_family.group if explicit_family else None,
-            family_group_policy="explicit" if explicit_family else None,
-            authoritative_shard_index_base=(authoritative_index_proof[0] if authoritative_index_proof else None),
-            authoritative_shard_index_path=(authoritative_index_proof[1] if authoritative_index_proof else None),
-            authoritative_shard_index_fingerprint=(authoritative_index_proof[2] if authoritative_index_proof else None),
-            authoritative_shard_index_generation=(authoritative_index_proof[3] if authoritative_index_proof else None),
-        )
-        if os.path.isfile(actual_path) and (not authority_required or authoritative_index_proof is not None)
-        else {}
-    )
+    pre_scan_shard_target = source_result.initial_shard_target
+    if explicit_family is not None and authoritative_index_proof != explicit_family.initial_index_proof:
+        pre_scan_shard_target = {}
     if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
         return
 
@@ -3529,7 +3663,10 @@ def _scan_local_or_downloaded_path(
                     _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
                 },
             )
-            path_state.record_non_shard_result_errors(streaming_result)
+            if pre_scan_shard_target is not None:
+                _record_shard_boundary_failure(streaming_result, actual_path)
+            else:
+                path_state.record_non_shard_result_errors(streaming_result)
             audit_result.aggregate_scan_result(streaming_result.model_dump())
             revalidate_huggingface_safetensors_indexes()
             path_state.record_dvc_coverage(actual_path, streaming_result, scanner_config=runtime.config)
@@ -3585,11 +3722,14 @@ def _scan_local_or_downloaded_path(
             use_hf_whitelist=runtime.use_hf_whitelist,
             **config_overrides,
         )
-        if os.path.isfile(actual_path):
-            path_state.record_validated_shard_targets(
-                scan_results,
-                pre_scan_target=pre_scan_shard_target,
-            )
+        if pre_scan_shard_target is not None:
+            if not pre_scan_shard_target:
+                _record_shard_boundary_failure(scan_results, actual_path)
+            else:
+                path_state.record_validated_shard_targets(
+                    scan_results,
+                    pre_scan_target=pre_scan_shard_target,
+                )
         else:
             path_state.record_non_shard_result_errors(scan_results)
         audit_result.aggregate_scan_result(scan_results.model_dump())
@@ -3763,6 +3903,7 @@ def _resolve_scan_source_for_path(
                 source_model_source=source_model_source,
                 repository_file_inventory=tuple(direct_repository_file_inventory),
                 repository_current_file=repository_current_file,
+                initial_shard_target=path_state.capture_initial_shard_target(str(download_path)),
             )
         except Exception as exc:
             if download_spinner:
@@ -4022,6 +4163,7 @@ def _resolve_scan_source_for_path(
                 source_model_source=source_model_source,
                 repository_file_inventory=tuple(download_repository_file_inventory),
                 safetensors_index_proofs=tuple(download_safetensors_index_proofs),
+                initial_shard_target=path_state.capture_initial_shard_target(str(download_path)),
             )
         except _HuggingFaceStreamInterruptedError as exc:
             if runtime.show_styled_output:
@@ -4148,7 +4290,11 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Downloaded successfully")
 
-            return _SourceDispatchResult(actual_path=str(download_path), temp_path=str(download_path))
+            return _SourceDispatchResult(
+                actual_path=str(download_path),
+                temp_path=str(download_path),
+                initial_shard_target=path_state.capture_initial_shard_target(str(download_path)),
+            )
         except Exception as exc:
             if download_spinner:
                 download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
@@ -4307,6 +4453,7 @@ def _resolve_scan_source_for_path(
             return _SourceDispatchResult(
                 actual_path=str(download_path),
                 temp_path=str(download_path) if not runtime.cache_enabled else None,
+                initial_shard_target=path_state.capture_initial_shard_target(str(download_path)),
             )
         except Exception as exc:
             if download_spinner:
@@ -4473,7 +4620,10 @@ def _resolve_scan_source_for_path(
         path_state.mark_non_shard_error(audit_result)
         return None
 
-    return _SourceDispatchResult(actual_path=path)
+    return _SourceDispatchResult(
+        actual_path=path,
+        initial_shard_target=path_state.capture_initial_shard_target(path),
+    )
 
 
 class DefaultCommandGroup(click.Group):
@@ -5252,14 +5402,18 @@ def scan_command(
             if should_break:
                 break
 
-    _complete_progress_tracking(progress_tracker, verbose=verbose)
-    _cleanup_progress_reporters(progress_reporters)
-    path_state.revalidate_explicit_shard_targets(audit_result)
-    _reconcile_cross_directory_shard_coverage(
-        audit_result,
-        path_state.validated_shard_targets,
-        missing_shard_errors_only=not path_state.has_errors_outside_reconciled_shards,
-    )
+    try:
+        _complete_progress_tracking(progress_tracker, verbose=verbose)
+        _cleanup_progress_reporters(progress_reporters)
+        path_state.revalidate_windows_shard_guards(audit_result)
+        path_state.revalidate_explicit_shard_targets(audit_result)
+        _reconcile_cross_directory_shard_coverage(
+            audit_result,
+            path_state.validated_shard_targets,
+            missing_shard_errors_only=not path_state.has_errors_outside_reconciled_shards,
+        )
+    finally:
+        path_state.close_windows_shard_guards()
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
 

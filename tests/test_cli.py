@@ -1444,6 +1444,213 @@ def test_scan_same_directory_shards_rejects_split_index_authority(
     assert boundary_check["details"]["reason"] == "shard_target_changed_during_scan"
 
 
+@pytest.mark.parametrize("assume_shard_family", [False, True], ids=["default", "assumed-family"])
+def test_scan_single_unindexed_shard_rejects_target_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    assume_shard_family: bool,
+) -> None:
+    """An unindexed shard cannot disappear from terminal validation after an A-B-A swap."""
+    shard_dir = tmp_path / "shards"
+    _make_trusted_shard_parent(shard_dir)
+    shard = shard_dir / "model-00001-of-00001.safetensors"
+    malicious_bytes = struct.pack("<Q", 128) + b"{}"
+    shard.write_bytes(malicious_bytes)
+    held_shard = shard_dir / "held-model.safetensors"
+    original_scan = cli_module.scan_model_directory_or_file
+
+    def scan_substitute(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
+        if Path(path) != shard:
+            return original_scan(path, *args, **kwargs)
+        shard.rename(held_shard)
+        shard.write_bytes(_minimal_safetensors_bytes())
+        try:
+            return original_scan(path, *args, **kwargs)
+        finally:
+            shard.unlink()
+            held_shard.rename(shard)
+
+    monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_substitute)
+    arguments = ["scan", str(shard), "--scanners", "safetensors", "--format", "json", "--no-cache"]
+    if assume_shard_family:
+        arguments.append("--assume-shard-family")
+
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    if os.name == "nt":
+        assert shard.read_bytes() == malicious_bytes
+        return
+    boundary_check = next(
+        check
+        for check in output_payload["checks"]
+        if check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+    )
+    assert boundary_check["details"]["reason"] == "shard_target_changed_during_scan"
+    assert shard.read_bytes() == malicious_bytes
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_scan_single_unindexed_shard_rejects_file_to_directory_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """A shard resolved as a file must retain that expectation through scan setup."""
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    malicious_bytes = struct.pack("<Q", 128) + b"{}"
+    shard.write_bytes(malicious_bytes)
+    held_shard = tmp_path / "held-model.safetensors"
+    original_resolve_source = cli_module._resolve_scan_source_for_path
+    original_complete_progress = cli_module._complete_progress_tracking
+    substituted = False
+
+    def substitute_after_source_resolution(*args: Any, **kwargs: Any) -> Any:
+        nonlocal substituted
+        resolved_source = original_resolve_source(*args, **kwargs)
+        if not substituted:
+            shard.rename(held_shard)
+            shard.mkdir()
+            (shard / "benign.safetensors").write_bytes(_minimal_safetensors_bytes())
+            substituted = True
+        return resolved_source
+
+    def restore_shard_before_reconciliation(*args: Any, **kwargs: Any) -> None:
+        original_complete_progress(*args, **kwargs)
+        if not substituted:
+            return
+        (shard / "benign.safetensors").unlink()
+        shard.rmdir()
+        held_shard.rename(shard)
+
+    monkeypatch.setattr(cli_module, "_resolve_scan_source_for_path", substitute_after_source_resolution)
+    monkeypatch.setattr(cli_module, "_complete_progress_tracking", restore_shard_before_reconciliation)
+
+    arguments = ["scan", str(shard), "--scanners", "safetensors", "--format", "json", "--no-cache"]
+    if stream:
+        arguments.append("--stream")
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    if os.name == "nt":
+        assert shard.read_bytes() == malicious_bytes
+        return
+    boundary_check = next(
+        check
+        for check in output_payload["checks"]
+        if check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+    )
+    assert boundary_check["details"]["reason"] == "shard_target_changed_during_scan"
+    assert shard.read_bytes() == malicious_bytes
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows file-sharing semantics")
+def test_windows_shard_replacement_guard_prevents_rename(tmp_path: Path) -> None:
+    """The Windows receipt guard must deny writes and replacement through reconciliation."""
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    original_bytes = _minimal_safetensors_bytes()
+    shard.write_bytes(original_bytes)
+    path_state = _ScanPathState()
+    assert path_state.capture_initial_shard_target(str(shard))
+    held_shard = tmp_path / "held-model.safetensors"
+
+    try:
+        with pytest.raises(OSError):
+            shard.rename(held_shard)
+        with pytest.raises(OSError):
+            shard.write_bytes(b"changed")
+    finally:
+        path_state.close_windows_shard_guards()
+        if held_shard.exists():
+            held_shard.rename(shard)
+
+    assert shard.read_bytes() == original_bytes
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows file-sharing semantics")
+def test_windows_shard_replacement_guard_allows_stable_cli_scan(tmp_path: Path) -> None:
+    """The Windows replacement guard must not reject an unchanged shard."""
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(_minimal_safetensors_bytes())
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(shard), "--scanners", "safetensors", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is True
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in output_payload["checks"]
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_scan_shard_shaped_directory_does_not_require_file_receipt(tmp_path: Path, stream: bool) -> None:
+    """A directory that starts as a directory is not a changed shard file."""
+    shard_shaped_directory = tmp_path / "model-00001-of-00001.safetensors"
+    shard_shaped_directory.mkdir()
+    (shard_shaped_directory / "benign.safetensors").write_bytes(_minimal_safetensors_bytes())
+
+    arguments = [
+        "scan",
+        str(shard_shaped_directory),
+        "--scanners",
+        "safetensors",
+        "--format",
+        "json",
+        "--no-cache",
+    ]
+    if stream:
+        arguments.append("--stream")
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is True
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in output_payload["checks"]
+    )
+
+
+def test_scan_path_state_requires_unindexed_shard_completion_receipt(tmp_path: Path) -> None:
+    """A clean shard result must still account for its pre-scan identity."""
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(_minimal_safetensors_bytes())
+    pre_scan_target = cli_module._snapshot_validated_shard_target(str(shard))
+    assert pre_scan_target
+
+    stable_result = create_initial_audit_result()
+    stable_result.assets.append(AssetModel(path=str(shard), type="safetensors", size=shard.stat().st_size))
+    stable_result.file_metadata[str(shard)] = FileMetadataModel(file_size=shard.stat().st_size)
+    path_state = _ScanPathState()
+    path_state.record_validated_shard_targets(stable_result, pre_scan_target=pre_scan_target)
+    assert path_state.validated_shard_targets == pre_scan_target
+
+    path_state.validated_shard_targets.clear()
+    missing_receipt_result = create_initial_audit_result()
+    path_state.record_validated_shard_targets(missing_receipt_result, pre_scan_target=pre_scan_target)
+
+    assert path_state.validated_shard_targets == {}
+    assert missing_receipt_result.success is False
+    assert missing_receipt_result.has_errors is True
+    boundary_check = next(
+        check
+        for check in missing_receipt_result.checks
+        if check.details.get("scan_outcome_reason") == "shard_boundary_changed"
+    )
+    assert boundary_check.location == str(shard.absolute())
+    assert boundary_check.details["reason"] == "shard_target_changed_during_scan"
+
+
 def test_scan_path_state_revalidates_index_authority_for_cached_results(tmp_path: Path) -> None:
     """Reused scan output cannot record a target after its index authority stops governing it."""
     header = b'{"__metadata__":{"format":"pt"}}'
@@ -5196,7 +5403,12 @@ def test_scan_huggingface_direct_file_stream_selection_bypasses_repo_stream_sele
     downloaded_file = tmp_path / "model-00001-of-00002.safetensors"
     downloaded_file.write_bytes(b"weights")
     mock_download_file.return_value = downloaded_file
-    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+    mock_scan.return_value = create_mock_scan_result(
+        files_scanned=1,
+        issues=[],
+        assets=[{"path": str(downloaded_file), "type": "safetensors", "size": downloaded_file.stat().st_size}],
+        file_metadata={str(downloaded_file): {"file_size": downloaded_file.stat().st_size}},
+    )
 
     result = CliRunner().invoke(
         cli,
