@@ -13,7 +13,7 @@ import sysconfig
 import tarfile
 import zipfile
 import zipimport
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
@@ -1548,6 +1548,39 @@ def test_zipimporter_directory_validation_does_not_execute_mutated_reader(tmp_pa
     assert marker.exists() is False
 
 
+def test_zipimporter_directory_validation_does_not_execute_mutated_reader_global(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "mutated-reader-global.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    finder = zipimporter(str(archive_path))
+    files = _zipimporter_directory_files(finder)
+    assert call_graph._zipimport_archive_files_match(str(archive_path), files)
+
+    zipimport_namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    original_unpack = dict.get(zipimport_namespace, "_unpack_uint32")
+    assert callable(original_unpack)
+    calls: list[bytes] = []
+
+    def poisoned_unpack(value: bytes) -> int:
+        calls.append(value)
+        return cast(Callable[[bytes], int], original_unpack)(value)
+
+    monkeypatch.setitem(zipimport_namespace, "_unpack_uint32", poisoned_unpack)
+
+    assert call_graph._zipimport_archive_files_match(str(archive_path), files) is False
+    with _standard_import_runtime(
+        monkeypatch,
+        module="trusted_module",
+        importer_cache={str(archive_path): finder},
+        search_path=[str(archive_path)],
+        trusted_site_package_root=tmp_path,
+    ):
+        assert call_graph._trusted_module_origin_kind("trusted_module") is None
+    assert calls == []
+
+
 def test_zipimporter_directory_validation_bounds_entries_before_reader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1569,7 +1602,11 @@ def test_zipimporter_directory_validation_bounds_entries_before_reader(
     zipimport_namespace = ModuleType.__getattribute__(zipimport, "__dict__")
     monkeypatch.setitem(zipimport_namespace, "_read_directory", counted_reader)
     monkeypatch.setattr(call_graph, "_ZIP_READ_DIRECTORY", counted_reader)
-    monkeypatch.setattr(call_graph, "_ZIP_READ_DIRECTORY_SNAPSHOT", call_graph._runtime_value_snapshot(counted_reader))
+    monkeypatch.setattr(
+        call_graph,
+        "_ZIP_READ_DIRECTORY_SNAPSHOT",
+        call_graph._trusted_executable_value_snapshot(counted_reader),
+    )
 
     assert call_graph._zipimport_archive_files_match(str(archive_path), {}) is False
     assert calls == []

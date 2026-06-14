@@ -274,7 +274,6 @@ _TRUSTED_ZIPIMPORTER_METHODS = tuple(
 _ZIPIMPORT_NAMESPACE = ModuleType.__getattribute__(zipimport, "__dict__")
 _ZIP_DIRECTORY_CACHE = dict.get(_ZIPIMPORT_NAMESPACE, "_zip_directory_cache")
 _ZIP_READ_DIRECTORY = dict.get(_ZIPIMPORT_NAMESPACE, "_read_directory")
-_ZIP_READ_DIRECTORY_SNAPSHOT = _runtime_value_snapshot(_ZIP_READ_DIRECTORY)
 
 
 def _module_namespace_snapshot(module: ModuleType) -> Mapping[str, _RuntimeValueSnapshot]:
@@ -1107,6 +1106,9 @@ def _trusted_executable_value_matches_snapshot(
         ):
             return False
     return True
+
+
+_ZIP_READ_DIRECTORY_SNAPSHOT = _trusted_executable_value_snapshot(_ZIP_READ_DIRECTORY)
 
 
 def _trusted_reference_executable_matches_snapshot(
@@ -3882,7 +3884,7 @@ def _zipimport_archive_files_match(archive: str, files: object) -> bool:
     if (
         namespace is not _ZIPIMPORT_NAMESPACE
         or dict.get(namespace, "_read_directory") is not _ZIP_READ_DIRECTORY
-        or not _runtime_value_matches_snapshot(_ZIP_READ_DIRECTORY, _ZIP_READ_DIRECTORY_SNAPSHOT)
+        or not _trusted_executable_value_matches_snapshot(_ZIP_READ_DIRECTORY, _ZIP_READ_DIRECTORY_SNAPSHOT)
     ):
         return False
     try:
