@@ -406,6 +406,7 @@ def test_dependency_audit_runs_for_source_reachability_changes() -> None:
     assert isinstance(job, dict)
 
     condition = job["if"]
+    assert "github.event_name == 'merge_group'" in condition
     assert "github.event_name == 'pull_request'" in condition
     assert "needs.changes.outputs.dependencies == 'true'" in condition
     assert "needs.changes.outputs.workflows == 'true'" in condition
@@ -603,6 +604,12 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     gate_script = _step_by_name(ci_success_steps, "Check if all jobs succeeded")["run"]
     assert (
         'if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then'
+        in gate_script
+    )
+    assert (
+        'if [[ "$ON_MERGE_GROUP" == "true" || ( "$ON_PULL_REQUEST" == "true" && '
+        '( "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" || '
+        '"$PYTHON_CHANGED" == "true" || "$PICKLESCAN_CHANGED" == "true" ) ) ]]; then'
         in gate_script
     )
     assert (

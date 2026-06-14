@@ -113,7 +113,7 @@ jobs:
   dependency-audit:
     name: Dependency Audit
     needs: changes
-    if: github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1192,7 +1192,7 @@ jobs:
             [[ "$BUILD_RESULT" != "success" ]] && FAILED=true
           fi
 
-          if [[ "$ON_PULL_REQUEST" == "true" && ( "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" || "$PYTHON_CHANGED" == "true" || "$PICKLESCAN_CHANGED" == "true" ) ]]; then
+          if [[ "$ON_MERGE_GROUP" == "true" || ( "$ON_PULL_REQUEST" == "true" && ( "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" || "$PYTHON_CHANGED" == "true" || "$PICKLESCAN_CHANGED" == "true" ) ) ]]; then
             [[ "$DEPENDENCY_AUDIT_RESULT" != "success" ]] && FAILED=true
           fi
 
