@@ -205,6 +205,37 @@ def create_external_onnx_weight_package(root: Path, weights: np.ndarray) -> Path
     return path
 
 
+def create_two_sidecar_onnx_package(root: Path, *, swap_contents: bool) -> Path:
+    root.mkdir(parents=True)
+    tensors = [
+        _make_external_tensor(name, TensorProto.FLOAT, [100, 10], sidecar)
+        for name, sidecar in (("W_a", "a.bin"), ("W_b", "b.bin"))
+    ]
+    graph = helper.make_graph(
+        [
+            helper.make_node("MatMul", ["X", "W_a"], ["Y_a"]),
+            helper.make_node("MatMul", ["X", "W_b"], ["Y_b"]),
+        ],
+        "two_sidecar_weights",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [
+            helper.make_tensor_value_info("Y_a", TensorProto.FLOAT, [1, 10]),
+            helper.make_tensor_value_info("Y_b", TensorProto.FLOAT, [1, 10]),
+        ],
+        initializer=tensors,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = root / "model.onnx"
+    onnx.save(model, str(path))
+    payloads = [np.zeros((100, 10), dtype=np.float32), np.ones((100, 10), dtype=np.float32)]
+    if swap_contents:
+        payloads.reverse()
+    for sidecar, payload in zip(("a.bin", "b.bin"), payloads, strict=True):
+        (root / sidecar).write_bytes(payload.tobytes())
+    return path
+
+
 def create_multiple_weight_model(tmp_path: Path, *, weight_count: int) -> Path:
     initializers = []
     nodes = []
@@ -1000,6 +1031,33 @@ def create_mixed_activation_and_raw_lineage_model(tmp_path: Path) -> Path:
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     path = tmp_path / "mixed-activation-raw-lineage.onnx"
+    _save_checked_onnx_model(model, path)
+    return path
+
+
+def create_two_hop_activation_raw_lineage_model(tmp_path: Path, *, rank_one_raw: bool) -> Path:
+    activation_weight = onnx.numpy_helper.from_array(np.zeros((100, 100), dtype=np.float32), name="A")
+    raw_shape = (10,) if rank_one_raw else (100, 10)
+    raw_weight = onnx.numpy_helper.from_array(np.zeros(raw_shape, dtype=np.float32), name="P")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    delta = helper.make_tensor_value_info("delta", TensorProto.FLOAT, [100, 10])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+    graph = helper.make_graph(
+        [
+            helper.make_node("MatMul", ["X", "A"], ["activation"]),
+            helper.make_node("Add", ["P", "delta"], ["raw_dynamic"]),
+            helper.make_node("Identity", ["raw_dynamic"], ["raw_two_hop"]),
+            helper.make_node("MatMul", ["activation", "raw_two_hop"], ["Y"]),
+        ],
+        "two_hop_activation_raw_lineage",
+        [X, delta],
+        [Y],
+        initializer=[activation_weight, raw_weight],
+        value_info=[helper.make_tensor_value_info("raw_dynamic", TensorProto.FLOAT, [100, 10])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / f"two-hop-activation-raw-{rank_one_raw}.onnx"
     _save_checked_onnx_model(model, path)
     return path
 
@@ -1818,13 +1876,21 @@ def create_dynamic_matmul_integer_bias_model(
     assert post_bias_operator in {
         None,
         "Abs",
+        "Add",
         "Cast",
+        "canonical_gelu",
+        "Div",
+        "Exp",
         "Identity",
         "Relu",
+        "Reshape",
+        "Squeeze",
+        "Transpose",
         "dynamic_mul",
         "dynamic_mul_with_transpose",
         "local_identity",
         "self_mul",
+        "spoofed_gelu",
     }
     weights = np.ones((100, 10), dtype=np.int8)
     weight_scale = np.ones(10, dtype=np.float32)
@@ -1860,7 +1926,7 @@ def create_dynamic_matmul_integer_bias_model(
             helper.make_node("Add", [f"{prefix}Y_scaled", bias_name], [output_name]),
         ]
 
-    bias_output = "Y_biased" if post_bias_scale or integer_op_boundary != "direct" else "Y"
+    bias_output = "Y_biased" if post_bias_scale or post_bias_operator or integer_op_boundary != "direct" else "Y"
     functions: list[Any] = []
     inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])]
     if integer_op_boundary == "function":
@@ -1932,6 +1998,7 @@ def create_dynamic_matmul_integer_bias_model(
             output_name=bias_output,
         )
     extra_outputs = []
+    extra_initializers: list[Any] = []
     if post_bias_scale:
         post_bias_input = bias_output
         if post_bias_operator in {"Abs", "Identity", "Relu"}:
@@ -1939,6 +2006,36 @@ def create_dynamic_matmul_integer_bias_model(
             post_bias_input = "Y_post_bias"
         elif post_bias_operator == "Cast":
             nodes.append(helper.make_node("Cast", [post_bias_input], ["Y_post_bias"], to=TensorProto.FLOAT))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "Reshape":
+            extra_initializers.append(
+                onnx.numpy_helper.from_array(np.asarray([1, 10], dtype=np.int64), name="post_bias_shape")
+            )
+            nodes.append(helper.make_node("Reshape", [post_bias_input, "post_bias_shape"], ["Y_post_bias"]))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "Squeeze":
+            extra_initializers.append(
+                onnx.numpy_helper.from_array(np.asarray([0], dtype=np.int64), name="post_bias_axes")
+            )
+            nodes.append(helper.make_node("Squeeze", [post_bias_input, "post_bias_axes"], ["Y_post_bias"]))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "Transpose":
+            nodes.append(helper.make_node("Transpose", [post_bias_input], ["Y_post_bias"], perm=[0, 1]))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "Add":
+            extra_initializers.append(
+                onnx.numpy_helper.from_array(np.asarray(0.0, dtype=np.float32), name="post_bias_addend")
+            )
+            nodes.append(helper.make_node("Add", [post_bias_input, "post_bias_addend"], ["Y_post_bias"]))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "Div":
+            extra_initializers.append(
+                onnx.numpy_helper.from_array(np.asarray(2.0, dtype=np.float32), name="post_bias_divisor")
+            )
+            nodes.append(helper.make_node("Div", [post_bias_input, "post_bias_divisor"], ["Y_post_bias"]))
+            post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "Exp":
+            nodes.append(helper.make_node("Exp", [post_bias_input], ["Y_post_bias"]))
             post_bias_input = "Y_post_bias"
         elif post_bias_operator in {"dynamic_mul", "dynamic_mul_with_transpose"}:
             inputs.append(helper.make_tensor_value_info("post_bias_gate", TensorProto.FLOAT, [1, 10]))
@@ -1963,7 +2060,41 @@ def create_dynamic_matmul_integer_bias_model(
             )
             nodes.append(helper.make_node("Identity", [post_bias_input], ["Y_post_bias"]))
             post_bias_input = "Y_post_bias"
+        elif post_bias_operator == "spoofed_gelu":
+            extra_initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(np.asarray(2.0, dtype=np.float32), name="fake_divisor"),
+                    onnx.numpy_helper.from_array(np.asarray(0.5, dtype=np.float32), name="fake_factor"),
+                ]
+            )
+            nodes.extend(
+                [
+                    helper.make_node("Div", [post_bias_input, "fake_divisor"], ["fake_div"]),
+                    helper.make_node("Mul", [post_bias_input, "fake_factor"], ["fake_mul"]),
+                    helper.make_node("Add", ["fake_div", "fake_mul"], ["Y_post_bias"]),
+                ]
+            )
+            post_bias_input = "Y_post_bias"
         nodes.append(helper.make_node("Mul", [post_bias_input, "W_scale_1"], ["Y"]))
+    elif post_bias_operator in {"Abs", "Relu"}:
+        nodes.append(helper.make_node(post_bias_operator, [bias_output], ["Y"]))
+    elif post_bias_operator == "canonical_gelu":
+        extra_initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.asarray(np.sqrt(2.0), dtype=np.float32), name="gelu_sqrt_two"),
+                onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="gelu_one"),
+                onnx.numpy_helper.from_array(np.asarray(0.5, dtype=np.float32), name="gelu_half"),
+            ]
+        )
+        nodes.extend(
+            [
+                helper.make_node("Div", [bias_output, "gelu_sqrt_two"], ["gelu_div"]),
+                helper.make_node("Erf", ["gelu_div"], ["gelu_erf"]),
+                helper.make_node("Add", ["gelu_erf", "gelu_one"], ["gelu_add"]),
+                helper.make_node("Mul", [bias_output, "gelu_add"], ["gelu_product"]),
+                helper.make_node("Mul", ["gelu_product", "gelu_half"], ["Y"]),
+            ]
+        )
     elif integer_op_boundary != "direct":
         nodes.append(helper.make_node("Identity", [bias_output], ["Y"]))
     metadata_sink_input = bias_output if metadata_sink_from_bias_output else "Y"
@@ -1973,8 +2104,16 @@ def create_dynamic_matmul_integer_bias_model(
         "dynamic_matmul_integer_bias",
         inputs,
         [
-            helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10]),
-            helper.make_tensor_value_info("Y_shape", TensorProto.INT64, [2]),
+            helper.make_tensor_value_info(
+                "Y",
+                TensorProto.FLOAT,
+                [10] if post_bias_operator == "Squeeze" else [1, 10],
+            ),
+            helper.make_tensor_value_info(
+                "Y_shape",
+                TensorProto.INT64,
+                [1] if post_bias_operator == "Squeeze" else [2],
+            ),
             *extra_outputs,
         ],
         initializer=[
@@ -1983,6 +2122,7 @@ def create_dynamic_matmul_integer_bias_model(
             onnx.numpy_helper.from_array(initial_scale, name=initial_scale_name),
             *([onnx.numpy_helper.from_array(weight_scale, name="W_scale_1")] if post_bias_scale else []),
             onnx.numpy_helper.from_array(np.zeros(10, dtype=np.float32), name="bias"),
+            *extra_initializers,
         ],
     )
     opset_imports = [helper.make_opsetid("", 13)]
@@ -1997,6 +2137,41 @@ def create_dynamic_matmul_integer_bias_model(
     path = tmp_path / (
         f"dynamic-matmul-integer-{suffix}-{integer_op_boundary}-{'malicious' if malicious else 'benign'}.onnx"
     )
+    onnx.save(model, str(path))
+    return path
+
+
+def create_wide_malformed_scale_expression_model(tmp_path: Path, *, fanout: int) -> Path:
+    nodes = [
+        helper.make_node("DynamicQuantizeLinear", ["X"], ["X_quantized", "X_scale", "X_zero_point"]),
+        helper.make_node(
+            "MatMulInteger",
+            ["X_quantized", "W", "X_zero_point", "W_zero_point"],
+            ["Y_integer"],
+        ),
+        helper.make_node("Cast", ["Y_integer"], ["Y_cast"], to=TensorProto.FLOAT),
+        helper.make_node("Mul", ["Y_cast", "X_scale"], ["Y_scaled"]),
+        helper.make_node("Add", ["Y_scaled", "bias"], ["Y_biased"]),
+        helper.make_node("Mul", ["W_scale"] * fanout, ["wide_scale"]),
+    ]
+    fanout_outputs = [f"Y_{index}" for index in range(fanout)]
+    nodes.extend(helper.make_node("Mul", ["Y_biased", "wide_scale"], [name]) for name in fanout_outputs)
+    nodes.append(helper.make_node("Sum", fanout_outputs, ["Y"]))
+    graph = helper.make_graph(
+        nodes,
+        "wide_malformed_scale_expression",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[
+            onnx.numpy_helper.from_array(np.ones((100, 10), dtype=np.int8), name="W"),
+            onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="W_zero_point"),
+            onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="W_scale"),
+            onnx.numpy_helper.from_array(np.zeros(10, dtype=np.float32), name="bias"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / f"wide-malformed-scale-{fanout}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -2509,11 +2684,13 @@ def create_typed_constant_of_shape_weight_model(
     fill_value: float | int,
     malformed: bool = False,
     typed_field_repetitions: int = 0,
+    string_field_repetitions: int = 0,
 ) -> Path:
     fill = helper.make_tensor("fill", data_type, [1], [fill_value])
     if malformed:
         fill.int32_data.append(0)
     fill.int32_data.extend([0] * typed_field_repetitions)
+    fill.string_data.extend([b""] * string_field_repetitions)
     quantized = data_type == TensorProto.INT8
     consumer = "MatMulInteger" if quantized else "MatMul"
     output_type = TensorProto.INT32 if quantized else data_type
@@ -2530,7 +2707,7 @@ def create_typed_constant_of_shape_weight_model(
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    if not malformed and not typed_field_repetitions:
+    if not malformed and not typed_field_repetitions and not string_field_repetitions:
         onnx.checker.check_model(model)
     path = tmp_path / f"typed-constant-of-shape-{data_type}-{fill_value}-{'bad' if malformed else 'valid'}.onnx"
     onnx.save(model, str(path))
@@ -2931,6 +3108,62 @@ def create_qlinear_matmul_left_weight_model(tmp_path: Path, *, malicious: bool) 
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
     model.ir_version = 10
     path = tmp_path / f"qlinear-matmul-left-{'malicious' if malicious else 'benign'}.onnx"
+    _save_checked_onnx_model(model, path)
+    return path
+
+
+def create_qlinear_matmul_float8_weight_model(
+    tmp_path: Path,
+    *,
+    data_type: int,
+    weight_on_left: bool,
+    cast_weight: bool,
+    malicious: bool,
+) -> Path:
+    weight_shape = (10, 100) if weight_on_left else (100, 10)
+    weights = np.zeros(weight_shape, dtype=np.float32)
+    if malicious:
+        if weight_on_left:
+            weights[3, 50:55] = 10.0
+        else:
+            weights[50:55, 3] = 10.0
+    weight_name = "W_source" if cast_weight else "W"
+    weight = (
+        onnx.numpy_helper.from_array(weights, name=weight_name)
+        if cast_weight
+        else helper.make_tensor("W", data_type, list(weight_shape), weights.reshape(-1).tolist())
+    )
+    nodes = []
+    if cast_weight:
+        nodes.append(helper.make_node("Cast", [weight_name], ["W"], to=data_type))
+    x_shape = [100, 1] if weight_on_left else [1, 100]
+    y_shape = [10, 1] if weight_on_left else [1, 10]
+    qlinear_inputs = (
+        ["W", "W_scale", "W_zero_point", "X", "X_scale", "X_zero_point", "Y_scale", "Y_zero_point"]
+        if weight_on_left
+        else ["X", "X_scale", "X_zero_point", "W", "W_scale", "W_zero_point", "Y_scale", "Y_zero_point"]
+    )
+    nodes.append(helper.make_node("QLinearMatMul", qlinear_inputs, ["Y"]))
+    initializers = [
+        weight,
+        onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="W_scale"),
+        helper.make_tensor("W_zero_point", data_type, [], [0.0]),
+        onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="X_scale"),
+        helper.make_tensor("X_zero_point", data_type, [], [0.0]),
+        onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="Y_scale"),
+        helper.make_tensor("Y_zero_point", data_type, [], [0.0]),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "qlinear_matmul_float8_weight",
+        [helper.make_tensor_value_info("X", data_type, x_shape)],
+        [helper.make_tensor_value_info("Y", data_type, y_shape)],
+        initializer=initializers,
+        value_info=[helper.make_tensor_value_info("W", data_type, list(weight_shape))] if cast_weight else [],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    path = tmp_path / f"qlinear-float8-{data_type}-{weight_on_left}-{cast_weight}-{malicious}.onnx"
     _save_checked_onnx_model(model, path)
     return path
 
@@ -3421,6 +3654,62 @@ def create_local_qlinear_matmul_collision_model(
     model = helper.make_model(graph, functions=[function], opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     path = tmp_path / f"local-qlinear-collision-{malicious_decoy}-{malicious_weight}.onnx"
+    _save_checked_onnx_model(model, path)
+    return path
+
+
+def create_local_constant_scale_collision_model(tmp_path: Path, *, malicious: bool) -> Path:
+    scale_values = np.ones(10, dtype=np.float32)
+    if malicious:
+        scale_values[3] = 100.0
+    function = helper.make_function(
+        "",
+        "Constant",
+        [],
+        ["function_scale"],
+        [
+            helper.make_node(
+                "Constant",
+                [],
+                ["function_scale"],
+                value=onnx.numpy_helper.from_array(scale_values),
+            )
+        ],
+        [helper.make_opsetid("", 13)],
+        attributes=["value"],
+        overload="local",
+    )
+    local_constant = helper.make_node(
+        "Constant",
+        [],
+        ["W_scale"],
+        value=onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32)),
+        overload="local",
+    )
+    graph = helper.make_graph(
+        [
+            local_constant,
+            helper.make_node("DynamicQuantizeLinear", ["X"], ["X_quantized", "X_scale", "X_zero_point"]),
+            helper.make_node(
+                "MatMulInteger",
+                ["X_quantized", "W", "X_zero_point", "W_zero_point"],
+                ["Y_integer"],
+            ),
+            helper.make_node("Cast", ["Y_integer"], ["Y_cast"], to=TensorProto.FLOAT),
+            helper.make_node("Mul", ["Y_cast", "X_scale"], ["Y_activation_scaled"]),
+            helper.make_node("Mul", ["Y_activation_scaled", "W_scale"], ["Y"]),
+        ],
+        "local_constant_scale_collision",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[
+            onnx.numpy_helper.from_array(np.ones((100, 10), dtype=np.int8), name="W"),
+            onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="W_zero_point"),
+        ],
+    )
+    model = helper.make_model(graph, functions=[function], opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / f"local-constant-scale-{malicious}.onnx"
     _save_checked_onnx_model(model, path)
     return path
 
@@ -8368,7 +8657,11 @@ class TestWeightDistributionSemantics:
         result = OnnxScanner().scan(str(model_path))
 
         assert result.success is True
-        checks = self._extreme_checks(result)
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
         assert len(checks) == int(malicious)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible"][0]["consumer_op"] == "Einsum"
@@ -8819,7 +9112,10 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert semantics["eligible"][0]["quantization_scale_factor_names"] == ["W_scale_0", "W_scale_1"]
 
-    @pytest.mark.parametrize("post_bias_operator", ["Identity", "Cast"])
+    @pytest.mark.parametrize(
+        "post_bias_operator",
+        ["Identity", "Cast", "Reshape", "Squeeze", "Transpose", "Add"],
+    )
     @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])
     def test_dynamic_matmul_integer_traces_authoritative_post_bias_copies(
         self,
@@ -8848,7 +9144,17 @@ class TestWeightDistributionSemantics:
 
     @pytest.mark.parametrize(
         "post_bias_operator",
-        ["Abs", "Relu", "dynamic_mul", "dynamic_mul_with_transpose", "self_mul", "local_identity"],
+        [
+            "Abs",
+            "Relu",
+            "Div",
+            "Exp",
+            "spoofed_gelu",
+            "dynamic_mul",
+            "dynamic_mul_with_transpose",
+            "self_mul",
+            "local_identity",
+        ],
     )
     @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])
     def test_dynamic_matmul_integer_fails_closed_on_ambiguous_post_bias_consumers(
@@ -8870,6 +9176,90 @@ class TestWeightDistributionSemantics:
         assert result.success is False
         assert semantics["analyzed_initializer_count"] == 0
         assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+
+    @pytest.mark.parametrize("post_bias_operator", ["Abs", "Relu"])
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])
+    def test_dynamic_matmul_integer_terminal_activation_is_complete(
+        self,
+        tmp_path: Path,
+        post_bias_operator: str,
+        malicious: bool,
+    ) -> None:
+        model_path = create_dynamic_matmul_integer_bias_model(
+            tmp_path,
+            malicious=malicious,
+            post_bias_operator=post_bias_operator,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert len(checks) == int(malicious)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])
+    def test_dynamic_matmul_integer_terminal_canonical_gelu_is_complete(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(
+                create_dynamic_matmul_integer_bias_model(
+                    tmp_path,
+                    malicious=malicious,
+                    post_bias_operator="canonical_gelu",
+                )
+            )
+        )
+
+        assert result.success is True
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert len(checks) == int(malicious)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {}
+
+    def test_wide_malformed_scale_expression_is_linear_and_interruptible(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_wide_malformed_scale_expression_model(tmp_path, fanout=1600)
+        scale_callbacks = 0
+
+        def count_scale_work(_scanner: OnnxScanner) -> None:
+            nonlocal scale_callbacks
+            if sys._getframe(1).f_code.co_name == "scale_initializer_names_in_expression":
+                scale_callbacks += 1
+
+        monkeypatch.setattr(OnnxScanner, "check_interrupted", count_scale_work)
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "unresolved_quantized_weight_scale"
+        assert 0 < scale_callbacks <= 3
+
+        def interrupt_scale_work(_scanner: OnnxScanner) -> None:
+            if sys._getframe(1).f_code.co_name == "scale_initializer_names_in_expression":
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(OnnxScanner, "check_interrupted", interrupt_scale_work)
+        with pytest.raises(KeyboardInterrupt):
+            OnnxScanner().scan(str(model_path))
 
     @pytest.mark.parametrize("prelude", ["Add", "Gather", "LayerNormalization"])
     @pytest.mark.parametrize("malicious_scale", [False, True], ids=["benign-scale", "malicious-scale"])
@@ -9376,6 +9766,32 @@ class TestWeightDistributionSemantics:
         assert decoded_fill is False
         assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
 
+    def test_constant_of_shape_bounds_empty_string_entries_before_decode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_typed_constant_of_shape_weight_model(
+            tmp_path,
+            data_type=TensorProto.INT8,
+            fill_value=0,
+            string_field_repetitions=150_000,
+        )
+        original_to_array = onnx.numpy_helper.to_array
+        decoded_fill = False
+
+        def recording_to_array(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal decoded_fill
+            decoded_fill |= tensor.name == "fill"
+            return original_to_array(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", recording_to_array)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        assert decoded_fill is False
+
     def test_constant_proof_reserves_packed_decoded_size_before_decode(
         self,
         tmp_path: Path,
@@ -9718,6 +10134,45 @@ class TestWeightDistributionSemantics:
         if malicious:
             assert checks[0].details["affected_neurons"] == [3]
 
+    @pytest.mark.parametrize(
+        "data_type",
+        [
+            TensorProto.FLOAT8E4M3FN,
+            TensorProto.FLOAT8E4M3FNUZ,
+            TensorProto.FLOAT8E5M2,
+            TensorProto.FLOAT8E5M2FNUZ,
+        ],
+    )
+    @pytest.mark.parametrize("weight_on_left", [False, True], ids=["right-weight", "left-weight"])
+    @pytest.mark.parametrize("cast_weight", [False, True], ids=["direct", "cast"])
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
+    def test_qlinear_matmul_float8_weight_lineage_is_not_omitted(
+        self,
+        tmp_path: Path,
+        data_type: int,
+        weight_on_left: bool,
+        cast_weight: bool,
+        malicious: bool,
+    ) -> None:
+        model_path = create_qlinear_matmul_float8_weight_model(
+            tmp_path,
+            data_type=data_type,
+            weight_on_left=weight_on_left,
+            cast_weight=cast_weight,
+            malicious=malicious,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible"][0]["consumer_input_index"] == (0 if weight_on_left else 3)
+
     def test_qdq_malformed_scale_shape_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_qdq_weight_model(tmp_path, malformed_scale=True)
 
@@ -9899,7 +10354,7 @@ class TestWeightDistributionSemantics:
         monkeypatch: pytest.MonkeyPatch,
         weight_count: int,
     ) -> None:
-        monkeypatch.setattr(onnx_scanner_module, "_ONNX_WEIGHT_RETAINED_ARRAY_BUDGET_MULTIPLIER", 1)
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_WEIGHT_RETAINED_ARRAY_BUDGET_MULTIPLIER", 2)
         model_path = create_multiple_weight_model(tmp_path, weight_count=weight_count)
         original_to_array = onnx.numpy_helper.to_array
         decoded_weights: list[str] = []
@@ -9921,6 +10376,87 @@ class TestWeightDistributionSemantics:
         assert len(coverage) == int(weight_count == 2)
         if coverage:
             assert coverage[0].details["oversized_initializers_skipped"] == 1
+
+    def test_quantized_materialization_charges_working_set_and_releases_raw_arrays(self, tmp_path: Path) -> None:
+        model = onnx.load(str(create_qlinear_matmul_nd_scale_model(tmp_path)))
+        balances: dict[str, int] = {}
+        events: list[tuple[str, int]] = []
+
+        def adjust(name: str, delta: int) -> bool:
+            events.append((name, delta))
+            balances[name] = balances.get(name, 0) + delta
+            return True
+
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model,
+            onnx=onnx,
+            np=np,
+            max_array_size=100_000,
+            pre_materialization_check=lambda *_args: True,
+            adjust_array_reservation=adjust,
+        )
+
+        weight = next(initializer for initializer in model.graph.initializer if initializer.name == "W")
+        decoded_bytes = int(np.prod(weight.dims)) * np.dtype(np.uint8).itemsize
+        inline_bytes = len(weight.raw_data)
+        assert next(delta for name, delta in events if name == "W" and delta > 0) == decoded_bytes + inline_bytes
+        assert plan.extraction_failures == 0
+        assert balances["W"] == 0
+        assert balances["W_scale"] == balances["W_zero_point"] == 0
+        assert balances["quantized weight"] == 4_000
+
+    @pytest.mark.parametrize("failure", ["weight_decode", "parameter_validation", "transform_reservation"])
+    def test_failed_materialization_rolls_back_all_retained_charges(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: str,
+    ) -> None:
+        if failure == "weight_decode":
+            model_path = create_onnx_weight_model(
+                tmp_path,
+                np.zeros((100, 10), dtype=np.float32),
+                op_type="MatMul",
+            )
+        elif failure == "parameter_validation":
+            model_path = create_qlinear_matmul_invalid_parameter_model(tmp_path, "scale_dtype")
+        else:
+            model_path = create_qdq_transpose_reshape_weight_model(tmp_path)
+        model = onnx.load(str(model_path))
+        if failure == "weight_decode":
+            original_to_array = onnx.numpy_helper.to_array
+
+            def fail_weight_decode(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+                if tensor.name == "W":
+                    raise ValueError("simulated decode failure")
+                return original_to_array(tensor, *args, **kwargs)
+
+            monkeypatch.setattr(onnx.numpy_helper, "to_array", fail_weight_decode)
+        balances: dict[str, int] = {}
+
+        def adjust(name: str, delta: int) -> bool:
+            if (
+                failure == "transform_reservation"
+                and name == "W"
+                and delta > 0
+                and balances.get("quantized weight", 0) > 0
+            ):
+                return False
+            balances[name] = balances.get(name, 0) + delta
+            return True
+
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model,
+            onnx=onnx,
+            np=np,
+            max_array_size=100_000,
+            pre_materialization_check=lambda *_args: True,
+            adjust_array_reservation=adjust,
+        )
+
+        assert plan.extraction_failures == 1
+        assert plan.specs == []
+        assert sum(balances.values()) == 0
 
     @pytest.mark.parametrize("malicious", [False, True])
     def test_qlinear_matmul_nd_scale_broadcast_is_analyzed(
@@ -10123,6 +10659,26 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_layer_count"] == 1
         assert semantics["eligible"][0]["initializer"] == "weight"
+
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign-scale", "malicious-scale"])
+    def test_local_constant_collision_uses_function_body_scale(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        result = OnnxScanner().scan(str(create_local_constant_scale_collision_model(tmp_path, malicious=malicious)))
+
+        assert result.success is True
+        checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and "abnormal weight magnitudes" in check.message
+        ]
+        assert len(checks) == int(malicious)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible"][0]["quantization_scale_factor_names"] == ["W_scale"]
 
     def test_repeated_function_constant_is_one_physical_initializer(self, tmp_path: Path) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)
@@ -10370,6 +10926,25 @@ class TestWeightDistributionSemantics:
         assert samples[0]["reason"] == "dynamic_input_lineage"
         assert samples[0]["consumer_input_index"] == 0
 
+    @pytest.mark.parametrize("rank_one_raw", [False, True], ids=["raw-matrix", "rank-one-raw"])
+    def test_two_hop_raw_taint_is_not_laundered_as_activation(
+        self,
+        tmp_path: Path,
+        rank_one_raw: bool,
+    ) -> None:
+        result = OnnxScanner().scan(
+            str(create_two_hop_activation_raw_lineage_model(tmp_path, rank_one_raw=rank_one_raw))
+        )
+
+        assert result.success is False
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        samples = semantics["unresolved_lineage_samples"]
+        raw_samples = [sample for sample in samples if sample["initializer"] == "P"]
+        assert len(raw_samples) == 1
+        assert raw_samples[0]["reason"] == "dynamic_input_lineage"
+        assert raw_samples[0]["consumer_op"] == "MatMul"
+        assert raw_samples[0]["consumer_input_index"] == 1
+
     @pytest.mark.parametrize(
         ("model_factory", "expected_layers"),
         [
@@ -10599,9 +11174,8 @@ class TestWeightDistributionSemantics:
         aggregate.file_metadata[str(second)] = aggregate.file_metadata[str(first)].model_copy(deep=True)
         issue_count = 4000
         aggregate.issues = [
-            template.model_copy(update={"location": str(first if index % 2 == 0 else second)}, deep=True)
-            for index in range(issue_count)
-        ]
+            template.model_copy(update={"location": str(first)}, deep=True) for _index in range(issue_count - 1)
+        ] + [template.model_copy(update={"location": str(second)}, deep=True)]
         metadata_type = type(aggregate.file_metadata[str(first)])
 
         def reject_metadata_serialization(*_args: Any, **_kwargs: Any) -> Any:
@@ -10617,12 +11191,14 @@ class TestWeightDistributionSemantics:
             return original_cluster_key(issue, content_hash=content_hash)
 
         monkeypatch.setattr(modelaudit_core, "_onnx_weight_anomaly_cluster_key", recording_cluster_key)
-
         modelaudit_core._cluster_onnx_weight_anomaly_issues(aggregate)
 
         assert cluster_key_call_count == issue_count
         assert len(aggregate.issues) == 1
-        assert aggregate.issues[0].details["cluster_size"] == issue_count
+        issue = aggregate.issues[0]
+        assert issue.details["cluster_size"] == 2
+        assert issue.details["byte_identical_export_groups"][0]["export_count"] == 2
+        assert {item["file"] for item in issue.details["export_provenance"]} == {str(first), str(second)}
 
     def test_aggregate_does_not_cluster_distinct_file_hashes_with_same_signature(self, tmp_path: Path) -> None:
         positive_weights = np.zeros((100, 10), dtype=np.float32)
@@ -10741,6 +11317,69 @@ class TestWeightDistributionSemantics:
             assert clustered == []
 
     @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
+    def test_external_package_identity_binds_sidecar_roles(self, tmp_path: Path, streaming: bool) -> None:
+        first = create_two_sidecar_onnx_package(tmp_path / "first", swap_contents=False)
+        second = create_two_sidecar_onnx_package(tmp_path / "second", swap_contents=True)
+        assert compute_sha256_hash(first) == compute_sha256_hash(second)
+
+        aggregate = (
+            scan_model_streaming(
+                iter([(first, False), (second, True)]),
+                delete_after_scan=False,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
+            if streaming
+            else scan_model_directory_or_file(
+                str(tmp_path),
+                recursive=True,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
+        )
+
+        metadata = [aggregate.file_metadata[str(path)] for path in (first, second)]
+        assert all(getattr(item, "onnx_package_hash_complete", None) is True for item in metadata)
+        assert len({getattr(item, "content_hash", None) for item in metadata}) == 2
+
+    def test_directory_package_identity_is_invalidated_when_sidecar_changes_during_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_external_onnx_weight_package(
+            tmp_path / "mutable",
+            np.zeros((100, 10), dtype=np.float32),
+        )
+        sidecar = model_path.parent / "weights.bin"
+        original_scan_file = modelaudit_core.scan_file
+        mutated = False
+
+        def mutate_sidecar_before_scan(path: str, config: dict[str, Any]) -> Any:
+            nonlocal mutated
+            if path == str(model_path):
+                sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
+                mutated = True
+            return original_scan_file(path, config)
+
+        monkeypatch.setattr(modelaudit_core, "scan_file", mutate_sidecar_before_scan)
+        result = scan_model_directory_or_file(
+            str(model_path.parent),
+            recursive=False,
+            scanners=["onnx"],
+            cache_enabled=False,
+        )
+
+        assert mutated is True
+        assert result.content_hash is None
+        assert determine_exit_code(result) == 2
+        assert getattr(result.file_metadata[str(model_path)], "onnx_package_hash_complete", None) is False
+        checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert checks[0].details["scan_outcome_reason"] == "onnx_external_data_changed_during_scan"
+
+    @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
     def test_incomplete_external_data_discovery_disables_onnx_clustering(
         self,
         tmp_path: Path,
@@ -10776,11 +11415,13 @@ class TestWeightDistributionSemantics:
         )
         assert not any(issue.details.get("clustered_onnx_weight_anomaly") is True for issue in aggregate.issues)
 
+    @pytest.mark.parametrize("streaming", [False, True], ids=["directory", "streaming"])
     @pytest.mark.parametrize("invalid_sidecar", ["missing", "traversal"])
     def test_invalid_declared_external_data_disables_package_identity_and_clustering(
         self,
         tmp_path: Path,
         invalid_sidecar: str,
+        streaming: bool,
     ) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)
         weights[50:55, 3] = 10.0
@@ -10798,11 +11439,20 @@ class TestWeightDistributionSemantics:
             (tmp_path / "outside.bin").write_bytes(weights.tobytes())
 
         assert all(modelaudit_core._streamed_onnx_external_data_hash_paths(path) is None for path in paths)
-        aggregate = scan_model_directory_or_file(
-            str(tmp_path),
-            recursive=True,
-            scanners=["onnx"],
-            cache_enabled=False,
+        aggregate = (
+            scan_model_streaming(
+                iter([(paths[0], False), (paths[1], True)]),
+                delete_after_scan=False,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
+            if streaming
+            else scan_model_directory_or_file(
+                str(tmp_path),
+                recursive=True,
+                scanners=["onnx"],
+                cache_enabled=False,
+            )
         )
 
         assert all(
