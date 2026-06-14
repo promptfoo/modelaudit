@@ -4041,6 +4041,8 @@ def _file_finder_state(
         and type(path_mtime) in {int, float}
         and len(typed_path_cache) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
         and len(typed_relaxed_path_cache) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        and all(type(name) is str for name in typed_path_cache)
+        and all(type(name) is str for name in typed_relaxed_path_cache)
     ):
         return None
     return (
@@ -4094,12 +4096,10 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
             validated_path_cache = canonical_path_cache
             validated_relaxed_path_cache = canonical_relaxed_path_cache
         else:
-            if not path_cache.issubset(canonical_path_cache) or not relaxed_path_cache.issubset(
-                canonical_relaxed_path_cache
-            ):
-                return None
-            validated_path_cache = frozenset(cast(Iterable[str], path_cache))
-            validated_relaxed_path_cache = frozenset(cast(Iterable[str], relaxed_path_cache))
+            validated_path_cache = frozenset(cast(Iterable[str], path_cache)) & canonical_path_cache
+            validated_relaxed_path_cache = (
+                frozenset(cast(Iterable[str], relaxed_path_cache)) & canonical_relaxed_path_cache
+            )
         instance_state["_loaders"] = _STANDARD_FILE_FINDER_LOADERS
         instance_state["_path_mtime"] = path_mtime
         instance_state["_path_cache"] = validated_path_cache

@@ -1336,7 +1336,11 @@ def test_cached_stdlib_importer_miss_with_later_untrusted_finder_fails_closed(
     else:
         finder = FileFinder(stdlib_path, *_standard_file_finder_loader_details())
         finder_state = object.__getattribute__(finder, "__dict__")
-        finder_state.update(_path_mtime=os.stat(stdlib_path).st_mtime, _path_cache=set(), _relaxed_path_cache=set())
+        finder_state.update(
+            _path_mtime=os.stat(stdlib_path).st_mtime,
+            _path_cache={"stale_deleted.py"},
+            _relaxed_path_cache={"stale_deleted.py"},
+        )
         assert finder.find_spec(module) is None
         importer_cache[stdlib_path] = finder
     importer_cache[evil_entry] = _FailIfExecutedFinder(calls)
@@ -1669,8 +1673,8 @@ def test_file_finder_miss_rejects_incomplete_current_cache(tmp_path: Path) -> No
     assert finder.find_spec(module) is not None
     finder_state = object.__getattribute__(finder, "__dict__")
     finder_state["_path_mtime"] = os.stat(path_entry).st_mtime
-    finder_state["_path_cache"] = set()
-    finder_state["_relaxed_path_cache"] = set()
+    finder_state["_path_cache"] = {"stale_deleted.py"}
+    finder_state["_relaxed_path_cache"] = {"stale_deleted.py"}
     assert finder.find_spec(module) is None
 
     call_graph._cached_file_finder_resolution_summary.cache_clear()
@@ -1723,8 +1727,14 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
         finder_state["_path_cache"] = transitioned_cache
         transitioned_cache.remove("module_0.py")
         transitioned_cache.add("transitioned.py")
-        assert call_graph._file_finder_resolution_identity(finder, path_entry) is None
-        assert work_count == work_before_transition
+        transitioned_identity = call_graph._file_finder_resolution_identity(finder, path_entry)
+        assert transitioned_identity is not None
+        assert transitioned_identity != first_identity
+        assert isinstance(
+            call_graph._trusted_path_importer_spec(finder, "module_0", path_entry),
+            call_graph._UnsafePathResolution,
+        )
+        assert work_before_transition < work_count <= work_before_transition + len(transitioned_cache) + 4
 
         work_before_oversized = work_count
         finder_state["_path_cache"] = {
