@@ -609,8 +609,7 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     assert (
         'if [[ "$ON_MERGE_GROUP" == "true" || ( "$ON_PULL_REQUEST" == "true" && '
         '( "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" || '
-        '"$PYTHON_CHANGED" == "true" || "$PICKLESCAN_CHANGED" == "true" ) ) ]]; then'
-        in gate_script
+        '"$PYTHON_CHANGED" == "true" || "$PICKLESCAN_CHANGED" == "true" ) ) ]]; then' in gate_script
     )
     assert (
         'if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then'
