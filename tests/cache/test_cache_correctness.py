@@ -33,7 +33,6 @@ from modelaudit_picklescan.call_graph import (
 )
 from modelaudit_picklescan.call_graph import _source_resolution_context as _picklescan_source_resolution_context
 
-import modelaudit.cache.scan_results_cache as scan_results_cache
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.batch_operations import BatchCacheOperations
 from modelaudit.cache.optimized_config import (
@@ -1860,7 +1859,10 @@ def test_scan_cache_rejects_resolution_metadata_without_current_picklescan_helpe
     )
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
-    monkeypatch.setattr(scan_results_cache, "_PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE", False)
+    monkeypatch.setattr(
+        "modelaudit.cache.scan_results_cache._PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE",
+        False,
+    )
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
