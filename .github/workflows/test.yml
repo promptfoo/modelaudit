@@ -339,7 +339,7 @@ jobs:
   type-check:
     name: Type Check
     needs: changes
-    # Only run if Python files changed
+    # Integration events fail closed instead of relying on changed-path data.
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -478,7 +478,7 @@ jobs:
   test:
     name: Fast Tests (Python ${{ matrix.python-version }}, Shard ${{ matrix.shard-name }})
     needs: changes
-    # Only run if Python files changed
+    # Integration events fail closed instead of relying on changed-path data.
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     # Coverage runs in dedicated shards below, and the Python 3.12
