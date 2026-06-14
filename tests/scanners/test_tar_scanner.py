@@ -1,11 +1,13 @@
 import gzip
+import io
+import lzma
 import os
 import pickle
 import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, BinaryIO, Literal, cast
 
 import pytest
 
@@ -2993,6 +2995,7 @@ class TestTarScanner:
 
         result = TarScanner(
             config={
+                "compressed_max_xz_padding_bytes": 4,
                 "compressed_max_decompressed_bytes": 1024 * 1024,
                 "compressed_max_decompression_ratio": 100_000.0,
             }
@@ -3001,6 +3004,111 @@ class TestTarScanner:
         trailing_checks = [check for check in result.checks if check.name == "Compressed TAR Trailing Data"]
         assert result.success is True
         assert trailing_checks == []
+
+    def test_xz_stream_padding_budget_is_cumulative_across_streams(self) -> None:
+        wrapped = io.BytesIO(lzma.compress(b"first") + (b"\0" * 4) + lzma.compress(b"second") + (b"\0" * 4))
+        reader = tar_scanner_module._StrictConcatenatedDecompressionReader(
+            wrapped,
+            compression_codec="xz",
+            max_xz_padding_bytes=4,
+        )
+
+        with pytest.raises(
+            tar_scanner_module._TarStreamBudgetExceeded,
+            match="XZ stream padding exceeded bounded read limit",
+        ) as exc_info:
+            reader.read()
+
+        assert exc_info.value.reason == "tar_compressed_padding_limit_exceeded"
+        assert exc_info.value.bytes_read == 8
+        assert exc_info.value.max_bytes == 4
+
+    def test_xz_stream_padding_followup_read_is_bounded_by_remaining_budget(self) -> None:
+        class SplitReader:
+            def __init__(self) -> None:
+                self.first_read = True
+                self.read_sizes: list[int] = []
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                if self.first_read:
+                    self.first_read = False
+                    return lzma.compress(b"payload")
+                return b"\0" * size
+
+        wrapped = SplitReader()
+        reader = tar_scanner_module._StrictConcatenatedDecompressionReader(
+            cast(BinaryIO, wrapped),
+            compression_codec="xz",
+            max_xz_padding_bytes=64,
+        )
+
+        with pytest.raises(tar_scanner_module._TarStreamBudgetExceeded) as exc_info:
+            reader.read()
+
+        assert exc_info.value.reason == "tar_compressed_padding_limit_exceeded"
+        assert wrapped.read_sizes == [reader._RAW_READ_SIZE, 65]
+
+    def test_scan_xz_tar_bounds_zero_stream_padding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "bounded-stream-padding.tar.xz"
+        with tarfile.open(archive_path, "w:xz") as archive:
+            info = tarfile.TarInfo("payload.txt")
+            payload = b"safe"
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+        padding_size = 1024 * 1024
+        with archive_path.open("r+b") as archive_file:
+            archive_file.seek(0, os.SEEK_END)
+            archive_file.seek(padding_size - 1, os.SEEK_CUR)
+            archive_file.write(b"\0")
+
+        class CountingReader:
+            def __init__(self, fileobj: BinaryIO) -> None:
+                self.fileobj = fileobj
+                self.bytes_read = 0
+
+            def read(self, size: int = -1) -> bytes:
+                data = self.fileobj.read(size)
+                self.bytes_read += len(data)
+                return data
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.fileobj, name)
+
+        readers: list[CountingReader] = []
+        original_init = tar_scanner_module._StrictConcatenatedDecompressionReader.__init__
+
+        def tracked_init(reader: Any, fileobj: BinaryIO, **kwargs: Any) -> None:
+            counting_reader = CountingReader(fileobj)
+            readers.append(counting_reader)
+            original_init(reader, cast(BinaryIO, counting_reader), **kwargs)
+
+        monkeypatch.setattr(tar_scanner_module._StrictConcatenatedDecompressionReader, "__init__", tracked_init)
+
+        result = TarScanner(
+            config={
+                "compressed_max_xz_padding_bytes": 64,
+                "compressed_max_decompressed_bytes": 1024 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            }
+        ).scan(str(archive_path))
+
+        assert result.success is False
+        assert "tar_compressed_padding_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert len(readers) == 1
+        assert readers[0].bytes_read <= tar_scanner_module._StrictConcatenatedDecompressionReader._RAW_READ_SIZE
+        _assert_inconclusive_aggregate_not_reused(
+            archive_path,
+            "tar_compressed_padding_limit_exceeded",
+            tmp_path / "xz-padding-cache",
+            compressed_max_xz_padding_bytes=64,
+            compressed_max_decompressed_bytes=1024 * 1024,
+            compressed_max_decompression_ratio=100_000.0,
+        )
 
     def test_scan_compressed_tar_stops_tail_at_ratio_limit(
         self,

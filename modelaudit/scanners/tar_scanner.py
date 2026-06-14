@@ -54,6 +54,7 @@ DEFAULT_MAX_TAR_TOTAL_UNCOMPRESSED_SIZE = 10 * 1024 * 1024 * 1024
 DEFAULT_MAX_TAR_METADATA_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSION_RATIO = 250.0
+DEFAULT_MAX_XZ_STREAM_PADDING_BYTES = 10 * 1024 * 1024
 ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
 MAX_TAR_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY = "_tar_security_only_nested_member_entries"
@@ -64,7 +65,14 @@ TAR_TOTAL_SIZE_INCOMPLETE_REASON = "tar_total_size_limit_exceeded"
 TAR_SPECIAL_MEMBER_INCOMPLETE_REASON = "tar_special_member_unsupported"
 TAR_SPARSE_MEMBER_INCOMPLETE_REASON = "tar_sparse_member_unsupported"
 TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON = "tar_compressed_trailing_data"
+TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON = "tar_compressed_padding_limit_exceeded"
 TAR_SPARSE_PAX_SIZE_FIELDS = frozenset({"GNU.sparse.size", "GNU.sparse.realsize"})
+_POST_TAR_EOF_CONTINUABLE_INCOMPLETE_REASONS = frozenset(
+    {
+        TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON,
+        TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON,
+    }
+)
 
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
@@ -170,9 +178,17 @@ class _StrictConcatenatedDecompressionReader:
 
     _RAW_READ_SIZE = 8 * 1024
 
-    def __init__(self, fileobj: BinaryIO, *, compression_codec: str) -> None:
+    def __init__(
+        self,
+        fileobj: BinaryIO,
+        *,
+        compression_codec: str,
+        max_xz_padding_bytes: int,
+    ) -> None:
         self._fileobj = fileobj
         self._compression_codec = compression_codec
+        self._max_xz_padding_bytes = max_xz_padding_bytes
+        self._xz_padding_bytes_read = 0
         self._decompressor = self._new_decompressor()
         self._completed_streams = 0
         self._eof = False
@@ -187,28 +203,38 @@ class _StrictConcatenatedDecompressionReader:
     def _read_after_xz_padding(self, initial: bytes) -> bytes | None:
         """Skip valid four-byte XZ stream padding before a possible next stream."""
         block = initial
-        padding_size = 0
+        stream_padding_size = 0
         while True:
             nonzero_offset = len(block) - len(block.lstrip(b"\0"))
-            padding_size += nonzero_offset
+            stream_padding_size += nonzero_offset
+            self._xz_padding_bytes_read += nonzero_offset
             block = block[nonzero_offset:]
+            if self._xz_padding_bytes_read > self._max_xz_padding_bytes:
+                raise _TarStreamBudgetExceeded(
+                    "XZ stream padding exceeded bounded read limit "
+                    f"({self._xz_padding_bytes_read} > {self._max_xz_padding_bytes} bytes)",
+                    bytes_read=self._xz_padding_bytes_read,
+                    max_bytes=self._max_xz_padding_bytes,
+                    reason=TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON,
+                )
             if block:
-                if padding_size % 4 != 0:
+                if stream_padding_size % 4 != 0:
                     raise _TarCompressedPhysicalTrailingData("Invalid XZ stream padding")
                 return block
 
-            block = self._fileobj.read(self._RAW_READ_SIZE)
+            padding_remaining = self._max_xz_padding_bytes - self._xz_padding_bytes_read
+            block = self._fileobj.read(min(self._RAW_READ_SIZE, padding_remaining + 1))
             if not block:
-                if padding_size % 4 != 0:
+                if stream_padding_size % 4 != 0:
                     raise _TarCompressedPhysicalTrailingData("Invalid XZ stream padding")
                 return None
 
     def _next_stream_input(self) -> bytes | None:
         block = cast(bytes, self._decompressor.unused_data)
-        if not block:
-            block = self._fileobj.read(self._RAW_READ_SIZE)
         if self._compression_codec == "xz":
             return self._read_after_xz_padding(block)
+        if not block:
+            block = self._fileobj.read(self._RAW_READ_SIZE)
         return block or None
 
     def _decompress(self, block: bytes, max_length: int) -> bytes:
@@ -283,6 +309,10 @@ class TarScanner(BaseScanner):
         self.max_decompression_ratio = self._normalize_positive_float_config(
             self.config.get("compressed_max_decompression_ratio"),
             DEFAULT_MAX_DECOMPRESSION_RATIO,
+        )
+        self.max_xz_padding_bytes = self._normalize_positive_int_config(
+            self.config.get("compressed_max_xz_padding_bytes"),
+            DEFAULT_MAX_XZ_STREAM_PADDING_BYTES,
         )
         self.max_metadata_bytes = self._normalize_positive_int_config(
             self.config.get("max_tar_metadata_bytes"),
@@ -489,9 +519,17 @@ class TarScanner(BaseScanner):
             if compression_codec == "gzip":
                 decompressed: Any = stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb"))
             elif compression_codec == "bzip2":
-                decompressed = _StrictConcatenatedDecompressionReader(raw, compression_codec="bzip2")
+                decompressed = _StrictConcatenatedDecompressionReader(
+                    raw,
+                    compression_codec="bzip2",
+                    max_xz_padding_bytes=self.max_xz_padding_bytes,
+                )
             elif compression_codec == "xz":
-                decompressed = _StrictConcatenatedDecompressionReader(raw, compression_codec="xz")
+                decompressed = _StrictConcatenatedDecompressionReader(
+                    raw,
+                    compression_codec="xz",
+                    max_xz_padding_bytes=self.max_xz_padding_bytes,
+                )
             else:  # pragma: no cover - _detect_compressed_tar_wrapper returns only supported codecs.
                 return
 
@@ -1127,8 +1165,17 @@ class TarScanner(BaseScanner):
                 has_trailing_data = any(chunk)
                 if has_trailing_data:
                     break
-        except _TarStreamBudgetExceeded:
-            raise
+        except _TarStreamBudgetExceeded as exc:
+            if exc.reason != TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON:
+                raise
+            self._record_tar_stream_budget_exceeded(
+                result,
+                path,
+                exc,
+                compression_codec=compression_codec,
+                compressed_size=compressed_size,
+            )
+            return False
         except _TarCompressedPhysicalTrailingData:
             has_trailing_data = True
         except Exception as exc:
@@ -1177,10 +1224,8 @@ class TarScanner(BaseScanner):
                                 ),
                             )
                             break
-                        if (
-                            compression_codec is not None
-                            and bounded_stream is not None
-                            and not self._drain_compressed_tar_tail(
+                        if compression_codec is not None and bounded_stream is not None:
+                            tail_complete = self._drain_compressed_tar_tail(
                                 tar,
                                 bounded_stream,
                                 result,
@@ -1188,8 +1233,11 @@ class TarScanner(BaseScanner):
                                 compressed_size=compressed_size,
                                 compression_codec=compression_codec,
                             )
-                        ):
-                            return False
+                            if not tail_complete:
+                                reasons = set(result.metadata.get("scan_outcome_reasons", []))
+                                if reasons and reasons <= _POST_TAR_EOF_CONTINUABLE_INCOMPLETE_REASONS:
+                                    break
+                                return False
                         break
 
                     entry_count += 1

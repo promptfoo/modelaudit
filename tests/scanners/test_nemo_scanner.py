@@ -5,6 +5,7 @@ import gzip
 import io
 import lzma
 import pickle
+import random
 import tarfile
 import zipfile
 from pathlib import Path
@@ -37,7 +38,7 @@ from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_fo
 from modelaudit.utils.file import detection as file_detection
 
 _TMP_PATH_MARKER = "__MODELAUDIT_TMP__/"
-_NemoTarWriteMode = Literal["w", "w:gz"]
+_NemoTarWriteMode = Literal["w", "w:gz", "w:bz2", "w:xz"]
 
 
 def _create_nemo_file_from_bytes(
@@ -92,6 +93,21 @@ def _create_sparse_raw_nemo_with_late_invalid_header(
         archive.write(b"\0" * (2 * tarfile.BLOCKSIZE))
         archive.seek(DEFAULT_MAX_FILE_READ_SIZE)
         archive.write(b"\0")
+    return path
+
+
+def _create_renamed_compressed_nemo_after_route_budget(
+    tmp_path: Path,
+    *,
+    filename: str,
+    target: str,
+    mode: Literal["w:gz", "w:bz2", "w:xz"],
+) -> Path:
+    path = tmp_path / filename
+    early_payload = random.Random(0).randbytes(file_detection._NEMO_ROUTE_MAX_BODY_SKIP_BYTES + 1)
+    with tarfile.open(path, mode) as archive:
+        _add_tar_bytes(archive, "large-weights.bin", early_payload)
+        _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
     return path
 
 
@@ -765,6 +781,173 @@ class TestNemoScannerBasic:
             )
             assert determine_exit_code(cached) == 1
             assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        ("codec", "mode", "expected_exit_code"),
+        [
+            ("gzip", "w:gz", 2),
+            ("bzip2", "w:bz2", 1),
+            ("xz", "w:xz", 1),
+        ],
+    )
+    def test_compressed_tail_nemo_is_inconclusive_without_cache(
+        self,
+        tmp_path: Path,
+        codec: str,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+        expected_exit_code: int,
+    ) -> None:
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model:\n  _target_: torch.nn.Linear\n",
+            filename=f"compressed-tail-benign-{codec}.nemo",
+            mode=mode,
+        )
+        tail = {
+            "gzip": gzip.compress(b"non-tar trailing payload", mtime=0),
+            "bzip2": bz2.compress(b"non-tar trailing payload"),
+            "xz": lzma.compress(b"non-tar trailing payload"),
+        }[codec]
+        with path.open("ab") as archive:
+            archive.write(tail)
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_compressed_trailing_data" in direct.metadata["scan_outcome_reasons"]
+        assert not [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert determine_exit_code(aggregate) == expected_exit_code
+
+        cache_dir = tmp_path / f"compressed-tail-benign-{codec}-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == expected_exit_code
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        ("codec", "mode", "expected_exit_code"),
+        [
+            ("gzip", "w:gz", 2),
+            ("bzip2", "w:bz2", 1),
+            ("xz", "w:xz", 1),
+        ],
+    )
+    def test_compressed_tail_nemo_preserves_hydra_finding_without_cache(
+        self,
+        tmp_path: Path,
+        codec: str,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+        expected_exit_code: int,
+    ) -> None:
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model:\n  _target_: os.system\n",
+            filename=f"compressed-tail-malicious-{codec}.nemo",
+            mode=mode,
+        )
+        tail = {
+            "gzip": gzip.compress(b"non-tar trailing payload", mtime=0),
+            "bzip2": bz2.compress(b"non-tar trailing payload"),
+            "xz": lzma.compress(b"non-tar trailing payload"),
+        }[codec]
+        with path.open("ab") as archive:
+            archive.write(tail)
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_compressed_trailing_data" in direct.metadata["scan_outcome_reasons"]
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert hydra_checks[0].location == f"{path}:model_config.yaml"
+        assert determine_exit_code(aggregate) == expected_exit_code
+
+        cache_dir = tmp_path / f"compressed-tail-malicious-{codec}-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == expected_exit_code
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        ("target", "expects_hydra_finding", "expected_exit_code"),
+        [
+            ("torch.nn.Linear", False, 2),
+            ("os.system", True, 1),
+        ],
+    )
+    def test_xz_padding_limit_nemo_preserves_reachable_analysis_without_cache(
+        self,
+        tmp_path: Path,
+        target: str,
+        expects_hydra_finding: bool,
+        expected_exit_code: int,
+    ) -> None:
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            f"model:\n  _target_: {target}\n".encode(),
+            filename=f"xz-padding-limit-{'malicious' if expects_hydra_finding else 'benign'}.nemo",
+            mode="w:xz",
+        )
+        with path.open("ab") as archive:
+            archive.write(b"\0" * 68)
+
+        direct = scan_file(
+            str(path),
+            config={"cache_enabled": False, "compressed_max_xz_padding_bytes": 64},
+        )
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            compressed_max_xz_padding_bytes=64,
+        )
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_compressed_padding_limit_exceeded" in direct.metadata["scan_outcome_reasons"]
+        assert bool(hydra_checks) is expects_hydra_finding
+        assert determine_exit_code(aggregate) == expected_exit_code
+
+        cache_dir = tmp_path / f"xz-padding-limit-{'malicious' if expects_hydra_finding else 'benign'}-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                compressed_max_xz_padding_bytes=64,
+            )
+            assert determine_exit_code(cached) == expected_exit_code
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues) is (
+                expects_hydra_finding
+            )
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
         finally:
             reset_cache_manager()
@@ -3801,6 +3984,79 @@ class TestCVE202523304HydraTarget:
             and check.details["target"] == "os.system"
             for check in result.checks
         )
+
+    @pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
+    def test_renamed_compressed_nemo_after_route_budget_scans_benign_config(
+        self,
+        tmp_path: Path,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+    ) -> None:
+        path = _create_renamed_compressed_nemo_after_route_budget(
+            tmp_path,
+            filename=f"late-benign-config-{mode.replace(':', '-')}.jpg",
+            target="torch.nn.Linear",
+            mode=mode,
+        )
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        assert direct.scanner_name == "tar"
+        assert direct.success is True
+        assert "nemo_routing_incomplete" not in direct.metadata.get("scan_outcome_reasons", [])
+        assert not [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert determine_exit_code(aggregate) == 0
+
+    @pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
+    def test_renamed_compressed_nemo_after_route_budget_preserves_hydra_finding(
+        self,
+        tmp_path: Path,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+    ) -> None:
+        path = _create_renamed_compressed_nemo_after_route_budget(
+            tmp_path,
+            filename=f"late-malicious-config-{mode.replace(':', '-')}.jpg",
+            target="os.system",
+            mode=mode,
+        )
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.scanner_name == "tar"
+        assert direct.success is False
+        assert "nemo_routing_incomplete" not in direct.metadata.get("scan_outcome_reasons", [])
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert hydra_checks[0].location == f"{path}:model_config.yaml"
+        assert determine_exit_code(aggregate) == 1
+
+    @pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
+    def test_nested_renamed_compressed_nemo_after_route_budget_preserves_hydra_finding(
+        self,
+        tmp_path: Path,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+    ) -> None:
+        nested_path = _create_renamed_compressed_nemo_after_route_budget(
+            tmp_path,
+            filename=f"nested-late-malicious-config-{mode.replace(':', '-')}.jpg",
+            target="os.system",
+            mode=mode,
+        )
+        archive_path = tmp_path / f"nested-late-config-{mode.replace(':', '-')}.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.write(nested_path, arcname="models/payload.jpg")
+
+        result = scan_file(str(archive_path), config={"cache_enabled": False})
+
+        hydra_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert result.scanner_name == "zip"
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert "models/payload.jpg:model_config.yaml" in str(hydra_checks[0].location)
 
     def test_renamed_nemo_safe_symlink_root_routes_before_late_target(
         self,

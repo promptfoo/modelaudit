@@ -8927,6 +8927,48 @@ def test_scan_file_preserves_nemo_finding_inside_valid_hdf5_userblock(tmp_path: 
     )
 
 
+@pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
+def test_explicit_compressed_tar_hdf5_overlap_preserves_top_level_and_nested_tar_analysis(
+    tmp_path: Path,
+    malicious: bool,
+) -> None:
+    model_path = tmp_path / f"explicit-overlap-{'malicious' if malicious else 'benign'}.tar.gz"
+    pickle_payload = _build_malicious_pickle(protocol=0) if malicious else pickle.dumps({"weights": [1]}, protocol=0)
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [
+            ("large-weights.bin", b"A" * (128 * 1024)),
+            ("payload.pkl", pickle_payload),
+        ],
+        compressed=True,
+    )
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == "tar"
+    assert file_detection.detect_file_format_from_magic(str(model_path)) == "tar"
+    assert file_detection.detect_file_format_for_skip_filter(str(model_path)) == "tar"
+
+    top_level = scan_file(str(model_path), config={"cache_enabled": False})
+
+    top_level_pickle_checks = [
+        check for check in top_level.checks if check.rule_code == "S201" and check.status == CheckStatus.FAILED
+    ]
+    assert top_level.scanner_name == "keras_h5"
+    assert "tar" in top_level.metadata["supplemental_scanners"]
+    assert bool(top_level_pickle_checks) is malicious
+
+    outer_path = tmp_path / f"explicit-overlap-{'malicious' if malicious else 'benign'}.zip"
+    with zipfile.ZipFile(outer_path, "w") as archive:
+        archive.write(model_path, arcname="models/payload.tar.gz")
+
+    nested = scan_file(str(outer_path), config={"cache_enabled": False})
+    nested_pickle_checks = [
+        check for check in nested.checks if check.rule_code == "S201" and check.status == CheckStatus.FAILED
+    ]
+    assert nested.scanner_name == "zip"
+    assert bool(nested_pickle_checks) is malicious
+
+
 def test_scan_file_preserves_large_zeroed_hdf5_userblock_above_16_mib(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

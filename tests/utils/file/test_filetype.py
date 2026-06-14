@@ -3843,7 +3843,7 @@ def test_detect_file_format_disguised_compressed_tar_by_content(tmp_path: Path) 
         archive.addfile(info, io.BytesIO(payload))
 
     assert detect_file_format(str(archive_path)) == "tar"
-    assert detect_file_format_from_magic(str(archive_path)) == "gzip"
+    assert detect_file_format_from_magic(str(archive_path)) == "tar"
     assert validate_file_type(str(archive_path)) is False
 
 
@@ -4283,13 +4283,15 @@ def test_detect_file_format_propagates_inconclusive_compressed_nemo_route(
     assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
-def test_detect_file_format_fails_closed_when_compressed_nemo_body_skip_budget_is_exhausted(
+@pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
+def test_detect_file_format_hands_compressed_nemo_body_skip_budget_to_tar(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mode: Literal["w:gz", "w:bz2", "w:xz"],
 ) -> None:
     monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
     archive_path = tmp_path / "renamed-model.jpg"
-    with tarfile.open(archive_path, "w:gz") as archive:
+    with tarfile.open(archive_path, mode) as archive:
         first_payload = b"x" * 128
         first_info = tarfile.TarInfo("large-weights.bin")
         first_info.size = len(first_payload)
@@ -4300,9 +4302,9 @@ def test_detect_file_format_fails_closed_when_compressed_nemo_body_skip_budget_i
         config_info.size = len(config_payload)
         archive.addfile(config_info, io.BytesIO(config_payload))
 
-    assert detect_file_format(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_from_magic(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "tar"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
 
 
 @pytest.mark.parametrize("suffix", [".tar", ".bin", ".pt"])

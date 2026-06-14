@@ -6248,7 +6248,9 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
                                 link_resolution_budget,
                             ):
                                 return "nemo"
-                            return "tar" if allow_incomplete_generic_tar_route else NEMO_ROUTING_INCONCLUSIVE_FORMAT
+                            if not allow_incomplete_generic_tar_route and find_hdf5_signature_offset(path) is not None:
+                                return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+                            return "tar"
                         body_skip_budget -= member_size
                 elif member.issym():
                     destination_name = _resolve_safe_tar_path_through_symlinks(
@@ -9158,9 +9160,7 @@ def detect_file_format_from_magic(path: str) -> str:
                     path,
                     allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
                 )
-                if _path_claims_tar_container(file_path) and tar_route is not None:
-                    return tar_route
-                if tar_route in {"nemo", NEMO_ROUTING_INCONCLUSIVE_FORMAT}:
+                if tar_route is not None:
                     return tar_route
             if format_result != "unknown":
                 return format_result
