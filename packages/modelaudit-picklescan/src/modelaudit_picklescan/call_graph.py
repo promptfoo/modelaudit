@@ -98,6 +98,13 @@ _TRUSTED_ZIPIMPORTER_METHODS = tuple(
     (name, getattr(zipimporter, name))
     for name in ("__init__", "find_spec", "get_code", "get_data", "get_filename", "get_source", "is_package")
 )
+
+
+class _UnsafePathResolution:
+    __slots__ = ()
+
+
+_UNSAFE_PATH_RESOLUTION = _UnsafePathResolution()
 _MAX_CLASS_INSTANCE_ALIASES = 128
 _MAX_INHERITED_CLASS_METHODS = 128
 _MAX_WILDCARD_IMPORTS = 16
@@ -2909,6 +2916,8 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
         standard_spec = _find_standard_filesystem_spec(module_name)
     except Exception:
         return None
+    if isinstance(standard_spec, _UnsafePathResolution):
+        return None
     loaded, _, loaded_spec = _loaded_module_state_without_hooks(module_name)
     spec: ModuleSpec | None
     if loaded:
@@ -3643,12 +3652,52 @@ def _meta_path_finder_resolution_identity(finder: object) -> str:
     return _pytest_assertion_rewrite_identity(finder) or _import_hook_identity(finder)
 
 
+def _zipimport_files_are_safe(files: object) -> bool:
+    if type(files) is not dict or len(files) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
+        return False
+    return all(
+        type(path) is str
+        and type(metadata) is tuple
+        and len(metadata) == 8
+        and type(metadata[0]) is str
+        and all(type(value) is int for value in metadata[1:])
+        for path, metadata in dict.items(files)
+    )
+
+
+def _file_finder_cache_is_safe(cache: object) -> bool:
+    return (
+        type(cache) is set
+        and len(cache) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        and all(type(entry) is str for entry in cache)
+    )
+
+
+def _file_finder_loaders_are_standard(loaders: object) -> bool:
+    if type(loaders) is not list or len(loaders) != len(_STANDARD_FILE_FINDER_LOADERS):
+        return False
+    return all(
+        type(actual) is tuple
+        and len(actual) == 2
+        and type(actual[0]) is str
+        and actual[0] == expected[0]
+        and actual[1] is expected[1]
+        for actual, expected in zip(loaders, _STANDARD_FILE_FINDER_LOADERS, strict=True)
+    )
+
+
 def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
+    if type(finder) not in {FileFinder, zipimporter}:
+        return False
     try:
         instance_state = object.__getattribute__(finder, "__dict__")
     except (AttributeError, TypeError):
         return False
-    if not isinstance(instance_state, dict):
+    if (
+        type(instance_state) is not dict
+        or len(instance_state) > 5
+        or any(type(key) is not str for key in instance_state)
+    ):
         return False
     if type(finder) is zipimporter:
         if not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
@@ -3657,25 +3706,39 @@ def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
             expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
         except (AttributeError, ImportError, OSError, TypeError):
             return False
+        if (
+            type(expected_state) is not dict
+            or len(expected_state) > 5
+            or any(type(key) is not str for key in expected_state)
+        ):
+            return False
+        archive = dict.get(instance_state, "archive")
+        prefix = dict.get(instance_state, "prefix")
+        files = dict.get(instance_state, "_files")
         return (
-            isinstance(expected_state, dict)
-            and set(instance_state) == set(expected_state)
-            and instance_state.get("archive") == expected_state.get("archive")
-            and instance_state.get("prefix") == expected_state.get("prefix")
-            and instance_state.get("_files") is expected_state.get("_files")
+            set(instance_state) == set(expected_state)
+            and type(archive) is str
+            and archive == dict.get(expected_state, "archive")
+            and type(prefix) is str
+            and prefix == dict.get(expected_state, "prefix")
+            and files is dict.get(expected_state, "_files")
+            and _zipimport_files_are_safe(files)
         )
-    if type(finder) is not FileFinder:
-        return False
     if not _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
         return False
-    finder_path = instance_state.get("path")
-    loaders = instance_state.get("_loaders")
+    finder_path = dict.get(instance_state, "path")
+    loaders = dict.get(instance_state, "_loaders")
+    path_mtime = dict.get(instance_state, "_path_mtime")
+    path_cache = dict.get(instance_state, "_path_cache")
+    relaxed_path_cache = dict.get(instance_state, "_relaxed_path_cache")
     return (
-        set(instance_state) <= {"_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache"}
-        and isinstance(finder_path, str)
+        set(instance_state) == {"_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache"}
+        and type(finder_path) is str
         and os.path.abspath(finder_path) == os.path.abspath(cache_key)
-        and isinstance(loaders, list)
-        and tuple(loaders) == _STANDARD_FILE_FINDER_LOADERS
+        and _file_finder_loaders_are_standard(loaders)
+        and type(path_mtime) in {int, float}
+        and _file_finder_cache_is_safe(path_cache)
+        and _file_finder_cache_is_safe(relaxed_path_cache)
     )
 
 
@@ -3689,15 +3752,6 @@ def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
         if finder is not None and not _is_trusted_standard_path_importer(finder, cache_key):
             return True
     return False
-
-
-def _search_path_entry_uses_trusted_importer(entry: str) -> bool:
-    path_importer_cache = _runtime_path_importer_cache_without_hooks()
-    if path_importer_cache is None:
-        return False
-    cache_key = entry or os.getcwd()
-    finder = dict.get(path_importer_cache, cache_key)
-    return finder is None or _is_trusted_standard_path_importer(finder, cache_key)
 
 
 def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -4152,6 +4206,9 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
         for entry in search_path:
             considered_entries.append(entry)
             entry_spec = _find_standard_path_spec(qualified_name, [entry])
+            if isinstance(entry_spec, _UnsafePathResolution):
+                _mark_shared_source_snapshot_unreusable()
+                return
             if entry_spec is None:
                 continue
             if entry_spec.loader is not None:
@@ -4355,10 +4412,11 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
     if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
         return None
 
-    return _find_standard_filesystem_spec(module_name)
+    spec = _find_standard_filesystem_spec(module_name)
+    return spec if type(spec) is ModuleSpec else None
 
 
-def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
+def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | _UnsafePathResolution | None:
     if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         return None
     parts = module_name.split(".")
@@ -4379,7 +4437,10 @@ def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
                     return None
                 search_path = loaded_search_path
                 continue
-        spec = _find_standard_path_spec(qualified_name, search_path)
+        path_spec = _find_standard_path_spec(qualified_name, search_path)
+        if isinstance(path_spec, _UnsafePathResolution):
+            return path_spec
+        spec = path_spec
         if spec is None:
             return None
         if index == len(parts) - 1:
@@ -4463,7 +4524,11 @@ def _current_module_source_path(module_name: str) -> str | None:
     if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         return None
     spec = _find_standard_filesystem_spec(module_name)
-    if spec is None or not isinstance(spec.origin, str) or not spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+    if (
+        type(spec) is not ModuleSpec
+        or not isinstance(spec.origin, str)
+        or not spec.origin.endswith(tuple(SOURCE_SUFFIXES))
+    ):
         return None
     return str(Path(spec.origin).absolute())
 
@@ -4605,30 +4670,79 @@ def _path_hooks_are_trusted() -> bool:
     return path_hooks is not None and all(_is_standard_path_hook(hook) for hook in path_hooks)
 
 
-def _find_standard_path_spec(module_name: str, search_path: list[str]) -> ModuleSpec | None:
+def _fresh_standard_path_importer(entry: str) -> FileFinder | zipimporter | _UnsafePathResolution | None:
+    path_hooks = _runtime_path_hooks_without_hooks()
+    if path_hooks is None:
+        return _UNSAFE_PATH_RESOLUTION
+    for hook in path_hooks:
+        if not _is_standard_path_hook(hook):
+            return _UNSAFE_PATH_RESOLUTION
+        try:
+            finder = zipimporter(entry) if hook is zipimporter else cast(Callable[[str], FileFinder], hook)(entry)
+        except ImportError:
+            continue
+        except Exception:
+            return _UNSAFE_PATH_RESOLUTION
+        if not _is_trusted_standard_path_importer(finder, entry or os.getcwd()):
+            return _UNSAFE_PATH_RESOLUTION
+        return finder
+    return None
+
+
+def _trusted_path_importer_spec(
+    finder: FileFinder | zipimporter,
+    module_name: str,
+) -> ModuleSpec | _UnsafePathResolution | None:
+    try:
+        spec = (
+            FileFinder.find_spec(finder, module_name)
+            if type(finder) is FileFinder
+            else zipimporter.find_spec(cast(zipimporter, finder), module_name)
+        )
+    except Exception:
+        return _UNSAFE_PATH_RESOLUTION
+    if spec is None or type(spec) is ModuleSpec:
+        return spec
+    return _UNSAFE_PATH_RESOLUTION
+
+
+def _find_standard_path_spec(
+    module_name: str,
+    search_path: list[str],
+) -> ModuleSpec | _UnsafePathResolution | None:
     if not _interpreter_import_runtime_is_trusted():
         _mark_shared_source_snapshot_unreusable()
         return None
 
-    namespace_locations: list[str] = []
-    loader_details = (
-        (ExtensionFileLoader, EXTENSION_SUFFIXES),
-        (SourceFileLoader, SOURCE_SUFFIXES),
-        (SourcelessFileLoader, BYTECODE_SUFFIXES),
-    )
-    for entry in search_path:
-        if not _search_path_entry_uses_trusted_importer(entry):
-            _mark_shared_source_snapshot_unreusable()
-            return None
-        try:
-            zip_spec = zipimporter(entry).find_spec(module_name)
-        except ImportError:
-            zip_spec = None
-        if zip_spec is not None:
-            return zip_spec
+    path_importer_cache = _runtime_path_importer_cache_without_hooks()
+    if path_importer_cache is None:
+        _mark_shared_source_snapshot_unreusable()
+        return _UNSAFE_PATH_RESOLUTION
 
-        finder = FileFinder(entry, *loader_details)
-        spec = finder.find_spec(module_name)
+    namespace_locations: list[str] = []
+    for entry in search_path:
+        cache_key = entry or os.getcwd()
+        if dict.__contains__(path_importer_cache, cache_key):
+            cached_finder = dict.__getitem__(path_importer_cache, cache_key)
+            if cached_finder is None:
+                continue
+            if not _is_trusted_standard_path_importer(cached_finder, cache_key):
+                _mark_shared_source_snapshot_unreusable()
+                return _UNSAFE_PATH_RESOLUTION
+            finder = cast(FileFinder | zipimporter, cached_finder)
+        else:
+            fresh_finder = _fresh_standard_path_importer(cache_key)
+            if isinstance(fresh_finder, _UnsafePathResolution):
+                _mark_shared_source_snapshot_unreusable()
+                return fresh_finder
+            if fresh_finder is None:
+                continue
+            finder = fresh_finder
+
+        spec = _trusted_path_importer_spec(finder, module_name)
+        if isinstance(spec, _UnsafePathResolution):
+            _mark_shared_source_snapshot_unreusable()
+            return spec
         if spec is None:
             continue
         if spec.loader is not None:
