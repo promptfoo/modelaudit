@@ -45,6 +45,7 @@ from modelaudit.cache.scan_results_cache import (
     _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
     AncestorIdentity,
     ScanResultsCache,
+    _current_module_source_path,
     _path_importer_resolution_context,
     _source_resolution_context,
 )
@@ -2013,7 +2014,8 @@ def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
         assert root_finder.find_spec(parent_module) is not None
         monkeypatch.setitem(sys.path_importer_cache, str(tmp_path), root_finder)
 
-    source = str(source_path.absolute())
+    source = _current_module_source_path(module)
+    assert source is not None
     fingerprint_metadata = _call_graph_fingerprint_metadata(
         {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
         module_sources={module: source},
