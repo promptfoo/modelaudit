@@ -4114,6 +4114,11 @@ def test_next_buffer_callback_precedes_invalid_continuation() -> None:
             id="embedded-unknown-GLOBAL-before-multibyte-invalid-tail",
         ),
         pytest.param(
+            b"MIT License\ncnotinstalled\nname\ncxx",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-unknown-GLOBAL-before-opcode-prefixed-tail",
+        ),
+        pytest.param(
             b"MIT License\ncnumpy\narray\n",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-terminal-third-party-GLOBAL",
@@ -4362,6 +4367,16 @@ def test_xgboost_json_legal_name_without_route_evidence_remains_unknown(tmp_path
             b"MIT License\n" + base64.b64encode(b"cmalicious\npayload\nAB"),
             "pickle",
             id="base64-unknown-GLOBAL-before-multibyte-invalid-tail",
+        ),
+        pytest.param(
+            b"MIT License\n" + base64.b64encode(b"cnotinstalled\nname\ncxx"),
+            "pickle",
+            id="base64-unknown-GLOBAL-before-opcode-prefixed-tail",
+        ),
+        pytest.param(
+            b"MIT License\n" + binascii.hexlify(b"cnotinstalled\nname\ncxx"),
+            "pickle",
+            id="hex-unknown-GLOBAL-before-opcode-prefixed-tail",
         ),
         pytest.param(
             b"MIT License\nWFBpZAou\n",

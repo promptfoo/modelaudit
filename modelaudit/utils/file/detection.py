@@ -5708,7 +5708,7 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
             operands = (lines[0], lines[1])
             return all(_plausible_pickle_import_operand(line) for line in operands) and (
                 _has_structural_pickle_continuation(payload, cursor)
-                or _has_compact_invalid_pickle_tail(payload, cursor)
+                or _has_compact_malformed_pickle_tail(payload, cursor)
                 or _has_pickle_import_signal(operands)
             )
         if opcode.name == "PERSID":
@@ -5717,7 +5717,7 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
                 return (
                     cursor == len(payload)
                     or payload[cursor : cursor + 1] == b"."
-                    or _has_compact_invalid_pickle_tail(payload, cursor)
+                    or _has_compact_malformed_pickle_tail(payload, cursor)
                 )
             terminal_or_stop = cursor == len(payload) or payload[cursor : cursor + 1] == b"."
             if terminal_or_stop and _has_short_terminal_persid_signal(lines[0]):
@@ -5727,7 +5727,7 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
                 and (
                     terminal_or_stop
                     or _has_structural_pickle_continuation(payload, cursor)
-                    or _has_compact_invalid_pickle_tail(payload, cursor)
+                    or _has_compact_malformed_pickle_tail(payload, cursor)
                 )
             )
         if opcode.name == "STRING":
@@ -5786,9 +5786,12 @@ def _has_structural_pickle_continuation(payload: bytes, offset: int) -> bool:
     return opcode is not None and opcode.name not in _PICKLE_LINE_PAIR_OPCODES
 
 
-def _has_compact_invalid_pickle_tail(payload: bytes, offset: int) -> bool:
-    tail = payload[offset:].strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
-    return _is_compact_pickle_line(tail) and tail[0] not in _PICKLE_OPCODE_BY_BYTE
+def _has_compact_malformed_pickle_tail(payload: bytes, offset: int) -> bool:
+    raw_tail = payload[offset:]
+    tail = raw_tail.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+    if not _is_compact_pickle_line(tail):
+        return False
+    return tail[0] not in _PICKLE_OPCODE_BY_BYTE or raw_tail == tail
 
 
 @lru_cache(maxsize=128)
@@ -5865,7 +5868,7 @@ def _iter_pickle_candidate_offsets(
                 and line_start == offset
                 and (
                     _has_structural_pickle_continuation(payload, line_end + 1)
-                    or _has_compact_invalid_pickle_tail(payload, line_end + 1)
+                    or _has_compact_malformed_pickle_tail(payload, line_end + 1)
                 )
             ):
                 require_continuation = False
@@ -5886,10 +5889,10 @@ def _iter_pickle_candidate_offsets(
             )
             continuation_offset = second_line_end + 1
             has_structural_continuation = _has_structural_pickle_continuation(payload, continuation_offset)
-            has_compact_invalid_tail = _has_compact_invalid_pickle_tail(payload, continuation_offset)
+            has_compact_malformed_tail = _has_compact_malformed_pickle_tail(payload, continuation_offset)
             has_import_boundary = not has_nontrivial_prefix or payload[offset - 1] in b" \t#;:="
             has_nonstructural_import_signal = has_import_boundary and (
-                has_compact_invalid_tail
+                has_compact_malformed_tail
                 or (
                     _has_pickle_import_signal(operands)
                     and (
@@ -5951,7 +5954,7 @@ def _iter_pickle_candidate_offsets(
                 require_continuation = candidate_start > 0 and bool(trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES))
                 if require_continuation and (
                     _has_structural_pickle_continuation(payload, line_end + 1)
-                    or _has_compact_invalid_pickle_tail(payload, line_end + 1)
+                    or _has_compact_malformed_pickle_tail(payload, line_end + 1)
                 ):
                     require_continuation = False
                 yield from maybe_add(
