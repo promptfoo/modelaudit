@@ -54,6 +54,10 @@ def _unavailable_path_importer_resolution_context(_search_path: Iterable[str]) -
     return _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
 
 
+def _unavailable_current_module_source_path(_module_name: str) -> str | None:
+    return None
+
+
 def _unavailable_search_path_has_untrusted_importer(_search_path: Iterable[str]) -> bool:
     return True
 
@@ -70,12 +74,14 @@ def _unavailable_resolution_context_allows_trusted_cache_population(
 _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE = all(
     callable(getattr(_picklescan_call_graph, name, None))
     for name in (
+        "_current_module_source_path",
         "_path_importer_resolution_context",
         "_resolution_context_allows_trusted_cache_population",
         "_search_path_has_untrusted_importer",
         "_source_resolution_context",
     )
 )
+_current_module_source_path: Callable[[str], str | None]
 _path_importer_resolution_context: Callable[[Iterable[str]], tuple[str, ...]]
 _resolution_context_allows_trusted_cache_population: Callable[
     [
@@ -86,6 +92,7 @@ _resolution_context_allows_trusted_cache_population: Callable[
 ]
 _search_path_has_untrusted_importer: Callable[[Iterable[str]], bool]
 if _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE:
+    _current_module_source_path = _picklescan_call_graph._current_module_source_path
     _path_importer_resolution_context = _picklescan_call_graph._path_importer_resolution_context
     _resolution_context_allows_trusted_cache_population = (
         _picklescan_call_graph._resolution_context_allows_trusted_cache_population
@@ -93,6 +100,7 @@ if _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE:
     _search_path_has_untrusted_importer = _picklescan_call_graph._search_path_has_untrusted_importer
     _picklescan_source_resolution_context = _picklescan_call_graph._source_resolution_context
 else:
+    _current_module_source_path = _unavailable_current_module_source_path
     _path_importer_resolution_context = _unavailable_path_importer_resolution_context
     _resolution_context_allows_trusted_cache_population = (
         _unavailable_resolution_context_allows_trusted_cache_population
@@ -1697,6 +1705,7 @@ class ScanResultsCache:
             return False
         expected_resolution_context = fingerprint_metadata.get("resolution_context")
         current_resolution_context = _source_resolution_context()
+        importer_cache_was_populated = expected_resolution_context != current_resolution_context
         if expected_resolution_context != current_resolution_context:
             expected_context = _parse_resolution_context(expected_resolution_context)
             current_context = _parse_resolution_context(current_resolution_context)
@@ -1714,6 +1723,12 @@ class ScanResultsCache:
                 return False
             is_overridden, current_source = _loaded_module_source_override(module_name)
             if is_overridden and current_source != expected_source:
+                return False
+            if (
+                not is_overridden
+                and importer_cache_was_populated
+                and _current_module_source_path(module_name) != expected_source
+            ):
                 return False
         loaded_module_sources = fingerprint_metadata.get("loaded_module_sources")
         if not isinstance(loaded_module_sources, dict):

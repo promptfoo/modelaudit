@@ -3863,29 +3863,28 @@ def _zipimport_central_directory_is_bounded(archive: str, expected_stat: os.stat
         os.close(file_descriptor)
 
 
-def _zipimport_directory_cache_files(archive: str) -> object:
+def _zipimport_runtime_is_trusted() -> bool:
     modules = _runtime_sys_modules_without_hooks()
     if modules is None or dict.get(modules, "zipimport") is not zipimport:
-        return None
+        return False
     namespace = ModuleType.__getattribute__(zipimport, "__dict__")
-    if (
+    return not (
         namespace is not _ZIPIMPORT_NAMESPACE
         or dict.get(namespace, "_zip_directory_cache") is not _ZIP_DIRECTORY_CACHE
         or type(_ZIP_DIRECTORY_CACHE) is not dict
-    ):
+        or dict.get(namespace, "_read_directory") is not _ZIP_READ_DIRECTORY
+        or not _trusted_executable_value_matches_snapshot(_ZIP_READ_DIRECTORY, _ZIP_READ_DIRECTORY_SNAPSHOT)
+    )
+
+
+def _zipimport_directory_cache_files(archive: str) -> object:
+    if not _zipimport_runtime_is_trusted():
         return None
     return dict.get(cast(dict[str, object], _ZIP_DIRECTORY_CACHE), archive)
 
 
 def _zipimport_archive_files_match(archive: str, files: object) -> bool:
-    if not _zipimport_files_are_safe(files):
-        return False
-    namespace = ModuleType.__getattribute__(zipimport, "__dict__")
-    if (
-        namespace is not _ZIPIMPORT_NAMESPACE
-        or dict.get(namespace, "_read_directory") is not _ZIP_READ_DIRECTORY
-        or not _trusted_executable_value_matches_snapshot(_ZIP_READ_DIRECTORY, _ZIP_READ_DIRECTORY_SNAPSHOT)
-    ):
+    if not _zipimport_files_are_safe(files) or not _zipimport_runtime_is_trusted():
         return False
     try:
         before = os.stat(archive)
@@ -3914,25 +3913,27 @@ def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | No
         return None
     try:
         instance_state = object.__getattribute__(finder, "__dict__")
-        expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
-    except (AttributeError, ImportError, OSError, TypeError):
+    except (AttributeError, TypeError):
         return None
-    if (
-        type(instance_state) is not dict
-        or type(expected_state) is not dict
-        or len(instance_state) > 5
-        or len(expected_state) > 5
-        or any(type(key) is not str for key in (*instance_state, *expected_state))
+    if not (
+        type(instance_state) is dict and len(instance_state) <= 5 and all(type(key) is str for key in instance_state)
     ):
         return None
     archive = dict.get(instance_state, "archive")
     prefix = dict.get(instance_state, "prefix")
     files = _zipimport_directory_cache_files(archive) if type(archive) is str else None
+    if type(archive) is not str or type(prefix) is not str or not _zipimport_files_are_safe(files):
+        return None
+    try:
+        expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
+    except (AttributeError, ImportError, OSError, TypeError):
+        return None
     if not (
-        set(instance_state) == set(expected_state)
-        and type(archive) is str
+        type(expected_state) is dict
+        and len(expected_state) <= 5
+        and all(type(key) is str for key in expected_state)
+        and set(instance_state) == set(expected_state)
         and archive == dict.get(expected_state, "archive")
-        and type(prefix) is str
         and prefix == dict.get(expected_state, "prefix")
         and dict.get(instance_state, "_files", files) is files
         and dict.get(expected_state, "_files", files) is files
@@ -4058,6 +4059,8 @@ class _FileFinderResolutionSummary:
     path_mtime: int | float | None = None
     path_cache: frozenset[str] | None = None
     relaxed_path_cache: frozenset[str] | None = None
+    canonical_path_cache: frozenset[str] | None = None
+    canonical_relaxed_path_cache: frozenset[str] | None = None
     identity: str | None = None
 
 
@@ -4114,8 +4117,53 @@ def _file_finder_resolution_identity(finder: object, cache_key: str) -> str | No
         summary.path_mtime = path_mtime
         summary.path_cache = validated_path_cache
         summary.relaxed_path_cache = validated_relaxed_path_cache
+        summary.canonical_path_cache = canonical_path_cache
+        summary.canonical_relaxed_path_cache = canonical_relaxed_path_cache
         summary.identity = f"trusted:importlib.machinery.FileFinder:{state_identity}"
         return summary.identity
+
+
+def _file_finder_miss_matches_canonical_state(finder: object, module_name: str) -> bool:
+    with _FILE_FINDER_IDENTITY_LOCK:
+        summary = _cached_file_finder_resolution_summary(id(finder))
+        if (
+            summary.finder is not finder
+            or summary.finder_path is None
+            or summary.path_mtime is None
+            or summary.path_cache is None
+            or summary.relaxed_path_cache is None
+            or summary.canonical_path_cache is None
+            or summary.canonical_relaxed_path_cache is None
+        ):
+            return False
+        if (
+            summary.path_cache == summary.canonical_path_cache
+            and summary.relaxed_path_cache == summary.canonical_relaxed_path_cache
+        ):
+            return True
+        finder_path = summary.finder_path
+        path_mtime = summary.path_mtime
+        canonical_path_cache = summary.canonical_path_cache
+        canonical_relaxed_path_cache = summary.canonical_relaxed_path_cache
+
+    try:
+        canonical_finder = FileFinder(finder_path, *_STANDARD_FILE_FINDER_LOADER_DETAILS)
+        canonical_state = object.__getattribute__(canonical_finder, "__dict__")
+        if type(canonical_state) is not dict:
+            return False
+        canonical_state["_loaders"] = _STANDARD_FILE_FINDER_LOADERS
+        canonical_state["_path_mtime"] = path_mtime
+        canonical_state["_path_cache"] = canonical_path_cache
+        canonical_state["_relaxed_path_cache"] = canonical_relaxed_path_cache
+        canonical_spec = FileFinder.find_spec(canonical_finder, module_name)
+    except Exception:
+        return False
+    return (
+        canonical_spec is None
+        and dict.get(canonical_state, "_path_mtime") == path_mtime
+        and dict.get(canonical_state, "_path_cache") is canonical_path_cache
+        and dict.get(canonical_state, "_relaxed_path_cache") is canonical_relaxed_path_cache
+    )
 
 
 def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
@@ -4644,7 +4692,11 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
         if resolved_spec is None and namespace_locations:
             resolved_spec = ModuleSpec(qualified_name, loader=None, is_package=True)
             resolved_spec.submodule_search_locations = namespace_locations
-        if resolved_spec is not None and resolved_spec.loader is None and resolved_spec.submodule_search_locations:
+        if (
+            resolved_spec is not None
+            and resolved_spec.submodule_search_locations
+            and (resolved_spec.loader is None or index < len(parts) - 1)
+        ):
             namespace_search_path = tuple(
                 str(Path(entry or os.getcwd()).absolute()) for entry in resolved_spec.submodule_search_locations
             )
@@ -5154,7 +5206,11 @@ def _trusted_path_importer_spec(
         )
     except Exception:
         return _UNSAFE_PATH_RESOLUTION
-    if spec is None or type(spec) is ModuleSpec:
+    if spec is None:
+        if type(finder) is FileFinder and not _file_finder_miss_matches_canonical_state(finder, module_name):
+            return _UNSAFE_PATH_RESOLUTION
+        return None
+    if type(spec) is ModuleSpec:
         return spec
     return _UNSAFE_PATH_RESOLUTION
 

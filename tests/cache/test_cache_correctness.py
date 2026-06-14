@@ -1922,6 +1922,61 @@ def test_scan_cache_rejects_resolution_metadata_without_current_picklescan_helpe
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+def test_scan_cache_revalidates_sources_after_standard_importer_cache_population(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = "cache_population_source"
+    source_path = tmp_path / f"{module}.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+    path_entry = str(tmp_path)
+    monkeypatch.syspath_prepend(path_entry)
+    monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    source = str(source_path.absolute())
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
+                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+                module_sources={module: source},
+            )
+        },
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    finder = FileFinder(
+        path_entry,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    assert finder.find_spec(module) is not None
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+    calls: list[str] = []
+
+    def missing_current_source(module_name: str) -> str | None:
+        calls.append(module_name)
+        return None
+
+    monkeypatch.setattr(
+        "modelaudit.cache.scan_results_cache._current_module_source_path",
+        missing_current_source,
+        raising=False,
+    )
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+    assert calls == [module]
+
+
 def test_resolution_context_rejects_mutated_zipimporter_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1581,6 +1581,37 @@ def test_zipimporter_directory_validation_does_not_execute_mutated_reader_global
     assert calls == []
 
 
+def test_zipimporter_identity_does_not_rebuild_evicted_cache_with_mutated_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "evicted-mutated-reader.zip"
+    _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
+    path_entry = str(archive_path)
+    finder = zipimporter(path_entry)
+    assert call_graph._zipimporter_resolution_identity(finder, path_entry) is not None
+
+    finder_state = object.__getattribute__(finder, "__dict__")
+    archive = dict.get(finder_state, "archive")
+    assert type(archive) is str
+    zipimport_namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    directory_cache = dict.get(zipimport_namespace, "_zip_directory_cache")
+    original_reader = dict.get(zipimport_namespace, "_read_directory")
+    assert type(directory_cache) is dict
+    assert isinstance(original_reader, FunctionType)
+    monkeypatch.delitem(directory_cache, archive)
+    calls: list[str] = []
+
+    def poisoned_reader(value: str) -> object:
+        calls.append(value)
+        return original_reader(value)
+
+    monkeypatch.setitem(zipimport_namespace, "_read_directory", poisoned_reader)
+
+    assert call_graph._zipimporter_resolution_identity(finder, path_entry) is None
+    assert calls == []
+
+
 def test_zipimporter_directory_validation_bounds_entries_before_reader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1628,6 +1659,30 @@ def test_file_finder_identity_does_not_execute_mutated_fill_cache(tmp_path: Path
     finally:
         fill_cache.__code__ = original_code
     assert marker.exists() is False
+
+
+def test_file_finder_miss_rejects_incomplete_current_cache(tmp_path: Path) -> None:
+    module = "present_but_hidden"
+    (tmp_path / f"{module}.py").write_text("value = 1\n", encoding="utf-8")
+    path_entry = str(tmp_path)
+    finder = FileFinder(path_entry, *_standard_file_finder_loader_details())
+    assert finder.find_spec(module) is not None
+    finder_state = object.__getattribute__(finder, "__dict__")
+    finder_state["_path_mtime"] = os.stat(path_entry).st_mtime
+    finder_state["_path_cache"] = set()
+    finder_state["_relaxed_path_cache"] = set()
+    assert finder.find_spec(module) is None
+
+    call_graph._cached_file_finder_resolution_summary.cache_clear()
+    try:
+        assert call_graph._file_finder_resolution_identity(finder, path_entry) is not None
+        assert call_graph._trusted_path_importer_spec(finder, "benign_missing", path_entry) is None
+        assert isinstance(
+            call_graph._trusted_path_importer_spec(finder, module, path_entry),
+            call_graph._UnsafePathResolution,
+        )
+    finally:
+        call_graph._cached_file_finder_resolution_summary.cache_clear()
 
 
 def test_file_finder_resolution_identity_caches_bounded_state_work(
@@ -1849,6 +1904,59 @@ def test_shared_cache_refreshes_when_unloaded_namespace_importer_semantics_chang
         imported = importlib.import_module(module)
         assert imported.Entry is not None
     assert marker.exists() is True
+
+
+@pytest.mark.parametrize("replacement", ["none", "custom"])
+def test_shared_cache_tracks_unloaded_regular_package_importer_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    parent_module = "regular_cache_package"
+    module = f"{parent_module}.child"
+    trusted_root = tmp_path / "trusted-root"
+    package_path = trusted_root / parent_module
+    package_path.mkdir(parents=True)
+    (package_path / "__init__.py").write_text("value = 1\n", encoding="utf-8")
+    (package_path / "child.py").write_text("class Entry:\n    pass\n", encoding="utf-8")
+    root_entry = str(trusted_root)
+    package_entry = str(package_path)
+    root_finder = FileFinder(root_entry, *_standard_file_finder_loader_details())
+    package_finder = FileFinder(package_entry, *_standard_file_finder_loader_details())
+    assert root_finder.find_spec(parent_module) is not None
+    assert package_finder.find_spec(module) is not None
+    calls: list[str] = []
+    importer_cache: dict[Any, Any] = {
+        root_entry: root_finder,
+        package_entry: package_finder,
+    }
+
+    with (
+        _standard_import_runtime(
+            monkeypatch,
+            module=module,
+            importer_cache=importer_cache,
+            search_path=[root_entry],
+            trusted_site_package_root=trusted_root,
+        ),
+        call_graph.shared_source_sensitive_caches(),
+    ):
+        monkeypatch.delitem(sys.modules, parent_module, raising=False)
+        first_generation = call_graph._begin_shared_source_report()
+        assert call_graph._trusted_module_origin_kind(module) == "site_packages"
+        call_graph._ensure_shared_source_snapshot_stable(first_generation)
+        metadata = call_graph.shared_source_fingerprint_metadata()
+        assert metadata is not None
+        assert parent_module in metadata["namespace_package_resolution_contexts"]
+
+        importer_cache[package_entry] = None if replacement == "none" else _FailIfExecutedFinder(calls)
+        second_generation = call_graph._begin_shared_source_report()
+        expected_kind = "unresolved" if replacement == "none" else None
+        assert call_graph._trusted_module_origin_kind(module) == expected_kind
+        call_graph._ensure_shared_source_snapshot_stable(second_generation)
+
+    assert second_generation != first_generation
+    assert calls == []
 
 
 def test_loaded_package_cached_untrusted_importer_is_not_unresolved_trusted(
