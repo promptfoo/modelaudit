@@ -459,6 +459,13 @@ _LEGAL_TEXT_SIGNAL_RE = re.compile(
 )
 _LEGAL_TEXT_BASE64_CHUNK_RE = re.compile(rb"[A-Za-z0-9+/_-]+={0,2}")
 _LEGAL_TEXT_HEX_CHUNK_RE = re.compile(rb"[A-Fa-f0-9]+")
+_LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE = re.compile(
+    rb"(?<![3-9A-Za-z_])(?:"
+    rb"[ci][A-Za-z0-9_\x80-\xff](?:[A-Za-z0-9_.$\x80-\xff-]*[A-Za-z0-9_\x80-\xff])?\n"
+    rb"[A-Za-z0-9_\x80-\xff](?:[A-Za-z0-9_.$\x80-\xff-]*[A-Za-z0-9_\x80-\xff])?\n|"
+    rb"P[^\x00-\x20\x7f-\x9f\r\n]+\n"
+    rb")"
+)
 _LEGAL_TEXT_MAX_DECODED_BYTES = 1024 * 1024
 _LEGAL_TEXT_ENCODED_EXECUTION_RE = re.compile(
     rb"(?:"
@@ -2297,7 +2304,7 @@ class _PickleProbeWorkBudget:
 
 @dataclass
 class _LegalTextPickleCandidateBudget:
-    """Bound aggregate structural work across raw and decoded candidates."""
+    """Bound plausible candidate and opcode work across raw and decoded payloads."""
 
     remaining_candidates: int = _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES
     remaining_opcodes: int = PROTO0_1_MAX_PROBE_OPCODES
@@ -2596,6 +2603,7 @@ _BINARY_PICKLE_SECURITY_OPCODES: frozenset[str] = frozenset(
         "INST",
         "NEWOBJ",
         "NEWOBJ_EX",
+        "NEXT_BUFFER",
         "OBJ",
         "PERSID",
         "REDUCE",
@@ -2610,12 +2618,19 @@ _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
         "EXT4",
         "GLOBAL",
         "INST",
+        "NEXT_BUFFER",
         "OBJ",
         "PERSID",
         "REDUCE",
         "STACK_GLOBAL",
     }
 )
+_PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES: frozenset[str] = frozenset(
+    {"EXT1", "EXT2", "EXT4", "GLOBAL", "NEXT_BUFFER", "PERSID"}
+)
+_PICKLE_DECODED_ENTRY_OPCODES: frozenset[str] = _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES | {"INST", "PROTO"}
+_PICKLE_IMPORT_OPERAND_PUNCTUATION: frozenset[str] = frozenset("._-$")
+_PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS: dict[str, int] = {"EXT1": 2, "EXT2": 3, "EXT4": 5, "NEXT_BUFFER": 1}
 _PROTOCOLLESS_BINARY_PICKLE_OPCODES: frozenset[str] = frozenset(
     {
         "ADDITEMS",
@@ -2661,6 +2676,9 @@ _PROTOCOLLESS_BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES = _BINARY_PICKLE_PRE_STOP_
     {"EXT1", "EXT2", "EXT4"}
 )
 _PICKLE_OPCODE_BY_BYTE = {ord(opcode.code): opcode for opcode in pickletools.opcodes}
+_PICKLE_SECURITY_OPCODE_BYTES: frozenset[int] = frozenset(
+    value for value, opcode in _PICKLE_OPCODE_BY_BYTE.items() if opcode.name in _BINARY_PICKLE_SECURITY_OPCODES
+)
 _PICKLE_LINE_PAIR_OPCODES: frozenset[str] = frozenset({"GLOBAL", "INST"})
 _PICKLE_VARIABLE_LENGTH_HEADER_BYTES: dict[int, int] = {-2: 1, -3: 4, -4: 4, -5: 8}
 
@@ -5327,15 +5345,37 @@ def _classify_pickle_security_payload(payload: bytes) -> str | None:
     return None
 
 
-def _compact_pickle_global_argument(argument: Any) -> bool:
-    if not _is_valid_pickle_global_argument(argument):
-        return False
+def _plausible_pickle_import_operand(value: str | bytes) -> bool:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    return (
+        bool(value)
+        and (value[0].isalnum() or value[0] == "_")
+        and (value[-1].isalnum() or value[-1] == "_")
+        and all(character.isalnum() or character in _PICKLE_IMPORT_OPERAND_PUNCTUATION for character in value)
+    )
+
+
+def _pickle_side_effect_argument_is_meaningful(opcode_name: str, argument: Any) -> bool:
+    if opcode_name in {"GLOBAL", "INST"}:
+        if not _is_valid_pickle_global_argument(argument):
+            return False
+        return all(_plausible_pickle_import_operand(value) for value in argument[1:])
+    elif opcode_name == "PERSID":
+        if not isinstance(argument, str):
+            return False
+        values = (argument,)
+    else:
+        return True
     return all(
         value
         and not any(
             character.isspace() or ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in value
         )
-        for value in argument[1:]
+        for value in values
     )
 
 
@@ -5345,25 +5385,61 @@ def _pickle_candidate_route(*, embedded: bool) -> str:
     return "pickle"
 
 
+def _decoded_pickle_events_are_meaningful(
+    events: list[tuple[int, str, bool]],
+    *,
+    completed: bool,
+    explicit_protocol: bool,
+) -> bool:
+    names = {name for _index, name, _flag in events}
+    if explicit_protocol or names.intersection({"GLOBAL", "INST", "PERSID", "STACK_GLOBAL"}):
+        return True
+    return completed and bool(names.intersection({"BINPERSID", "BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ", "REDUCE"}))
+
+
+def _meaningful_pickle_events(
+    events: list[tuple[int, str, bool]],
+    *,
+    embedded: bool,
+) -> list[tuple[int, str, bool]]:
+    meaningful = [event for event in events if event[2]]
+    if embedded and meaningful and all(name == "PERSID" for _index, name, _flag in meaningful):
+        return []
+    return meaningful
+
+
 def _incomplete_pickle_security_route(
     *,
     embedded: bool,
+    decoded: bool,
+    explicit_protocol: bool,
+    require_continuation: bool,
     stream_start: int,
     pre_stack_inst: bool,
     security_events: list[tuple[int, str, bool]],
 ) -> str | None:
-    if pre_stack_inst and not any(name == "INST" for _index, name, _compact in security_events):
+    meaningful_events = _meaningful_pickle_events(security_events, embedded=embedded)
+    if pre_stack_inst and not any(name == "INST" for _index, name, _meaningful in meaningful_events):
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if not embedded and stream_start == 0 else None
-    if any(name in {"GLOBAL", "INST"} and not compact_argument for _index, name, compact_argument in security_events):
+    if not meaningful_events:
         return None
-    if not security_events:
+    if require_continuation and len(meaningful_events) == 1 and meaningful_events[0][1] == "GLOBAL":
         return None
-    if any(name == "INST" for _index, name, _compact in security_events):
+    if decoded and not _decoded_pickle_events_are_meaningful(
+        meaningful_events,
+        completed=False,
+        explicit_protocol=explicit_protocol,
+    ):
+        return None
+    if any(name == "INST" for _index, name, _meaningful in meaningful_events):
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if any(
+        name in _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES and (name != "PERSID" or (not embedded and stream_start == 0))
+        for _index, name, _flag in meaningful_events
+    ):
+        return _pickle_candidate_route(embedded=embedded or stream_start > 0)
     has_strong_structure = (
-        stream_start > 0
-        or len(security_events) > 1
-        or any(index > 0 or compact_argument for index, _name, compact_argument in security_events)
+        stream_start > 0 or len(meaningful_events) > 1 or any(index > 0 for index, _name, _flag in meaningful_events)
     )
     if not has_strong_structure:
         return None
@@ -5374,6 +5450,8 @@ def _classify_bounded_pickle_candidate(
     candidate: bytes,
     *,
     embedded: bool,
+    decoded: bool,
+    require_continuation: bool,
     budget: _LegalTextPickleCandidateBudget,
 ) -> str | None:
     """Classify one raw or decoded candidate with shared structural budgets."""
@@ -5386,6 +5464,22 @@ def _classify_bounded_pickle_candidate(
     hashability_cache: dict[int, tuple[Any, bool]] = {}
     sample_is_prefix = len(candidate) > len(sample)
 
+    def incomplete_route(
+        stream_start: int,
+        pre_stack_inst: bool,
+        explicit_protocol: bool,
+        security_events: list[tuple[int, str, bool]],
+    ) -> str | None:
+        return _incomplete_pickle_security_route(
+            embedded=embedded,
+            decoded=decoded,
+            explicit_protocol=explicit_protocol,
+            require_continuation=require_continuation,
+            stream_start=stream_start,
+            pre_stack_inst=pre_stack_inst,
+            security_events=security_events,
+        )
+
     while stream.tell() < len(sample):
         stream_start = stream.tell()
         stack: list[Any] = []
@@ -5393,6 +5487,7 @@ def _classify_bounded_pickle_candidate(
         parsed_opcodes = 0
         has_nontrivial_opcode = False
         pre_stack_inst = False
+        explicit_protocol = False
 
         try:
             for opcode, argument, _position in _gen_pickle_probe_ops(stream):
@@ -5404,14 +5499,11 @@ def _classify_bounded_pickle_candidate(
                 parsed_opcodes += 1
 
                 if _has_invalid_pickle_opcode_argument(opcode_name, argument):
-                    return _incomplete_pickle_security_route(
-                        embedded=embedded,
-                        stream_start=stream_start,
-                        pre_stack_inst=pre_stack_inst,
-                        security_events=security_events,
-                    )
-                compact_argument = opcode_name in {"GLOBAL", "INST"} and _compact_pickle_global_argument(argument)
-                if opcode_name == "INST" and compact_argument:
+                    return incomplete_route(stream_start, pre_stack_inst, explicit_protocol, security_events)
+                meaningful_argument = _pickle_side_effect_argument_is_meaningful(opcode_name, argument)
+                if opcode_name == "PROTO":
+                    explicit_protocol = True
+                if opcode_name == "INST" and meaningful_argument:
                     pre_stack_inst = True
 
                 if not _apply_pickle_stack_effect(
@@ -5421,58 +5513,49 @@ def _classify_bounded_pickle_candidate(
                     memo,
                     hashability_cache,
                 ):
-                    return _incomplete_pickle_security_route(
-                        embedded=embedded,
-                        stream_start=stream_start,
-                        pre_stack_inst=pre_stack_inst,
-                        security_events=security_events,
-                    )
+                    return incomplete_route(stream_start, pre_stack_inst, explicit_protocol, security_events)
 
                 if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:
-                    security_events.append((opcode_index, opcode_name, compact_argument))
+                    security_events.append((opcode_index, opcode_name, meaningful_argument))
                 if opcode_name not in {"GLOBAL", "STOP"} and opcode_name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
                     has_nontrivial_opcode = True
                 if opcode_name != "STOP":
                     continue
 
-                if security_events or (has_nontrivial_opcode and not embedded):
+                meaningful_events = _meaningful_pickle_events(security_events, embedded=embedded)
+                if meaningful_events and (
+                    not decoded
+                    or _decoded_pickle_events_are_meaningful(
+                        meaningful_events,
+                        completed=True,
+                        explicit_protocol=explicit_protocol,
+                    )
+                ):
                     return _pickle_candidate_route(embedded=embedded)
+                if has_nontrivial_opcode and not embedded and not decoded:
+                    return "pickle"
                 break
         except _PickleNumericOperandLimitExceeded:
-            route = _incomplete_pickle_security_route(
-                embedded=embedded,
-                stream_start=stream_start,
-                pre_stack_inst=pre_stack_inst,
-                security_events=security_events,
-            )
+            route = incomplete_route(stream_start, pre_stack_inst, explicit_protocol, security_events)
             return route if route is not None else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
         except ValueError as exc:
-            route = _incomplete_pickle_security_route(
-                embedded=embedded,
-                stream_start=stream_start,
-                pre_stack_inst=pre_stack_inst,
-                security_events=security_events,
-            )
+            route = incomplete_route(stream_start, pre_stack_inst, explicit_protocol, security_events)
             if route is not None:
                 return route
-            if sample_is_prefix and parsed_opcodes and "opcode" not in str(exc):
+            first_opcode = _PICKLE_OPCODE_BY_BYTE.get(sample[stream_start])
+            known_truncated_security_prefix = first_opcode is not None and first_opcode.name in {
+                "GLOBAL",
+                "INST",
+                "PERSID",
+            }
+            if sample_is_prefix and (parsed_opcodes or known_truncated_security_prefix) and "opcode" not in str(exc):
                 return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
             return None
         except (MemoryError, RecursionError):
-            route = _incomplete_pickle_security_route(
-                embedded=embedded,
-                stream_start=stream_start,
-                pre_stack_inst=pre_stack_inst,
-                security_events=security_events,
-            )
+            route = incomplete_route(stream_start, pre_stack_inst, explicit_protocol, security_events)
             return route if route is not None else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
         except Exception:
-            route = _incomplete_pickle_security_route(
-                embedded=embedded,
-                stream_start=stream_start,
-                pre_stack_inst=pre_stack_inst,
-                security_events=security_events,
-            )
+            route = incomplete_route(stream_start, pre_stack_inst, explicit_protocol, security_events)
             if route is not None:
                 return route
             if sample_is_prefix and parsed_opcodes:
@@ -5480,12 +5563,7 @@ def _classify_bounded_pickle_candidate(
             return None
 
         if stream.tell() <= stream_start:
-            return _incomplete_pickle_security_route(
-                embedded=embedded,
-                stream_start=stream_start,
-                pre_stack_inst=pre_stack_inst,
-                security_events=security_events,
-            )
+            return incomplete_route(stream_start, pre_stack_inst, explicit_protocol, security_events)
         if stream.tell() == len(sample):
             break
 
@@ -5494,16 +5572,91 @@ def _classify_bounded_pickle_candidate(
     return None
 
 
-def _iter_pickle_candidate_offsets(payload: bytes, *, scan_embedded: bool) -> Iterator[int]:
+def _is_compact_pickle_line(value: bytes) -> bool:
+    return bool(value) and not any(byte <= 0x20 or 0x7F <= byte <= 0x9F for byte in value)
+
+
+def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
+    """Cheaply reject incomplete first operands before charging structural work."""
+    if offset >= len(payload):
+        return False
+    opcode = _PICKLE_OPCODE_BY_BYTE.get(payload[offset])
+    if opcode is None or opcode.arg is None:
+        return opcode is not None
+
+    argument_size = opcode.arg.n
+    if argument_size > 0:
+        return len(payload) - offset >= 1 + argument_size
+    if argument_size == -1:
+        cursor = offset + 1
+        lines: list[bytes] = []
+        for _ in range(2 if opcode.name in _PICKLE_LINE_PAIR_OPCODES else 1):
+            line_end = payload.find(b"\n", cursor)
+            if line_end < 0:
+                return False
+            lines.append(payload[cursor:line_end])
+            cursor = line_end + 1
+        if opcode.name in {"GLOBAL", "INST"}:
+            return all(_plausible_pickle_import_operand(line) for line in lines)
+        if opcode.name == "PERSID":
+            return _is_compact_pickle_line(lines[0])
+        return True
+
+    header_size = _PICKLE_VARIABLE_LENGTH_HEADER_BYTES.get(argument_size)
+    if header_size is None or len(payload) - offset < 1 + header_size:
+        return False
+    argument_offset = offset + 1
+    payload_size = int.from_bytes(
+        payload[argument_offset : argument_offset + header_size],
+        "little",
+        signed=argument_size == -3,
+    )
+    return 0 <= payload_size <= len(payload) - offset - 1 - header_size
+
+
+def _iter_pickle_candidate_offsets(
+    payload: bytes,
+    *,
+    scan_embedded: bool,
+    is_plain_text: bool,
+) -> Iterator[tuple[int, bool, bool]]:
     seen: set[int] = set()
 
-    def maybe_add(offset: int) -> Iterator[int]:
+    def maybe_add(
+        offset: int,
+        *,
+        prevalidated: bool = False,
+        require_continuation: bool = False,
+    ) -> Iterator[tuple[int, bool, bool]]:
         if offset not in seen and offset < len(payload) and payload[offset] in _PICKLE_OPCODE_BY_BYTE:
             seen.add(offset)
-            yield offset
+            yield offset, prevalidated, require_continuation
 
-    yield from maybe_add(0)
+    yield from maybe_add(0, prevalidated=_is_plausible_pickle_candidate(payload))
     if not scan_embedded:
+        return
+
+    for match in _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE.finditer(payload):
+        offset = match.start()
+        opcode_name = _PICKLE_OPCODE_BY_BYTE[payload[offset]].name
+        line_start = payload.rfind(b"\n", 0, offset) + 1
+        while line_start < offset and payload[line_start] in b" \t":
+            line_start += 1
+        if opcode_name in {"GLOBAL", "INST"}:
+            yield from maybe_add(line_start)
+        if opcode_name == "GLOBAL" and line_start > 0:
+            previous_line_end = line_start - 1
+            previous_line_start = payload.rfind(b"\n", 0, previous_line_end) + 1
+            while previous_line_start < previous_line_end and payload[previous_line_start] in b" \t":
+                previous_line_start += 1
+            yield from maybe_add(previous_line_start)
+        yield from maybe_add(
+            offset,
+            prevalidated=True,
+            require_continuation=offset != line_start,
+        )
+
+    if is_plain_text:
         return
 
     line_start = 0
@@ -5534,17 +5687,43 @@ def _bounded_pickle_candidate_route(
     *,
     budget: _LegalTextPickleCandidateBudget | None = None,
     scan_embedded: bool = True,
+    decoded: bool = False,
+    is_plain_text: bool | None = None,
 ) -> str | None:
     if budget is None:
         budget = _LegalTextPickleCandidateBudget()
-
-    for offset in _iter_pickle_candidate_offsets(payload, scan_embedded=scan_embedded):
+    if is_plain_text is None:
+        is_plain_text = _decode_complete_utf8_plain_text(payload) is not None
+    last_security_offset = (
+        max((offset for offset, value in enumerate(payload) if value in _PICKLE_SECURITY_OPCODE_BYTES), default=-1)
+        if decoded
+        else -1
+    )
+    for offset, prevalidated, require_continuation in _iter_pickle_candidate_offsets(
+        payload,
+        scan_embedded=scan_embedded,
+        is_plain_text=is_plain_text,
+    ):
+        if decoded:
+            opcode_name = _PICKLE_OPCODE_BY_BYTE[payload[offset]].name
+            if opcode_name not in _PICKLE_DECODED_ENTRY_OPCODES and not (
+                opcode_name in PROTO0_1_TRIVIAL_LEADING_OPCODES and last_security_offset > offset
+            ):
+                continue
+            weak_suffix_offset = _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.get(opcode_name)
+            if weak_suffix_offset is not None and last_security_offset < offset + weak_suffix_offset:
+                continue
+        if not prevalidated and not _is_plausible_pickle_candidate(payload, offset):
+            continue
         if budget.remaining_candidates <= 0:
             return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
         budget.remaining_candidates -= 1
+        candidate = payload[offset:]
         route = _classify_bounded_pickle_candidate(
-            payload[offset:],
+            candidate,
             embedded=offset != 0,
+            decoded=decoded,
+            require_continuation=require_continuation,
             budget=budget,
         )
         if route is not None:
@@ -5559,21 +5738,24 @@ def _decode_base64_route_token(token: bytes) -> bytes:
     return base64.b64decode(token + padding, altchars=b"-_", validate=True)
 
 
-def _is_plain_alphabetic_base64_word(token: bytes) -> bool:
-    normalized = token.replace(b"-", b"").replace(b"_", b"")
-    return b"=" not in token and normalized.isalpha()
-
-
-def _iter_encoded_route_tokens(payload: bytes, token_re: re.Pattern[bytes]) -> Iterator[bytes]:
+def _iter_encoded_route_tokens(
+    payload: bytes,
+    token_re: re.Pattern[bytes],
+) -> Iterator[bytes]:
     block = bytearray()
     block_lines = 0
 
     for raw_line in payload.splitlines():
         line = raw_line.strip(b" \t")
-        if line and token_re.fullmatch(line) is not None:
-            block.extend(line)
-            block_lines += 1
-            continue
+        compact_line = line.translate(None, b" \t")
+        encoded_line = compact_line if compact_line and token_re.fullmatch(compact_line) is not None else None
+        if encoded_line is not None:
+            if encoded_line != line:
+                yield encoded_line
+            if encoded_line == line or not encoded_line.rstrip(b"=").isalpha() or block_lines:
+                block.extend(encoded_line)
+                block_lines += 1
+                continue
         if block_lines > 1:
             yield bytes(block)
         block.clear()
@@ -5585,15 +5767,49 @@ def _iter_encoded_route_tokens(payload: bytes, token_re: re.Pattern[bytes]) -> I
         yield match.group(0)
 
 
-def _encoded_pickle_route(payload: bytes) -> str | None:
-    budget = _LegalTextPickleCandidateBudget()
+def _encoded_pickle_route(
+    payload: bytes,
+    *,
+    budget: _LegalTextPickleCandidateBudget | None = None,
+) -> str | None:
+    if budget is None:
+        budget = _LegalTextPickleCandidateBudget()
 
-    for decoder_name, token_re, minimum_length, decoder in (
-        ("base64", _LEGAL_TEXT_BASE64_CHUNK_RE, 4, _decode_base64_route_token),
-        ("hex", _LEGAL_TEXT_HEX_CHUNK_RE, 6, binascii.unhexlify),
+    for token_re, minimum_length, maximum_encoded_length, alphabetic_offset_zero_only, decoder in (
+        (
+            _LEGAL_TEXT_BASE64_CHUNK_RE,
+            4,
+            4 * ((_LEGAL_TEXT_MAX_DECODED_BYTES + 2) // 3),
+            True,
+            _decode_base64_route_token,
+        ),
+        (
+            _LEGAL_TEXT_HEX_CHUNK_RE,
+            6,
+            2 * _LEGAL_TEXT_MAX_DECODED_BYTES,
+            False,
+            binascii.unhexlify,
+        ),
     ):
         for token in _iter_encoded_route_tokens(payload, token_re):
             if len(token) < minimum_length:
+                continue
+            plain_alphabetic_token = alphabetic_offset_zero_only and token.rstrip(b"=").isalpha()
+            if len(token) > maximum_encoded_length:
+                if not plain_alphabetic_token:
+                    return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+                encoded_prefix_length = 4 * ((PROTO0_1_MAX_PROBE_BYTES + 2) // 3)
+                decoded_prefix = decoder(token[:encoded_prefix_length])
+                route = _bounded_pickle_candidate_route(
+                    decoded_prefix,
+                    budget=budget,
+                    scan_embedded=False,
+                    decoded=True,
+                )
+                if route is not None:
+                    return route
+                if _LEGAL_TEXT_ENCODED_EXECUTION_RE.search(decoded_prefix) is not None:
+                    return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
                 continue
             try:
                 decoded = decoder(token)
@@ -5607,17 +5823,15 @@ def _encoded_pickle_route(payload: bytes) -> str | None:
             route = _bounded_pickle_candidate_route(
                 decoded,
                 budget=budget,
-                scan_embedded=not (decoder_name == "base64" and _is_plain_alphabetic_base64_word(token)),
+                # Alphabetic legal words are valid base64; require their decoded stream to start at byte zero.
+                scan_embedded=not plain_alphabetic_token,
+                decoded=True,
             )
             if route is not None:
                 return route
             if _LEGAL_TEXT_ENCODED_EXECUTION_RE.search(decoded) is not None:
                 return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     return None
-
-
-def _embedded_raw_pickle_route(payload: bytes) -> str | None:
-    return _bounded_pickle_candidate_route(payload)
 
 
 def _legal_text_sidecar_route_from_bytes(
@@ -5629,15 +5843,16 @@ def _legal_text_sidecar_route_from_bytes(
     if not _is_legal_text_sidecar_name(path, logical_name):
         return None
 
-    raw_route = _embedded_raw_pickle_route(payload)
+    text = _decode_complete_utf8_plain_text(payload)
+    budget = _LegalTextPickleCandidateBudget()
+    raw_route = _bounded_pickle_candidate_route(payload, budget=budget, is_plain_text=text is not None)
     if raw_route is not None:
         return raw_route
 
-    encoded_route = _encoded_pickle_route(payload)
+    encoded_route = _encoded_pickle_route(payload, budget=budget)
     if encoded_route is not None:
         return encoded_route
 
-    text = _decode_complete_utf8_plain_text(payload)
     if text is None:
         return None
     filename = _logical_basename_for_route(path, logical_name)
@@ -9316,7 +9531,7 @@ def _resolve_legal_text_sidecar_route(
     *,
     logical_name: str | None,
 ) -> str | None:
-    """Let proven structured models override only a validated text fallback."""
+    """Preserve structured-model authority over a validated text fallback."""
     legal_text_route = _detect_legal_text_sidecar_route(file_path, file_size, logical_name=logical_name)
     if legal_text_route != "text":
         return legal_text_route
@@ -9331,7 +9546,7 @@ def _resolve_legal_text_sidecar_route(
     signature_model = _detect_content_routed_signature_model(file_path, file_size, prefix)
     if signature_model is not None:
         return signature_model
-    if _is_confirmed_content_routed_jax_json_checkpoint(file_path):
+    if _could_be_content_routed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
     if not file_path.suffix:
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(
@@ -9356,7 +9571,7 @@ def detect_file_format_from_magic(path: str, *, logical_name: str | None = None)
     try:
         size = file_path.stat().st_size
         if size < 4:
-            return "unknown"
+            return _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name) or "unknown"
 
         if file_path.suffix.lower() == ".meta":
             if _is_tensorflow_metagraph_file(path):
@@ -9550,7 +9765,7 @@ def detect_file_format_for_skip_filter(path: str, *, logical_name: str | None = 
 
     size = file_path.stat().st_size
     if size < 4:
-        return "unknown"
+        return _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name) or "unknown"
 
     initial_read_size = min(size, max(64, _TAR_BLOCK_SIZE))
     with file_path.open("rb") as f:
@@ -9689,7 +9904,7 @@ def detect_file_format(path: str, *, logical_name: str | None = None) -> str:
     # Single file
     size = file_path.stat().st_size
     if size < 4:
-        return "unknown"
+        return _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name) or "unknown"
 
     # Read first bytes for format detection using a single file handle
     with file_path.open("rb") as f:

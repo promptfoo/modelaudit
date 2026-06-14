@@ -33,7 +33,7 @@ from modelaudit.scanner_selection import (
     selected_scanner_filenames,
 )
 from modelaudit.scanners.archive_dispatch import scan_nested_file
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import LOGICAL_SCAN_PATH_CONFIG_KEY, CheckStatus, IssueSeverity
 from modelaudit.utils.file.detection import (
     _LEGAL_TEXT_ROUTE_MAX_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
@@ -67,6 +67,18 @@ def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
         + (b"id #" + b"A" * 70000)
         + b"'\ntR."
     )
+
+
+def _long_global_operand_in_legal_text() -> bytes:
+    return b"MIT License\n" + b"c" + (b"a" * 70000) + b"\nx\n."
+
+
+def _encoded_pickle_after_benign_candidate_budget(word: bytes = b"license") -> bytes:
+    return b"MIT License\n" + ((word + b" ") * 4096) + b"\n" + base64.b64encode(b"cb\nx\n.")
+
+
+def _large_zero_fill_base64_legal_text() -> bytes:
+    return b"MIT License " + (b"A" * 1_468_008)
 
 
 def _wrap_encoded_lines(payload: bytes, width: int) -> bytes:
@@ -616,6 +628,35 @@ def test_nested_selected_zip_scanner_handles_zip_backed_extension_fallback(tmp_p
     )
 
 
+def test_nested_ambiguous_jax_legal_member_preserves_model_ownership(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "member"
+    extracted_member.write_bytes(b'{"license":"MIT","value":' + (b"9" * 5000) + b',"framework":"jax"}')
+
+    result = scan_nested_file(
+        str(extracted_member),
+        config={"cache_enabled": False, LOGICAL_SCAN_PATH_CONFIG_KEY: "LICENSE"},
+    )
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["scan_outcome_reasons"] == ["jax_json_scan_failed"]
+
+
+def test_nested_physical_license_with_mxnet_structure_preserves_model_ownership(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "LICENSE"
+    extracted_member.write_text(
+        '{"license":"MIT","nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), config={"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert result.success is True
+    assert result.metadata["node_count"] == 1
+
+
 def test_embedded_pickle_helpers_honor_selection_policy(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt", malicious=True)
 
@@ -815,6 +856,41 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         pytest.param(b"MIT License\n\x82\x01)R.", 2, id="embedded-EXT1"),
         pytest.param(b"MIT License\nPid\n)R.", 2, id="embedded-PERSID"),
         pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
+        pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
+        pytest.param(b"\x82\x01", 1, id="sole-EXT1"),
+        pytest.param(b"\x97", 1, id="sole-NEXT_BUFFER"),
+        pytest.param("cmódulo\nthing\n.".encode(), 1, id="unicode-GLOBAL-operand"),
+        pytest.param(
+            b"MIT License\nprefix cposix\nsystem\n(S'id'\ntR.",
+            2,
+            id="mid-line-GLOBAL",
+        ),
+        pytest.param(
+            b"#cposix\nsystem\n(S'id'\ntR.\nMIT License",
+            2,
+            id="comment-prefixed-GLOBAL",
+        ),
+        pytest.param(b"MIT License\nY2IK eAou\n", 1, id="base64-intra-line-whitespace"),
+        pytest.param(b"MIT License\n63620a 780a2e\n", 1, id="hex-intra-line-whitespace"),
+        pytest.param(b"MIT License\nY 2IKeAou\n", 1, id="base64-unaligned-intra-line-whitespace"),
+        pytest.param(b"MIT License\n6 3620a780a2e\n", 1, id="hex-unaligned-intra-line-whitespace"),
+        pytest.param(b"MIT License\nY 2IK\ne Aou\n", 1, id="base64-mixed-line-whitespace"),
+        pytest.param(b"MIT License\n63 62\n0a78 0a2e\n", 1, id="hex-mixed-line-whitespace"),
+        pytest.param(b"MIT License\nY2IK\teAou\n", 1, id="base64-intra-line-tab"),
+        pytest.param(b"MIT License\n63620a\t780a2e\n", 1, id="hex-intra-line-tab"),
+        pytest.param(base64.b64encode(b"S'id'\nQ."), 1, id="base64-BINPERSID"),
+        pytest.param(binascii.hexlify(b"S'id'\nQ."), 1, id="hex-BINPERSID"),
+        pytest.param(
+            _encoded_pickle_after_benign_candidate_budget(),
+            1,
+            id="encoded-pickle-after-benign-candidate-budget",
+        ),
+        pytest.param(
+            _encoded_pickle_after_benign_candidate_budget(b"groups"),
+            1,
+            id="encoded-pickle-after-weak-candidate-budget",
+        ),
+        pytest.param(_long_global_operand_in_legal_text(), 2, id="truncated-GLOBAL-operand"),
     ],
 )
 def test_scan_file_rejects_shared_structural_pickle_bypasses(
@@ -919,6 +995,46 @@ def test_scan_file_keeps_benign_encoded_execution_word_on_text_route(
     assert determine_exit_code(result) == 0
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param("MIT License\n∂\n".encode(), id="utf8-partial-pickle-symbol"),
+        pytest.param(
+            b"MIT License\nPermission is granted to groups of users.\n",
+            id="base64-word-groups",
+        ),
+        pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),
+        pytest.param(b"MIT License\n" + (b"groups " * 4096), id="candidate-budget-groups-words"),
+        pytest.param(
+            b"Permission is granted to users.\nPermission remains granted.\n",
+            id="two-P-leading-prose-lines",
+        ),
+        pytest.param(
+            b"MIT License\nPURPOSE\nARE DISCLAIMED. IN NO EVENT SHALL THE AUTHORS BE LIABLE.\n",
+            id="single-word-P-leading-prose-line",
+        ),
+        pytest.param(
+            b"MIT License\nFOR ANY PARTICULAR PURPOSE OR THAT THE USE OF PYTHON WILL NOT\n",
+            id="base64-shaped-uppercase-prose",
+        ),
+        pytest.param(_large_zero_fill_base64_legal_text(), id="oversized-zero-fill-base64-prose"),
+    ],
+)
+def test_scan_file_keeps_structural_pickle_near_match_prose_on_text_route(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.scanner_names == ["text"]
+    assert determine_exit_code(result) == 0
+    assert result.success is True
+    assert not any(check.name == "Pickle Routing" for check in result.checks)
+
+
 def test_scan_file_fails_closed_for_urlsafe_base64_encoded_pickle(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     embedded_pickle = b"\xfb" + b"cposix\nsystem\n(S'id'\ntR."
@@ -957,6 +1073,11 @@ def test_scan_file_routes_proven_leading_pickle_before_oversized_legal_fallback(
     "payload",
     [
         pytest.param(_long_embedded_protocol0_pickle_in_legal_text(), id="long-embedded-GLOBAL"),
+        pytest.param(_long_global_operand_in_legal_text(), id="truncated-GLOBAL-operand"),
+        pytest.param(
+            b"MIT License\nprefix cposix\nsystem\n(S'id'\ntR.",
+            id="mid-line-GLOBAL",
+        ),
         pytest.param(
             b"imystery_module\nThing\nApache License\n",
             id="initial-INST-without-MARK",

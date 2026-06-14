@@ -2,6 +2,7 @@ import base64
 import binascii
 import builtins
 import bz2
+import copyreg
 import gzip
 import importlib
 import io
@@ -14,7 +15,7 @@ import tarfile
 import types
 import zipfile
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO, Any, cast
 
@@ -72,6 +73,18 @@ def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
         + (b"id #" + b"A" * 70000)
         + b"'\ntR."
     )
+
+
+def _long_global_operand_in_legal_text() -> bytes:
+    return b"MIT License\n" + b"c" + (b"a" * 70000) + b"\nx\n."
+
+
+def _encoded_pickle_after_benign_candidate_budget(word: bytes = b"license") -> bytes:
+    return b"MIT License\n" + ((word + b" ") * 4096) + b"\n" + base64.b64encode(b"cb\nx\n.")
+
+
+def _large_zero_fill_base64_legal_text() -> bytes:
+    return b"MIT License " + (b"A" * 1_468_008)
 
 
 def _wrap_encoded_lines(payload: bytes, width: int) -> bytes:
@@ -404,6 +417,23 @@ def test_detect_jax_json_checkpoint_with_object_after_routing_budget_fails_close
         encoding="utf-8",
     )
 
+    assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+
+
+def test_detect_ambiguous_jax_json_preempts_legal_text_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+    checkpoint_path = tmp_path / "LICENSE"
+    checkpoint_path.write_text(
+        '{"license":"MIT","padding":"' + ("x" * 128) + '","framework":"jax"}',
+        encoding="utf-8",
+    )
+
+    assert file_detection._probe_jax_json_checkpoint_file_state(checkpoint_path) == "ambiguous"
     assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
     assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
     assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
@@ -1611,6 +1641,18 @@ def test_detect_file_format_routes_renamed_mxnet_symbol_and_rejects_near_match(t
     assert detect_file_format(str(near_match)) == "unknown"
     assert detect_file_format_from_magic(str(near_match)) == "unknown"
     assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+
+
+def test_detect_physical_license_with_mxnet_structure_preserves_model_ownership(tmp_path: Path) -> None:
+    model_path = tmp_path / "LICENSE"
+    model_path.write_text(
+        '{"license":"MIT","nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
+    assert detect_file_format(str(model_path)) == "mxnet"
 
 
 def test_detect_file_format_routes_renamed_mxnet_symbol_with_escaped_contract_keys(tmp_path: Path) -> None:
@@ -3769,6 +3811,65 @@ def test_initial_inst_import_side_effect_precedes_missing_mark_in_pure_python_un
     assert import_calls == ["mystery_module"]
 
 
+def test_protocol0_persid_callback_precedes_invalid_continuation() -> None:
+    persistent_ids: list[str] = []
+
+    class TrackingUnpickler(pickle.Unpickler):
+        def persistent_load(self, pid: str) -> object:
+            persistent_ids.append(pid)
+            return object()
+
+    with pytest.raises(pickle.UnpicklingError):
+        TrackingUnpickler(io.BytesIO(b"Pid\nApache License\n")).load()
+
+    assert persistent_ids == ["id"]
+
+
+def test_ext1_import_precedes_eof(monkeypatch: pytest.MonkeyPatch) -> None:
+    module_name = "legal_sidecar_extension_probe"
+    module = types.ModuleType(module_name)
+    module.__dict__["Probe"] = type("Probe", (), {})
+    monkeypatch.setitem(sys.modules, module_name, module)
+    real_import = builtins.__import__
+    import_calls: list[str] = []
+
+    def tracking_import(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        if name == module_name:
+            import_calls.append(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    copyreg.add_extension(module_name, "Probe", 1)
+    monkeypatch.setattr(builtins, "__import__", tracking_import)
+    try:
+        with pytest.raises(EOFError):
+            pickle.loads(b"\x82\x01")
+    finally:
+        copyreg.remove_extension(module_name, "Probe", 1)
+        copyreg.clear_extension_cache()
+
+    assert import_calls == [module_name]
+
+
+def test_next_buffer_callback_precedes_eof() -> None:
+    callback_count = 0
+
+    def buffers() -> Iterator[memoryview]:
+        nonlocal callback_count
+        callback_count += 1
+        yield memoryview(b"x")
+
+    with pytest.raises(EOFError):
+        pickle.loads(b"\x97", buffers=buffers())
+
+    assert callback_count == 1
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_format"),
     [
@@ -3812,6 +3913,25 @@ def test_initial_inst_import_side_effect_precedes_missing_mark_in_pure_python_un
             b"MIT License\ncevil-module\nthing\nApache License\n",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-GLOBAL-punctuation",
+        ),
+        pytest.param(b"Pid\nApache License\n", "pickle", id="whole-PERSID"),
+        pytest.param(b"\x82\x01", "pickle", id="sole-EXT1"),
+        pytest.param(b"\x97", "pickle", id="sole-NEXT_BUFFER"),
+        pytest.param("cmódulo\nthing\n.".encode(), "pickle", id="unicode-GLOBAL-operand"),
+        pytest.param(
+            b"MIT License\nprefix cposix\nsystem\n(S'id'\ntR.",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="mid-line-GLOBAL",
+        ),
+        pytest.param(
+            b"#cposix\nsystem\n(S'id'\ntR.\nMIT License",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="comment-prefixed-GLOBAL",
+        ),
+        pytest.param(
+            _long_global_operand_in_legal_text(),
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="truncated-GLOBAL-operand",
         ),
     ],
 )
@@ -3858,6 +3978,26 @@ def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_pa
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="base64-prefixed-STACK_GLOBAL",
         ),
+        pytest.param(b"MIT License\nY2IK eAou\n", "pickle", id="base64-intra-line-whitespace"),
+        pytest.param(b"MIT License\n63620a 780a2e\n", "pickle", id="hex-intra-line-whitespace"),
+        pytest.param(b"MIT License\nY 2IKeAou\n", "pickle", id="base64-unaligned-intra-line-whitespace"),
+        pytest.param(b"MIT License\n6 3620a780a2e\n", "pickle", id="hex-unaligned-intra-line-whitespace"),
+        pytest.param(b"MIT License\nY 2IK\ne Aou\n", "pickle", id="base64-mixed-line-whitespace"),
+        pytest.param(b"MIT License\n63 62\n0a78 0a2e\n", "pickle", id="hex-mixed-line-whitespace"),
+        pytest.param(b"MIT License\nY2IK\teAou\n", "pickle", id="base64-intra-line-tab"),
+        pytest.param(b"MIT License\n63620a\t780a2e\n", "pickle", id="hex-intra-line-tab"),
+        pytest.param(base64.b64encode(b"S'id'\nQ."), "pickle", id="base64-BINPERSID"),
+        pytest.param(binascii.hexlify(b"S'id'\nQ."), "pickle", id="hex-BINPERSID"),
+        pytest.param(
+            _encoded_pickle_after_benign_candidate_budget(),
+            "pickle",
+            id="encoded-pickle-after-benign-candidate-budget",
+        ),
+        pytest.param(
+            _encoded_pickle_after_benign_candidate_budget(b"groups"),
+            "pickle",
+            id="encoded-pickle-after-weak-candidate-budget",
+        ),
     ],
 )
 def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candidates(
@@ -3885,6 +4025,26 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
             _wrap_encoded_lines(binascii.hexlify(b"hello world"), 18),
             id="line-wrapped-benign-hex",
         ),
+        pytest.param("MIT License\n∂\n".encode(), id="utf8-partial-pickle-symbol"),
+        pytest.param(
+            b"MIT License\nPermission is granted to groups of users.\n",
+            id="base64-word-groups",
+        ),
+        pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),
+        pytest.param(b"MIT License\n" + (b"groups " * 4096), id="candidate-budget-groups-words"),
+        pytest.param(
+            b"Permission is granted to users.\nPermission remains granted.\n",
+            id="two-P-leading-prose-lines",
+        ),
+        pytest.param(
+            b"MIT License\nPURPOSE\nARE DISCLAIMED. IN NO EVENT SHALL THE AUTHORS BE LIABLE.\n",
+            id="single-word-P-leading-prose-line",
+        ),
+        pytest.param(
+            b"MIT License\nFOR ANY PARTICULAR PURPOSE OR THAT THE USE OF PYTHON WILL NOT\n",
+            id="base64-shaped-uppercase-prose",
+        ),
+        pytest.param(_large_zero_fill_base64_legal_text(), id="oversized-zero-fill-base64-prose"),
     ],
 )
 def test_legal_sidecar_structural_candidate_routing_preserves_benign_near_matches(

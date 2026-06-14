@@ -205,6 +205,18 @@ def _malicious_lightgbm_legal_payload() -> bytes:
     )
 
 
+def _long_global_operand_in_legal_text() -> bytes:
+    return b"MIT License\n" + b"c" + (b"a" * 70000) + b"\nx\n."
+
+
+def _encoded_pickle_after_benign_candidate_budget(word: bytes = b"license") -> bytes:
+    return b"MIT License\n" + ((word + b" ") * 4096) + b"\n" + base64.b64encode(b"cb\nx\n.")
+
+
+def _large_zero_fill_base64_legal_text() -> bytes:
+    return b"MIT License " + (b"A" * 1_468_008)
+
+
 def _build_malicious_tf_metagraph() -> bytes:
     if not _has_tf_protos():
         pytest.skip("TensorFlow protobuf stubs unavailable")
@@ -11255,6 +11267,41 @@ class TestZipScanner:
             pytest.param(b"MIT License\n\x82\x01)R.", 2, id="embedded-EXT1"),
             pytest.param(b"MIT License\nPid\n)R.", 2, id="embedded-PERSID"),
             pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
+            pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
+            pytest.param(b"\x82\x01", 1, id="sole-EXT1"),
+            pytest.param(b"\x97", 1, id="sole-NEXT_BUFFER"),
+            pytest.param("cmódulo\nthing\n.".encode(), 1, id="unicode-GLOBAL-operand"),
+            pytest.param(
+                b"MIT License\nprefix cposix\nsystem\n(S'id'\ntR.",
+                2,
+                id="mid-line-GLOBAL",
+            ),
+            pytest.param(
+                b"#cposix\nsystem\n(S'id'\ntR.\nMIT License",
+                2,
+                id="comment-prefixed-GLOBAL",
+            ),
+            pytest.param(b"MIT License\nY2IK eAou\n", 1, id="base64-intra-line-whitespace"),
+            pytest.param(b"MIT License\n63620a 780a2e\n", 1, id="hex-intra-line-whitespace"),
+            pytest.param(b"MIT License\nY 2IKeAou\n", 1, id="base64-unaligned-intra-line-whitespace"),
+            pytest.param(b"MIT License\n6 3620a780a2e\n", 1, id="hex-unaligned-intra-line-whitespace"),
+            pytest.param(b"MIT License\nY 2IK\ne Aou\n", 1, id="base64-mixed-line-whitespace"),
+            pytest.param(b"MIT License\n63 62\n0a78 0a2e\n", 1, id="hex-mixed-line-whitespace"),
+            pytest.param(b"MIT License\nY2IK\teAou\n", 1, id="base64-intra-line-tab"),
+            pytest.param(b"MIT License\n63620a\t780a2e\n", 1, id="hex-intra-line-tab"),
+            pytest.param(base64.b64encode(b"S'id'\nQ."), 1, id="base64-BINPERSID"),
+            pytest.param(binascii.hexlify(b"S'id'\nQ."), 1, id="hex-BINPERSID"),
+            pytest.param(
+                _encoded_pickle_after_benign_candidate_budget(),
+                1,
+                id="encoded-pickle-after-benign-candidate-budget",
+            ),
+            pytest.param(
+                _encoded_pickle_after_benign_candidate_budget(b"groups"),
+                1,
+                id="encoded-pickle-after-weak-candidate-budget",
+            ),
+            pytest.param(_long_global_operand_in_legal_text(), 2, id="truncated-GLOBAL-operand"),
         ],
     )
     def test_scan_zip_rejects_shared_structural_pickle_bypasses(
@@ -11289,6 +11336,26 @@ class TestZipScanner:
                 _wrap_encoded_lines(binascii.hexlify(b"hello world"), 18),
                 id="line-wrapped-benign-hex",
             ),
+            pytest.param("MIT License\n∂\n".encode(), id="utf8-partial-pickle-symbol"),
+            pytest.param(
+                b"MIT License\nPermission is granted to groups of users.\n",
+                id="base64-word-groups",
+            ),
+            pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),
+            pytest.param(b"MIT License\n" + (b"groups " * 4096), id="candidate-budget-groups-words"),
+            pytest.param(
+                b"Permission is granted to users.\nPermission remains granted.\n",
+                id="two-P-leading-prose-lines",
+            ),
+            pytest.param(
+                b"MIT License\nPURPOSE\nARE DISCLAIMED. IN NO EVENT SHALL THE AUTHORS BE LIABLE.\n",
+                id="single-word-P-leading-prose-line",
+            ),
+            pytest.param(
+                b"MIT License\nFOR ANY PARTICULAR PURPOSE OR THAT THE USE OF PYTHON WILL NOT\n",
+                id="base64-shaped-uppercase-prose",
+            ),
+            pytest.param(_large_zero_fill_base64_legal_text(), id="oversized-zero-fill-base64-prose"),
         ],
     )
     def test_scan_zip_preserves_benign_structural_pickle_near_matches(
