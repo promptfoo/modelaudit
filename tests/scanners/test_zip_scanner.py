@@ -209,6 +209,14 @@ def _long_global_operand_in_legal_text() -> bytes:
     return b"MIT License\n" + b"c" + (b"a" * 70000) + b"\nx\n."
 
 
+def _long_binpersid_lookbehind_in_legal_text() -> bytes:
+    return b"Apache License\nS'" + (b"a" * 70000) + b"'\nQApache License\n"
+
+
+def _long_context_opcode_prose() -> bytes:
+    return b"Apache License\nSoftware " + (b"A" * 70000) + b"\nQuality terms apply.\n"
+
+
 def _encoded_pickle_after_benign_candidate_budget(word: bytes = b"license") -> bytes:
     return b"MIT License\n" + ((word + b" ") * 4096) + b"\n" + base64.b64encode(b"cb\nx\n.")
 
@@ -11304,6 +11312,17 @@ class TestZipScanner:
             ),
             pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
             pytest.param(
+                b"MIT License\nNcposix\nsystem\n(S'id'\ntR.",
+                2,
+                id="trivial-prefix-before-GLOBAL",
+            ),
+            pytest.param(b"MIT License\nNPid\n.", 2, id="trivial-prefix-before-PERSID"),
+            pytest.param(
+                _long_binpersid_lookbehind_in_legal_text(),
+                2,
+                id="truncated-BINPERSID-lookbehind",
+            ),
+            pytest.param(
                 b"MIT License\nprefix cposix\nsystem\n(S'id'\ntR.",
                 2,
                 id="mid-line-GLOBAL",
@@ -11329,6 +11348,9 @@ class TestZipScanner:
             pytest.param(b"MIT License\nWFBpZAou\n", 2, id="base64-alpha-prefixed-PERSID"),
             pytest.param(b"MIT License\nggE =\n", 1, id="base64-whitespace-padded-EXT1"),
             pytest.param(b"MIT License\nlw ==\n", 1, id="base64-whitespace-padded-NEXT_BUFFER"),
+            pytest.param(b"MIT License\ngwEA\n", 1, id="base64-unpadded-alphabetic-EXT2"),
+            pytest.param(b"MIT License\nggE\n", 1, id="base64-unpadded-alphabetic-EXT1"),
+            pytest.param(b"MIT License\nlw\n", 1, id="base64-unpadded-alphabetic-NEXT_BUFFER"),
             pytest.param(
                 b"MIT License\n" + base64.b64encode(b"# comment\ncposix\nsystem\n(S'id'\ntR."),
                 2,
@@ -11385,6 +11407,7 @@ class TestZipScanner:
                 b"MIT License\nPermission is granted to groups of users.\n",
                 id="base64-word-groups",
             ),
+            pytest.param(b"MIT License\ngroups\n", id="standalone-base64-word-groups"),
             pytest.param(b"MIT License\n" + (b"license " * 4096), id="candidate-budget-license-words"),
             pytest.param(b"MIT License\n" + (b"groups " * 4096), id="candidate-budget-groups-words"),
             pytest.param(
@@ -11407,6 +11430,17 @@ class TestZipScanner:
                 b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
                 id="context-opcode-leading-prose-lines",
             ),
+            pytest.param(
+                b"MIT License\nNcopyright\nconditions\ninclude\n",
+                id="trivial-prefix-like-global-prose",
+            ),
+            pytest.param(
+                b"MIT License\nNPermission\nterms\n",
+                id="trivial-prefix-like-persid-prose",
+            ),
+            pytest.param(b"MIT License\nin to of be dead face\n", id="short-base64-and-hex-words"),
+            pytest.param(b"MIT License\n" + (b"in be " * 4096), id="short-base64-word-budget"),
+            pytest.param(_long_context_opcode_prose(), id="long-context-opcode-leading-prose"),
             pytest.param(_large_zero_fill_base64_legal_text(), id="oversized-zero-fill-base64-prose"),
         ],
     )
