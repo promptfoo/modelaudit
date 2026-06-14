@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
+import zipfile
 from collections.abc import Iterator
 from contextlib import ExitStack
 from pathlib import Path
@@ -36,11 +37,37 @@ from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, CheckStatus, Is
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
+from modelaudit.utils.file.streaming import StreamedSourceByteAccounting
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from modelaudit.utils.sources.huggingface import download_model_streaming
-from tests.helpers import create_malicious_pickle, create_mock_pytorch_zip
+from tests.helpers import create_malicious_pickle, create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
+
+
+class _StreamingMaliciousPicklePayload:
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return (eval, ("__import__('os').system('echo modelaudit-stream-test')",))
+
+
+def _create_streaming_pytorch_zip(path: Path, members: dict[str, bytes]) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        write_mock_pytorch_zip_metadata(archive)
+        for member_name, payload in members.items():
+            archive.writestr(member_name, payload)
+    return path
+
+
+def _streaming_member_record(metadata: dict[str, Any], path_segments: list[str]) -> dict[str, Any]:
+    member_hashes = metadata.get("member_file_hashes")
+    assert isinstance(member_hashes, dict)
+    records = [
+        record
+        for record in member_hashes.values()
+        if isinstance(record, dict) and record.get("path_segments") == path_segments
+    ]
+    assert len(records) == 1
+    return records[0]
 
 
 @pytest.fixture
@@ -2184,13 +2211,22 @@ def test_scan_model_streaming_openvino_prefetched_companion_changes_content_hash
     assert first_result.content_hash != second_result.content_hash
 
 
-def test_scan_model_streaming_onnx_external_data_contributes_content_hash(tmp_path: Path) -> None:
+def test_scan_model_streaming_onnx_external_data_contributes_content_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A staged ONNX external_data sidecar must remain part of the streaming aggregate hash."""
     model_path = tmp_path / "model.onnx"
     sidecar_path = tmp_path / "model.onnx_data"
     model_path.write_bytes(create_external_onnx_payload(tmp_path))
     sidecar_path.write_bytes(struct.pack("f", 1.0))
     expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+    onnx = pytest.importorskip("onnx")
+    monkeypatch.setattr(
+        onnx,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("streaming sidecar discovery must not preload ONNX"),
+    )
 
     result = scan_model_streaming(
         file_generator=iter([(model_path, True)]),
@@ -2218,6 +2254,178 @@ def test_scan_model_streaming_onnx_external_data_contributes_content_hash(tmp_pa
     assert_only_onnx_external_schema_validation_skipped(changed_result)
     assert changed_result.content_hash == changed_hash
     assert changed_result.content_hash != result.content_hash
+
+
+def test_streamed_onnx_sidecar_discovery_invokes_interrupt_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit import core
+    from modelaudit.scanners import onnx_scanner
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    onnx = pytest.importorskip("onnx")
+    parsed_model = onnx.load_model_from_string(model_path.read_bytes())
+    callback_invocations = 0
+
+    def cancel() -> None:
+        nonlocal callback_invocations
+        callback_invocations += 1
+        if callback_invocations == 3:
+            raise KeyboardInterrupt
+
+    def load_without_invoking_callback(
+        _path: str,
+        _file_size: int,
+        _interrupt_check: Any,
+        *,
+        expected_stat: os.stat_result,
+    ) -> Any:
+        assert expected_stat.st_size == model_path.stat().st_size
+        return parsed_model, object()
+
+    monkeypatch.setattr(core, "check_interrupted", cancel)
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", load_without_invoking_callback)
+
+    with pytest.raises(KeyboardInterrupt):
+        core._streamed_onnx_external_data_hash_paths(model_path)
+    assert callback_invocations == 3
+
+
+def test_streamed_onnx_sidecar_discovery_honors_scan_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit import core
+    from modelaudit.scanners import onnx_scanner
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+
+    def invoke_interrupt_check(
+        _path: str,
+        _file_size: int,
+        interrupt_check: Any,
+        *,
+        expected_stat: os.stat_result,
+    ) -> Any:
+        assert expected_stat.st_size == model_path.stat().st_size
+        interrupt_check()
+        pytest.fail("expired ONNX discovery should stop before parsing")
+
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", invoke_interrupt_check)
+
+    with pytest.raises(TimeoutError, match="external_data discovery exceeded"):
+        core._streamed_onnx_external_data_hash_paths(model_path, deadline=time.time() - 1)
+
+
+def test_scan_model_streaming_onnx_sidecar_discovery_enforces_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners import onnx_scanner
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+
+    def delay_until_deadline(
+        _path: str,
+        _file_size: int,
+        interrupt_check: Any,
+        *,
+        expected_stat: os.stat_result,
+    ) -> Any:
+        assert expected_stat.st_size == model_path.stat().st_size
+        time.sleep(1.05)
+        interrupt_check()
+        pytest.fail("expired ONNX discovery should not return a parsed model")
+
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", delay_until_deadline)
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=1,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.content_hash is None
+
+
+def test_scan_model_streaming_defers_hash_when_onnx_sidecar_discovery_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners import onnx_scanner
+
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(struct.pack("f", 1.0))
+
+    def fail_bounded_discovery(*_args: Any, **_kwargs: Any) -> Any:
+        raise onnx_scanner._OnnxStructureParseError(
+            "retained_object_limit_exceeded",
+            "bounded discovery exhausted its retained-object budget",
+        )
+
+    monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", fail_bounded_discovery)
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert result.content_hash is None
+
+
+def test_scan_model_streaming_defers_file_backed_onnx_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.utils.helpers import file_hash as file_hash_module
+
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(struct.pack("f", 1.0))
+    hashed_paths: list[Path] = []
+
+    def record_hash(path: Path) -> str:
+        hashed_paths.append(path)
+        return "a" * 64
+
+    monkeypatch.setattr(file_hash_module, "compute_sha256_hash", record_hash)
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=True,
+        scanners=["onnx"],
+        skip_file_types=False,
+        onnx_raw_detector_max_bytes=1,
+    )
+
+    assert result.content_hash is None
+    assert hashed_paths == []
+    assert result.bytes_scanned == model_path.stat().st_size + sidecar_path.stat().st_size
+    assert result.file_metadata[str(model_path)]["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+    assert any(
+        check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+        for check in result.checks
+    )
 
 
 def test_scan_model_streaming_onnx_external_data_refetch_does_not_duplicate_content_hash(
@@ -3502,6 +3710,99 @@ def test_scan_model_streaming_with_deletion(temp_test_files: list[Path]) -> None
     assert result.content_hash is not None
 
 
+def test_scan_model_streaming_precomputed_remote_result_does_not_delete_local_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Precomputed remote scans must not unlink same-named local files."""
+    monkeypatch.chdir(tmp_path)
+    local_match = Path("model.safetensors")
+    local_match.write_bytes(b"local file that was never streamed")
+    remote_path = "hf://test/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model.safetensors"
+    precomputed = ScanResult(scanner_name="safetensors")
+    precomputed.bytes_scanned = 32
+    precomputed.metadata.update(
+        {
+            "remote_header_only": True,
+            "remote_source_path": remote_path,
+            "source_path": remote_path,
+        }
+    )
+    precomputed.add_check(
+        name="Remote SafeTensors Header Integrity",
+        passed=True,
+        message="Remote SafeTensors header was scanned with bounded range reads",
+        severity=IssueSeverity.INFO,
+        location=remote_path,
+    )
+    precomputed.finish(success=True)
+
+    result = scan_model_streaming(
+        file_generator=iter([(local_match, True, precomputed)]),
+        timeout=30,
+        delete_after_scan=True,
+    )
+
+    assert local_match.exists()
+    assert result.files_scanned == 1
+    assert result.file_metadata[remote_path].model_dump()["remote_header_only"] is True
+    assert result.assets
+
+
+def test_scan_model_streaming_preserves_precomputed_inconclusive_failure_without_cache_write() -> None:
+    """A failed source-native result must remain an operational failure and bypass local caching."""
+    source_path = "hf://test/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model.safetensors"
+    precomputed = ScanResult(scanner_name="safetensors")
+    precomputed.bytes_scanned = 8
+    precomputed.metadata.update(
+        {
+            "remote_header_only": True,
+            "remote_source_path": source_path,
+            "source_path": source_path,
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "remote_safetensors_header_range_failed",
+            "scan_outcome_reasons": ["remote_safetensors_header_range_failed"],
+            "operational_error": True,
+            "operational_error_reason": "remote_safetensors_header_range_failed",
+        }
+    )
+    precomputed.add_check(
+        name="Remote SafeTensors Header Acquisition",
+        passed=False,
+        message="Remote SafeTensors header could not be acquired",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "remote_safetensors_header_range_failed",
+            "operational_error": True,
+        },
+    )
+    precomputed.finish(success=False)
+
+    with (
+        patch("modelaudit.core.scan_file") as mock_scan_file,
+        patch("modelaudit.cache.scan_results_cache.ScanResultsCache.store_result") as mock_cache_store,
+    ):
+        result = scan_model_streaming(
+            file_generator=iter([(Path("model.safetensors"), True, precomputed)]),
+            timeout=30,
+            delete_after_scan=True,
+            cache_enabled=True,
+        )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == 8
+    assert determine_exit_code(result) == 2
+    assert result.file_metadata[source_path].model_dump()["scan_outcome"] == "inconclusive"
+    mock_scan_file.assert_not_called()
+    mock_cache_store.assert_not_called()
+
+
 def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
     temp_test_files: list[Path],
 ) -> None:
@@ -3809,6 +4110,74 @@ def test_scan_model_streaming_does_not_hash_files_over_max_file_size(
     assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
 
 
+def test_scan_model_streaming_preserves_pretransferred_bytes_across_max_file_size(tmp_path: Path) -> None:
+    """A selected source rejected by max-file-size must retain its earlier transfer accounting."""
+    payload = tmp_path / "selected-index.json"
+    payload.write_bytes(b"X" * 128)
+    accounting = StreamedSourceByteAccounting(
+        pretransferred_bytes=payload.stat().st_size,
+        source_bytes_preaccounted=payload.stat().st_size,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True, None, accounting)]),
+        timeout=30,
+        delete_after_scan=False,
+        max_file_size=64,
+        cache_enabled=False,
+    )
+
+    assert result.bytes_scanned == payload.stat().st_size
+    assert result.files_scanned == 1
+    assert result.success is False
+    assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+
+
+def test_scan_model_streaming_preserves_pretransferred_bytes_for_lfs_pointer(tmp_path: Path) -> None:
+    """A selected Git LFS pointer must not erase bytes transferred before local routing."""
+    payload = tmp_path / "model.safetensors.index.json"
+    payload.write_text(f"version https://git-lfs.github.com/spec/v1\noid sha256:{'a' * 64}\nsize 123456\n")
+    payload_size = payload.stat().st_size
+    accounting = StreamedSourceByteAccounting(
+        pretransferred_bytes=payload_size,
+        source_bytes_preaccounted=payload_size,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True, None, accounting)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert result.bytes_scanned == payload_size
+    assert result.files_scanned == 1
+    assert result.success is True
+    assert determine_exit_code(result) == 1
+    assert any(check.name == "Git LFS Pointer Detection" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    ("pretransferred_bytes", "source_bytes_preaccounted"),
+    [(True, 0), (-1, 0), (0, True), (0, -1)],
+)
+def test_streamed_source_byte_accounting_rejects_invalid_values(
+    pretransferred_bytes: object,
+    source_bytes_preaccounted: object,
+) -> None:
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        StreamedSourceByteAccounting(
+            pretransferred_bytes=cast(Any, pretransferred_bytes),
+            source_bytes_preaccounted=cast(Any, source_bytes_preaccounted),
+        )
+
+
+@pytest.mark.parametrize("source_path", ["", 1])
+def test_streamed_source_byte_accounting_rejects_invalid_source_path(source_path: object) -> None:
+    with pytest.raises(ValueError, match="source_path must be a non-empty string"):
+        StreamedSourceByteAccounting(source_path=cast(Any, source_path))
+
+
 def test_scan_model_streaming_fails_closed_after_max_total_size(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3919,6 +4288,40 @@ def test_scan_model_streaming_content_hash_deterministic():
         for file_path in files1 + files2:
             if file_path.exists():
                 file_path.unlink()
+
+
+def test_scan_model_streaming_keeps_member_hashes_separate_from_parent(tmp_path: Path) -> None:
+    benign_payload = pickle.dumps({"safe": "stream"})
+    malicious_payload = pickle.dumps(_StreamingMaliciousPicklePayload())
+    model_path = _create_streaming_pytorch_zip(
+        tmp_path / "streamed.pt",
+        {
+            "data.pkl": benign_payload,
+            "evil.pkl": malicious_payload,
+        },
+    )
+    outer_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    malicious_hash = hashlib.sha256(malicious_payload).hexdigest()
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
+    assert result.content_hash == compute_aggregate_hash([outer_hash])
+    assert metadata["file_hashes"]["sha256"] == outer_hash
+    malicious_record = _streaming_member_record(metadata, ["evil.pkl"])
+    assert malicious_record["file_hashes"]["sha256"] == malicious_hash
+    assert malicious_record["file_hashes"]["sha256"] != outer_hash
+    assert any(
+        issue.location is not None
+        and ":evil.pkl" in issue.location
+        and issue.details.get("pickle_filename") == "evil.pkl"
+        for issue in result.issues
+    )
 
 
 def test_scan_model_streaming_empty_generator():

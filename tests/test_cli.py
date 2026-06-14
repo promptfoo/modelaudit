@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -128,6 +129,13 @@ def default_remote_cache_dir() -> str:
 def strip_ansi(text: str) -> str:
     """Strip ANSI color codes from text for testing."""
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def test_track_huggingface_stream_acquisition_preserves_precomputed_result_tuple() -> None:
+    scan_result = object()
+    streamed_item = (Path("model.safetensors"), True, scan_result)
+
+    assert list(cli_module._track_huggingface_stream_acquisition(iter([streamed_item]))) == [streamed_item]
 
 
 def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
@@ -4613,6 +4621,7 @@ def test_scan_huggingface_streaming_dry_run_uses_metadata_preview_without_downlo
     assert "Access: 1 selected file size(s) unavailable" in result.output
     mock_plan_streaming.assert_called_once()
     assert mock_plan_streaming.call_args.kwargs["allow_content_probes"] is False
+    assert mock_plan_streaming.call_args.kwargs["_stream_safetensors_headers"] is True
     mock_get_model_info.assert_called_once()
     assert mock_get_model_info.call_args.args == ("hf://test/model",)
     preview_kwargs = mock_get_model_info.call_args.kwargs
@@ -6356,6 +6365,10 @@ def test_get_huggingface_file_metadata_fails_closed_when_deadline_expires() -> N
 
 def test_get_huggingface_file_metadata_uses_deadline_worker() -> None:
     """Direct-file metadata SDK calls should be bounded by the shared acquisition deadline."""
+    timeout_seconds = 7.0
+    # Crossing this binary exponent boundary reproduces the Windows cancellation roundoff.
+    monotonic_now = 4095.1
+    assert (monotonic_now + timeout_seconds) - monotonic_now > timeout_seconds
 
     def run_worker(
         operation: str,
@@ -6369,8 +6382,9 @@ def test_get_huggingface_file_metadata_uses_deadline_worker() -> None:
         assert operation_kwargs["filenames"] == ["model.bin"]
         assert operation_kwargs["requested_revision"] == "main"
         assert operation_kwargs["resolved_revision"] is None
-        assert 0 < operation_kwargs["request_timeout"] <= 7
-        assert 0 < deadline - cli_module.time.monotonic() <= 7
+        deadline_roundoff = math.ulp(deadline)
+        assert 0 < operation_kwargs["request_timeout"] <= timeout_seconds + deadline_roundoff
+        assert 0 < deadline - cli_module.time.monotonic() <= timeout_seconds + deadline_roundoff
         return {
             "value": {
                 "revision": _HF_TEST_REVISION,
@@ -6379,6 +6393,7 @@ def test_get_huggingface_file_metadata_uses_deadline_worker() -> None:
         }
 
     with (
+        patch("modelaudit.cli.time.monotonic", return_value=monotonic_now),
         patch("huggingface_hub.HfApi") as mock_hf_api,
         patch(
             "modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline", side_effect=run_worker
@@ -6388,7 +6403,7 @@ def test_get_huggingface_file_metadata_uses_deadline_worker() -> None:
             "test/model",
             "main",
             "model.bin",
-            timeout_seconds=7,
+            timeout_seconds=timeout_seconds,
         )
 
     assert metadata == {"size_bytes": 2048, "resolved_revision": _HF_TEST_REVISION}
@@ -6898,6 +6913,8 @@ def test_scan_huggingface_streaming_passes_max_size_to_download(
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 2048
     assert mock_download_streaming.call_args.kwargs["timeout_seconds"] == 7
+    assert mock_download_streaming.call_args.kwargs["scanner_config"]["timeout"] == 7
+    assert mock_download_streaming.call_args.kwargs["scanner_config"]["max_file_size"] == 2048
 
 
 @patch("modelaudit.cli.is_huggingface_url")

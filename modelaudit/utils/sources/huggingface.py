@@ -1,5 +1,6 @@
 """Utilities for handling HuggingFace model downloads."""
 
+import hashlib
 import json
 import logging
 import ntpath
@@ -10,6 +11,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from collections.abc import Callable, Collection, Iterator
@@ -18,12 +20,14 @@ from dataclasses import dataclass, field
 from functools import cache
 from glob import escape as escape_glob
 from io import BytesIO
-from pathlib import Path, PurePosixPath
-from typing import Any, cast
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from pathlib import Path, PurePath, PurePosixPath
+from typing import Any, Literal, cast, overload
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from ..file.detection import detect_file_format_for_skip_filter
+from ..file.streaming import StreamedSourceByteAccounting
 from ..helpers.disk_space import check_disk_space
+from ..helpers.interrupt_handler import check_interrupted
 from .huggingface_paths import (
     extract_model_id_from_path,
     is_huggingface_cache_path,
@@ -44,6 +48,23 @@ _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
+_HF_SAFETENSORS_STRICT_RANGE_REDIRECTS = 5
+_HF_SAFETENSORS_RANGE_ATTEMPTS = 3
+_HF_SAFETENSORS_OVERLAP_PROBE_BYTES = 64 * 1024
+_HF_SAFETENSORS_OVERLAP_TAIL_PROBE_BYTES = 128 * 1024
+_HF_SAFETENSORS_TORCH7_PROBE_BYTES = 4 * 1024
+_MAX_HF_SAFETENSORS_INDEX_BYTES = 32 * 1024 * 1024
+_MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_HF_SAFETENSORS_INDEX_TENSORS = 250_000
+_MAX_HF_SAFETENSORS_INDEX_JSON_TOKENS = (2 * _MAX_HF_SAFETENSORS_INDEX_TENSORS) + 4096
+_MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS = 20
+_HF_SAFETENSORS_INDEX_RECONCILIATION_REASON = "remote_safetensors_index_reconciliation_incomplete"
+_HF_SAFETENSORS_REMOTE_OVERLAP_REASON = "remote_safetensors_overlap_coverage_incomplete"
+_MAX_HF_SAFETENSORS_RETAINED_RESULTS = 512
+_MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES = 65_536
+_MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES = 32 * 1024 * 1024
+_HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES = 256 * 1024
+_HF_SAFETENSORS_RESULT_BUDGET_REASON = "remote_safetensors_result_budget_exceeded"
 _MAX_HF_STREAMING_ONNX_EXTERNAL_DATA_FILES = 256
 _MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES = 128
 _MAX_HF_REPOSITORY_INVENTORY_FILES = 8192
@@ -53,6 +74,7 @@ _MAX_HF_REPOSITORY_PATH_CHARS = 4096
 _HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES = 64 * 1024
 _HF_PATH_INFO_BATCH_SIZE = 512
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
+_HF_ACQUIRED_SAFETENSORS_INDEX_BASENAME = "acquired.safetensors.index.json"
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
 _HF_SAFETENSORS_SHARD_PATTERN = re.compile(
@@ -60,7 +82,7 @@ _HF_SAFETENSORS_SHARD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _HF_SAFETENSORS_SHARD_SHAPE_PATTERN = re.compile(
-    r".+-\d+-of-\d+\.safetensors",
+    r"(?P<stem>.+)-(?P<index>\d+)-of-(?P<total>\d+)\.safetensors",
     re.IGNORECASE,
 )
 _HF_REPO_BOOKKEEPING_FILENAMES = frozenset({".gitattributes"})
@@ -90,6 +112,7 @@ class _HuggingFaceProbeBudget:
     deadline: float | None = None
     file_sizes: dict[str, int] = field(default_factory=dict)
     prefixes: dict[str, bytes] = field(default_factory=dict)
+    transferred_bytes: int = 0
 
     def reserve(self, repo_id: str, max_bytes: int) -> None:
         """Reserve a bounded remote read or fail closed before issuing it."""
@@ -129,9 +152,1696 @@ class _HuggingFaceProbeBudget:
 
 
 @dataclass
+class _HuggingFaceSafeTensorsRetentionBudget:
+    retained_results: int = 0
+    retained_tensor_names: int = 0
+    retained_result_bytes: int = 0
+
+    def preflight_result_count(self) -> dict[str, Any] | None:
+        """Reject a result slot before materializing work that cannot be retained."""
+        projected_results = self.retained_results + 1
+        if projected_results < _MAX_HF_SAFETENSORS_RETAINED_RESULTS:
+            return None
+        return {
+            "exceeded": ["result_count"],
+            "retained_results": self.retained_results,
+            "retained_tensor_names": self.retained_tensor_names,
+            "retained_result_bytes": self.retained_result_bytes,
+            "candidate_tensor_names": 0,
+            "candidate_result_bytes": 0,
+            "projected_results": projected_results,
+            "projected_tensor_names": self.retained_tensor_names,
+            "projected_result_bytes": self.retained_result_bytes,
+            "max_retained_results": _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
+            "max_retained_tensor_names": _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
+            "max_retained_result_bytes": _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
+            "candidate_serialization_failed": False,
+            "candidate_scan_preflighted": True,
+        }
+
+    def retain(self, result: Any) -> dict[str, Any] | None:
+        """Charge one source-native result or describe the exceeded repository budget."""
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        raw_names = metadata.get("tensors")
+        tensor_name_count = sum(1 for name in raw_names if isinstance(name, str)) if isinstance(raw_names, list) else 0
+        serialization_failed = False
+        try:
+            result_bytes = len(
+                json.dumps(
+                    result.to_dict(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            )
+        except (OverflowError, RecursionError, TypeError, ValueError):
+            result_bytes = _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES + 1
+            serialization_failed = True
+
+        projected_results = self.retained_results + 1
+        projected_tensor_names = self.retained_tensor_names + tensor_name_count
+        projected_result_bytes = self.retained_result_bytes + result_bytes
+        result_byte_limit = max(
+            _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES - _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES,
+            0,
+        )
+        exceeded = []
+        if projected_results >= _MAX_HF_SAFETENSORS_RETAINED_RESULTS:
+            exceeded.append("result_count")
+        if projected_tensor_names > _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES:
+            exceeded.append("tensor_name_count")
+        if projected_result_bytes > result_byte_limit:
+            exceeded.append("result_bytes")
+        if exceeded:
+            return {
+                "exceeded": exceeded,
+                "retained_results": self.retained_results,
+                "retained_tensor_names": self.retained_tensor_names,
+                "retained_result_bytes": self.retained_result_bytes,
+                "candidate_tensor_names": tensor_name_count,
+                "candidate_result_bytes": result_bytes,
+                "projected_results": projected_results,
+                "projected_tensor_names": projected_tensor_names,
+                "projected_result_bytes": projected_result_bytes,
+                "max_retained_results": _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
+                "max_retained_tensor_names": _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
+                "max_retained_result_bytes": _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
+                "candidate_serialization_failed": serialization_failed,
+            }
+
+        self.retained_results = projected_results
+        self.retained_tensor_names = projected_tensor_names
+        self.retained_result_bytes = projected_result_bytes
+        return None
+
+
+class _SparseRangeReader:
+    """Seekable bounded view over known remote ranges without allocating gaps."""
+
+    def __init__(self, size: int, ranges: Collection[tuple[int, bytes]]) -> None:
+        self._size = size
+        self._ranges = tuple(ranges)
+        self._position = 0
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            position = offset
+        elif whence == os.SEEK_CUR:
+            position = self._position + offset
+        elif whence == os.SEEK_END:
+            position = self._size + offset
+        else:
+            raise ValueError(f"invalid seek mode: {whence}")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        if self._position >= self._size:
+            return b""
+        read_size = self._size - self._position if size < 0 else min(size, self._size - self._position)
+        start = self._position
+        end = start + read_size
+        output = bytearray(read_size)
+        for range_start, range_bytes in self._ranges:
+            range_end = range_start + len(range_bytes)
+            overlap_start = max(start, range_start)
+            overlap_end = min(end, range_end)
+            if overlap_start < overlap_end:
+                output[overlap_start - start : overlap_end - start] = range_bytes[
+                    overlap_start - range_start : overlap_end - range_start
+                ]
+        self._position = end
+        return bytes(output)
+
+
+@dataclass(frozen=True)
+class _HuggingFaceStrictRangeRead:
+    data: bytes
+    total_size: int
+    validator: str
+    final_url: str
+    bytes_transferred: int
+
+
+class _HuggingFaceRangeBudgetExceeded(ValueError):
+    """Raised when a bounded range read would exceed the caller's byte budget."""
+
+
+class _HuggingFaceStrictRangeError(RuntimeError):
+    """Preserve bytes consumed before a strict range read failed."""
+
+    def __init__(self, error: BaseException, bytes_transferred: int) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.bytes_transferred = bytes_transferred
+
+
+class _DuplicateAwareJsonObject(dict[str, Any]):
+    """JSON object retaining values hidden by duplicate keys."""
+
+    def __init__(self, values: dict[str, Any], overwritten_items: list[tuple[str, Any]]) -> None:
+        super().__init__(values)
+        self.overwritten_items = overwritten_items
+
+
+def _remote_safetensors_source_path(repo_id: str, revision: str, filename: str) -> str:
+    return f"hf://{repo_id}@{revision}/{filename}"
+
+
+def _replace_remote_temp_path(value: Any, temp_path: str, source_path: str) -> Any:
+    """Rewrite source-local temporary paths before records leave remote scanning."""
+    if isinstance(value, str):
+        return value.replace(temp_path, source_path)
+    if isinstance(value, list):
+        return [_replace_remote_temp_path(item, temp_path, source_path) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_remote_temp_path(item, temp_path, source_path) for key, item in value.items()}
+    return value
+
+
+def _is_trusted_huggingface_range_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    host = hostname.rstrip(".").lower()
+    return (
+        host in {"huggingface.co", "hf.co"}
+        or host.endswith(".huggingface.co")
+        or host.endswith(".hf.co")
+        or host.endswith(".cloudfront.net")
+    )
+
+
+def _validate_huggingface_range_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("Hugging Face range redirect used an untrusted scheme")
+    if parsed.username or parsed.password:
+        raise ValueError("Hugging Face range redirect used userinfo credentials")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Hugging Face range redirect used an invalid port") from exc
+    if port not in {None, 443}:
+        raise ValueError("Hugging Face range redirect used an untrusted port")
+    if not _is_trusted_huggingface_range_host(parsed.hostname):
+        raise ValueError("Hugging Face range redirect used an untrusted final host")
+
+
+def _range_response_validator(headers: Any) -> str:
+    validator_parts: list[str] = []
+    for key in ("ETag", "X-Linked-ETag", "X-Xet-Hash"):
+        value = headers.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = value.strip()
+        if normalized.lower().startswith("w/"):
+            raise ValueError("Hugging Face range response used a weak object validator")
+        validator_value = normalized.strip('"')
+        if not validator_value:
+            raise ValueError("Hugging Face range response used an empty object validator")
+        validator_parts.append(f"{key.lower()}={validator_value}")
+    if not validator_parts:
+        raise ValueError("Hugging Face range response omitted a stable object validator")
+    return ";".join(validator_parts)
+
+
+def _parse_strict_content_range(
+    response: Any,
+    expected_size: int | None,
+    max_bytes: int,
+    start_offset: int,
+) -> tuple[int, int]:
+    content_range = response.headers.get("Content-Range", "")
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+    if match is None:
+        raise ValueError("Hugging Face range response omitted a valid Content-Range")
+    reported_start, end_offset, total_size = (int(value) for value in match.groups())
+    if reported_start != start_offset:
+        raise ValueError("Hugging Face range response returned an unexpected start offset")
+    if expected_size is not None and total_size != expected_size:
+        raise ValueError("Hugging Face range response size changed during header scan")
+    expected_bytes = min(max(total_size - start_offset, 0), max_bytes)
+    if end_offset - start_offset + 1 != expected_bytes:
+        raise ValueError("Hugging Face range response returned an unexpected byte range")
+    return expected_bytes, total_size
+
+
+def _interrupt_huggingface_range_response(response: Any) -> None:
+    """Interrupt a blocking Requests body read at the hard acquisition deadline."""
+    import socket
+
+    raw_response = getattr(response, "raw", None)
+    connection = getattr(raw_response, "_connection", None)
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        response_fp = getattr(getattr(raw_response, "_fp", None), "fp", None)
+        sock = getattr(getattr(response_fp, "raw", None), "_sock", None)
+    if sock is not None:
+        with suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        with suppress(OSError):
+            sock.close()
+    if raw_response is not None:
+        with suppress(Exception):
+            raw_response.close()
+    with suppress(Exception):
+        response.close()
+
+
+def _is_retryable_huggingface_range_error(error: BaseException) -> bool:
+    """Return whether a remote range failure is likely transport-side, not evidence-side."""
+    if isinstance(error, _HuggingFaceStrictRangeError):
+        return _is_retryable_huggingface_range_error(error.error)
+    try:
+        import requests
+    except Exception:
+        return False
+
+    if isinstance(
+        error,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ContentDecodingError,
+            requests.exceptions.SSLError,
+        ),
+    ):
+        return True
+    if isinstance(error, requests.exceptions.HTTPError):
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+        return status_code in {408, 425, 429, 500, 502, 503, 504}
+    return False
+
+
+def _read_huggingface_strict_range(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    max_bytes: int,
+    *,
+    expected_size: int | None,
+    deadline: float | None,
+    start_offset: int = 0,
+) -> _HuggingFaceStrictRangeRead:
+    """Read a trusted prefix range and reject ambiguous range or object identity semantics."""
+    if max_bytes <= 0 or start_offset < 0:
+        raise ValueError("Hugging Face range read size must be positive")
+
+    import requests
+    from huggingface_hub import hf_hub_url
+    from huggingface_hub.utils import build_hf_headers
+
+    request_deadline = _HuggingFaceProbeBudget(remaining_bytes=max_bytes, deadline=deadline)
+    current_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+    _validate_huggingface_range_url(current_url)
+    headers = build_hf_headers(
+        token=None,
+        headers={
+            "Range": f"bytes={start_offset}-{start_offset + max_bytes - 1}",
+            "Accept-Encoding": "identity",
+        },
+    )
+    current_headers = dict(headers)
+    original_url = urlparse(current_url)
+    original_origin = (original_url.scheme, original_url.hostname, original_url.port or 443)
+
+    response = None
+    for _redirect_count in range(_HF_SAFETENSORS_STRICT_RANGE_REDIRECTS + 1):
+        request_deadline.check_deadline(repo_id)
+        response = requests.get(
+            current_url,
+            headers=dict(current_headers),
+            stream=True,
+            timeout=request_deadline.request_timeout(repo_id),
+            allow_redirects=False,
+        )
+        if response.status_code in {301, 302, 303, 307, 308}:
+            location = response.headers.get("Location")
+            response.close()
+            if not isinstance(location, str) or not location:
+                raise ValueError("Hugging Face range redirect omitted a Location header")
+            next_url = urljoin(current_url, location)
+            _validate_huggingface_range_url(next_url)
+            parsed_next_url = urlparse(next_url)
+            next_origin = (parsed_next_url.scheme, parsed_next_url.hostname, parsed_next_url.port or 443)
+            if next_origin != original_origin:
+                current_headers = {
+                    key: value
+                    for key, value in current_headers.items()
+                    if key.lower() not in {"authorization", "cookie"}
+                }
+            current_url = next_url
+            continue
+        break
+    else:
+        raise ValueError("Hugging Face range redirect limit exceeded")
+
+    assert response is not None
+    with response:
+        response.raise_for_status()
+        if response.status_code != 206:
+            raise ValueError("Hugging Face server did not honor required range semantics")
+        content_encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+        if content_encoding not in {"", "identity"}:
+            raise ValueError("Hugging Face range response used encoded content")
+        expected_bytes, total_size = _parse_strict_content_range(response, expected_size, max_bytes, start_offset)
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                parsed_content_length = int(content_length)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Hugging Face range response used invalid Content-Length") from exc
+            if parsed_content_length != expected_bytes:
+                raise ValueError("Hugging Face range response Content-Length did not match Content-Range")
+        validator = _range_response_validator(response.headers)
+
+        chunks: list[bytes] = []
+        total = 0
+        chunk_size = min(64 * 1024, max(1, expected_bytes))
+        deadline_timer = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            import threading
+
+            deadline_timer = threading.Timer(remaining, _interrupt_huggingface_range_response, args=(response,))
+            deadline_timer.daemon = True
+            deadline_timer.start()
+        try:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > expected_bytes:
+                    raise ValueError("Hugging Face range response body exceeded declared range")
+                chunks.append(chunk)
+                request_deadline.check_deadline(repo_id)
+                if total == expected_bytes:
+                    break
+            data = b"".join(chunks)
+            if len(data) != expected_bytes:
+                raise ValueError("Hugging Face range response ended before declared range")
+        except Exception as exc:
+            raise _HuggingFaceStrictRangeError(exc, total) from exc
+        finally:
+            if deadline_timer is not None:
+                deadline_timer.cancel()
+        return _HuggingFaceStrictRangeRead(
+            data=data,
+            total_size=total_size,
+            validator=validator,
+            final_url=response.url,
+            bytes_transferred=len(data),
+        )
+
+
+def _remote_safetensors_failure_result(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    *,
+    declared_size: int | None,
+    bytes_transferred: int,
+    reason: str,
+    error: BaseException,
+) -> Any:
+    from ...core_results import mark_operational_scan_error
+    from ...scanner_results import ScanResult, mark_inconclusive_scan_result
+    from ...scanners.base import IssueSeverity
+
+    source_path = _remote_safetensors_source_path(repo_id, revision, filename)
+    result = ScanResult(scanner_name="safetensors")
+    result.metadata.update(
+        {
+            "source_path": source_path,
+            "remote_source_path": source_path,
+            "hf_repo_id": repo_id,
+            "hf_revision": revision,
+            "hf_filename": filename,
+            "file_size": declared_size,
+            "remote_declared_size": declared_size,
+            "remote_bytes_transferred": bytes_transferred,
+            "remote_header_only": True,
+            "analysis_scope": "safetensors_header_and_metadata",
+        }
+    )
+    mark_inconclusive_scan_result(result, reason)
+    mark_operational_scan_error(result, reason)
+    result.add_check(
+        name="Hugging Face SafeTensors Header Range Read",
+        passed=False,
+        message=f"Unable to inspect remote SafeTensors header: {type(error).__name__}",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            "exception_type": type(error).__name__,
+            "exception": redact_huggingface_urls_in_text(str(error)),
+            "analysis_incomplete": True,
+            "scan_outcome_reason": reason,
+            "remote_bytes_transferred": bytes_transferred,
+        },
+    )
+    result.bytes_scanned = bytes_transferred
+    result.finish(success=False)
+    return result
+
+
+def _remote_safetensors_result_budget_failure_result(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    candidate_result: Any,
+    budget_details: dict[str, Any],
+) -> Any:
+    """Replace an over-budget result with one bounded operational failure."""
+    from ...scanners.base import IssueSeverity
+
+    candidate_metadata = candidate_result.metadata if isinstance(candidate_result.metadata, dict) else {}
+    declared_size = candidate_metadata.get("remote_declared_size")
+    bytes_transferred = candidate_metadata.get("remote_bytes_transferred", candidate_result.bytes_scanned)
+    security_severities = [
+        getattr(getattr(record, "severity", None), "value", None)
+        for record in [*candidate_result.issues, *candidate_result.checks]
+        if getattr(getattr(record, "status", None), "value", "failed") == "failed"
+        and getattr(getattr(record, "severity", None), "value", None) in {"warning", "critical"}
+    ]
+    result = _remote_safetensors_failure_result(
+        repo_id,
+        filename,
+        revision,
+        declared_size=(
+            declared_size
+            if isinstance(declared_size, int) and not isinstance(declared_size, bool) and declared_size >= 0
+            else None
+        ),
+        bytes_transferred=bytes_transferred,
+        reason=_HF_SAFETENSORS_RESULT_BUDGET_REASON,
+        error=ValueError("repository retained SafeTensors result budget exceeded"),
+    )
+    raw_candidate_scope = candidate_metadata.get("analysis_scope")
+    candidate_scope = raw_candidate_scope if isinstance(raw_candidate_scope, str) else None
+    if candidate_scope is not None:
+        result.metadata["analysis_scope"] = candidate_scope
+    if candidate_metadata.get("remote_index_only") is True:
+        result.metadata.pop("remote_header_only", None)
+        result.metadata["remote_index_only"] = True
+        index_reconciliation = candidate_metadata.get("remote_index_reconciliation")
+        if isinstance(index_reconciliation, dict):
+            summary: dict[str, Any] = {}
+            string_limits = {
+                "index_manifest": _MAX_HF_REPOSITORY_PATH_CHARS,
+                "index_incomplete_reason": 256,
+                "index_error_type": 256,
+            }
+            for key, limit in string_limits.items():
+                value = index_reconciliation.get(key)
+                if isinstance(value, str):
+                    summary[key] = value[:limit]
+            for key in (
+                "index_bytes_transferred",
+                "index_declared_size",
+                "index_weight_map_tensor_count",
+                "index_referenced_shard_count",
+                "index_missing_shard_count",
+                "index_unselected_shard_count",
+                "index_invalid_entry_count",
+                "index_duplicate_json_key_count",
+                "index_manifest_count",
+            ):
+                value = index_reconciliation.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    summary[key] = value
+            result.metadata["remote_index_reconciliation"] = summary
+    budget_details = {
+        **budget_details,
+        "candidate_issue_count": len(candidate_result.issues),
+        "candidate_failed_check_count": sum(
+            getattr(getattr(check, "status", None), "value", None) == "failed" for check in candidate_result.checks
+        ),
+        "candidate_had_security_errors": bool(candidate_result.has_errors),
+        "candidate_security_record_count": len(security_severities),
+    }
+    result.metadata["remote_result_retention_budget"] = budget_details
+    budget_check = result.checks[-1]
+    budget_check.name = "Hugging Face SafeTensors Retained Result Budget"
+    budget_check.message = "Remote SafeTensors repository result retention exceeded its bounded budget"
+    budget_check.details = {
+        **budget_details,
+        "analysis_incomplete": True,
+        "scan_outcome_reason": _HF_SAFETENSORS_RESULT_BUDGET_REASON,
+    }
+    if security_severities:
+        summary_severity = IssueSeverity.CRITICAL if "critical" in security_severities else IssueSeverity.WARNING
+        result.add_check(
+            name="SafeTensors Candidate Security Finding Summary",
+            passed=False,
+            message="Security findings were preserved as a bounded summary after result-budget exhaustion",
+            severity=summary_severity,
+            location=_remote_safetensors_source_path(repo_id, revision, filename),
+            details={
+                "candidate_security_record_count": len(security_severities),
+                "candidate_max_security_severity": summary_severity.value,
+                "finding_details_omitted_by_result_budget": True,
+            },
+        )
+    result.finish(success=False)
+    return result
+
+
+def _remote_safetensors_gzip_overlap_state(prefix: bytes, *, sample_is_prefix: bool) -> bool | None:
+    """Classify a bounded gzip candidate without accepting magic alone."""
+    if len(prefix) < 4 or prefix[:3] != b"\x1f\x8b\x08" or prefix[3] & 0xE0:
+        return False
+
+    import zlib
+
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        decompressed = decompressor.decompress(prefix, _HF_SAFETENSORS_OVERLAP_PROBE_BYTES + 1)
+    except zlib.error:
+        return False
+    if decompressor.eof or decompressor.unconsumed_tail or len(decompressed) > _HF_SAFETENSORS_OVERLAP_PROBE_BYTES:
+        return True
+    return None if sample_is_prefix else False
+
+
+def _remote_safetensors_structural_overlap_scanner_ids(
+    prefix: bytes,
+    active_scanner_ids: Collection[str],
+    *,
+    file_size: int,
+    include_pickle: bool,
+) -> list[str]:
+    from ..file.detection import classify_safetensors_pickle_overlap_sample, find_structural_torch7_offset
+
+    active = {str(scanner_id).lower() for scanner_id in active_scanner_ids}
+    matched: set[str] = set()
+    if (
+        "compressed" in active
+        and _remote_safetensors_gzip_overlap_state(
+            prefix,
+            sample_is_prefix=len(prefix) < file_size,
+        )
+        is not False
+    ):
+        matched.add("compressed")
+    if "torch7" in active and find_structural_torch7_offset(prefix[:_HF_SAFETENSORS_TORCH7_PROBE_BYTES]) == 0:
+        matched.add("torch7")
+    if include_pickle and "pickle" in active:
+        pickle_state = classify_safetensors_pickle_overlap_sample(prefix, file_size=file_size)
+        if pickle_state is not False:
+            matched.add("pickle")
+    return sorted(matched)
+
+
+def _active_safetensors_overlap_scanner_ids(active_scanner_ids: Collection[str] | None) -> set[str]:
+    overlap_ids = set(_hf_safetensors_route_scanner_ids()) - {"safetensors"}
+    if active_scanner_ids is None:
+        return overlap_ids
+    active = {str(scanner_id).lower() for scanner_id in active_scanner_ids}
+    return overlap_ids.intersection(active)
+
+
+def _mark_remote_safetensors_overlap_incomplete(
+    result: Any,
+    *,
+    source_path: str,
+    overlap_scanner_ids: list[str],
+    payload_bytes_downloaded: int,
+) -> None:
+    from ...core_results import mark_operational_scan_error
+    from ...scanner_results import mark_inconclusive_scan_result
+    from ...scanners.base import IssueSeverity
+
+    result.add_check(
+        name="Remote SafeTensors Overlap Coverage",
+        passed=False,
+        message="Remote SafeTensors header-only scan could not cover overlapping payload scanner evidence",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            "remote_overlap_scanner_ids": overlap_scanner_ids,
+            "analysis_incomplete": True,
+            "scan_outcome_reason": _HF_SAFETENSORS_REMOTE_OVERLAP_REASON,
+            "tensor_payload_bytes_downloaded": payload_bytes_downloaded,
+        },
+    )
+    mark_inconclusive_scan_result(result, _HF_SAFETENSORS_REMOTE_OVERLAP_REASON)
+    mark_operational_scan_error(result, _HF_SAFETENSORS_REMOTE_OVERLAP_REASON)
+    result.finish(success=False)
+
+
+def _scan_remote_huggingface_safetensors_header(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    *,
+    declared_size: int,
+    deadline: float | None,
+    shard_details: dict[str, Any] | None = None,
+    max_transferred_bytes: int | None = None,
+    scanner_config: dict[str, Any] | None = None,
+    active_scanner_ids: Collection[str] | None = None,
+) -> Any:
+    """Inspect one remote SafeTensors header without downloading tensor payload bytes."""
+    from ...scanners.base import FORMAT_VALIDATION_CONFIG_KEY
+    from ...scanners.safetensors_scanner import (
+        _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY,
+        _REMOTE_HEADER_INTEGRITY_CONFIG_KEY,
+        _REMOTE_HEADER_ONLY_CONFIG_KEY,
+        MAX_HEADER_BYTES,
+        SafeTensorsScanner,
+    )
+
+    source_path = _remote_safetensors_source_path(repo_id, revision, filename)
+    caller_scanner_config = dict(scanner_config or {})
+    max_header_bytes = int(caller_scanner_config.get("max_safetensors_header_bytes", MAX_HEADER_BYTES))
+    total_bytes_transferred = 0
+    for attempt in range(_HF_SAFETENSORS_RANGE_ATTEMPTS):
+        attempt_bytes_transferred = 0
+        payload_probe = b""
+        tail_probe = b""
+        tail_probe_start = declared_size
+        sparse_overlap_probes: list[tuple[int, bytes]] = []
+        header_range: _HuggingFaceStrictRangeRead | None = None
+        frame_probe = b""
+        covered_prefix = b""
+        sparse_ranges: list[tuple[int, bytes]] = []
+        temp_path: str | None = None
+        try:
+            if max_transferred_bytes is not None and total_bytes_transferred + 8 > max_transferred_bytes:
+                raise _HuggingFaceRangeBudgetExceeded("remote SafeTensors header length read exceeds max-size budget")
+            first_range = _read_huggingface_strict_range(
+                repo_id,
+                filename,
+                revision,
+                8,
+                expected_size=declared_size,
+                deadline=deadline,
+            )
+            attempt_bytes_transferred += first_range.bytes_transferred
+            if len(first_range.data) != 8:
+                raise ValueError("SafeTensors header length range returned a short body")
+
+            header_len = struct.unpack("<Q", first_range.data)[0]
+            header_payload = first_range.data
+            final_url = first_range.final_url
+            validator = first_range.validator
+            active_overlap_scanner_ids = _active_safetensors_overlap_scanner_ids(active_scanner_ids)
+            overlap_scanner_ids: list[str] = []
+            if 0 < header_len <= max_header_bytes and header_len <= declared_size - 8:
+                projected_bytes = total_bytes_transferred + attempt_bytes_transferred + 8 + header_len
+                if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
+                    raise _HuggingFaceRangeBudgetExceeded("remote SafeTensors header range exceeds max-size budget")
+                header_range = _read_huggingface_strict_range(
+                    repo_id,
+                    filename,
+                    revision,
+                    8 + header_len,
+                    expected_size=declared_size,
+                    deadline=deadline,
+                )
+                attempt_bytes_transferred += header_range.bytes_transferred
+                if header_range.data[:8] != first_range.data:
+                    raise ValueError("Hugging Face SafeTensors header prefix changed between range reads")
+                if header_range.validator != first_range.validator:
+                    raise ValueError("Hugging Face SafeTensors object validator changed during header scan")
+                if header_range.total_size != first_range.total_size:
+                    raise ValueError("Hugging Face SafeTensors declared size changed during header scan")
+                header_payload = header_range.data
+                final_url = header_range.final_url
+                validator = header_range.validator
+
+                payload_size = declared_size - (8 + header_len)
+                if payload_size > 0 and active_overlap_scanner_ids:
+                    payload_probe_size = min(payload_size, _HF_SAFETENSORS_OVERLAP_PROBE_BYTES)
+                    projected_bytes = total_bytes_transferred + attempt_bytes_transferred + payload_probe_size
+                    if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
+                        raise _HuggingFaceRangeBudgetExceeded(
+                            "remote SafeTensors overlap probe exceeds max-size budget"
+                        )
+                    payload_range = _read_huggingface_strict_range(
+                        repo_id,
+                        filename,
+                        revision,
+                        payload_probe_size,
+                        expected_size=declared_size,
+                        deadline=deadline,
+                        start_offset=8 + header_len,
+                    )
+                    attempt_bytes_transferred += payload_range.bytes_transferred
+                    if payload_range.validator != first_range.validator:
+                        raise ValueError("Hugging Face SafeTensors object validator changed during overlap probe")
+                    payload_probe = payload_range.data
+
+                    if "keras_h5" in active_overlap_scanner_ids:
+                        from ..file.hdf5 import (
+                            HDF5_SUPERBLOCK_PROBE_BYTES,
+                            has_plausible_hdf5_superblock,
+                            hdf5_signature_offsets,
+                        )
+
+                        covered_prefix_end = 8 + header_len + len(payload_probe)
+                        covered_prefix = header_payload + payload_probe
+                        for signature_offset in hdf5_signature_offsets(
+                            declared_size,
+                            max_signature_scan_bytes=None,
+                        ):
+                            probe_size = min(HDF5_SUPERBLOCK_PROBE_BYTES, declared_size - signature_offset)
+                            if signature_offset + probe_size <= covered_prefix_end:
+                                if has_plausible_hdf5_superblock(
+                                    covered_prefix[signature_offset : signature_offset + probe_size],
+                                    signature_offset,
+                                    declared_size,
+                                ):
+                                    overlap_scanner_ids = sorted({*overlap_scanner_ids, "keras_h5"})
+                                    break
+                                continue
+                            projected_bytes = total_bytes_transferred + attempt_bytes_transferred + probe_size
+                            if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
+                                raise _HuggingFaceRangeBudgetExceeded(
+                                    "remote SafeTensors HDF5 overlap probes exceed max-size budget"
+                                )
+                            hdf5_range = _read_huggingface_strict_range(
+                                repo_id,
+                                filename,
+                                revision,
+                                probe_size,
+                                expected_size=declared_size,
+                                deadline=deadline,
+                                start_offset=signature_offset,
+                            )
+                            attempt_bytes_transferred += hdf5_range.bytes_transferred
+                            if hdf5_range.validator != first_range.validator:
+                                raise ValueError(
+                                    "Hugging Face SafeTensors object validator changed during HDF5 overlap probe"
+                                )
+                            sparse_overlap_probes.append((signature_offset, hdf5_range.data))
+                            if has_plausible_hdf5_superblock(
+                                hdf5_range.data,
+                                signature_offset,
+                                declared_size,
+                            ):
+                                overlap_scanner_ids = sorted({*overlap_scanner_ids, "keras_h5"})
+                                break
+
+                    zip_overlap_scanner_ids = active_overlap_scanner_ids.intersection(
+                        _hf_route_scanner_ids_for_formats(frozenset({"zip"}))
+                    )
+                    payload_probe_end = 8 + header_len + len(payload_probe)
+                    if zip_overlap_scanner_ids and declared_size > payload_probe_end:
+                        tail_probe_size = min(
+                            declared_size - payload_probe_end,
+                            _HF_SAFETENSORS_OVERLAP_TAIL_PROBE_BYTES,
+                        )
+                        tail_probe_start = declared_size - tail_probe_size
+                        projected_bytes = total_bytes_transferred + attempt_bytes_transferred + tail_probe_size
+                        if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
+                            raise _HuggingFaceRangeBudgetExceeded(
+                                "remote SafeTensors overlap tail probe exceeds max-size budget"
+                            )
+                        tail_range = _read_huggingface_strict_range(
+                            repo_id,
+                            filename,
+                            revision,
+                            tail_probe_size,
+                            expected_size=declared_size,
+                            deadline=deadline,
+                            start_offset=tail_probe_start,
+                        )
+                        attempt_bytes_transferred += tail_range.bytes_transferred
+                        if tail_range.validator != first_range.validator:
+                            raise ValueError(
+                                "Hugging Face SafeTensors object validator changed during overlap tail probe"
+                            )
+                        tail_probe = tail_range.data
+
+                if active_overlap_scanner_ids:
+                    frame_probe = header_payload + payload_probe
+                    structural_overlap_scanner_ids = _remote_safetensors_structural_overlap_scanner_ids(
+                        frame_probe,
+                        active_overlap_scanner_ids,
+                        file_size=declared_size,
+                        include_pickle=True,
+                    )
+                    overlap_scanner_ids = sorted({*overlap_scanner_ids, *structural_overlap_scanner_ids})
+
+            bytes_transferred = total_bytes_transferred + attempt_bytes_transferred
+            with tempfile.NamedTemporaryFile(
+                prefix="modelaudit_hf_safetensors_",
+                suffix=".safetensors",
+                delete=False,
+            ) as temp_file:
+                temp_path = temp_file.name
+                temp_file.write(header_payload)
+                temp_file.write(payload_probe)
+
+            if active_overlap_scanner_ids:
+                import zipfile
+
+                sparse_ranges = [
+                    (0, header_payload),
+                    (len(header_payload), payload_probe),
+                    (tail_probe_start, tail_probe),
+                    *sparse_overlap_probes,
+                ]
+                if zipfile.is_zipfile(_SparseRangeReader(declared_size, sparse_ranges)):
+                    overlap_scanner_ids = sorted(
+                        set(overlap_scanner_ids).union(
+                            active_overlap_scanner_ids.intersection(
+                                _hf_route_scanner_ids_for_formats(frozenset({"zip"}))
+                            )
+                        )
+                    )
+
+            tensor_payload_bytes_downloaded = (
+                len(payload_probe) + len(tail_probe) + sum(len(probe_bytes) for _, probe_bytes in sparse_overlap_probes)
+            )
+            header_payload = b""
+            header_range = None
+            frame_probe = b""
+            covered_prefix = b""
+            sparse_ranges.clear()
+            payload_probe = b""
+            tail_probe = b""
+            sparse_overlap_probes.clear()
+
+            integrity_details: dict[str, Any] = {
+                "hf_repo_id": repo_id,
+                "hf_revision": revision,
+                "hf_filename": filename,
+                "remote_source_path": source_path,
+                "remote_declared_size": declared_size,
+                "remote_header_len": header_len,
+                "remote_bytes_transferred": bytes_transferred,
+                "remote_object_validator": validator,
+                "remote_final_host": urlparse(final_url).hostname,
+                "range_semantics": "strict_206_content_range",
+                "range_attempts": attempt + 1,
+                "tensor_payload_bytes_downloaded": tensor_payload_bytes_downloaded,
+            }
+            remote_scanner_config = dict(caller_scanner_config)
+            remote_scanner_config.update(
+                {
+                    FORMAT_VALIDATION_CONFIG_KEY: {
+                        "path": os.path.abspath(temp_path),
+                        "file_type_valid": True,
+                        "header_format": "safetensors",
+                        "extension_format": "safetensors",
+                    },
+                    _REMOTE_HEADER_ONLY_CONFIG_KEY: True,
+                    _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY: bytes_transferred,
+                    _REMOTE_HEADER_INTEGRITY_CONFIG_KEY: integrity_details,
+                }
+            )
+            scanner = SafeTensorsScanner(
+                config=remote_scanner_config,
+            )
+            result = scanner.scan(temp_path)
+            for record in [*result.checks, *result.issues]:
+                record_value = cast(Any, record)
+                if getattr(record_value, "location", None) == temp_path:
+                    record_value.location = source_path
+                record_value.details = _replace_remote_temp_path(record_value.details, temp_path, source_path)
+            result.metadata.update(integrity_details)
+            result.metadata.update(
+                {
+                    "source_path": source_path,
+                    "remote_source_path": source_path,
+                    "file_size": declared_size,
+                    "remote_header_only": True,
+                    "analysis_scope": "safetensors_header_and_metadata",
+                    "content_hash_unavailable_reason": "remote_safetensors_header_only",
+                    "tensor_payload_bytes_downloaded": integrity_details["tensor_payload_bytes_downloaded"],
+                }
+            )
+            if shard_details is not None:
+                from ...scanners.base import IssueSeverity
+
+                evaluated_shard_details = dict(shard_details)
+                expected_tensor_digest = evaluated_shard_details.get("index_tensor_names_digest")
+                actual_tensor_digest = result.metadata.get("tensor_names_digest")
+                if (
+                    evaluated_shard_details.get("index_referenced_by_manifest")
+                    and isinstance(expected_tensor_digest, str)
+                    and expected_tensor_digest != actual_tensor_digest
+                ):
+                    evaluated_shard_details.update(
+                        {
+                            "complete": False,
+                            "index_complete": False,
+                            "index_incomplete_reason": "index_tensor_assignment_mismatch",
+                            "message": "Remote SafeTensors index tensor assignments do not match the shard header.",
+                        }
+                    )
+                result.metadata["remote_shard_family"] = evaluated_shard_details
+                result.add_check(
+                    name="Hugging Face SafeTensors Shard Coverage",
+                    passed=bool(evaluated_shard_details.get("complete")),
+                    message=str(evaluated_shard_details.get("message", "Remote SafeTensors shard coverage evaluated")),
+                    severity=None if evaluated_shard_details.get("complete") else IssueSeverity.INFO,
+                    location=source_path,
+                    details=evaluated_shard_details,
+                )
+                if not evaluated_shard_details.get("complete"):
+                    from ...scanner_results import mark_inconclusive_scan_result
+
+                    mark_inconclusive_scan_result(result, "remote_safetensors_shard_coverage_incomplete")
+                    result.finish(success=False)
+            if overlap_scanner_ids:
+                result.metadata["remote_overlap_scanner_ids"] = overlap_scanner_ids
+                _mark_remote_safetensors_overlap_incomplete(
+                    result,
+                    source_path=source_path,
+                    overlap_scanner_ids=overlap_scanner_ids,
+                    payload_bytes_downloaded=int(integrity_details["tensor_payload_bytes_downloaded"]),
+                )
+            result.bytes_scanned = bytes_transferred
+            return result
+        except Exception as exc:
+            if isinstance(exc, _HuggingFaceStrictRangeError):
+                attempt_bytes_transferred += exc.bytes_transferred
+            total_bytes_transferred += attempt_bytes_transferred
+            if not _is_retryable_huggingface_range_error(exc) or attempt + 1 >= _HF_SAFETENSORS_RANGE_ATTEMPTS:
+                reason = (
+                    "remote_safetensors_header_max_size_exceeded"
+                    if isinstance(exc, _HuggingFaceRangeBudgetExceeded)
+                    else "remote_safetensors_header_range_failed"
+                )
+                return _remote_safetensors_failure_result(
+                    repo_id,
+                    filename,
+                    revision,
+                    declared_size=declared_size,
+                    bytes_transferred=total_bytes_transferred,
+                    reason=reason,
+                    error=exc,
+                )
+            retry_delay = 0.25 * (attempt + 1)
+            if deadline is not None:
+                retry_delay = min(retry_delay, max(0.0, deadline - time.monotonic()))
+            if retry_delay > 0:
+                time.sleep(retry_delay)
+        finally:
+            if temp_path is not None:
+                with suppress(OSError):
+                    Path(temp_path).unlink()
+
+    raise AssertionError("unreachable SafeTensors range retry state")
+
+
+def _remote_safetensors_filename_shard_details_by_file(
+    model_files: list[str], repo_files: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Return per-shard filename coverage details derived from the immutable repository listing."""
+    from modelaudit.utils.file.handlers import _summarize_missing_shard_indices
+
+    grouped: dict[tuple[str, int], dict[int, list[str]]] = {}
+    selected = set(model_files)
+    for filename in repo_files:
+        parsed = _parse_hf_safetensors_shard(filename) or _parse_hf_safetensors_shard_shape(filename)
+        if parsed is None:
+            continue
+        stem, shard_index, expected_total = parsed
+        if expected_total <= 0:
+            continue
+        key = (stem, expected_total)
+        grouped.setdefault(key, {}).setdefault(shard_index, []).append(filename)
+
+    details_by_file: dict[str, dict[str, Any]] = {}
+    for (_stem, expected_total), by_index in grouped.items():
+        missing_indices, missing_count, missing_truncated = _summarize_missing_shard_indices(
+            set(by_index), expected_total
+        )
+        duplicate_indices = {index: names for index, names in by_index.items() if len(names) > 1}
+        present_filenames = [name for names in by_index.values() for name in names]
+        unselected = sorted(name for name in present_filenames if name not in selected)
+        filename_pattern_authoritative = all(1 <= index <= expected_total for index in by_index)
+        complete = (
+            filename_pattern_authoritative
+            and missing_count == 0
+            and not duplicate_indices
+            and not unselected
+            and len(present_filenames) == expected_total
+        )
+        message = (
+            f"All {expected_total} remote SafeTensors shard headers are selected for inspection."
+            if complete
+            else "Remote SafeTensors shard coverage is incomplete."
+        )
+        group_details: dict[str, Any] = {
+            "complete": complete,
+            "filename_pattern_complete": complete,
+            "filename_pattern_authoritative": filename_pattern_authoritative,
+            "message": message,
+            "pattern": _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.pattern,
+            "expected_total_shards": expected_total,
+            "present_total_shards": len(present_filenames),
+            "missing_shard_count": missing_count,
+            "missing_shard_indices": missing_indices[:20],
+            "missing_shard_indices_truncated": missing_truncated or missing_count > 20,
+            "duplicate_shard_count": len(duplicate_indices),
+            "duplicate_shard_indices": sorted(duplicate_indices)[:20],
+            "unselected_shard_count": len(unselected),
+            "unselected_shards": unselected[:20],
+            "unselected_shards_truncated": len(unselected) > 20,
+        }
+        for filename in present_filenames:
+            if filename in selected:
+                details_by_file[filename] = dict(group_details)
+    return details_by_file
+
+
+def _is_safetensors_index_file(filename: str) -> bool:
+    return PurePosixPath(filename).name.lower().endswith(".safetensors.index.json")
+
+
+def _remote_index_parent_prefix(index_filename: str) -> str:
+    parent = PurePosixPath(index_filename).parent
+    return "" if parent.as_posix() == "." else f"{parent.as_posix().rstrip('/')}/"
+
+
+def _remote_safetensors_index_filename_family(
+    index_filename: str,
+    selected_safetensors: Collection[str],
+) -> set[str]:
+    """Return selected shards that the index filename can identify without parsing it."""
+    index_family = index_filename[: -len(".safetensors.index.json")]
+    standalone_name = f"{index_family}.safetensors".casefold()
+    shard_prefix = f"{index_family}-".casefold()
+    return {
+        filename
+        for filename in selected_safetensors
+        if filename.casefold() == standalone_name
+        or (filename.casefold().startswith(shard_prefix) and _has_hf_safetensors_shard_shape(filename))
+    }
+
+
+def _normalize_safetensors_index_shard_path(index_filename: str, shard_name: object) -> tuple[str | None, str | None]:
+    if not isinstance(shard_name, str) or not shard_name:
+        return None, "non-string or empty shard reference"
+    if "\x00" in shard_name or "\\" in shard_name:
+        return None, "invalid character in shard reference"
+    if re.match(r"^[A-Za-z]:", shard_name):
+        return None, "Windows-absolute shard reference"
+    if (
+        shard_name.startswith("/")
+        or "//" in shard_name
+        or any(part in {"", ".", ".."} for part in shard_name.split("/"))
+    ):
+        return None, "unsafe shard reference path"
+    shard_path = PurePosixPath(shard_name)
+    if shard_path.is_absolute() or any(part in {"", ".", ".."} for part in shard_path.parts):
+        return None, "unsafe shard reference path"
+    parent_prefix = _remote_index_parent_prefix(index_filename)
+    return f"{parent_prefix}{shard_path.as_posix()}" if parent_prefix else shard_path.as_posix(), None
+
+
+def _loads_json_without_duplicate_keys(
+    raw: bytes,
+) -> tuple[Any | None, list[str], int, int, int, str | None]:
+    from ...scanners.safetensors_scanner import _safetensors_name_preview, _validate_json_structural_token_limit
+
+    duplicate_keys: list[str] = []
+    duplicate_key_count = 0
+    duplicate_key_utf8_bytes = 0
+    duplicate_key_preview_truncated_count = 0
+
+    try:
+        _validate_json_structural_token_limit(raw, _MAX_HF_SAFETENSORS_INDEX_JSON_TOKENS, "SafeTensors index")
+    except ValueError as exc:
+        return None, [], 0, 0, 0, str(exc)
+
+    def object_pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        nonlocal duplicate_key_count, duplicate_key_preview_truncated_count, duplicate_key_utf8_bytes
+        obj: dict[str, Any] = {}
+        seen: set[str] = set()
+        overwritten_items: list[tuple[str, Any]] = []
+        for key, value in pairs:
+            if key in seen:
+                duplicate_key_count += 1
+                overwritten_items.append((key, obj[key]))
+                key_preview, key_utf8_bytes, preview_truncated = _safetensors_name_preview(key)
+                duplicate_key_utf8_bytes += key_utf8_bytes
+                duplicate_key_preview_truncated_count += int(preview_truncated)
+                if key_preview not in duplicate_keys and len(duplicate_keys) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
+                    duplicate_keys.append(key_preview)
+            seen.add(key)
+            obj[key] = value
+        return _DuplicateAwareJsonObject(obj, overwritten_items)
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return None, [], 0, 0, 0, f"invalid UTF-8: {exc}"
+    try:
+        parsed = json.loads(text, object_pairs_hook=object_pairs_hook)
+    except json.JSONDecodeError as exc:
+        return (
+            None,
+            [],
+            duplicate_key_count,
+            duplicate_key_utf8_bytes,
+            duplicate_key_preview_truncated_count,
+            f"invalid JSON: {exc}",
+        )
+    return (
+        parsed,
+        sorted(duplicate_keys),
+        duplicate_key_count,
+        duplicate_key_utf8_bytes,
+        duplicate_key_preview_truncated_count,
+        None,
+    )
+
+
+def _index_failure_details(
+    index_filename: str,
+    reason: str,
+    *,
+    bytes_transferred: int = 0,
+    index_size: int | None = None,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "complete": False,
+        "index_complete": False,
+        "index_manifest": index_filename,
+        "index_bytes_transferred": bytes_transferred,
+        "index_declared_size": index_size,
+        "index_incomplete_reason": reason,
+        "message": "Remote SafeTensors index coverage is incomplete.",
+    }
+    if error is not None:
+        details["index_error_type"] = type(error).__name__
+        details["index_error"] = redact_huggingface_urls_in_text(str(error))
+    return details
+
+
+def _remote_safetensors_index_failure_result(
+    repo_id: str,
+    index_filename: str,
+    revision: str,
+    details: dict[str, Any],
+) -> Any:
+    """Return an operational result for index failures with no provable shard scope."""
+    from ...core_results import mark_operational_scan_error
+    from ...scanner_results import ScanResult, mark_inconclusive_scan_result
+    from ...scanners.base import IssueSeverity
+
+    source_path = _remote_safetensors_source_path(repo_id, revision, index_filename)
+    bytes_transferred = details.get("index_bytes_transferred", 0)
+    if not isinstance(bytes_transferred, int) or isinstance(bytes_transferred, bool) or bytes_transferred < 0:
+        bytes_transferred = 0
+    result = ScanResult(scanner_name="safetensors")
+    result.metadata.update(
+        {
+            "source_path": source_path,
+            "remote_source_path": source_path,
+            "hf_repo_id": repo_id,
+            "hf_revision": revision,
+            "hf_filename": index_filename,
+            "remote_bytes_transferred": bytes_transferred,
+            "analysis_scope": "safetensors_index_reconciliation",
+            "remote_index_only": True,
+            "remote_index_reconciliation": dict(details),
+        }
+    )
+    mark_inconclusive_scan_result(result, _HF_SAFETENSORS_INDEX_RECONCILIATION_REASON)
+    mark_operational_scan_error(result, _HF_SAFETENSORS_INDEX_RECONCILIATION_REASON)
+    result.add_check(
+        name="Hugging Face SafeTensors Index Reconciliation",
+        passed=False,
+        message="Unable to prove the shard scope of a remote SafeTensors index failure.",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            **details,
+            "analysis_incomplete": True,
+            "scan_outcome_reason": _HF_SAFETENSORS_INDEX_RECONCILIATION_REASON,
+        },
+    )
+    result.bytes_scanned = bytes_transferred
+    result.finish(success=False)
+    return result
+
+
+def _tensor_name_digest(tensor_names: Collection[str], *, deadline: float | None = None) -> str:
+    """Return an order-independent digest without retaining an unbounded name list."""
+    from ...scanners.safetensors_scanner import _update_safetensors_tensor_name_digest
+
+    digest = hashlib.sha256()
+    sorted_names = sorted(tensor_names)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("SafeTensors index reconciliation timed out")
+    for index, name in enumerate(sorted_names):
+        if index % 1024 == 0 and deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("SafeTensors index reconciliation timed out")
+        _update_safetensors_tensor_name_digest(digest, name)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("SafeTensors index reconciliation timed out")
+    return digest.hexdigest()
+
+
+def _merge_remote_index_details(
+    existing: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge manifest evidence conservatively so a later manifest cannot erase failure."""
+    if existing is None:
+        merged = dict(incoming)
+        merged["index_manifest_count"] = 1
+        merged["index_manifests"] = [incoming.get("index_manifest")]
+        return merged
+
+    existing_complete = bool(existing.get("index_complete"))
+    incoming_complete = bool(incoming.get("index_complete"))
+    conflicting_tensors = (
+        existing_complete
+        and incoming_complete
+        and existing.get("index_tensor_names_digest") != incoming.get("index_tensor_names_digest")
+    )
+    merged = dict(incoming if not incoming_complete else existing)
+    manifests = [
+        manifest
+        for manifest in [*existing.get("index_manifests", []), incoming.get("index_manifest")]
+        if isinstance(manifest, str)
+    ]
+    merged["index_manifest_count"] = int(existing.get("index_manifest_count", 1)) + 1
+    merged["index_manifests"] = list(dict.fromkeys(manifests))[:_MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS]
+    merged["index_manifests_truncated"] = len(set(manifests)) > _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS
+    merged["index_complete"] = existing_complete and incoming_complete and not conflicting_tensors
+    merged["complete"] = merged["index_complete"]
+    if conflicting_tensors:
+        merged["index_incomplete_reason"] = "conflicting_index_tensor_assignments"
+    if not merged["index_complete"]:
+        merged["message"] = "Remote SafeTensors index coverage is incomplete."
+    return merged
+
+
+def _remote_safetensors_index_details_by_file(
+    repo_id: str,
+    model_files: list[str],
+    repo_files: list[str],
+    revision: str,
+    path_sizes: dict[str, int | None],
+    *,
+    deadline: float | None,
+    max_transferred_bytes: int | None,
+    retain_unscoped_failure: Callable[[str, dict[str, Any]], bool] | None = None,
+) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]]]:
+    """Return per-shard details, stopping when an optional failure retainer rejects a result."""
+    from ...scanners.safetensors_scanner import _safetensors_name_preview
+
+    selected_files = set(model_files)
+    repo_file_set = set(repo_files)
+    if not selected_files:
+        return {}, 0, {}, {}
+
+    details_by_file: dict[str, dict[str, Any]] = {}
+    unscoped_failures: dict[str, dict[str, Any]] = {}
+
+    def attach_details(filename: str, details: dict[str, Any]) -> None:
+        details_by_file[filename] = _merge_remote_index_details(details_by_file.get(filename), details)
+
+    def record_failure(index_filename: str, details: dict[str, Any], scoped_files: Collection[str]) -> bool:
+        if scoped_files:
+            for filename in scoped_files:
+                attach_details(filename, details)
+            return True
+        if retain_unscoped_failure is not None:
+            return retain_unscoped_failure(index_filename, details)
+        unscoped_failures[index_filename] = dict(details)
+        return True
+
+    total_index_bytes = 0
+    acquired_index_bytes: dict[str, bytes] = {}
+    for index_filename in sorted(filename for filename in repo_files if _is_safetensors_index_file(filename)):
+        filename_family = _remote_safetensors_index_filename_family(index_filename, selected_files)
+        if deadline is not None and time.monotonic() >= deadline:
+            failure = _index_failure_details(index_filename, "index_reconciliation_timed_out")
+            record_failure(index_filename, failure, filename_family)
+            break
+        parent_prefix = _remote_index_parent_prefix(index_filename)
+        if not any(not parent_prefix or filename.startswith(parent_prefix) for filename in selected_files):
+            continue
+
+        index_size = path_sizes.get(index_filename)
+        if index_size is None:
+            failure = _index_failure_details(index_filename, "missing_index_size")
+            if not record_failure(index_filename, failure, filename_family):
+                break
+            continue
+        if index_size > _MAX_HF_SAFETENSORS_INDEX_BYTES:
+            failure = _index_failure_details(index_filename, "index_exceeds_limit", index_size=index_size)
+            if not record_failure(index_filename, failure, filename_family):
+                break
+            continue
+        if total_index_bytes + index_size > _MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES:
+            failure = _index_failure_details(
+                index_filename, "aggregate_index_bytes_exceed_limit", index_size=index_size
+            )
+            if not record_failure(index_filename, failure, filename_family):
+                break
+            continue
+        if max_transferred_bytes is not None and total_index_bytes + index_size > max_transferred_bytes:
+            failure = _index_failure_details(index_filename, "index_exceeds_max_size_budget", index_size=index_size)
+            if not record_failure(index_filename, failure, filename_family):
+                break
+            continue
+
+        index_bytes_transferred = 0
+        try:
+            index_range = _read_huggingface_strict_range(
+                repo_id,
+                index_filename,
+                revision,
+                index_size,
+                expected_size=index_size,
+                deadline=deadline,
+            )
+            index_bytes_transferred = index_range.bytes_transferred
+            total_index_bytes += index_range.bytes_transferred
+            acquired_index_bytes[index_filename] = index_range.data
+            (
+                parsed,
+                duplicate_keys,
+                duplicate_key_count,
+                duplicate_key_utf8_bytes,
+                duplicate_key_preview_truncated_count,
+                parse_error,
+            ) = _loads_json_without_duplicate_keys(index_range.data)
+            if parse_error is not None:
+                raise ValueError(parse_error)
+            if not isinstance(parsed, dict):
+                raise ValueError("SafeTensors index root is not a JSON object")
+            metadata = parsed.get("metadata")
+            if metadata is not None and not isinstance(metadata, dict):
+                raise ValueError("SafeTensors index metadata is not a JSON object")
+            weight_map_values = [parsed.get("weight_map")]
+            if isinstance(parsed, _DuplicateAwareJsonObject):
+                weight_map_values.extend(value for key, value in parsed.overwritten_items if key == "weight_map")
+            weight_maps = [value for value in weight_map_values if isinstance(value, dict)]
+            if not weight_maps:
+                raise ValueError("SafeTensors index weight_map is not a JSON object")
+            invalid_weight_map_count = len(weight_map_values) - len(weight_maps)
+            weight_map_items: list[tuple[str, Any]] = []
+            for weight_map in weight_maps:
+                weight_map_items.extend(weight_map.items())
+                if isinstance(weight_map, _DuplicateAwareJsonObject):
+                    weight_map_items.extend(weight_map.overwritten_items)
+            if len(weight_map_items) > _MAX_HF_SAFETENSORS_INDEX_TENSORS:
+                raise ValueError("SafeTensors index weight_map exceeds tensor entry limit")
+        except Exception as exc:
+            if isinstance(exc, _HuggingFaceStrictRangeError):
+                index_bytes_transferred += exc.bytes_transferred
+                total_index_bytes += exc.bytes_transferred
+            failure = _index_failure_details(
+                index_filename,
+                "index_read_or_parse_failed",
+                bytes_transferred=index_bytes_transferred,
+                index_size=index_size,
+                error=exc,
+            )
+            if not record_failure(index_filename, failure, filename_family):
+                break
+            continue
+
+        referenced_by_file: dict[str, list[str]] = {}
+        referenced_name_previews_by_file: dict[str, list[str]] = {}
+        referenced_name_utf8_bytes_by_file: dict[str, int] = {}
+        referenced_max_name_utf8_bytes_by_file: dict[str, int] = {}
+        referenced_name_preview_truncated_by_file: dict[str, int] = {}
+        index_tensor_name_utf8_bytes = 0
+        index_max_tensor_name_utf8_bytes = 0
+        index_tensor_name_preview_truncated_count = 0
+        invalid_entry_count = invalid_weight_map_count
+        invalid_entries = ["weight_map occurrence is not a JSON object"] * min(
+            invalid_weight_map_count,
+            _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS,
+        )
+        reconciliation_timed_out = False
+        for entry_index, (tensor_name, shard_name) in enumerate(weight_map_items):
+            if entry_index % 1024 == 0 and deadline is not None and time.monotonic() >= deadline:
+                reconciliation_timed_out = True
+                break
+            if not isinstance(tensor_name, str) or not tensor_name:
+                invalid_entry_count += 1
+                if len(invalid_entries) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
+                    invalid_entries.append("<invalid tensor key>")
+                continue
+            tensor_name_preview, tensor_name_utf8_bytes, tensor_name_preview_truncated = _safetensors_name_preview(
+                tensor_name
+            )
+            index_tensor_name_utf8_bytes += tensor_name_utf8_bytes
+            index_max_tensor_name_utf8_bytes = max(index_max_tensor_name_utf8_bytes, tensor_name_utf8_bytes)
+            index_tensor_name_preview_truncated_count += int(tensor_name_preview_truncated)
+            normalized_path, invalid_reason = _normalize_safetensors_index_shard_path(index_filename, shard_name)
+            if normalized_path is None:
+                invalid_entry_count += 1
+                if len(invalid_entries) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
+                    invalid_entries.append(f"{tensor_name_preview}: {invalid_reason}")
+                continue
+            referenced_by_file.setdefault(normalized_path, []).append(tensor_name)
+            previews = referenced_name_previews_by_file.setdefault(normalized_path, [])
+            if len(previews) < _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS:
+                previews.append(tensor_name_preview)
+            referenced_name_utf8_bytes_by_file[normalized_path] = (
+                referenced_name_utf8_bytes_by_file.get(normalized_path, 0) + tensor_name_utf8_bytes
+            )
+            referenced_max_name_utf8_bytes_by_file[normalized_path] = max(
+                referenced_max_name_utf8_bytes_by_file.get(normalized_path, 0),
+                tensor_name_utf8_bytes,
+            )
+            referenced_name_preview_truncated_by_file[normalized_path] = referenced_name_preview_truncated_by_file.get(
+                normalized_path, 0
+            ) + int(tensor_name_preview_truncated)
+
+        if reconciliation_timed_out:
+            failure = _index_failure_details(
+                index_filename,
+                "index_reconciliation_timed_out",
+                bytes_transferred=index_range.bytes_transferred,
+                index_size=index_size,
+            )
+            scoped_files = filename_family.union(referenced_by_file).intersection(selected_files)
+            if not record_failure(index_filename, failure, scoped_files):
+                break
+            continue
+
+        referenced_files = set(referenced_by_file)
+        missing_files = sorted(referenced_files - repo_file_set)
+        unselected_files = sorted((referenced_files & repo_file_set) - selected_files)
+        selected_referenced = sorted(referenced_files & selected_files)
+        metadata_total_size = metadata.get("total_size") if isinstance(metadata, dict) else None
+        invalid_total_size = False
+        if metadata_total_size is not None:
+            if (
+                not isinstance(metadata_total_size, int)
+                or isinstance(metadata_total_size, bool)
+                or metadata_total_size < 0
+            ):
+                invalid_total_size = True
+            else:
+                known_capacity = 0
+                for filename in referenced_files:
+                    file_size = path_sizes.get(filename)
+                    if isinstance(file_size, int) and not isinstance(file_size, bool):
+                        known_capacity += max(0, file_size - 8)
+                if known_capacity > 0 and metadata_total_size > known_capacity:
+                    invalid_total_size = True
+
+        try:
+            tensor_digests_by_file = {
+                filename: _tensor_name_digest(tensors, deadline=deadline)
+                for filename, tensors in referenced_by_file.items()
+            }
+        except TimeoutError:
+            failure = _index_failure_details(
+                index_filename,
+                "index_reconciliation_timed_out",
+                bytes_transferred=index_range.bytes_transferred,
+                index_size=index_size,
+            )
+            if not record_failure(index_filename, failure, filename_family.union(selected_referenced)):
+                break
+            continue
+
+        if deadline is not None and time.monotonic() >= deadline:
+            failure = _index_failure_details(
+                index_filename,
+                "index_reconciliation_timed_out",
+                bytes_transferred=index_range.bytes_transferred,
+                index_size=index_size,
+            )
+            if not record_failure(index_filename, failure, filename_family.union(selected_referenced)):
+                break
+            continue
+
+        index_complete = (
+            not duplicate_keys
+            and invalid_entry_count == 0
+            and not missing_files
+            and not unselected_files
+            and not invalid_total_size
+            and bool(selected_referenced)
+        )
+        common_details: dict[str, Any] = {
+            "complete": index_complete,
+            "index_complete": index_complete,
+            "index_manifest": index_filename,
+            "index_declared_size": index_size,
+            "index_bytes_transferred": index_range.bytes_transferred,
+            "index_object_validator": index_range.validator,
+            "index_final_host": urlparse(index_range.final_url).hostname,
+            "index_weight_map_tensor_count": len(weight_map_items),
+            "index_tensor_name_utf8_bytes": index_tensor_name_utf8_bytes,
+            "index_max_tensor_name_utf8_bytes": index_max_tensor_name_utf8_bytes,
+            "index_tensor_name_preview_truncated_count": index_tensor_name_preview_truncated_count,
+            "index_referenced_shard_count": len(referenced_files),
+            "index_missing_shard_count": len(missing_files),
+            "index_missing_shards": missing_files[:20],
+            "index_missing_shards_truncated": len(missing_files) > 20,
+            "index_unselected_shard_count": len(unselected_files),
+            "index_unselected_shards": unselected_files[:20],
+            "index_unselected_shards_truncated": len(unselected_files) > 20,
+            "index_invalid_entry_count": invalid_entry_count,
+            "index_invalid_entries": invalid_entries,
+            "index_invalid_entries_truncated": invalid_entry_count > len(invalid_entries),
+            "index_duplicate_json_key_count": duplicate_key_count,
+            "index_duplicate_json_key_utf8_bytes": duplicate_key_utf8_bytes,
+            "index_duplicate_json_key_preview_truncated_count": duplicate_key_preview_truncated_count,
+            "index_duplicate_json_keys": duplicate_keys[:20],
+            "index_duplicate_json_keys_truncated": (
+                duplicate_key_count > len(duplicate_keys) or duplicate_key_preview_truncated_count > 0
+            ),
+            "index_metadata_total_size": metadata_total_size,
+            "index_metadata_total_size_plausible": not invalid_total_size,
+            "index_metadata_total_size_verified": None if metadata_total_size is None else False,
+            "index_relationships_complete": index_complete,
+            "message": (
+                (
+                    "SafeTensors index file and tensor relationships are complete for this shard; "
+                    "metadata.total_size was not independently verified."
+                )
+                if index_complete and metadata_total_size is not None
+                else "SafeTensors index file and tensor relationships are complete for this shard."
+                if index_complete
+                else "Remote SafeTensors index coverage is incomplete."
+            ),
+        }
+        attach_filenames = (
+            sorted(filename_family.union(selected_referenced))
+            if duplicate_keys or invalid_entry_count or invalid_total_size or not selected_referenced
+            else selected_referenced
+        )
+        if not attach_filenames and not index_complete and not record_failure(index_filename, common_details, ()):
+            break
+        for filename in attach_filenames:
+            details = dict(common_details)
+            tensors = referenced_by_file.get(filename, [])
+            details["index_referenced_by_manifest"] = filename in referenced_by_file
+            details["index_tensor_count_for_shard"] = len(tensors)
+            tensor_name_previews = referenced_name_previews_by_file.get(filename, [])
+            details["index_tensor_names_for_shard"] = tensor_name_previews
+            details["index_tensor_name_utf8_bytes_for_shard"] = referenced_name_utf8_bytes_by_file.get(filename, 0)
+            details["index_max_tensor_name_utf8_bytes_for_shard"] = referenced_max_name_utf8_bytes_by_file.get(
+                filename, 0
+            )
+            details["index_tensor_name_preview_truncated_count_for_shard"] = (
+                referenced_name_preview_truncated_by_file.get(filename, 0)
+            )
+            details["index_tensor_names_for_shard_truncated"] = (
+                len(tensors) > len(tensor_name_previews)
+                or referenced_name_preview_truncated_by_file.get(filename, 0) > 0
+            )
+            details["index_tensor_names_digest"] = tensor_digests_by_file.get(filename, _tensor_name_digest(()))
+            attach_details(filename, details)
+
+    return details_by_file, total_index_bytes, acquired_index_bytes, unscoped_failures
+
+
+def _combine_remote_safetensors_shard_details(
+    filename_details: dict[str, dict[str, Any]],
+    index_details: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    details_by_file: dict[str, dict[str, Any]] = {}
+    for filename in sorted(set(filename_details) | set(index_details)):
+        filename_detail = filename_details.get(filename)
+        index_detail = index_details.get(filename)
+        if filename_detail is None:
+            details_by_file[filename] = dict(index_detail or {})
+            continue
+        if index_detail is None:
+            details_by_file[filename] = dict(filename_detail)
+            continue
+
+        combined = dict(filename_detail)
+        combined.update(index_detail)
+        filename_complete = bool(filename_detail.get("complete"))
+        filename_pattern_authoritative = bool(filename_detail.get("filename_pattern_authoritative", True))
+        index_complete = bool(index_detail.get("complete"))
+        combined["filename_pattern_complete"] = filename_complete
+        combined["index_complete"] = index_complete
+        combined["complete"] = index_complete and (filename_complete or not filename_pattern_authoritative)
+        combined["message"] = (
+            "Remote SafeTensors shard filename and index coverage are complete."
+            if combined["complete"]
+            else "Remote SafeTensors shard coverage is incomplete."
+        )
+        details_by_file[filename] = combined
+    return details_by_file
+
+
+def _remote_safetensors_shard_details_by_file(
+    repo_id: str,
+    model_files: list[str],
+    repo_files: list[str],
+    revision: str,
+    path_sizes: dict[str, int | None],
+    *,
+    deadline: float | None,
+    max_transferred_bytes: int | None,
+    retain_unscoped_failure: Callable[[str, dict[str, Any]], bool] | None = None,
+) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]]]:
+    """Return per-shard remote coverage details from filenames and index manifests."""
+    filename_details = _remote_safetensors_filename_shard_details_by_file(model_files, repo_files)
+    index_details, index_bytes, acquired_index_bytes, unscoped_failures = _remote_safetensors_index_details_by_file(
+        repo_id,
+        model_files,
+        repo_files,
+        revision,
+        path_sizes,
+        deadline=deadline,
+        max_transferred_bytes=max_transferred_bytes,
+        retain_unscoped_failure=retain_unscoped_failure,
+    )
+    return (
+        _combine_remote_safetensors_shard_details(filename_details, index_details),
+        index_bytes,
+        acquired_index_bytes,
+        unscoped_failures,
+    )
+
+
+@dataclass
 class _HuggingFaceStreamingSelection:
     filenames: list[str]
     content_route_formats: dict[str, str] = field(default_factory=dict)
+
+
+def _check_hf_acquisition_interrupted(repo_id: str, deadline: float | None) -> None:
+    """Honor global cancellation and the end-to-end acquisition deadline."""
+    check_interrupted()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
 
 @dataclass(frozen=True)
@@ -147,6 +1857,7 @@ class HuggingFaceDownloadPlan:
     selected_sizes: dict[str, int]
     download_revision: str
     content_route_formats: dict[str, str] = field(default_factory=dict)
+    probe_bytes_transferred: int = 0
 
 
 def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_bytes: int) -> int | None:
@@ -225,7 +1936,8 @@ def _read_huggingface_prefix(
     if len(cached_prefix) >= max_bytes or (known_size is not None and len(cached_prefix) >= known_size):
         return cached_prefix[:max_bytes]
 
-    budget.reserve(repo_id, max_bytes)
+    reserved_bytes = min(max_bytes, known_size) if known_size is not None else max_bytes
+    budget.reserve(repo_id, reserved_bytes)
     try:
         import requests
         from huggingface_hub import hf_hub_url
@@ -253,6 +1965,7 @@ def _read_huggingface_prefix(
                 budget.check_deadline(repo_id)
                 if not chunk:
                     continue
+                budget.transferred_bytes += len(chunk)
                 chunks.append(chunk)
                 total += len(chunk)
                 if total >= max_bytes:
@@ -262,7 +1975,7 @@ def _read_huggingface_prefix(
             if file_size is not None:
                 budget.record_file_size(repo_id, filename, file_size)
                 if file_size <= len(prefix):
-                    budget.refund(max_bytes - len(prefix))
+                    budget.refund(reserved_bytes - len(prefix))
             if len(prefix) > len(cached_prefix):
                 budget.prefixes[filename] = prefix
         return prefix
@@ -337,6 +2050,7 @@ def _read_huggingface_tail(
                 budget.check_deadline(repo_id)
                 if not chunk:
                     continue
+                budget.transferred_bytes += len(chunk)
                 chunks.append(chunk)
                 total += len(chunk)
                 if total >= read_size:
@@ -422,6 +2136,7 @@ def _read_huggingface_range(
                 budget.check_deadline(repo_id)
                 if not chunk:
                     continue
+                budget.transferred_bytes += len(chunk)
                 remote_chunks.append(chunk)
                 total += len(chunk)
                 if total >= remote_size:
@@ -1283,6 +2998,11 @@ def _detect_huggingface_content_route_format(
     if llamafile_route is not None:
         return llamafile_route
 
+    from modelaudit.utils.file._compression import is_zlib_header
+
+    if is_zlib_header(prefix[:2]) and prefix[1] & 0x20:
+        return "zlib"
+
     if _looks_like_safetensors_prefix(repo_id, filename, revision, budget, prefix):
         if remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
             flax_route = _detect_huggingface_flax_msgpack_route(
@@ -1565,6 +3285,7 @@ def _include_huggingface_openvino_companions(
     allow_content_probes: bool = True,
     include_openvino_companions: bool = True,
     deadline: float | None = None,
+    probe_budget: _HuggingFaceProbeBudget | None = None,
 ) -> list[str]:
     """Include exact OpenVINO XML/BIN companions before size checks and downloads."""
     if not include_openvino_companions:
@@ -1575,10 +3296,11 @@ def _include_huggingface_openvino_companions(
     repo_file_set = set(repo_files)
     selected_files = set(model_files)
     expanded_files = list(model_files)
-    probe_budget = _HuggingFaceProbeBudget(
-        remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
-        deadline=deadline,
-    )
+    if probe_budget is None:
+        probe_budget = _HuggingFaceProbeBudget(
+            remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
+            deadline=deadline,
+        )
 
     for filename in model_files:
         companion = _openvino_bin_companion_name(filename, repo_files)
@@ -1623,7 +3345,13 @@ def _validate_huggingface_repo_filename(repo_id: str, filename: str) -> str:
             "Hugging Face repository inventory incomplete: repository filename exceeds "
             f"the bounded path length ({_MAX_HF_REPOSITORY_PATH_CHARS}) for {repo_id}"
         )
-    if not filename or filename.startswith("/") or "\x00" in filename or "\\" in filename:
+    if (
+        not filename
+        or filename.startswith("/")
+        or "\x00" in filename
+        or "\\" in filename
+        or bool(ntpath.splitdrive(filename)[0])
+    ):
         raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
     if any(ord(character) < 32 or ord(character) == 127 for character in filename):
         raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
@@ -1632,6 +3360,16 @@ def _validate_huggingface_repo_filename(repo_id: str, filename: str) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
     return filename
+
+
+def _private_huggingface_acquired_index_candidate(
+    temp_root: PurePath,
+    repo_id: str,
+    filename: str,
+) -> PurePath:
+    """Return a fixed private index path after validating remote identity separately."""
+    _validate_huggingface_repo_filename(repo_id, filename)
+    return temp_root / _HF_ACQUIRED_SAFETENSORS_INDEX_BASENAME
 
 
 def _normalize_huggingface_repo_files(repo_id: str, filenames: Collection[str]) -> list[str]:
@@ -1803,8 +3541,15 @@ def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
     return match.group("stem"), index, total
 
 
+def _parse_hf_safetensors_shard_shape(filename: str) -> tuple[str, int, int] | None:
+    match = _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename)
+    if match is None:
+        return None
+    return match.group("stem"), int(match.group("index")), int(match.group("total"))
+
+
 def _has_hf_safetensors_shard_shape(filename: str) -> bool:
-    return _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename) is not None
+    return _parse_hf_safetensors_shard_shape(filename) is not None
 
 
 def _complete_hf_safetensors_shard_files(repo_files: Collection[str]) -> frozenset[str]:
@@ -1961,6 +3706,7 @@ def _select_streamable_hf_files(
     include_all_files: bool = False,
     include_all_files_unbounded_extra_limit: int | None = None,
     deadline: float | None = None,
+    probe_budget: _HuggingFaceProbeBudget | None = None,
 ) -> _HuggingFaceStreamingSelection:
     """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
     selected_route_formats: set[str] | None = None
@@ -2059,10 +3805,11 @@ def _select_streamable_hf_files(
 
     if sniff_renamed_files:
         inspected_files = 0
-        probe_budget = _HuggingFaceProbeBudget(
-            remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
-            deadline=deadline,
-        )
+        if probe_budget is None:
+            probe_budget = _HuggingFaceProbeBudget(
+                remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
+                deadline=deadline,
+            )
         unskippable_detected_safetensors_shards: list[str] = []
         for file_name in _streamable_hf_content_probe_candidates(
             repo_files,
@@ -2071,6 +3818,8 @@ def _select_streamable_hf_files(
             selected_route_formats,
             exact_openvino_companion_candidates,
         ):
+            if _is_safetensors_index_file(file_name):
+                continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
@@ -2144,27 +3893,49 @@ def _discover_hf_onnx_external_data_files(
     onnx_path: Path,
     onnx_filename: str,
     repo_files: set[str],
+    interrupt_check: Callable[[], None] | None = None,
 ) -> list[str]:
     """Return safe declared ONNX external_data companions present in the repo listing."""
     try:
         import onnx
 
-        from ...scanners.onnx_scanner import _iter_model_external_data_tensor_groups
+        from ...scanners.onnx_scanner import (
+            _iter_model_external_data_tensor_groups,
+            _load_onnx_structure_file_backed,
+            _OnnxStructureParseError,
+        )
     except Exception:
         return []
 
     try:
-        model = onnx.load(str(onnx_path), load_external_data=False)
+        source_stat = os.stat(onnx_path)
+        model, _ = _load_onnx_structure_file_backed(
+            str(onnx_path),
+            source_stat.st_size,
+            interrupt_check,
+            expected_stat=source_stat,
+        )
+    except TimeoutError:
+        raise
+    except _OnnxStructureParseError as exc:
+        raise ValueError(
+            "Hugging Face ONNX external_data coverage incomplete: "
+            f"bounded structural discovery failed for {onnx_filename}: {exc.reason}"
+        ) from exc
     except Exception:
         return []
 
     companions: list[str] = []
     seen: set[str] = set()
-    for tensors in _iter_model_external_data_tensor_groups(model):
+    for tensors in _iter_model_external_data_tensor_groups(model, interrupt_check):
         for tensor in tensors:
             if tensor.data_location != onnx.TensorProto.EXTERNAL:
                 continue
-            info = {entry.key: entry.value for entry in tensor.external_data}
+            info: dict[str, str] = {}
+            for entry in tensor.external_data:
+                if interrupt_check is not None:
+                    interrupt_check()
+                info[entry.key] = entry.value
             location = info.get("location")
             if not isinstance(location, str):
                 continue
@@ -3130,6 +4901,8 @@ def get_model_size(
 
     Args:
         repo_id: Repository ID (e.g., "namespace/model-name")
+        timeout_seconds: Optional request timeout
+        revision: Optional branch, tag, or commit to size
 
     Returns:
         Total size in bytes, or None if size cannot be determined
@@ -3418,6 +5191,7 @@ def plan_huggingface_streaming_download(
     scannable_scanner_ids: Collection[str] | None = None,
     allow_content_probes: bool = True,
     include_all_files: bool = False,
+    _stream_safetensors_headers: bool = False,
 ) -> HuggingFaceDownloadPlan:
     """Plan the bounded Hugging Face files a streaming acquisition would download."""
     namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
@@ -3446,6 +5220,14 @@ def plan_huggingface_streaming_download(
             f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
         )
 
+    plan_probe_budget = _HuggingFaceProbeBudget(
+        remaining_bytes=(
+            min(_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES, size_limit)
+            if size_limit is not None
+            else _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES
+        ),
+        deadline=deadline,
+    )
     selection = _select_streamable_hf_files(
         repo_id,
         repo_files,
@@ -3459,6 +5241,7 @@ def plan_huggingface_streaming_download(
             _MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES if include_all_files and size_limit is None else None
         ),
         deadline=deadline,
+        probe_budget=plan_probe_budget,
     )
     model_files = selection.filenames
     openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
@@ -3472,14 +5255,75 @@ def plan_huggingface_streaming_download(
         allow_content_probes=allow_content_probes,
         include_openvino_companions=openvino_companion_suppression_enabled,
         deadline=deadline,
+        probe_budget=plan_probe_budget,
     )
+    size_preflight_files = model_files
+    minimum_safetensors_read_bytes = 0
+    safetensors_header_files: set[str] = set()
+    if _stream_safetensors_headers:
+        safetensors_selection_enabled = scannable_scanner_ids is None or "safetensors" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        if safetensors_selection_enabled:
+            safetensors_header_files = {
+                filename
+                for filename in model_files
+                if selection.content_route_formats.get(filename) == "safetensors"
+                or (
+                    PurePosixPath(filename).suffix.lower() == ".safetensors"
+                    and selection.content_route_formats.get(filename) is None
+                )
+            }
+            minimum_safetensors_read_bytes = 8 * len(safetensors_header_files)
+            size_preflight_files = [filename for filename in model_files if filename not in safetensors_header_files]
     revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
         repo_id,
-        model_files,
+        size_preflight_files,
         size_limit,
         resolved_revision=repo_revision,
         deadline=deadline,
     )
+    declared_safetensors_probe_files = [
+        filename
+        for filename in safetensors_header_files
+        if PurePosixPath(filename).suffix.lower() == ".safetensors"
+        and selection.content_route_formats.get(filename) is None
+    ]
+    if (
+        size_limit is not None
+        and declared_safetensors_probe_files
+        and _active_safetensors_overlap_scanner_ids(scannable_scanner_ids)
+    ):
+        probe_sizes, probe_revision = _get_huggingface_path_sizes(
+            repo_id,
+            declared_safetensors_probe_files,
+            resolved_revision=repo_revision,
+            deadline=deadline,
+        )
+        if probe_revision != repo_revision:
+            raise ValueError(
+                f"Cannot stream {repo_id}: file metadata revision {probe_revision} "
+                f"did not match listing revision {repo_revision}"
+            )
+        for filename in declared_safetensors_probe_files:
+            file_size = probe_sizes.get(filename)
+            if file_size is None:
+                raise ValueError(f"Cannot stream {repo_id}: unknown size for selected file {filename}")
+            selected_sizes[filename] = file_size
+            minimum_safetensors_read_bytes += min(file_size, _HF_CONTENT_SNIFF_BYTES)
+            if not allow_content_probes or file_size <= _HF_CONTENT_SNIFF_BYTES:
+                minimum_safetensors_read_bytes += file_size
+    minimum_selected_bytes = (
+        plan_probe_budget.transferred_bytes
+        + minimum_safetensors_read_bytes
+        + sum(selected_sizes.get(filename, 0) for filename in size_preflight_files)
+    )
+    if size_limit is not None and minimum_selected_bytes > size_limit:
+        raise ValueError(
+            f"Cannot stream {repo_id}: selected files plus minimum remote SafeTensors routing reads "
+            f"require at least {minimum_selected_bytes} bytes, "
+            f"exceeding max size {size_limit} bytes"
+        )
     return HuggingFaceDownloadPlan(
         namespace=namespace,
         repo_name=repo_name,
@@ -3492,7 +5336,46 @@ def plan_huggingface_streaming_download(
         selected_sizes=selected_sizes,
         download_revision=revision or repo_revision,
         content_route_formats=selection.content_route_formats,
+        probe_bytes_transferred=plan_probe_budget.transferred_bytes,
     )
+
+
+@overload
+def download_model_streaming(
+    url: str,
+    cache_dir: Path | None = None,
+    show_progress: bool = True,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    include_all_files: bool = False,
+    repository_file_inventory: list[str] | None = None,
+    scanner_config: dict[str, Any] | None = None,
+    _include_scan_results: Literal[False] = False,
+) -> Iterator[tuple[Path, bool]]:
+    pass
+
+
+@overload
+def download_model_streaming(
+    url: str,
+    cache_dir: Path | None = None,
+    show_progress: bool = True,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    include_all_files: bool = False,
+    repository_file_inventory: list[str] | None = None,
+    scanner_config: dict[str, Any] | None = None,
+    _include_scan_results: Literal[True],
+) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]]:
+    pass
 
 
 def download_model_streaming(
@@ -3507,7 +5390,9 @@ def download_model_streaming(
     scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
     repository_file_inventory: list[str] | None = None,
-) -> Iterator[tuple[Path, bool]]:
+    scanner_config: dict[str, Any] | None = None,
+    _include_scan_results: bool = False,
+) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
     This generator yields (file_path, is_last_file) tuples as each file is downloaded.
@@ -3524,9 +5409,13 @@ def download_model_streaming(
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
         repository_file_inventory: Optional list filled with repository member names from metadata
+        scanner_config: Optional scanner configuration to preserve in remote native scans
+        _include_scan_results: Internal opt-in for precomputed trusted source-native scan results
 
     Yields:
-        Tuple of (Path, bool) - (downloaded file path, is_last_file flag)
+        Tuple of (Path, bool) for downloaded files. Internal scan callers that pass
+        _include_scan_results may receive trusted source-native scan results and
+        internal exact-once byte-accounting metadata.
 
     Raises:
         ValueError: If URL is invalid
@@ -3563,23 +5452,167 @@ def download_model_streaming(
             scannable_filenames=scannable_filenames,
             scannable_scanner_ids=scannable_scanner_ids,
             include_all_files=include_all_files,
+            _stream_safetensors_headers=_include_scan_results,
         )
         namespace = plan.namespace
         repo_name = plan.repo_name
         repo_id = plan.repo_id
         deadline = plan.deadline
         size_limit = plan.size_limit
+        repo_files = plan.repo_files
+        repo_revision = plan.repo_revision
         model_files = plan.selected_files
-        selected_sizes = plan.selected_sizes
-        download_revision = plan.download_revision
         selection = _HuggingFaceStreamingSelection(model_files, dict(plan.content_route_formats))
         if repository_file_inventory is not None:
-            repository_file_inventory[:] = plan.repo_files
+            repository_file_inventory[:] = repo_files
+
+        safetensors_header_streaming_allowed = _include_scan_results and (
+            scannable_scanner_ids is None
+            or "safetensors" in {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}
+        )
+        safetensors_header_candidates = (
+            {
+                filename
+                for filename in model_files
+                if selection.content_route_formats.get(filename) == "safetensors"
+                or (
+                    PurePosixPath(filename).suffix.lower() == ".safetensors"
+                    and selection.content_route_formats.get(filename) is None
+                )
+            }
+            if safetensors_header_streaming_allowed
+            else set()
+        )
+        safetensors_index_files = (
+            {
+                filename
+                for filename in repo_files
+                if _is_safetensors_index_file(filename)
+                and any(
+                    not _remote_index_parent_prefix(filename)
+                    or selected_file.startswith(_remote_index_parent_prefix(filename))
+                    for selected_file in safetensors_header_candidates
+                )
+            }
+            if safetensors_header_candidates
+            else set()
+        )
+        selected_sizes: dict[str, int] = dict(plan.selected_sizes)
+        path_sizes: dict[str, int | None] = {}
+        if _include_scan_results and (size_limit is not None or safetensors_header_candidates):
+            size_lookup_files = sorted(set(model_files).union(safetensors_index_files))
+            path_sizes, metadata_revision = _get_huggingface_path_sizes(
+                repo_id,
+                size_lookup_files,
+                resolved_revision=repo_revision,
+                deadline=deadline,
+            )
+            if metadata_revision != repo_revision:
+                raise Exception(
+                    f"Cannot stream {repo_id}: file metadata revision {metadata_revision} "
+                    f"did not match listing revision {repo_revision}"
+                )
+            for filename in model_files:
+                if size_limit is None and filename not in safetensors_header_candidates:
+                    continue
+                file_size = path_sizes.get(filename)
+                if file_size is None:
+                    raise Exception(f"Cannot stream {repo_id}: unknown size for selected file {filename}")
+                selected_sizes[filename] = file_size
+        download_revision = plan.download_revision if not _include_scan_results else repo_revision
+        safetensors_header_files: set[str] = set()
+        remaining_probe_bytes = max(_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES - plan.probe_bytes_transferred, 0)
+        if size_limit is not None:
+            remaining_probe_bytes = min(remaining_probe_bytes, max(size_limit - plan.probe_bytes_transferred, 0))
+        content_probe_budget = (
+            _HuggingFaceProbeBudget(
+                remaining_bytes=remaining_probe_bytes,
+                deadline=deadline,
+                file_sizes={filename: selected_sizes[filename] for filename in safetensors_header_candidates},
+            )
+            if _active_safetensors_overlap_scanner_ids(scannable_scanner_ids)
+            else None
+        )
+        for filename in model_files:
+            if filename not in safetensors_header_candidates:
+                continue
+            detected_format = selection.content_route_formats.get(filename)
+            if detected_format == "safetensors" or content_probe_budget is None:
+                safetensors_header_files.add(filename)
+                continue
+            detected_format = _detect_huggingface_content_route_format(
+                repo_id,
+                filename,
+                repo_revision,
+                content_probe_budget,
+            )
+            if detected_format == "safetensors":
+                safetensors_header_files.add(filename)
+            elif detected_format is not None:
+                selection.content_route_formats[filename] = detected_format
+        content_probe_bytes_transferred = plan.probe_bytes_transferred
+        if content_probe_budget is not None:
+            content_probe_bytes_transferred += content_probe_budget.transferred_bytes
+        safetensors_retention_budget = _HuggingFaceSafeTensorsRetentionBudget()
+        retained_index_failure_results: list[tuple[str, Any]] = []
+        index_result_budget_exhausted = False
+
+        def apply_safetensors_retention_budget(filename: str, candidate_result: Any) -> tuple[Any, bool]:
+            budget_failure = safetensors_retention_budget.retain(candidate_result)
+            if budget_failure is None:
+                return candidate_result, False
+            return (
+                _remote_safetensors_result_budget_failure_result(
+                    repo_id,
+                    filename,
+                    download_revision,
+                    candidate_result,
+                    budget_failure,
+                ),
+                True,
+            )
+
+        def retain_unscoped_index_failure(index_filename: str, failure_details: dict[str, Any]) -> bool:
+            nonlocal index_result_budget_exhausted
+
+            candidate_result = _remote_safetensors_index_failure_result(
+                repo_id,
+                index_filename,
+                download_revision,
+                failure_details,
+            )
+            retained_result, index_result_budget_exhausted = apply_safetensors_retention_budget(
+                index_filename,
+                candidate_result,
+            )
+            retained_index_failure_results.append((index_filename, retained_result))
+            return not index_result_budget_exhausted
+
+        (
+            shard_details_by_file,
+            remote_index_bytes_transferred,
+            acquired_index_bytes,
+            _,
+        ) = _remote_safetensors_shard_details_by_file(
+            repo_id,
+            sorted(safetensors_header_files),
+            repo_files,
+            repo_revision,
+            path_sizes,
+            deadline=deadline,
+            max_transferred_bytes=(size_limit - content_probe_bytes_transferred if size_limit is not None else None),
+            retain_unscoped_failure=retain_unscoped_index_failure,
+        )
         openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
-        repo_file_set = set(plan.repo_files)
+        repo_file_set = set(repo_files)
         selected_file_set = set(model_files)
+        preaccounted_acquired_index_bytes = {
+            filename: len(payload)
+            for filename, payload in acquired_index_bytes.items()
+            if filename in selected_file_set and filename not in safetensors_header_files
+        }
         onnx_external_data_enabled = scannable_scanner_ids is None or "onnx" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
@@ -3604,17 +5637,58 @@ def download_model_streaming(
         # Download each file one at a time. OpenVINO XML/BIN pairs are staged
         # together, then only the XML is yielded so the scanner owns the logical
         # model and the weights sidecar is not routed as standalone PyTorch.
-        downloaded_total_size = 0
+        downloaded_total_size = content_probe_bytes_transferred + remote_index_bytes_transferred
         prefetched_selected_paths: dict[str, Path] = {}
         downloaded_selected_paths: dict[str, Path] = {}
         downloaded_context_paths: dict[str, Path] = {}
         context_cleanup_paths: set[Path] = set()
-        accounted_selected_filenames: set[str] = set()
+        acquired_index_temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
+        accounted_selected_filenames = acquired_index_bytes.keys() & selected_file_set
         consumed_filenames: set[str] = set()
+        pending_pretransferred_bytes = (
+            content_probe_bytes_transferred + remote_index_bytes_transferred if _include_scan_results else 0
+        )
 
-        def emit_file(path: Path, cleanup_paths: list[Path], is_last: bool) -> Iterator[tuple[Path, bool]]:
+        def make_streamed_item(
+            filename: str,
+            path: Path,
+            is_last: bool,
+            precomputed_result: Any | None = None,
+            *,
+            source_bytes_preaccounted: int | None = None,
+        ) -> tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]:
+            nonlocal pending_pretransferred_bytes
+
+            accounting = StreamedSourceByteAccounting(
+                pretransferred_bytes=pending_pretransferred_bytes,
+                source_bytes_preaccounted=(
+                    preaccounted_acquired_index_bytes.get(filename, 0)
+                    if source_bytes_preaccounted is None
+                    else source_bytes_preaccounted
+                ),
+                source_path=(
+                    _remote_safetensors_source_path(repo_id, download_revision, filename)
+                    if precomputed_result is None and filename in preaccounted_acquired_index_bytes
+                    else None
+                ),
+            )
+            pending_pretransferred_bytes = 0
+            if accounting.pretransferred_bytes or accounting.source_bytes_preaccounted:
+                return (path, is_last, precomputed_result, accounting)
+            if precomputed_result is not None:
+                return (path, is_last, precomputed_result)
+            return (path, is_last)
+
+        def emit_file(
+            filename: str,
+            path: Path,
+            cleanup_paths: list[Path],
+            is_last: bool,
+        ) -> Iterator[
+            tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]
+        ]:
             try:
-                yield (path, is_last)
+                yield make_streamed_item(filename, path, is_last)
             finally:
                 for external_path in cleanup_paths:
                     with suppress(OSError):
@@ -3628,6 +5702,38 @@ def download_model_streaming(
                     continue
                 return True
             return False
+
+        def scan_remote_safetensors(filename: str) -> Any:
+            nonlocal downloaded_total_size
+            declared_size = selected_sizes[filename]
+            scan_result = _scan_remote_huggingface_safetensors_header(
+                repo_id,
+                filename,
+                download_revision,
+                declared_size=declared_size,
+                deadline=deadline,
+                shard_details=shard_details_by_file.get(filename),
+                max_transferred_bytes=(size_limit - downloaded_total_size if size_limit is not None else None),
+                scanner_config=scanner_config,
+                active_scanner_ids=scannable_scanner_ids,
+            )
+            transferred_bytes = scan_result.bytes_scanned
+            remote_bytes_transferred = scan_result.metadata.get("remote_bytes_transferred")
+            if (
+                not isinstance(remote_bytes_transferred, int)
+                or isinstance(remote_bytes_transferred, bool)
+                or remote_bytes_transferred < 0
+            ):
+                raise ValueError("Remote SafeTensors scan returned invalid byte accounting")
+            transferred_bytes = max(transferred_bytes, remote_bytes_transferred)
+            if size_limit is not None and downloaded_total_size + transferred_bytes > size_limit:
+                raise ValueError(
+                    f"Cannot stream {repo_id}: remote SafeTensors header bytes plus prior downloads "
+                    f"would total {downloaded_total_size + transferred_bytes} bytes, "
+                    f"exceeding max size {size_limit} bytes"
+                )
+            downloaded_total_size += transferred_bytes
+            return scan_result
 
         def download_stream_file(filename: str) -> Path:
             download_kwargs: dict[str, Any] = {
@@ -3657,6 +5763,30 @@ def download_model_streaming(
                 )
             return Path(local_path)
 
+        def materialize_acquired_index(filename: str) -> Path | None:
+            payload = acquired_index_bytes.get(filename)
+            if payload is None:
+                return None
+            temp_dir = tempfile.TemporaryDirectory(
+                prefix=".modelaudit_hf_index_" if download_path is not None else "modelaudit_hf_index_",
+                dir=download_path,
+            )
+            try:
+                temp_root = Path(temp_dir.name).resolve()
+                candidate = _private_huggingface_acquired_index_candidate(temp_root, repo_id, filename)
+                temp_path = Path(candidate).resolve(strict=False)
+                try:
+                    temp_path.relative_to(temp_root)
+                except ValueError as exc:
+                    raise ValueError("Private Hugging Face index path escaped its temporary root") from exc
+                temp_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path.write_bytes(payload)
+            except Exception:
+                temp_dir.cleanup()
+                raise
+            acquired_index_temp_dirs.append(temp_dir)
+            return temp_path
+
         def download_selected_file(filename: str) -> Path:
             nonlocal downloaded_total_size
             downloaded_file = downloaded_selected_paths.get(filename)
@@ -3678,6 +5808,8 @@ def download_model_streaming(
 
             # Download single file
             downloaded_file = prefetched_selected_paths.pop(filename, None)
+            if downloaded_file is None or not downloaded_file.is_file():
+                downloaded_file = materialize_acquired_index(filename)
             if downloaded_file is None or not downloaded_file.is_file():
                 downloaded_file = download_stream_file(filename)
             if size_limit is not None and not already_accounted:
@@ -3720,10 +5852,15 @@ def download_model_streaming(
                 filename,
                 content_route_format=content_route_format,
             ):
+
+                def check_onnx_sidecar_discovery_interrupted() -> None:
+                    _check_hf_acquisition_interrupted(repo_id, deadline)
+
                 external_data_files = _discover_hf_onnx_external_data_files(
                     downloaded_file,
                     filename,
                     repo_file_set,
+                    check_onnx_sidecar_discovery_interrupted,
                 )
                 if external_data_files:
                     external_context_files = [
@@ -3810,8 +5947,55 @@ def download_model_streaming(
             return downloaded_file, onnx_external_data_cleanup_paths
 
         try:
+            for failure_index, (index_filename, failure_result) in enumerate(retained_index_failure_results):
+                is_last_failure = failure_index == len(retained_index_failure_results) - 1 and (
+                    index_result_budget_exhausted or not has_future_yield(-1)
+                )
+                yield make_streamed_item(
+                    index_filename,
+                    Path(index_filename),
+                    is_last_failure,
+                    failure_result,
+                    source_bytes_preaccounted=failure_result.bytes_scanned,
+                )
+            if index_result_budget_exhausted:
+                return
+
             for idx, filename in enumerate(model_files):
                 if filename in consumed_filenames:
+                    continue
+
+                if filename in safetensors_header_files:
+                    preflight_budget_failure = safetensors_retention_budget.preflight_result_count()
+                    if preflight_budget_failure is not None:
+                        preflight_candidate = _remote_safetensors_failure_result(
+                            repo_id,
+                            filename,
+                            download_revision,
+                            declared_size=selected_sizes[filename],
+                            bytes_transferred=0,
+                            reason=_HF_SAFETENSORS_RESULT_BUDGET_REASON,
+                            error=ValueError("repository retained SafeTensors result count preflight failed"),
+                        )
+                        scan_result = _remote_safetensors_result_budget_failure_result(
+                            repo_id,
+                            filename,
+                            download_revision,
+                            preflight_candidate,
+                            preflight_budget_failure,
+                        )
+                        yield make_streamed_item(filename, Path(filename), True, scan_result)
+                        return
+                    scan_result = scan_remote_safetensors(filename)
+                    scan_result, result_budget_exhausted = apply_safetensors_retention_budget(filename, scan_result)
+                    yield make_streamed_item(
+                        filename,
+                        Path(filename),
+                        result_budget_exhausted or not has_future_yield(idx),
+                        scan_result,
+                    )
+                    if result_budget_exhausted:
+                        return
                     continue
 
                 if filename in openvino_xml_by_companion:
@@ -3830,15 +6014,25 @@ def download_model_streaming(
                     else:
                         companion_path, companion_cleanup_paths = prepare_stream_yield(companion)
                         consumed_filenames.add(companion)
-                        yield from emit_file(downloaded_file, cleanup_paths, False)
-                        yield from emit_file(companion_path, companion_cleanup_paths, not has_future_yield(idx))
+                        yield from emit_file(filename, downloaded_file, cleanup_paths, False)
+                        yield from emit_file(
+                            companion,
+                            companion_path,
+                            companion_cleanup_paths,
+                            not has_future_yield(idx),
+                        )
                         continue
 
-                yield from emit_file(downloaded_file, cleanup_paths, not has_future_yield(idx))
+                yield from emit_file(filename, downloaded_file, cleanup_paths, not has_future_yield(idx))
+            if pending_pretransferred_bytes:
+                raise ValueError("Remote pretransfer bytes were not attached to a streamed item")
         finally:
             for external_path in context_cleanup_paths:
                 with suppress(OSError):
                     external_path.unlink()
+            for temp_dir in acquired_index_temp_dirs:
+                with suppress(OSError):
+                    temp_dir.cleanup()
 
     except Exception as e:
         raise Exception(

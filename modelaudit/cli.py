@@ -320,6 +320,7 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
             scannable_scanner_ids=runtime.scannable_scanner_ids,
             allow_content_probes=False,
             include_all_files=runtime.hf_stream_include_all_files,
+            _stream_safetensors_headers=True,
         )
     else:
         plan = plan_huggingface_model_download(
@@ -1972,14 +1973,14 @@ class _HuggingFaceStreamInterruptedError(RuntimeError):
 
 
 def _track_huggingface_stream_acquisition(
-    file_generator: Iterator[tuple[Path, bool]],
-) -> Iterator[tuple[Path, bool]]:
+    file_generator: Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, Any]],
+) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, Any]]:
     """Distinguish pre-yield acquisition failures from interrupted streamed scans."""
     yielded_artifact = False
     try:
-        for file_path, is_last in file_generator:
+        for streamed_item in file_generator:
             yielded_artifact = True
-            yield file_path, is_last
+            yield streamed_item
     except Exception as exc:
         if yielded_artifact:
             raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
@@ -2121,6 +2122,18 @@ def style_text(text: str, **kwargs: Any) -> str:
     if should_use_color():
         return click.style(text, **kwargs)
     return text
+
+
+def _configure_unicode_safe_cli_streams() -> None:
+    """Keep decorative CLI text from crashing legacy redirected encodings."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="backslashreplace")
+        except (OSError, TypeError, ValueError):
+            continue
 
 
 def _escape_terminal_text(value: Any) -> str:
@@ -3514,6 +3527,8 @@ def _resolve_scan_source_for_path(
                         max_size=runtime.max_download_bytes,
                         timeout_seconds=runtime.timeout,
                         repository_file_inventory=stream_repository_file_inventory,
+                        scanner_config=runtime.config,
+                        _include_scan_results=True,
                         **hf_stream_kwargs,
                     )
                 )
@@ -6223,6 +6238,7 @@ def debug(output_json: bool, verbose: bool) -> None:
 
 
 def main() -> None:
+    _configure_unicode_safe_cli_streams()
     if sys.version_info < (3, 10):  # noqa: UP036 — intentional safety net for bypassed requires-python
         click.echo(
             click.style(

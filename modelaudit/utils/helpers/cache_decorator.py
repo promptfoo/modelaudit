@@ -179,6 +179,35 @@ def should_bypass_cache_for_file_backed_hdf5(file_path: str) -> bool:
     return file_size > DEFAULT_MAX_FILE_READ_SIZE and find_hdf5_signature_offset(file_path) is not None
 
 
+def should_defer_hash_for_file_backed_onnx(
+    file_path: str,
+    config: dict[str, Any],
+    file_size: int | None = None,
+) -> bool:
+    """Avoid whole-file hashes when ONNX uses bounded file-backed inspection."""
+    try:
+        from ...scanner_selection import allows_protobuf_model_candidate_analyzer, policy_from_config
+        from ...scanners.onnx_scanner import OnnxScanner, resolve_onnx_raw_detector_max_bytes
+        from ..file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT, detect_file_format_for_skip_filter
+
+        size = os.path.getsize(file_path) if file_size is None else file_size
+        max_bytes = resolve_onnx_raw_detector_max_bytes(config)
+        scanner_selection = policy_from_config(config)
+    except Exception:
+        return False
+    if size <= max_bytes:
+        return False
+    try:
+        detected_format = detect_file_format_for_skip_filter(file_path)
+    except Exception:
+        return scanner_selection.allows("onnx") and OnnxScanner.can_handle(file_path)
+    if detected_format == "onnx":
+        return scanner_selection.allows("onnx")
+    if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+        return allows_protobuf_model_candidate_analyzer(scanner_selection, "onnx")
+    return detected_format == "unknown" and scanner_selection.allows("onnx") and OnnxScanner.can_handle(file_path)
+
+
 def should_bypass_cache_for_zip_entry_preflight(file_path: str, config: dict[str, Any]) -> bool:
     """Avoid cache probes that materialize an over-limit or inconsistent ZIP directory."""
     try:
@@ -439,6 +468,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if should_bypass_cache_for_file_backed_hdf5(file_path):
                     logger.debug(f"Bypassing cache for file-backed HDF5 inspection: {file_path}")
+                    return func(*args, **kwargs)
+
+                if should_defer_hash_for_file_backed_onnx(file_path, raw_config or {}, file_stat.st_size):
+                    logger.debug(f"Bypassing cache for file-backed ONNX inspection: {file_path}")
                     return func(*args, **kwargs)
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):

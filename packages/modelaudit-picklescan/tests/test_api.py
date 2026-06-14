@@ -25,6 +25,7 @@ import tarfile
 import uuid
 import warnings
 import zipfile
+from importlib import metadata as importlib_metadata
 from importlib.abc import Loader
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
@@ -38,7 +39,7 @@ from importlib.machinery import (
 from importlib.util import cache_from_source
 from pathlib import Path, PurePosixPath
 from types import CodeType, ModuleType
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -225,11 +226,232 @@ def _pytorch_storage_persistent_id_payload(
     )
 
 
+def _pickle_binint(value: int) -> bytes:
+    if 0 <= value <= 0xFF:
+        return b"K" + bytes([value])
+    return b"J" + value.to_bytes(4, "little", signed=True)
+
+
+def _float_storage_element_count_for_bytes(data: bytes) -> int:
+    assert len(data) % 4 == 0
+    return len(data) // 4
+
+
+def _float_storage_persistent_id_payload_for_bytes(key: str, data: bytes) -> bytes:
+    return _pytorch_storage_persistent_id_payload(
+        key,
+        size_opcode=_pickle_binint(_float_storage_element_count_for_bytes(data)),
+    )
+
+
+def _pickle_int_tuple(values: tuple[int, ...]) -> bytes:
+    payload = b"".join(_pickle_binint(value) for value in values)
+    if len(values) == 0:
+        return b")"
+    if len(values) == 1:
+        return payload + b"\x85"
+    if len(values) == 2:
+        return payload + b"\x86"
+    if len(values) == 3:
+        return payload + b"\x87"
+    return b"(" + payload + b"t"
+
+
+def _pytorch_storage_binpersid_expr(
+    key: str = "0",
+    *,
+    storage_module: str = "torch",
+    storage_name: str = "LongStorage",
+    location: str = "cpu",
+    element_count: int = 3,
+) -> bytes:
+    return (
+        b"("
+        + _short_binunicode(b"storage")
+        + _short_binunicode(storage_module.encode("ascii"))
+        + _short_binunicode(storage_name.encode("ascii"))
+        + b"\x93"
+        + _short_binunicode(key.encode("ascii"))
+        + _short_binunicode(location.encode("ascii"))
+        + _pickle_binint(element_count)
+        + b"tQ"
+    )
+
+
+def _pytorch_empty_ordered_dict_reduce_expr() -> bytes:
+    return _global(b"collections", b"OrderedDict") + b")R"
+
+
+def _pytorch_rebuild_tensor_v2_payload(
+    *,
+    key: str = "0",
+    global_memo_expr: bytes = b"q\x00",
+    storage_module: str = "torch",
+    storage_name: str = "LongStorage",
+    location: str = "cpu",
+    storage_expr: bytes | None = None,
+    element_count: int = 3,
+    offset: int = 0,
+    size: tuple[int, ...] = (3,),
+    stride: tuple[int, ...] = (1,),
+    requires_grad: bool = False,
+    hooks_expr: bytes | None = None,
+    extra_arg_expr: bytes = b"",
+    trailing_ops: bytes = b"",
+) -> bytes:
+    hooks_payload = _pytorch_empty_ordered_dict_reduce_expr() if hooks_expr is None else hooks_expr
+    storage_payload = (
+        _pytorch_storage_binpersid_expr(
+            key,
+            storage_module=storage_module,
+            storage_name=storage_name,
+            location=location,
+            element_count=element_count,
+        )
+        if storage_expr is None
+        else storage_expr
+    )
+    return (
+        b"\x80\x04"
+        + _global(b"torch._utils", b"_rebuild_tensor_v2")
+        + global_memo_expr
+        + b"("
+        + storage_payload
+        + _pickle_binint(offset)
+        + _pickle_int_tuple(size)
+        + _pickle_int_tuple(stride)
+        + (b"\x88" if requires_grad else b"\x89")
+        + hooks_payload
+        + extra_arg_expr
+        + b"tR"
+        + trailing_ops
+        + b"."
+    )
+
+
+def _pytorch_rebuild_tensor_v2_reduce_expr(
+    *,
+    key: str = "0",
+    storage_module: str = "torch",
+    storage_name: str = "LongStorage",
+    location: str = "cpu",
+    element_count: int = 3,
+    offset: int = 0,
+    size: tuple[int, ...] = (3,),
+    stride: tuple[int, ...] = (1,),
+) -> bytes:
+    return (
+        b"h\x00("
+        + _pytorch_storage_binpersid_expr(
+            key,
+            storage_module=storage_module,
+            storage_name=storage_name,
+            location=location,
+            element_count=element_count,
+        )
+        + _pickle_binint(offset)
+        + _pickle_int_tuple(size)
+        + _pickle_int_tuple(stride)
+        + b"\x89"
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"tR"
+    )
+
+
+def _pytorch_rebuild_tensor_v2_payload_with_mutated_hooks() -> bytes:
+    return (
+        b"\x80\x04"
+        + _global(b"collections", b"OrderedDict")
+        + b")Rq\x01"
+        + b"h\x01"
+        + _short_binunicode(b"x")
+        + _short_binunicode(b"y")
+        + b"s"
+        + _global(b"torch._utils", b"_rebuild_tensor_v2")
+        + b"q\x00("
+        + _pytorch_storage_binpersid_expr()
+        + b"K\x00"
+        + _pickle_int_tuple((3,))
+        + _pickle_int_tuple((1,))
+        + b"\x89"
+        + b"h\x01"
+        + b"tR."
+    )
+
+
+def _write_pytorch_zip_data_pickle(
+    archive_path: Path,
+    data_pkl: bytes,
+    *,
+    include_storage: bool = True,
+    include_version: bool = True,
+    storage_bytes: bytes = b"\x00" * 24,
+) -> None:
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        if include_version:
+            archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        if include_storage:
+            archive.writestr("archive/data/0", storage_bytes)
+
+
+def _require_torch_distribution() -> None:
+    try:
+        importlib_metadata.distribution("torch")
+    except importlib_metadata.PackageNotFoundError:
+        pytest.skip("torch distribution not installed")
+
+
+def _torch_rebuild_tensor_v2_warnings(report: PickleReport) -> list[Finding]:
+    return [
+        finding
+        for finding in report.findings
+        if finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+    ]
+
+
+def _torch_rebuild_tensor_v2_warning_dicts(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        finding
+        for finding in cast(list[dict[str, Any]], report["findings"])
+        if finding.get("rule_code") == "NON_ALLOWLISTED_GLOBAL"
+        and cast(dict[str, Any], finding.get("details", {})).get("import_reference")
+        == "torch._utils._rebuild_tensor_v2"
+    ]
+
+
+def _scan_file_report_dict_subprocess(
+    path: Path,
+    *,
+    prelude: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    script = "\n".join(
+        (
+            *prelude,
+            "import json",
+            "import sys",
+            "from modelaudit_picklescan import scan_file",
+            "report = scan_file(sys.argv[1])",
+            "print(json.dumps(report.to_dict()))",
+        )
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"},
+    )
+    return cast(dict[str, Any], json.loads(completed.stdout))
+
+
 def _pytorch_storage_protocol0_persistent_id_payload(
     key: str,
     *,
     storage_qualname: str = "torch.FloatStorage",
-    size: int = 1,
+    size: int | str = 1,
 ) -> bytes:
     return f"(dp0\nVx\np1\nP('storage', <class '{storage_qualname}'>, '{key}', 'cpu', {size})\ns.".encode("ascii")
 
@@ -278,7 +500,7 @@ def _frame_first_large_malicious_eval_pickle_payload() -> bytes:
 
 
 def _frame_first_raw_storage_bytes() -> bytes:
-    return b"\x95" + (10_000).to_bytes(8, "little") + (b"\x00" * 4096)
+    return b"\x95" + (10_000).to_bytes(8, "little") + (b"\x00" * 4095)
 
 
 def _large_length_prefixed_malicious_payload() -> bytes:
@@ -297,7 +519,7 @@ def _pickleish_tensor_storage_bytes() -> bytes:
 
 
 def _binary_magic_tensor_storage_bytes() -> bytes:
-    return b"\x80\x04\x00" + (b"\x00" * 128)
+    return b"\x80\x04\x00" + (b"\x00" * 129)
 
 
 def _writestr_preserving_member_name(archive: zipfile.ZipFile, member_name: str, data: bytes) -> None:
@@ -3135,6 +3357,519 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert report.coverage.bytes_scanned > 0
 
 
+def test_scan_file_suppresses_rebuild_tensor_v2_for_valid_canonical_pytorch_zip(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "model.pt"
+    _write_pytorch_zip_data_pickle(archive_path, _pytorch_rebuild_tensor_v2_payload())
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["status"] == "complete"
+    assert report["verdict"] == "clean"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+    assert not any(finding["rule_code"] == "PERSISTENT_ID" for finding in report["findings"])
+
+
+def test_scan_file_suppresses_rebuild_tensor_v2_for_multiple_canonical_memo_uses(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "model.pt"
+    data_pkl = (
+        b"\x80\x04"
+        + _global(b"torch._utils", b"_rebuild_tensor_v2")
+        + b"q\x00"
+        + _pytorch_rebuild_tensor_v2_reduce_expr()
+        + _pytorch_rebuild_tensor_v2_reduce_expr()
+        + b"."
+    )
+    _write_pytorch_zip_data_pickle(archive_path, data_pkl)
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["status"] == "complete"
+    assert report["verdict"] == "clean"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+
+
+def test_scan_file_suppresses_rebuild_tensor_v2_for_real_ordered_state_dict(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    import torch
+
+    archive_path = tmp_path / "ordered-state.pt"
+    torch.save(collections.OrderedDict([("weight", torch.nn.Linear(3, 2).state_dict()["weight"])]), archive_path)
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["status"] == "complete"
+    assert report["verdict"] == "clean"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+
+
+def test_scan_bytes_keeps_rebuild_tensor_v2_warning_for_raw_data_pickle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_torch_distribution()
+    monkeypatch.delitem(sys.modules, "torch._utils", raising=False)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(_pytorch_rebuild_tensor_v2_payload(), source="data.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert _torch_rebuild_tensor_v2_warnings(report)
+
+
+def test_scan_file_keeps_rebuild_tensor_v2_warning_when_torch_parent_is_loaded(
+    tmp_path: Path,
+) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "model.pt"
+    _write_pytorch_zip_data_pickle(archive_path, _pytorch_rebuild_tensor_v2_payload())
+
+    report = _scan_file_report_dict_subprocess(
+        archive_path,
+        prelude=(
+            "import sys",
+            "from types import ModuleType",
+            "sys.modules['torch'] = ModuleType('torch')",
+            "sys.modules.pop('torch._utils', None)",
+        ),
+    )
+
+    assert report["status"] == "inconclusive"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report)
+
+
+def test_scan_file_keeps_rebuild_tensor_v2_warning_when_torch_utils_is_loaded(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "model.pt"
+    _write_pytorch_zip_data_pickle(archive_path, _pytorch_rebuild_tensor_v2_payload())
+
+    report = _scan_file_report_dict_subprocess(archive_path, prelude=("import torch._utils",))
+
+    assert report["status"] == "complete"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report)
+
+
+def test_scan_file_keeps_rebuild_tensor_v2_warning_for_shadowed_torch_distribution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "model.pt"
+    _write_pytorch_zip_data_pickle(archive_path, _pytorch_rebuild_tensor_v2_payload())
+    shadow_root = tmp_path / "shadow"
+    torch_dir = shadow_root / "torch"
+    torch_dir.mkdir(parents=True)
+    (torch_dir / "__init__.py").write_text("", encoding="utf-8")
+    (torch_dir / "_utils.py").write_text("def _rebuild_tensor_v2(*args):\n    return None\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(shadow_root))
+    monkeypatch.delitem(sys.modules, "torch._utils", raising=False)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_file(archive_path)
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert _torch_rebuild_tensor_v2_warnings(report)
+
+
+def test_scan_file_keeps_rebuild_tensor_v2_warning_for_shadowed_torch_parent_with_real_utils(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "model.pt"
+    _write_pytorch_zip_data_pickle(archive_path, _pytorch_rebuild_tensor_v2_payload())
+    torch_distribution = importlib_metadata.distribution("torch")
+    real_utils = Path(str(torch_distribution.locate_file("torch/_utils.py"))).resolve()
+    shadow_root = tmp_path / "shadow-parent"
+    shadow_torch = shadow_root / "torch"
+    shadow_torch.mkdir(parents=True)
+    (shadow_torch / "__init__.py").write_text("value = 'shadow-parent'\n", encoding="utf-8")
+    try:
+        (shadow_torch / "_utils.py").symlink_to(real_utils)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable for shadow-parent test: {error}")
+    monkeypatch.syspath_prepend(str(shadow_root))
+    monkeypatch.delitem(sys.modules, "torch._utils", raising=False)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_file(archive_path)
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert _torch_rebuild_tensor_v2_warnings(report)
+
+
+def test_scan_file_keeps_rebuild_tensor_v2_warning_when_ordered_dict_is_rebound(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "model.pt"
+    marker = tmp_path / "ordered_dict_marker"
+    _write_pytorch_zip_data_pickle(archive_path, _pytorch_rebuild_tensor_v2_payload())
+    script = "\n".join(
+        (
+            "import collections",
+            "import io",
+            "import json",
+            "import pickle",
+            "import sys",
+            "import zipfile",
+            "from pathlib import Path",
+            "marker = Path(sys.argv[2])",
+            "armed = False",
+            "class EvilOrderedDict(dict):",
+            "    def __init__(self, *args, **kwargs):",
+            "        if armed:",
+            "            marker.write_text('owned', encoding='utf-8')",
+            "        super().__init__(*args, **kwargs)",
+            "collections.OrderedDict = EvilOrderedDict",
+            "from modelaudit_picklescan import scan_file",
+            "report = scan_file(sys.argv[1]).to_dict()",
+            "before = marker.exists()",
+            "armed = True",
+            "with zipfile.ZipFile(sys.argv[1]) as archive:",
+            "    payload = archive.read('archive/data.pkl')",
+            "class Loader(pickle.Unpickler):",
+            "    def persistent_load(self, _pid):",
+            "        return object()",
+            "try:",
+            "    Loader(io.BytesIO(payload)).load()",
+            "except Exception:",
+            "    pass",
+            "print(json.dumps({'report': report, 'before': before, 'after': marker.exists()}))",
+        )
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(archive_path), str(marker)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"},
+    )
+    observed = cast(dict[str, Any], json.loads(completed.stdout))
+    report = cast(dict[str, Any], observed["report"])
+
+    assert report["status"] == "complete"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report)
+    assert observed["before"] is False
+    assert observed["after"] is True
+
+
+def test_scan_file_keeps_rebuild_tensor_v2_warning_for_hostile_collections_module_like(
+    tmp_path: Path,
+) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "model.pt"
+    marker = tmp_path / "collections_getattr_marker"
+    _write_pytorch_zip_data_pickle(archive_path, _pytorch_rebuild_tensor_v2_payload())
+    script = "\n".join(
+        (
+            "import collections",
+            "import json",
+            "import sys",
+            "from pathlib import Path",
+            "real_collections = collections",
+            "marker = Path(sys.argv[2])",
+            "class HostileCollections:",
+            "    def __getattr__(self, name):",
+            "        if name == 'OrderedDict':",
+            "            marker.write_text(name, encoding='utf-8')",
+            "        return getattr(real_collections, name)",
+            "from modelaudit_picklescan import scan_file",
+            "sys.modules['collections'] = HostileCollections()",
+            "report = scan_file(sys.argv[1]).to_dict()",
+            "print(json.dumps({'report': report, 'marker': marker.exists()}))",
+        )
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(archive_path), str(marker)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"},
+    )
+    observed = cast(dict[str, Any], json.loads(completed.stdout))
+    report = cast(dict[str, Any], observed["report"])
+
+    assert report["status"] == "inconclusive"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report)
+    assert observed["marker"] is False
+
+
+def test_scan_file_keeps_rebuild_tensor_v2_warning_when_distribution_lookup_loads_torch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "model.pt"
+    _write_pytorch_zip_data_pickle(archive_path, _pytorch_rebuild_tensor_v2_payload())
+    monkeypatch.delitem(sys.modules, "torch._utils", raising=False)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    original_distribution = package_api.importlib_metadata.distribution
+
+    def load_torch_during_distribution_lookup(name: str) -> Any:
+        distribution = original_distribution(name)
+        if name == "torch":
+            sys.modules["torch"] = ModuleType("torch")
+        return distribution
+
+    monkeypatch.setattr(
+        package_api.importlib_metadata,
+        "distribution",
+        load_torch_during_distribution_lookup,
+    )
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_file(archive_path)
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert _torch_rebuild_tensor_v2_warnings(report)
+
+
+def test_scan_file_keeps_rebuild_tensor_v2_warning_for_hostile_meta_path(
+    tmp_path: Path,
+) -> None:
+    _require_torch_distribution()
+    marker = tmp_path / "meta_path_torch_marker"
+    archive_path = tmp_path / "model.pt"
+    _write_pytorch_zip_data_pickle(archive_path, _pytorch_rebuild_tensor_v2_payload())
+
+    report = _scan_file_report_dict_subprocess(
+        archive_path,
+        prelude=(
+            "import sys",
+            "from importlib.abc import Loader",
+            "from importlib.machinery import ModuleSpec",
+            "from pathlib import Path",
+            f"marker = Path({str(marker)!r})",
+            f"torch_init_origin = {str(tmp_path / 'torch' / '__init__.py')!r}",
+            f"torch_utils_origin = {str(tmp_path / 'torch' / '_utils.py')!r}",
+            "class ShadowLoader(Loader):\n"
+            "    def create_module(self, spec):\n"
+            "        return None\n"
+            "    def exec_module(self, module):\n"
+            "        marker.write_text(module.__name__, encoding='utf-8')\n"
+            "        module.__dict__['_rebuild_tensor_v2'] = object()",
+            "class ShadowFinder:\n"
+            "    def find_spec(self, fullname, path=None, target=None):\n"
+            "        if fullname == 'torch':\n"
+            "            return ModuleSpec(fullname, ShadowLoader(), origin=torch_init_origin)\n"
+            "        if fullname == 'torch._utils':\n"
+            "            return ModuleSpec(fullname, ShadowLoader(), origin=torch_utils_origin)\n"
+            "        return None",
+            "sys.meta_path.insert(0, ShadowFinder())",
+            "sys.modules.pop('torch._utils', None)",
+            "sys.modules.pop('torch', None)",
+        ),
+    )
+
+    assert marker.exists() is False
+    assert report["status"] == "inconclusive"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report)
+
+
+@pytest.mark.parametrize(
+    ("data_pkl", "include_storage", "storage_bytes", "expected_status"),
+    [
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(),
+            False,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="missing-storage",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(hooks_expr=b""),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="five-args",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(extra_arg_expr=b"N"),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="seven-args",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(hooks_expr=b"}"),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="plain-dict-hooks",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(size=(4,)),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="out-of-bounds-view",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(location="cuda:0"),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="non-cpu-storage",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(key="k"),
+            True,
+            b"\x00" * 24,
+            ScanStatus.INCONCLUSIVE,
+            id="nondecimal-storage-key",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(storage_name="QUInt4x2Storage"),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="unknown-item-size",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(storage_expr=b"Pid\n"),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="protocol0-persistent-id",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(trailing_ops=b"h\x00K\x01\x85R"),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="malformed-memo-reuse",
+        ),
+        pytest.param(
+            b"\x80\x04"
+            + _global(b"torch._utils", b"_rebuild_tensor_v2")
+            + b"q\x00"
+            + _pytorch_storage_binpersid_expr()
+            + b"q\x010"
+            + _global(b"builtins", b"tuple")
+            + b"h\x01\x85R0"
+            + _pytorch_rebuild_tensor_v2_reduce_expr()
+            + b".",
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="storage-sentinel-escapes-unknown-reduce",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(global_memo_expr=b"q\x01\x94"),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="memoize-overwrites-sparse-memo-key",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload() + b"\x80\x04N.",
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="trailing-second-stream",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload_with_mutated_hooks(),
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="mutated-ordered-dict-hooks",
+        ),
+        pytest.param(
+            b"\x80\x04"
+            + _global(b"torch._utils", b"_rebuild_tensor_v2")
+            + b"q\x00"
+            + _pytorch_rebuild_tensor_v2_reduce_expr()
+            + _pytorch_rebuild_tensor_v2_reduce_expr(storage_name="DoubleStorage")
+            + b".",
+            True,
+            b"\x00" * 24,
+            ScanStatus.COMPLETE,
+            id="duplicate-key-different-storage-type",
+        ),
+        pytest.param(
+            _pytorch_rebuild_tensor_v2_payload(),
+            True,
+            b"\x00" * 16,
+            ScanStatus.INCONCLUSIVE,
+            id="storage-size-mismatch",
+        ),
+    ],
+)
+def test_scan_file_keeps_rebuild_tensor_v2_warning_for_noncanonical_zip_contexts(
+    data_pkl: bytes,
+    include_storage: bool,
+    storage_bytes: bytes,
+    expected_status: ScanStatus,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_torch_distribution()
+    monkeypatch.delitem(sys.modules, "torch._utils", raising=False)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    archive_path = tmp_path / "model.pt"
+    _write_pytorch_zip_data_pickle(
+        archive_path,
+        data_pkl,
+        include_storage=include_storage,
+        storage_bytes=storage_bytes,
+    )
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_file(archive_path)
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == expected_status
+    assert _torch_rebuild_tensor_v2_warnings(report)
+
+
+def test_trusted_rebuild_tensor_v2_cleanup_requires_complete_callable_metadata() -> None:
+    _require_torch_distribution()
+    report = scan_bytes(_pytorch_rebuild_tensor_v2_payload(), source="data.pkl")
+    warning = _torch_rebuild_tensor_v2_warnings(report)[0]
+    position = cast(int, warning.details["position"])
+    invocation = next(
+        invocation
+        for invocation in cast(tuple[dict[str, object], ...], report.metadata["callable_invocations"])
+        if invocation.get("global_position") == position
+    )
+    metadata = report.to_dict()["metadata"]
+    metadata["callable_invocations_truncated"] = True
+    truncated_report = PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=report.verdict,
+        findings=report.findings,
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=metadata,
+        private_metadata=report.private_metadata,
+        duration_s=report.duration_s,
+    )
+    trusted_data_pkl = package_api._PytorchZipDataPickleTrust(
+        storage_keys={"0"},
+        canonical_tensor_rebuild_invocations=frozenset({(position, cast(int, invocation["opcode_position"]))}),
+    )
+
+    cleaned_report = package_api._without_trusted_pytorch_data_pkl_findings(truncated_report, trusted_data_pkl)
+
+    assert _torch_rebuild_tensor_v2_warnings(cleaned_report)
+
+
 def test_scan_file_combines_pytorch_zip_private_source_fingerprints(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3340,57 +4075,112 @@ def test_scan_file_detects_hidden_pytorch_zip_pickle_member_with_data_pickle(tmp
 
 def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
+    storage_blob = _pickleish_tensor_storage_bytes()
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-        archive.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
+        archive.writestr("archive/data/0", storage_blob)
         archive.writestr("archive/notes", b"cat is a category label, not a GLOBAL opcode stream")
 
     report = scan_file(archive_path)
 
     assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_scans_size_mismatched_storage_blob_on_hidden_pickle_path(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    hidden_payload = b"S'" + (b"A" * 5000) + b"'\n" + b"cposix\nsystem\n(S'echo hidden'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_does_not_route_size_mismatched_benign_storage_blob(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = _binary_magic_tensor_storage_bytes()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    persistent_id_findings = [finding for finding in report.findings if finding.rule_code == "PERSISTENT_ID"]
+    assert persistent_id_findings
+    assert not any(finding.details.get("trusted_pytorch_archive_context") is True for finding in persistent_id_findings)
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
 def test_scan_file_does_not_route_binary_magic_storage_blob_without_opcode(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
+    storage_blob = _binary_magic_tensor_storage_bytes()
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-        archive.writestr("archive/data/0", _binary_magic_tensor_storage_bytes())
+        archive.writestr("archive/data/0", storage_blob)
 
     report = scan_file(archive_path)
 
     assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
 def test_scan_file_does_not_route_frame_first_storage_blob_without_opcode(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
+    storage_blob = _frame_first_raw_storage_bytes()
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-        archive.writestr("archive/data/0", _frame_first_raw_storage_bytes())
+        archive.writestr("archive/data/0", storage_blob)
 
     report = scan_file(archive_path)
 
     assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
 def test_scan_file_routes_protocol0_storage_blob_as_raw_storage(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
+    storage_blob = _pickleish_tensor_storage_bytes()
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", _pytorch_storage_protocol0_persistent_id_payload("0"))
+        archive.writestr(
+            "archive/data.pkl",
+            _pytorch_storage_protocol0_persistent_id_payload(
+                "0",
+                size=_float_storage_element_count_for_bytes(storage_blob),
+            ),
+        )
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-        archive.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
+        archive.writestr("archive/data/0", storage_blob)
 
     report = scan_file(archive_path)
 
@@ -3402,7 +4192,7 @@ def test_scan_file_routes_protocol0_storage_blob_as_raw_storage(tmp_path: Path) 
 def test_scan_file_trusts_protocol0_storage_persid_in_data_pkl(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", _pytorch_storage_protocol0_persistent_id_payload("0"))
+        archive.writestr("archive/data.pkl", _pytorch_storage_protocol0_persistent_id_payload("0", size=2))
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
         archive.writestr("archive/data/0", b"\x00" * 8)
@@ -3492,6 +4282,7 @@ def test_scan_file_keeps_noncanonical_protocol0_storage_persid_warning_in_data_p
 
 def test_scan_file_routes_torch_storage_untyped_storage_blob_as_raw_storage(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
+    storage_blob = _pickleish_tensor_storage_bytes()
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr(
             "archive/data.pkl",
@@ -3499,11 +4290,12 @@ def test_scan_file_routes_torch_storage_untyped_storage_blob_as_raw_storage(tmp_
                 "0",
                 storage_module="torch.storage",
                 storage_name="UntypedStorage",
+                size_opcode=_pickle_binint(len(storage_blob)),
             ),
         )
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-        archive.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
+        archive.writestr("archive/data/0", storage_blob)
 
     report = scan_file(archive_path)
 
@@ -3583,6 +4375,40 @@ def test_scan_file_scans_referenced_storage_blob_with_frame_first_large_pickle(t
     )
 
 
+@pytest.mark.parametrize(
+    "data_pkl_payload",
+    [
+        _pytorch_storage_protocol0_persistent_id_payload("0", size="9" * 128),
+        _pytorch_storage_persistent_id_payload("0", size_opcode=b"\x88"),
+    ],
+    ids=["oversized-protocol0-count", "bool-binpersid-count"],
+)
+def test_scan_file_long_probes_invalid_count_storage_with_frame_first_pickle(
+    data_pkl_payload: bytes,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", _frame_first_large_malicious_eval_pickle_payload())
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert not any(finding.details.get("trusted_pytorch_archive_context") is True for finding in report.findings)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        and finding.details.get("import_reference") == "builtins.eval"
+        for finding in report.findings
+    )
+
+
 @pytest.mark.parametrize("storage_member", [r"archive\data\0", "/archive/data/0"])
 def test_scan_file_scans_noncanonical_referenced_storage_aliases(
     storage_member: str,
@@ -3640,6 +4466,7 @@ def test_scan_file_keeps_unreferenced_storage_lookalike_on_hidden_pickle_path(tm
         (_fake_byte_storage_persistent_id_payload("0"), True, None),
         (_pytorch_storage_persistent_id_payload("0", storage_name="FakeStorage"), True, None),
         (_pytorch_storage_protocol0_persistent_id_payload("0", storage_qualname="torch.FakeStorage"), True, None),
+        (_pytorch_storage_protocol0_persistent_id_payload("0", size="9" * 128), True, None),
         (_pytorch_storage_persistent_id_payload("0", size_opcode=b"\x88"), True, None),
         (_pytorch_storage_persistent_id_payload_with_extra_field("0"), True, None),
         (_pytorch_storage_persistent_id_payload("0")[:-1], True, "pytorch_zip_storage_reference_validation_failed"),

@@ -286,9 +286,13 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_START_PATTERN = re.compile(
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
+_PASSIVE_PRIORITY_PRINT_ASSIGNMENT_PATTERN = re.compile(
+    rb"([A-Za-z_]\w*)\s*=\s*print\s*\(\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\)"
+)
 _EMBEDDED_PYTHON_ASSIGNMENT_OPERATOR_PATTERN = rb"(?://=|<<=|>>=|\*\*=|[-+*/%@&|^]=|=)"
+# Keep LF excluded so each greedy bounded probe stays on one physical line.
 _EMBEDDED_PYTHON_ASSIGNMENT_VALUE_LINE_PATTERN = (
-    rb"(?=[^\x00-\x08\x0b-\x1f\x7f]{0,"
+    rb"(?=[^\x00-\x08\x0a-\x1f\x7f]{0,"
     + str(_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES).encode("ascii")
     + rb"}(?:\r?\n|$))"
 )
@@ -641,6 +645,8 @@ def _priority_import_sites(bounded: bytes) -> list[tuple[int, int | None]]:
     sites: list[tuple[int, int | None]] = []
     matches = iter(_PRIORITY_EMBEDDED_PYTHON_IMPORT_START_PATTERN.finditer(bounded.lower()))
     match = next(matches, None)
+    if match is None:
+        return sites
     line_start = 0
     multiline_quote: bytes | None = None
     for line in bounded.splitlines(keepends=True):
@@ -660,6 +666,8 @@ def _priority_import_sites(bounded: bytes) -> list[tuple[int, int | None]]:
                     continue
                 sites.append((offset, header_start))
             match = next(matches, None)
+        if match is None:
+            break
         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end
     return sites
@@ -1650,6 +1658,20 @@ def _simple_priority_forwarding_usage(
                 namespace_modules[local_name] = module_name
             line_start = line_end
             continue
+        passive_print_match = _PASSIVE_PRIORITY_PRINT_ASSIGNMENT_PATTERN.fullmatch(structural_line)
+        if passive_print_match is not None:
+            target_name = passive_print_match.group(1).decode("utf-8")
+            namespace_name = passive_print_match.group(2).decode("utf-8")
+            member_name = passive_print_match.group(3).decode("utf-8")
+            module_name = namespace_modules.get(namespace_name)
+            if module_name is None or f"{module_name}.{member_name}" not in rule_codes_by_reference:
+                return None
+            namespace_modules.pop(target_name, None)
+            rule_codes_by_name.pop(target_name, None)
+            line_start = line_end
+            continue
+        if re.search(rb"\bprint\b", structural_line) is not None:
+            return None
         forwarding = _simple_forwarded_alias_assignment(structural_line)
         if forwarding is not None:
             target_name, dependency_name, expression = forwarding
@@ -1686,6 +1708,11 @@ def _simple_priority_forwarding_usage(
                     [(line_start, line_end)],
                     frozenset(rule_code for root_name in matched_roots for rule_code in rule_codes_by_name[root_name]),
                 )
+            if identifiers.isdisjoint(tracked_names) and all(
+                not _python_structural_line_bytes(remaining_line).strip()
+                for remaining_line in candidate[line_end:].splitlines()
+            ):
+                return [], frozenset()
             return None
         elif (
             not identifiers.isdisjoint(tracked_names)
@@ -1698,6 +1725,21 @@ def _simple_priority_forwarding_usage(
             return None
         line_start = line_end
     return [], frozenset()
+
+
+def _canonical_builtin_helper_aliases_in(
+    identifiers: Collection[str],
+    canonical_aliases: Mapping[str, str],
+    helper_names: Collection[str],
+    *,
+    excluded_aliases: Collection[str] = (),
+) -> set[str]:
+    """Return matching helper aliases by inspecting only identifiers in the statement."""
+    return {
+        identifier
+        for identifier in identifiers
+        if canonical_aliases.get(identifier) in helper_names and identifier not in excluded_aliases
+    }
 
 
 def _priority_alias_usage_lines(
@@ -3722,12 +3764,13 @@ def _priority_alias_usage_lines(
                 may_bind_namespace_update = (
                     b"__dict__" in line
                     or b"vars" in line
-                    or not _python_identifier_names(line).isdisjoint(
-                        {
-                            name
-                            for name, helper_name in canonical_builtin_helper_aliases.items()
-                            if helper_name == "vars" and name not in shadowed_builtin_helper_names
-                        }
+                    or bool(
+                        _canonical_builtin_helper_aliases_in(
+                            _python_identifier_names(line),
+                            canonical_builtin_helper_aliases,
+                            {"vars"},
+                            excluded_aliases=shadowed_builtin_helper_names,
+                        )
                     )
                     or (
                         (b".update" in line or b"__ior__" in line)
@@ -4260,12 +4303,10 @@ def _priority_alias_usage_lines(
                         )
                     )
                     alias_dependencies.update(
-                        referenced_identifiers.intersection(
-                            {
-                                name
-                                for name, helper_name in canonical_builtin_helper_aliases.items()
-                                if helper_name == "vars"
-                            }
+                        _canonical_builtin_helper_aliases_in(
+                            referenced_identifiers,
+                            canonical_builtin_helper_aliases,
+                            {"vars"},
                         )
                     )
                 if descriptor_reference is not None:
@@ -4791,12 +4832,10 @@ def _priority_alias_usage_lines(
                     | builtin_dict_descriptor_setdefault_aliases
                 )
                 or bool(
-                    member_identifiers.intersection(
-                        {
-                            name
-                            for name, helper_name in canonical_builtin_helper_aliases.items()
-                            if helper_name == "setattr"
-                        }
+                    _canonical_builtin_helper_aliases_in(
+                        member_identifiers,
+                        canonical_builtin_helper_aliases,
+                        {"setattr"},
                     )
                 )
             )
@@ -4876,14 +4915,13 @@ def _priority_alias_usage_lines(
             else frozenset()
         )
         tracked_priority_aliases = aliases | priority_aliases
-        has_canonical_namespace_helper_use = has_priority_reference_syntax and not _python_identifier_names(
-            line
-        ).isdisjoint(
-            {
-                name
-                for name, helper_name in canonical_builtin_helper_aliases.items()
-                if helper_name in {"getattr", "vars"} and name not in shadowed_builtin_helper_names
-            }
+        has_canonical_namespace_helper_use = has_priority_reference_syntax and bool(
+            _canonical_builtin_helper_aliases_in(
+                _python_identifier_names(line),
+                canonical_builtin_helper_aliases,
+                {"getattr", "vars"},
+                excluded_aliases=shadowed_builtin_helper_names,
+            )
         )
         getattr_member = (
             _priority_getattr_alias_member(
@@ -8874,18 +8912,32 @@ def _line_calls_fail_closed_runpy_member(
 
 def _line_starts_continued_priority_getattr(
     code_line: bytes,
-    canonical_builtin_helper_aliases: dict[str, str] | None = None,
+    canonical_builtin_helper_aliases: Mapping[str, str] | None = None,
     shadowed_builtin_helper_names: set[str] | None = None,
 ) -> bool:
     if re.fullmatch(rb"\s*(?:builtins\s*\.\s*)?getattr\s*(?:\\\s*|\(\s*)", code_line) is not None:
         return True
+    identifiers = _python_identifier_names(code_line)
+    reference_match = re.fullmatch(rb"\s*(?P<reference>\S+?)\s*(?:\\\s*|\(\s*)", code_line)
+    if reference_match is not None:
+        try:
+            reference = reference_match.group("reference").decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            if reference.isidentifier():
+                identifiers.add(reference)
     blocked_helpers = shadowed_builtin_helper_names or set()
+    helper_aliases = _canonical_builtin_helper_aliases_in(
+        identifiers,
+        canonical_builtin_helper_aliases or {},
+        {"getattr"},
+        excluded_aliases=blocked_helpers,
+    )
     return any(
         "." not in reference
-        and helper_name == "getattr"
-        and reference not in blocked_helpers
         and re.fullmatch(rb"\s*" + re.escape(reference.encode("utf-8")) + rb"\s*(?:\\\s*|\(\s*)", code_line) is not None
-        for reference, helper_name in (canonical_builtin_helper_aliases or {}).items()
+        for reference in helper_aliases
     )
 
 
@@ -10638,12 +10690,17 @@ def _append_single_window_prefix_context_windows(
             extraction_windows.append((context + b"\n" + bounded[start:], True))
 
 
+def _deduplicated_extraction_windows(windows: list[tuple[bytes, bool]]) -> list[tuple[bytes, bool]]:
+    """Preserve the first copy of each exact analysis window."""
+    return list(dict.fromkeys(windows))
+
+
 def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
     windows = _embedded_python_scan_windows(data)
     if len(windows) == 1:
         extraction_windows = [(windows[0], False), *_contextual_priority_framed_windows(windows[0])]
         _append_single_window_prefix_context_windows(extraction_windows, windows[0])
-        return extraction_windows
+        return _deduplicated_extraction_windows(extraction_windows)
 
     prefix, tail = windows
     extraction_windows = [(prefix, False), *_contextual_priority_framed_windows(prefix), (tail, False)]
@@ -10717,7 +10774,7 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
         contextual_windows = [] if proved_rule_codes else _contextual_priority_framed_windows(contextual_source)
         fallback_contextual_windows = [] if proved_rule_codes else [*contextual_windows, (contextual_source, True)]
         extraction_windows[0:0] = [*targeted_contextual_windows, *fallback_contextual_windows]
-    return extraction_windows
+    return _deduplicated_extraction_windows(extraction_windows)
 
 
 def _contextual_priority_framed_windows(data: bytes) -> list[tuple[bytes, bool]]:

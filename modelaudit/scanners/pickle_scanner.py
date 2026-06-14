@@ -6,6 +6,7 @@ import ast
 import base64
 import binascii
 import hashlib
+import inspect
 import io
 import pickletools
 import re
@@ -26,7 +27,14 @@ from modelaudit.detectors.network_comm import (
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
-from ..scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, Check, Issue, mark_inconclusive_scan_result
+from ..scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+    FILE_HASHES_BYTES_HASHED_METADATA_KEY,
+    FILE_HASHES_COMPLETE_METADATA_KEY,
+    Check,
+    Issue,
+    mark_inconclusive_scan_result,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
@@ -2639,8 +2647,30 @@ class PickleScanner(BaseScanner):
 
         return None
 
-    def _scan_standalone_stream(self, file_obj: BinaryIO, file_size: int | None, *, source: str) -> ScanResult:
-        report = self._standalone_pickle_scanner.scan_stream(file_obj, source=source, size=file_size)
+    def _standalone_scan_stream_supports_pytorch_zip_context(self) -> bool:
+        try:
+            parameters = inspect.signature(self._standalone_pickle_scanner.scan_stream).parameters
+        except (TypeError, ValueError):
+            return False
+        return "_pytorch_zip_storage_member_sizes" in parameters
+
+    def _scan_standalone_stream(
+        self,
+        file_obj: BinaryIO,
+        file_size: int | None,
+        *,
+        source: str,
+        pytorch_zip_storage_member_sizes: Mapping[str, int] | None = None,
+    ) -> ScanResult:
+        if pytorch_zip_storage_member_sizes is not None and self._standalone_scan_stream_supports_pytorch_zip_context():
+            report = self._standalone_pickle_scanner.scan_stream(
+                file_obj,
+                source=source,
+                size=file_size,
+                _pytorch_zip_storage_member_sizes=pytorch_zip_storage_member_sizes,
+            )
+        else:
+            report = self._standalone_pickle_scanner.scan_stream(file_obj, source=source, size=file_size)
         result = pickle_report_to_scan_result(report, scanner_name=self.name, scanner=self)
         result.metadata["pickle_primary_engine"] = "rust"
         return result
@@ -3748,6 +3778,8 @@ class PickleScanner(BaseScanner):
         sha256 = hashlib.sha256(payload).hexdigest()
         hash_key = "sha256" if hash_complete else "sha256_prefix"
         result.metadata.setdefault("file_hashes", {})[hash_key] = sha256
+        result.metadata[FILE_HASHES_COMPLETE_METADATA_KEY] = hash_complete
+        result.metadata[FILE_HASHES_BYTES_HASHED_METADATA_KEY] = len(payload)
         details: dict[str, Any] = {
             hash_key: sha256,
             "bytes_hashed": len(payload),
@@ -3770,6 +3802,8 @@ class PickleScanner(BaseScanner):
     ) -> None:
         sha256 = hashlib.sha256(payload).hexdigest()
         result.metadata.setdefault("file_hashes", {})["sha256_prefix"] = sha256
+        result.metadata[FILE_HASHES_COMPLETE_METADATA_KEY] = False
+        result.metadata[FILE_HASHES_BYTES_HASHED_METADATA_KEY] = len(payload)
         result.add_check(
             name="File Integrity Check",
             passed=True,
@@ -3821,6 +3855,8 @@ class PickleScanner(BaseScanner):
         sha256 = hasher.hexdigest()
         hash_key = "sha256" if hash_complete else "sha256_prefix"
         result.metadata.setdefault("file_hashes", {})[hash_key] = sha256
+        result.metadata[FILE_HASHES_COMPLETE_METADATA_KEY] = hash_complete
+        result.metadata[FILE_HASHES_BYTES_HASHED_METADATA_KEY] = bytes_hashed
         details: dict[str, Any] = {
             hash_key: sha256,
             "bytes_hashed": bytes_hashed,
@@ -4873,7 +4909,14 @@ class PickleScanner(BaseScanner):
         metadata.update(opcode_summary)
         return metadata
 
-    def scan_stream(self, file_obj: BinaryIO, file_size: int | None, source: str = "<stream>") -> ScanResult:
+    def scan_stream(
+        self,
+        file_obj: BinaryIO,
+        file_size: int | None,
+        source: str = "<stream>",
+        *,
+        _pytorch_zip_storage_member_sizes: Mapping[str, int] | None = None,
+    ) -> ScanResult:
         """Scan pickle bytes from an already-open stream."""
         self._prepare_scan_context(source)
         size_check = self._check_scan_stream_size_limit(file_size, source)
@@ -4899,7 +4942,12 @@ class PickleScanner(BaseScanner):
 
             control_probe_size = self._legacy_pytorch_control_probe_size(standalone_size)
             if deferred_size_check is None:
-                result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
+                result = self._scan_standalone_stream(
+                    file_obj,
+                    standalone_size,
+                    source=source,
+                    pytorch_zip_storage_member_sizes=_pytorch_zip_storage_member_sizes,
+                )
                 if result.metadata.get("operational_error"):
                     return result
                 try:
@@ -5146,7 +5194,12 @@ class PickleScanner(BaseScanner):
                     allow_binary_tail_scan = False
             else:
                 rust_stream_size = len(payload) if stream_read.truncated else standalone_size
-                result = self._scan_standalone_stream(io.BytesIO(payload), rust_stream_size, source=source)
+                result = self._scan_standalone_stream(
+                    io.BytesIO(payload),
+                    rust_stream_size,
+                    source=source,
+                    pytorch_zip_storage_member_sizes=_pytorch_zip_storage_member_sizes,
+                )
                 self._annotate_legacy_pytorch_storage_persistent_id_details_from_payload(result, payload)
                 if _matches_legacy_pytorch_preamble(payload):
                     if deferred_size_check is not None and not (stream_read.truncated or stream_read.short_read):

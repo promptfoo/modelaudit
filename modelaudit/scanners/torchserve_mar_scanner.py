@@ -5772,7 +5772,7 @@ class TorchServeMarScanner(BaseScanner):
                     archive_path=archive_path,
                     member_name=member_name,
                 )
-                result.merge(file_result)
+                result.merge_member_result(file_result, member_name)
 
                 asset_entry = asset_from_scan_result(f"{archive_path}:{member_name}", file_result)
                 asset_entry.setdefault("size", member_info.file_size)

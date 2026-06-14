@@ -139,8 +139,12 @@ from modelaudit.utils.file.large_file_handler import (
     scan_large_file,
     should_use_large_file_handler,
 )
-from modelaudit.utils.file.streaming import stream_analyze_file, stream_source_path
-from modelaudit.utils.helpers.cache_decorator import cached_scan, should_defer_hash_for_pytorch_read_limit
+from modelaudit.utils.file.streaming import StreamedSourceByteAccounting, stream_analyze_file, stream_source_path
+from modelaudit.utils.helpers.cache_decorator import (
+    cached_scan,
+    should_defer_hash_for_file_backed_onnx,
+    should_defer_hash_for_pytorch_read_limit,
+)
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
     FilePath,
@@ -1266,10 +1270,19 @@ def _is_streamed_onnx_external_data_hash_candidate(path: Path) -> bool:
         return False
 
 
-def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
-    """Return safe, present ONNX external_data sidecars that should join the stream hash."""
+def _streamed_onnx_external_data_hash_paths(
+    path: Path,
+    *,
+    deadline: float | None = None,
+) -> list[Path] | None:
+    """Return safe ONNX sidecars, or ``None`` when discovery cannot complete."""
     if not _is_streamed_onnx_external_data_hash_candidate(path):
         return []
+
+    def check_discovery_interrupted() -> None:
+        check_interrupted()
+        if deadline is not None and time.time() > deadline:
+            raise TimeoutError("ONNX external_data discovery exceeded the scan deadline")
 
     try:
         import onnx
@@ -1278,6 +1291,8 @@ def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
             _is_trusted_huggingface_cache_external_alias,
             _is_windows_absolute_path,
             _iter_model_external_data_tensor_groups,
+            _load_onnx_structure_file_backed,
+            _OnnxStructureParseError,
             _resolve_external_location,
             _resolve_external_location_lexically,
         )
@@ -1286,7 +1301,17 @@ def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
 
     try:
         model_path = Path(os.path.abspath(path))
-        model = onnx.load(str(model_path), load_external_data=False)
+        source_stat = os.stat(model_path)
+        model, _ = _load_onnx_structure_file_backed(
+            str(model_path),
+            source_stat.st_size,
+            check_discovery_interrupted,
+            expected_stat=source_stat,
+        )
+    except TimeoutError:
+        raise
+    except _OnnxStructureParseError:
+        return None
     except Exception:
         return []
 
@@ -1299,13 +1324,16 @@ def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
 
     external_paths: list[Path] = []
     seen_external_paths: set[Path] = set()
-    for tensors in _iter_model_external_data_tensor_groups(model):
+    for tensors in _iter_model_external_data_tensor_groups(model, check_discovery_interrupted):
         for tensor in tensors:
             if getattr(tensor, "data_location", None) != onnx.TensorProto.EXTERNAL:
                 continue
             if not getattr(tensor, "external_data", ()):
                 continue
-            info = {entry.key: entry.value for entry in tensor.external_data}
+            info: dict[str, str] = {}
+            for entry in tensor.external_data:
+                check_discovery_interrupted()
+                info[entry.key] = entry.value
             location = info.get("location")
             if (
                 not isinstance(location, str)
@@ -2848,6 +2876,7 @@ def _should_defer_hash_for_max_total_size(
 
 
 _FILE_BACKED_HDF5_UNHASHABLE_PREFIX = "unhashable_file_backed_hdf5_"
+_FILE_BACKED_ONNX_UNHASHABLE_PREFIX = "unhashable_file_backed_onnx_"
 
 
 def _is_file_backed_hdf5_hash_placeholder(content_hash: str) -> bool:
@@ -2885,6 +2914,7 @@ def _is_incomplete_aggregate_hash_placeholder(content_hash: str) -> bool:
     return content_hash.startswith(
         (
             _FILE_BACKED_HDF5_UNHASHABLE_PREFIX,
+            _FILE_BACKED_ONNX_UNHASHABLE_PREFIX,
             "unhashable_max_file_size_",
             "unhashable_max_total_size_",
             "unhashable_timeout_",
@@ -2928,6 +2958,11 @@ def _hash_files_by_path(
             continue
         if _should_defer_hash_for_file_backed_hdf5(routing_path):
             content_hashes[file_path] = f"unhashable_file_backed_hdf5_{id(file_path)}"
+            continue
+        if should_defer_hash_for_file_backed_onnx(routing_path, hash_config):
+            content_hashes[file_path] = f"{_FILE_BACKED_ONNX_UNHASHABLE_PREFIX}{id(file_path)}"
+            with suppress(OSError):
+                hashed_bytes += os.path.getsize(file_path)
             continue
         if should_defer_hash_for_pytorch_read_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_pytorch_zip_read_limit_{id(file_path)}"
@@ -4458,14 +4493,24 @@ def scan_model_directory_or_file(
                             with suppress(OSError):
                                 hash_budget_bytes += os.path.getsize(hash_source)
                     representative_hash_source = hash_source_by_path.get(representative_file)
-                    if (
-                        scanner_selection.allows("onnx")
-                        and representative_hash_source is not None
-                        and not _should_defer_hash_for_max_file_size(representative_hash_source, config)
-                    ):
+                    if not scanner_selection.allows("onnx") or representative_hash_source is None:
+                        continue
+                    representative_hash_deferred = should_defer_hash_for_file_backed_onnx(
+                        representative_hash_source,
+                        config,
+                    )
+                    if representative_hash_deferred:
+                        aggregate_hash_complete = False
+                    if not _should_defer_hash_for_max_file_size(representative_hash_source, config):
                         representative_external_sources: list[str] = []
                         representative_external_bytes = 0
-                        for external_data_path in _streamed_onnx_external_data_hash_paths(Path(representative_file)):
+                        discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(
+                            Path(representative_file),
+                            deadline=start_time + timeout,
+                        )
+                        if discovered_external_data_paths is None:
+                            aggregate_hash_complete = False
+                        for external_data_path in discovered_external_data_paths or ():
                             external_data_identity = _snapshot_file_identity(external_data_path)
                             external_data_target_key = _file_target_identity_key(
                                 external_data_path,
@@ -4493,11 +4538,13 @@ def scan_model_directory_or_file(
                                 else external_data_path
                             )
                             if external_data_source not in seen_hash_sources:
-                                hash_sources.append(external_data_source)
-                                seen_hash_sources.add(external_data_source)
                                 hash_budget_bytes += external_data_size
+                                seen_hash_sources.add(external_data_source)
+                                if not representative_hash_deferred:
+                                    hash_sources.append(external_data_source)
+                            if not representative_hash_deferred:
+                                onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
                             representative_external_sources.append(external_data_source)
-                            onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
                             if external_data_target_key is not None:
                                 scan_entry_target_keys.add(external_data_target_key)
                         if representative_external_sources:
@@ -5403,6 +5450,7 @@ def scan_model_directory_or_file(
                 )
                 defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(target, config)
                 defer_hash_for_file_backed_hdf5 = _should_defer_hash_for_file_backed_hdf5(target)
+                defer_hash_for_file_backed_onnx = should_defer_hash_for_file_backed_onnx(target, config)
                 defer_hash_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(
                     target,
                     config,
@@ -5411,6 +5459,7 @@ def scan_model_directory_or_file(
                     defer_hash_for_max_total_size
                     or defer_hash_for_max_file_size
                     or defer_hash_for_file_backed_hdf5
+                    or defer_hash_for_file_backed_onnx
                     or defer_hash_for_pytorch_read_limit
                 ):
                     aggregate_hash_complete = False
@@ -5422,6 +5471,7 @@ def scan_model_directory_or_file(
                     and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
                     and not defer_hash_for_file_backed_hdf5
+                    and not defer_hash_for_file_backed_onnx
                     and not defer_hash_for_pytorch_read_limit
                 ):
                     try:
@@ -6952,7 +7002,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
 
 def scan_model_streaming(
-    file_generator: Iterator[tuple[Path, bool]],
+    file_generator: Iterator[
+        tuple[Path, bool]
+        | tuple[Path, bool, ScanResult]
+        | tuple[Path, bool, ScanResult | None, StreamedSourceByteAccounting]
+    ],
     timeout: int = 3600,
     progress_callback: ProgressCallback | None = None,
     delete_after_scan: bool = True,
@@ -6968,7 +7022,7 @@ def scan_model_streaming(
     deletes to minimize disk usage. Computes aggregate content hash at the end.
 
     Args:
-        file_generator: Generator yielding (file_path, is_last) tuples
+        file_generator: Generator yielding public path tuples or trusted internal scan/accounting tuples
         timeout: Scan timeout in seconds
         progress_callback: Optional callback for progress reporting
         delete_after_scan: Whether to delete files after scanning (default: True)
@@ -7019,6 +7073,8 @@ def scan_model_streaming(
     deferred_openvino_sidecars: dict[Path, Path] = {}
     consumed_openvino_companions: set[Path] = set()
     preserve_shard_reconciliation_errors = False
+    streamed_item_count = 0
+    received_pretransferred_bytes = False
 
     def streaming_repository_inventory_context() -> RepositoryFileInventory:
         nonlocal repository_inventory_context
@@ -7044,6 +7100,30 @@ def scan_model_streaming(
         except Exception as e:
             logger.warning(f"Failed to delete {source_path} {context}: {e}")
             pending_delete_failures[source_path] = e
+
+    def adjusted_streamed_bytes(bytes_scanned: object, source_bytes_preaccounted: int) -> int:
+        """Return an item's new byte contribution after exact-once source accounting."""
+        if not isinstance(bytes_scanned, int) or isinstance(bytes_scanned, bool) or bytes_scanned < 0:
+            raise ValueError("Streamed scan bytes must be a non-negative integer")
+        return max(bytes_scanned - source_bytes_preaccounted, 0)
+
+    def record_max_total_size_failure(location: str) -> bool:
+        """Record the shared streaming size failure after any accounting contribution."""
+        nonlocal aggregate_hash_complete, preserve_shard_reconciliation_errors
+
+        if max_total_size <= 0 or results.bytes_scanned <= max_total_size:
+            return False
+        aggregate_hash_complete = False
+        _add_issue_to_model(
+            results,
+            f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
+            severity=IssueSeverity.INFO.value,
+            location=location,
+            details={"max_total_size": max_total_size, "analysis_incomplete": True},
+        )
+        results.has_errors = True
+        preserve_shard_reconciliation_errors = True
+        return True
 
     def record_shard_pin_failure(source_path: Path, error: _ShardPinUnavailableError) -> None:
         """Record a durable operational failure when a streamed shard cannot be pinned."""
@@ -7160,11 +7240,13 @@ def scan_model_streaming(
         )
         defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
         defer_hash_for_file_backed_hdf5 = _should_defer_hash_for_file_backed_hdf5(str(scan_path))
+        defer_hash_for_file_backed_onnx = should_defer_hash_for_file_backed_onnx(str(scan_path), scan_config)
         defer_hash_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(str(scan_path), scan_config)
         if (
             defer_hash_for_max_total_size
             or defer_hash_for_max_file_size
             or defer_hash_for_file_backed_hdf5
+            or defer_hash_for_file_backed_onnx
             or defer_hash_for_pytorch_read_limit
         ):
             aggregate_hash_complete = False
@@ -7224,11 +7306,28 @@ def scan_model_streaming(
     stream_started = False
 
     try:
-        file_iterator = iter(file_generator)
+        try:
+            file_iterator = iter(file_generator)
+        except TypeError as error:
+            logger.error(f"Streaming file source is not iterable: {error}", exc_info=True)
+            results.has_errors = True
+            preserve_shard_reconciliation_errors = True
+            aggregate_hash_complete = False
+            _add_issue_to_model(
+                results,
+                f"Streaming file source is not iterable: {error}",
+                severity=IssueSeverity.INFO.value,
+                details={
+                    "analysis_incomplete": True,
+                    "operational_error": True,
+                    "exception_type": type(error).__name__,
+                },
+            )
+            file_iterator = iter(())
         scanning_deferred_openvino_sidecars = False
         while True:
             try:
-                file_path, _is_last = next(file_iterator)
+                streamed_item = next(file_iterator)
                 stream_started = True
             except StopIteration:
                 if not scanning_deferred_openvino_sidecars and deferred_openvino_sidecars:
@@ -7265,14 +7364,49 @@ def scan_model_streaming(
                 )
                 break
 
+            streamed_item_count += 1
+            precomputed_result: ScanResult | None = None
+            source_bytes_preaccounted = 0
+            pretransferred_bytes = 0
+            reported_source_path: str | None = None
+            if len(streamed_item) == 4:
+                file_path, _is_last, precomputed_result, byte_accounting = streamed_item
+                if not isinstance(byte_accounting, StreamedSourceByteAccounting):
+                    raise TypeError("Invalid streamed source byte accounting metadata")
+                pretransferred_bytes = byte_accounting.pretransferred_bytes
+                source_bytes_preaccounted = byte_accounting.source_bytes_preaccounted
+                reported_source_path = byte_accounting.source_path
+            elif len(streamed_item) == 3:
+                file_path, _is_last, precomputed_result = streamed_item
+            elif len(streamed_item) == 2:
+                file_path, _is_last = streamed_item
+            else:
+                raise ValueError("Streamed items must contain two, three, or four values")
+            if precomputed_result is not None and not isinstance(precomputed_result, ScanResult):
+                raise TypeError("Invalid precomputed streamed scan result")
             source_path = Path(file_path)
+            report_path = reported_source_path or str(source_path)
+            is_precomputed_streamed_result = precomputed_result is not None
             source_key = Path(os.path.abspath(source_path))
-            if source_key in consumed_openvino_companions:
+            if pretransferred_bytes:
+                if received_pretransferred_bytes or streamed_item_count != 1:
+                    raise ValueError("Pretransferred bytes must be reported exactly once on the first streamed item")
+                received_pretransferred_bytes = True
+                results.bytes_scanned += pretransferred_bytes
+            if source_bytes_preaccounted and not received_pretransferred_bytes:
+                raise ValueError("Source bytes cannot be preaccounted before pretransferred bytes are reported")
+            if (
+                pretransferred_bytes
+                and not is_precomputed_streamed_result
+                and record_max_total_size_failure(report_path)
+            ):
+                delete_streamed_source(source_path, "after streaming size limit")
+                break
+            if not is_precomputed_streamed_result and source_key in consumed_openvino_companions:
                 continue
             scan_path = source_path
-            report_path = str(source_path)
             pinned_scan_context: Any | None = None
-            preserve_source_after_scan = False
+            preserve_source_after_scan = is_precomputed_streamed_result
             openvino_scan_companion_path: Path | None = None
             openvino_scan_companion_key: Path | None = None
             openvino_companion_pre_scan_identity: _FileIdentitySnapshot | None = None
@@ -7288,7 +7422,8 @@ def scan_model_streaming(
             try:
                 check_interrupted()
             except KeyboardInterrupt:
-                delete_streamed_source(source_path, "after streaming interruption")
+                if not is_precomputed_streamed_result:
+                    delete_streamed_source(source_path, "after streaming interruption")
                 raise
 
             # Check timeout
@@ -7297,10 +7432,54 @@ def scan_model_streaming(
                 preserve_shard_reconciliation_errors = True
                 aggregate_hash_complete = False
                 logger.error(f"Streaming scan timeout after {timeout}s")
-                delete_streamed_source(source_path, "after streaming timeout")
+                if not is_precomputed_streamed_result:
+                    delete_streamed_source(source_path, "after streaming timeout")
                 break
 
             try:
+                if precomputed_result is not None:
+                    _normalize_unclassified_scan_failure(precomputed_result)
+                    metadata_dict = dict(precomputed_result.metadata or {})
+                    report_path = str(
+                        metadata_dict.get("source_path") or metadata_dict.get("remote_source_path") or source_path
+                    )
+                    resolved_report_path = str(source_path)
+                    operational_scan_failure = _scan_result_has_operational_error(precomputed_result)
+                    if operational_scan_failure:
+                        preserve_shard_reconciliation_errors = True
+                    aggregate_hash_complete = False
+                    scan_result_dict = {
+                        "bytes_scanned": adjusted_streamed_bytes(
+                            precomputed_result.bytes_scanned,
+                            source_bytes_preaccounted,
+                        ),
+                        "files_scanned": 1,
+                        "has_errors": operational_scan_failure,
+                        "success": precomputed_result.success,
+                        "issues": _serialize_streamed_records(
+                            list(precomputed_result.issues or []),
+                            report_path,
+                            resolved_report_path,
+                        ),
+                        "checks": _serialize_streamed_records(
+                            list(precomputed_result.checks or []),
+                            report_path,
+                            resolved_report_path,
+                        ),
+                        "scanners": [precomputed_result.scanner_name] if precomputed_result.scanner_name else [],
+                        "file_metadata": {report_path: metadata_dict},
+                    }
+                    results.aggregate_scan_result(scan_result_dict)
+                    asset = asset_from_scan_result(report_path, precomputed_result, metadata=metadata_dict)
+                    if asset:
+                        asset["is_streamed"] = True
+                        asset["is_remote_header_only"] = bool(metadata_dict.get("remote_header_only"))
+                        results.assets.extend(convert_assets_to_models([asset]))
+                    files_processed += 1
+                    if record_max_total_size_failure(report_path):
+                        break
+                    continue
+
                 if base_dir is not None and _is_huggingface_cache_file(str(source_path)):
                     logger.debug(f"Skipping HuggingFace cache file: {source_path}")
                     continue
@@ -7496,6 +7675,10 @@ def scan_model_streaming(
                     str(scan_path),
                     scan_config,
                 )
+                defer_hash_for_file_backed_onnx = should_defer_hash_for_file_backed_onnx(
+                    str(scan_path),
+                    scan_config,
+                )
                 if defer_hash_for_pytorch_read_limit:
                     scan_config = dict(scan_config)
                     scan_config["cache_enabled"] = False
@@ -7517,7 +7700,13 @@ def scan_model_streaming(
                     str(scan_path),
                     scan_config,
                 ):
-                    for onnx_external_data_path in _streamed_onnx_external_data_hash_paths(scan_path):
+                    discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(
+                        scan_path,
+                        deadline=start_time + timeout,
+                    )
+                    if discovered_external_data_paths is None:
+                        aggregate_hash_complete = False
+                    for onnx_external_data_path in discovered_external_data_paths or ():
                         external_data_key = Path(os.path.abspath(onnx_external_data_path))
                         external_data_identity = _snapshot_file_identity(onnx_external_data_path)
                         external_data_target_key = _file_target_identity_key(
@@ -7558,14 +7747,18 @@ def scan_model_streaming(
                             if max_total_size > 0 and top_level_hashed_bytes + external_data_size > max_total_size:
                                 aggregate_hash_complete = False
                                 continue
-                        external_data_hash = append_streamed_file_hash(
-                            onnx_external_data_path,
-                            scan_config,
-                            progress_label=onnx_external_data_path.name,
-                            skip_if_stream_source_seen=True,
-                            skip_if_stream_target_seen=True,
-                        )
-                        if external_data_hash is not None and external_data_target_key is not None:
+                        external_data_hash = None
+                        if not defer_hash_for_file_backed_onnx:
+                            external_data_hash = append_streamed_file_hash(
+                                onnx_external_data_path,
+                                scan_config,
+                                progress_label=onnx_external_data_path.name,
+                                skip_if_stream_source_seen=True,
+                                skip_if_stream_target_seen=True,
+                            )
+                        if external_data_target_key is not None and (
+                            defer_hash_for_file_backed_onnx or external_data_hash is not None
+                        ):
                             consumed_onnx_external_data_aliases[external_data_key] = external_data_target_key
 
                 # Scan the file
@@ -7668,13 +7861,16 @@ def scan_model_streaming(
                     if file_hash is not None:
                         existing_hashes = metadata_dict.get("file_hashes")
                         if isinstance(existing_hashes, dict):
-                            existing_hashes.setdefault("sha256", file_hash)
+                            metadata_dict["file_hashes"] = {**existing_hashes, "sha256": file_hash}
                         else:
                             metadata_dict["file_hashes"] = {"sha256": file_hash}
 
                     # Use dict-based aggregation to avoid import issues
                     scan_result_dict = {
-                        "bytes_scanned": scan_result.bytes_scanned,
+                        "bytes_scanned": adjusted_streamed_bytes(
+                            scan_result.bytes_scanned,
+                            source_bytes_preaccounted,
+                        ),
                         "files_scanned": 1,  # Each scan_result represents one file
                         # Bare success=False results were normalized above so
                         # they fail closed as inconclusive instead of exiting 0.
@@ -7743,17 +7939,7 @@ def scan_model_streaming(
                         results.assets.extend(convert_assets_to_models([asset]))
 
                 files_processed += 1
-                if max_total_size > 0 and results.bytes_scanned > max_total_size:
-                    aggregate_hash_complete = False
-                    _add_issue_to_model(
-                        results,
-                        f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
-                        severity=IssueSeverity.INFO.value,
-                        location=report_path,
-                        details={"max_total_size": max_total_size, "analysis_incomplete": True},
-                    )
-                    results.has_errors = True
-                    preserve_shard_reconciliation_errors = True
+                if record_max_total_size_failure(report_path):
                     break
 
             except Exception as e:

@@ -2,8 +2,10 @@
 
 import builtins
 import hashlib
+import json
 import os
 import pickle
+import tarfile
 import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -12,9 +14,52 @@ from typing import Any, BinaryIO, cast
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.integrations.sarif_formatter import format_sarif_output
+from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
+from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
+from modelaudit.scanner_results import MAX_MEMBER_FILE_HASH_RECORDS
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
-from tests.helpers import create_mock_pytorch_zip
+from tests.helpers import create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
+
+
+class _MaliciousPicklePayload:
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return (eval, ("__import__('os').system('echo modelaudit-test')",))
+
+
+def _pytorch_zip_with_pickle_members(
+    path: Path,
+    *,
+    members: dict[str, bytes],
+) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        write_mock_pytorch_zip_metadata(archive)
+        for member_name, payload in members.items():
+            archive.writestr(member_name, payload)
+    return path
+
+
+def _member_sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _member_records_for_segments(metadata: dict[str, Any], path_segments: list[str]) -> list[dict[str, Any]]:
+    member_hashes = metadata.get("member_file_hashes")
+    assert isinstance(member_hashes, dict)
+    return [
+        record
+        for record in member_hashes.values()
+        if isinstance(record, dict) and record.get("path_segments") == path_segments
+    ]
+
+
+def _single_member_record(metadata: dict[str, Any], path_segments: list[str]) -> dict[str, Any]:
+    records = _member_records_for_segments(metadata, path_segments)
+    assert len(records) == 1
+    return records[0]
+
 
 _PYTORCH_LEGACY_MAGIC_NUMBER = 0x1950A86A20F9469CFC6C
 _PYTORCH_LEGACY_PROTOCOL_VERSION = 1001
@@ -237,6 +282,222 @@ class TestRegularScanContentHash:
         nested_hash = hashlib.sha256(nested_payload).hexdigest()
         assert result.content_hash == compute_aggregate_hash([outer_hash])
         assert result.content_hash != compute_aggregate_hash([nested_hash])
+
+    def test_pytorch_member_hashes_are_namespaced_in_json_sarif_and_sbom(self, tmp_path: Path) -> None:
+        benign_payload = pickle.dumps({"safe": True})
+        malicious_payload = pickle.dumps(_MaliciousPicklePayload())
+        model_path = _pytorch_zip_with_pickle_members(
+            tmp_path / "model.pt",
+            members={
+                "data.pkl": benign_payload,
+                "evil.pkl": malicious_payload,
+            },
+        )
+
+        result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+        outer_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        benign_hash = _member_sha256(benign_payload)
+        malicious_hash = _member_sha256(malicious_payload)
+        metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
+
+        assert metadata["file_hashes"]["sha256"] == outer_hash
+        assert "file_hashes_complete" not in metadata
+        assert "file_hashes_bytes_hashed" not in metadata
+        assert metadata["file_hashes"]["sha256"] not in {benign_hash, malicious_hash}
+        assert _single_member_record(metadata, ["data.pkl"])["file_hashes"]["sha256"] == benign_hash
+        assert _single_member_record(metadata, ["evil.pkl"])["file_hashes"]["sha256"] == malicious_hash
+        assert any(
+            issue.location is not None
+            and ":evil.pkl" in issue.location
+            and issue.details.get("pickle_filename") == "evil.pkl"
+            for issue in result.issues
+        )
+
+        json_payload = result.model_dump(mode="json", exclude_none=True)
+        json_metadata = json_payload["file_metadata"][str(model_path)]
+        assert json_metadata["file_hashes"]["sha256"] == outer_hash
+        assert _single_member_record(json_metadata, ["evil.pkl"])["file_hashes"]["sha256"] == malicious_hash
+
+        sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+        artifact = sarif_payload["runs"][0]["artifacts"][0]
+        assert artifact["hashes"]["sha-256"] == outer_hash
+        sarif_member_metadata = {"member_file_hashes": artifact["properties"]["memberFileHashes"]}
+        assert _single_member_record(sarif_member_metadata, ["evil.pkl"])["file_hashes"]["sha256"] == malicious_hash
+
+        sbom_payload = json.loads(generate_sbom_pydantic([str(model_path)], result))
+        component = sbom_payload["components"][0]
+        assert component["hashes"][0]["content"] == outer_hash
+        member_hash_property = next(
+            prop["value"] for prop in component["properties"] if prop["name"] == "modelaudit:member_file_hashes"
+        )
+        assert (
+            _single_member_record({"member_file_hashes": json.loads(member_hash_property)}, ["evil.pkl"])[
+                "file_hashes"
+            ]["sha256"]
+            == malicious_hash
+        )
+
+    def test_member_hash_truncation_summary_exports_to_sarif_and_sbom(self, tmp_path: Path) -> None:
+        model_path = tmp_path / "bounded.pt"
+        model_path.write_bytes(b"outer")
+        outer_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        member_hash = hashlib.sha256(b"inner").hexdigest()
+        member_identity = json.dumps({"occurrence": 1, "path": ["retained.pkl"]}, sort_keys=True, separators=(",", ":"))
+        result = create_initial_audit_result()
+        result.assets = [AssetModel(path=str(model_path), type="pytorch", size=model_path.stat().st_size)]
+        result.file_metadata[str(model_path)] = FileMetadataModel(
+            file_size=model_path.stat().st_size,
+            file_hashes=FileHashesModel(sha256=outer_hash),
+            member_file_hashes={
+                member_identity: {
+                    "file_hashes": {"sha256": member_hash},
+                    "file_size": len(b"inner"),
+                    "hash_complete": True,
+                    "hash_status": "complete",
+                    "path_segments": ["retained.pkl"],
+                    "occurrence": 1,
+                }
+            },
+            member_file_hashes_total=MAX_MEMBER_FILE_HASH_RECORDS + 2,
+            member_file_hashes_truncated=True,
+            member_file_hashes_omitted=2,
+        )
+
+        sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+        artifact_properties = sarif_payload["runs"][0]["artifacts"][0]["properties"]
+        assert artifact_properties["memberFileHashesTotal"] == MAX_MEMBER_FILE_HASH_RECORDS + 2
+        assert artifact_properties["memberFileHashesTruncated"] is True
+        assert artifact_properties["memberFileHashesOmitted"] == 2
+        assert (
+            _single_member_record({"member_file_hashes": artifact_properties["memberFileHashes"]}, ["retained.pkl"])[
+                "file_hashes"
+            ]["sha256"]
+            == member_hash
+        )
+
+        sbom_payload = json.loads(generate_sbom_pydantic([str(model_path)], result))
+        component_properties = {prop["name"]: prop["value"] for prop in sbom_payload["components"][0]["properties"]}
+        assert component_properties["modelaudit:member_file_hashes_total"] == str(MAX_MEMBER_FILE_HASH_RECORDS + 2)
+        assert component_properties["modelaudit:member_file_hashes_truncated"] == "true"
+        assert component_properties["modelaudit:member_file_hashes_omitted"] == "2"
+
+    def test_generic_zip_member_hash_identities_are_collision_free(self, tmp_path: Path) -> None:
+        duplicate_payload = pickle.dumps({"duplicate": True})
+        literal_colon_payload = pickle.dumps({"literal": "colon"})
+        inner_payload = pickle.dumps({"nested": True})
+        malicious_payload = pickle.dumps(_MaliciousPicklePayload())
+        inner_zip_path = tmp_path / "inner.zip"
+        with zipfile.ZipFile(inner_zip_path, "w") as inner_zip:
+            inner_zip.writestr("inner.pkl", inner_payload)
+        archive_path = tmp_path / "collision.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("dup.pkl", duplicate_payload)
+            archive.writestr("dup.pkl", duplicate_payload)
+            archive.writestr("nested.zip:inner.pkl", literal_colon_payload)
+            archive.write(inner_zip_path, "nested.zip")
+            archive.writestr("evil.pkl", malicious_payload)
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+        metadata = result.file_metadata[str(archive_path)].model_dump(mode="json", exclude_none=True)
+
+        duplicate_records = sorted(
+            _member_records_for_segments(metadata, ["dup.pkl"]),
+            key=lambda record: record["occurrence"],
+        )
+        assert [record["occurrence"] for record in duplicate_records] == [1, 2]
+        assert all(record["file_hashes"]["sha256"] == _member_sha256(duplicate_payload) for record in duplicate_records)
+        assert _single_member_record(metadata, ["nested.zip:inner.pkl"])["file_hashes"]["sha256"] == _member_sha256(
+            literal_colon_payload
+        )
+        assert _single_member_record(metadata, ["nested.zip", "inner.pkl"])["file_hashes"]["sha256"] == _member_sha256(
+            inner_payload
+        )
+        assert any(issue.location is not None and ":evil.pkl" in issue.location for issue in result.issues)
+
+    def test_tar_member_hashes_are_child_scoped(self, tmp_path: Path) -> None:
+        payload = pickle.dumps({"safe": "tar"})
+        archive_path = tmp_path / "model.tar"
+        payload_path = tmp_path / "payload.pkl"
+        payload_path.write_bytes(payload)
+        with tarfile.open(archive_path, "w") as archive:
+            archive.add(payload_path, arcname="payload.pkl")
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+        metadata = result.file_metadata[str(archive_path)].model_dump(mode="json", exclude_none=True)
+
+        assert metadata["file_hashes"]["sha256"] == hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        assert _single_member_record(metadata, ["payload.pkl"])["file_hashes"]["sha256"] == _member_sha256(payload)
+
+    def test_pytorch_member_hashes_survive_cache_round_trip(self, tmp_path: Path) -> None:
+        reset_cache_manager()
+        payload = pickle.dumps({"safe": "cache"})
+        model_path = _pytorch_zip_with_pickle_members(tmp_path / "cached.pt", members={"data.pkl": payload})
+        outer_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        member_hash = _member_sha256(payload)
+        cache_dir = str(tmp_path / "cache")
+        first = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=cache_dir,
+            min_cache_file_size=0,
+        )
+        cache_manager = get_cache_manager(cache_dir, enabled=True)
+        stats_after_first = cache_manager.get_stats()
+        second = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=cache_dir,
+            min_cache_file_size=0,
+        )
+        stats_after_second = cache_manager.get_stats()
+        assert stats_after_second["cache_hits"] == stats_after_first["cache_hits"] + 1
+
+        for result in (first, second):
+            metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
+            assert metadata["file_hashes"]["sha256"] == outer_hash
+            assert _single_member_record(metadata, ["data.pkl"])["file_hashes"]["sha256"] == member_hash
+            assert _single_member_record(metadata, ["data.pkl"])["file_hashes"]["sha256"] != outer_hash
+
+        reset_cache_manager()
+
+    @pytest.mark.integration
+    @pytest.mark.slow
+    def test_real_hf_bert_large_rust_model_member_hash_is_namespaced(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if os.environ.get("MODELAUDIT_RUN_REAL_HF") != "1":
+            pytest.skip("set MODELAUDIT_RUN_REAL_HF=1 to download the pinned Hugging Face artifact")
+
+        from huggingface_hub import hf_hub_download
+
+        repo_id = "google-bert/bert-large-uncased"
+        revision = "6da4b6a26a1877e173fca3225479512db81a5e5b"
+        member_name = "rust_model/code/__torch__.py.debug_pkl"
+        expected_parent_sha = "9db92b28d6fb0e5ab770b24ed27bde941d1f314a3c5e8c28d698025cc1807d7f"
+        expected_member_sha = "326da525ff54021be4bbeb601c3ff4ee74e0cee4e45a0fbe1b9ccde3ca16229c"
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-cache"))
+        model_path = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                revision=revision,
+                filename="rust_model.ot",
+                local_dir=tmp_path / "hf-model",
+            )
+        )
+
+        with zipfile.ZipFile(model_path) as archive:
+            member_payload = archive.read(member_name)
+        assert hashlib.sha256(model_path.read_bytes()).hexdigest() == expected_parent_sha
+        assert len(member_payload) == 106
+        assert _member_sha256(member_payload) == expected_member_sha
+
+        result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+        metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
+
+        assert metadata["file_hashes"]["sha256"] == expected_parent_sha
+        assert _single_member_record(metadata, [member_name])["file_hashes"]["sha256"] == expected_member_sha
 
     def test_directory_generates_hash(self, tmp_path):
         """Test that scanning a directory generates an aggregate content hash."""
@@ -606,6 +867,156 @@ class TestHashGenerationEdgeCases:
         )
 
         assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")
+
+    def test_hash_files_by_path_defers_file_backed_onnx(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit import core
+
+        model_path = tmp_path / "model.onnx"
+        later_path = tmp_path / "later.pkl"
+        _write_regular_scan_onnx_model(model_path)
+        later_path.write_bytes(pickle.dumps({"safe": True}))
+        monkeypatch.setattr(
+            core,
+            "_calculate_file_hash",
+            lambda *_args, **_kwargs: pytest.fail("files beyond the deferred ONNX budget must not be hashed"),
+        )
+
+        hashes = core._hash_files_by_path(
+            [str(model_path), str(later_path)],
+            config={
+                "max_total_size": model_path.stat().st_size - 1,
+                "onnx_raw_detector_max_bytes": 1,
+            },
+        )
+
+        assert hashes[str(model_path)].startswith("unhashable_file_backed_onnx_")
+        assert hashes[str(later_path)].startswith("unhashable_max_total_size_")
+
+    def test_file_backed_onnx_hash_deferral_uses_bounded_content_routing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from modelaudit.utils.file.detection import (
+            PROTOBUF_MODEL_CANDIDATE_FORMAT,
+            detect_file_format_for_skip_filter,
+        )
+        from modelaudit.utils.helpers.cache_decorator import should_defer_hash_for_file_backed_onnx
+
+        renamed_model = tmp_path / "renamed"
+        ambiguous_model = tmp_path / "ambiguous.conf"
+        foreign_zip = tmp_path / "foreign.onnx"
+        _write_regular_scan_onnx_model(renamed_model)
+        _write_regular_scan_onnx_model(ambiguous_model)
+        ambiguous_model.write_bytes((b"\x12\x01a" * 4097) + ambiguous_model.read_bytes())
+        with zipfile.ZipFile(foreign_zip, "w") as archive:
+            archive.writestr("payload.txt", "not ONNX")
+        config = {"onnx_raw_detector_max_bytes": 1}
+
+        assert should_defer_hash_for_file_backed_onnx(str(renamed_model), config)
+        assert not should_defer_hash_for_file_backed_onnx(str(foreign_zip), config)
+        assert detect_file_format_for_skip_filter(str(ambiguous_model)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        assert should_defer_hash_for_file_backed_onnx(
+            str(ambiguous_model),
+            {**config, "scanners": ["protobuf_model_candidate"]},
+        )
+        assert not should_defer_hash_for_file_backed_onnx(
+            str(ambiguous_model),
+            {**config, "scanners": ["metadata"]},
+        )
+        assert not should_defer_hash_for_file_backed_onnx(
+            str(renamed_model),
+            {**config, "scanners": ["metadata"]},
+        )
+
+        metadata_result = scan_model_directory_or_file(
+            str(ambiguous_model),
+            cache_enabled=False,
+            scanners=["metadata"],
+            skip_file_types=False,
+            onnx_raw_detector_max_bytes=1,
+        )
+        expected_hash = compute_aggregate_hash([hashlib.sha256(ambiguous_model.read_bytes()).hexdigest()])
+        assert metadata_result.content_hash == expected_hash
+
+    def test_single_file_backed_onnx_bypasses_aggregate_and_cache_hashes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit import core
+        from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
+
+        model_path = tmp_path / "model.onnx"
+        _write_regular_scan_onnx_model(model_path)
+        monkeypatch.setattr(
+            core,
+            "_calculate_file_hash",
+            lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must not be aggregate-hashed"),
+        )
+        monkeypatch.setattr(
+            SecureFileHasher,
+            "hash_file",
+            lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must not be cache-hashed"),
+        )
+        monkeypatch.setattr(
+            SecureFileHasher,
+            "hash_file_with_stat",
+            lambda *_args, **_kwargs: pytest.fail("file-backed ONNX must not be cache-hashed"),
+        )
+
+        result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            onnx_raw_detector_max_bytes=1,
+        )
+
+        assert result.content_hash is None
+        assert result.file_metadata[str(model_path)]["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+
+    def test_directory_file_backed_onnx_omits_aggregate_but_hashes_other_files(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit import core
+
+        model_path = tmp_path / "model.onnx"
+        sidecar = tmp_path / "weights.data"
+        safe_path = tmp_path / "safe.pkl"
+        sidecar.write_bytes(b"W" * 4096)
+        _write_regular_scan_onnx_model(
+            model_path,
+            external_location=sidecar.name,
+            external_size=sidecar.stat().st_size,
+        )
+        _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+        safe_path.write_bytes(pickle.dumps({"safe": True}))
+        original_hash = core._calculate_file_hash
+        hashed: list[Path] = []
+
+        def track_hash(path: str, *, deadline: float | None = None) -> str:
+            hashed.append(Path(path))
+            if Path(path) in {model_path, sidecar}:
+                pytest.fail("file-backed ONNX owners and context sidecars must not be aggregate-hashed")
+            return original_hash(path, deadline=deadline)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            onnx_raw_detector_max_bytes=1,
+        )
+
+        assert safe_path in hashed
+        assert model_path not in hashed
+        assert sidecar not in hashed
+        assert result.bytes_scanned == sum(path.stat().st_size for path in (model_path, sidecar, safe_path))
+        assert result.content_hash is None
 
     def test_hash_files_by_path_defers_oversized_pytorch_zip_ckpt_read_limit(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1123,6 +1534,40 @@ class TestHashGenerationEdgeCases:
 
 
 class TestOnnxExternalDataContentHash:
+    def test_directory_hash_is_deferred_when_onnx_sidecar_discovery_is_incomplete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A bounded discovery failure must not produce a partial aggregate hash."""
+        from modelaudit.scanners import onnx_scanner
+
+        model_path = tmp_path / "model.onnx"
+        sidecar = tmp_path / "weights.data"
+        sidecar.write_bytes(b"\x01\x02\x03\x04")
+        _write_regular_scan_onnx_model(
+            model_path,
+            external_location=sidecar.name,
+            external_size=sidecar.stat().st_size,
+        )
+        _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+
+        def fail_bounded_discovery(*_args: Any, **_kwargs: Any) -> Any:
+            raise onnx_scanner._OnnxStructureParseError(
+                "retained_object_limit_exceeded",
+                "bounded discovery exhausted its retained-object budget",
+            )
+
+        monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", fail_bounded_discovery)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            scanners=["onnx"],
+        )
+
+        assert result.content_hash is None
+
     def test_directory_hash_ignores_stale_external_data_on_inline_tensor(
         self,
         tmp_path: Path,
@@ -1156,6 +1601,12 @@ class TestOnnxExternalDataContentHash:
         sidecar.write_bytes(b"\x01\x02\x03\x04")
         _write_regular_scan_onnx_model(model_path, external_location=sidecar.name, external_size=sidecar.stat().st_size)
         _skip_path_during_directory_prefilter(monkeypatch, sidecar)
+        onnx = pytest.importorskip("onnx")
+        monkeypatch.setattr(
+            onnx,
+            "load",
+            lambda *_args, **_kwargs: pytest.fail("directory sidecar discovery must not preload ONNX"),
+        )
 
         result = scan_model_directory_or_file(
             str(tmp_path),
@@ -1233,10 +1684,12 @@ class TestOnnxExternalDataContentHash:
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
         assert result.content_hash is None
 
+    @pytest.mark.parametrize("defer_owner_hash", [False, True])
     def test_directory_hash_omits_hash_when_onnx_sidecar_exceeds_max_total_size(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        defer_owner_hash: bool,
     ) -> None:
         """Sidecar bytes should participate in max_total_size accounting."""
         from modelaudit import core
@@ -1260,6 +1713,7 @@ class TestOnnxExternalDataContentHash:
             cache_enabled=False,
             scanners=["onnx"],
             max_total_size=model_path.stat().st_size,
+            onnx_raw_detector_max_bytes=1 if defer_owner_hash else 512 * 1024 * 1024,
         )
 
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
