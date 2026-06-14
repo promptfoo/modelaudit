@@ -3494,7 +3494,7 @@ def _source_search_context() -> tuple[str, ...]:
     search_path = _runtime_search_path_without_hooks()
     if search_path is None:
         return (_UNREUSABLE_HOOK_STATE_IDENTITY,)
-    return tuple(os.path.abspath(entry or os.getcwd()) for entry in search_path)
+    return tuple(str(Path(entry or os.getcwd()).absolute()) for entry in search_path)
 
 
 def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
@@ -4033,7 +4033,7 @@ def _file_finder_state(
             for name in ("_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache")
         )
         and type(finder_path) is str
-        and os.path.abspath(finder_path) == os.path.abspath(cache_key)
+        and Path(finder_path).absolute() == Path(cache_key).absolute()
         and _file_finder_loaders_are_standard(loaders)
         and type(path_mtime) in {int, float}
         and len(typed_path_cache) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
@@ -4146,7 +4146,7 @@ def _path_importer_resolution_context(search_path: Iterable[str]) -> tuple[str, 
         if not dict.__contains__(path_importer_cache, cache_key):
             continue
         finder = dict.__getitem__(path_importer_cache, cache_key)
-        absolute_cache_key = os.path.abspath(cache_key)
+        absolute_cache_key = str(Path(cache_key).absolute())
         if finder is None:
             path_importers.append(f"{absolute_cache_key}=cached-none")
             continue
@@ -4644,7 +4644,7 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
             resolved_spec.submodule_search_locations = namespace_locations
         if resolved_spec is not None and resolved_spec.loader is None and resolved_spec.submodule_search_locations:
             namespace_search_path = tuple(
-                os.path.abspath(entry or os.getcwd()) for entry in resolved_spec.submodule_search_locations
+                str(Path(entry or os.getcwd()).absolute()) for entry in resolved_spec.submodule_search_locations
             )
             if len(namespace_search_path) > _MAX_SOURCE_FINGERPRINT_CANDIDATES or _search_path_has_untrusted_importer(
                 namespace_search_path

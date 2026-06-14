@@ -362,7 +362,7 @@ def _loaded_package_search_path(module_name: str) -> list[str] | None:
     raw_search_path = vars(loaded_module).get("__path__")
     if not isinstance(raw_search_path, (list, tuple)) or not all(isinstance(entry, str) for entry in raw_search_path):
         return None
-    return [os.path.abspath(entry or os.getcwd()) for entry in raw_search_path]
+    return [str(Path(entry or os.getcwd()).absolute()) for entry in raw_search_path]
 
 
 @dataclass
@@ -1480,7 +1480,7 @@ class ScanResultsCache:
 
     @staticmethod
     def _source_search_context() -> list[str]:
-        return [os.path.abspath(entry or os.getcwd()) for entry in sys.path]
+        return [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path]
 
     @staticmethod
     def _regular_file_identity_fingerprint(file_stat: os.stat_result) -> str:

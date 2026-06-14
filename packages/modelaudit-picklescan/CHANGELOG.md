@@ -9,7 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- mirror cached path-importer semantics for call-graph origin proofs and shared snapshots with loaded-package contexts, bounded memoized `FileFinder` summaries, archive-validated ZIP directories, and startup-frozen distribution roots across Python 3.10-3.13, failing closed on cached misses and untrusted earlier finders while preserving trusted earlier resolutions and metadata-only finder removal
+- mirror cached path-importer semantics for call-graph origin proofs and shared snapshots with symlink-sensitive lexical paths, loaded-package contexts, bounded memoized `FileFinder` summaries, archive-validated ZIP directories, and startup-frozen distribution roots across Python 3.10-3.13, failing closed on cached misses and untrusted earlier finders while preserving trusted earlier resolutions and metadata-only finder removal
 - suppress canonical PyTorch tensor rebuild warnings only for validated unloaded-runtime ZIP `data.pkl` storage context
 - suppress installed source-trusted inert Hugging Face training metadata and safe NumPy ndarray reconstruction noise while keeping default-install, unresolved, rebound, or shadowed framework metadata suspicious
 - skip PyTorch ZIP tensor storage members referenced by `data.pkl` during hidden-pickle discovery while preserving inconclusive outcomes for ambiguous storage evidence

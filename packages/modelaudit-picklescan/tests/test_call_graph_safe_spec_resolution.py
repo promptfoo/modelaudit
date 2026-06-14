@@ -1647,6 +1647,47 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
         call_graph._cached_file_finder_resolution_summary.cache_clear()
 
 
+def test_importer_context_preserves_symlink_sensitive_parent_components(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "base"
+    clean_parent = tmp_path / "other"
+    clean_root = clean_parent / "pkgroot"
+    poisoned_root = base / "pkgroot"
+    clean_root.mkdir(parents=True)
+    poisoned_root.mkdir(parents=True)
+    symlink_target = clean_parent / "inner"
+    symlink_target.mkdir()
+    link = base / "link"
+    try:
+        link.symlink_to(symlink_target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    clean_entry = str(link / ".." / "pkgroot")
+    poisoned_entry = str(poisoned_root)
+    assert Path(clean_entry).resolve() == clean_root.resolve()
+    assert os.path.abspath(clean_entry) == os.path.abspath(poisoned_entry)
+
+    finder = FileFinder(clean_entry, *_standard_file_finder_loader_details())
+    monkeypatch.setitem(sys.path_importer_cache, clean_entry, finder)
+    monkeypatch.setitem(sys.path_importer_cache, poisoned_entry, finder)
+    _clear_call_graph_caches()
+    try:
+        monkeypatch.setattr(sys, "path", [clean_entry])
+        clean_search_context = call_graph._source_search_context()
+        clean_importer_context = call_graph._path_importer_resolution_context(sys.path)
+        assert call_graph._file_finder_resolution_identity(finder, clean_entry) is not None
+
+        monkeypatch.setattr(sys, "path", [poisoned_entry])
+        assert call_graph._source_search_context() != clean_search_context
+        assert call_graph._path_importer_resolution_context(sys.path) != clean_importer_context
+        assert call_graph._file_finder_resolution_identity(finder, poisoned_entry) is None
+    finally:
+        _clear_call_graph_caches()
+
+
 def test_invalidated_file_finder_is_normalized_before_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1361,6 +1361,60 @@ def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+def test_scan_cache_invalidates_symlink_sensitive_parent_search_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "base"
+    clean_parent = tmp_path / "other"
+    clean_root = clean_parent / "pkgroot"
+    poisoned_root = base / "pkgroot"
+    clean_root.mkdir(parents=True)
+    poisoned_root.mkdir(parents=True)
+    symlink_target = clean_parent / "inner"
+    symlink_target.mkdir()
+    link = base / "link"
+    try:
+        link.symlink_to(symlink_target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    clean_entry = link / ".." / "pkgroot"
+    poisoned_entry = poisoned_root
+    assert clean_entry.resolve() == clean_root.resolve()
+    assert os.path.abspath(clean_entry) == os.path.abspath(poisoned_entry)
+    clean_source = clean_root / "cache_switch_module.py"
+    poisoned_source = poisoned_root / "cache_switch_module.py"
+    clean_source.write_text("def entrypoint():\n    return 1\n")
+    poisoned_source.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    original_search_path = list(sys.path)
+    monkeypatch.setattr(sys, "path", [str(clean_entry), *original_search_path])
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    clean_source_path = str(clean_source.absolute())
+    fingerprint_metadata = _call_graph_fingerprint_metadata(
+        {clean_source_path: hashlib.sha256(clean_source.read_bytes()).hexdigest()},
+        module_sources={"cache_switch_module": clean_source_path},
+    )
+    fingerprint_metadata["search_context"] = cache._source_search_context()
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    monkeypatch.setattr(sys, "path", [str(poisoned_entry), *original_search_path])
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
 def test_scan_cache_invalidates_when_loaded_module_override_appears(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
