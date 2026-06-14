@@ -111,6 +111,17 @@ def _malicious_lightgbm_legal_payload() -> bytes:
     )
 
 
+def _xgboost_json_legal_payload() -> bytes:
+    return json.dumps(
+        {
+            "version": [1, 7, 4],
+            "learner": {"gradient_booster": {"model": {"trees": ["invalid"]}}},
+            "license": "MIT License",
+            "metadata": "os.system('id')",
+        }
+    ).encode()
+
+
 def _over_budget_legal_payload(leading: bytes, trailing: bytes = b"") -> bytes:
     return leading + (b"A" * (_LEGAL_TEXT_ROUTE_MAX_BYTES + 1 - len(leading))) + trailing
 
@@ -912,6 +923,8 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         ),
         pytest.param(b"MIT License\n\x82\x01)R.", 2, id="embedded-EXT1"),
         pytest.param(b"MIT License\nPid\n)R.", 2, id="embedded-PERSID"),
+        pytest.param(b"MIT License\nPid\n", 2, id="terminal-embedded-PERSID"),
+        pytest.param(b"MIT License\nPid\n0", 2, id="embedded-PERSID-structural-continuation"),
         pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
         pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
         pytest.param(b"MIT License\nXPid\n)R.\n", 2, id="adjacent-embedded-PERSID"),
@@ -925,6 +938,7 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
             id="embedded-import-only-GLOBAL",
         ),
         pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
+        pytest.param(b"MIT License\n]QApache License\n", 2, id="same-line-BINPERSID"),
         pytest.param(b"MIT\nXS'id'\nQtext\n", 2, id="mid-line-STRING-before-BINPERSID"),
         pytest.param(
             b"MIT License\nNcposix\nsystem\n(S'id'\ntR.",
@@ -1065,6 +1079,17 @@ def test_scan_file_routes_oversized_lightgbm_named_license_before_text(tmp_path:
     )
 
 
+def test_scan_file_routes_xgboost_json_named_license_before_text(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(_xgboost_json_legal_payload())
+
+    result = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.scanner_names == ["xgboost"]
+    assert any(check.name == "XGBoost JSON Structure Validation" for check in result.checks)
+    assert any(check.name == "JSON Content Analysis" for check in result.checks)
+
+
 def test_scan_file_fails_closed_for_binary_pickle_embedded_in_license_text(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     path.write_bytes(b"MIT License\nCopyright (c) Example\n" + b"\x80\x04cposix\nsystem\n(S'id'\ntR.")
@@ -1168,6 +1193,10 @@ def test_scan_file_keeps_benign_encoded_execution_word_on_text_route(
         pytest.param(
             b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
             id="context-opcode-leading-prose-lines",
+        ),
+        pytest.param(
+            b"MIT License\n]AQuality terms apply.\n",
+            id="same-line-context-opcode-near-match",
         ),
         pytest.param(
             b"MIT License\nXS'id'\nZtext\n",

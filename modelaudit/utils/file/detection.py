@@ -5443,9 +5443,10 @@ def _incomplete_pickle_security_route(
     pre_stack_inst: bool,
     security_events: list[tuple[int, str, bool]],
 ) -> str | None:
+    allow_embedded_persid = decoded or not require_continuation or not only_text_line_side_effects
     meaningful_events = _meaningful_pickle_events(
         security_events,
-        allow_embedded_persid=decoded,
+        allow_embedded_persid=allow_embedded_persid,
         embedded=embedded,
     )
     if pre_stack_inst and not any(name == "INST" for _index, name, _meaningful in meaningful_events):
@@ -5468,7 +5469,8 @@ def _incomplete_pickle_security_route(
     if any(name == "INST" for _index, name, _meaningful in meaningful_events):
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     if any(
-        name in _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES and (name != "PERSID" or (not embedded and stream_start == 0))
+        name in _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES
+        and (name != "PERSID" or (stream_start == 0 and allow_embedded_persid))
         for _index, name, _flag in meaningful_events
     ):
         return _pickle_candidate_route(embedded=embedded or stream_start > 0)
@@ -5567,7 +5569,7 @@ def _classify_bounded_pickle_candidate(
 
                 meaningful_events = _meaningful_pickle_events(
                     events,
-                    allow_embedded_persid=decoded,
+                    allow_embedded_persid=(decoded or not require_continuation or not text_line_side_effects_only),
                     embedded=embedded,
                 )
                 if meaningful_events and (
@@ -5696,14 +5698,13 @@ def _iter_pickle_line_candidate_starts(payload: bytes) -> Iterator[int]:
             candidate_start += 1
         if candidate_start < line_end:
             yield candidate_start
-            search_start = candidate_start + 1
-            while search_start < line_end:
-                string_start = payload.find(b"S", search_start, line_end)
-                if string_start < 0:
-                    break
-                if string_start + 1 < line_end and payload[string_start + 1 : string_start + 2] in {b"'", b'"'}:
-                    yield string_start
-                search_start = string_start + 1
+            for offset in range(candidate_start + 1, line_end):
+                value = payload[offset]
+                if (
+                    value in _PICKLE_CONTEXT_REQUIRED_SECURITY_OPCODE_BYTES
+                    and payload[offset - 1] in _PICKLE_TRIVIAL_NO_ARGUMENT_PREFIX_BYTES
+                ) or (value == ord("S") and offset + 1 < line_end and payload[offset + 1 : offset + 2] in {b"'", b'"'}):
+                    yield offset
         line_start = line_end + 1
 
 
@@ -5755,6 +5756,10 @@ def _iter_pickle_candidate_offsets(
             and not has_trivial_prefix
         )
         require_continuation = offset > 0
+        if opcode_name == "PERSID":
+            line_end = payload.find(b"\n", offset + 1)
+            trailing = payload[line_end + 1 :] if line_end >= 0 else b""
+            require_continuation = require_continuation and bool(trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES))
         if opcode_name in _PICKLE_LINE_PAIR_OPCODES:
             first_line_end = payload.find(b"\n", offset + 1)
             second_line_end = payload.find(b"\n", first_line_end + 1)
@@ -9860,6 +9865,13 @@ def _detect_structured_legal_sidecar_route(
     signature_model = _detect_content_routed_signature_model(file_path, file_size, prefix)
     if signature_model is not None:
         return signature_model
+    from ...scanners.xgboost_scanner import XGBoostScanner
+
+    if XGBoostScanner._is_xgboost_json(
+        str(file_path),
+        max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+    ):
+        return "xgboost"
     if _could_be_content_routed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
     if huggingface_tokenizer_json_has_template_route_evidence(file_path, allow_renamed_path=True):

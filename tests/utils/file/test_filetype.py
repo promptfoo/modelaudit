@@ -3955,6 +3955,16 @@ def test_next_buffer_callback_precedes_eof() -> None:
             id="embedded-PERSID",
         ),
         pytest.param(
+            b"MIT License\nPid\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="terminal-embedded-PERSID",
+        ),
+        pytest.param(
+            b"MIT License\nPid\n0",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="embedded-PERSID-structural-continuation",
+        ),
+        pytest.param(
             b"mit\nVb\nVx\n\x93)R.",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-STACK_GLOBAL-unicode",
@@ -3988,6 +3998,11 @@ def test_next_buffer_callback_precedes_eof() -> None:
             b"MIT License\nS'id'\nQApache License\n",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-BINPERSID",
+        ),
+        pytest.param(
+            b"MIT License\n]QApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="same-line-BINPERSID",
         ),
         pytest.param(
             b"MIT\nXS'id'\nQtext\n",
@@ -4047,6 +4062,28 @@ def test_legal_sidecar_structural_candidate_routing_covers_shared_side_effect_pa
     assert detect_file_format(str(path)) == expected_format
     assert detect_file_format_from_magic(str(path)) == expected_format
     assert detect_file_format_for_skip_filter(str(path)) == expected_format
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            b'{"version":"1.7.4","learner":{},"license":"MIT License"}',
+            id="scalar-version",
+        ),
+        pytest.param(
+            b'{"version":[1,7,4],"learner":"student","license":"MIT License"}',
+            id="scalar-learner",
+        ),
+    ],
+)
+def test_xgboost_json_legal_sidecar_near_matches_remain_text(tmp_path: Path, payload: bytes) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
 @pytest.mark.parametrize(
@@ -4223,6 +4260,10 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
         pytest.param(
             b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
             id="context-opcode-leading-prose-lines",
+        ),
+        pytest.param(
+            b"MIT License\n]AQuality terms apply.\n",
+            id="same-line-context-opcode-near-match",
         ),
         pytest.param(
             b"MIT License\nXS'id'\nZtext\n",
@@ -4504,6 +4545,11 @@ def test_structured_xml_model_named_license_precedes_legal_text_fallback(
             id="xgboost",
         ),
         pytest.param(
+            b'{"version":[1,7,4],"learner":{},"license":"MIT License"}',
+            "xgboost",
+            id="xgboost-json",
+        ),
+        pytest.param(
             json.dumps(
                 {
                     "framework": "jax",
@@ -4548,6 +4594,11 @@ def test_structured_model_named_license_precedes_legal_text_fallback(
             b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions",
             "cntk",
             id="cntk",
+        ),
+        pytest.param(
+            b'{"version":[1,7,4],"learner":{},"license":"MIT License"}',
+            "xgboost",
+            id="xgboost-json",
         ),
         pytest.param(
             b'{"framework":"jax","orbax_version":"0.1.0","license":"MIT License"}',

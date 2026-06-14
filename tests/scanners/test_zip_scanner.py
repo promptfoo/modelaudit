@@ -205,6 +205,17 @@ def _malicious_lightgbm_legal_payload() -> bytes:
     )
 
 
+def _xgboost_json_legal_payload() -> bytes:
+    return json.dumps(
+        {
+            "version": [1, 7, 4],
+            "learner": {"gradient_booster": {"model": {"trees": ["invalid"]}}},
+            "license": "MIT License",
+            "metadata": "os.system('id')",
+        }
+    ).encode()
+
+
 def _long_global_operand_in_legal_text() -> bytes:
     return b"MIT License\n" + b"c" + (b"a" * 70000) + b"\nx\n."
 
@@ -11322,6 +11333,8 @@ class TestZipScanner:
             ),
             pytest.param(b"MIT License\n\x82\x01)R.", 2, id="embedded-EXT1"),
             pytest.param(b"MIT License\nPid\n)R.", 2, id="embedded-PERSID"),
+            pytest.param(b"MIT License\nPid\n", 2, id="terminal-embedded-PERSID"),
+            pytest.param(b"MIT License\nPid\n0", 2, id="embedded-PERSID-structural-continuation"),
             pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
             pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
             pytest.param(b"MIT License\nXPid\n)R.\n", 2, id="adjacent-embedded-PERSID"),
@@ -11335,6 +11348,7 @@ class TestZipScanner:
                 id="embedded-import-only-GLOBAL",
             ),
             pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
+            pytest.param(b"MIT License\n]QApache License\n", 2, id="same-line-BINPERSID"),
             pytest.param(b"MIT\nXS'id'\nQtext\n", 2, id="mid-line-STRING-before-BINPERSID"),
             pytest.param(
                 b"MIT License\nNcposix\nsystem\n(S'id'\ntR.",
@@ -11499,6 +11513,10 @@ class TestZipScanner:
             pytest.param(
                 b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
                 id="context-opcode-leading-prose-lines",
+            ),
+            pytest.param(
+                b"MIT License\n]AQuality terms apply.\n",
+                id="same-line-context-opcode-near-match",
             ),
             pytest.param(
                 b"MIT License\nXS'id'\nZtext\n",
@@ -11715,6 +11733,22 @@ class TestZipScanner:
             check.name == "Command Indicator Check"
             and check.status == CheckStatus.FAILED
             and check.details.get("zip_entry") == "LICENSE"
+            for check in result.checks
+        )
+
+    def test_scan_zip_routes_xgboost_json_license_member_before_text(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "xgboost_license.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", _xgboost_json_legal_payload())
+
+        result = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert any(
+            check.name == "XGBoost JSON Structure Validation" and check.details.get("zip_entry") == "LICENSE"
+            for check in result.checks
+        )
+        assert any(
+            check.name == "JSON Content Analysis" and check.details.get("zip_entry") == "LICENSE"
             for check in result.checks
         )
 
