@@ -3811,49 +3811,36 @@ def _zipimport_bounded_central_directory_names(
         tail = _read_exact_file_descriptor(file_descriptor, tail_size)
         if tail is None:
             return None
-        search_end = len(tail)
-        end_record: tuple[int, int, int] | None = None
-        while search_end:
-            end_offset = tail.rfind(b"PK\x05\x06", 0, search_end)
-            if end_offset < 0:
-                return None
-            search_end = end_offset
-            if end_offset + _ZIP_END_RECORD_SIZE > len(tail):
-                continue
-            (
-                disk_number,
-                central_directory_disk,
-                entries_on_disk,
-                entry_count,
-                central_directory_size,
-                central_directory_offset,
-                comment_size,
-            ) = struct.unpack_from("<4H2LH", tail, end_offset + 4)
-            # Windows console-script launchers embed a ZIP resource inside a PE
-            # executable, so valid non-ZIP bytes may follow the end record.
-            if end_offset + _ZIP_END_RECORD_SIZE + comment_size > len(tail):
-                continue
-            if (
-                disk_number != 0
-                or central_directory_disk != 0
-                or entries_on_disk != entry_count
-                or entry_count > _MAX_SOURCE_FINGERPRINT_CANDIDATES
-                or entry_count == 0xFFFF
-                or central_directory_size > _MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES
-                or central_directory_size == 0xFFFFFFFF
-                or central_directory_offset == 0xFFFFFFFF
-            ):
-                return None
-            absolute_end_offset = opened.st_size - tail_size + end_offset
-            central_directory_start = absolute_end_offset - central_directory_size
-            if central_directory_start < central_directory_offset or central_directory_start < 0:
-                return None
-            end_record = central_directory_start, central_directory_size, entry_count
-            break
-        if end_record is None:
+        end_offset = tail.rfind(b"PK\x05\x06")
+        if end_offset < 0 or end_offset + _ZIP_END_RECORD_SIZE > len(tail):
             return None
-
-        central_directory_start, central_directory_size, expected_entries = end_record
+        (
+            disk_number,
+            central_directory_disk,
+            entries_on_disk,
+            expected_entries,
+            central_directory_size,
+            central_directory_offset,
+            comment_size,
+        ) = struct.unpack_from("<4H2LH", tail, end_offset + 4)
+        # Windows console-script launchers embed a ZIP resource inside a PE
+        # executable, so valid non-ZIP bytes may follow the end record.
+        if (
+            end_offset + _ZIP_END_RECORD_SIZE + comment_size > len(tail)
+            or disk_number != 0
+            or central_directory_disk != 0
+            or entries_on_disk != expected_entries
+            or expected_entries > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+            or expected_entries == 0xFFFF
+            or central_directory_size > _MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES
+            or central_directory_size == 0xFFFFFFFF
+            or central_directory_offset == 0xFFFFFFFF
+        ):
+            return None
+        absolute_end_offset = opened.st_size - tail_size + end_offset
+        central_directory_start = absolute_end_offset - central_directory_size
+        if central_directory_start < central_directory_offset or central_directory_start < 0:
+            return None
         os.lseek(file_descriptor, central_directory_start, os.SEEK_SET)
         central_directory = _read_exact_file_descriptor(file_descriptor, central_directory_size)
         if central_directory is None:
@@ -3950,6 +3937,7 @@ def _zipimport_names_exclude_module(
     module_name: str,
 ) -> bool:
     leaf_name = module_name.rsplit(".", maxsplit=1)[-1]
+    prefix = prefix.replace("\\", "/")
     if (
         not prefix.isascii()
         or not leaf_name
@@ -4060,7 +4048,11 @@ def _cached_oversized_zipimporter_excludes_module(
         return False
     archive = dict.get(instance_state, "archive")
     prefix = dict.get(instance_state, "prefix")
-    if type(archive) is not str or type(prefix) is not str or _zipimport_expected_prefix(archive, cache_key) != prefix:
+    if (
+        type(archive) is not str
+        or type(prefix) is not str
+        or _zipimport_expected_prefix(archive, cache_key) != prefix.replace("\\", "/")
+    ):
         return False
     files = _zipimport_directory_cache_files(archive)
     snapshot = _zipimport_absent_cache_snapshot(files, prefix, module_name)

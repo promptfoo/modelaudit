@@ -1632,6 +1632,12 @@ def test_zipimporter_directory_shape_accepts_implicit_directory_sentinels() -> N
     assert call_graph._zipimport_files_are_safe(files)
 
 
+def test_zipimport_absence_check_normalizes_platform_separators() -> None:
+    assert not call_graph._zipimport_names_exclude_module({b"package/module.py"}, "package\\", "package.module")
+    assert not call_graph._zipimport_names_exclude_module({"package\\module.py"}, "package\\", "package.module")
+    assert call_graph._zipimport_names_exclude_module({b"package/other.py"}, "package\\", "package.module")
+
+
 def test_zipimporter_directory_validation_does_not_execute_mutated_reader(tmp_path: Path) -> None:
     archive_path = tmp_path / "mutated-reader.zip"
     _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
