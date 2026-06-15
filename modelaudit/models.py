@@ -689,12 +689,14 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         # operationally unsuccessful scan by themselves, but incomplete
         # coverage is always an unsuccessful aggregate security coverage result.
         incoming_unsuccessful = results_dict.get("success", True) is False
-        if (
+        incoming_invalidates_content_hash = (
             results_dict.get("has_errors", False)
             or incoming_has_incomplete_coverage
             or (incoming_unsuccessful and not incoming_has_security_findings)
-        ):
+        )
+        if incoming_invalidates_content_hash:
             self.success = False
+            self.content_hash = None
 
         # Convert and extend issues
         new_issues = convert_issues_to_models(results_dict.get("issues", []))
@@ -742,7 +744,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                 self.scanner_names.append(scanner)
 
         # Merge content_hash if present (for streaming mode)
-        if "content_hash" in results_dict and results_dict["content_hash"] is not None:
+        if self.success and "content_hash" in results_dict and results_dict["content_hash"] is not None:
             self.content_hash = results_dict["content_hash"]
 
     def aggregate_scan_result_direct(self, scan_result: Any) -> None:

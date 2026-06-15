@@ -4090,7 +4090,7 @@ def test_pytorch_zip_regular_scan_sparse_zip64_storage_shard_is_bounded(
 
     def fail_hash(path: str) -> str:
         hashed_paths.append(path)
-        if path == str(zip_path):
+        if Path(path).name == zip_path.name:
             pytest.fail("oversized PyTorch ZIP shard was content-hashed before bounded scan dispatch")
         return "a" * 64
 

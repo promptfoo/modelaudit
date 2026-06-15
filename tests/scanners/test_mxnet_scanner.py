@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
@@ -218,7 +218,8 @@ def test_mxnet_direct_symbol_routed_params_preserves_raw_text_findings(
     assert "mxnet_symbol_truncated" in result.metadata["scan_outcome_reasons"]
 
 
-def test_directory_scan_preserves_path_sensitive_companion_metadata(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "streaming"])
+def test_directory_scan_preserves_path_sensitive_companion_metadata(tmp_path: Path, stream: bool) -> None:
     with_params_dir = tmp_path / "with_params"
     without_params_dir = tmp_path / "without_params"
     with_params_dir.mkdir()
@@ -230,7 +231,17 @@ def test_directory_scan_preserves_path_sensitive_companion_metadata(tmp_path: Pa
     _write_symbol_file(without_params_symbol)
     _write_params_file(with_params_dir / "net-0000.params")
 
-    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=False)
+    if stream:
+        files = sorted(path for path in tmp_path.rglob("*") if path.is_file())
+        result = scan_model_streaming(
+            ((path, index == len(files) - 1) for index, path in enumerate(files)),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=False,
+        )
+    else:
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=False)
 
     assert result.file_metadata[str(with_params_symbol)]["has_params_companion"] is True
     assert result.file_metadata[str(without_params_symbol)]["has_params_companion"] is False

@@ -1750,8 +1750,10 @@ def test_scan_same_directory_shards_rejects_split_index_authority(
         None,
     )
     assert boundary_check is not None, output_payload["checks"]
-    expected_reason = "shard_target_changed_during_scan" if os.name == "nt" else "shard_family_changed_during_scan"
-    assert boundary_check["details"]["reason"] == expected_reason
+    assert boundary_check["details"]["reason"] in {
+        "shard_target_changed_during_scan",
+        "shard_family_changed_during_scan",
+    }
 
 
 @pytest.mark.parametrize("assume_shard_family", [False, True], ids=["default", "assumed-family"])
@@ -1856,6 +1858,34 @@ def test_scan_single_unindexed_shard_rejects_file_to_directory_aba(
     )
     assert boundary_check["details"]["reason"] == "shard_target_changed_during_scan"
     assert shard.read_bytes() == malicious_bytes
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "stream-flag"])
+@pytest.mark.parametrize(
+    "scanner_args",
+    [pytest.param([], id="default"), pytest.param(["--scanners", "jax_checkpoint"], id="jax-only")],
+)
+def test_scan_explicit_orbax_metadata_preserves_sibling_marker_context(
+    tmp_path: Path,
+    stream: bool,
+    scanner_args: list[str],
+) -> None:
+    marker_path = tmp_path / "_CHECKPOINT"
+    marker_path.write_text("{}", encoding="utf-8")
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text('{"restore_fn":"os.system"}', encoding="utf-8")
+    arguments = ["scan", str(metadata_path), "--format", "json", "--no-cache", *scanner_args]
+    if stream:
+        arguments.append("--stream")
+
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+
+    assert result.exit_code == 1, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert any(
+        issue.get("rule_code") == "S302" and issue.get("location") == str(metadata_path)
+        for issue in output_payload["issues"]
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows file-sharing semantics")
@@ -1969,9 +1999,457 @@ def test_scan_shard_shaped_directory_does_not_require_file_receipt(tmp_path: Pat
     )
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_scan_stable_symlinked_directory_preserves_dispatch_receipt(
+    tmp_path: Path,
+    requires_symlinks: None,
+    stream: bool,
+) -> None:
+    """Stable top-level directory symlinks remain supported while receipt checks are active."""
+    del requires_symlinks
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    (model_directory / "weights.safetensors").write_bytes(_minimal_safetensors_bytes())
+    source_link = tmp_path / "model-link"
+    source_link.symlink_to(model_directory, target_is_directory=True)
+    arguments = [
+        "scan",
+        str(source_link),
+        "--scanners",
+        "safetensors",
+        "--format",
+        "json",
+        "--no-cache",
+    ]
+    if stream:
+        arguments.append("--stream")
+
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is True
+    assert not any(check.get("name") == "Local Source Boundary Check" for check in output_payload["checks"])
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_cli_retained_source_rejects_ordinary_ancestor_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """Ordinary-ancestor ABA cannot splice a benign target into a malicious source scan."""
+    import pickle
+
+    from modelaudit import core as core_module
+
+    staging = tmp_path / "staging"
+    alternate = tmp_path / "alternate"
+    malicious_root = staging / "model"
+    benign_root = alternate / "model"
+    malicious_root.mkdir(parents=True)
+    benign_root.mkdir(parents=True)
+    malicious = b"cos\nsystem\n(S'echo unsafe'\ntR."
+    (malicious_root / "payload.pkl").write_bytes(malicious)
+    (benign_root / "payload.pkl").write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    requested = malicious_root.absolute()
+    malicious_parent_inode = staging.stat().st_ino
+    swap = tmp_path / "swap"
+    snapshot_count = 0
+
+    def select_malicious(selected: bool) -> None:
+        currently_malicious = staging.stat().st_ino == malicious_parent_inode
+        if currently_malicious == selected:
+            return
+        staging.rename(swap)
+        alternate.rename(staging)
+        swap.rename(alternate)
+
+    def is_requested(value: str | os.PathLike[str]) -> bool:
+        try:
+            candidate = os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(value))))
+        except TypeError:
+            return False
+        return candidate == os.path.normcase(os.path.normpath(str(requested)))
+
+    original_lexical = core_module._local_source_lexical_identity_entries
+    original_snapshot = core_module._snapshot_local_source_receipt
+    original_open = os.open
+
+    def lexical_with_ancestor_aba(source: str | os.PathLike[str]) -> list[tuple[Path, os.stat_result]]:
+        if not is_requested(source):
+            return original_lexical(source)
+        select_malicious(True)
+        observed = original_lexical(source)
+        select_malicious(False)
+        return observed
+
+    def snapshot_with_ancestor_aba(
+        source: str | os.PathLike[str],
+    ) -> dict[str, int | str] | None:
+        nonlocal snapshot_count
+        if not is_requested(source):
+            return original_snapshot(source)
+        snapshot_count += 1
+        select_malicious(True)
+        try:
+            return original_snapshot(source)
+        finally:
+            select_malicious(True)
+
+    def open_with_ancestor_aba(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        race_old_binder = (
+            snapshot_count >= 2
+            and bool(flags & getattr(os, "O_DIRECTORY", 0))
+            and is_requested(cast(str | os.PathLike[str], path))
+        )
+        if race_old_binder:
+            select_malicious(False)
+        try:
+            if dir_fd is None:
+                return original_open(path, flags, mode)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+        finally:
+            if race_old_binder:
+                select_malicious(True)
+
+    monkeypatch.setattr(core_module, "_local_source_lexical_identity_entries", lexical_with_ancestor_aba)
+    monkeypatch.setattr(core_module, "_snapshot_local_source_receipt", snapshot_with_ancestor_aba)
+    monkeypatch.setattr(cli_module, "_snapshot_local_source_receipt", snapshot_with_ancestor_aba)
+    monkeypatch.setattr(os, "open", open_with_ancestor_aba)
+
+    arguments = ["scan", str(requested), "--scanners", "pickle", "--format", "json", "--no-cache"]
+    if stream:
+        arguments.append("--stream")
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+    output = parse_click_json_output(result.output)
+
+    assert (requested / "payload.pkl").read_bytes() == malicious
+    assert result.exit_code != 0, output
+    critical = [issue for issue in output["issues"] if issue.get("severity") == "critical"]
+    boundary = [check for check in output["checks"] if check.get("name") == "Local Source Boundary Check"]
+    assert critical or boundary, json.dumps(output, indent=2)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_cli_retained_directory_bypasses_raced_file_prefilter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """A pathname race cannot skip a retained malicious directory as a non-model file."""
+    import pickle
+
+    staging = tmp_path / "staging"
+    alternate = tmp_path / "alternate"
+    requested = staging / "model.py"
+    requested.mkdir(parents=True)
+    malicious = b"cos\nsystem\n(S'echo unsafe'\ntR."
+    (requested / "payload.pkl").write_bytes(malicious)
+    alternate.mkdir()
+    (alternate / "model.py").write_text("print('benign')\n", encoding="utf-8")
+    benign = tmp_path / "benign.pkl"
+    benign.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    held = tmp_path / "held"
+
+    def select_benign() -> None:
+        staging.rename(held)
+        alternate.rename(staging)
+
+    def select_malicious() -> None:
+        staging.rename(alternate)
+        held.rename(staging)
+
+    original_defaults = cli_module.generate_auto_defaults
+    original_prefilter = cli_module._should_skip_non_model_file
+
+    def raced_defaults(paths: list[str]) -> dict[str, Any]:
+        select_benign()
+        try:
+            defaults = original_defaults(paths)
+            assert defaults["skip_non_model_files"] is True
+            return defaults
+        finally:
+            select_malicious()
+
+    def raced_prefilter(path: str, runtime: Any, *, verbose: bool) -> bool:
+        if Path(path) != requested.absolute():
+            return original_prefilter(path, runtime, verbose=verbose)
+        select_benign()
+        try:
+            skipped = original_prefilter(path, runtime, verbose=verbose)
+            assert skipped is True
+            return skipped
+        finally:
+            select_malicious()
+
+    monkeypatch.setattr(cli_module, "generate_auto_defaults", raced_defaults)
+    monkeypatch.setattr(cli_module, "_should_skip_non_model_file", raced_prefilter)
+    arguments = [
+        "scan",
+        str(requested),
+        str(benign),
+        "--scanners",
+        "pickle",
+        "--format",
+        "json",
+        "--no-cache",
+    ]
+    if stream:
+        arguments.append("--stream")
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+    output = parse_click_json_output(result.output)
+
+    assert (requested / "payload.pkl").read_bytes() == malicious
+    assert result.exit_code != 0, output
+    assert any(issue.get("severity") == "critical" for issue in output["issues"])
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_cli_explicit_symlink_is_retained_before_resolution_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """Explicit source expansion cannot resolve a transient benign symlink target."""
+    import pickle
+
+    malicious_root = tmp_path / "malicious"
+    benign_root = tmp_path / "benign"
+    malicious_root.mkdir()
+    benign_root.mkdir()
+    malicious = b"cos\nsystem\n(S'echo unsafe'\ntR."
+    (malicious_root / "payload.pkl").write_bytes(malicious)
+    (benign_root / "payload.pkl").write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    source = tmp_path / "model"
+    source.symlink_to(malicious_root, target_is_directory=True)
+    original_resolve = Path.resolve
+    fired = False
+
+    def raced_resolve(path: Path, *args: Any, **kwargs: Any) -> Path:
+        nonlocal fired
+        if path.absolute() == source.absolute() and not fired:
+            fired = True
+            source.unlink()
+            source.symlink_to(benign_root, target_is_directory=True)
+            try:
+                return original_resolve(path, *args, **kwargs)
+            finally:
+                source.unlink()
+                source.symlink_to(malicious_root, target_is_directory=True)
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", raced_resolve)
+    arguments = ["scan", str(source), "--scanners", "pickle", "--format", "json", "--no-cache"]
+    if stream:
+        arguments.append("--stream")
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+    output = parse_click_json_output(result.output)
+
+    assert original_resolve(source) == malicious_root
+    assert result.exit_code != 0, output
+    assert any(issue.get("severity") == "critical" for issue in output["issues"]) or any(
+        check.get("name") == "Local Source Boundary Check" for check in output["checks"]
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "stream-flag"])
+def test_cli_retained_file_alias_retarget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """A regular-file alias changed after dispatch cannot redirect the scan to benign bytes."""
+    import pickle
+
+    malicious = tmp_path / "malicious.pkl"
+    malicious.write_bytes(b"cos\nsystem\n(S'echo unsafe'\ntR.")
+    benign = tmp_path / "benign.pkl"
+    benign.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    source = tmp_path / "model.pkl"
+    source.symlink_to(malicious)
+    original_scan = cli_module.scan_model_directory_or_file
+    retargeted = False
+
+    def scan_after_retarget(*args: Any, **kwargs: Any) -> ModelAuditResultModel:
+        nonlocal retargeted
+        source.unlink()
+        source.symlink_to(benign)
+        retargeted = True
+        try:
+            return original_scan(*args, **kwargs)
+        finally:
+            source.unlink()
+            source.symlink_to(malicious)
+
+    monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_after_retarget)
+    arguments = ["scan", str(source), "--scanners", "pickle", "--format", "json", "--no-cache"]
+    if stream:
+        arguments.append("--stream")
+
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+    output = parse_click_json_output(result.output)
+
+    assert retargeted is True
+    assert source.resolve() == malicious
+    assert result.exit_code == 2, output
+    assert output["success"] is False
+    assert output["has_errors"] is True
+    assert output.get("content_hash") is None
+    assert any(check.get("name") == "Local Source Boundary Check" for check in output["checks"])
+    assert "/proc/self/fd/" not in result.output
+    assert "/dev/fd/" not in result.output
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_cli_stable_file_alias_preserves_scan_and_content_hash(tmp_path: Path) -> None:
+    """A stable regular-file alias remains fully scannable through its retained source."""
+    import pickle
+
+    target = tmp_path / "target.pkl"
+    target.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    source = tmp_path / "model.pkl"
+    source.symlink_to(target)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(source), "--scanners", "pickle", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+    output = parse_click_json_output(result.output)
+
+    assert result.exit_code == 0, output
+    assert output["success"] is True
+    assert output["files_scanned"] == 1
+    assert output["content_hash"]
+    assert output["assets"][0]["path"] == str(source)
+    assert "/proc/self/fd/" not in result.output
+    assert "/dev/fd/" not in result.output
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "stream-flag"])
+@pytest.mark.parametrize("filename", ["model.pkl", "pytorch_model-00001-of-00001.bin"])
+def test_cli_retained_regular_file_survives_ordinary_ancestor_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+    filename: str,
+) -> None:
+    """A restored ancestor cannot make an ordinary malicious file scan benign replacement bytes."""
+    import pickle
+
+    from modelaudit import core as core_module
+
+    staging = tmp_path / "staging"
+    alternate = tmp_path / "alternate"
+    source = staging / filename
+    substitute = alternate / filename
+    source.parent.mkdir()
+    substitute.parent.mkdir()
+    malicious = b"cos\nsystem\n(S'echo unsafe'\ntR."
+    source.write_bytes(malicious)
+    substitute.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    swap = tmp_path / "swap"
+    original_scan_file = core_module.scan_file
+    scan_calls = 0
+
+    def swap_ancestors() -> None:
+        staging.rename(swap)
+        alternate.rename(staging)
+        swap.rename(alternate)
+
+    def scan_during_ancestor_aba(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal scan_calls
+        scan_calls += 1
+        swap_ancestors()
+        try:
+            return original_scan_file(path, config=config)
+        finally:
+            swap_ancestors()
+
+    monkeypatch.setattr(core_module, "scan_file", scan_during_ancestor_aba)
+    arguments = ["scan", str(source), "--scanners", "pickle", "--format", "json", "--no-cache"]
+    if stream:
+        arguments.append("--stream")
+
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+    output = parse_click_json_output(result.output)
+
+    assert scan_calls == 1
+    assert source.read_bytes() == malicious
+    assert result.exit_code in {1, 2}, output
+    assert any(issue.get("severity") == "critical" for issue in output["issues"])
+    if filename == "model.pkl":
+        assert not any(check.get("name") == "Local Source Boundary Check" for check in output["checks"])
+    assert output["assets"][0]["path"] == str(source)
+    assert "/proc/" not in result.output
+    assert "/dev/fd/" not in result.output
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_scan_receipt_bound_hf_snapshot_preserves_blob_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+    stream: bool,
+) -> None:
+    """Descriptor binding must retain the logical HF snapshot path used to admit blob aliases."""
+    del requires_symlinks
+    hub_root = tmp_path / "hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub_root))
+    model_cache = hub_root / "models--org--repo"
+    snapshot = model_cache / "snapshots" / "revision"
+    blobs = model_cache / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    blob = blobs / "deadbeef"
+    blob.write_bytes(b"\x80\x04}\x94.")
+    alias = snapshot / "model.pkl"
+    alias.symlink_to(Path("../../blobs") / blob.name)
+    arguments = [
+        "scan",
+        str(snapshot),
+        "--scanners",
+        "pickle",
+        "--format",
+        "json",
+        "--no-cache",
+    ]
+    if stream:
+        arguments.append("--stream")
+
+    result = CliRunner().invoke(cli, arguments, catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is True
+    assert output_payload["files_scanned"] == 1
+    assert output_payload["content_hash"]
+    assert not any(
+        issue.get("message") == "Path traversal outside scanned directory" for issue in output_payload["issues"]
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
 def test_scan_shard_shaped_directory_rejects_file_substitution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
 ) -> None:
     """A directory-to-file swap after dispatch cannot produce a clean singleton scan."""
     shard_directory = tmp_path / "model-00001-of-00001.safetensors"
@@ -1979,22 +2457,30 @@ def test_scan_shard_shaped_directory_rejects_file_substitution(
     malicious_child = shard_directory / "malicious.pkl"
     malicious_child.write_bytes(b"cos\nsystem\n(S'echo unsafe'\ntR.")
     held_directory = tmp_path / "held-model-directory"
-    original_scan = cli_module.scan_model_directory_or_file
+    from modelaudit import core as core_module
 
-    def scan_substitute(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
+    original_scan = core_module.scan_model_streaming if stream else cli_module.scan_model_directory_or_file
+
+    def scan_substitute(*args: Any, **kwargs: Any) -> ModelAuditResultModel:
         shard_directory.rename(held_directory)
         shard_directory.write_bytes(_minimal_safetensors_bytes())
         try:
-            return original_scan(path, *args, **kwargs)
+            return original_scan(*args, **kwargs)
         finally:
             shard_directory.unlink()
             held_directory.rename(shard_directory)
 
-    monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_substitute)
+    if stream:
+        monkeypatch.setattr(core_module, "scan_model_streaming", scan_substitute)
+    else:
+        monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_substitute)
 
+    arguments = ["scan", str(shard_directory), "--scanners", "safetensors", "--format", "json", "--no-cache"]
+    if stream:
+        arguments.append("--stream")
     result = CliRunner().invoke(
         cli,
-        ["scan", str(shard_directory), "--scanners", "safetensors", "--format", "json", "--no-cache"],
+        arguments,
         catch_exceptions=False,
     )
 

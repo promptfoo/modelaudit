@@ -6,6 +6,9 @@ import re
 # Progress tracking imports with circular dependency detection
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -145,6 +148,32 @@ _WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile
 )
 DEFAULT_MAX_FILE_READ_SIZE: Final[int] = 512 * 1024 * 1024
 DEFAULT_READ_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024
+_TRUSTED_LOGICAL_SCAN_PATH: ContextVar[tuple[str, str] | None] = ContextVar(
+    "modelaudit_trusted_logical_scan_path",
+    default=None,
+)
+
+
+@contextmanager
+def _trusted_logical_scan_path(scan_path: str, logical_path: str) -> Iterator[None]:
+    """Bind lexical routing hints to one internally retained physical scan path."""
+    binding = (os.path.normcase(os.path.abspath(scan_path)), os.path.abspath(logical_path))
+    token = _TRUSTED_LOGICAL_SCAN_PATH.set(binding)
+    try:
+        yield
+    finally:
+        _TRUSTED_LOGICAL_SCAN_PATH.reset(token)
+
+
+def _trusted_logical_path_for_scan(scan_path: str) -> str | None:
+    """Return the internal lexical route only for its exact physical scan path."""
+    binding = _TRUSTED_LOGICAL_SCAN_PATH.get()
+    if binding is None:
+        return None
+    bound_scan_path, logical_path = binding
+    if os.path.normcase(os.path.abspath(scan_path)) != bound_scan_path:
+        return None
+    return logical_path
 
 
 @lru_cache(maxsize=16)
@@ -439,10 +468,10 @@ class BaseScanner(ABC):
         Returns:
             ScanResult object (either from cache or fresh scan)
         """
-        from ..utils.helpers.cache_decorator import cached_scan
+        from ..utils.helpers.cache_decorator import BOUND_CACHE_IDENTITY_CONFIG_KEY, cached_scan
 
         # Create cached version of the scan method
-        @cached_scan()
+        @cached_scan(cache_identity_config_key=BOUND_CACHE_IDENTITY_CONFIG_KEY)
         def cached_scan_method(scanner_self: "BaseScanner", file_path: str) -> ScanResult:
             return scanner_self.scan(file_path)
 

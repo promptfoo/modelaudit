@@ -35,6 +35,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY = "_jax_skip_xgboost_json_overlap"
 JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY = "_jax_skip_jinja_json_overlap"
+JAX_VERIFIED_ORBAX_SIBLING_CONFIG_KEY = "_jax_verified_orbax_sibling"
 
 try:
     import numpy as np
@@ -2065,7 +2066,10 @@ class JaxCheckpointScanner(BaseScanner):
                     Path(path).name.lower() in {"_checkpoint", "orbax_checkpoint_metadata.json"}
                     or (
                         Path(path).name.lower() == "metadata.json"
-                        and self._has_regular_orbax_sibling_marker(Path(path))
+                        and (
+                            self.config.get(JAX_VERIFIED_ORBAX_SIBLING_CONFIG_KEY) is True
+                            or self._has_regular_orbax_sibling_marker(Path(path))
+                        )
                     )
                     or has_jax_json_checkpoint_structure(data)
                 )

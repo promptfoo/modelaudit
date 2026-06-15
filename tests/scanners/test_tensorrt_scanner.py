@@ -154,7 +154,7 @@ def test_tensorrt_read_failure_takes_precedence_over_security_finding(
     original_read = TensorRTScanner._read_file_safely
 
     def fail_selected_read(self: TensorRTScanner, path: str) -> bytes:
-        if path == str(unreadable):
+        if Path(path).name == unreadable.name:
             raise OSError("simulated TensorRT read failure")
         return original_read(self, path)
 

@@ -11,9 +11,10 @@ import logging
 import os
 import re
 import stat
+import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar, copy_context
@@ -96,6 +97,48 @@ class _PinnedShardScan:
 
     path: str
     changed_during_scan: bool = False
+
+
+_PINNED_FILE_IDENTITY_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+    "st_nlink",
+)
+CONTEXT_ONLY_COMPANION_TARGET_KEY = "_context_only_companion"
+
+
+def _pinned_file_descriptor_changed(
+    file_fd: int,
+    expected_stat: os.stat_result,
+    expected_hash: str | None = None,
+    *,
+    max_bytes: int | None = None,
+    deadline: float | None = None,
+) -> bool:
+    """Return whether a pinned descriptor no longer matches observed metadata and bytes."""
+    try:
+        current_stat = os.fstat(file_fd)
+    except OSError:
+        return True
+    if any(getattr(expected_stat, field) != getattr(current_stat, field) for field in _PINNED_FILE_IDENTITY_FIELDS):
+        return True
+    if expected_hash is not None:
+        try:
+            return (
+                _hash_pinned_file_descriptor(
+                    file_fd,
+                    max_bytes=max_bytes,
+                    deadline=deadline,
+                )
+                != expected_hash
+            )
+        except OSError:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -362,22 +405,14 @@ def _validated_stat_matches_target(opened_stat: os.stat_result, target: dict[str
     )
 
 
-def _descriptor_relative_scan_path(directory_fd: int, filename: str) -> str | None:
-    """Return a filename-preserving path rooted at an already-open directory."""
-    for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
-        candidate = descriptor_root / str(directory_fd) / filename
-        try:
-            if stat.S_ISREG(os.stat(candidate).st_mode):
-                return str(candidate)
-        except OSError:
-            continue
-    return None
-
-
 def _descriptor_path_for_open_file(file_fd: int) -> str | None:
     """Return a stable path to an opened regular file descriptor."""
     opened_stat = os.fstat(file_fd)
-    for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+    for descriptor_root in (
+        Path("/proc") / str(os.getpid()) / "fd",
+        Path("/proc/self/fd"),
+        Path("/dev/fd"),
+    ):
         candidate = descriptor_root / str(file_fd)
         try:
             if os.path.samestat(opened_stat, os.stat(candidate)):
@@ -412,7 +447,7 @@ def _rebase_pinned_shard_result(result: "ScanResult", pinned_path: str, report_p
     result.metadata = rebase(result.metadata)
 
 
-def _open_windows_shard_guard_fd(path: str) -> int:
+def _open_windows_shard_guard_fd(path: str, *, open_reparse_point: bool = False) -> int:
     """Open a Windows shard for shared reads while denying writes and replacement."""
     import ctypes
     import ctypes.wintypes as wintypes
@@ -431,13 +466,16 @@ def _open_windows_shard_guard_fd(path: str) -> int:
         wintypes.HANDLE,
     )
     create_file.restype = wintypes.HANDLE
+    file_flags = 0x00000080
+    if open_reparse_point:
+        file_flags |= 0x00200000
     handle = create_file(
         path,
         0x80000000,
         0x00000001,
         None,
         3,
-        0x00000080,
+        file_flags,
         None,
     )
     invalid_handle_value = ctypes.c_void_p(-1).value
@@ -484,45 +522,562 @@ def _pinned_windows_shard_scan_path(
         raise _ShardPinUnavailableError(str(error)) from error
     finally:
         if pinned_scan is not None and source_stat is not None and source_fd is not None:
-            try:
-                final_stat = os.fstat(source_fd)
-            except OSError:
-                pinned_scan.changed_during_scan = True
-            else:
-                identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
-                pinned_scan.changed_during_scan = any(
-                    getattr(source_stat, field) != getattr(final_stat, field) for field in identity_fields
-                )
+            pinned_scan.changed_during_scan = pinned_scan.changed_during_scan or _pinned_file_descriptor_changed(
+                source_fd,
+                source_stat,
+            )
         if source_fd is not None:
             os.close(source_fd)
+
+
+def _hash_pinned_file_descriptor(
+    source_fd: int,
+    *,
+    max_bytes: int | None = None,
+    deadline: float | None = None,
+) -> str:
+    """Hash one retained descriptor without transferring ownership of it."""
+    copied_fd = os.dup(source_fd)
+    try:
+        os.lseek(copied_fd, 0, os.SEEK_SET)
+        source = os.fdopen(copied_fd, "rb", closefd=True)
+        copied_fd = -1
+        digest = hashlib.sha256()
+        hashed_bytes = 0
+        with source:
+            while chunk := source.read(1024 * 1024):
+                hashed_bytes += len(chunk)
+                if max_bytes is not None and max_bytes >= 0 and hashed_bytes > max_bytes:
+                    raise _ShardPinUnavailableError("validated source exceeds the staging byte limit")
+                if deadline is not None and time.time() > deadline:
+                    raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
+                digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        if copied_fd >= 0:
+            os.close(copied_fd)
+
+
+class _StagingMutationMonitor:
+    """Watch private staging directories so pathname ABA cannot be erased by restoration."""
+
+    def __init__(self, *, inotify_fd: int | None = None, kqueue: Any | None = None) -> None:
+        self._inotify_fd = inotify_fd
+        self._kqueue = kqueue
+
+    @classmethod
+    def arm(cls, directory_fds: Iterable[int]) -> "_StagingMutationMonitor":
+        descriptors = tuple(directory_fds)
+        if _is_linux_platform():
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            inotify_init1 = libc.inotify_init1
+            inotify_init1.argtypes = (ctypes.c_int,)
+            inotify_init1.restype = ctypes.c_int
+            inotify_add_watch = libc.inotify_add_watch
+            inotify_add_watch.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+            inotify_add_watch.restype = ctypes.c_int
+            monitor_fd = inotify_init1(os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+            if monitor_fd < 0:
+                raise _ShardPinUnavailableError("private staging mutation monitoring is unavailable")
+            mutation_mask = 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
+            mutation_mask |= 0x00000400 | 0x00000800 | 0x00002000 | 0x00004000 | 0x00008000
+            try:
+                for descriptor in descriptors:
+                    descriptor_path = _descriptor_path_for_open_file(descriptor)
+                    if (
+                        descriptor_path is None
+                        or inotify_add_watch(
+                            monitor_fd,
+                            os.fsencode(descriptor_path),
+                            mutation_mask,
+                        )
+                        < 0
+                    ):
+                        raise _ShardPinUnavailableError("private staging mutation monitoring is unavailable")
+            except BaseException:
+                os.close(monitor_fd)
+                raise
+            return cls(inotify_fd=monitor_fd)
+
+        queue: Any | None = None
+        try:
+            import select
+
+            def select_attribute(name: str) -> Any:
+                return getattr(select, name)
+
+            kqueue_factory = select_attribute("kqueue")
+            kevent_factory = select_attribute("kevent")
+            vnode_filter = select_attribute("KQ_FILTER_VNODE")
+            add_flag = select_attribute("KQ_EV_ADD")
+            clear_flag = select_attribute("KQ_EV_CLEAR")
+            fflags = sum(
+                getattr(select, name, 0)
+                for name in (
+                    "KQ_NOTE_WRITE",
+                    "KQ_NOTE_DELETE",
+                    "KQ_NOTE_RENAME",
+                    "KQ_NOTE_ATTRIB",
+                    "KQ_NOTE_EXTEND",
+                    "KQ_NOTE_LINK",
+                    "KQ_NOTE_REVOKE",
+                )
+            )
+            queue = kqueue_factory()
+            changes = [
+                kevent_factory(
+                    descriptor,
+                    filter=vnode_filter,
+                    flags=add_flag | clear_flag,
+                    fflags=fflags,
+                )
+                for descriptor in descriptors
+            ]
+            queue.control(changes, 0, 0)
+        except (AttributeError, OSError, TypeError, ValueError) as error:
+            if queue is not None:
+                with suppress(Exception):
+                    queue.close()
+            raise _ShardPinUnavailableError("private staging mutation monitoring is unavailable") from error
+        return cls(kqueue=queue)
+
+    def changed(self) -> bool:
+        """Return whether any watched directory observed a mutation event."""
+        if self._inotify_fd is not None:
+            try:
+                return bool(os.read(self._inotify_fd, 64 * 1024))
+            except BlockingIOError:
+                return False
+            except OSError:
+                return True
+        if self._kqueue is not None:
+            try:
+                return bool(self._kqueue.control(None, 1024, 0))
+            except OSError:
+                return True
+        return True
+
+    def close(self) -> None:
+        """Release the platform watcher."""
+        if self._inotify_fd is not None:
+            os.close(self._inotify_fd)
+            self._inotify_fd = None
+        if self._kqueue is not None:
+            self._kqueue.close()
+            self._kqueue = None
+
+
+def _is_linux_platform() -> bool:
+    """Return the runtime platform check without type-checker constant folding."""
+    return sys.platform.startswith("linux")
+
+
+@contextmanager
+def _open_exclusive_staging_target(
+    destination: Path | str,
+    destination_dir_fd: int | None,
+) -> Iterator[Any]:
+    """Open one new staging destination without following an existing entry."""
+    if destination_dir_fd is None:
+        with Path(destination).open("xb") as target:
+            yield target
+        return
+
+    destination_fd = os.open(
+        str(destination),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=destination_dir_fd,
+    )
+    with os.fdopen(destination_fd, "wb", closefd=True) as target:
+        yield target
+
+
+def _copy_pinned_file_descriptor(
+    source_fd: int,
+    destination: Path | str,
+    *,
+    destination_dir_fd: int | None = None,
+    max_bytes: int | None = None,
+    deadline: float | None = None,
+) -> str:
+    """Copy and hash an already-open regular file into private staging."""
+    copied_fd = os.dup(source_fd)
+    destination_created = False
+    try:
+        source_size = os.fstat(copied_fd).st_size
+        if max_bytes is not None and max_bytes >= 0 and source_size > max_bytes:
+            raise _ShardPinUnavailableError("validated source exceeds the staging byte limit")
+        if deadline is not None and time.time() > deadline:
+            raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
+        os.lseek(copied_fd, 0, os.SEEK_SET)
+        source = os.fdopen(copied_fd, "rb", closefd=True)
+        copied_fd = -1
+        digest = hashlib.sha256()
+        with source, _open_exclusive_staging_target(destination, destination_dir_fd) as target:
+            destination_created = True
+            copied_bytes = 0
+            while chunk := source.read(1024 * 1024):
+                copied_bytes += len(chunk)
+                if max_bytes is not None and max_bytes >= 0 and copied_bytes > max_bytes:
+                    raise _ShardPinUnavailableError("validated source exceeds the staging byte limit")
+                if deadline is not None and time.time() > deadline:
+                    raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
+                digest.update(chunk)
+                target.write(chunk)
+        return digest.hexdigest()
+    except BaseException:
+        if destination_created:
+            with suppress(OSError):
+                if destination_dir_fd is None:
+                    Path(destination).unlink()
+                else:
+                    os.unlink(str(destination), dir_fd=destination_dir_fd)
+        raise
+    finally:
+        if copied_fd >= 0:
+            os.close(copied_fd)
+
+
+@contextmanager
+def _pinned_windows_logical_scan_path(
+    resolved_path: str,
+    target: dict[str, int | str],
+    pinned_name: str,
+    companion_targets: Mapping[str, tuple[str, dict[str, int | str]]] | None,
+    *,
+    copy_max_bytes: int | None = None,
+    deadline: float | None = None,
+) -> Iterator[_PinnedShardScan]:
+    """Stage descriptor-read bytes under logical filenames while retaining Windows guards."""
+    source_fd: int | None = None
+    source_stat: os.stat_result | None = None
+    source_hash: str | None = None
+    staged_source_fd: int | None = None
+    staged_source_stat: os.stat_result | None = None
+    companion_fds: list[tuple[int, os.stat_result, str | None]] = []
+    staged_companion_fds: list[tuple[int, os.stat_result, str]] = []
+    staging_path: Path | None = None
+    initial_staging_stat: os.stat_result | None = None
+    staged_file_stats: dict[Path, os.stat_result] = {}
+    staged_directories: set[Path] = set()
+    pinned_scan: _PinnedShardScan | None = None
+    remaining_copy_bytes = copy_max_bytes
+
+    def bounded_copy_limit(expected_size: int) -> int:
+        if remaining_copy_bytes is None:
+            return expected_size
+        return min(expected_size, max(remaining_copy_bytes, 0))
+
+    def record_copied_bytes(copied_size: int) -> None:
+        nonlocal remaining_copy_bytes
+        if remaining_copy_bytes is not None:
+            remaining_copy_bytes -= copied_size
+
+    try:
+        source_fd = _open_windows_shard_guard_fd(resolved_path)
+        source_stat = os.fstat(source_fd)
+        if not _validated_stat_matches_target(source_stat, target):
+            raise _ShardPinUnavailableError("validated shard target changed before pinning")
+
+        staging_path = Path(tempfile.mkdtemp(prefix=".modelaudit_scan_"))
+        initial_staging_stat = os.stat(staging_path, follow_symlinks=False)
+        staged_source = staging_path / pinned_name
+        source_hash = _copy_pinned_file_descriptor(
+            source_fd,
+            staged_source,
+            max_bytes=bounded_copy_limit(source_stat.st_size),
+            deadline=deadline,
+        )
+        staged_file_stat = os.stat(staged_source, follow_symlinks=False)
+        record_copied_bytes(staged_file_stat.st_size)
+        staged_file_stats[staged_source] = staged_file_stat
+        if _pinned_file_descriptor_changed(
+            source_fd,
+            source_stat,
+            source_hash,
+            max_bytes=source_stat.st_size,
+            deadline=deadline,
+        ):
+            raise _ShardPinUnavailableError("validated shard content changed while staging")
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        staged_file_attributes = getattr(staged_file_stat, "st_file_attributes", 0) or 0
+        if not stat.S_ISREG(staged_file_stat.st_mode) or bool(reparse_flag and staged_file_attributes & reparse_flag):
+            raise _ShardPinUnavailableError("staged shard path changed while opening")
+        staged_source_fd = _open_windows_shard_guard_fd(str(staged_source), open_reparse_point=True)
+        staged_source_stat = os.fstat(staged_source_fd)
+        staged_source_fd_attributes = getattr(staged_source_stat, "st_file_attributes", 0) or 0
+        if (
+            bool(reparse_flag and staged_source_fd_attributes & reparse_flag)
+            or not os.path.samestat(staged_file_stat, staged_source_stat)
+            or _pinned_file_descriptor_changed(
+                staged_source_fd,
+                staged_source_stat,
+                source_hash,
+                max_bytes=staged_source_stat.st_size,
+                deadline=deadline,
+            )
+        ):
+            raise _ShardPinUnavailableError("staged shard content changed while staging")
+        staged_source_target: dict[str, int | str] = {
+            "device": staged_file_stat.st_dev,
+            "inode": staged_file_stat.st_ino,
+            "size": staged_file_stat.st_size,
+            "mtime_ns": staged_file_stat.st_mtime_ns,
+            "ctime_ns": staged_file_stat.st_ctime_ns,
+            "nlink": staged_file_stat.st_nlink,
+        }
+
+        for relative_name, (companion_path, companion_target) in (companion_targets or {}).items():
+            relative_path = Path(relative_name)
+            context_only_companion = bool(companion_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY))
+            if (
+                relative_path.is_absolute()
+                or not relative_path.parts
+                or any(part in {"", ".", ".."} for part in relative_path.parts)
+            ):
+                raise _ShardPinUnavailableError("validated companion path escaped its scan directory")
+            companion_fd = _open_windows_shard_guard_fd(companion_path)
+            companion_stat = os.fstat(companion_fd)
+            if not _validated_stat_matches_target(companion_stat, companion_target):
+                os.close(companion_fd)
+                raise _ShardPinUnavailableError("validated companion target changed before pinning")
+            companion_fds.append((companion_fd, companion_stat, None))
+            staged_companion = staging_path.joinpath(*relative_path.parts)
+            staged_companion.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            parent = staged_companion.parent
+            while parent != staging_path:
+                staged_directories.add(parent)
+                parent = parent.parent
+            staged_companion_hash = _copy_pinned_file_descriptor(
+                companion_fd,
+                staged_companion,
+                max_bytes=(
+                    companion_stat.st_size if context_only_companion else bounded_copy_limit(companion_stat.st_size)
+                ),
+                deadline=deadline,
+            )
+            companion_fds[-1] = (companion_fd, companion_stat, staged_companion_hash)
+            staged_companion_path_stat = os.stat(staged_companion, follow_symlinks=False)
+            if not context_only_companion:
+                record_copied_bytes(staged_companion_path_stat.st_size)
+            staged_file_stats[staged_companion] = staged_companion_path_stat
+            if _pinned_file_descriptor_changed(
+                companion_fd,
+                companion_stat,
+                staged_companion_hash,
+                max_bytes=companion_stat.st_size,
+                deadline=deadline,
+            ):
+                raise _ShardPinUnavailableError("validated companion content changed while staging")
+            staged_companion_attributes = getattr(staged_companion_path_stat, "st_file_attributes", 0) or 0
+            if not stat.S_ISREG(staged_companion_path_stat.st_mode) or bool(
+                reparse_flag and staged_companion_attributes & reparse_flag
+            ):
+                raise _ShardPinUnavailableError("staged companion path changed while opening")
+            staged_companion_fd = _open_windows_shard_guard_fd(
+                str(staged_companion),
+                open_reparse_point=True,
+            )
+            staged_companion_stat = os.fstat(staged_companion_fd)
+            staged_companion_fd_attributes = getattr(staged_companion_stat, "st_file_attributes", 0) or 0
+            if (
+                not os.path.samestat(staged_companion_path_stat, staged_companion_stat)
+                or bool(reparse_flag and staged_companion_fd_attributes & reparse_flag)
+                or _pinned_file_descriptor_changed(
+                    staged_companion_fd,
+                    staged_companion_stat,
+                    staged_companion_hash,
+                    max_bytes=staged_companion_stat.st_size,
+                    deadline=deadline,
+                )
+            ):
+                os.close(staged_companion_fd)
+                raise _ShardPinUnavailableError("staged companion content changed while staging")
+            staged_companion_fds.append((staged_companion_fd, staged_companion_stat, staged_companion_hash))
+
+        if deadline is not None and time.time() > deadline:
+            raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
+        with _pinned_windows_shard_scan_path(str(staged_source), staged_source_target) as pinned_scan:
+            yield pinned_scan
+            if (
+                source_stat is None
+                or source_fd is None
+                or source_hash is None
+                or _pinned_file_descriptor_changed(
+                    source_fd,
+                    source_stat,
+                    source_hash,
+                    max_bytes=source_stat.st_size,
+                    deadline=deadline,
+                )
+            ):
+                pinned_scan.changed_during_scan = True
+            if (
+                staged_source_fd is None
+                or staged_source_stat is None
+                or source_hash is None
+                or _pinned_file_descriptor_changed(
+                    staged_source_fd,
+                    staged_source_stat,
+                    source_hash,
+                    max_bytes=staged_source_stat.st_size,
+                    deadline=deadline,
+                )
+            ):
+                pinned_scan.changed_during_scan = True
+            for companion_fd, companion_stat, companion_hash in companion_fds:
+                if companion_hash is None or _pinned_file_descriptor_changed(
+                    companion_fd,
+                    companion_stat,
+                    companion_hash,
+                    max_bytes=companion_stat.st_size,
+                    deadline=deadline,
+                ):
+                    pinned_scan.changed_during_scan = True
+                    break
+            for companion_fd, companion_stat, companion_hash in staged_companion_fds:
+                if _pinned_file_descriptor_changed(
+                    companion_fd,
+                    companion_stat,
+                    companion_hash,
+                    max_bytes=companion_stat.st_size,
+                    deadline=deadline,
+                ):
+                    pinned_scan.changed_during_scan = True
+                    break
+    except _ShardPinUnavailableError:
+        raise
+    except OSError as error:
+        if pinned_scan is not None:
+            raise
+        raise _ShardPinUnavailableError(str(error)) from error
+    finally:
+        for companion_fd, _staged_stat, _staged_hash in reversed(staged_companion_fds):
+            os.close(companion_fd)
+        if staged_source_fd is not None:
+            os.close(staged_source_fd)
+        for companion_fd, _source_stat, _source_hash in reversed(companion_fds):
+            os.close(companion_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+        if staging_path is not None and initial_staging_stat is not None:
+            current_staging_stat: os.stat_result | None
+            try:
+                current_staging_stat = os.stat(staging_path, follow_symlinks=False)
+            except OSError:
+                current_staging_stat = None
+            if current_staging_stat is not None and os.path.samestat(initial_staging_stat, current_staging_stat):
+                for staged_file, expected_stat in reversed(staged_file_stats.items()):
+                    try:
+                        current_file_stat = os.stat(staged_file, follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(current_file_stat.st_mode) and os.path.samestat(expected_stat, current_file_stat):
+                        with suppress(OSError):
+                            staged_file.unlink()
+                for staged_directory in sorted(
+                    staged_directories,
+                    key=lambda path: len(path.parts),
+                    reverse=True,
+                ):
+                    with suppress(OSError):
+                        staged_directory.rmdir()
+                with suppress(OSError):
+                    final_staging_stat = os.stat(staging_path, follow_symlinks=False)
+                    if os.path.samestat(initial_staging_stat, final_staging_stat):
+                        staging_path.rmdir()
 
 
 @contextmanager
 def _pinned_shard_scan_path(
     resolved_path: str,
     target: dict[str, int | str],
+    *,
+    logical_path: str | None = None,
+    companion_targets: Mapping[str, tuple[str, dict[str, int | str]]] | None = None,
+    require_regular_path: bool = False,
+    copy_max_bytes: int | None = None,
+    deadline: float | None = None,
 ) -> Iterator[_PinnedShardScan]:
     """Expose a validated shard through a directory descriptor immune to pathname ABA swaps."""
     if os.name == "nt":
-        with _pinned_windows_shard_scan_path(resolved_path, target) as windows_pinned_scan:
-            yield windows_pinned_scan
+        if logical_path is not None or companion_targets:
+            pinned_name = Path(logical_path).name if logical_path is not None else Path(resolved_path).name
+            if not pinned_name or pinned_name in {".", ".."}:
+                raise _ShardPinUnavailableError("validated scan path omitted a safe filename")
+            with _pinned_windows_logical_scan_path(
+                resolved_path,
+                target,
+                pinned_name,
+                companion_targets,
+                copy_max_bytes=copy_max_bytes,
+                deadline=deadline,
+            ) as windows_pinned_scan:
+                yield windows_pinned_scan
+        else:
+            with _pinned_windows_shard_scan_path(resolved_path, target) as windows_pinned_scan:
+                yield windows_pinned_scan
         return
 
     source_path = Path(resolved_path)
     parent_fd: int | None = None
     source_fd: int | None = None
     staging_fd: int | None = None
+    staging_parent_fd: int | None = None
     staging_path: Path | None = None
-    pinned_name = source_path.name
+    initial_staging_stat: os.stat_result | None = None
+    staging_descriptor_root: Path | None = None
+    source_name = source_path.name
+    pinned_name = Path(logical_path).name if logical_path is not None else source_name
+    if not pinned_name or pinned_name in {".", ".."}:
+        raise _ShardPinUnavailableError("validated scan path omitted a safe filename")
     pinned_created = False
     pinned_scan: _PinnedShardScan | None = None
     pinned_stat: os.stat_result | None = None
+    pinned_source_copy_fd: int | None = None
+    pinned_source_copy_stat: os.stat_result | None = None
+    pinned_source_copy_hash: str | None = None
+    pinned_companion_fds: list[tuple[int, os.stat_result, str | None]] = []
+    pinned_companion_copy_fds: list[tuple[int, os.stat_result, str]] = []
+    companion_parent_fds: list[int] = []
+    created_staging_entries: list[tuple[int, str]] = []
+    staged_entry_bindings: list[tuple[int, str, int]] = []
+    staging_directory_fds: dict[tuple[str, ...], int] = {}
+    staging_directory_stats: dict[int, os.stat_result] = {}
+    staging_mutation_monitor: _StagingMutationMonitor | None = None
+    created_staging_directories: set[tuple[str, ...]] = set()
+    remaining_copy_bytes = copy_max_bytes
+
+    def bounded_copy_limit(expected_size: int) -> int:
+        if remaining_copy_bytes is None:
+            return expected_size
+        return min(expected_size, max(remaining_copy_bytes, 0))
+
+    def record_copied_bytes(copied_size: int) -> None:
+        nonlocal remaining_copy_bytes
+        if remaining_copy_bytes is not None:
+            remaining_copy_bytes -= copied_size
+
+    def staged_bindings_changed() -> bool:
+        for entry_parent_fd, entry_name, expected_target_fd in staged_entry_bindings:
+            try:
+                current_entry_target = os.stat(entry_name, dir_fd=entry_parent_fd)
+                expected_entry_target = os.fstat(expected_target_fd)
+            except OSError:
+                return True
+            if not os.path.samestat(current_entry_target, expected_entry_target):
+                return True
+        return False
+
     try:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         directory = getattr(os, "O_DIRECTORY", 0)
         cloexec = getattr(os, "O_CLOEXEC", 0)
         nonblock = getattr(os, "O_NONBLOCK", 0)
-        required_dir_fd_functions = (os.open, os.stat, os.symlink, os.unlink)
+        required_dir_fd_functions = [os.mkdir, os.open, os.stat, os.symlink, os.unlink]
         if (
             not nofollow
             or not directory
@@ -533,7 +1088,7 @@ def _pinned_shard_scan_path(
         directory_flags = os.O_RDONLY | directory | nofollow | cloexec
         parent_fd = os.open(source_path.parent, directory_flags)
         source_fd = os.open(
-            pinned_name,
+            source_name,
             os.O_RDONLY | nofollow | nonblock | cloexec,
             dir_fd=parent_fd,
         )
@@ -547,7 +1102,9 @@ def _pinned_shard_scan_path(
 
         staging_path = Path(tempfile.mkdtemp(prefix=".modelaudit_scan_"))
         initial_staging_stat = os.stat(staging_path, follow_symlinks=False)
+        staging_parent_fd = os.open(staging_path.parent, directory_flags)
         staging_fd = os.open(staging_path, directory_flags)
+        staging_directory_fds[()] = staging_fd
         staging_stat = os.fstat(staging_fd)
         effective_uid = getattr(os, "geteuid", lambda: staging_stat.st_uid)()
         if (
@@ -558,17 +1115,201 @@ def _pinned_shard_scan_path(
         ):
             raise _ShardPinUnavailableError("private shard staging directory changed while opening")
 
-        os.symlink(source_descriptor_path, pinned_name, dir_fd=staging_fd)
+        staging_descriptor_path = _descriptor_path_for_open_file(staging_fd)
+        if staging_descriptor_path is None:
+            raise _ShardPinUnavailableError("platform cannot expose the pinned shard directory")
+        staging_descriptor_root = Path(staging_descriptor_path)
+
+        portable_regular_fallback = staging_descriptor_root.parts[:3] == ("/", "dev", "fd")
+        use_regular_copy = require_regular_path or portable_regular_fallback
+        scan_root = staging_path if portable_regular_fallback else staging_descriptor_root
+
+        if use_regular_copy:
+            try:
+                pinned_source_copy_hash = _copy_pinned_file_descriptor(
+                    source_fd,
+                    pinned_name,
+                    destination_dir_fd=staging_fd,
+                    max_bytes=bounded_copy_limit(source_stat.st_size),
+                    deadline=deadline,
+                )
+            except OSError as error:
+                raise _ShardPinUnavailableError("platform cannot retain a regular source scan path") from error
+        else:
+            os.symlink(source_descriptor_path, pinned_name, dir_fd=staging_fd)
         pinned_created = True
         pinned_stat = os.stat(pinned_name, dir_fd=staging_fd)
-        if not os.path.samestat(source_stat, pinned_stat):
+        if use_regular_copy:
+            record_copied_bytes(pinned_stat.st_size)
+        if (
+            use_regular_copy and (not stat.S_ISREG(pinned_stat.st_mode) or pinned_stat.st_size != source_stat.st_size)
+        ) or (not use_regular_copy and not os.path.samestat(source_stat, pinned_stat)):
             raise _ShardPinUnavailableError("validated shard target changed while pinning")
+        if _pinned_file_descriptor_changed(
+            source_fd,
+            source_stat,
+            pinned_source_copy_hash,
+            max_bytes=source_stat.st_size,
+            deadline=deadline,
+        ):
+            raise _ShardPinUnavailableError("validated shard target changed while staging")
+        if use_regular_copy:
+            pinned_source_copy_fd = os.open(
+                pinned_name,
+                os.O_RDONLY | nofollow | nonblock | cloexec,
+                dir_fd=staging_fd,
+            )
+            pinned_source_copy_stat = os.fstat(pinned_source_copy_fd)
+            if _pinned_file_descriptor_changed(
+                pinned_source_copy_fd,
+                pinned_source_copy_stat,
+                pinned_source_copy_hash,
+                max_bytes=pinned_source_copy_stat.st_size,
+                deadline=deadline,
+            ):
+                raise _ShardPinUnavailableError("pinned shard content changed while staging")
+            staged_entry_bindings.append((staging_fd, pinned_name, pinned_source_copy_fd))
+        else:
+            staged_entry_bindings.append((staging_fd, pinned_name, source_fd))
 
-        scan_path = _descriptor_relative_scan_path(staging_fd, pinned_name)
-        if scan_path is None:
-            raise _ShardPinUnavailableError("platform cannot expose the pinned shard directory")
+        for relative_name, (companion_path, companion_target) in (companion_targets or {}).items():
+            relative_path = Path(relative_name)
+            context_only_companion = bool(companion_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY))
+            companion_use_regular_copy = use_regular_copy or context_only_companion
+            if (
+                relative_path.is_absolute()
+                or not relative_path.parts
+                or any(part in {"", ".", ".."} for part in relative_path.parts)
+            ):
+                raise _ShardPinUnavailableError("validated companion path escaped its scan directory")
+            companion_source = Path(companion_path)
+            companion_parent_fd = os.open(companion_source.parent, directory_flags)
+            companion_parent_fds.append(companion_parent_fd)
+            companion_fd = os.open(
+                companion_source.name,
+                os.O_RDONLY | nofollow | nonblock | cloexec,
+                dir_fd=companion_parent_fd,
+            )
+            companion_stat = os.fstat(companion_fd)
+            if not _validated_stat_matches_target(companion_stat, companion_target):
+                os.close(companion_fd)
+                raise _ShardPinUnavailableError("validated companion target changed before pinning")
+            pinned_companion_fds.append((companion_fd, companion_stat, None))
+            companion_staging_parent_fd = staging_fd
+            parent_parts: tuple[str, ...] = ()
+            for parent_part in relative_path.parts[:-1]:
+                parent_parts = (*parent_parts, parent_part)
+                existing_parent_fd = staging_directory_fds.get(parent_parts)
+                if existing_parent_fd is not None:
+                    companion_staging_parent_fd = existing_parent_fd
+                    continue
+                try:
+                    os.mkdir(parent_part, mode=0o700, dir_fd=companion_staging_parent_fd)
+                except FileExistsError as error:
+                    raise _ShardPinUnavailableError("validated companion staging directory changed") from error
+                created_staging_directories.add(parent_parts)
+                created_parent_fd = os.open(parent_part, directory_flags, dir_fd=companion_staging_parent_fd)
+                created_parent_stat = os.fstat(created_parent_fd)
+                if (
+                    not stat.S_ISDIR(created_parent_stat.st_mode)
+                    or created_parent_stat.st_uid != effective_uid
+                    or stat.S_IMODE(created_parent_stat.st_mode) & 0o077
+                ):
+                    os.close(created_parent_fd)
+                    raise _ShardPinUnavailableError("validated companion staging directory changed")
+                staging_directory_fds[parent_parts] = created_parent_fd
+                staged_entry_bindings.append((companion_staging_parent_fd, parent_part, created_parent_fd))
+                companion_staging_parent_fd = created_parent_fd
+            companion_descriptor_path = _descriptor_path_for_open_file(companion_fd)
+            if companion_descriptor_path is None:
+                raise _ShardPinUnavailableError("platform cannot expose an opened companion descriptor")
+            companion_copy_hash: str | None = None
+            if companion_use_regular_copy:
+                try:
+                    companion_copy_hash = _copy_pinned_file_descriptor(
+                        companion_fd,
+                        relative_path.name,
+                        destination_dir_fd=companion_staging_parent_fd,
+                        max_bytes=(
+                            companion_stat.st_size
+                            if context_only_companion
+                            else bounded_copy_limit(companion_stat.st_size)
+                        ),
+                        deadline=deadline,
+                    )
+                except OSError as error:
+                    raise _ShardPinUnavailableError("platform cannot retain a regular companion scan path") from error
+                created_staging_entries.append((companion_staging_parent_fd, relative_path.name))
+                pinned_companion_fds[-1] = (companion_fd, companion_stat, companion_copy_hash)
+                if _pinned_file_descriptor_changed(
+                    companion_fd,
+                    companion_stat,
+                    companion_copy_hash,
+                    max_bytes=companion_stat.st_size,
+                    deadline=deadline,
+                ):
+                    raise _ShardPinUnavailableError("validated companion target changed while staging")
+            else:
+                os.symlink(companion_descriptor_path, relative_path.name, dir_fd=companion_staging_parent_fd)
+                created_staging_entries.append((companion_staging_parent_fd, relative_path.name))
+            pinned_companion_stat = os.stat(relative_path.name, dir_fd=companion_staging_parent_fd)
+            if companion_use_regular_copy and not context_only_companion:
+                record_copied_bytes(pinned_companion_stat.st_size)
+            if (
+                companion_use_regular_copy
+                and (
+                    not stat.S_ISREG(pinned_companion_stat.st_mode)
+                    or pinned_companion_stat.st_size != companion_stat.st_size
+                )
+            ) or (not companion_use_regular_copy and not os.path.samestat(companion_stat, pinned_companion_stat)):
+                raise _ShardPinUnavailableError("pinned companion scan path resolved to a different file")
+            if companion_use_regular_copy:
+                assert companion_copy_hash is not None
+                pinned_companion_copy_fd = os.open(
+                    relative_path.name,
+                    os.O_RDONLY | nofollow | nonblock | cloexec,
+                    dir_fd=companion_staging_parent_fd,
+                )
+                pinned_companion_copy_stat = os.fstat(pinned_companion_copy_fd)
+                if _pinned_file_descriptor_changed(
+                    pinned_companion_copy_fd,
+                    pinned_companion_copy_stat,
+                    companion_copy_hash,
+                    max_bytes=pinned_companion_copy_stat.st_size,
+                    deadline=deadline,
+                ):
+                    os.close(pinned_companion_copy_fd)
+                    raise _ShardPinUnavailableError("pinned companion content changed while staging")
+                pinned_companion_copy_fds.append(
+                    (pinned_companion_copy_fd, pinned_companion_copy_stat, companion_copy_hash)
+                )
+                staged_entry_bindings.append(
+                    (companion_staging_parent_fd, relative_path.name, pinned_companion_copy_fd)
+                )
+            else:
+                staged_entry_bindings.append((companion_staging_parent_fd, relative_path.name, companion_fd))
+
+        staging_directory_stats = {
+            directory_fd: os.fstat(directory_fd) for directory_fd in staging_directory_fds.values()
+        }
+        staging_mutation_monitor = _StagingMutationMonitor.arm(
+            [
+                *staging_directory_fds.values(),
+                source_fd,
+                *(companion_fd for companion_fd, _stat, _hash in pinned_companion_fds),
+            ]
+        )
+        if staged_bindings_changed():
+            raise _ShardPinUnavailableError("private staging entry changed before scanner dispatch")
+        if deadline is not None and time.time() > deadline:
+            raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
+
+        scan_path = str(scan_root / pinned_name)
         opened_scan_stat = os.stat(scan_path)
-        if not os.path.samestat(source_stat, opened_scan_stat):
+        if (
+            use_regular_copy
+            and (not stat.S_ISREG(opened_scan_stat.st_mode) or opened_scan_stat.st_size != source_stat.st_size)
+        ) or (not use_regular_copy and not os.path.samestat(source_stat, opened_scan_stat)):
             raise _ShardPinUnavailableError("pinned shard scan path resolved to a different file")
         pinned_scan = _PinnedShardScan(path=scan_path)
         yield pinned_scan
@@ -579,26 +1320,94 @@ def _pinned_shard_scan_path(
             raise
         raise _ShardPinUnavailableError(str(error)) from error
     finally:
-        if pinned_scan is not None and pinned_stat is not None and source_fd is not None:
-            try:
-                final_stat = os.fstat(source_fd)
-            except OSError:
+        if pinned_scan is not None and source_stat is not None and source_fd is not None:
+            if staging_mutation_monitor is None or staging_mutation_monitor.changed():
                 pinned_scan.changed_during_scan = True
-            else:
-                identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
-                pinned_scan.changed_during_scan = any(
-                    getattr(pinned_stat, field) != getattr(final_stat, field) for field in identity_fields
+            pinned_scan.changed_during_scan = pinned_scan.changed_during_scan or _pinned_file_descriptor_changed(
+                source_fd,
+                source_stat,
+                pinned_source_copy_hash,
+                max_bytes=source_stat.st_size,
+                deadline=deadline,
+            )
+            for companion_fd, companion_stat, companion_hash in pinned_companion_fds:
+                if _pinned_file_descriptor_changed(
+                    companion_fd,
+                    companion_stat,
+                    companion_hash,
+                    max_bytes=companion_stat.st_size,
+                    deadline=deadline,
+                ):
+                    pinned_scan.changed_during_scan = True
+                    break
+            if (
+                pinned_source_copy_fd is not None
+                and pinned_source_copy_stat is not None
+                and _pinned_file_descriptor_changed(
+                    pinned_source_copy_fd,
+                    pinned_source_copy_stat,
+                    pinned_source_copy_hash,
+                    max_bytes=pinned_source_copy_stat.st_size,
+                    deadline=deadline,
                 )
+            ):
+                pinned_scan.changed_during_scan = True
+            for companion_fd, companion_stat, companion_hash in pinned_companion_copy_fds:
+                if _pinned_file_descriptor_changed(
+                    companion_fd,
+                    companion_stat,
+                    companion_hash,
+                    max_bytes=companion_stat.st_size,
+                    deadline=deadline,
+                ):
+                    pinned_scan.changed_during_scan = True
+                    break
+            for directory_fd, expected_directory_stat in staging_directory_stats.items():
+                if _pinned_file_descriptor_changed(directory_fd, expected_directory_stat):
+                    pinned_scan.changed_during_scan = True
+                    break
+            pinned_scan.changed_during_scan = pinned_scan.changed_during_scan or staged_bindings_changed()
+        if pinned_source_copy_fd is not None:
+            os.close(pinned_source_copy_fd)
+        if staging_mutation_monitor is not None:
+            staging_mutation_monitor.close()
+        for companion_fd, _companion_stat, _companion_hash in reversed(pinned_companion_copy_fds):
+            os.close(companion_fd)
+        for entry_parent_fd, entry_name in reversed(created_staging_entries):
+            with suppress(OSError):
+                os.unlink(entry_name, dir_fd=entry_parent_fd)
+        for directory_parts in sorted(created_staging_directories, key=len, reverse=True):
+            parent_parts = directory_parts[:-1]
+            parent_directory_fd = staging_directory_fds.get(parent_parts)
+            if parent_directory_fd is None:
+                continue
+            with suppress(OSError):
+                os.rmdir(directory_parts[-1], dir_fd=parent_directory_fd)
         if pinned_created and staging_fd is not None:
             with suppress(OSError):
                 os.unlink(pinned_name, dir_fd=staging_fd)
+        for directory_parts, directory_fd in sorted(
+            staging_directory_fds.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            if directory_parts:
+                os.close(directory_fd)
         if staging_fd is not None:
             os.close(staging_fd)
-        if staging_path is not None:
+        if staging_path is not None and initial_staging_stat is not None and staging_parent_fd is not None:
             with suppress(OSError):
-                staging_path.rmdir()
+                final_staging_stat = os.stat(staging_path.name, dir_fd=staging_parent_fd, follow_symlinks=False)
+                if os.path.samestat(initial_staging_stat, final_staging_stat):
+                    os.rmdir(staging_path.name, dir_fd=staging_parent_fd)
         if source_fd is not None:
             os.close(source_fd)
+        for companion_fd, _source_stat, _source_hash in reversed(pinned_companion_fds):
+            os.close(companion_fd)
+        for companion_parent_fd in reversed(companion_parent_fds):
+            os.close(companion_parent_fd)
+        if staging_parent_fd is not None:
+            os.close(staging_parent_fd)
         if parent_fd is not None:
             os.close(parent_fd)
 
@@ -1765,9 +2574,42 @@ class ShardedModelDetector:
                     normalized_candidate = os.path.normcase(os.path.normpath(os.path.abspath(candidate)))
                     candidate_paths.setdefault(normalized_candidate, candidate)
                 if index_inventory is not None and index_inventory.error is None:
+                    candidate_aliases_by_name: dict[str, list[Path]] = {}
+                    for candidate in candidate_paths.values():
+                        if re.fullmatch(pattern, candidate.name) is None:
+                            continue
+                        candidate_aliases_by_name.setdefault(os.path.normcase(candidate.name), []).append(candidate)
+                    alias_comparisons = 0
                     for expected_source in index_inventory.expected_source_paths:
                         expected_path = Path(expected_source)
                         if expected_path.exists() or expected_path.is_symlink():
+                            try:
+                                resolved_expected = expected_path.resolve(strict=True)
+                            except (OSError, RuntimeError):
+                                resolved_expected = None
+                            if resolved_expected is not None:
+                                normalized_resolved_expected = os.path.normcase(
+                                    os.path.normpath(str(resolved_expected))
+                                )
+                                matches_existing_alias = False
+                                for candidate in candidate_aliases_by_name.get(
+                                    os.path.normcase(expected_path.name),
+                                    (),
+                                ):
+                                    if alias_comparisons >= MAX_SAFETENSORS_SHARD_ALIAS_IDENTITY_CHECKS:
+                                        break
+                                    alias_comparisons += 1
+                                    try:
+                                        resolved_candidate = candidate.resolve(strict=True)
+                                    except (OSError, RuntimeError):
+                                        continue
+                                    if os.path.normcase(os.path.normpath(str(resolved_candidate))) == (
+                                        normalized_resolved_expected
+                                    ):
+                                        matches_existing_alias = True
+                                        break
+                                if matches_existing_alias:
+                                    continue
                             normalized_expected = os.path.normcase(os.path.normpath(os.path.abspath(expected_path)))
                             candidate_paths.setdefault(normalized_expected, expected_path)
 
@@ -2716,7 +3558,18 @@ class ParallelShardHandler:
             elif already_pinned:
                 result = scanner.scan(shard_path)
             else:
-                with _pinned_shard_scan_path(scan_path, validated_target) as pinned_scan:
+                validated_size = validated_target.get("size")
+                copy_limit = validated_size if isinstance(validated_size, int) else None
+                if isinstance(self.scanner_config, dict):
+                    for limit_name in ("max_file_size", "max_total_size"):
+                        configured_limit = self.scanner_config.get(limit_name)
+                        if isinstance(configured_limit, int) and configured_limit > 0:
+                            copy_limit = configured_limit if copy_limit is None else min(copy_limit, configured_limit)
+                with _pinned_shard_scan_path(
+                    scan_path,
+                    validated_target,
+                    copy_max_bytes=copy_limit,
+                ) as pinned_scan:
                     result = scanner.scan(pinned_scan.path)
                     _rebase_pinned_shard_result(result, pinned_scan.path, shard_path)
         except _ShardPinUnavailableError as error:

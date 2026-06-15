@@ -150,8 +150,12 @@ def _scope_cache_ancestor_identity_to_tree(
     original_capture = cache._capture_ancestor_identity
     root_path = Path(os.path.abspath(root))
 
-    def capture_ancestor_identity(file_path: str) -> AncestorIdentity:
-        identity = original_capture(file_path)
+    def capture_ancestor_identity(
+        file_path: str,
+        *,
+        trusted_descriptor_path: bool = False,
+    ) -> AncestorIdentity:
+        identity = original_capture(file_path, trusted_descriptor_path=trusted_descriptor_path)
         entries = tuple(
             entry
             for entry in identity
@@ -317,7 +321,7 @@ def test_windows_capture_barrier_ignores_ancestor_churn(
         monkeypatch.setattr(cache, "_path_has_symlink_component", lambda _path: False)
         monkeypatch.setattr(cache, "_get_change_clock_probe", lambda _path, _device: probe)
         monkeypatch.setattr(cache, "_get_file_change_token", lambda _path, _stat: 1)
-        monkeypatch.setattr(cache, "_capture_ancestor_identity", lambda _path: ancestor_identity)
+        monkeypatch.setattr(cache, "_capture_ancestor_identity", lambda _path, **_kwargs: ancestor_identity)
         monkeypatch.setattr(cache, "_advance_change_clock", lambda *_args: 2)
         monkeypatch.setattr(cache, "_monitor_ancestor_identity", lambda _path, identity: identity)
         monkeypatch.setattr(cache.hasher, "hash_file_with_stat", lambda _path, _stat: "secure:stable")
@@ -658,10 +662,10 @@ def test_cache_manager_reuses_lookup_identity_for_miss(
     capture_calls = 0
     original_capture = cache_manager.cache.capture_file_identity
 
-    def capture_once(path: str) -> Any:
+    def capture_once(path: str, *, trusted_descriptor_path: bool = False) -> Any:
         nonlocal capture_calls
         capture_calls += 1
-        return original_capture(path)
+        return original_capture(path, trusted_descriptor_path=trusted_descriptor_path)
 
     monkeypatch.setattr(cache_manager.cache, "capture_file_identity", capture_once)
 
@@ -815,7 +819,7 @@ def test_store_result_rejects_changed_ancestor_identity_when_file_identity_match
         (*expected_ancestor_identity[0][:-1], expected_ancestor_identity[0][-1] + 1),
         *expected_ancestor_identity[1:],
     )
-    monkeypatch.setattr(cache, "_capture_ancestor_identity", lambda _path: changed_ancestor_identity)
+    monkeypatch.setattr(cache, "_capture_ancestor_identity", lambda _path, **_kwargs: changed_ancestor_identity)
 
     stored = cache.store_result(
         str(file_path),

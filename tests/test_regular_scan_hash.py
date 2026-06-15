@@ -737,7 +737,7 @@ class TestHashGenerationEdgeCases:
 
         def fail_if_oversized_hashed(path: str, *, deadline: float | None = None) -> str:
             hashed_paths.append(path)
-            if path == str(oversized):
+            if Path(path).name == oversized.name:
                 raise AssertionError("oversized file was hashed before max_file_size rejection")
             return original_hash(path, deadline=deadline)
 
@@ -749,8 +749,9 @@ class TestHashGenerationEdgeCases:
             cache_enabled=False,
         )
 
-        assert str(oversized) not in hashed_paths
-        assert str(small) in hashed_paths
+        hashed_names = {Path(path).name for path in hashed_paths}
+        assert oversized.name not in hashed_names
+        assert small.name in hashed_names
         assert determine_exit_code(result) == 2
         assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
         assert result.has_errors is True
@@ -841,7 +842,8 @@ class TestHashGenerationEdgeCases:
             config={"max_total_size": 64},
         )
 
-        assert hashed_paths == [str(first), str(second)]
+        assert hashed_paths == [str(first)]
+        assert content_hashes[str(second)].startswith("unhashable_max_total_size_")
         assert content_hashes[str(third)].startswith("unhashable_max_total_size_")
 
     def test_hash_files_by_path_defers_oversized_pytorch_zip_read_limit(
@@ -1256,8 +1258,9 @@ class TestHashGenerationEdgeCases:
             cache_enabled=False,
         )
 
-        assert str(safe_path) in hashed_paths
-        assert str(legacy_path) not in hashed_paths
+        hashed_names = {Path(path).name for path in hashed_paths}
+        assert safe_path.name in hashed_names
+        assert legacy_path.name not in hashed_names
         assert result.success is True
         assert result.content_hash is None
 
@@ -1388,7 +1391,7 @@ class TestHashGenerationEdgeCases:
             cache_enabled=False,
         )
 
-        assert len(hashed_paths) == 2
+        assert [Path(path).name for path in hashed_paths] == [first.name]
         assert result.content_hash is None
         assert result.success is True
 
@@ -1440,7 +1443,7 @@ class TestHashGenerationEdgeCases:
             cache_enabled=False,
         )
 
-        assert scanned_paths == [str(first)]
+        assert [Path(path).name for path in scanned_paths] == [first.name]
         assert result.content_hash is None
         assert determine_exit_code(result) == 2
         assert any(issue.message.startswith("Total scan size limit exceeded") for issue in result.issues)
@@ -1474,7 +1477,7 @@ class TestHashGenerationEdgeCases:
             cache_enabled=False,
         )
 
-        assert hashed_paths == [str(oversized)]
+        assert hashed_paths == []
         assert determine_exit_code(result) == 2
         assert any(issue.message.startswith("Total scan size limit exceeded") for issue in result.issues)
         assert result.has_errors is True

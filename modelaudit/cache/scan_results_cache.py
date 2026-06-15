@@ -472,21 +472,31 @@ class ScanResultsCache:
         version_context: dict[str, Any] | None = None,
         *,
         include_private_metadata: bool = False,
+        cache_key_path: str | None = None,
+        trusted_descriptor_path: bool = False,
     ) -> tuple[dict[str, Any] | None, ScannedFileIdentity | None]:
         """Return a cache lookup plus the monitored identity reusable by a miss scan."""
         file_identity: ScannedFileIdentity | None = None
         try:
-            if self._path_has_symlink_component(file_path):
+            trusted_descriptor_path = trusted_descriptor_path and self._is_private_descriptor_bound_path(
+                Path(file_path)
+            )
+            if not trusted_descriptor_path and self._path_has_symlink_component(file_path):
                 logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
                 return None, None
 
-            file_identity = self.capture_file_identity(file_path)
+            file_identity = self.capture_file_identity(
+                file_path,
+                trusted_descriptor_path=trusted_descriptor_path,
+            )
             file_stat, file_hash, _change_token, _ancestor_identity = file_identity
             cache_key, _content_hash = self._generate_cache_key_material(
                 file_path,
                 file_stat=file_stat,
                 version_context=version_context,
                 content_hash=file_hash,
+                cache_key_path=cache_key_path,
+                trusted_descriptor_path=trusted_descriptor_path,
             )
             if not cache_key:
                 return None, file_identity
@@ -515,7 +525,11 @@ class ScanResultsCache:
             with open(cache_file_path, "w", encoding="utf-8") as f:
                 json.dump(cache_entry, f, indent=2)
 
-            if not self._file_identity_matches(file_path, file_identity):
+            if not self._file_identity_matches(
+                file_path,
+                file_identity,
+                trusted_descriptor_path=trusted_descriptor_path,
+            ):
                 self._record_cache_miss("changed")
                 return None, file_identity
 
@@ -691,6 +705,9 @@ class ScanResultsCache:
         expected_file_hash: str | None = None,
         expected_change_token: int | None = None,
         expected_ancestor_identity: AncestorIdentity | None = None,
+        *,
+        cache_key_path: str | None = None,
+        trusted_descriptor_path: bool = False,
     ) -> bool:
         """
         Store scan result in cache with optimized file system calls.
@@ -709,7 +726,10 @@ class ScanResultsCache:
         """
         temporary_cache_path: Path | None = None
         try:
-            if self._path_has_symlink_component(file_path):
+            trusted_descriptor_path = trusted_descriptor_path and self._is_private_descriptor_bound_path(
+                Path(file_path)
+            )
+            if not trusted_descriptor_path and self._path_has_symlink_component(file_path):
                 logger.debug("Skipping cache store for symlinked path %s", file_path)
                 return False
             if (
@@ -734,7 +754,10 @@ class ScanResultsCache:
                 expected_ancestor_identity
             ) or not self._ancestor_identity_matches_for_store(
                 expected_ancestor_identity,
-                self._capture_ancestor_identity(file_path),
+                self._capture_ancestor_identity(
+                    file_path,
+                    trusted_descriptor_path=trusted_descriptor_path,
+                ),
             ):
                 logger.debug("Skipping cache store for %s: ancestor path changed during scan", file_path)
                 return False
@@ -754,7 +777,10 @@ class ScanResultsCache:
                 expected_ancestor_identity
             ) or not self._ancestor_identity_matches_for_store(
                 expected_ancestor_identity,
-                self._capture_ancestor_identity(file_path),
+                self._capture_ancestor_identity(
+                    file_path,
+                    trusted_descriptor_path=trusted_descriptor_path,
+                ),
             ):
                 logger.debug("Skipping cache store for %s: ancestor path changed during verification", file_path)
                 return False
@@ -771,6 +797,8 @@ class ScanResultsCache:
                 version_context=version_context,
                 version_info=version_info,
                 content_hash=verified_current_hash,
+                cache_key_path=cache_key_path,
+                trusted_descriptor_path=trusted_descriptor_path,
             )
             if not cache_key:
                 return False
@@ -833,7 +861,10 @@ class ScanResultsCache:
                 or self._ancestor_monitor_changed(expected_ancestor_identity)
                 or not self._ancestor_identity_matches_for_store(
                     expected_ancestor_identity,
-                    self._capture_ancestor_identity(file_path),
+                    self._capture_ancestor_identity(
+                        file_path,
+                        trusted_descriptor_path=trusted_descriptor_path,
+                    ),
                 )
             ):
                 logger.debug("Discarding cache store for %s: path changed during persistence", file_path)
@@ -854,9 +885,15 @@ class ScanResultsCache:
                 temporary_cache_path.unlink(missing_ok=True)
             self.release_ancestor_identity(expected_ancestor_identity)
 
-    def capture_file_identity(self, file_path: str) -> ScannedFileIdentity:
+    def capture_file_identity(
+        self,
+        file_path: str,
+        *,
+        trusted_descriptor_path: bool = False,
+    ) -> ScannedFileIdentity:
         """Capture a stable stat, content hash, and platform change token before scanning."""
-        if self._path_has_symlink_component(file_path):
+        trusted_descriptor_path = trusted_descriptor_path and self._is_private_descriptor_bound_path(Path(file_path))
+        if not trusted_descriptor_path and self._path_has_symlink_component(file_path):
             raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
 
         last_change_error: ValueError | None = None
@@ -864,7 +901,10 @@ class ScanResultsCache:
             preliminary_stat = os.stat(file_path)
             probe = self._get_change_clock_probe(file_path, preliminary_stat.st_dev)
             preliminary_change_token = self._get_file_change_token(file_path, preliminary_stat)
-            preliminary_ancestor_identity = self._capture_ancestor_identity(file_path)
+            preliminary_ancestor_identity = self._capture_ancestor_identity(
+                file_path,
+                trusted_descriptor_path=trusted_descriptor_path,
+            )
 
             for _attempt in range(_MAX_IDENTITY_BARRIER_ATTEMPTS):
                 barrier_token = self._advance_change_clock(
@@ -873,11 +913,14 @@ class ScanResultsCache:
                     preliminary_change_token,
                     preliminary_ancestor_identity,
                 )
-                if self._path_has_symlink_component(file_path):
+                if not trusted_descriptor_path and self._path_has_symlink_component(file_path):
                     raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
                 initial_stat = os.stat(file_path)
                 initial_change_token = self._get_file_change_token(file_path, initial_stat)
-                initial_ancestor_identity = self._capture_ancestor_identity(file_path)
+                initial_ancestor_identity = self._capture_ancestor_identity(
+                    file_path,
+                    trusted_descriptor_path=trusted_descriptor_path,
+                )
                 newest_initial_token = self._newest_identity_change_token(
                     initial_change_token,
                     initial_ancestor_identity,
@@ -897,7 +940,10 @@ class ScanResultsCache:
                     or initial_change_token != self._get_file_change_token(file_path, monitored_stat)
                     or not self._ancestor_identity_matches(
                         initial_ancestor_identity,
-                        self._capture_ancestor_identity(file_path),
+                        self._capture_ancestor_identity(
+                            file_path,
+                            trusted_descriptor_path=trusted_descriptor_path,
+                        ),
                     )
                 ):
                     raise ValueError(f"File changed while starting cache identity monitor: {file_path}")
@@ -905,7 +951,10 @@ class ScanResultsCache:
                 content_hash = self.hasher.hash_file_with_stat(file_path, initial_stat)
                 verified_stat = os.stat(file_path)
                 verified_change_token = self._get_file_change_token(file_path, verified_stat)
-                verified_ancestor_identity = self._capture_ancestor_identity(file_path)
+                verified_ancestor_identity = self._capture_ancestor_identity(
+                    file_path,
+                    trusted_descriptor_path=trusted_descriptor_path,
+                )
 
                 if (
                     not self._stat_matches(initial_stat, verified_stat)
@@ -1039,10 +1088,33 @@ class ScanResultsCache:
         msvcrt_windows: Any = msvcrt
         return self._get_windows_handle_change_token(msvcrt_windows.get_osfhandle(probe.fileno()))
 
-    def _capture_ancestor_identity(self, file_path: str) -> AncestorIdentity:
+    def _capture_ancestor_identity(
+        self,
+        file_path: str,
+        *,
+        trusted_descriptor_path: bool = False,
+    ) -> AncestorIdentity:
         """Capture lexical ancestors, including a change token for the direct parent."""
         file_device = os.stat(file_path).st_dev
         ancestor = Path(os.path.abspath(file_path)).parent
+        if trusted_descriptor_path and self._is_private_descriptor_bound_path(Path(file_path)):
+            ancestor_stat = os.stat(ancestor)
+            return AncestorIdentity(
+                (
+                    (
+                        str(ancestor),
+                        ancestor_stat.st_dev,
+                        ancestor_stat.st_ino,
+                        ancestor_stat.st_mode,
+                        getattr(
+                            ancestor_stat,
+                            "st_mtime_ns",
+                            int(ancestor_stat.st_mtime * 1_000_000_000),
+                        ),
+                        self._get_file_change_token(str(ancestor), ancestor_stat),
+                    ),
+                )
+            )
         identity: list[AncestorEntry] = []
         direct_parent = True
         while True:
@@ -1094,7 +1166,13 @@ class ScanResultsCache:
     def _ancestor_monitor_changed(identity: AncestorIdentity) -> bool:
         return identity.monitor is not None and identity.monitor.changed()
 
-    def _file_identity_matches(self, file_path: str, expected: ScannedFileIdentity) -> bool:
+    def _file_identity_matches(
+        self,
+        file_path: str,
+        expected: ScannedFileIdentity,
+        *,
+        trusted_descriptor_path: bool = False,
+    ) -> bool:
         expected_stat, _expected_hash, expected_change_token, expected_ancestor_identity = expected
         try:
             current_stat = os.stat(file_path)
@@ -1104,7 +1182,10 @@ class ScanResultsCache:
                 and not self._ancestor_monitor_changed(expected_ancestor_identity)
                 and self._ancestor_identity_matches_for_store(
                     expected_ancestor_identity,
-                    self._capture_ancestor_identity(file_path),
+                    self._capture_ancestor_identity(
+                        file_path,
+                        trusted_descriptor_path=trusted_descriptor_path,
+                    ),
                 )
             )
         except (OSError, ValueError):
@@ -1141,6 +1222,35 @@ class ScanResultsCache:
             return False
         expected_target = _DARWIN_STABLE_SYMLINK_ALIASES.get(str(path))
         return expected_target is not None and os.path.realpath(path) == expected_target
+
+    @staticmethod
+    def _is_private_descriptor_bound_path(path: Path) -> bool:
+        """Recognize one retained filename below this process's private directory descriptor."""
+        parts = path.parts
+        descriptor_index: int | None = None
+        if len(parts) == 6 and parts[1] == "proc" and parts[3] == "fd":
+            if parts[2] not in {"self", str(os.getpid())}:
+                return False
+            descriptor_index = 4
+        elif len(parts) == 5 and parts[1:3] == ("dev", "fd"):
+            descriptor_index = 3
+        if descriptor_index is None or parts[-1] in {"", ".", ".."}:
+            return False
+        try:
+            descriptor = int(parts[descriptor_index])
+            root_stat = os.fstat(descriptor)
+            entry_stat = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
+            target_stat = os.stat(parts[-1], dir_fd=descriptor)
+        except (OSError, ValueError):
+            return False
+        effective_uid = getattr(os, "geteuid", lambda: root_stat.st_uid)()
+        return bool(
+            stat.S_ISDIR(root_stat.st_mode)
+            and root_stat.st_uid == effective_uid
+            and not stat.S_IMODE(root_stat.st_mode) & 0o077
+            and stat.S_ISLNK(entry_stat.st_mode)
+            and stat.S_ISREG(target_stat.st_mode)
+        )
 
     @staticmethod
     def _path_has_symlink_component(file_path: str) -> bool:
@@ -1308,10 +1418,12 @@ class ScanResultsCache:
         version_context: dict[str, Any] | None = None,
         version_info: dict[str, Any] | None = None,
         content_hash: str | None = None,
+        cache_key_path: str | None = None,
+        trusted_descriptor_path: bool = False,
     ) -> tuple[str | None, str | None]:
         """Generate a cache key and surface any secure content hash already computed for it."""
         try:
-            if self._path_has_symlink_component(file_path):
+            if not trusted_descriptor_path and self._path_has_symlink_component(file_path):
                 logger.debug("Skipping scan-result cache key for symlinked path %s", file_path)
                 return None, None
 
@@ -1319,7 +1431,7 @@ class ScanResultsCache:
                 file_stat = os.stat(file_path)
 
             file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(
-                file_path,
+                cache_key_path or file_path,
                 file_stat,
                 content_hash=content_hash,
             )

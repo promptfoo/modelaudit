@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from modelaudit.config.rule_config import ModelAuditConfig, reset_config, set_config
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.scanners import jinja2_template_scanner
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
@@ -67,6 +67,37 @@ def test_directory_scan_preserves_path_sensitive_yaml_routing(tmp_path: Path) ->
     assert determine_exit_code(result) == 1
     assert any(issue.location and str(model_file) in issue.location for issue in result.issues)
     assert not any(issue.location and str(misc_file) in issue.location for issue in result.issues)
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "streaming"])
+@pytest.mark.parametrize(("parent_name", "expected_exit"), [("model", 1), ("misc", 0)])
+def test_retained_single_file_preserves_path_sensitive_yaml_routing(
+    tmp_path: Path,
+    stream: bool,
+    parent_name: str,
+    expected_exit: int,
+) -> None:
+    model_dir = tmp_path / parent_name
+    model_dir.mkdir()
+    model_file = model_dir / "settings.yaml"
+    model_file.write_text("{{ cycler.__init__.__globals__.os.popen('id').read() }}\n", encoding="utf-8")
+
+    if stream:
+        result = scan_model_streaming(
+            iter([(model_file, True)]),
+            scan_root=str(model_dir),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=False,
+        )
+    else:
+        result = scan_model_directory_or_file(str(model_file), cache_enabled=False, skip_file_types=False)
+
+    assert determine_exit_code(result) == expected_exit
+    assert any(
+        issue.type == "jinja2_template_check" and "Potential SSTI vulnerability" in issue.message
+        for issue in result.issues
+    ) is bool(expected_exit)
 
 
 def test_jinja_scanner_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -39,10 +39,13 @@ from .cache.trusted_config_store import TrustedConfigStore
 from .config import ModelAuditConfig, set_config
 from .config.local_config import find_local_config_for_paths
 from .core import (
+    _LOCAL_SOURCE_BOUND_GUARD_CONFIG_KEY,
     _LOCAL_SOURCE_RECEIPT_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY,
+    _BoundLocalSourceGuard,
     _make_trusted_stream_shard_root,
+    _open_bound_local_source,
     _reconcile_cross_directory_shard_coverage,
     _snapshot_local_source_receipt,
     _snapshot_validated_shard_target,
@@ -1704,6 +1707,7 @@ class _SourceDispatchResult:
     safetensors_index_proofs: tuple[HuggingFaceSafetensorsIndexProof, ...] = ()
     initial_shard_target: ValidatedShardTargets | None = None
     initial_local_source_receipt: dict[str, int | str] | None = None
+    initial_local_source_guard: _BoundLocalSourceGuard | None = None
 
 
 @dataclass(frozen=True)
@@ -1808,7 +1812,12 @@ class _ScanPathState:
         normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
         return self.explicit_shard_families.get(normalized_path)
 
-    def capture_initial_shard_target(self, path: str) -> ValidatedShardTargets | None:
+    def capture_initial_shard_target(
+        self,
+        path: str,
+        *,
+        expected_target: dict[str, int | str] | None = None,
+    ) -> ValidatedShardTargets | None:
         """Capture a resolved shard identity at the source-dispatch boundary."""
         shard_match = ShardedModelDetector.match_shard_filename(Path(path).name)
         if (
@@ -1832,6 +1841,19 @@ class _ScanPathState:
                 authoritative_shard_index_fingerprint=(initial_index_proof[2] if initial_index_proof else None),
                 authoritative_shard_index_generation=(initial_index_proof[3] if initial_index_proof else None),
             )
+            if expected_target is not None and initial_target:
+                target_receipt = next(iter(initial_target.values()))
+                identity_fields = ("device", "inode", "size", "mtime_ns", "ctime_ns", "nlink")
+                expected_resolved_path = expected_target.get("resolved_path")
+                observed_resolved_path = target_receipt.get("resolved_path")
+                if (
+                    any(target_receipt.get(field) != expected_target.get(field) for field in identity_fields)
+                    or not isinstance(expected_resolved_path, str)
+                    or not isinstance(observed_resolved_path, str)
+                    or os.path.normcase(os.path.normpath(expected_resolved_path))
+                    != os.path.normcase(os.path.normpath(observed_resolved_path))
+                ):
+                    return {}
             if guard_fd is None:
                 return initial_target
             if len(initial_target) != 1:
@@ -2508,7 +2530,7 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
             else:
                 missing_globs.append(path_str)
         else:
-            expanded.append(str(path.resolve()) if path.exists() else path_str)
+            expanded.append(str(path.absolute()) if path.exists() else path_str)
     return expanded, missing_globs
 
 
@@ -3511,14 +3533,20 @@ def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_ti
     sys.exit(determine_exit_code(audit_result))
 
 
-def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, verbose: bool) -> bool:
+def _should_skip_non_model_file(
+    scan_path: str,
+    runtime: _ScanRuntimeConfig,
+    *,
+    verbose: bool,
+    report_path: str | None = None,
+) -> bool:
     """Return True when the local scan prefilter should skip a non-model file."""
     if _local_path_will_be_scanned(scan_path, skip_non_model_files=runtime.skip_non_model_files):
         return False
 
     _, ext = os.path.splitext(scan_path)
     ext = ext.lower()
-    display_path = _display_path(scan_path)
+    display_path = _display_path(report_path or scan_path)
     if ext in (".py", ".js", ".html", ".css"):
         if verbose:
             logger.debug(f"Skipped: {display_path} (non-model file)")
@@ -3613,6 +3641,16 @@ def _scan_local_or_downloaded_path(
 ) -> None:
     """Scan a local artifact or a downloaded path resolved by source dispatch."""
     actual_path = source_result.actual_path
+    retained_local_directory = bool(
+        source_result.initial_local_source_guard is not None
+        and source_result.initial_local_source_receipt is not None
+        and source_result.initial_local_source_receipt.get("mode_type") == stat.S_IFDIR
+    )
+    prefilter_path = (
+        source_result.initial_local_source_guard.bound_path
+        if source_result.initial_local_source_guard is not None
+        else actual_path
+    )
     display_path = _display_path(path)
     explicit_family = path_state.explicit_shard_family_for(actual_path)
     authoritative_index_proof = _current_explicit_shard_index_proof(
@@ -3624,7 +3662,12 @@ def _scan_local_or_downloaded_path(
         explicit_family.authority_invalid or authoritative_index_proof != explicit_family.initial_index_proof
     ):
         pre_scan_shard_target = {}
-    if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
+    if not retained_local_directory and _should_skip_non_model_file(
+        prefilter_path,
+        runtime,
+        verbose=verbose,
+        report_path=actual_path,
+    ):
         return
 
     proof_deadline = (
@@ -3663,8 +3706,18 @@ def _scan_local_or_downloaded_path(
             progress_tracker=progress_tracker,
             actual_path=actual_path,
         )
+        dispatch_overrides: dict[str, Any] = {
+            **_scanner_selection_overrides(runtime),
+            _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
+        }
+        if source_result.initial_local_source_guard is not None:
+            assert source_result.initial_local_source_receipt is not None
+            dispatch_overrides[_LOCAL_SOURCE_RECEIPT_CONFIG_KEY] = source_result.initial_local_source_receipt
+            dispatch_overrides[_LOCAL_SOURCE_BOUND_GUARD_CONFIG_KEY] = source_result.initial_local_source_guard
+        elif source_result.initial_local_source_receipt is not None:
+            dispatch_overrides[_LOCAL_SOURCE_RECEIPT_CONFIG_KEY] = source_result.initial_local_source_receipt
 
-        if runtime.scan_and_delete and os.path.isdir(actual_path):
+        if runtime.scan_and_delete and (retained_local_directory or os.path.isdir(actual_path)):
             from .core import scan_model_streaming
             from .utils.helpers.file_iterator import iterate_files_streaming
 
@@ -3688,10 +3741,7 @@ def _scan_local_or_downloaded_path(
                 use_hf_whitelist=runtime.use_hf_whitelist,
                 cache_enabled=runtime.cache_enabled,
                 cache_dir=runtime.cache_dir,
-                **{
-                    **_scanner_selection_overrides(runtime),
-                    _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
-                },
+                **dispatch_overrides,
             )
             if pre_scan_shard_target is not None:
                 _record_shard_boundary_failure(streaming_result, actual_path)
@@ -3713,14 +3763,8 @@ def _scan_local_or_downloaded_path(
             "progress_update_interval": 2.0,
             "cache_enabled": runtime.cache_enabled,
             "cache_dir": runtime.cache_dir,
-            _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
-            **_scanner_selection_overrides(runtime),
+            **dispatch_overrides,
         }
-        if (
-            source_result.initial_local_source_receipt is not None
-            and source_result.initial_local_source_receipt.get("mode_type") == stat.S_IFDIR
-        ):
-            config_overrides[_LOCAL_SOURCE_RECEIPT_CONFIG_KEY] = source_result.initial_local_source_receipt
         if explicit_family is not None:
             config_overrides[_DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY] = True
         is_dvc_pointer = actual_path.lower().endswith(".dvc")
@@ -3774,7 +3818,7 @@ def _scan_local_or_downloaded_path(
         path_state.record_dvc_coverage(actual_path, scan_results, scanner_config=runtime.config)
         if is_dvc_pointer:
             path_state.track_streaming_paths_for_sbom(scan_results, None)
-        elif os.path.isdir(actual_path):
+        elif retained_local_directory or os.path.isdir(actual_path):
             path_state.track_directory_paths_for_sbom(scan_results)
         else:
             path_state.scanned_paths.append(_display_scan_path(actual_path))
@@ -4116,7 +4160,7 @@ def _resolve_scan_source_for_path(
                         shard_family_group=f"stream-invocation:{id(file_generator):x}",
                         _trusted_shard_family_root=(
                             _make_trusted_stream_shard_root(str(hf_cache_dir / "huggingface"))
-                            if runtime.cache_enabled and trusted_source_provenance is not None
+                            if trusted_source_provenance is not None
                             else None
                         ),
                         timeout=runtime.timeout,
@@ -4675,15 +4719,36 @@ def _resolve_scan_source_for_path(
         path_state.mark_non_shard_error(audit_result)
         return None
 
-    initial_local_source_receipt = _snapshot_local_source_receipt(path)
+    initial_local_source_guard: _BoundLocalSourceGuard | None = None
+    if os.name == "posix":
+        try:
+            initial_local_source_guard = _open_bound_local_source(path)
+        except (OSError, RuntimeError, ValueError):
+            click.echo(f"Error: Path changed during source dispatch: {_display_path(path)}", err=True)
+            path_state.mark_non_shard_error(audit_result)
+            return None
+    initial_local_source_receipt = (
+        initial_local_source_guard.receipt
+        if initial_local_source_guard is not None
+        else _snapshot_local_source_receipt(path)
+    )
     if initial_local_source_receipt is None:
         click.echo(f"Error: Path changed during source dispatch: {_display_path(path)}", err=True)
         path_state.mark_non_shard_error(audit_result)
         return None
     return _SourceDispatchResult(
         actual_path=path,
-        initial_shard_target=path_state.capture_initial_shard_target(path),
+        initial_shard_target=path_state.capture_initial_shard_target(
+            path,
+            expected_target=(
+                initial_local_source_receipt
+                if initial_local_source_guard is not None
+                and initial_local_source_receipt.get("mode_type") == stat.S_IFREG
+                else None
+            ),
+        ),
         initial_local_source_receipt=initial_local_source_receipt,
+        initial_local_source_guard=initial_local_source_guard,
     )
 
 
@@ -5437,6 +5502,8 @@ def scan_command(
                     progress_tracker.report_error(Exception(display_error))
 
             finally:
+                if source_result.initial_local_source_guard is not None:
+                    source_result.initial_local_source_guard.close()
                 path_state.defer_temp_cleanup(
                     source_result.temp_path,
                     cache_enabled=runtime.cache_enabled,

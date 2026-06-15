@@ -80,6 +80,37 @@ def _streaming_member_record(metadata: dict[str, Any], path_segments: list[str])
     return records[0]
 
 
+def test_local_source_receipt_is_runtime_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The private dispatch receipt must not reach scanner or cache configuration."""
+    from modelaudit import core as core_module
+
+    model_path, _companion_path = _write_openvino_pair(tmp_path)
+    receipt = core_module._snapshot_local_source_receipt(tmp_path)
+    assert receipt is not None
+    original_scan_file = core_module.scan_file
+    observed_configs: list[dict[str, Any]] = []
+
+    def capture_scan_config(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        observed_configs.append(dict(config or {}))
+        return original_scan_file(path, config=config)
+
+    monkeypatch.setattr(core_module, "scan_file", capture_scan_config)
+
+    result = scan_model_streaming(
+        iter([(model_path, True)]),
+        scan_root=str(tmp_path),
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["pickle"],
+        skip_file_types=False,
+        _local_source_receipt=receipt,
+    )
+
+    assert result.success is True
+    assert observed_configs
+    assert all(core_module._LOCAL_SOURCE_RECEIPT_CONFIG_KEY not in config for config in observed_configs)
+
+
 @pytest.fixture
 def temp_test_files() -> Iterator[list[Path]]:
     """Create temporary test files for streaming."""
@@ -2555,11 +2586,11 @@ def test_scan_model_streaming_tracks_deleted_index_scope_through_symlink(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory descriptor semantics required")
-def test_scan_model_streaming_preserves_reused_symlink_parent_receipts(
+def test_scan_model_streaming_rejects_retargeted_symlink_parent_receipt(
     tmp_path: Path,
     requires_symlinks: None,
 ) -> None:
-    """Reusing one lexical path cannot overwrite an earlier physical scope receipt."""
+    """Reusing one lexical path cannot replace its initial physical scope receipt."""
     roots = [tmp_path / name for name in ("a", "b")]
     for root in roots:
         root.mkdir()
@@ -2592,17 +2623,15 @@ def test_scan_model_streaming_preserves_reused_symlink_parent_receipts(
 
     assert result.success is False
     assert determine_exit_code(result) == 2
-    assert any(
-        check.details.get("reason") == "safetensors_index_deleted_before_shard_validation" for check in result.checks
-    )
+    assert any(check.name == "Local Source Boundary Check" for check in result.checks)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory descriptor semantics required")
-def test_scan_model_streaming_defers_same_lexical_index_in_distinct_symlink_parents(
+def test_scan_model_streaming_rejects_same_lexical_index_in_retargeted_symlink_parent(
     tmp_path: Path,
     requires_symlinks: None,
 ) -> None:
-    """Deferred cleanup is keyed by physical parent rather than a reused alias spelling."""
+    """A reused alias cannot introduce a second physical index authority."""
     roots = [tmp_path / name for name in ("a", "b")]
     for root in roots:
         root.mkdir()
@@ -2630,9 +2659,9 @@ def test_scan_model_streaming_defers_same_lexical_index_in_distinct_symlink_pare
         scanners=["metadata"],
     )
 
-    assert result.success is True
-    assert determine_exit_code(result) == 0
-    assert not any((root / index_path.name).exists() for root in roots)
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.name == "Local Source Boundary Check" for check in result.checks)
 
 
 def test_scan_model_streaming_retains_valid_index_symlink_before_shard(
@@ -3324,17 +3353,22 @@ def test_scan_model_streaming_total_one_rebases_pinned_result_paths(
         json.dumps({"weight_map": {"tensor": shard.name}}),
         encoding="utf-8",
     )
-    pinned_dir = tmp_path / "alternate-pinned-path"
+    pinned_dir = tmp_path.parent / f"{tmp_path.name}-alternate-pinned-path"
     pinned_dir.mkdir()
     pinned_path = pinned_dir / shard.name
 
     @contextmanager
-    def alternate_pinned_path(_resolved_path: str, _target: dict[str, int | str]) -> Iterator[Any]:
+    def alternate_pinned_path(
+        _resolved_path: str,
+        _target: dict[str, int | str],
+        **_kwargs: Any,
+    ) -> Iterator[Any]:
         shutil.copyfile(shard, pinned_path)
         try:
             yield SimpleNamespace(path=str(pinned_path), changed_during_scan=False)
         finally:
             pinned_path.unlink(missing_ok=True)
+            pinned_dir.rmdir()
 
     monkeypatch.setattr("modelaudit.core._pinned_shard_scan_path", alternate_pinned_path)
 
@@ -3440,8 +3474,12 @@ def test_scan_model_streaming_total_one_pinned_descriptor_change_fails_closed(
     shard.write_bytes(struct.pack("<Q", len(header)) + header)
 
     @contextmanager
-    def changed_pinned_path(resolved_path: str, target: dict[str, int | str]) -> Iterator[Any]:
-        with _pinned_shard_scan_path(resolved_path, target) as pinned_scan:
+    def changed_pinned_path(
+        resolved_path: str,
+        target: dict[str, int | str],
+        **kwargs: Any,
+    ) -> Iterator[Any]:
+        with _pinned_shard_scan_path(resolved_path, target, **kwargs) as pinned_scan:
             yield pinned_scan
         pinned_scan.changed_during_scan = True
 
@@ -4851,6 +4889,297 @@ def test_scan_model_streaming_openvino_prefetched_companion_counts_toward_max_to
     assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
 
 
+def test_scan_model_streaming_rejects_local_companion_stage_before_total_size_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local source over the total cap must fail before copying source or companion bytes."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    bin_path.write_bytes(b"\x00" * (2 * 1024 * 1024))
+
+    def fail_copy(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("over-budget local files must not be copied into private staging")
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
+
+    result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        max_total_size=1,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.content_hash is None
+    assert any(
+        issue.details.get("projected_total_size", 0) > 1 and issue.details.get("max_total_size") == 1
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_rejects_local_stage_before_max_file_size_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local source over its file cap must fail before staging source or companion bytes."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    bin_path.write_bytes(b"\x00" * (2 * 1024 * 1024))
+
+    def fail_copy(*_args: Any, **_kwargs: Any) -> str:
+        pytest.fail("over-budget local files must not be copied into private staging")
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
+
+    result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        max_file_size=1,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.content_hash is None
+    assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "streaming"])
+def test_local_scan_rejects_oversized_companion_before_private_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """A small primary cannot stage an oversized companion past max_file_size."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    bin_path.write_bytes(b"\x00" * (2 * 1024 * 1024))
+
+    def fail_copy(*_args: Any, **_kwargs: Any) -> str:
+        pytest.fail("an oversized companion must fail before any private staging copy")
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
+    if stream:
+        result = scan_model_streaming(
+            iter([(xml_path, True)]),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            max_file_size=1024,
+            scanners=["openvino"],
+            skip_file_types=False,
+        )
+    else:
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            max_file_size=1024,
+            scanners=["openvino"],
+            skip_file_types=False,
+        )
+
+    assert determine_exit_code(result) == 2
+    assert result.content_hash is None
+    assert any(
+        issue.message.startswith("File too large to scan") and issue.details.get("file_size") == bin_path.stat().st_size
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "streaming"])
+def test_explicit_openvino_xml_retains_malicious_weights_companion(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    """Binding one XML file must retain its adjacent executable weights context."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    create_malicious_pickle(bin_path)
+
+    if stream:
+        result = scan_model_streaming(
+            iter([(xml_path, True)]),
+            scan_root=str(xml_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=False,
+        )
+    else:
+        result = scan_model_directory_or_file(
+            str(xml_path),
+            cache_enabled=False,
+            skip_file_types=False,
+        )
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and ("dangerous global" in issue.message.lower() or "system" in issue.message.lower())
+        for issue in result.issues
+    )
+    assert not any(check.name == "OpenVINO Weights File Check" for check in result.checks)
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "streaming"])
+def test_explicit_onnx_retains_external_data_companion(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    """Binding one ONNX file must retain its declared external-data sidecar."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(struct.pack("f", 1.0))
+
+    if stream:
+        result = scan_model_streaming(
+            iter([(model_path, True)]),
+            scan_root=str(model_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+    else:
+        result = scan_model_directory_or_file(
+            str(model_path),
+            cache_scan_results=False,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+
+    assert not any(
+        check.name == "External Data Reference Check" and check.status.value == "failed" for check in result.checks
+    )
+    assert any(
+        check.name == "External Data Reference Check" and check.status.value == "passed" for check in result.checks
+    )
+    assert result.bytes_scanned == model_path.stat().st_size + sidecar_path.stat().st_size
+    assert result.content_hash == compute_aggregate_hash(
+        [compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)]
+    )
+
+
+def test_standard_openvino_companion_identity_counts_once_under_exact_total_budget(tmp_path: Path) -> None:
+    """A sidecar scanned independently and as XML context consumes one aggregate byte budget."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    bin_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    unique_bytes = xml_path.stat().st_size + bin_path.stat().st_size
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_enabled=False,
+        max_total_size=unique_bytes,
+        scanners=["openvino", "pickle"],
+        skip_file_types=False,
+    )
+
+    assert result.bytes_scanned == unique_bytes
+    assert not any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+    assert determine_exit_code(result) == 0
+
+
+def test_standard_local_scan_rejects_total_budget_before_private_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A standard directory scan enforces max_total_size before staging its first file."""
+    model_path = tmp_path / "model.pkl"
+    model_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    def fail_copy(*_args: Any, **_kwargs: Any) -> str:
+        pytest.fail("an over-budget source must fail before any private staging copy")
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_enabled=False,
+        max_total_size=1,
+        scanners=["pickle"],
+        skip_file_types=False,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.content_hash is None
+    assert any(
+        "Total scan size limit exceeded" in issue.message and issue.details.get("projected_total_size", 0) > 1
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "streaming"])
+def test_local_private_copy_rejects_post_preflight_source_growth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """A source cannot grow past its validated size while a private copy is starting."""
+    model_path = tmp_path / "model.pkl"
+    model_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    initial_size = model_path.stat().st_size
+    source_inode = model_path.stat().st_ino
+    observed_limits: list[int | None] = []
+    from modelaudit.utils.file import handlers
+
+    original_copy = handlers._copy_pinned_file_descriptor
+
+    def grow_before_copy(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
+        if os.fstat(source_fd).st_ino == source_inode:
+            observed_limits.append(kwargs.get("max_bytes"))
+            model_path.write_bytes(b"x" * (2 * 1024 * 1024))
+        return original_copy(source_fd, destination, **kwargs)
+
+    monkeypatch.setattr(handlers, "_copy_pinned_file_descriptor", grow_before_copy)
+    if stream:
+        result = scan_model_streaming(
+            iter([(model_path, True)]),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            max_file_size=1024,
+            max_total_size=1024,
+            scanners=["pickle"],
+            skip_file_types=False,
+        )
+    else:
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            max_file_size=1024,
+            max_total_size=1024,
+            scanners=["pickle"],
+            skip_file_types=False,
+        )
+
+    assert observed_limits == [initial_size]
+    assert determine_exit_code(result) == 2
+    assert result.content_hash is None
+
+
+def test_local_stream_rejects_initial_index_generation_replacement(tmp_path: Path) -> None:
+    """An index present in the initial namespace cannot be replaced before it is yielded."""
+    index_path = tmp_path / "payload.safetensors.index.json"
+    index_path.write_bytes(pickle.dumps(_StreamingMaliciousPicklePayload()))
+
+    def replace_before_yield() -> Iterator[tuple[Path, bool]]:
+        index_path.write_text("{}", encoding="utf-8")
+        yield index_path, True
+
+    result = scan_model_streaming(
+        replace_before_yield(),
+        scan_root=str(tmp_path),
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["pickle", "metadata", "safetensors"],
+        skip_file_types=False,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.content_hash is None
+    assert any(check.name == "Local Source Boundary Check" for check in result.checks)
+
+
 def test_scan_model_streaming_openvino_missing_companion_still_reports_s701(tmp_path: Path) -> None:
     """Missing OpenVINO weights must not be suppressed by companion-preservation logic."""
     xml_path = tmp_path / "model.xml"
@@ -5069,9 +5398,12 @@ def test_scan_model_directory_or_file_selected_openvino_sidecar_counts_toward_ma
     )
 
     assert determine_exit_code(result) == 2
-    assert result.bytes_scanned > 32
+    assert result.bytes_scanned == 0
     assert result.content_hash is None
-    assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+    assert any(
+        "Total scan size limit exceeded" in issue.message and issue.details.get("projected_total_size", 0) > 32
+        for issue in result.issues
+    )
 
 
 def test_openvino_bin_sidecar_respects_selected_pytorch_binary_scanner(tmp_path: Path) -> None:
@@ -5263,9 +5595,18 @@ def test_scan_model_streaming_skips_huggingface_cache_metadata(
     model_file = snapshots_dir / "model.pkl"
     with model_file.open("wb") as f:
         pickle.dump({"data": "safe"}, f)
+    scanned_source_matches: list[bool] = []
 
     with patch("modelaudit.core.scan_file") as mock_scan:
-        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        def record_scan(path: str, config: dict[str, Any]) -> ScanResult:
+            del config
+            scanned_source_matches.append(
+                Path(path).name == model_file.name and Path(path).read_bytes() == model_file.read_bytes()
+            )
+            return create_mock_scan_result(bytes_scanned=100)
+
+        mock_scan.side_effect = record_scan
 
         result = scan_model_streaming(
             file_generator=iter([(metadata_file, False), (model_file, True)]),
@@ -5276,7 +5617,7 @@ def test_scan_model_streaming_skips_huggingface_cache_metadata(
         )
 
     mock_scan.assert_called_once()
-    assert mock_scan.call_args.args[0] == str(model_file)
+    assert scanned_source_matches == [True]
     assert result.files_scanned == 1
 
 
@@ -5298,9 +5639,18 @@ def test_scan_model_streaming_skips_local_download_sidecars(tmp_path: Path) -> N
     config_lock.touch()
     write_hf_download_metadata(vocab_metadata)
     write_hf_cachedir_tag(cachedir_tag)
+    scanned_source_matches: list[bool] = []
+    expected_by_name = {path.name: path for path in (config_path, vocab_path)}
 
     with patch("modelaudit.core.scan_file") as mock_scan:
-        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        def record_scan(path: str, config: dict[str, Any]) -> ScanResult:
+            del config
+            expected_path = expected_by_name[Path(path).name]
+            scanned_source_matches.append(Path(path).read_bytes() == expected_path.read_bytes())
+            return create_mock_scan_result(bytes_scanned=100)
+
+        mock_scan.side_effect = record_scan
 
         result = scan_model_streaming(
             file_generator=iter(
@@ -5319,8 +5669,7 @@ def test_scan_model_streaming_skips_local_download_sidecars(tmp_path: Path) -> N
             skip_file_types=True,
             cache_enabled=False,
         )
-
-    assert [call.args[0] for call in mock_scan.call_args_list] == [str(config_path), str(vocab_path)]
+    assert scanned_source_matches == [True, True]
     assert result.files_scanned == 2
 
 
@@ -5601,6 +5950,43 @@ def test_scan_model_streaming_hf_cache_symlink_allowed(
     assert len(path_traversal_issues) == 0
 
 
+def test_scan_model_streaming_hf_cache_alias_rejects_post_scan_blob_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """A trusted snapshot alias remains bound to the blob generation that was scanned."""
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--test-model"
+    snapshots_dir = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshots_dir.mkdir(parents=True)
+    blobs_dir.mkdir(parents=True)
+    blob_path = blobs_dir / "blob123"
+    blob_path.write_bytes(pickle.dumps({"data": "safe"}))
+    malicious_blob = blobs_dir / "malicious"
+    create_malicious_pickle(malicious_blob)
+    model_link = snapshots_dir / "model.pkl"
+    model_link.symlink_to(os.path.relpath(blob_path, model_link.parent))
+
+    def replacing_stream() -> Iterator[tuple[Path, bool]]:
+        yield model_link, False
+        malicious_blob.replace(blob_path)
+
+    result = scan_model_streaming(
+        file_generator=replacing_stream(),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshots_dir),
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert any(check.name == "Local Source Boundary Check" for check in result.checks)
+
+
 def test_scan_model_streaming_hf_home_cache_symlink_allowed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5650,8 +6036,17 @@ def test_scan_model_streaming_symlink_reports_source_path_consistently(
     source_link = base_dir / "link.pkl"
     source_link.symlink_to(resolved_target.relative_to(source_link.parent))
 
+    scanned_source_matches: list[bool] = []
     with patch("modelaudit.core.scan_file") as mock_scan:
-        mock_scan.return_value = create_mock_location_scan_result(resolved_target)
+
+        def record_scan(path: str, config: dict[str, Any]) -> ScanResult:
+            del config
+            scanned_source_matches.append(
+                Path(path).name == source_link.name and Path(path).read_bytes() == resolved_target.read_bytes()
+            )
+            return create_mock_location_scan_result(resolved_target)
+
+        mock_scan.side_effect = record_scan
 
         result = scan_model_streaming(
             file_generator=iter([(source_link, True)]),
@@ -5661,7 +6056,7 @@ def test_scan_model_streaming_symlink_reports_source_path_consistently(
             cache_enabled=False,
         )
 
-    assert mock_scan.call_args[0][0] == str(resolved_target)
+    assert scanned_source_matches == [True]
     assert result.files_scanned == 1
     assert result.assets[0].path == str(source_link)
     assert result.assets[0].size == resolved_target.stat().st_size
@@ -5708,7 +6103,7 @@ def test_scan_model_streaming_hf_cache_symlink_reports_snapshot_path(
             cache_enabled=False,
         )
 
-    assert mock_scan.call_args[0][0] == str(blob_path)
+    assert Path(mock_scan.call_args[0][0]).name == model_link.name
     assert result.files_scanned == 1
     assert result.assets[0].path == str(model_link)
 
@@ -5777,6 +6172,53 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_uses_snapshot_alias(
     assert_only_onnx_external_schema_validation_skipped(result)
 
 
+def test_scan_model_streaming_hf_cache_rejects_onnx_stage_before_total_size_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Trusted HF aliases must enforce projected total size before private staging copies."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(b"\x00" * (2 * 1024 * 1024))
+    model_link = snapshot_dir / "model.onnx"
+    sidecar_link = snapshot_dir / "model.onnx_data"
+    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    def fail_copy(*_args: Any, **_kwargs: Any) -> str:
+        pytest.fail("over-budget HF files must not be copied into private staging")
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_link, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_dir),
+        cache_enabled=False,
+        max_total_size=1,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.content_hash is None
+    assert any(
+        issue.details.get("projected_total_size", 0) > 1 and issue.details.get("max_total_size") == 1
+        for issue in result.issues
+    )
+
+
 def test_scan_model_streaming_hf_cache_onnx_external_data_dedupes_yielded_alias_sidecar(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5825,6 +6267,57 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_dedupes_yielded_alias_
     assert result.content_hash == expected_hash
     assert not any("Total scan size limit exceeded" in issue.message for issue in result.issues)
     assert determine_exit_code(result) == 0
+
+
+def test_scan_model_streaming_hf_cache_replaced_onnx_sidecar_is_reaccounted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Path reuse cannot exempt a new external-data generation from the total-size budget."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blobs = [blobs_dir / f"model-{index}-blob" for index in range(2)]
+    for model_blob in model_blobs:
+        model_blob.write_bytes(create_external_onnx_payload(tmp_path, external_path="shared.onnx_data"))
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    model_links = [snapshot_dir / f"model-{index}.onnx" for index in range(2)]
+    for model_link, model_blob in zip(model_links, model_blobs, strict=True):
+        model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    sidecar_link = snapshot_dir / "shared.onnx_data"
+    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+    initial_budget = sum(path.stat().st_size for path in [*model_blobs, sidecar_blob])
+
+    def replacing_stream() -> Iterator[tuple[Path, bool]]:
+        yield model_links[0], False
+        sidecar_blob.write_bytes(b"x" * (4 * 1024 * 1024))
+        yield model_links[1], True
+
+    result = scan_model_streaming(
+        file_generator=replacing_stream(),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_dir),
+        cache_enabled=False,
+        max_total_size=initial_budget,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.bytes_scanned <= initial_budget
+    assert any(
+        "Total scan size limit exceeded" in issue.message
+        and issue.details.get("projected_total_size", 0) > initial_budget
+        for issue in result.issues
+    )
 
 
 def test_scan_model_streaming_scans_consumed_scannable_onnx_external_data_alias(tmp_path: Path) -> None:

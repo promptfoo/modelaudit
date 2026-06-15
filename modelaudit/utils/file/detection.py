@@ -30,6 +30,8 @@ from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 from .hdf5 import find_hdf5_signature_offset
 
+VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY = "_validated_descriptor_bound_source"
+
 # Known GGML header variants (older formats like GGMF and GGJT)
 GGML_MAGIC_VARIANTS = {
     b"GGML",
@@ -7266,6 +7268,35 @@ def _same_regular_file_identity(current: os.stat_result, expected: os.stat_resul
     )
 
 
+def _is_private_descriptor_bound_regular_file(path: str | Path) -> bool:
+    """Recognize one regular-file symlink below this process's private directory descriptor."""
+    parts = Path(path).parts
+    descriptor_index: int | None = None
+    if len(parts) == 6 and parts[1] == "proc" and parts[3] == "fd":
+        if parts[2] not in {"self", str(os.getpid())}:
+            return False
+        descriptor_index = 4
+    elif len(parts) == 5 and parts[1:3] == ("dev", "fd"):
+        descriptor_index = 3
+    if descriptor_index is None or parts[-1] in {"", ".", ".."}:
+        return False
+    try:
+        descriptor = int(parts[descriptor_index])
+        root_stat = os.fstat(descriptor)
+        entry_stat = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
+        target_stat = os.stat(parts[-1], dir_fd=descriptor)
+    except (OSError, ValueError):
+        return False
+    effective_uid = getattr(os, "geteuid", lambda: root_stat.st_uid)()
+    return bool(
+        stat.S_ISDIR(root_stat.st_mode)
+        and root_stat.st_uid == effective_uid
+        and not stat.S_IMODE(root_stat.st_mode) & 0o077
+        and stat.S_ISLNK(entry_stat.st_mode)
+        and stat.S_ISREG(target_stat.st_mode)
+    )
+
+
 _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE: Literal["unavailable"] = "unavailable"
 _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS: Literal["ambiguous"] = "ambiguous"
 _JaxJsonCheckpointProbeState = bool | Literal["unavailable", "ambiguous"] | None
@@ -7274,10 +7305,12 @@ _JaxJsonCheckpointProbeState = bool | Literal["unavailable", "ambiguous"] | None
 def _jax_json_checkpoint_prefix_failure_result(
     file_path: Path,
     expected_stat: os.stat_result,
+    *,
+    follow_validated_symlink: bool = False,
 ) -> Literal["unavailable"] | None:
     """Fall through unchanged unavailable files but fail closed on retargets."""
     try:
-        current_stat = file_path.lstat()
+        current_stat = file_path.stat() if follow_validated_symlink else file_path.lstat()
     except OSError:
         return None
     if _same_regular_file_identity(current_stat, expected_stat):
@@ -7285,10 +7318,15 @@ def _jax_json_checkpoint_prefix_failure_result(
     return None
 
 
-def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Literal["unavailable"] | None:
+def _read_jax_json_checkpoint_prefix(
+    file_path: Path,
+    *,
+    follow_validated_symlink: bool = False,
+) -> tuple[int, bytes] | Literal["unavailable"] | None:
     """Read the routing prefix without following a changed lexical entry."""
     try:
-        expected_stat = file_path.lstat()
+        trusted_descriptor_symlink = follow_validated_symlink and _is_private_descriptor_bound_regular_file(file_path)
+        expected_stat = file_path.stat() if trusted_descriptor_symlink else file_path.lstat()
     except OSError:
         return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
 
@@ -7297,17 +7335,22 @@ def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Lit
         file_attributes = getattr(expected_stat, "st_file_attributes", 0) or 0
         if (
             not stat.S_ISREG(expected_stat.st_mode)
-            or stat.S_ISLNK(expected_stat.st_mode)
+            or (not trusted_descriptor_symlink and stat.S_ISLNK(expected_stat.st_mode))
             or bool(reparse_flag and file_attributes & reparse_flag)
         ):
             return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
 
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        if not trusted_descriptor_symlink:
+            flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(file_path, flags)
         except OSError:
-            return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+            return _jax_json_checkpoint_prefix_failure_result(
+                file_path,
+                expected_stat,
+                follow_validated_symlink=trusted_descriptor_symlink,
+            )
         try:
             opened_stat = os.fstat(descriptor)
             if not _same_regular_file_identity(opened_stat, expected_stat):
@@ -7319,23 +7362,42 @@ def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Lit
                 try:
                     chunk = os.read(descriptor, remaining)
                 except OSError:
-                    return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+                    return _jax_json_checkpoint_prefix_failure_result(
+                        file_path,
+                        expected_stat,
+                        follow_validated_symlink=trusted_descriptor_symlink,
+                    )
                 if not chunk:
                     break
                 chunks.append(chunk)
                 remaining -= len(chunk)
-            if not _same_regular_file_identity(os.fstat(descriptor), expected_stat):
+            final_path_stat = file_path.stat() if trusted_descriptor_symlink else file_path.lstat()
+            if not _same_regular_file_identity(os.fstat(descriptor), expected_stat) or not _same_regular_file_identity(
+                final_path_stat,
+                expected_stat,
+            ):
                 return None
         finally:
             os.close(descriptor)
     except OSError:
-        return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
+        return _jax_json_checkpoint_prefix_failure_result(
+            file_path,
+            expected_stat,
+            follow_validated_symlink=trusted_descriptor_symlink,
+        )
     return expected_stat.st_size, b"".join(chunks)
 
 
-def _probe_jax_json_checkpoint_file_state(file_path: Path) -> _JaxJsonCheckpointProbeState:
+def _probe_jax_json_checkpoint_file_state(
+    file_path: Path,
+    *,
+    follow_validated_symlink: bool = False,
+) -> _JaxJsonCheckpointProbeState:
     """Return bounded JAX JSON routing state without flattening refusal causes."""
-    snapshot = _read_jax_json_checkpoint_prefix(file_path)
+    snapshot = _read_jax_json_checkpoint_prefix(
+        file_path,
+        follow_validated_symlink=follow_validated_symlink,
+    )
     if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
         return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
     if snapshot is None:
@@ -7376,9 +7438,17 @@ def _probe_jax_json_checkpoint_file_state(file_path: Path) -> _JaxJsonCheckpoint
     return has_jax_json_checkpoint_structure(payload)
 
 
-def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous: bool = False) -> bool | None:
+def _probe_jax_json_checkpoint_file(
+    file_path: Path,
+    *,
+    unavailable_is_ambiguous: bool = False,
+    follow_validated_symlink: bool = False,
+) -> bool | None:
     """Return True for JAX JSON, None for bounded ambiguity or retargets, else False."""
-    probe_state = _probe_jax_json_checkpoint_file_state(file_path)
+    probe_state = _probe_jax_json_checkpoint_file_state(
+        file_path,
+        follow_validated_symlink=follow_validated_symlink,
+    )
     if probe_state == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
         return None if unavailable_is_ambiguous else False
     if probe_state == _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS:
@@ -7386,34 +7456,73 @@ def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous
     return probe_state
 
 
-def is_jax_json_checkpoint_file(path: str | Path) -> bool:
+def is_jax_json_checkpoint_file(path: str | Path, *, follow_validated_symlink: bool = False) -> bool:
     """Preserve confirmed and bounded-inconclusive JAX JSON candidates for scanning."""
-    return _probe_jax_json_checkpoint_file(Path(path)) is not False
+    return (
+        _probe_jax_json_checkpoint_file(
+            Path(path),
+            follow_validated_symlink=follow_validated_symlink,
+        )
+        is not False
+    )
 
 
-def is_confirmed_jax_json_checkpoint_file(path: str | Path) -> bool:
+def is_confirmed_jax_json_checkpoint_file(path: str | Path, *, follow_validated_symlink: bool = False) -> bool:
     """Return whether bounded JSON evidence positively identifies JAX metadata."""
-    return _probe_jax_json_checkpoint_file(Path(path)) is True
+    return (
+        _probe_jax_json_checkpoint_file(
+            Path(path),
+            follow_validated_symlink=follow_validated_symlink,
+        )
+        is True
+    )
 
 
-def _probe_content_routed_jax_json_checkpoint(file_path: Path) -> bool | None:
+def _probe_content_routed_jax_json_checkpoint(
+    file_path: Path,
+    *,
+    follow_validated_symlink: bool = False,
+) -> bool | None:
     """Return the bounded JAX JSON probe state for content-routable suffixes."""
     ext = file_path.suffix.lower()
     if ext in _JAX_JSON_CHECKPOINT_CONTENT_ROUTE_EXCLUDED_SUFFIXES:
         return False
     if not (ext in _JAX_JSON_CHECKPOINT_SCANNER_SUFFIXES or ext not in _JAX_JSON_CHECKPOINT_DECLARED_SUFFIXES):
         return False
-    return _probe_jax_json_checkpoint_file(file_path)
+    return _probe_jax_json_checkpoint_file(
+        file_path,
+        follow_validated_symlink=follow_validated_symlink,
+    )
 
 
-def _is_confirmed_content_routed_jax_json_checkpoint(file_path: Path) -> bool:
+def _is_confirmed_content_routed_jax_json_checkpoint(
+    file_path: Path,
+    *,
+    follow_validated_symlink: bool = False,
+) -> bool:
     """Return whether bounded routing positively identifies JAX JSON metadata."""
-    return _probe_content_routed_jax_json_checkpoint(file_path) is True
+    return (
+        _probe_content_routed_jax_json_checkpoint(
+            file_path,
+            follow_validated_symlink=follow_validated_symlink,
+        )
+        is True
+    )
 
 
-def _could_be_content_routed_jax_json_checkpoint(file_path: Path) -> bool:
+def _could_be_content_routed_jax_json_checkpoint(
+    file_path: Path,
+    *,
+    follow_validated_symlink: bool = False,
+) -> bool:
     """Route JAX-owned or renamed JSON candidates without claiming foreign suffixes."""
-    return _probe_content_routed_jax_json_checkpoint(file_path) is not False
+    return (
+        _probe_content_routed_jax_json_checkpoint(
+            file_path,
+            follow_validated_symlink=follow_validated_symlink,
+        )
+        is not False
+    )
 
 
 class _MsgpackProbeInvalid(ValueError):
@@ -8653,6 +8762,7 @@ def detect_format_from_magic_bytes(
     include_onnx_structure: bool = True,
     pickle_probe_sample: bytes | None = None,
     pickle_probe_is_prefix: bool | None = None,
+    follow_validated_symlink: bool = False,
 ) -> FileFormat:
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     compression_format = _detect_compression_format(magic16)
@@ -8769,7 +8879,10 @@ def detect_format_from_magic_bytes(
         ) and not _could_be_content_routed_flax_msgpack(file_path):
             return "pickle"
 
-    if file_path is not None and _is_confirmed_content_routed_jax_json_checkpoint(file_path):
+    if file_path is not None and _is_confirmed_content_routed_jax_json_checkpoint(
+        file_path,
+        follow_validated_symlink=follow_validated_symlink,
+    ):
         return "jax_checkpoint"
 
     if file_path is not None and not file_path.suffix:
@@ -8814,7 +8927,10 @@ def detect_format_from_magic_bytes(
             return PROTOBUF_MODEL_CANDIDATE_FORMAT
         return "flax_msgpack"
 
-    if file_path is not None and _could_be_content_routed_jax_json_checkpoint(file_path):
+    if file_path is not None and _could_be_content_routed_jax_json_checkpoint(
+        file_path,
+        follow_validated_symlink=follow_validated_symlink,
+    ):
         return "jax_checkpoint"
 
     if renamed_tensorflow_format == "inconclusive":
@@ -8840,7 +8956,7 @@ def detect_format_from_magic_bytes(
     return "unknown"
 
 
-def detect_file_format_from_magic(path: str) -> str:
+def detect_file_format_from_magic(path: str, *, follow_validated_symlink: bool = False) -> str:
     """Detect file format solely from magic bytes."""
     file_path = Path(path)
     if file_path.is_dir():
@@ -8891,6 +9007,7 @@ def detect_file_format_from_magic(path: str) -> str:
                 magic16,
                 size,
                 file_path,
+                follow_validated_symlink=follow_validated_symlink,
             )
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
@@ -9173,7 +9290,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     return "unknown"
 
 
-def detect_file_format(path: str) -> str:
+def detect_file_format(path: str, *, follow_validated_symlink: bool = False) -> str:
     """
     Attempt to identify the format:
     - TensorFlow SavedModel (directory with saved_model.pb)
@@ -9374,7 +9491,10 @@ def detect_file_format(path: str) -> str:
             return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
         return "safetensors"
 
-    if _is_confirmed_content_routed_jax_json_checkpoint(file_path):
+    if _is_confirmed_content_routed_jax_json_checkpoint(
+        file_path,
+        follow_validated_symlink=follow_validated_symlink,
+    ):
         return "jax_checkpoint"
 
     if ext in _FLAX_MSGPACK_SCANNER_SUFFIXES or _could_be_content_routed_flax_msgpack(file_path):
@@ -9392,7 +9512,10 @@ def detect_file_format(path: str) -> str:
             return PROTOBUF_MODEL_CANDIDATE_FORMAT
         return "flax_msgpack"
 
-    if _could_be_content_routed_jax_json_checkpoint(file_path):
+    if _could_be_content_routed_jax_json_checkpoint(
+        file_path,
+        follow_validated_symlink=follow_validated_symlink,
+    ):
         return "jax_checkpoint"
 
     torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)

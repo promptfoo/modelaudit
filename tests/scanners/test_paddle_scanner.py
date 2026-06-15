@@ -184,7 +184,7 @@ def test_paddle_read_failure_takes_precedence_over_security_finding(
     real_open = builtins.open
 
     def fail_selected_read(path: str, *args: Any, **kwargs: Any) -> Any:
-        if path == str(unreadable):
+        if Path(path).name == unreadable.name:
             raise OSError("simulated Paddle read failure")
         return real_open(path, *args, **kwargs)
 

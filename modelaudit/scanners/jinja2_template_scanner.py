@@ -47,7 +47,14 @@ from modelaudit.utils.file.detection import (
     huggingface_tokenizer_json_has_template_route_evidence,
 )
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
+from .base import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    BaseScanner,
+    IssueSeverity,
+    ScanResult,
+    _trusted_logical_path_for_scan,
+    logger,
+)
 
 # Optional GGUF support with graceful fallback
 try:
@@ -455,8 +462,9 @@ class Jinja2TemplateScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        filename = os.path.basename(path).lower()
-        ext = os.path.splitext(path)[1].lower()
+        routing_path = _trusted_logical_path_for_scan(path) or path
+        filename = os.path.basename(routing_path).lower()
+        ext = os.path.splitext(routing_path)[1].lower()
 
         # GGUF files
         if ext == ".gguf":
@@ -486,7 +494,7 @@ class Jinja2TemplateScanner(BaseScanner):
         # YAML files in ML contexts
         if ext in [".yaml", ".yml"]:
             # Check if in ML model directory or contains ML-related patterns
-            path_lower = path.lower()
+            path_lower = routing_path.lower()
             if any(
                 ml_term in path_lower for ml_term in ["model", "checkpoint", "huggingface", "transformers", "config"]
             ):
@@ -818,8 +826,9 @@ class Jinja2TemplateScanner(BaseScanner):
     def _determine_context(self, path: str) -> MLContext:
         """Determine ML context and file type"""
         context = MLContext()
-        filename = os.path.basename(path).lower()
-        ext = os.path.splitext(path)[1].lower()
+        routing_path = _trusted_logical_path_for_scan(path) or path
+        filename = os.path.basename(routing_path).lower()
+        ext = os.path.splitext(routing_path)[1].lower()
 
         # File type detection
         if ext == ".gguf":
@@ -841,7 +850,7 @@ class Jinja2TemplateScanner(BaseScanner):
             context.confidence += 1
 
         # Framework detection from path
-        path_lower = path.lower()
+        path_lower = routing_path.lower()
         if "huggingface" in path_lower or "transformers" in path_lower:
             context.framework = "huggingface"
             context.confidence += 1

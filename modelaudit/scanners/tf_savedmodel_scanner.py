@@ -22,6 +22,8 @@ from modelaudit.utils.file.detection import (
     PROTO0_1_MAX_PROBE_BYTES,
     PROTO0_1_MAX_PROBE_OPCODES,
     PROTO0_1_TRIVIAL_LEADING_OPCODES,
+    VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY,
+    _is_private_descriptor_bound_regular_file,
     _looks_like_proto0_or_1_pickle,
 )
 from modelaudit.utils.helpers.code_validation import (
@@ -217,16 +219,22 @@ def _is_link_like(file_stat: os.stat_result) -> bool:
 
 
 @contextlib.contextmanager
-def _open_bound_regular_file(path: Path, expected_stat: os.stat_result) -> Iterator[Any]:
+def _open_bound_regular_file(
+    path: Path,
+    expected_stat: os.stat_result,
+    *,
+    follow_validated_symlink: bool = False,
+) -> Iterator[Any]:
     """Open a regular file without reading through a changed lexical entry."""
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    if not follow_validated_symlink:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = -1
     try:
         descriptor = os.open(path, flags)
         opened_stat = os.fstat(descriptor)
         if (
-            _is_link_like(expected_stat)
+            (not follow_validated_symlink and _is_link_like(expected_stat))
             or not _is_regular_file(expected_stat)
             or not _is_regular_file(opened_stat)
             or _regular_file_identity(opened_stat) != _regular_file_identity(expected_stat)
@@ -235,7 +243,10 @@ def _open_bound_regular_file(path: Path, expected_stat: os.stat_result) -> Itera
         with os.fdopen(descriptor, "rb", closefd=True) as stream:
             descriptor = -1
             yield stream
-            if _regular_file_identity(os.fstat(stream.fileno())) != _regular_file_identity(expected_stat):
+            final_path_stat = path.stat() if follow_validated_symlink else path.lstat()
+            if _regular_file_identity(os.fstat(stream.fileno())) != _regular_file_identity(
+                expected_stat
+            ) or _regular_file_identity(final_path_stat) != _regular_file_identity(expected_stat):
                 raise OSError("file identity changed during bounded read")
     finally:
         if descriptor >= 0:
@@ -835,11 +846,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Scan a single SavedModel protobuf file"""
         result = self._create_result()
         path_obj = Path(path)
+        follow_validated_symlink = bool(
+            self.config.get(VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY) is True
+            and _is_private_descriptor_bound_regular_file(path_obj)
+        )
         try:
-            expected_stat = path_obj.lstat()
+            expected_stat = path_obj.stat() if follow_validated_symlink else path_obj.lstat()
         except OSError as error:
             return self._finish_read_failure(result, path, error)
-        if _is_link_like(expected_stat) or not _is_regular_file(expected_stat):
+        if (not follow_validated_symlink and _is_link_like(expected_stat)) or not _is_regular_file(expected_stat):
             return self._finish_read_failure(result, path, OSError("SavedModel source is not a regular file"))
         file_size = expected_stat.st_size
         result.metadata["file_size"] = file_size
@@ -871,7 +886,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
-            with _open_bound_regular_file(path_obj, expected_stat) as f:
+            with _open_bound_regular_file(
+                path_obj,
+                expected_stat,
+                follow_validated_symlink=follow_validated_symlink,
+            ) as f:
                 content = f.read(_MAX_PROTOBUF_PARSE_BYTES + 1)
                 result.bytes_scanned = min(len(content), _MAX_PROTOBUF_PARSE_BYTES)
 
@@ -1994,10 +2013,18 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Scan keras_metadata.pb for Lambda layers and unsafe patterns"""
         try:
             path_obj = Path(path)
-            expected_stat = path_obj.lstat()
-            if _is_link_like(expected_stat) or not _is_regular_file(expected_stat):
+            follow_validated_symlink = bool(
+                self.config.get(VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY) is True
+                and _is_private_descriptor_bound_regular_file(path_obj)
+            )
+            expected_stat = path_obj.stat() if follow_validated_symlink else path_obj.lstat()
+            if (not follow_validated_symlink and _is_link_like(expected_stat)) or not _is_regular_file(expected_stat):
                 raise OSError("Keras metadata source is not a regular file")
-            with _open_bound_regular_file(path_obj, expected_stat) as f:
+            with _open_bound_regular_file(
+                path_obj,
+                expected_stat,
+                follow_validated_symlink=follow_validated_symlink,
+            ) as f:
                 content = f.read(_MAX_KERAS_METADATA_PARSE_BYTES + 1)
                 result.bytes_scanned += min(len(content), _MAX_KERAS_METADATA_PARSE_BYTES)
                 if len(content) > _MAX_KERAS_METADATA_PARSE_BYTES:

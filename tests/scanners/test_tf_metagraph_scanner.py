@@ -300,7 +300,7 @@ def test_tf_metagraph_single_file_scan_bypasses_stale_cache_when_read_fails(
             *args: Any,
             **kwargs: Any,
         ) -> Any:
-            if str(candidate) == str(cached_clean):
+            if Path(os.fsdecode(candidate)).name == cached_clean.name:
                 raise OSError("simulated transient MetaGraph read failure")
             return real_open(candidate, *args, **kwargs)
 
@@ -357,7 +357,7 @@ def test_tf_metagraph_directory_scan_bypasses_stale_cache_when_read_fails_with_s
             *args: Any,
             **kwargs: Any,
         ) -> Any:
-            if str(candidate) == str(cached_clean):
+            if Path(os.fsdecode(candidate)).name == cached_clean.name:
                 raise OSError("simulated transient MetaGraph read failure")
             return real_open(candidate, *args, **kwargs)
 
@@ -411,7 +411,7 @@ def test_tf_metagraph_read_failure_takes_precedence_over_security_finding(
     original_read_bounded = importlib.import_module("modelaudit.scanners.tf_metagraph_scanner")._read_bounded
 
     def fail_selected_read(path: str, limit: int) -> tuple[bytes, bool]:
-        if path == str(unreadable_meta):
+        if Path(path).name == unreadable_meta.name:
             raise OSError("simulated MetaGraph read failure")
         return cast(tuple[bytes, bool], original_read_bounded(path, limit))
 

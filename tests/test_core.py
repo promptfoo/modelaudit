@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pickle
+import shutil
 import stat
 import struct
 import subprocess
@@ -18,8 +19,8 @@ import sys
 import tarfile
 import zipfile
 import zlib
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Collection, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -171,7 +172,11 @@ def _stat_result_with(
     return cast(os.stat_result, SimpleNamespace(**values))
 
 
-def _install_stale_directory_scandir_stats(monkeypatch: pytest.MonkeyPatch) -> None:
+def _install_stale_directory_scandir_stats(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    force_path_fallback: bool = True,
+) -> None:
     real_scandir = core_module.os.scandir
 
     class StaleDirectoryEntry:
@@ -220,8 +225,9 @@ def _install_stale_directory_scandir_stats(monkeypatch: pytest.MonkeyPatch) -> N
                 self._iterator = iter(self._context)
             return StaleDirectoryEntry(next(self._iterator))
 
-    monkeypatch.setattr(core_module.os, "supports_fd", set())
-    monkeypatch.setattr(core_module.os, "supports_dir_fd", set())
+    if force_path_fallback:
+        monkeypatch.setattr(core_module.os, "supports_fd", set())
+        monkeypatch.setattr(core_module.os, "supports_dir_fd", set())
     monkeypatch.setattr(core_module.os, "scandir", StaleScandir)
 
 
@@ -238,10 +244,27 @@ def _force_staged_directory_owner_scan(monkeypatch: pytest.MonkeyPatch) -> None:
         ) -> None:
             return None
 
-    def unavailable_bound_owner_path(_root_path: Path) -> UnavailableBoundOwnerPath:
+    def unavailable_bound_owner_path(
+        _root_path: Path,
+        **_kwargs: Any,
+    ) -> UnavailableBoundOwnerPath:
         return UnavailableBoundOwnerPath()
 
     monkeypatch.setattr(core_module, "_bound_directory_owner_scan_path", unavailable_bound_owner_path)
+
+
+def _same_resolved_test_path(
+    candidate: str | bytes | os.PathLike[str],
+    expected: Path,
+) -> bool:
+    """Compare test hook paths across lexical, descriptor, and hardlink spellings."""
+    with suppress(OSError, TypeError, ValueError):
+        if os.path.samefile(candidate, expected):
+            return True
+    try:
+        return Path(os.fsdecode(candidate)).resolve() == expected.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def test_directory_owner_snapshot_ignores_directory_link_count_drift() -> None:
@@ -314,6 +337,673 @@ def test_windows_missing_reparse_attributes_and_mode_are_treated_as_absent() -> 
     assert unknown_entry.mode == 0
     assert not tf_savedmodel_scanner._is_link_like(unknown_mode_stat)
     assert not JaxCheckpointScanner._is_link_like_entry(unknown_mode_stat)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name == "nt", reason="Windows replacement is covered by retained-handle tests")
+def test_local_source_receipt_retries_mixed_symlink_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient target swap cannot produce a mixed lexical and resolved receipt."""
+    first_root = tmp_path / "first"
+    first_root.mkdir()
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    source_link = tmp_path / "model"
+    source_link.symlink_to(first_root, target_is_directory=True)
+    original_resolve = Path.resolve
+    injected_swap = False
+
+    def resolve_with_transient_swap(path: Path, *args: Any, **kwargs: Any) -> Path:
+        nonlocal injected_swap
+        if path == source_link and not injected_swap:
+            injected_swap = True
+            source_link.unlink()
+            source_link.symlink_to(second_root, target_is_directory=True)
+            resolved = original_resolve(path, *args, **kwargs)
+            source_link.unlink()
+            source_link.symlink_to(first_root, target_is_directory=True)
+            return resolved
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_with_transient_swap)
+
+    receipt = core_module._snapshot_local_source_receipt(source_link)
+
+    assert injected_swap is True
+    assert receipt is not None
+    assert receipt["resolved_path"] == str(first_root)
+    assert receipt["inode"] == first_root.stat().st_ino
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor binding")
+def test_bound_local_source_directory_rejects_mixed_receipt_target(tmp_path: Path) -> None:
+    """Descriptor binding follows the requested path, not an untrusted resolved receipt string."""
+    requested_root = tmp_path / "requested"
+    requested_root.mkdir()
+    substituted_root = tmp_path / "substituted"
+    substituted_root.mkdir()
+    source_link = tmp_path / "model"
+    source_link.symlink_to(requested_root, target_is_directory=True)
+    mixed_receipt = core_module._snapshot_local_source_receipt(substituted_root)
+    assert mixed_receipt is not None
+
+    with (
+        pytest.raises(core_module._LocalSourceBoundaryError, match="changed before descriptor binding"),
+        core_module._bound_local_source_directory(source_link, mixed_receipt),
+    ):
+        pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_retained_local_source_directory_detects_ordinary_ancestor_replacement(tmp_path: Path) -> None:
+    """A retained descriptor stays on its source and detects a replaced ordinary ancestor."""
+    staging = tmp_path / "staging"
+    alternate = tmp_path / "alternate"
+    source = staging / "model"
+    substitute = alternate / "model"
+    source.mkdir(parents=True)
+    substitute.mkdir(parents=True)
+    (source / "payload").write_bytes(b"malicious")
+    (substitute / "payload").write_bytes(b"benign")
+    swap = tmp_path / "swap"
+    guard = core_module._open_bound_local_source(source)
+    try:
+        staging.rename(swap)
+        alternate.rename(staging)
+        swap.rename(alternate)
+
+        assert (Path(guard.bound_path) / "payload").read_bytes() == b"malicious"
+        assert guard.changed() is True
+    finally:
+        guard.close()
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_retained_local_source_file_preserves_name_and_detects_alias_retarget(tmp_path: Path) -> None:
+    """A retained regular file keeps its routing name and detects a changed lexical alias."""
+    malicious = tmp_path / "malicious.pkl"
+    malicious.write_bytes(_build_malicious_pickle())
+    benign = tmp_path / "benign.pkl"
+    benign.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    source = tmp_path / "model.pkl"
+    source.symlink_to(malicious)
+
+    guard = core_module._open_bound_local_source(source)
+    staging_path = guard.staging_path
+    descriptors = [descriptor for descriptor, _receipt in guard.guarded_descriptors]
+    try:
+        assert Path(guard.bound_path).name == source.name
+        assert Path(guard.bound_path).read_bytes() == malicious.read_bytes()
+
+        source.unlink()
+        source.symlink_to(benign)
+
+        assert guard.changed() is True
+        assert Path(guard.bound_path).read_bytes() == malicious.read_bytes()
+    finally:
+        guard.close()
+
+    assert staging_path is not None
+    assert not staging_path.exists()
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_retained_local_source_file_survives_ordinary_ancestor_aba(tmp_path: Path) -> None:
+    """An ordinary file is scanned through its retained descriptor, not a restored pathname."""
+    staging = tmp_path / "staging"
+    alternate = tmp_path / "alternate"
+    source = staging / "model.pkl"
+    substitute = alternate / "model.pkl"
+    source.parent.mkdir()
+    substitute.parent.mkdir()
+    source.write_bytes(_build_malicious_pickle())
+    benign = pickle.dumps({"weights": [1, 2, 3]})
+    substitute.write_bytes(benign)
+    swap = tmp_path / "swap"
+
+    guard = core_module._open_bound_local_source(source)
+    try:
+        staging.rename(swap)
+        alternate.rename(staging)
+        swap.rename(alternate)
+
+        assert Path(guard.bound_path).name == source.name
+        assert Path(guard.bound_path).read_bytes() == _build_malicious_pickle()
+        assert source.read_bytes() == benign
+        assert guard.changed() is True
+    finally:
+        guard.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_retained_local_source_file_detects_staged_name_aba(tmp_path: Path) -> None:
+    """A restored private staging name cannot erase a transient scanner-path substitution."""
+    source = tmp_path / "model.pkl"
+    source.write_bytes(_build_malicious_pickle())
+    benign = tmp_path / "benign.pkl"
+    benign.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    guard = core_module._open_bound_local_source(source)
+    try:
+        scan_path = Path(guard.bound_path)
+        held_path = scan_path.with_name("held-model.pkl")
+        scan_path.rename(held_path)
+        scan_path.symlink_to(benign)
+        scan_path.unlink()
+        held_path.rename(scan_path)
+
+        assert guard.changed() is True
+        assert scan_path.read_bytes() == source.read_bytes()
+    finally:
+        guard.close()
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name == "nt", reason="Windows replacement is covered by retained-handle tests")
+def test_local_source_receipt_rejects_symlink_directory_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restoring a top-level directory symlink cannot erase a transient target swap."""
+    malicious_root = tmp_path / "malicious"
+    malicious_root.mkdir()
+    (malicious_root / "payload.pkl").write_bytes(_build_malicious_pickle())
+    benign_root = tmp_path / "benign"
+    benign_root.mkdir()
+    _write_minimal_safetensors(benign_root / "weights.safetensors")
+    source_link = tmp_path / "model"
+    source_link.symlink_to(malicious_root, target_is_directory=True)
+    held_link = tmp_path / "held-model-link"
+    receipt = core_module._snapshot_local_source_receipt(source_link)
+    assert receipt is not None
+    swapped = False
+    original_scan_file = core_module.scan_file
+
+    def swap_around_scan(message: str, _percentage: float) -> None:
+        nonlocal swapped
+        if message.startswith("Scanning directory:"):
+            source_link.rename(held_link)
+            source_link.symlink_to(benign_root, target_is_directory=True)
+            swapped = True
+
+    def restore_after_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal swapped
+        result = original_scan_file(path, config=config)
+        if swapped:
+            source_link.unlink()
+            held_link.rename(source_link)
+            swapped = False
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", restore_after_scan)
+
+    result = scan_model_directory_or_file(
+        str(source_link),
+        progress_callback=swap_around_scan,
+        skip_file_types=False,
+        cache_enabled=False,
+        scanners=["pickle", "safetensors"],
+        _local_source_receipt=receipt,
+    )
+
+    assert swapped is False
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+    assert any(
+        check.name == "Local Source Boundary Check"
+        and check.details.get("reason") == "local_source_changed_during_scan"
+        and check.details.get("scan_outcome_reason") == "source_boundary_changed"
+        for check in result.checks
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows directory sharing semantics")
+def test_windows_local_source_guard_denies_directory_rename_restore_aba(tmp_path: Path) -> None:
+    """A retained Windows directory handle prevents dispatch-time rename substitution."""
+    model_root = tmp_path / "model"
+    model_root.mkdir()
+    (model_root / "payload.pkl").write_bytes(_build_malicious_pickle())
+    held_root = tmp_path / "held-model"
+    receipt = core_module._snapshot_local_source_receipt(model_root)
+    assert receipt is not None
+    rename_denied = False
+
+    def attempt_rename(message: str, _percentage: float) -> None:
+        nonlocal rename_denied
+        if not message.startswith("Scanning directory:"):
+            return
+        try:
+            model_root.rename(held_root)
+        except OSError:
+            rename_denied = True
+
+    result = scan_model_directory_or_file(
+        str(model_root),
+        progress_callback=attempt_rename,
+        skip_file_types=False,
+        cache_enabled=False,
+        scanners=["pickle"],
+        _local_source_receipt=receipt,
+    )
+
+    assert rename_denied is True
+    assert model_root.is_dir()
+    assert determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize("receipt_mode", ["explicit", "auto"], ids=["explicit-receipt", "auto-retention"])
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_local_source_retention_rejects_ordinary_ancestor_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+    receipt_mode: str,
+) -> None:
+    """Explicit receipts and automatic retention both resist ordinary ancestor substitution."""
+    if receipt_mode == "auto" and os.name != "posix":
+        pytest.skip("automatic descriptor retention requires POSIX")
+    staging_root = tmp_path / "staging"
+    model_root = staging_root / "model"
+    model_root.mkdir(parents=True)
+    payload = model_root / "payload.pkl"
+    payload.write_bytes(_build_malicious_pickle())
+    held_root = tmp_path / "held-staging"
+    receipt = core_module._snapshot_local_source_receipt(model_root) if receipt_mode == "explicit" else None
+    if receipt_mode == "explicit":
+        assert receipt is not None
+    original_scan_file = core_module.scan_file
+    swapped = False
+
+    def swap_ancestor() -> None:
+        nonlocal swapped
+        staging_root.rename(held_root)
+        replacement_model = staging_root / "model"
+        replacement_model.mkdir(parents=True)
+        (replacement_model / "benign.pkl").write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+        swapped = True
+
+    def swap_during_scan(message: str, _percentage: float) -> None:
+        if swapped:
+            return
+        if message.startswith("Scanning directory:") or message.startswith("Scanning payload.pkl"):
+            swap_ancestor()
+
+    def restore_after_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal swapped
+        result = original_scan_file(path, config=config)
+        if swapped:
+            shutil.rmtree(staging_root)
+            held_root.rename(staging_root)
+            swapped = False
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", restore_after_scan)
+    receipt_kwargs: dict[str, Any] = {"_local_source_receipt": receipt} if receipt is not None else {}
+    if stream:
+        from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
+
+        result = scan_model_streaming(
+            iterate_files_streaming(model_root),
+            scan_root=str(model_root),
+            progress_callback=swap_during_scan,
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["pickle"],
+            skip_file_types=False,
+            **receipt_kwargs,
+        )
+    else:
+        result = scan_model_directory_or_file(
+            str(model_root),
+            progress_callback=swap_during_scan,
+            skip_file_types=False,
+            cache_enabled=False,
+            scanners=["pickle"],
+            **receipt_kwargs,
+        )
+
+    if swapped:
+        shutil.rmtree(staging_root)
+        held_root.rename(staging_root)
+        swapped = False
+    assert determine_exit_code(result) in {1, 2}
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) or any(
+        check.name == "Local Source Boundary Check" for check in result.checks
+    )
+    assert all(
+        "/proc/self/fd/" not in (issue.location or "") and "/dev/fd/" not in (issue.location or "")
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_local_member_rewrite_after_pin_fails_terminal_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """A rewrite immediately after descriptor release cannot become the trusted baseline."""
+    model_root = tmp_path / "model"
+    model_root.mkdir()
+    payload = model_root / "payload.pkl"
+    payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    original_pin = core_module._pinned_shard_scan_path
+    rewrote = False
+
+    @contextmanager
+    def rewrite_after_pin(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        nonlocal rewrote
+        with original_pin(*args, **kwargs) as pinned_scan:
+            yield pinned_scan
+        payload.write_bytes(_build_malicious_pickle())
+        rewrote = True
+
+    monkeypatch.setattr(core_module, "_pinned_shard_scan_path", rewrite_after_pin)
+    if stream:
+        from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
+
+        result = scan_model_streaming(
+            iterate_files_streaming(model_root),
+            scan_root=str(model_root),
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["pickle"],
+            skip_file_types=False,
+        )
+    else:
+        result = scan_model_directory_or_file(
+            str(model_root),
+            cache_enabled=False,
+            scanners=["pickle"],
+            skip_file_types=False,
+        )
+
+    assert rewrote is True
+    assert payload.read_bytes() == _build_malicious_pickle()
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.content_hash is None
+    assert any(check.name == "Local Source Boundary Check" for check in result.checks)
+
+
+def test_local_directory_cache_inside_source_fails_closed(tmp_path: Path) -> None:
+    model_root = tmp_path / "model"
+    model_root.mkdir()
+    _write_minimal_safetensors(model_root / "weights.safetensors")
+    cache_dir = model_root / ".modelaudit-cache"
+
+    result = scan_model_directory_or_file(
+        str(model_root),
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+    assert not cache_dir.exists()
+    assert any(
+        check.name == "Local Source Boundary Check"
+        and check.details.get("scan_outcome_reason") == "source_boundary_changed"
+        for check in result.checks
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_local_source_pins_nested_member_across_directory_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """A nested directory swap cannot redirect a discovered member to benign bytes."""
+    model_root = tmp_path / "model"
+    slot = model_root / "level1" / "slot"
+    benign_slot = tmp_path / "benign-slot"
+    slot.mkdir(parents=True)
+    benign_slot.mkdir()
+    payload = slot / "payload.pkl"
+    payload.write_bytes(_build_malicious_pickle())
+    (benign_slot / payload.name).write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    held_slot = tmp_path / "held-slot"
+    original_scan_file = core_module.scan_file
+    scan_calls = 0
+
+    def swap_slots() -> None:
+        slot.rename(held_slot)
+        benign_slot.rename(slot)
+        held_slot.rename(benign_slot)
+
+    def scan_during_slot_aba(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal scan_calls
+        scan_calls += 1
+        swap_slots()
+        try:
+            return original_scan_file(path, config=config)
+        finally:
+            swap_slots()
+
+    monkeypatch.setattr(core_module, "scan_file", scan_during_slot_aba)
+    if stream:
+        from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
+
+        result = scan_model_streaming(
+            iterate_files_streaming(model_root),
+            scan_root=str(model_root),
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["pickle"],
+            skip_file_types=False,
+        )
+    else:
+        result = scan_model_directory_or_file(
+            str(model_root),
+            cache_enabled=False,
+            scanners=["pickle"],
+            skip_file_types=False,
+        )
+
+    assert scan_calls == 1
+    assert payload.read_bytes() == _build_malicious_pickle()
+    assert determine_exit_code(result) in {1, 2}
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_local_streaming_requires_every_initial_regular_member(tmp_path: Path) -> None:
+    """A caller generator cannot hide and restore an initial malicious member."""
+    model_root = tmp_path / "model"
+    slot = model_root / "level1" / "slot"
+    slot.mkdir(parents=True)
+    malicious = slot / "payload.pkl"
+    malicious.write_bytes(_build_malicious_pickle())
+    benign = model_root / "benign.pkl"
+    benign.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    held_slot = tmp_path / "held-slot"
+
+    def incomplete_generator() -> Iterator[tuple[Path, bool]]:
+        slot.rename(held_slot)
+        try:
+            yield benign, True
+        finally:
+            held_slot.rename(slot)
+
+    result = scan_model_streaming(
+        incomplete_generator(),
+        scan_root=str(model_root),
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["pickle"],
+        skip_file_types=False,
+    )
+
+    assert malicious.read_bytes() == _build_malicious_pickle()
+    assert determine_exit_code(result) == 2
+    assert any(check.name == "Local Source Boundary Check" for check in result.checks)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name == "nt", reason="Windows source guards prevent the ancestor rename")
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_receipt_bound_hf_blob_alias_rejects_ancestor_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """An admitted HF alias must keep reading the blob below the bound snapshot object."""
+    hub_root = tmp_path / "hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub_root))
+    model_cache = hub_root / "models--org--repo"
+    snapshot = model_cache / "snapshots" / "revision"
+    blob = model_cache / "blobs" / "deadbeef"
+    snapshot.mkdir(parents=True)
+    blob.parent.mkdir()
+    blob.write_bytes(_build_malicious_pickle())
+    alias = snapshot / "model.pkl"
+    alias.symlink_to(Path("../../blobs") / blob.name)
+    held_hub = tmp_path / "held-hub"
+    receipt = core_module._snapshot_local_source_receipt(snapshot)
+    assert receipt is not None
+    original_scan_file = core_module.scan_file
+    swapped = False
+
+    def swap_around_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal swapped
+        hub_root.rename(held_hub)
+        replacement_blob = hub_root / "models--org--repo" / "blobs" / blob.name
+        replacement_blob.parent.mkdir(parents=True)
+        replacement_blob.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+        swapped = True
+        try:
+            return original_scan_file(path, config=config)
+        finally:
+            shutil.rmtree(hub_root)
+            held_hub.rename(hub_root)
+            swapped = False
+
+    monkeypatch.setattr(core_module, "scan_file", swap_around_scan)
+    if stream:
+        from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
+
+        result = scan_model_streaming(
+            iterate_files_streaming(snapshot),
+            scan_root=str(snapshot),
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["pickle"],
+            skip_file_types=False,
+            _local_source_receipt=receipt,
+        )
+    else:
+        result = scan_model_directory_or_file(
+            str(snapshot),
+            skip_file_types=False,
+            cache_enabled=False,
+            scanners=["pickle"],
+            _local_source_receipt=receipt,
+        )
+
+    assert swapped is False
+    assert determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert all(
+        "/proc/self/fd/" not in (issue.location or "") and "/dev/fd/" not in (issue.location or "")
+        for issue in result.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-path reproduction")
+@pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
+def test_receipt_bound_hf_blob_rejects_content_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """A blob overwritten between hashing and scanning must fail closed."""
+    hub_root = tmp_path / "hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub_root))
+    model_cache = hub_root / "models--org--repo"
+    blob = model_cache / "blobs" / "deadbeef"
+    snapshot = model_cache / "snapshots" / "revision"
+    blob.parent.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    malicious = _build_malicious_pickle()
+    benign = pickle.dumps({"weights": [1, 2, 3]})
+    blob.write_bytes(malicious)
+    alias = snapshot / "model.pkl"
+    alias.symlink_to(Path("../../blobs") / blob.name)
+    receipt = core_module._snapshot_local_source_receipt(snapshot)
+    assert receipt is not None
+    original_scan_file = core_module.scan_file
+    swapped = False
+    scanned_paths: list[str] = []
+
+    def swap_after_hash(message: str, _percentage: float) -> None:
+        nonlocal swapped
+        trigger = message.startswith("Scanning ") if stream else message.startswith("Scanning file")
+        if trigger and not swapped:
+            blob.write_bytes(benign)
+            swapped = True
+
+    def scan_then_restore(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal swapped
+        scanned_paths.append(path)
+        try:
+            return original_scan_file(path, config=config)
+        finally:
+            if swapped:
+                blob.write_bytes(malicious)
+                swapped = False
+
+    monkeypatch.setattr(core_module, "scan_file", scan_then_restore)
+    if stream:
+        from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
+
+        result = scan_model_streaming(
+            iterate_files_streaming(snapshot),
+            scan_root=str(snapshot),
+            progress_callback=swap_after_hash,
+            delete_after_scan=False,
+            skip_file_types=False,
+            cache_enabled=False,
+            scanners=["pickle"],
+            _local_source_receipt=receipt,
+        )
+    else:
+        result = scan_model_directory_or_file(
+            str(snapshot),
+            progress_callback=swap_after_hash,
+            skip_file_types=False,
+            cache_enabled=False,
+            scanners=["pickle"],
+            _local_source_receipt=receipt,
+        )
+
+    if swapped:
+        blob.write_bytes(malicious)
+        swapped = False
+
+    assert blob.read_bytes() == malicious
+    assert len(scanned_paths) <= 1
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.content_hash is None
+    assert any(check.name == "Local Source Boundary Check" for check in result.checks)
 
 
 def _mock_weight_distribution_scanner_availability(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1170,9 +1860,18 @@ def test_savedmodel_owner_snapshot_does_not_rehash_opaque_variable_shards(
     hashed_paths: list[str] = []
     original_hash = core_module._calculate_file_hash
 
-    def record_hash(path: str, *, deadline: float | None = None) -> str:
-        hashed_paths.append(path)
-        return original_hash(path, deadline=deadline)
+    def record_hash(
+        path: str,
+        *,
+        deadline: float | None = None,
+        follow_validated_symlink: bool = False,
+    ) -> str:
+        hashed_paths.append(str(Path(path).resolve()))
+        return original_hash(
+            path,
+            deadline=deadline,
+            follow_validated_symlink=follow_validated_symlink,
+        )
 
     monkeypatch.setattr(core_module, "_calculate_file_hash", record_hash)
 
@@ -1424,7 +2123,7 @@ def test_directory_scan_rejects_owner_source_retargeted_before_dispatch_without_
     def retarget_before_second_snapshot(*args: Any, **kwargs: Any) -> Any:
         nonlocal snapshot_calls
         snapshot_calls += 1
-        if snapshot_calls == 2:
+        if snapshot_calls == 3:
             marker_path.unlink()
             marker_path.symlink_to(outside_metadata)
         return original_snapshot(*args, **kwargs)
@@ -1476,7 +2175,7 @@ def test_directory_scan_rejects_owner_namespace_change_before_dispatch(
     def mutate_after_hash(file_paths: list[str], **kwargs: Any) -> dict[str, str]:
         nonlocal mutated
         hashes = original_hash_files(file_paths, **kwargs)
-        if not mutated and str(metadata_path) in file_paths:
+        if not mutated and any(Path(path).resolve() == metadata_path.resolve() for path in file_paths):
             mutated = True
             if mutation == "addition":
                 (model_dir / "checkpoint_1").write_bytes(b"benign checkpoint data")
@@ -1582,37 +2281,6 @@ def test_directory_scan_fails_closed_when_owner_root_is_swapped_and_restored(
     assert determine_exit_code(result) == 2
 
 
-@pytest.mark.skipif(not hasattr(os, "fchdir"), reason="descriptor cwd fallback is unavailable")
-def test_directory_scan_uses_descriptor_cwd_when_owner_fd_paths_are_unavailable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model_dir = tmp_path / "orbax-model"
-    _write_orbax_metadata(model_dir)
-    original_stat = Path.stat
-    owner_paths: list[tuple[str, Path]] = []
-
-    def hide_descriptor_aliases(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
-        if str(candidate).startswith(("/proc/self/fd/", "/dev/fd/")):
-            raise FileNotFoundError(str(candidate))
-        return original_stat(candidate, *args, **kwargs)
-
-    def record_owner_scan(_scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
-        if Path(owner_path).is_dir():
-            owner_paths.append((owner_path, Path(owner_path).resolve()))
-        owner_result = ScanResult(scanner_name=JaxCheckpointScanner.name)
-        owner_result.finish()
-        return owner_result
-
-    monkeypatch.setattr(Path, "stat", hide_descriptor_aliases)
-    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
-
-    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
-
-    assert owner_paths == [(os.curdir, model_dir.resolve())]
-    assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
-
-
 def test_directory_scan_uses_staged_snapshot_without_descriptor_owner_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1635,7 +2303,8 @@ def test_directory_scan_uses_staged_snapshot_without_descriptor_owner_binding(
     original_scan = JaxCheckpointScanner.scan
 
     def hide_descriptor_aliases(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
-        if str(candidate).startswith(("/proc/self/fd/", "/dev/fd/")):
+        descriptor_prefixes = (f"/proc/{os.getpid()}/fd/", "/proc/self/fd/", "/dev/fd/")
+        if str(candidate).startswith(descriptor_prefixes) and candidate.parent.name == "fd":
             raise FileNotFoundError(str(candidate))
         return original_stat(candidate, *args, **kwargs)
 
@@ -1645,7 +2314,6 @@ def test_directory_scan_uses_staged_snapshot_without_descriptor_owner_binding(
         return original_scan(scanner, owner_path)
 
     monkeypatch.setattr(Path, "stat", hide_descriptor_aliases)
-    monkeypatch.setattr(os, "fchdir", None, raising=False)
     monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
@@ -1674,7 +2342,7 @@ def test_directory_scan_keeps_child_walk_when_owner_snapshot_is_unavailable(
     def fail_initial_owner_snapshot(*args: Any, **kwargs: Any) -> Any:
         nonlocal capture_calls
         capture_calls += 1
-        if capture_calls == 1:
+        if capture_calls == 2:
             raise OSError("simulated Windows directory snapshot failure")
         return original_capture(*args, **kwargs)
 
@@ -2086,7 +2754,7 @@ def test_filtered_savedmodel_owner_hash_survives_stale_scandir_directory_metadat
     assets_dir.mkdir()
     asset_path = assets_dir / "notes.txt"
     asset_path.write_bytes(b"benign asset")
-    _install_stale_directory_scandir_stats(monkeypatch)
+    _install_stale_directory_scandir_stats(monkeypatch, force_path_fallback=False)
     _force_staged_directory_owner_scan(monkeypatch)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
@@ -2150,6 +2818,7 @@ def test_savedmodel_owner_snapshot_ignores_directory_link_count_drift(
     asset_path = assets_dir / "notes.txt"
     asset_path.write_bytes(b"benign asset")
     original_lstat = Path.lstat
+    original_capture = core_module._capture_directory_owner_namespace
 
     def drift_directory_link_count(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
         candidate_stat = original_lstat(candidate, *args, **kwargs)
@@ -2168,8 +2837,13 @@ def test_savedmodel_owner_snapshot_ignores_directory_link_count_drift(
             ),
         )
 
-    monkeypatch.setattr(core_module.os, "supports_fd", set())
-    monkeypatch.setattr(core_module.os, "supports_dir_fd", set())
+    def capture_with_path_fallback(*args: Any, **kwargs: Any) -> Any:
+        with monkeypatch.context() as snapshot_monkeypatch:
+            snapshot_monkeypatch.setattr(core_module.os, "supports_fd", set())
+            snapshot_monkeypatch.setattr(core_module.os, "supports_dir_fd", set())
+            return original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(core_module, "_capture_directory_owner_namespace", capture_with_path_fallback)
     monkeypatch.setattr(Path, "lstat", drift_directory_link_count)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
@@ -2261,15 +2935,15 @@ def test_savedmodel_owner_allows_large_file_backed_hdf5_child(
     hdf5_path = variables_dir / "large-benign.json"
     _write_large_benign_keras_hdf5(hdf5_path)
 
-    hdf5_scans: list[Path] = []
+    hdf5_scans: list[tuple[str, bool]] = []
     owner_calls: list[Path] = []
     original_hdf5_scan = KerasH5Scanner.scan
     original_owner_scan = TensorFlowSavedModelScanner.scan
     original_hash = core_module._calculate_file_hash
 
     def record_hdf5_scan(scanner: KerasH5Scanner, path: str) -> ScanResult:
-        if Path(path).resolve() == hdf5_path.resolve():
-            hdf5_scans.append(Path(path).resolve())
+        if Path(path).name == hdf5_path.name and Path(path).stat().st_size == hdf5_path.stat().st_size:
+            hdf5_scans.append((Path(path).name, not os.path.samefile(path, hdf5_path)))
         return original_hdf5_scan(scanner, path)
 
     def record_owner_scan(scanner: TensorFlowSavedModelScanner, owner_path: str) -> ScanResult:
@@ -2277,10 +2951,19 @@ def test_savedmodel_owner_allows_large_file_backed_hdf5_child(
             owner_calls.append(Path(owner_path).resolve())
         return original_owner_scan(scanner, owner_path)
 
-    def reject_large_hdf5_hash(path: str, *, deadline: float | None = None) -> str:
-        if Path(path).resolve() == hdf5_path.resolve():
+    def reject_large_hdf5_hash(
+        path: str,
+        *,
+        deadline: float | None = None,
+        follow_validated_symlink: bool = False,
+    ) -> str:
+        if os.path.samefile(path, hdf5_path):
             pytest.fail("large file-backed HDF5 child must not be whole-file hashed")
-        return original_hash(path, deadline=deadline)
+        return original_hash(
+            path,
+            deadline=deadline,
+            follow_validated_symlink=follow_validated_symlink,
+        )
 
     monkeypatch.setattr(KerasH5Scanner, "scan", record_hdf5_scan)
     monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", record_owner_scan)
@@ -2291,7 +2974,7 @@ def test_savedmodel_owner_allows_large_file_backed_hdf5_child(
     owner_metadata = result.file_metadata[str(model_dir)]
     hdf5_metadata = result.file_metadata[str(hdf5_path)]
     assert owner_calls == [model_dir.resolve()]
-    assert hdf5_scans == [hdf5_path.resolve()]
+    assert hdf5_scans == [(hdf5_path.name, True)]
     assert owner_metadata["directory_owner_scan"] is True
     assert "directory_owner_snapshot_incomplete" not in owner_metadata.get("scan_outcome_reasons", [])
     assert hdf5_metadata["content_hash"].startswith("unhashable_file_backed_hdf5_")
@@ -3229,7 +3912,7 @@ def test_directory_scan_does_not_reresolve_trusted_hf_alias(
     result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
 
     assert result.files_scanned == 1
-    assert alias_resolve_calls == 1
+    assert alias_resolve_calls <= 1
     assert result.has_errors is False
     assert not any(issue.message == "Directory entry unavailable during discovery" for issue in result.issues)
 
@@ -3264,6 +3947,8 @@ def test_directory_scan_continues_when_hf_shard_alias_retargets_after_resolution
         hf_cache_root: Path | None,
         results: ModelAuditResultModel,
         reported_traversal_targets: set[str] | None = None,
+        preserve_bound_path: bool = False,
+        hf_snapshot_path: Path | None = None,
     ) -> tuple[Path | None, bool, bool]:
         nonlocal retargeted
         resolved = original_resolve_target(
@@ -3273,8 +3958,10 @@ def test_directory_scan_continues_when_hf_shard_alias_retargets_after_resolution
             hf_cache_root=hf_cache_root,
             results=results,
             reported_traversal_targets=reported_traversal_targets,
+            preserve_bound_path=preserve_bound_path,
+            hf_snapshot_path=hf_snapshot_path,
         )
-        if file_path == alias and resolved[0] is not None:
+        if hf_snapshot_path == alias and resolved[0] is not None:
             alias.unlink()
             alias.symlink_to(alias.name)
             retargeted = True
@@ -3384,15 +4071,18 @@ def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
         *,
         config: dict[str, Any] | None = None,
         routing_paths: dict[str, str] | None = None,
+        follow_symlink_paths: Collection[str] = (),
         hashed_identities: dict[str, dict[str, int]] | None = None,
         deadline: float | None = None,
     ) -> dict[str, str]:
         assert set(file_paths) == {str(blob_one), str(blob_two)}
         assert routing_paths == {str(blob_one): str(shard_one), str(blob_two): str(shard_two)}
+        assert {str(Path(path).resolve()) for path in follow_symlink_paths} == {str(blob_one), str(blob_two)}
         hashes = original_hash_files(
             file_paths,
             config=config,
             routing_paths=routing_paths,
+            follow_symlink_paths=follow_symlink_paths,
             hashed_identities=hashed_identities,
             deadline=deadline,
         )
@@ -3471,7 +4161,8 @@ def test_directory_scan_keeps_nonsharded_hf_snapshot_aliases_deduplicated(
 
     result = core_module.scan_model_directory_or_file(str(cache_dir / "snapshots"), cache_scan_results=False)
 
-    assert calls == [str(blob_path.resolve())]
+    assert len(calls) == 1
+    assert Path(calls[0]).name == "model.safetensors"
     assert result.files_scanned == 1
 
 
@@ -4437,6 +5128,150 @@ def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) 
         reset_cache_manager()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires retained POSIX source descriptors")
+def test_public_file_scan_reuses_cache_without_mutating_source_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.pkl"
+    model_path.write_bytes(pickle.dumps({"values": list(range(1024))}))
+    cache_dir = tmp_path / "cache"
+    before = model_path.stat()
+    internal_calls = 0
+    original_scan_file_internal = core_module._scan_file_internal
+
+    def counted_scan_file_internal(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal internal_calls
+        internal_calls += 1
+        return original_scan_file_internal(path, config)
+
+    monkeypatch.setattr(core_module, "_scan_file_internal", counted_scan_file_internal)
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        cache_stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+    finally:
+        reset_cache_manager()
+
+    after = model_path.stat()
+    assert first.has_errors is False
+    assert second.has_errors is False
+    assert internal_calls == 1
+    assert cache_stats["cache_hits"] >= 1
+    assert before.st_nlink == after.st_nlink
+    assert before.st_ctime_ns == after.st_ctime_ns
+    assert ".modelaudit_source_" not in second.model_dump_json()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires retained POSIX source descriptors")
+def test_bound_cache_lookup_validates_retained_bytes_not_lexical_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logical_path = tmp_path / "model.pkl"
+    malicious_path = tmp_path / "malicious.pkl"
+    logical_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    malicious_path.write_bytes(_build_malicious_pickle())
+    cache_dir = tmp_path / "cache"
+    internal_calls = 0
+    original_scan_file_internal = core_module._scan_file_internal
+
+    def counted_scan_file_internal(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal internal_calls
+        internal_calls += 1
+        return original_scan_file_internal(path, config)
+
+    def scan_bound(source: Path) -> ScanResult:
+        guard = core_module._open_bound_local_source(source)
+        try:
+            return scan_file(
+                guard.bound_path,
+                config={
+                    "cache_enabled": True,
+                    "cache_dir": str(cache_dir),
+                    "min_cache_file_size": 0,
+                    core_module._BOUND_CACHE_IDENTITY_CONFIG_KEY: core_module.CacheIdentityBinding(
+                        scan_path=guard.bound_path,
+                        identity_path=str(logical_path),
+                    ),
+                },
+            )
+        finally:
+            guard.close()
+
+    monkeypatch.setattr(core_module, "_scan_file_internal", counted_scan_file_internal)
+    reset_cache_manager()
+    try:
+        clean_result = scan_bound(logical_path)
+        malicious_result = scan_bound(malicious_path)
+    finally:
+        reset_cache_manager()
+
+    assert clean_result.success is True
+    assert internal_calls == 2
+    assert any(issue.rule_code == "S201" for issue in malicious_result.issues)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires retained POSIX source descriptors")
+def test_bound_cache_store_cannot_publish_clean_result_under_malicious_lexical_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logical_path = tmp_path / "model.pkl"
+    benign_path = tmp_path / "benign.pkl"
+    logical_path.write_bytes(_build_malicious_pickle())
+    benign_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    cache_dir = tmp_path / "cache"
+    internal_calls = 0
+    original_scan_file_internal = core_module._scan_file_internal
+
+    def counted_scan_file_internal(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal internal_calls
+        internal_calls += 1
+        return original_scan_file_internal(path, config)
+
+    def scan_bound(source: Path) -> ScanResult:
+        guard = core_module._open_bound_local_source(source)
+        try:
+            return scan_file(
+                guard.bound_path,
+                config={
+                    "cache_enabled": True,
+                    "cache_dir": str(cache_dir),
+                    "min_cache_file_size": 0,
+                    core_module._BOUND_CACHE_IDENTITY_CONFIG_KEY: core_module.CacheIdentityBinding(
+                        scan_path=guard.bound_path,
+                        identity_path=str(logical_path),
+                    ),
+                },
+            )
+        finally:
+            guard.close()
+
+    monkeypatch.setattr(core_module, "_scan_file_internal", counted_scan_file_internal)
+    reset_cache_manager()
+    try:
+        clean_result = scan_bound(benign_path)
+        malicious_result = scan_bound(logical_path)
+    finally:
+        reset_cache_manager()
+
+    assert clean_result.success is True
+    assert internal_calls == 2
+    assert any(issue.rule_code == "S201" for issue in malicious_result.issues)
+
+
 def test_directory_scan_groups_shard_family_without_declared_total(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4467,7 +5302,7 @@ def test_directory_scan_groups_shard_family_without_declared_total(
     assert {member["path"] for member in fingerprint["members"]} == {str(shard) for shard in shards}
 
 
-def test_directory_scan_content_hash_excludes_files_skipped_by_total_size_limit(
+def test_directory_scan_total_size_limit_stops_before_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4489,7 +5324,7 @@ def test_directory_scan_content_hash_excludes_files_skipped_by_total_size_limit(
 
     result = core_module.scan_model_directory_or_file(str(tmp_path), max_total_size=1)
 
-    assert len(calls) == 1
+    assert calls == []
     assert result.content_hash is None
     assert result.success is False
 
@@ -15582,7 +16417,7 @@ def test_scan_file_unreadable_non_read_failure_aware_suffix_is_operational(
     real_access = os.access
 
     def deny_file_access(candidate: str | bytes | os.PathLike[str], mode: int) -> bool:
-        if str(candidate) == str(unreadable):
+        if _same_resolved_test_path(candidate, unreadable):
             return False
         return real_access(candidate, mode)
 
@@ -15639,7 +16474,11 @@ def test_scan_file_unreadable_suffix_only_candidate_does_not_emit_path_security_
     real_access = os.access
 
     def unreadable_path(candidate: str, mode: int) -> bool:
-        return False if candidate == str(model_path) and mode == os.R_OK else real_access(candidate, mode)
+        return (
+            False
+            if _same_resolved_test_path(candidate, model_path) and mode == os.R_OK
+            else real_access(candidate, mode)
+        )
 
     def raise_read_error(*_args: object, **_kwargs: object) -> str:
         raise OSError("simulated unreadable model payload")
@@ -15780,7 +16619,7 @@ def test_single_file_scan_bypasses_stale_cache_when_owner_becomes_unreadable(
         real_access = os.access
 
         def deny_model_access(candidate: str | bytes | os.PathLike[str], mode: int) -> bool:
-            if str(candidate) == str(model_path):
+            if _same_resolved_test_path(candidate, model_path):
                 return False
             return real_access(candidate, mode)
 
@@ -15862,7 +16701,7 @@ def test_directory_scan_bypasses_stale_cache_when_owner_read_fails_with_access(
             *args: Any,
             **kwargs: Any,
         ) -> Any:
-            if str(candidate) == str(cached_clean):
+            if Path(os.fsdecode(candidate)).name == cached_clean.name:
                 raise OSError("simulated transient LightGBM read failure")
             return real_open(candidate, *args, **kwargs)
 
@@ -15967,7 +16806,7 @@ def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_rea
             *args: Any,
             **kwargs: Any,
         ) -> Any:
-            if str(candidate) == str(model_path):
+            if _same_resolved_test_path(candidate, model_path):
                 if reason == "r_serialized_read_failed":
                     raise PermissionError(13, f"simulated transient {reason} read")
                 raise OSError(f"simulated transient {reason} read")
@@ -15981,10 +16820,16 @@ def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_rea
             def fail_cached_savedmodel_read(
                 candidate: Path,
                 expected_stat: os.stat_result,
+                *,
+                follow_validated_symlink: bool = False,
             ) -> Iterator[Any]:
-                if candidate == model_path:
+                if _same_resolved_test_path(candidate, model_path):
                     raise OSError(f"simulated transient {reason} read")
-                with real_bound_open(candidate, expected_stat) as stream:
+                with real_bound_open(
+                    candidate,
+                    expected_stat,
+                    follow_validated_symlink=follow_validated_symlink,
+                ) as stream:
                     yield stream
 
             monkeypatch.setattr(
@@ -16000,7 +16845,7 @@ def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_rea
                 *args: Any,
                 **kwargs: Any,
             ) -> Any:
-                if str(candidate) == str(model_path):
+                if _same_resolved_test_path(candidate, model_path):
                     raise OSError(f"simulated transient {reason} read")
                 return real_zip_file(candidate, *args, **kwargs)
 
@@ -16162,7 +17007,7 @@ def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_
             *args: Any,
             **kwargs: Any,
         ) -> Any:
-            if str(candidate) == str(cached_clean):
+            if Path(os.fsdecode(candidate)).name == cached_clean.name:
                 if reason == "r_serialized_read_failed":
                     raise PermissionError(13, f"simulated transient {reason} read")
                 raise OSError(f"simulated transient {reason} read")
@@ -16176,10 +17021,16 @@ def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_
             def fail_cached_savedmodel_read(
                 candidate: Path,
                 expected_stat: os.stat_result,
+                *,
+                follow_validated_symlink: bool = False,
             ) -> Iterator[Any]:
-                if candidate == cached_clean:
+                if candidate.name == cached_clean.name:
                     raise OSError(f"simulated transient {reason} read")
-                with real_bound_open(candidate, expected_stat) as stream:
+                with real_bound_open(
+                    candidate,
+                    expected_stat,
+                    follow_validated_symlink=follow_validated_symlink,
+                ) as stream:
                     yield stream
 
             monkeypatch.setattr(
@@ -16195,7 +17046,7 @@ def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_
                 *args: Any,
                 **kwargs: Any,
             ) -> Any:
-                if str(candidate) == str(cached_clean):
+                if Path(candidate).name == cached_clean.name:
                     raise OSError(f"simulated transient {reason} read")
                 return real_zip_file(candidate, *args, **kwargs)
 

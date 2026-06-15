@@ -1,12 +1,15 @@
 """Tests for advanced file handler."""
 
 import builtins
+import errno
 import hashlib
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from contextvars import ContextVar
 from pathlib import Path
@@ -27,10 +30,559 @@ from modelaudit.utils.file.handlers import (
     ShardedModelDetector,
     ValidatedShardTargets,
     _build_advanced_shard_family_cache_fingerprint,
+    _copy_pinned_file_descriptor,
+    _pinned_file_descriptor_changed,
+    _pinned_shard_scan_path,
+    _pinned_windows_logical_scan_path,
+    _pinned_windows_shard_scan_path,
     _SafetensorsIndexInspectionContext,
+    _ShardPinUnavailableError,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
+
+
+def _target_for_path(path: Path) -> dict[str, int | str]:
+    path_stat = path.stat()
+    return {
+        "resolved_path": str(path),
+        "device": path_stat.st_dev,
+        "inode": path_stat.st_ino,
+        "size": path_stat.st_size,
+        "mtime_ns": path_stat.st_mtime_ns,
+        "ctime_ns": path_stat.st_ctime_ns,
+        "nlink": path_stat.st_nlink,
+    }
+
+
+def test_pinned_file_descriptor_change_fails_closed_on_fstat_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable terminal descriptor state must be treated as changed."""
+    file_path = tmp_path / "model.bin"
+    file_path.write_bytes(b"model")
+    with file_path.open("rb") as handle:
+        expected_stat = os.fstat(handle.fileno())
+        monkeypatch.setattr(os, "fstat", MagicMock(side_effect=OSError("descriptor unavailable")))
+
+        assert _pinned_file_descriptor_changed(handle.fileno(), expected_stat) is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX open-unlink semantics")
+def test_pinned_file_descriptor_change_detects_replaced_path(tmp_path: Path) -> None:
+    source_path = tmp_path / "model.bin"
+    replacement_path = tmp_path / "replacement.bin"
+    source_path.write_bytes(b"benign")
+    replacement_path.write_bytes(b"malicious")
+
+    with source_path.open("rb") as source:
+        expected_stat = os.fstat(source.fileno())
+        replacement_path.replace(source_path)
+
+        assert _pinned_file_descriptor_changed(source.fileno(), expected_stat) is True
+
+
+def test_copy_pinned_file_descriptor_removes_partial_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    source_path.write_bytes(b"x" * (2 * 1024 * 1024))
+    original_path_open = Path.open
+
+    class FailingWriter:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> "FailingWriter":
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            self.handle.close()
+
+        def write(self, data: bytes) -> int:
+            self.handle.write(data[:1024])
+            self.handle.flush()
+            raise OSError(errno.ENOSPC, "simulated full staging filesystem")
+
+    def failing_destination_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = original_path_open(path, *args, **kwargs)
+        if path == destination:
+            return FailingWriter(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", failing_destination_open)
+    source_fd = os.open(source_path, os.O_RDONLY)
+    try:
+        with pytest.raises(OSError, match="simulated full staging filesystem"):
+            _copy_pinned_file_descriptor(source_fd, destination)
+    finally:
+        os.close(source_fd)
+
+    assert not destination.exists()
+
+
+def test_copy_pinned_file_descriptor_preserves_destination_open_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    source_path.write_bytes(b"source")
+    original_path_open = Path.open
+
+    def failing_destination_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == destination:
+            raise OSError(errno.EACCES, "destination unavailable")
+        return original_path_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_destination_open)
+    source_fd = os.open(source_path, os.O_RDONLY)
+    try:
+        with pytest.raises(OSError, match="destination unavailable"):
+            _copy_pinned_file_descriptor(source_fd, destination)
+        os.fstat(source_fd)
+    finally:
+        os.close(source_fd)
+
+
+def test_copy_pinned_file_descriptor_enforces_byte_and_deadline_bounds(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"0123456789")
+    with source.open("rb") as source_handle:
+        with pytest.raises(_ShardPinUnavailableError, match="staging byte limit"):
+            _copy_pinned_file_descriptor(source_handle.fileno(), tmp_path / "too-large.bin", max_bytes=1)
+        with pytest.raises(_ShardPinUnavailableError, match="scan deadline"):
+            _copy_pinned_file_descriptor(source_handle.fileno(), tmp_path / "too-late.bin", deadline=0)
+
+    assert not (tmp_path / "too-large.bin").exists()
+    assert not (tmp_path / "too-late.bin").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_regular_pinned_source_copy_detects_staged_mutation(tmp_path: Path) -> None:
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    target = _target_for_path(source_path)
+
+    with _pinned_shard_scan_path(
+        str(source_path),
+        target,
+        logical_path=str(source_path),
+        require_regular_path=True,
+    ) as pinned_scan:
+        Path(pinned_scan.path).write_bytes(b"staged")
+
+    assert pinned_scan.changed_during_scan is True
+    assert source_path.read_bytes() == b"source"
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not Path("/dev/fd").exists(),
+    reason="requires POSIX /dev/fd descriptor staging",
+)
+def test_dev_fd_fallback_exposes_subprocess_portable_regular_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    target = _target_for_path(source_path)
+    original_stat = os.stat
+
+    def stat_without_proc(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(path).startswith("/proc/"):
+            raise FileNotFoundError(os.fspath(path))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat_without_proc)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, stat_without_proc})
+
+    with _pinned_shard_scan_path(str(source_path), target) as pinned_scan:
+        assert not pinned_scan.path.startswith("/dev/fd/")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; print(Path(sys.argv[1]).read_text())",
+                pinned_scan.path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    assert completed.stdout.strip() == "source"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+@pytest.mark.parametrize("require_regular_path", [False, True], ids=["descriptor-link", "regular-copy"])
+def test_pinned_scan_detects_staged_name_aba(
+    tmp_path: Path,
+    require_regular_path: bool,
+) -> None:
+    """Restoring a staged filename cannot erase a transient scanner-path substitution."""
+    source_path = tmp_path / "model.pkl"
+    source_path.write_bytes(b"malicious")
+    target = _target_for_path(source_path)
+
+    with _pinned_shard_scan_path(
+        str(source_path),
+        target,
+        logical_path=str(source_path),
+        require_regular_path=require_regular_path,
+    ) as pinned_scan:
+        scan_path = Path(pinned_scan.path)
+        held_path = scan_path.with_name("held-model.pkl")
+        scan_path.rename(held_path)
+        scan_path.write_bytes(b"benign")
+        scan_path.unlink()
+        held_path.rename(scan_path)
+
+    assert pinned_scan.changed_during_scan is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_regular_pinned_companion_rejects_source_mutation_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "model.onnx_data"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+
+    original_copy = _copy_pinned_file_descriptor
+    companion_inode = companion_path.stat().st_ino
+    staging_directories_before = set(Path(tempfile.gettempdir()).glob(".modelaudit_scan_*"))
+
+    def copy_then_mutate(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
+        copied_hash = original_copy(source_fd, destination, **kwargs)
+        if os.fstat(source_fd).st_ino == companion_inode:
+            companion_path.write_bytes(b"mutated!!")
+        return copied_hash
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", copy_then_mutate)
+
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="companion target changed while staging"),
+        _pinned_shard_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            logical_path=str(source_path),
+            companion_targets={
+                companion_path.name: (str(companion_path), _target_for_path(companion_path)),
+            },
+            require_regular_path=True,
+        ),
+    ):
+        pytest.fail("mutated companion must be rejected before scanner dispatch")
+    assert set(Path(tempfile.gettempdir()).glob(".modelaudit_scan_*")) == staging_directories_before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_regular_pinned_nested_companion_rejects_parent_replacement_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nested staging parent must remain bound to the directory opened for copying."""
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "data.bin"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+
+    original_copy = _copy_pinned_file_descriptor
+    companion_inode = companion_path.stat().st_ino
+    replacement_root: Path | None = None
+
+    def copy_after_parent_replacement(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
+        nonlocal replacement_root
+        if os.fstat(source_fd).st_ino == companion_inode:
+            destination_fd = cast(int, kwargs["destination_dir_fd"])
+            descriptor_root = Path("/proc/self/fd") if Path("/proc/self/fd").exists() else Path("/dev/fd")
+            opened_parent = Path(os.path.realpath(descriptor_root / str(destination_fd)))
+            replacement_root = opened_parent.parent
+            held_parent = replacement_root / "held-sub"
+            opened_parent.rename(held_parent)
+            opened_parent.mkdir()
+            (opened_parent / os.fspath(destination)).write_bytes(b"substitute")
+        return original_copy(source_fd, destination, **kwargs)
+
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._copy_pinned_file_descriptor",
+        copy_after_parent_replacement,
+    )
+
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="private staging entry changed"),
+        _pinned_shard_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            logical_path=str(source_path),
+            companion_targets={
+                "sub/data.bin": (str(companion_path), _target_for_path(companion_path)),
+            },
+            require_regular_path=True,
+        ),
+    ):
+        pytest.fail("a replacement staging parent must be rejected before dispatch")
+
+    assert replacement_root is not None
+    for staged_directory in (replacement_root / "sub", replacement_root / "held-sub"):
+        if staged_directory.exists():
+            for child in staged_directory.iterdir():
+                child.unlink()
+            staged_directory.rmdir()
+    replacement_root.rmdir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_nested_companion_open_failure_removes_created_staging_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory created immediately before descriptor exhaustion remains cleanup-owned."""
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "data.bin"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+    source_target = _target_for_path(source_path)
+    companion_target = _target_for_path(companion_path)
+    original_open = os.open
+    staging_directories_before = set(Path(tempfile.gettempdir()).glob(".modelaudit_scan_*"))
+
+    def fail_nested_directory_open(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> int:
+        if os.fspath(path) == "nested" and kwargs.get("dir_fd") is not None:
+            raise OSError(errno.EMFILE, "descriptor table exhausted")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_nested_directory_open)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, fail_nested_directory_open})
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="descriptor table exhausted"),
+        _pinned_shard_scan_path(
+            str(source_path),
+            source_target,
+            logical_path=str(source_path),
+            companion_targets={"nested/data.bin": (str(companion_path), companion_target)},
+            require_regular_path=True,
+        ),
+    ):
+        pytest.fail("descriptor exhaustion must stop before dispatch")
+
+    assert set(Path(tempfile.gettempdir()).glob(".modelaudit_scan_*")) == staging_directories_before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_regular_pinned_copy_uses_validated_size_as_hard_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Growth after validation cannot consume staging space beyond the captured size."""
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    source_stat = source_path.stat()
+    target = _target_for_path(source_path)
+    observed_limits: list[int | None] = []
+    original_copy = _copy_pinned_file_descriptor
+
+    def grow_before_copy(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
+        observed_limits.append(kwargs.get("max_bytes"))
+        source_path.write_bytes(b"x" * (2 * 1024 * 1024))
+        return original_copy(source_fd, destination, **kwargs)
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", grow_before_copy)
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="regular source scan path"),
+        _pinned_shard_scan_path(
+            str(source_path),
+            target,
+            logical_path=str(source_path),
+            require_regular_path=True,
+        ),
+    ):
+        pytest.fail("grown content must not reach scanner dispatch")
+
+    assert observed_limits == [source_stat.st_size]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_regular_pinned_validation_hash_honors_dispatch_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-copy validation cannot overrun the deadline and still dispatch a scanner."""
+    from modelaudit.utils.file import handlers
+
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    target = _target_for_path(source_path)
+    original_hash = handlers._hash_pinned_file_descriptor
+
+    def delayed_hash(source_fd: int, **kwargs: Any) -> str:
+        time.sleep(0.02)
+        return original_hash(source_fd, **kwargs)
+
+    monkeypatch.setattr(handlers, "_hash_pinned_file_descriptor", delayed_hash)
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="changed while staging"),
+        _pinned_shard_scan_path(
+            str(source_path),
+            target,
+            logical_path=str(source_path),
+            require_regular_path=True,
+            deadline=time.time() + 0.01,
+        ),
+    ):
+        pytest.fail("an expired validation deadline must stop before dispatch")
+
+
+def test_windows_logical_pin_rejects_staged_source_mutation_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "blob"
+    source_path.write_bytes(b"malicious")
+    target = _target_for_path(source_path)
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+        lambda path, **_kwargs: os.open(path, os.O_RDONLY),
+    )
+    original_copy = _copy_pinned_file_descriptor
+
+    def copy_then_mutate(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
+        copied_hash = original_copy(source_fd, destination, **kwargs)
+        Path(destination).write_bytes(b"benign!!!")
+        return copied_hash
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", copy_then_mutate)
+
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="staged shard content changed while staging"),
+        _pinned_windows_logical_scan_path(str(source_path), target, "model.pkl", None),
+    ):
+        pytest.fail("mutated staged bytes must be rejected before scanner dispatch")
+
+
+def test_windows_logical_pin_rejects_staged_companion_reparse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged companion cannot be replaced with a reparse-style alias before its guard opens."""
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "model.onnx_data"
+    benign_path = tmp_path / "benign.bin"
+    source_path.write_bytes(b"model")
+    companion_path.write_bytes(b"malicious")
+    benign_path.write_bytes(b"benign")
+
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+        lambda path, **_kwargs: os.open(path, os.O_RDONLY),
+    )
+    original_copy = _copy_pinned_file_descriptor
+    companion_inode = companion_path.stat().st_ino
+
+    def copy_then_retarget(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
+        copied_hash = original_copy(source_fd, destination, **kwargs)
+        if os.fstat(source_fd).st_ino == companion_inode:
+            destination_path = Path(destination)
+            destination_path.unlink()
+            destination_path.symlink_to(benign_path)
+        return copied_hash
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", copy_then_retarget)
+
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="staged companion path changed"),
+        _pinned_windows_logical_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            source_path.name,
+            {companion_path.name: (str(companion_path), _target_for_path(companion_path))},
+        ),
+    ):
+        pytest.fail("a staged companion reparse must fail before scanner dispatch")
+
+
+def test_windows_pinned_source_preserves_existing_companion_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A companion failure cannot be cleared by a stable Windows source descriptor."""
+    source_path = tmp_path / "model.bin"
+    source_path.write_bytes(b"model")
+    with source_path.open("rb") as handle:
+        source_fd = handle.fileno()
+        target = _target_for_path(source_path)
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+            lambda _path, **_kwargs: os.dup(source_fd),
+        )
+
+        with _pinned_windows_shard_scan_path(str(source_path), target) as pinned_scan:
+            pinned_scan.changed_during_scan = True
+
+    assert pinned_scan.changed_during_scan is True
+
+
+def test_windows_logical_pin_scans_staged_descriptor_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mutable logical alias cannot redirect a Windows scan away from guarded bytes."""
+    source_path = tmp_path / "blob"
+    source_path.write_bytes(b"malicious")
+    source_stat = source_path.stat()
+    target = _target_for_path(source_path)
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+        lambda path, **_kwargs: os.open(path, os.O_RDONLY),
+    )
+
+    with _pinned_windows_logical_scan_path(str(source_path), target, "model.pkl", None) as pinned_scan:
+        source_path.write_bytes(b"benign!!!")
+        os.utime(
+            source_path,
+            ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 1_000_000_000),
+        )
+        assert Path(pinned_scan.path).name == "model.pkl"
+        assert Path(pinned_scan.path).read_bytes() == b"malicious"
+
+    assert pinned_scan.changed_during_scan is True
+
+
+def test_windows_logical_pin_does_not_delete_replaced_staging_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup must not recurse into a replacement at the private staging pathname."""
+    source_path = tmp_path / "blob"
+    source_path.write_bytes(b"model")
+    target = _target_for_path(source_path)
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+        lambda path, **_kwargs: os.open(path, os.O_RDONLY),
+    )
+    held_staging: Path | None = None
+    replacement_staging: Path | None = None
+
+    with _pinned_windows_logical_scan_path(str(source_path), target, "model.pkl", None) as pinned_scan:
+        replacement_staging = Path(pinned_scan.path).parent
+        held_staging = replacement_staging.with_name(f"{replacement_staging.name}-held")
+        replacement_staging.rename(held_staging)
+        replacement_staging.mkdir()
+        (replacement_staging / "must-survive").write_text("sentinel", encoding="utf-8")
+
+    assert replacement_staging is not None
+    assert held_staging is not None
+    assert (replacement_staging / "must-survive").read_text(encoding="utf-8") == "sentinel"
+    for directory in (replacement_staging, held_staging):
+        for child in directory.iterdir():
+            child.unlink()
+        directory.rmdir()
 
 
 class CompletingShardScanner:
@@ -1896,7 +2448,7 @@ class TestShardedModelDetector:
             result = scan_model_directory_or_file(
                 str(tmp_path),
                 cache_enabled=cache_enabled,
-                cache_dir=str(tmp_path / "cache"),
+                cache_dir=str(tmp_path.parent / f"{tmp_path.name}-cache"),
                 scanners=["safetensors"],
             )
 
@@ -2093,6 +2645,59 @@ class TestShardedModelDetector:
         assert "missing_shard_count" not in shard_info
         assert result.success is True
         assert result.bytes_scanned == sum(shard.stat().st_size for shard in shards)
+
+    def test_detect_shards_does_not_dedupe_expected_peer_against_unrelated_alias(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Only an equivalent shard slot may replace an index-declared path alias."""
+        del requires_symlinks
+        first_dir = tmp_path / "a"
+        second_dir = tmp_path / "b"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        shard_zero = first_dir / "model-00000-of-00002.safetensors"
+        shard_one = second_dir / "model-00001-of-00002.safetensors"
+        shard_zero.write_bytes(b"first")
+        shard_one.write_bytes(b"second")
+        _write_safetensors_index(
+            tmp_path,
+            [f"a/{shard_zero.name}", f"b/{shard_one.name}"],
+        )
+        unrelated_alias = first_dir / "unrelated.txt"
+        unrelated_alias.symlink_to(shard_one)
+        for index in range(20):
+            (first_dir / f"irrelevant-{index}.txt").write_text("metadata", encoding="utf-8")
+
+        original_resolve = Path.resolve
+        irrelevant_resolves = 0
+
+        def track_resolve(path: Path, strict: bool = False) -> Path:
+            nonlocal irrelevant_resolves
+            if path.name == unrelated_alias.name or path.name.startswith("irrelevant-"):
+                irrelevant_resolves += 1
+            return original_resolve(path, strict=strict)
+
+        monkeypatch.setattr(Path, "resolve", track_resolve)
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shard_zero),
+            index_search_root=tmp_path,
+        )
+        result = AdvancedFileHandler(
+            str(shard_zero),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_zero), str(shard_one)]
+        assert "missing_shard_count" not in shard_info
+        assert irrelevant_resolves == 0
+        assert result.success is True
+        assert result.bytes_scanned == shard_zero.stat().st_size + shard_one.stat().st_size
 
     def test_detect_shards_rejects_changed_cross_directory_peer(
         self,

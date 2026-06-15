@@ -1654,7 +1654,7 @@ class TestTarScanner:
         monkeypatch.setattr(
             TarScanner,
             "can_handle",
-            classmethod(lambda _cls, path: path == str(archive_path)),
+            classmethod(lambda _cls, path: Path(path).name == archive_path.name),
         )
         monkeypatch.setattr(TarScanner, "_preflight_tar_archive", lambda _self, _path, _result: True)
         original_member_risk_scan = tar_scanner_module.scan_archive_member_for_known_risks
@@ -1671,7 +1671,7 @@ class TestTarScanner:
             if (
                 malicious_member_scanned
                 and archive.name is not None
-                and Path(os.fsdecode(archive.name)) == archive_path
+                and Path(os.fsdecode(archive.name)).name == archive_path.name
             ):
                 raise OSError("later TAR traversal unavailable")
             return original_next(archive)

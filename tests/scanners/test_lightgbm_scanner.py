@@ -312,7 +312,7 @@ def test_lightgbm_read_failure_takes_operational_precedence_over_security_findin
     )
 
     def deny_only_unreadable(path: str, _mode: int) -> bool:
-        return path != str(unreadable)
+        return Path(path).name != unreadable.name
 
     monkeypatch.setattr("modelaudit.scanners.base.os.access", deny_only_unreadable)
 

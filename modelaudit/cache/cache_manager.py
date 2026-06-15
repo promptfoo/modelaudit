@@ -101,6 +101,8 @@ class CacheManager:
         version_context: dict[str, Any] | None = None,
         *,
         include_private_metadata: bool = False,
+        cache_key_path: str | None = None,
+        trusted_descriptor_path: bool = False,
     ) -> tuple[dict[str, Any] | None, ScannedFileIdentity | None]:
         """Return a cache lookup and retain the monitored identity for a miss scan."""
         if not self.enabled or not self.cache:
@@ -110,6 +112,8 @@ class CacheManager:
             file_path,
             version_context=version_context,
             include_private_metadata=include_private_metadata,
+            cache_key_path=cache_key_path,
+            trusted_descriptor_path=trusted_descriptor_path,
         )
         if cached_result is not None and not cached_scan_result_dependencies_available(cached_result):
             logger.debug(f"Bypassing cached result with unavailable scanner dependencies: {Path(file_path).name}")
@@ -126,6 +130,9 @@ class CacheManager:
         expected_file_hash: str | None = None,
         expected_change_token: int | None = None,
         expected_ancestor_identity: AncestorIdentity | None = None,
+        *,
+        cache_key_path: str | None = None,
+        trusted_descriptor_path: bool = False,
     ) -> bool:
         """
         Store scan result in cache.
@@ -152,6 +159,8 @@ class CacheManager:
             expected_file_hash=expected_file_hash,
             expected_change_token=expected_change_token,
             expected_ancestor_identity=expected_ancestor_identity,
+            cache_key_path=cache_key_path,
+            trusted_descriptor_path=trusted_descriptor_path,
         )
 
     def cached_scan(

@@ -11,6 +11,7 @@ import os
 import time
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 from ...cache.optimized_config import get_config_extractor
@@ -18,6 +19,16 @@ from ..file.hdf5 import find_hdf5_signature_offset
 
 logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
+BOUND_CACHE_IDENTITY_CONFIG_KEY = "_bound_cache_identity"
+
+
+@dataclass(frozen=True)
+class CacheIdentityBinding:
+    """Bind cache validation to a guarded source while scanning a pinned path."""
+
+    scan_path: str
+    identity_path: str
+
 
 _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset(
     {
@@ -393,7 +404,12 @@ def should_bypass_cache_for_max_file_size(file_path: str, config: dict[str, Any]
     return not should_use_advanced_handler(file_path)
 
 
-def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "cache_dir") -> Callable[[F], F]:
+def cached_scan(
+    cache_enabled_key: str = "cache_enabled",
+    cache_dir_key: str = "cache_dir",
+    *,
+    cache_identity_config_key: str | None = None,
+) -> Callable[[F], F]:
     """
     Cache decorator for scan functions that take (path, config) arguments.
 
@@ -403,6 +419,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
     Args:
         cache_enabled_key: Config key to check if caching is enabled (default: "cache_enabled")
         cache_dir_key: Config key for cache directory (default: "cache_dir")
+        cache_identity_config_key: Optional private config key containing a guarded cache identity binding
 
     Returns:
         Decorated function with caching support
@@ -436,6 +453,17 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 logger.debug("No file path found, calling function directly")
                 return func(*args, **kwargs)
 
+            raw_config, _ = _extract_config_and_path(args, kwargs)
+            cache_key_path = file_path
+            trusted_descriptor_path = False
+            if cache_identity_config_key is not None and isinstance(raw_config, dict):
+                binding = raw_config.get(cache_identity_config_key)
+                if isinstance(binding, CacheIdentityBinding) and os.path.normcase(
+                    os.path.abspath(binding.scan_path)
+                ) == os.path.normcase(os.path.abspath(file_path)):
+                    cache_key_path = binding.identity_path
+                    trusted_descriptor_path = True
+
             # Check if file should be cached based on characteristics
             try:
                 file_stat = os.stat(file_path)
@@ -457,7 +485,6 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Bypassing cache for OpenVINO sidecar-dependent scan: {file_path}")
                     return func(*args, **kwargs)
 
-                raw_config, _ = _extract_config_and_path(args, kwargs)
                 if should_bypass_cache_for_zip_entry_preflight(file_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded ZIP entry preflight: {file_path}")
                     return func(*args, **kwargs)
@@ -534,6 +561,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                         file_path,
                         version_context=version_context,
                         include_private_metadata=True,
+                        cache_key_path=cache_key_path,
+                        trusted_descriptor_path=trusted_descriptor_path,
                     )
 
                     if cached_result is not None:
@@ -566,6 +595,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                                 expected_file_hash=pre_scan_hash,
                                 expected_change_token=pre_scan_change_token,
                                 expected_ancestor_identity=pre_scan_ancestor_identity,
+                                cache_key_path=cache_key_path,
+                                trusted_descriptor_path=trusted_descriptor_path,
                             )
                         else:
                             logger.debug(

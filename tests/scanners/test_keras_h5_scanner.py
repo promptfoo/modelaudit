@@ -907,7 +907,7 @@ def test_large_file_backed_hdf5_bypasses_cache_content_hash(
     assert should_bypass_cache_for_file_backed_hdf5(str(model_path)) is True
 
     def fail_if_cache_hashes_hdf5(self: SecureFileHasher, path: str) -> str:
-        if path == str(model_path):
+        if Path(path).name == model_path.name:
             pytest.fail("large file-backed HDF5 was content-hashed for cache lookup")
         return "a" * 64
 

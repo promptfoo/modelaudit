@@ -1463,14 +1463,14 @@ def _remote_safetensors_index_details_by_file(
     deadline: float | None,
     max_transferred_bytes: int | None,
     retain_unscoped_failure: Callable[[str, dict[str, Any]], bool] | None = None,
-) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]], bool]:
     """Return per-shard details, stopping when an optional failure retainer rejects a result."""
     from ...scanners.safetensors_scanner import _safetensors_name_preview
 
     selected_files = set(model_files)
     repo_file_set = set(repo_files)
     if not selected_files and retain_unscoped_failure is None:
-        return {}, 0, {}, {}
+        return {}, 0, {}, {}, False
 
     details_by_file: dict[str, dict[str, Any]] = {}
     unscoped_failures: dict[str, dict[str, Any]] = {}
@@ -1496,7 +1496,7 @@ def _remote_safetensors_index_details_by_file(
         if deadline is not None and time.monotonic() >= deadline:
             failure = _index_failure_details(index_filename, "index_reconciliation_timed_out")
             record_failure(index_filename, failure, filename_family)
-            return details_by_file, total_index_bytes, acquired_index_bytes, unscoped_failures
+            return details_by_file, total_index_bytes, acquired_index_bytes, unscoped_failures, False
         parent_prefix = _remote_index_parent_prefix(index_filename)
         if selected_files and not any(
             not parent_prefix or filename.startswith(parent_prefix) for filename in selected_files
@@ -1508,7 +1508,7 @@ def _remote_safetensors_index_details_by_file(
             failure["index_file_count"] = len(relevant_index_files)
             failure["index_file_limit"] = _HF_SAFETENSORS_INDEX_MAX_FILES
             record_failure(index_filename, failure, filename_family)
-            return details_by_file, total_index_bytes, acquired_index_bytes, unscoped_failures
+            return details_by_file, total_index_bytes, acquired_index_bytes, unscoped_failures, True
 
     for index_filename, filename_family in relevant_index_files:
         if deadline is not None and time.monotonic() >= deadline:
@@ -1787,7 +1787,35 @@ def _remote_safetensors_index_details_by_file(
             details["index_tensor_names_digest"] = tensor_digests_by_file.get(filename, _tensor_name_digest(()))
             attach_details(filename, details)
 
-    return details_by_file, total_index_bytes, acquired_index_bytes, unscoped_failures
+    return details_by_file, total_index_bytes, acquired_index_bytes, unscoped_failures, False
+
+
+def _remote_safetensors_index_files_for_reconciliation(
+    repo_files: Collection[str],
+    model_files: Collection[str],
+    safetensors_header_files: Collection[str],
+    *,
+    enabled: bool,
+    index_expansion_enabled: bool,
+) -> set[str]:
+    """Return index candidates relevant to source-native SafeTensors reconciliation."""
+    if not enabled:
+        return set()
+    header_files = set(safetensors_header_files)
+    if header_files:
+        return {
+            filename
+            for filename in repo_files
+            if _is_safetensors_index_file(filename)
+            and any(
+                not _remote_index_parent_prefix(filename)
+                or selected_file.startswith(_remote_index_parent_prefix(filename))
+                for selected_file in header_files
+            )
+        }
+    if not index_expansion_enabled:
+        return set()
+    return {filename for filename in model_files if _is_safetensors_index_file(filename)}
 
 
 def _combine_remote_safetensors_shard_details(
@@ -1832,10 +1860,16 @@ def _remote_safetensors_shard_details_by_file(
     deadline: float | None,
     max_transferred_bytes: int | None,
     retain_unscoped_failure: Callable[[str, dict[str, Any]], bool] | None = None,
-) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, Any]], int, dict[str, bytes], dict[str, dict[str, Any]], bool]:
     """Return per-shard remote coverage details from filenames and index manifests."""
     filename_details = _remote_safetensors_filename_shard_details_by_file(model_files, repo_files)
-    index_details, index_bytes, acquired_index_bytes, unscoped_failures = _remote_safetensors_index_details_by_file(
+    (
+        index_details,
+        index_bytes,
+        acquired_index_bytes,
+        unscoped_failures,
+        index_inspection_limit_exceeded,
+    ) = _remote_safetensors_index_details_by_file(
         repo_id,
         model_files,
         repo_files,
@@ -1850,6 +1884,7 @@ def _remote_safetensors_shard_details_by_file(
         index_bytes,
         acquired_index_bytes,
         unscoped_failures,
+        index_inspection_limit_exceeded,
     )
 
 
@@ -3273,6 +3308,19 @@ def _select_huggingface_model_files(
         else set()
     )
     if not allow_content_probes:
+        deferred_index_route_scanner_ids = (
+            selected_route_scanner_ids
+            if selected_route_scanner_ids is not None
+            else (
+                None
+                if selected_route_formats is None
+                else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+            )
+        )
+        index_content_probe_required = bool(
+            deferred_index_route_scanner_ids is not None
+            and deferred_index_route_scanner_ids.difference({"safetensors"})
+        )
         selected_safetensors_indexes = [
             filename for filename in model_files if _is_hf_safetensors_index_filename(filename)
         ]
@@ -3287,6 +3335,7 @@ def _select_huggingface_model_files(
                     not _is_hf_safetensors_index_filename(filename)
                     or not allow_safetensors_index_expansion
                     or _metadata_only_hf_index_may_govern_selected_shard(filename, model_files)
+                    or index_content_probe_required
                 )
             ]
             if content_probes_relevant
@@ -6255,14 +6304,13 @@ def plan_huggingface_streaming_download(
         ),
         deadline=deadline,
     )
+    safetensors_index_expansion_enabled = _allows_safetensors_index_expansion(
+        scannable_extensions,
+        scannable_scanner_ids,
+        include_all_files=include_all_files,
+    )
     defer_safetensors_index_validation = (
-        _stream_safetensors_headers
-        and allow_content_probes
-        and _allows_safetensors_index_expansion(
-            scannable_extensions,
-            scannable_scanner_ids,
-            include_all_files=include_all_files,
-        )
+        _stream_safetensors_headers and allow_content_probes and safetensors_index_expansion_enabled
     )
     selection = _select_streamable_hf_files(
         repo_id,
@@ -6299,22 +6347,38 @@ def plan_huggingface_streaming_download(
     size_preflight_files = model_files
     minimum_safetensors_read_bytes = 0
     safetensors_header_files: set[str] = set()
-    if _stream_safetensors_headers:
-        safetensors_selection_enabled = scannable_scanner_ids is None or "safetensors" in {
-            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+    safetensors_selection_enabled = _stream_safetensors_headers and (
+        scannable_scanner_ids is None
+        or "safetensors" in {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}
+    )
+    if safetensors_selection_enabled:
+        safetensors_header_files = {
+            filename
+            for filename in model_files
+            if selection.content_route_formats.get(filename) == "safetensors"
+            or (
+                PurePosixPath(filename).suffix.lower() == ".safetensors"
+                and selection.content_route_formats.get(filename) is None
+            )
         }
-        if safetensors_selection_enabled:
-            safetensors_header_files = {
-                filename
-                for filename in model_files
-                if selection.content_route_formats.get(filename) == "safetensors"
-                or (
-                    PurePosixPath(filename).suffix.lower() == ".safetensors"
-                    and selection.content_route_formats.get(filename) is None
-                )
-            }
-            minimum_safetensors_read_bytes = 8 * len(safetensors_header_files)
-            size_preflight_files = [filename for filename in model_files if filename not in safetensors_header_files]
+        minimum_safetensors_read_bytes = 8 * len(safetensors_header_files)
+        size_preflight_files = [filename for filename in model_files if filename not in safetensors_header_files]
+    safetensors_index_files = _remote_safetensors_index_files_for_reconciliation(
+        repo_files,
+        model_files,
+        safetensors_header_files,
+        enabled=safetensors_selection_enabled,
+        index_expansion_enabled=safetensors_index_expansion_enabled,
+    )
+    if len(safetensors_index_files) > _HF_SAFETENSORS_INDEX_MAX_FILES:
+        reconciliation_only_indexes = {
+            filename
+            for filename in safetensors_index_files
+            if filename not in safetensors_header_files and selection.content_route_formats.get(filename) is None
+        }
+        size_preflight_files = [
+            filename for filename in size_preflight_files if filename not in reconciliation_only_indexes
+        ]
     revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
         repo_id,
         size_preflight_files,
@@ -6375,7 +6439,11 @@ def plan_huggingface_streaming_download(
         selected_sizes=selected_sizes,
         download_revision=revision or repo_revision,
         content_route_formats=selection.content_route_formats,
-        safetensors_index_files=tuple(selection.safetensors_index_files),
+        safetensors_index_files=(
+            tuple(sorted(safetensors_index_files))
+            if safetensors_index_files
+            else tuple(selection.safetensors_index_files)
+        ),
         probe_bytes_transferred=plan_probe_budget.transferred_bytes,
     )
 
@@ -6508,6 +6576,12 @@ def download_model_streaming(
             include_all_files=include_all_files,
         )
         selected_safetensors_indexes = list(plan.safetensors_index_files) if safetensors_index_expansion_enabled else []
+        preflight_index_limit_exceeded = (
+            _include_scan_results and len(selected_safetensors_indexes) > _HF_SAFETENSORS_INDEX_MAX_FILES
+        )
+        preflight_reconciliation_only_indexes = {
+            filename for filename in selected_safetensors_indexes if plan.content_route_formats.get(filename) is None
+        }
         if selected_safetensors_indexes and not _include_scan_results:
             selected_safetensors_index_set = set(selected_safetensors_indexes)
             model_files = [
@@ -6535,42 +6609,50 @@ def download_model_streaming(
             if safetensors_header_streaming_allowed
             else set()
         )
-        safetensors_index_files = (
-            {
-                filename
-                for filename in repo_files
-                if _is_safetensors_index_file(filename)
-                and any(
-                    not _remote_index_parent_prefix(filename)
-                    or selected_file.startswith(_remote_index_parent_prefix(filename))
-                    for selected_file in safetensors_header_candidates
-                )
-            }
-            if safetensors_header_candidates
-            else (
-                {filename for filename in model_files if _is_safetensors_index_file(filename)}
-                if safetensors_header_streaming_allowed and safetensors_index_expansion_enabled
-                else set()
-            )
+        safetensors_index_files = _remote_safetensors_index_files_for_reconciliation(
+            repo_files,
+            model_files,
+            safetensors_header_candidates,
+            enabled=safetensors_header_streaming_allowed,
+            index_expansion_enabled=safetensors_index_expansion_enabled,
         )
         selected_sizes: dict[str, int] = dict(plan.selected_sizes)
         path_sizes: dict[str, int | None] = {}
         if _include_scan_results and (
             size_limit is not None or safetensors_header_candidates or safetensors_index_files
         ):
-            size_lookup_files = sorted(set(model_files).union(safetensors_index_files))
-            path_sizes, metadata_revision = _get_huggingface_path_sizes(
-                repo_id,
-                size_lookup_files,
-                resolved_revision=repo_revision,
-                deadline=deadline,
-            )
-            if metadata_revision != repo_revision:
-                raise Exception(
-                    f"Cannot stream {repo_id}: file metadata revision {metadata_revision} "
-                    f"did not match listing revision {repo_revision}"
+            reconciliation_only_indexes = (
+                preflight_reconciliation_only_indexes
+                if preflight_index_limit_exceeded
+                else (
+                    {
+                        filename
+                        for filename in safetensors_index_files
+                        if filename not in safetensors_header_candidates
+                        and selection.content_route_formats.get(filename) is None
+                    }
+                    if len(safetensors_index_files) > _HF_SAFETENSORS_INDEX_MAX_FILES
+                    else set()
                 )
+            )
+            size_lookup_files = sorted(
+                set(model_files).union(safetensors_index_files).difference(reconciliation_only_indexes)
+            )
+            if size_lookup_files:
+                path_sizes, metadata_revision = _get_huggingface_path_sizes(
+                    repo_id,
+                    size_lookup_files,
+                    resolved_revision=repo_revision,
+                    deadline=deadline,
+                )
+                if metadata_revision != repo_revision:
+                    raise Exception(
+                        f"Cannot stream {repo_id}: file metadata revision {metadata_revision} "
+                        f"did not match listing revision {repo_revision}"
+                    )
             for filename in model_files:
+                if filename in reconciliation_only_indexes:
+                    continue
                 if size_limit is None and filename not in safetensors_header_candidates:
                     continue
                 file_size = path_sizes.get(filename)
@@ -6646,29 +6728,54 @@ def download_model_streaming(
             retained_index_failure_results.append((index_filename, retained_result))
             return not index_result_budget_exhausted
 
-        (
-            shard_details_by_file,
-            remote_index_bytes_transferred,
-            acquired_index_bytes,
-            _,
-        ) = _remote_safetensors_shard_details_by_file(
-            repo_id,
-            sorted(safetensors_header_files),
+        if preflight_index_limit_exceeded:
+            sorted_preflight_indexes = sorted(selected_safetensors_indexes)
+            failure_index_filename = sorted_preflight_indexes[_HF_SAFETENSORS_INDEX_MAX_FILES]
+            failure = _index_failure_details(failure_index_filename, "index_inspection_limit_exceeded")
+            failure["index_file_count"] = len(sorted_preflight_indexes)
+            failure["index_file_limit"] = _HF_SAFETENSORS_INDEX_MAX_FILES
+            retain_unscoped_index_failure(failure_index_filename, failure)
+            shard_details_by_file = _remote_safetensors_filename_shard_details_by_file(
+                sorted(safetensors_header_files),
+                repo_files,
+            )
+            remote_index_bytes_transferred = 0
+            acquired_index_bytes: dict[str, bytes] = {}
+            index_inspection_limit_exceeded = True
+        else:
             (
-                repo_files
-                if safetensors_header_files
-                else [
-                    filename
-                    for filename in repo_files
-                    if not _is_safetensors_index_file(filename) or filename in safetensors_index_files
-                ]
-            ),
-            repo_revision,
-            path_sizes,
-            deadline=deadline,
-            max_transferred_bytes=(size_limit - content_probe_bytes_transferred if size_limit is not None else None),
-            retain_unscoped_failure=retain_unscoped_index_failure,
-        )
+                shard_details_by_file,
+                remote_index_bytes_transferred,
+                acquired_index_bytes,
+                _,
+                index_inspection_limit_exceeded,
+            ) = _remote_safetensors_shard_details_by_file(
+                repo_id,
+                sorted(safetensors_header_files),
+                (
+                    repo_files
+                    if safetensors_header_files
+                    else [
+                        filename
+                        for filename in repo_files
+                        if not _is_safetensors_index_file(filename) or filename in safetensors_index_files
+                    ]
+                ),
+                repo_revision,
+                path_sizes,
+                deadline=deadline,
+                max_transferred_bytes=(
+                    size_limit - content_probe_bytes_transferred if size_limit is not None else None
+                ),
+                retain_unscoped_failure=retain_unscoped_index_failure,
+            )
+        if index_inspection_limit_exceeded:
+            reconciliation_only_indexes = {
+                filename
+                for filename in set(safetensors_index_files).union(preflight_reconciliation_only_indexes)
+                if filename not in safetensors_header_files and selection.content_route_formats.get(filename) is None
+            }
+            model_files = [filename for filename in model_files if filename not in reconciliation_only_indexes]
         openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }

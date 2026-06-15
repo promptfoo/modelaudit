@@ -478,6 +478,23 @@ class TestModelAuditResultModel:
         assert result.bytes_scanned == 1000
         assert result.files_scanned == 1
 
+    def test_aggregate_incomplete_child_clears_prior_content_hash(self) -> None:
+        result = create_initial_audit_result()
+        result.aggregate_scan_result({"content_hash": "a" * 64, "success": True})
+        assert result.content_hash == "a" * 64
+
+        result.aggregate_scan_result(
+            {
+                "content_hash": None,
+                "success": False,
+                "has_errors": True,
+            }
+        )
+        result.aggregate_scan_result({"content_hash": "b" * 64, "success": True})
+
+        assert result.success is False
+        assert result.content_hash is None
+
     def test_aggregate_scan_result_with_issues(self):
         """Test aggregating results with issues."""
         result = create_initial_audit_result()

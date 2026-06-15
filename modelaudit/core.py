@@ -2,14 +2,16 @@
 
 import hashlib
 import itertools
+import json
 import logging
 import math
 import os
+import re
 import shutil
 import stat
 import tempfile
 import time
-from collections.abc import Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,7 +72,13 @@ from modelaudit.scanners.archive_dispatch import (
     merge_inconclusive_flax_msgpack_outcome,
     merge_safetensors_overlap_analysis,
 )
-from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
+from modelaudit.scanners.base import (
+    DEFAULT_MAX_FILE_READ_SIZE,
+    FORMAT_VALIDATION_CONFIG_KEY,
+    BaseScanner,
+    _trusted_logical_scan_path,
+)
+from modelaudit.scanners.jax_checkpoint_scanner import JAX_VERIFIED_ORBAX_SIBLING_CONFIG_KEY
 from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES as SAFETENSORS_MAX_HEADER_BYTES
 from modelaudit.scanners.xgboost_scanner import (
@@ -99,9 +107,11 @@ from modelaudit.utils.file.detection import (
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+    VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     _is_malformed_sentencepiece_model_proto_candidate_file,
+    _is_private_descriptor_bound_regular_file,
     detect_file_format,
     detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
@@ -130,6 +140,7 @@ from modelaudit.utils.file.handlers import (
     _PREVALIDATED_SHARD_INFO_CONFIG_KEY,
     _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY,
     _SHARD_ALREADY_PINNED_CONFIG_KEY,
+    CONTEXT_ONLY_COMPANION_TARGET_KEY,
     MAX_RECORDED_MISSING_SHARD_INDICES,
     MAX_SAFETENSORS_SHARD_INDEX_BYTES,
     MAX_SAFETENSORS_SHARD_INDEX_DIRECTORIES,
@@ -148,6 +159,7 @@ from modelaudit.utils.file.handlers import (
     _rebase_pinned_shard_result,
     _SafetensorsIndexInspectionContext,
     _ShardPinUnavailableError,
+    _StagingMutationMonitor,
     _validated_stat_matches_target,
     scan_advanced_large_file,
     should_use_advanced_handler,
@@ -159,6 +171,8 @@ from modelaudit.utils.file.large_file_handler import (
 )
 from modelaudit.utils.file.streaming import StreamedSourceByteAccounting, stream_analyze_file, stream_source_path
 from modelaudit.utils.helpers.cache_decorator import (
+    BOUND_CACHE_IDENTITY_CONFIG_KEY,
+    CacheIdentityBinding,
     cached_scan,
     should_defer_hash_for_file_backed_onnx,
     should_defer_hash_for_pytorch_read_limit,
@@ -201,6 +215,8 @@ from modelaudit.utils.sources.cloud_storage import (
 )
 
 logger = logging.getLogger("modelaudit.core")
+_VALIDATED_SYMLINK_DETECT_FILE_FORMAT = detect_file_format
+_VALIDATED_SYMLINK_DETECT_FILE_FORMAT_FROM_MAGIC = detect_file_format_from_magic
 
 _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
@@ -423,6 +439,8 @@ _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
 DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
 DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
 _LOCAL_SOURCE_RECEIPT_CONFIG_KEY = "_local_source_receipt"
+_LOCAL_SOURCE_BOUND_GUARD_CONFIG_KEY = "_local_source_bound_guard"
+_BOUND_CACHE_IDENTITY_CONFIG_KEY = BOUND_CACHE_IDENTITY_CONFIG_KEY
 _INCOMPLETE_SHARD_CHECK_NAMES = frozenset(
     {
         "Shard Scan",
@@ -656,8 +674,21 @@ def _directory_owner_snapshot_entry(
     )
 
 
+def _retained_descriptor_paths(descriptor: int) -> tuple[Path, ...]:
+    """Return descriptor aliases that remain usable by child scanner processes."""
+    return (
+        Path("/proc") / str(os.getpid()) / "fd" / str(descriptor),
+        Path("/proc/self/fd") / str(descriptor),
+        Path("/dev/fd") / str(descriptor),
+    )
+
+
 @contextmanager
-def _bound_directory_owner_scan_path(root_path: Path) -> Iterator[str]:
+def _bound_directory_owner_scan_path(
+    root_path: Path,
+    *,
+    trusted_root_symlink: bool = False,
+) -> Iterator[str]:
     """Yield a descriptor-backed owner root when the platform exposes one."""
     directory_flags = (
         os.O_RDONLY
@@ -666,8 +697,9 @@ def _bound_directory_owner_scan_path(root_path: Path) -> Iterator[str]:
         | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    expected_root_stat = root_path.lstat()
-    root_descriptor = os.open(root_path, directory_flags)
+    expected_root_stat = os.stat(root_path) if trusted_root_symlink else root_path.lstat()
+    root_flags = directory_flags & ~getattr(os, "O_NOFOLLOW", 0) if trusted_root_symlink else directory_flags
+    root_descriptor = os.open(root_path, root_flags)
     try:
         root_stat = os.fstat(root_descriptor)
         if (
@@ -677,7 +709,7 @@ def _bound_directory_owner_scan_path(root_path: Path) -> Iterator[str]:
         ):
             raise OSError("Directory owner root changed before owner dispatch")
 
-        for descriptor_root in (Path("/proc/self/fd") / str(root_descriptor), Path("/dev/fd") / str(root_descriptor)):
+        for descriptor_root in _retained_descriptor_paths(root_descriptor):
             with suppress(OSError):
                 descriptor_stat = descriptor_root.stat()
                 if stat.S_ISDIR(_directory_owner_stat_mode(descriptor_stat)) and _directory_owner_snapshot_stat_matches(
@@ -687,17 +719,7 @@ def _bound_directory_owner_scan_path(root_path: Path) -> Iterator[str]:
                     yield str(descriptor_root)
                     return
 
-        fchdir = getattr(os, "fchdir", None)
-        if not callable(fchdir):
-            raise OSError("Descriptor-backed directory owner path is unavailable")
-
-        current_directory_descriptor = os.open(Path.cwd(), directory_flags)
-        try:
-            fchdir(root_descriptor)
-            yield os.curdir
-        finally:
-            fchdir(current_directory_descriptor)
-            os.close(current_directory_descriptor)
+        raise OSError("Descriptor-backed directory owner path is unavailable")
     finally:
         os.close(root_descriptor)
 
@@ -715,10 +737,11 @@ def _directory_owner_snapshot_stat_matches(
 
 def _capture_directory_owner_namespace_by_descriptor(
     root_path: Path,
-    owner_class: type[BaseScanner],
+    owner_class: type[BaseScanner] | None,
     *,
     deadline: float,
     max_entries: int,
+    trusted_root_symlink: bool = False,
 ) -> tuple[_DirectoryOwnerSnapshotEntry, ...]:
     """Capture a namespace through no-follow directory descriptors."""
     directory_flags = (
@@ -728,8 +751,9 @@ def _capture_directory_owner_namespace_by_descriptor(
         | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    expected_root_stat = root_path.lstat()
-    root_descriptor = os.open(root_path, directory_flags)
+    expected_root_stat = os.stat(root_path) if trusted_root_symlink else root_path.lstat()
+    root_flags = directory_flags & ~getattr(os, "O_NOFOLLOW", 0) if trusted_root_symlink else directory_flags
+    root_descriptor = os.open(root_path, root_flags)
     root_stat = os.fstat(root_descriptor)
     if (
         not stat.S_ISDIR(_directory_owner_stat_mode(expected_root_stat))
@@ -774,7 +798,11 @@ def _capture_directory_owner_namespace_by_descriptor(
                 )
 
             relative_parts = (*parent_parts, lexical_entry.name)
-            entry_stat = lexical_entry.stat(follow_symlinks=False)
+            entry_stat = os.stat(
+                lexical_entry.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
             reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
             file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
             entry_mode = _directory_owner_stat_mode(entry_stat)
@@ -785,13 +813,13 @@ def _capture_directory_owner_namespace_by_descriptor(
                     raw_link_target = os.readlink(lexical_entry.name, dir_fd=directory_descriptor)
 
             entry_path = root_path.joinpath(*relative_parts)
-            directory_in_scope = stat.S_ISDIR(entry_mode) and owner_class.directory_owner_directory_in_scope(
-                relative_parts
+            directory_in_scope = stat.S_ISDIR(entry_mode) and (
+                owner_class is None or owner_class.directory_owner_directory_in_scope(relative_parts)
             )
-            should_descend = stat.S_ISDIR(entry_mode) and owner_class.directory_owner_should_descend_into_directory(
-                relative_parts
+            should_descend = stat.S_ISDIR(entry_mode) and (
+                owner_class is None or owner_class.directory_owner_should_descend_into_directory(relative_parts)
             )
-            if directory_in_scope or owner_class.directory_owner_source_in_scope(relative_parts):
+            if directory_in_scope or owner_class is None or owner_class.directory_owner_source_in_scope(relative_parts):
                 snapshot.append(
                     _directory_owner_snapshot_entry(
                         entry_path,
@@ -832,10 +860,11 @@ def _capture_directory_owner_namespace_by_descriptor(
 
 def _capture_directory_owner_namespace(
     root_path: Path,
-    owner_class: type[BaseScanner],
+    owner_class: type[BaseScanner] | None,
     *,
     deadline: float,
     max_entries: int,
+    trusted_root_symlink: bool = False,
 ) -> tuple[_DirectoryOwnerSnapshotEntry, ...]:
     """Capture every lexical entry the logical directory owner may inspect."""
     if os.scandir in os.supports_fd and os.open in os.supports_dir_fd:
@@ -844,9 +873,10 @@ def _capture_directory_owner_namespace(
             owner_class,
             deadline=deadline,
             max_entries=max_entries,
+            trusted_root_symlink=trusted_root_symlink,
         )
 
-    root_stat = root_path.lstat()
+    root_stat = os.stat(root_path) if trusted_root_symlink else root_path.lstat()
     if not stat.S_ISDIR(_directory_owner_stat_mode(root_stat)):
         raise OSError("Directory owner root is not a regular directory")
     snapshot = [_directory_owner_snapshot_entry(root_path, (), entry_stat=root_stat)]
@@ -854,7 +884,8 @@ def _capture_directory_owner_namespace(
     pending_directories: list[tuple[Path, tuple[str, ...], os.stat_result]] = [(root_path, (), root_stat)]
     while pending_directories:
         root, root_relative_parts, expected_root_stat = pending_directories.pop()
-        if not _directory_owner_snapshot_stat_matches(root.lstat(), expected_root_stat):
+        current_root_stat = os.stat(root) if trusted_root_symlink and not root_relative_parts else root.lstat()
+        if not _directory_owner_snapshot_stat_matches(current_root_stat, expected_root_stat):
             raise OSError("Directory changed before owner namespace descent")
         child_directories: list[tuple[Path, tuple[str, ...], os.stat_result]] = []
         with os.scandir(root) as entries:
@@ -874,16 +905,20 @@ def _capture_directory_owner_namespace(
                 file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
                 entry_mode = _directory_owner_stat_mode(entry_stat)
                 is_link = stat.S_ISLNK(entry_mode) or bool(reparse_flag and file_attributes & reparse_flag)
-                directory_in_scope = stat.S_ISDIR(entry_mode) and owner_class.directory_owner_directory_in_scope(
-                    relative_parts
+                directory_in_scope = stat.S_ISDIR(entry_mode) and (
+                    owner_class is None or owner_class.directory_owner_directory_in_scope(relative_parts)
                 )
-                should_descend = stat.S_ISDIR(entry_mode) and owner_class.directory_owner_should_descend_into_directory(
-                    relative_parts
+                should_descend = stat.S_ISDIR(entry_mode) and (
+                    owner_class is None or owner_class.directory_owner_should_descend_into_directory(relative_parts)
                 )
                 if should_descend and not is_link:
                     child_directories.append((entry_path, relative_parts, entry_stat))
 
-                if not (directory_in_scope or owner_class.directory_owner_source_in_scope(relative_parts)):
+                if not (
+                    directory_in_scope
+                    or owner_class is None
+                    or owner_class.directory_owner_source_in_scope(relative_parts)
+                ):
                     continue
                 snapshot.append(
                     _directory_owner_snapshot_entry(
@@ -892,7 +927,8 @@ def _capture_directory_owner_namespace(
                         entry_stat=entry_stat,
                     )
                 )
-        if not _directory_owner_snapshot_stat_matches(root.lstat(), expected_root_stat):
+        current_root_stat = os.stat(root) if trusted_root_symlink and not root_relative_parts else root.lstat()
+        if not _directory_owner_snapshot_stat_matches(current_root_stat, expected_root_stat):
             raise OSError("Directory changed during owner namespace snapshot")
         pending_directories.extend(sorted(child_directories, reverse=True))
     return tuple(sorted(snapshot, key=lambda entry: entry.relative_parts))
@@ -937,6 +973,34 @@ def _directory_owner_snapshot_entries_match(
             )
         )
     return before == after
+
+
+def _terminal_local_namespace_changed(
+    initial: tuple[_DirectoryOwnerSnapshotEntry, ...],
+    terminal: tuple[_DirectoryOwnerSnapshotEntry, ...],
+    *,
+    deleted_relative_parts: set[tuple[str, ...]],
+) -> bool:
+    """Compare a retained namespace while allowing only scanner-owned deletions."""
+    if not deleted_relative_parts:
+        return bool(_directory_owner_snapshot_changed_paths(initial, terminal))
+
+    initial_entries = {entry.relative_parts: entry for entry in initial}
+    terminal_entries = {entry.relative_parts: entry for entry in terminal}
+    if set(terminal_entries) != set(initial_entries) - deleted_relative_parts:
+        return True
+    stable_directory_fields = ("relative_parts", "entry_type", "device", "inode", "mode", "raw_link_target")
+    for relative_parts, terminal_entry in terminal_entries.items():
+        initial_entry = initial_entries[relative_parts]
+        if initial_entry.entry_type == terminal_entry.entry_type == "directory":
+            if any(
+                getattr(initial_entry, field) != getattr(terminal_entry, field) for field in stable_directory_fields
+            ):
+                return True
+            continue
+        if not _directory_owner_snapshot_entries_match(initial_entry, terminal_entry):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -1283,13 +1347,263 @@ def _snapshot_validated_shard_target(
 
 def _snapshot_local_source_receipt(source_path: str | os.PathLike[str]) -> dict[str, int | str] | None:
     """Capture the filesystem object selected by a local source path."""
+    for _attempt in range(3):
+        try:
+            lexical_entries = _local_source_lexical_identity_entries(source_path)
+            resolved_source = Path(source_path).resolve(strict=True)
+            source_stat = os.stat(resolved_source, follow_symlinks=False)
+            verified_lexical_entries = _local_source_lexical_identity_entries(source_path)
+            verified_resolved_source = Path(source_path).resolve(strict=True)
+            verified_source_stat = os.stat(verified_resolved_source, follow_symlinks=False)
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+        lexical_identity = _local_source_lexical_identity(lexical_entries)
+        if lexical_identity != _local_source_lexical_identity(verified_lexical_entries):
+            continue
+        if os.path.normcase(os.path.normpath(str(resolved_source))) != os.path.normcase(
+            os.path.normpath(str(verified_resolved_source))
+        ):
+            continue
+        receipt = _local_source_receipt_from_stat(str(resolved_source), lexical_identity, source_stat)
+        if _local_source_stat_matches_receipt(verified_source_stat, receipt):
+            return receipt
+    return None
+
+
+def _snapshot_regular_file_target(path: str | os.PathLike[str]) -> dict[str, int | str] | None:
+    """Capture a regular file identity for later descriptor-bound dispatch."""
     try:
-        resolved_source = Path(source_path).resolve(strict=True)
-        source_stat = os.stat(resolved_source, follow_symlinks=False)
-    except (OSError, RuntimeError, ValueError):
+        # Callers already supply a trusted, resolved target. Resolving it again
+        # would re-enter an untrusted alias path and reopen a pathname race.
+        resolved_path = Path(os.path.abspath(os.fspath(path)))
+        target_stat = os.stat(resolved_path, follow_symlinks=False)
+    except (OSError, RuntimeError):
+        return None
+    if not stat.S_ISREG(target_stat.st_mode):
         return None
     return {
-        "resolved_path": str(resolved_source),
+        "resolved_path": str(resolved_path),
+        "device": target_stat.st_dev,
+        "inode": target_stat.st_ino,
+        "size": target_stat.st_size,
+        "mtime_ns": target_stat.st_mtime_ns,
+        "ctime_ns": target_stat.st_ctime_ns,
+        "nlink": target_stat.st_nlink,
+    }
+
+
+def _local_source_lexical_identity(entries: list[tuple[Path, os.stat_result]]) -> str:
+    """Hash the lexical path entries observed around local source resolution."""
+    return hashlib.sha256(
+        repr(
+            [
+                (
+                    os.path.normcase(os.path.normpath(str(entry_path))),
+                    entry_stat.st_dev,
+                    entry_stat.st_ino,
+                    stat.S_IFMT(entry_stat.st_mode),
+                    entry_stat.st_size,
+                    entry_stat.st_mtime_ns,
+                    entry_stat.st_ctime_ns,
+                    entry_stat.st_nlink,
+                    getattr(entry_stat, "st_file_attributes", 0) or 0,
+                )
+                for entry_path, entry_stat in entries
+            ]
+        ).encode("utf-8", errors="surrogateescape")
+    ).hexdigest()
+
+
+def _local_source_lexical_identity_entries(
+    source_path: str | os.PathLike[str],
+) -> list[tuple[Path, os.stat_result]]:
+    """Return the final lexical entry and any reparse components leading to it."""
+    absolute_source = Path(os.path.abspath(os.fspath(source_path)))
+    parts = absolute_source.parts
+    if not parts:
+        raise ValueError("local source path has no components")
+
+    current = Path(parts[0])
+    candidates = [current] if len(parts) == 1 else []
+    for part in parts[1:]:
+        current /= part
+        candidates.append(current)
+
+    entries: list[tuple[Path, os.stat_result]] = []
+    for candidate in candidates:
+        entry_stat = os.lstat(candidate)
+        is_final = candidate == absolute_source
+        is_reparse_point = _stat_is_windows_reparse_point(entry_stat)
+        if is_final or stat.S_ISLNK(entry_stat.st_mode) or is_reparse_point or os.name == "nt":
+            entries.append((candidate, entry_stat))
+    return entries
+
+
+def _local_source_stat_matches_receipt(
+    current: os.stat_result,
+    expected: dict[str, int | str],
+) -> bool:
+    """Return whether an opened directory is the target captured at dispatch."""
+    expected_fields = {
+        "device": current.st_dev,
+        "inode": current.st_ino,
+        "mode_type": stat.S_IFMT(current.st_mode),
+        "size": current.st_size,
+        "mtime_ns": current.st_mtime_ns,
+        "ctime_ns": current.st_ctime_ns,
+        "nlink": current.st_nlink,
+    }
+    return all(expected.get(field) == value for field, value in expected_fields.items())
+
+
+def _local_source_lexical_entry_matches_receipt(
+    current: os.stat_result,
+    expected: dict[str, int | str],
+) -> bool:
+    """Compare a lexical entry without treating directory contents as identity."""
+    if stat.S_IFMT(current.st_mode) == stat.S_IFDIR and expected.get("mode_type") == stat.S_IFDIR:
+        return current.st_dev == expected.get("device") and current.st_ino == expected.get("inode")
+    return _local_source_stat_matches_receipt(current, expected)
+
+
+@dataclass
+class _BoundLocalSourceGuard:
+    """Retained POSIX path chain that binds one local source selection."""
+
+    bound_path: str
+    receipt: dict[str, int | str]
+    guarded_descriptors: tuple[tuple[int, dict[str, int | str]], ...]
+    guarded_entries: tuple[tuple[int, str, int, dict[str, int | str]], ...]
+    staging_path: Path | None = None
+    staging_stat: os.stat_result | None = None
+    staging_parent_fd: int | None = None
+    staging_fd: int | None = None
+    staged_name: str | None = None
+    staged_entry_stat: os.stat_result | None = None
+    staging_mutation_monitor: _StagingMutationMonitor | None = None
+    staging_changed: bool = False
+    closed: bool = False
+
+    def changed(self, *, allow_directory_content_changes: bool = False) -> bool:
+        """Return whether any retained path component changed after acquisition."""
+        if self.closed:
+            return True
+        for descriptor, expected in self.guarded_descriptors:
+            try:
+                current = os.fstat(descriptor)
+            except OSError:
+                return True
+            if (
+                current.st_dev != expected.get("device")
+                or current.st_ino != expected.get("inode")
+                or stat.S_IFMT(current.st_mode) != expected.get("mode_type")
+            ):
+                return True
+        for parent_descriptor, name, child_descriptor, lexical_receipt in self.guarded_entries:
+            try:
+                current_lexical_entry = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                current_entry = os.stat(name, dir_fd=parent_descriptor)
+                opened_child = os.fstat(child_descriptor)
+            except OSError:
+                return True
+            if not _local_source_lexical_entry_matches_receipt(
+                current_lexical_entry,
+                lexical_receipt,
+            ) or not os.path.samestat(current_entry, opened_child):
+                return True
+        try:
+            final_source = os.fstat(self.guarded_descriptors[-1][0])
+        except (IndexError, OSError):
+            return True
+        final_source_matches = (
+            _local_source_lexical_entry_matches_receipt(final_source, self.receipt)
+            if allow_directory_content_changes
+            else _local_source_stat_matches_receipt(final_source, self.receipt)
+        )
+        if not final_source_matches:
+            return True
+        if self.staging_fd is not None and self.staged_name is not None:
+            self.staging_changed = self.staging_changed or (
+                self.staging_mutation_monitor is None or self.staging_mutation_monitor.changed()
+            )
+            if self.staging_changed:
+                return True
+            try:
+                staged_entry = os.stat(
+                    self.staged_name,
+                    dir_fd=self.staging_fd,
+                    follow_symlinks=False,
+                )
+                staged_target = os.stat(self.staged_name, dir_fd=self.staging_fd)
+            except OSError:
+                return True
+            if (
+                self.staged_entry_stat is None
+                or any(
+                    getattr(staged_entry, field) != getattr(self.staged_entry_stat, field)
+                    for field in (
+                        "st_dev",
+                        "st_ino",
+                        "st_mode",
+                        "st_size",
+                        "st_mtime_ns",
+                        "st_ctime_ns",
+                        "st_nlink",
+                    )
+                )
+                or not os.path.samestat(final_source, staged_target)
+            ):
+                return True
+        return False
+
+    def close(self) -> None:
+        """Release the retained directory chain exactly once."""
+        if self.closed:
+            return
+        self.closed = True
+        if self.staging_mutation_monitor is not None:
+            with suppress(OSError):
+                self.staging_mutation_monitor.close()
+        if self.staging_fd is not None and self.staged_name is not None:
+            with suppress(OSError):
+                os.unlink(self.staged_name, dir_fd=self.staging_fd)
+        if self.staging_fd is not None:
+            with suppress(OSError):
+                os.close(self.staging_fd)
+        if self.staging_path is not None and self.staging_stat is not None and self.staging_parent_fd is not None:
+            with suppress(OSError):
+                current_staging = os.stat(
+                    self.staging_path.name,
+                    dir_fd=self.staging_parent_fd,
+                    follow_symlinks=False,
+                )
+                if os.path.samestat(self.staging_stat, current_staging):
+                    os.rmdir(self.staging_path.name, dir_fd=self.staging_parent_fd)
+        elif self.staging_path is not None:
+            with suppress(OSError):
+                self.staging_path.rmdir()
+        if self.staging_parent_fd is not None:
+            with suppress(OSError):
+                os.close(self.staging_parent_fd)
+        for descriptor, _expected in reversed(self.guarded_descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _local_source_receipt_from_stat(
+    resolved_path: str,
+    lexical_identity: str,
+    source_stat: os.stat_result,
+) -> dict[str, int | str]:
+    """Build the scalar source receipt shared by path and descriptor validation."""
+    return {
+        "resolved_path": resolved_path,
+        "lexical_identity": lexical_identity,
         "device": source_stat.st_dev,
         "inode": source_stat.st_ino,
         "mode_type": stat.S_IFMT(source_stat.st_mode),
@@ -1298,6 +1612,462 @@ def _snapshot_local_source_receipt(source_path: str | os.PathLike[str]) -> dict[
         "ctime_ns": source_stat.st_ctime_ns,
         "nlink": source_stat.st_nlink,
     }
+
+
+def _open_bound_local_source(source_path: str | os.PathLike[str]) -> _BoundLocalSourceGuard:
+    """Open and retain a POSIX root-to-source chain without a reopen gap."""
+    if os.name != "posix":
+        raise OSError("retained POSIX source traversal is unsupported")
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if not directory_flag:
+        raise OSError("retained POSIX source traversal is unsupported")
+
+    absolute_source = Path(os.path.abspath(os.fspath(source_path)))
+    parts = absolute_source.parts
+    if not parts:
+        raise ValueError("local source path has no components")
+    directory_flags = os.O_RDONLY | directory_flag | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    opened: list[tuple[int, dict[str, int | str]]] = []
+    opened_entries: list[tuple[int, str, int, dict[str, int | str]]] = []
+    identity_entries: list[tuple[Path, os.stat_result]] = []
+    guard: _BoundLocalSourceGuard | None = None
+    current_path = Path(parts[0])
+    try:
+        current_fd = os.open(current_path, directory_flags)
+        try:
+            current_stat = os.fstat(current_fd)
+        except Exception:
+            os.close(current_fd)
+            raise
+        current_receipt = _local_source_receipt_from_stat(str(current_path), "", current_stat)
+        opened.append((current_fd, current_receipt))
+        identity_entries.append((current_path, current_stat))
+
+        for index, part in enumerate(parts[1:], start=1):
+            child_fd = os.open(
+                part,
+                source_flags if index == len(parts) - 1 else directory_flags,
+                dir_fd=current_fd,
+            )
+            try:
+                child_stat = os.fstat(child_fd)
+            except Exception:
+                os.close(child_fd)
+                raise
+            if index != len(parts) - 1 and not stat.S_ISDIR(child_stat.st_mode):
+                os.close(child_fd)
+                raise NotADirectoryError(str(current_path / part))
+            try:
+                lexical_entry_stat = os.stat(
+                    part,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                current_entry_stat = os.stat(part, dir_fd=current_fd)
+            except OSError:
+                os.close(child_fd)
+                raise
+            if not os.path.samestat(current_entry_stat, child_stat):
+                os.close(child_fd)
+                raise _LocalSourceBoundaryError("local source entry changed during descriptor binding")
+            lexical_entry_receipt = _local_source_receipt_from_stat(
+                str(current_path / part),
+                "",
+                lexical_entry_stat,
+            )
+            opened_entries.append((current_fd, part, child_fd, lexical_entry_receipt))
+            current_path /= part
+            current_receipt = _local_source_receipt_from_stat(str(current_path), "", child_stat)
+            opened.append((child_fd, current_receipt))
+            identity_entries.append((current_path, child_stat))
+            current_fd = child_fd
+
+        final_stat = os.fstat(current_fd)
+        if not (stat.S_ISDIR(final_stat.st_mode) or stat.S_ISREG(final_stat.st_mode)):
+            raise OSError("local source is not a regular file or directory")
+        descriptor_path = ""
+        for descriptor_root in _retained_descriptor_paths(current_fd):
+            try:
+                descriptor_stat = os.stat(descriptor_root)
+            except OSError:
+                continue
+            if os.path.samestat(final_stat, descriptor_stat):
+                descriptor_path = str(descriptor_root)
+                break
+        if not descriptor_path:
+            raise OSError("descriptor-backed local source traversal is unavailable")
+
+        lexical_identity = _local_source_lexical_identity(identity_entries)
+        receipt = _local_source_receipt_from_stat(
+            os.path.realpath(descriptor_path),
+            lexical_identity,
+            final_stat,
+        )
+        guard = _BoundLocalSourceGuard(
+            bound_path=descriptor_path,
+            receipt=receipt,
+            guarded_descriptors=tuple(opened),
+            guarded_entries=tuple(opened_entries),
+        )
+        if stat.S_ISREG(final_stat.st_mode):
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            staging_path = Path(tempfile.mkdtemp(prefix=".modelaudit_source_"))
+            guard.staging_path = staging_path
+            guard.staging_stat = os.stat(staging_path, follow_symlinks=False)
+            guard.staging_parent_fd = os.open(staging_path.parent, directory_flags)
+            guard.staging_fd = os.open(staging_path, directory_flags | nofollow)
+            opened_staging = os.fstat(guard.staging_fd)
+            effective_uid = getattr(os, "geteuid", lambda: opened_staging.st_uid)()
+            if (
+                not stat.S_ISDIR(opened_staging.st_mode)
+                or opened_staging.st_uid != effective_uid
+                or stat.S_IMODE(opened_staging.st_mode) & 0o077
+                or not os.path.samestat(opened_staging, guard.staging_stat)
+            ):
+                raise _LocalSourceBoundaryError("private source staging directory changed while opening")
+            staging_descriptor_root = ""
+            for staged_descriptor_path in _retained_descriptor_paths(guard.staging_fd):
+                try:
+                    descriptor_stat = os.stat(staged_descriptor_path)
+                except OSError:
+                    continue
+                if os.path.samestat(opened_staging, descriptor_stat):
+                    staging_descriptor_root = str(staged_descriptor_path)
+                    break
+            if not staging_descriptor_root:
+                raise OSError("descriptor-backed local source staging is unavailable")
+            guard.staged_name = absolute_source.name
+            if not guard.staged_name or guard.staged_name in {".", ".."}:
+                raise _LocalSourceBoundaryError("local source omitted a safe filename")
+            os.symlink(descriptor_path, guard.staged_name, dir_fd=guard.staging_fd)
+            guard.staged_entry_stat = os.stat(
+                guard.staged_name,
+                dir_fd=guard.staging_fd,
+                follow_symlinks=False,
+            )
+            staged_target = os.stat(guard.staged_name, dir_fd=guard.staging_fd)
+            if not os.path.samestat(final_stat, staged_target):
+                raise _LocalSourceBoundaryError("staged local source resolved to a different file")
+            guard.staging_mutation_monitor = _StagingMutationMonitor.arm((guard.staging_fd,))
+            guard.bound_path = str(Path(staging_descriptor_root) / guard.staged_name)
+        if guard.changed():
+            raise _LocalSourceBoundaryError("local source changed during descriptor binding")
+        return guard
+    except Exception:
+        if guard is not None:
+            guard.close()
+            opened.clear()
+        for descriptor, _expected in reversed(opened):
+            with suppress(OSError):
+                os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _bound_local_source_directory(
+    source_path: str | os.PathLike[str],
+    expected_receipt: dict[str, int | str],
+) -> Iterator[str]:
+    """Yield a descriptor-backed POSIX directory captured by a dispatch receipt."""
+    resolved_path = expected_receipt.get("resolved_path")
+    if not isinstance(resolved_path, str):
+        raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
+    if os.name != "posix":
+        yield resolved_path
+        return
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NONBLOCK", 0)
+    )
+    source_descriptor = os.open(source_path, directory_flags)
+    try:
+        bound_stat = os.fstat(source_descriptor)
+        if not _local_source_stat_matches_receipt(bound_stat, expected_receipt):
+            raise _LocalSourceBoundaryError("local source changed before descriptor binding")
+        for descriptor_root in _retained_descriptor_paths(source_descriptor):
+            try:
+                descriptor_stat = descriptor_root.stat()
+            except OSError:
+                continue
+            if _local_source_stat_matches_receipt(descriptor_stat, expected_receipt):
+                yield str(descriptor_root)
+                return
+        raise _LocalSourceBoundaryError("descriptor-backed local source traversal is unavailable")
+    finally:
+        os.close(source_descriptor)
+
+
+def _map_nested_source_value(value: Any, transform: Callable[[str], str]) -> Any:
+    """Apply one path transform across scanner-owned nested values."""
+    if isinstance(value, str):
+        return transform(value)
+    if isinstance(value, os.PathLike):
+        return transform(os.fspath(value))
+    if isinstance(value, dict):
+        return {
+            _map_nested_source_value(key, transform): _map_nested_source_value(item, transform)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_map_nested_source_value(item, transform) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_map_nested_source_value(item, transform) for item in value)
+    if isinstance(value, set):
+        return {_map_nested_source_value(item, transform) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_map_nested_source_value(item, transform) for item in value)
+    return value
+
+
+def _rebase_local_source_value(value: Any, source_roots: tuple[str, ...], report_root: str) -> Any:
+    """Rewrite descriptor or resolved source paths to the requested lexical root."""
+
+    def rebase(source_value: str) -> str:
+        for source_root in source_roots:
+            if source_root and source_root != report_root:
+                source_value = source_value.replace(source_root, report_root)
+        return re.sub(
+            r"(?:/proc/(?:self|\d+)/fd|/dev/fd)/\d+",
+            lambda _match: report_root,
+            source_value,
+        )
+
+    return _map_nested_source_value(value, rebase)
+
+
+def _local_source_logical_path(
+    path: str | os.PathLike[str],
+    bound_root: str | None,
+    resolved_root: str | None,
+) -> Path:
+    """Map a descriptor-backed member to its stable resolved-root spelling."""
+    path_obj = Path(path)
+    if bound_root is None or resolved_root is None:
+        return path_obj
+    try:
+        relative_path = Path(os.path.abspath(path_obj)).relative_to(Path(os.path.abspath(bound_root)))
+    except ValueError:
+        return path_obj
+    return Path(resolved_root).joinpath(*relative_path.parts)
+
+
+def _rebase_local_source_result(
+    results: ModelAuditResultModel,
+    bound_root: str,
+    resolved_root: str,
+    report_root: str,
+) -> ModelAuditResultModel:
+    """Remove descriptor-only paths from a local source result."""
+    rebased = _rebase_local_source_value(
+        results.model_dump(mode="python"),
+        (bound_root, resolved_root),
+        report_root,
+    )
+    return ModelAuditResultModel.model_validate(rebased)
+
+
+def _rebase_local_source_descendants(
+    value: Any,
+    source_root: str,
+    target_root: str,
+) -> Any:
+    """Map descendants while preserving the selected top-level source spelling."""
+
+    def rebase_descendant(source_value: str) -> str:
+        source_prefix = source_root.rstrip(os.sep) + os.sep
+        if source_value.startswith(source_prefix):
+            return target_root.rstrip(os.sep) + os.sep + source_value[len(source_prefix) :]
+        return source_value
+
+    return _map_nested_source_value(value, rebase_descendant)
+
+
+def _rebase_symlinked_local_source_directory_descendants(
+    results: ModelAuditResultModel,
+    report_root: str,
+    resolved_root: str,
+) -> ModelAuditResultModel:
+    """Preserve legacy resolved child paths below a lexical directory symlink."""
+    rebased = _rebase_local_source_descendants(
+        results.model_dump(mode="python"),
+        report_root,
+        resolved_root,
+    )
+    return ModelAuditResultModel.model_validate(rebased)
+
+
+def _validated_local_source_receipt(value: object) -> dict[str, int | str] | None:
+    """Accept only the private scalar receipt shape used across CLI dispatch."""
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) and isinstance(item, (int, str)) for key, item in value.items()
+    ):
+        return None
+    return dict(value)
+
+
+@contextmanager
+def _retain_windows_local_source_guards(
+    source_path: str | os.PathLike[str],
+    expected_receipt: dict[str, int | str],
+) -> Iterator[None]:
+    """Deny replacement of a validated Windows source and its reparse chain."""
+    if os.name != "nt":
+        yield
+        return
+
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    guard_paths: list[tuple[Path, bool]] = []
+    for entry_path, entry_stat in _local_source_lexical_identity_entries(source_path):
+        is_reparse_point = stat.S_ISLNK(entry_stat.st_mode) or _stat_is_windows_reparse_point(entry_stat)
+        guard_paths.append((entry_path, is_reparse_point))
+    resolved_path = expected_receipt.get("resolved_path")
+    if not isinstance(resolved_path, str):
+        raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
+    guard_paths.append((Path(resolved_path), False))
+
+    handles: list[int] = []
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    try:
+        for guard_path, open_reparse_point in dict.fromkeys(guard_paths):
+            flags = 0x02000000 | (0x00200000 if open_reparse_point else 0)
+            handle = create_file(
+                str(guard_path),
+                0,
+                0x00000001,
+                None,
+                3,
+                flags,
+                None,
+            )
+            if handle in (None, invalid_handle_value):
+                raise ctypes_windows.WinError(ctypes_windows.get_last_error())
+            handles.append(handle if isinstance(handle, int) else int(handle.value))
+        if not _local_source_receipts_match(expected_receipt, _snapshot_local_source_receipt(source_path)):
+            raise _LocalSourceBoundaryError("local source changed while retaining its boundary")
+        yield
+    finally:
+        for handle in reversed(handles):
+            close_handle(handle)
+
+
+def _record_local_source_boundary_failure(results: ModelAuditResultModel, source_path: FilePath) -> None:
+    """Record one fail-closed local dispatch boundary result."""
+    report_path = _redacted_scan_path_for_reporting(source_path)
+    results.has_errors = True
+    results.success = False
+    results.content_hash = None
+    if any(
+        check.name == "Local Source Boundary Check"
+        and check.details.get("reason") == "local_source_changed_during_scan"
+        for check in results.checks
+    ):
+        return
+    results.checks.append(
+        Check(
+            name="Local Source Boundary Check",
+            status=CheckStatus.FAILED,
+            message="Validated local source changed during scan dispatch; scan coverage is incomplete.",
+            severity=IssueSeverity.INFO,
+            location=report_path,
+            details={
+                "path": report_path,
+                "reason": "local_source_changed_during_scan",
+                "analysis_incomplete": True,
+                "operational_error": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "source_boundary_changed",
+            },
+        )
+    )
+
+
+def _local_source_boundary_failure_scan_result(source_path: str, error: Exception | None = None) -> ScanResult:
+    """Return a path-specific operational failure for an unpinnable local source."""
+    result = ScanResult(scanner_name="local_source_boundary")
+    details: dict[str, Any] = {
+        "path": source_path,
+        "reason": "local_source_changed_during_scan",
+        "analysis_incomplete": True,
+        "operational_error": True,
+        "scan_outcome": "inconclusive",
+        "scan_outcome_reason": "source_boundary_changed",
+    }
+    if error is not None:
+        details["exception_type"] = type(error).__name__
+    result.add_check(
+        name="Local Source Boundary Check",
+        passed=False,
+        message="Validated local source changed during scan dispatch; scan coverage is incomplete.",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details=details,
+    )
+    _mark_operational_scan_error(result, "source_boundary_changed")
+    _mark_inconclusive_scan_outcome(result, "source_boundary_changed")
+    result.finish(success=False)
+    return result
+
+
+def _max_file_size_failure_scan_result(source_path: str, file_size: int, max_file_size: int) -> ScanResult:
+    """Return a bounded operational result without opening oversized staged content."""
+    result = ScanResult(scanner_name="size_check")
+    result.add_check(
+        name="File Size Limit Check",
+        passed=False,
+        message=f"File too large to scan: {file_size} bytes (max: {max_file_size})",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            "file_size": file_size,
+            "max_file_size": max_file_size,
+            "path": source_path,
+            "analysis_incomplete": True,
+        },
+    )
+    _mark_operational_scan_error(result, "max_file_size_exceeded")
+    _mark_inconclusive_scan_outcome(result, "max_file_size_exceeded")
+    result.finish(success=False)
+    return result
+
+
+def _max_total_size_failure_scan_result(source_path: str, projected_total: int, max_total_size: int) -> ScanResult:
+    """Return an operational result before a private copy would exceed the aggregate cap."""
+    result = ScanResult(scanner_name="size_check")
+    result.add_check(
+        name="Total Scan Size Limit Check",
+        passed=False,
+        message=f"Total scan size limit exceeded: {projected_total} bytes (max: {max_total_size})",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            "max_total_size": max_total_size,
+            "projected_total_size": projected_total,
+            "analysis_incomplete": True,
+        },
+    )
+    _mark_operational_scan_error(result, "max_total_size_exceeded")
+    _mark_inconclusive_scan_outcome(result, "max_total_size_exceeded")
+    result.finish(success=False)
+    return result
 
 
 def _local_source_receipts_match(
@@ -1608,6 +2378,104 @@ def _openvino_xml_weights_companion(path: Path) -> Path | None:
         return openvino_weights_companion_for_xml(path)
     except Exception:
         return None
+
+
+def _openvino_weights_symlink_escape(xml_path: Path, companion_path: Path) -> Path | None:
+    """Return an escaped OpenVINO weights target while preserving lexical symlink evidence."""
+    if not companion_path.is_symlink():
+        return None
+    try:
+        model_dir = xml_path.resolve(strict=True).parent
+        resolved_companion = companion_path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return Path(os.path.realpath(companion_path))
+    if is_within_directory(str(model_dir), str(resolved_companion)):
+        return None
+    return resolved_companion
+
+
+def _openvino_weights_symlink_escape_result(
+    xml_path: Path,
+    companion_path: Path,
+    resolved_companion: Path,
+) -> ScanResult:
+    """Represent an escaped lexical sidecar without reopening it through a staged copy."""
+    result = ScanResult(scanner_name="openvino")
+    result.add_check(
+        name="OpenVINO Weights Symlink Boundary Check",
+        passed=False,
+        message="Associated .bin weights file resolves outside the model directory",
+        severity=IssueSeverity.CRITICAL,
+        location=str(companion_path),
+        details={
+            "expected_file": str(companion_path),
+            "resolved_path": str(resolved_companion),
+            "model_directory": os.path.realpath(xml_path.parent),
+            "cwe": "CWE-22",
+        },
+        rule_code="S701",
+        why=(
+            "OpenVINO sidecar weights are loaded from the .bin file adjacent to the XML. "
+            "A symlinked sidecar can make model loading read data outside the model directory."
+        ),
+    )
+    result.finish(success=False)
+    return result
+
+
+def _mxnet_companion_paths(path: Path) -> tuple[Path, ...]:
+    """Return same-directory MXNet symbol/params companions used for path-sensitive metadata."""
+    symbol_suffix = "-symbol.json"
+    if path.name.lower().endswith(symbol_suffix):
+        prefix = path.name[: -len(symbol_suffix)]
+        candidates: list[Path] = []
+        for candidate in path.parent.glob(f"{prefix}-*.params"):
+            match = re.fullmatch(r"(?P<prefix>.+)-(?P<epoch>\d{1,8})\.params", candidate.name, re.IGNORECASE)
+            if match is not None and match.group("prefix") == prefix:
+                candidates.append(candidate)
+        return tuple(sorted(candidates))
+
+    params_match = re.fullmatch(r"(?P<prefix>.+)-(?P<epoch>\d{1,8})\.params", path.name, re.IGNORECASE)
+    if params_match is None:
+        return ()
+    symbol_path = path.with_name(f"{params_match.group('prefix')}{symbol_suffix}")
+    return (symbol_path,) if symbol_path.is_file() else ()
+
+
+def _oci_manifest_layer_companion_paths(path: Path) -> tuple[Path, ...]:
+    """Return bounded local OCI layer references that must accompany one manifest scan."""
+    try:
+        from modelaudit.scanners import oci_layer_scanner
+
+        scanner_class = oci_layer_scanner.OciLayerScanner
+        if not scanner_class.can_handle(str(path)):
+            return ()
+        if path.stat().st_size > scanner_class.default_max_file_read_size:
+            return ()
+        manifest_text = path.read_text(encoding="utf-8", errors="ignore")
+        try:
+            manifest_data: Any = json.loads(manifest_text)
+        except Exception:
+            if not oci_layer_scanner.HAS_YAML:
+                return ()
+            manifest_data = oci_layer_scanner.yaml.safe_load(manifest_text)
+    except Exception:
+        return ()
+
+    companions: list[Path] = []
+    for layer_ref in scanner_class._collect_layer_paths(manifest_data):
+        normalized_ref = scanner_class._normalize_layer_ref(layer_ref)
+        if scanner_class._is_remote_layer_ref(normalized_ref):
+            continue
+        candidate = path.parent / normalized_ref
+        try:
+            resolved_candidate = candidate.resolve(strict=True)
+            resolved_parent = path.parent.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if candidate.is_file() and is_within_directory(str(resolved_parent), str(resolved_candidate)):
+            companions.append(candidate)
+    return tuple(dict.fromkeys(companions))
 
 
 def _snapshot_openvino_companion_for_hash(xml_path: Path, companion_path: Path) -> _FileIdentitySnapshot | None:
@@ -2638,6 +3506,18 @@ def _resolve_discovered_shard_path(shard_path: str, results: ModelAuditResultMod
         return None
 
 
+def _is_validated_bound_source_path(path: str, config: dict[str, Any] | None) -> bool:
+    """Return whether a cache binding names this private descriptor-backed source path."""
+    if config is None:
+        return False
+    binding = config.get(_BOUND_CACHE_IDENTITY_CONFIG_KEY)
+    return bool(
+        isinstance(binding, CacheIdentityBinding)
+        and os.path.normcase(os.path.abspath(binding.scan_path)) == os.path.normcase(os.path.abspath(path))
+        and _is_private_descriptor_bound_regular_file(path)
+    )
+
+
 def _select_non_hdf5_preferred_scanner_id(
     path: str,
     header_format: str,
@@ -2645,6 +3525,7 @@ def _select_non_hdf5_preferred_scanner_id(
     config: dict[str, Any] | None = None,
 ) -> str | None:
     """Select the trusted route that owns content before an HDF5 user block."""
+    follow_validated_symlink = _is_validated_bound_source_path(path, config)
     if header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
         return "zip"
 
@@ -2705,7 +3586,10 @@ def _select_non_hdf5_preferred_scanner_id(
         and header_format == "unknown"
         and not is_huggingface_tokenizer_json_file(path)
         and (not tokenizer_template_route or not scanner_policy.allows("jinja2_template"))
-        and is_jax_json_checkpoint_file(path)
+        and is_jax_json_checkpoint_file(
+            path,
+            follow_validated_symlink=follow_validated_symlink,
+        )
     )
     if (
         config is not None
@@ -2715,7 +3599,14 @@ def _select_non_hdf5_preferred_scanner_id(
         and scanner_policy.allows("jax_checkpoint")
         and not is_huggingface_tokenizer_json_file(path)
         and (not tokenizer_template_route or not scanner_policy.allows("jinja2_template"))
-        and (is_confirmed_jax_json_checkpoint_file(path) or tokenizer_jax_route or selected_ambiguous_jax_json_route)
+        and (
+            is_confirmed_jax_json_checkpoint_file(
+                path,
+                follow_validated_symlink=follow_validated_symlink,
+            )
+            or tokenizer_jax_route
+            or selected_ambiguous_jax_json_route
+        )
     ):
         return "jax_checkpoint"
 
@@ -2839,12 +3730,25 @@ def _merge_jax_metadata_supplemental_analysis(
     """Preserve JAX/Orbax metadata findings when a generic manifest scanner owns the file."""
     if result.scanner_name == "jax_checkpoint":
         return
-    if _registry.get_scanner_id_for_content_routed_filename(path) != "jax_checkpoint":
+    current_file = normalize_repository_member_path(config.get(REPOSITORY_CURRENT_FILE_CONFIG_KEY))
+    inventory = repository_file_inventory_context_from_config(config)
+    verified_orbax_sibling = config.get(JAX_VERIFIED_ORBAX_SIBLING_CONFIG_KEY) is True
+    if current_file is not None and current_file.rsplit("/", 1)[-1].lower() == "metadata.json":
+        parent = current_file.rpartition("/")[0]
+        prefix = f"{parent}/" if parent else ""
+        verified_orbax_sibling = any(
+            f"{prefix}{marker_name}" in inventory.files
+            for marker_name in ("_CHECKPOINT", "orbax_checkpoint_metadata.json")
+        )
+    if _registry.get_scanner_id_for_content_routed_filename(path) != "jax_checkpoint" and not verified_orbax_sibling:
         return
+    supplemental_config = dict(config)
+    if verified_orbax_sibling:
+        supplemental_config[JAX_VERIFIED_ORBAX_SIBLING_CONFIG_KEY] = True
     _merge_supplemental_scanner_analysis(
         path,
         result,
-        config,
+        supplemental_config,
         scanner_selection,
         "jax_checkpoint",
         context="supplemental JAX metadata analysis",
@@ -2864,6 +3768,19 @@ def _preferred_scanner_can_handle(
     config: dict[str, Any] | None = None,
 ) -> bool:
     """Honor trusted header routing even when scanner can_handle is suffix-gated."""
+    if (
+        scanner_id == "jax_checkpoint"
+        and config is not None
+        and config.get(JAX_VERIFIED_ORBAX_SIBLING_CONFIG_KEY) is True
+    ):
+        return True
+    if (
+        scanner_id == "jax_checkpoint"
+        and _is_validated_bound_source_path(path, config)
+        and is_jax_json_checkpoint_file(path, follow_validated_symlink=True)
+    ):
+        return True
+
     if scanner_id == "keras_h5" and find_hdf5_signature_offset(path) is not None:
         logger.debug(
             "Using %s scanner for validated HDF5 file %s",
@@ -2895,7 +3812,10 @@ def _preferred_scanner_can_handle(
         and header_format == "unknown"
         and Path(path).suffix.lower() == ".json"
         and not is_huggingface_tokenizer_json_file(path)
-        and is_jax_json_checkpoint_file(path)
+        and is_jax_json_checkpoint_file(
+            path,
+            follow_validated_symlink=_is_validated_bound_source_path(path, config),
+        )
     ):
         logger.debug(
             "Using %s scanner for selected ambiguous JAX JSON candidate %s",
@@ -3309,14 +4229,19 @@ def _scan_executable_zip_polyglot(path: str, config: dict[str, Any]) -> ScanResu
     return result
 
 
-def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> str:
+def _calculate_file_hash(
+    file_path: str,
+    *,
+    deadline: float | None = None,
+    follow_validated_symlink: bool = False,
+) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
     Raises:
         Exception: If file cannot be hashed (security: prevents hash collision attacks)
     """
     identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
-    path_stat_before = os.stat(file_path, follow_symlinks=False)
+    path_stat_before = os.stat(file_path, follow_symlinks=follow_validated_symlink)
     if not stat.S_ISREG(path_stat_before.st_mode):
         raise OSError(f"Refusing to hash non-regular file: {file_path}")
 
@@ -3325,7 +4250,7 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
         | getattr(os, "O_BINARY", 0)
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NONBLOCK", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
+        | (0 if follow_validated_symlink else getattr(os, "O_NOFOLLOW", 0))
     )
     descriptor = os.open(file_path, flags)
     try:
@@ -3344,7 +4269,7 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                 hash_sha256.update(chunk)
 
             final_stat = os.fstat(source.fileno())
-            path_stat_after = os.stat(file_path, follow_symlinks=False)
+            path_stat_after = os.stat(file_path, follow_symlinks=follow_validated_symlink)
             if any(
                 getattr(opened_stat, field) != getattr(candidate, field)
                 for candidate in (final_stat, path_stat_after)
@@ -3375,7 +4300,12 @@ def _should_defer_hash_for_file_backed_hdf5(file_path: str) -> bool:
     return file_size > DEFAULT_MAX_FILE_READ_SIZE and find_hdf5_signature_offset(file_path) is not None
 
 
-def _should_defer_hash_for_max_file_size(file_path: str, config: dict[str, Any]) -> bool:
+def _should_defer_hash_for_max_file_size(
+    file_path: str,
+    config: dict[str, Any],
+    *,
+    file_size: int | None = None,
+) -> bool:
     """Avoid hashing files that regular scanning will reject on max_file_size."""
     try:
         max_file_size = int(config.get("max_file_size", 0) or 0)
@@ -3384,10 +4314,11 @@ def _should_defer_hash_for_max_file_size(file_path: str, config: dict[str, Any])
     if max_file_size <= 0:
         return False
 
-    try:
-        file_size = os.path.getsize(file_path)
-    except OSError:
-        return False
+    if file_size is None:
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            return False
 
     return file_size > max_file_size and not should_use_advanced_handler(file_path)
 
@@ -3462,6 +4393,7 @@ def _hash_files_by_path(
     *,
     config: dict[str, Any] | None = None,
     routing_paths: dict[str, str] | None = None,
+    follow_symlink_paths: Collection[str] = (),
     hashed_identities: dict[str, dict[str, int]] | None = None,
     deadline: float | None = None,
 ) -> dict[str, str]:
@@ -3478,9 +4410,14 @@ def _hash_files_by_path(
     """
     content_hashes: dict[str, str] = {}
     hashes_by_inode: dict[tuple[int, int, int, int, int], str] = {}
+    followed_paths = set(follow_symlink_paths)
     hashed_bytes = 0
+    hash_budget_exhausted = False
 
     for file_path in file_paths:
+        if hash_budget_exhausted:
+            content_hashes[file_path] = f"unhashable_max_total_size_{id(file_path)}"
+            continue
         if deadline is not None and time.time() > deadline:
             content_hashes[file_path] = f"unhashable_timeout_{id(file_path)}"
             continue
@@ -3504,10 +4441,11 @@ def _hash_files_by_path(
             content_hashes[file_path] = f"unhashable_max_file_size_{id(file_path)}"
             continue
         try:
+            follow_validated_symlink = file_path in followed_paths
             inode_key: tuple[int, int, int, int, int] | None = None
             pre_hash_stat: os.stat_result | None = None
             try:
-                pre_hash_stat = os.stat(file_path, follow_symlinks=False)
+                pre_hash_stat = os.stat(file_path, follow_symlinks=follow_validated_symlink)
                 if pre_hash_stat.st_nlink > 1:
                     inode_key = (
                         pre_hash_stat.st_dev,
@@ -3531,13 +4469,24 @@ def _hash_files_by_path(
                 # Fall back to direct hashing when stat is unavailable or the file changes mid-scan.
                 pass
 
-            if _should_defer_hash_for_max_total_size(hash_config, hashed_bytes=hashed_bytes):
+            current_file_size = os.path.getsize(file_path)
+            if _should_defer_hash_for_max_total_size(
+                hash_config,
+                hashed_bytes=hashed_bytes + current_file_size,
+            ):
                 content_hashes[file_path] = f"unhashable_max_total_size_{id(file_path)}"
+                hash_budget_exhausted = True
                 continue
-            with suppress(OSError):
-                hashed_bytes += os.path.getsize(file_path)
-            content_hashes[file_path] = _calculate_file_hash(file_path, deadline=deadline)
-            post_hash_stat = os.stat(file_path, follow_symlinks=False)
+            hashed_bytes += current_file_size
+            if follow_validated_symlink:
+                content_hashes[file_path] = _calculate_file_hash(
+                    file_path,
+                    deadline=deadline,
+                    follow_validated_symlink=True,
+                )
+            else:
+                content_hashes[file_path] = _calculate_file_hash(file_path, deadline=deadline)
+            post_hash_stat = os.stat(file_path, follow_symlinks=follow_validated_symlink)
             if pre_hash_stat is None or any(
                 getattr(pre_hash_stat, field) != getattr(post_hash_stat, field)
                 for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
@@ -3618,12 +4567,18 @@ def _directory_owner_scan_path(
     force_staged: bool = False,
     require_bound: bool = False,
     source_paths_by_owner_path: dict[str, str] | None = None,
+    trusted_root_symlink: bool = False,
 ) -> Iterator[str]:
     """Yield a bound or hash-verified copied path for logical directory-owner scanning."""
     with ExitStack() as scan_path_stack:
         if not force_staged:
             try:
-                owner_scan_path = scan_path_stack.enter_context(_bound_directory_owner_scan_path(root_path))
+                owner_scan_path = scan_path_stack.enter_context(
+                    _bound_directory_owner_scan_path(
+                        root_path,
+                        trusted_root_symlink=trusted_root_symlink,
+                    )
+                )
             except OSError:
                 if require_bound:
                     raise
@@ -3673,8 +4628,8 @@ def _is_directory_link(path: Path) -> bool:
 
 def _stat_is_windows_reparse_point(stat_result: os.stat_result) -> bool:
     """Return whether a stat result reports a Windows reparse-point entry."""
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    file_attributes = getattr(stat_result, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+    file_attributes = getattr(stat_result, "st_file_attributes", 0) or 0
     return bool(reparse_flag and file_attributes & reparse_flag)
 
 
@@ -3686,6 +4641,8 @@ def _resolve_directory_scan_target(
     hf_cache_root: Path | None,
     results: ModelAuditResultModel,
     reported_traversal_targets: set[str] | None = None,
+    preserve_bound_path: bool = False,
+    hf_snapshot_path: Path | None = None,
 ) -> tuple[Path | None, bool, bool]:
     """Resolve a directory entry and reject symlink traversal outside the scan root."""
     is_symlink = file_path.is_symlink()
@@ -3738,7 +4695,7 @@ def _resolve_directory_scan_target(
 
     # Check if this is a HuggingFace cache symlink scenario
     is_hf_cache_symlink = False
-    if is_symlink and is_hf_cache and _is_hf_cache_snapshot_alias(file_path, hf_cache_root):
+    if is_symlink and is_hf_cache and _is_hf_cache_snapshot_alias(hf_snapshot_path or file_path, hf_cache_root):
         # Reuse the canonical target resolved above. On Windows, os.readlink()
         # may expose a device-path spelling that cannot safely be rejoined.
         resolved_target = resolved_file
@@ -3750,7 +4707,8 @@ def _resolve_directory_scan_target(
                 # Update the resolved_file to the actual target for scanning
                 resolved_file = resolved_target
 
-    if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
+    containment_base_dir = base_dir.resolve() if preserve_bound_path else base_dir
+    if not is_hf_cache_symlink and not is_within_directory(str(containment_base_dir), str(resolved_file)):
         _add_path_traversal_issue_once(
             results,
             location=str(file_path),
@@ -3759,7 +4717,8 @@ def _resolve_directory_scan_target(
         )
         return None, False, False
 
-    return resolved_file, is_hf_cache_symlink, False
+    preserve_scan_path = preserve_bound_path and not is_symlink
+    return (file_path if preserve_scan_path else resolved_file), is_hf_cache_symlink, False
 
 
 def _hf_cache_snapshot_alias_has_safe_parent_components(snapshot_path: Path, hf_cache_root: Path | None) -> bool:
@@ -3881,15 +4840,21 @@ def scan_model_directory_or_file(
     """
     # Start timer for timeout
     start_time = time.time()
+    local_source_report_path = str(path)
+    local_source_boundary_stack = ExitStack()
+    bound_local_source_path: str | None = None
+    resolved_local_source_path: str | None = None
     local_source_receipt_value = kwargs.pop(_LOCAL_SOURCE_RECEIPT_CONFIG_KEY, None)
-    expected_local_source_receipt = (
-        local_source_receipt_value
-        if isinstance(local_source_receipt_value, dict)
-        and all(
-            isinstance(key, str) and isinstance(value, (int, str)) for key, value in local_source_receipt_value.items()
-        )
-        else None
+    expected_local_source_receipt = _validated_local_source_receipt(local_source_receipt_value)
+    local_source_bound_guard_value = kwargs.pop(_LOCAL_SOURCE_BOUND_GUARD_CONFIG_KEY, None)
+    local_source_bound_guard = (
+        local_source_bound_guard_value if isinstance(local_source_bound_guard_value, _BoundLocalSourceGuard) else None
     )
+    owned_local_source_guard: _BoundLocalSourceGuard | None = None
+    bound_local_source_owner_root_trusted = False
+    bound_local_source_is_lexical_link = False
+    local_source_initial_namespace: tuple[_DirectoryOwnerSnapshotEntry, ...] | None = None
+    local_source_initial_namespace_error: Exception | None = None
     dvc_parent_file = kwargs.pop(_DVC_PARENT_FILE_CONFIG_KEY, None)
     dvc_remaining_total_size = kwargs.pop(_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY, None)
     dvc_total_size_limit = kwargs.pop(_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY, None)
@@ -3957,6 +4922,11 @@ def scan_model_directory_or_file(
     }
     config = normalize_scanner_selection_config(config)
     config = _normalize_repository_inventory_config(config)
+    if not is_stream_url(local_source_report_path) and Path(local_source_report_path).name.lower() == "metadata.json":
+        from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
+
+        if JaxCheckpointScanner._has_regular_orbax_sibling_marker(Path(local_source_report_path)):
+            config[JAX_VERIFIED_ORBAX_SIBLING_CONFIG_KEY] = True
     directory_owner_snapshot_max_entries_value = config.get(
         "max_directory_owner_snapshot_entries",
         _DEFAULT_MAX_DIRECTORY_OWNER_SNAPSHOT_ENTRIES,
@@ -3967,6 +4937,10 @@ def scan_model_directory_or_file(
         and not isinstance(directory_owner_snapshot_max_entries_value, bool)
         and directory_owner_snapshot_max_entries_value > 0
         else _DEFAULT_MAX_DIRECTORY_OWNER_SNAPSHOT_ENTRIES
+    )
+    local_source_namespace_max_entries = max(
+        directory_owner_snapshot_max_entries,
+        _DEFAULT_MAX_DIRECTORY_OWNER_SNAPSHOT_ENTRIES,
     )
     scanner_selection = policy_from_config(config)
     scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
@@ -3985,11 +4959,91 @@ def scan_model_directory_or_file(
     config[_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY] = index_inspection_context
 
     try:
-        if expected_local_source_receipt is not None and not _local_source_receipts_match(
-            expected_local_source_receipt,
-            _snapshot_local_source_receipt(path),
+        if (
+            local_source_bound_guard is None
+            and expected_local_source_receipt is None
+            and not is_stream_url(local_source_report_path)
+        ):
+            if not os.path.lexists(local_source_report_path):
+                raise FileNotFoundError(f"Path does not exist: {local_source_report_path}")
+            if os.name == "posix":
+                try:
+                    owned_local_source_guard = _open_bound_local_source(local_source_report_path)
+                except FileNotFoundError:
+                    raise
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise _LocalSourceBoundaryError("local source could not be retained") from error
+                local_source_bound_guard = owned_local_source_guard
+                expected_local_source_receipt = owned_local_source_guard.receipt
+                local_source_boundary_stack.callback(owned_local_source_guard.close)
+            elif os.name == "nt":
+                expected_local_source_receipt = _snapshot_local_source_receipt(local_source_report_path)
+                if expected_local_source_receipt is None:
+                    raise _LocalSourceBoundaryError("local source could not be retained")
+        if (
+            local_source_bound_guard is None
+            and expected_local_source_receipt is not None
+            and not _local_source_receipts_match(
+                expected_local_source_receipt,
+                _snapshot_local_source_receipt(local_source_report_path),
+            )
         ):
             raise _LocalSourceBoundaryError("local source changed after dispatch")
+        if local_source_bound_guard is not None:
+            if (
+                expected_local_source_receipt is None
+                or not _local_source_receipts_match(expected_local_source_receipt, local_source_bound_guard.receipt)
+                or local_source_bound_guard.changed()
+            ):
+                raise _LocalSourceBoundaryError("retained local source changed after dispatch")
+            bound_local_source_path = local_source_bound_guard.bound_path
+            resolved_path_value = expected_local_source_receipt.get("resolved_path")
+            if not isinstance(resolved_path_value, str):
+                raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
+            resolved_local_source_path = resolved_path_value
+            path = bound_local_source_path
+            bound_local_source_is_lexical_link = bool(
+                local_source_bound_guard.guarded_entries
+                and local_source_bound_guard.guarded_entries[-1][3].get("mode_type") == stat.S_IFLNK
+            )
+            bound_local_source_owner_root_trusted = not bound_local_source_is_lexical_link
+            if expected_local_source_receipt.get("mode_type") == stat.S_IFREG:
+                config[_BOUND_CACHE_IDENTITY_CONFIG_KEY] = CacheIdentityBinding(
+                    scan_path=bound_local_source_path,
+                    identity_path=local_source_report_path,
+                )
+            configured_cache_dir = config.get("cache_dir")
+            cache_inside_source = bool(
+                expected_local_source_receipt.get("mode_type") == stat.S_IFDIR
+                and config.get("cache_enabled", True)
+                and isinstance(configured_cache_dir, str)
+                and configured_cache_dir
+                and is_within_directory(
+                    str(Path(local_source_report_path).absolute()),
+                    str(Path(configured_cache_dir).absolute()),
+                )
+            )
+            if cache_inside_source:
+                raise _LocalSourceBoundaryError("cache directory must be outside the retained local source")
+        elif expected_local_source_receipt is not None:
+            try:
+                local_source_boundary_stack.enter_context(
+                    _retain_windows_local_source_guards(
+                        local_source_report_path,
+                        expected_local_source_receipt,
+                    )
+                )
+                if expected_local_source_receipt.get("mode_type") == stat.S_IFDIR and os.name == "posix":
+                    bound_local_source_path = local_source_boundary_stack.enter_context(
+                        _bound_local_source_directory(local_source_report_path, expected_local_source_receipt)
+                    )
+                    resolved_path_value = expected_local_source_receipt.get("resolved_path")
+                    if not isinstance(resolved_path_value, str):
+                        raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
+                    resolved_local_source_path = resolved_path_value
+                    path = bound_local_source_path
+            except Exception as error:
+                raise _LocalSourceBoundaryError("local source boundary could not be retained") from error
         # Handle streaming paths
         if is_stream_url(path):
             # Extract the actual URL
@@ -4057,6 +5111,17 @@ def scan_model_directory_or_file(
         if os.path.isdir(path):
             if not os.access(path, os.R_OK):
                 raise PermissionError(f"Path is not readable: {path}")
+
+            try:
+                local_source_initial_namespace = _capture_directory_owner_namespace(
+                    Path(path),
+                    None,
+                    deadline=start_time + timeout,
+                    max_entries=local_source_namespace_max_entries,
+                    trusted_root_symlink=bound_local_source_path is not None,
+                )
+            except (OSError, RuntimeError, TimeoutError) as error:
+                local_source_initial_namespace_error = error
 
             if progress_callback:
                 progress_callback(f"Scanning directory: {path}", 0.0)
@@ -4174,14 +5239,27 @@ def scan_model_directory_or_file(
                 finally:
                     _finish_phase_timing(phase_timings, "directory_file_count", directory_file_count_started_at)
 
-            base_dir = Path(path).resolve()
-            hf_cache_root = _find_hf_cache_root(base_dir)
+            base_dir = Path(path).absolute() if bound_local_source_path is not None else Path(path).resolve()
+
+            def logical_local_path(source: str | os.PathLike[str]) -> Path:
+                return _local_source_logical_path(
+                    source,
+                    bound_local_source_path,
+                    resolved_local_source_path,
+                )
+
+            hf_cache_root = _find_hf_cache_root(
+                Path(resolved_local_source_path) if resolved_local_source_path is not None else base_dir
+            )
             is_hf_cache = hf_cache_root is not None
             trusted_hf_blobs_root = _trusted_hf_blobs_root(hf_cache_root) if hf_cache_root is not None else None
             scanned_paths: set[str] = set()
             directory_walk_covered_directories: set[str] = set()
             hf_shard_blob_paths: set[str] = set()
             hf_onnx_alias_hash_sources: dict[str, str] = {}
+            trusted_hf_alias_scan_paths: set[str] = set()
+            trusted_hf_alias_targets: dict[str, dict[str, int | str]] = {}
+            trusted_hf_alias_logical_paths: dict[str, str] = {}
             reported_traversal_targets: set[str] = set()
 
             # First pass: collect all file paths that need scanning
@@ -4204,12 +5282,17 @@ def scan_model_directory_or_file(
                 *,
                 owner_entry: _DirectoryOwnerSnapshotEntry,
             ) -> Path | None:
+                logical_owner_source = _local_source_logical_path(
+                    owner_source,
+                    bound_local_source_path,
+                    resolved_local_source_path,
+                )
                 if (
                     not is_hf_cache
                     or hf_cache_root is None
                     or trusted_hf_blobs_root is None
                     or owner_entry.entry_type != "link"
-                    or not _path_has_part(owner_source, "snapshots")
+                    or not _path_has_part(logical_owner_source, "snapshots")
                 ):
                     return None
 
@@ -4218,21 +5301,21 @@ def scan_model_directory_or_file(
                         return None
                     raw_target = Path(owner_entry.raw_link_target)
                     if not raw_target.is_absolute():
-                        raw_target = owner_source.parent / raw_target
+                        raw_target = logical_owner_source.parent / raw_target
                     try:
                         return raw_target.resolve(strict=True)
                     except (OSError, RuntimeError):
                         return None
 
                 try:
-                    resolved_target = owner_source.resolve(strict=True)
+                    resolved_target = logical_owner_source.resolve(strict=True)
                 except (OSError, RuntimeError):
                     raw_resolved_target = resolve_raw_link_target()
                     if raw_resolved_target is None:
                         return None
                     resolved_target = raw_resolved_target
                 else:
-                    if resolved_target == owner_source.absolute():
+                    if resolved_target == logical_owner_source.absolute():
                         raw_resolved_target = resolve_raw_link_target()
                         if raw_resolved_target is not None:
                             resolved_target = raw_resolved_target
@@ -4367,6 +5450,7 @@ def scan_model_directory_or_file(
                         directory_owner_class,
                         deadline=start_time + timeout,
                         max_entries=directory_owner_snapshot_max_entries,
+                        trusted_root_symlink=bound_local_source_owner_root_trusted,
                     )
                 except (OSError, RuntimeError, TimeoutError) as error:
                     (
@@ -4407,13 +5491,48 @@ def scan_model_directory_or_file(
                                 ):
                                     directory_owner_budget_source_paths.add(owner_source)
 
+            if local_source_initial_namespace_error is not None:
+                if directory_owner_class is None:
+                    raise _LocalSourceBoundaryError("local source namespace could not be retained") from (
+                        local_source_initial_namespace_error
+                    )
+                if directory_owner_snapshot_failure_reason is None:
+                    (
+                        directory_owner_snapshot_failure_reason,
+                        directory_owner_snapshot_failure_details,
+                    ) = directory_owner_snapshot_failure(local_source_initial_namespace_error)
+                directory_owner_snapshot_failure_allows_child_walk = False
+
             initial_owner_entries = {entry.relative_parts: entry for entry in directory_owner_initial_snapshot}
+            initial_local_source_entries = {
+                entry.relative_parts: entry for entry in local_source_initial_namespace or ()
+            }
+            observed_local_source_entries: set[tuple[str, ...]] = (
+                {()} if local_source_initial_namespace is not None else set()
+            )
+
+            def validate_local_source_walk_entry(entry_path: Path, relative_parts: tuple[str, ...]) -> None:
+                expected_entry = initial_local_source_entries.get(relative_parts)
+                try:
+                    current_stat = os.stat(entry_path) if not relative_parts else entry_path.lstat()
+                    current_entry = _directory_owner_snapshot_entry(
+                        entry_path,
+                        relative_parts,
+                        entry_stat=current_stat,
+                    )
+                except OSError as error:
+                    raise _LocalSourceBoundaryError("local source entry changed during discovery") from error
+                if not _directory_owner_snapshot_entries_match(expected_entry, current_entry):
+                    raise _LocalSourceBoundaryError("local source entry changed during discovery")
+                observed_local_source_entries.add(relative_parts)
+
+            directory_walk_skipped = bool(
+                directory_owner_snapshot_failure_reason is not None
+                and not directory_owner_snapshot_failure_allows_child_walk
+            )
             directory_walk = (
                 ()
-                if (
-                    directory_owner_snapshot_failure_reason is not None
-                    and not directory_owner_snapshot_failure_allows_child_walk
-                )
+                if directory_walk_skipped
                 else os.walk(
                     path,
                     followlinks=False,
@@ -4421,6 +5540,16 @@ def scan_model_directory_or_file(
                 )
             )
             for root, dirs, files in directory_walk:
+                root_path = Path(root)
+                root_relative_parts = Path(os.path.relpath(root_path, path)).parts
+                if root_relative_parts == (".",):
+                    root_relative_parts = ()
+                validate_local_source_walk_entry(root_path, root_relative_parts)
+                for child_name in [*dirs, *files]:
+                    validate_local_source_walk_entry(
+                        root_path / child_name,
+                        (*root_relative_parts, child_name),
+                    )
                 dirs.sort()
                 directory_walk_covered_directories.add(str(Path(root).resolve()))
                 unclassified_symlinks = _unclassified_symlink_names(root, dirs, files)
@@ -4463,6 +5592,11 @@ def scan_model_directory_or_file(
                     resolved_file = resolve_covered_dvc_file_symlink(file_path_obj)
                     is_dvc_covered_file_symlink = resolved_file is not None
                     is_hf_cache_symlink = False
+                    logical_file_path = _local_source_logical_path(
+                        file_path_obj,
+                        bound_local_source_path,
+                        resolved_local_source_path,
+                    )
                     if resolved_file is None:
                         resolved_file, is_hf_cache_symlink, entry_unavailable = _resolve_directory_scan_target(
                             file_path_obj,
@@ -4471,6 +5605,8 @@ def scan_model_directory_or_file(
                             hf_cache_root=hf_cache_root,
                             results=results,
                             reported_traversal_targets=reported_traversal_targets,
+                            preserve_bound_path=bound_local_source_path is not None,
+                            hf_snapshot_path=logical_file_path,
                         )
                         if entry_unavailable:
                             scan_metadata["success"] = False
@@ -4511,10 +5647,15 @@ def scan_model_directory_or_file(
                         is_hf_cache_symlink and resolved_file.exists() and snapshot_shard_family_key is not None
                     )
                     route_hf_onnx_alias = is_hf_cache_symlink and _should_scan_hf_cache_alias_lexically_for_onnx(
-                        snapshot_path,
+                        logical_file_path,
                         hf_cache_root,
                     )
-                    scan_source = snapshot_path if route_hf_shard_alias or route_hf_onnx_alias else resolved_file
+                    scan_source = (
+                        snapshot_path
+                        if is_hf_cache_symlink
+                        and (bound_local_source_path is not None or route_hf_shard_alias or route_hf_onnx_alias)
+                        else resolved_file
+                    )
 
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value
@@ -4580,7 +5721,14 @@ def scan_model_directory_or_file(
                         )
                         if target_repository_member is not None:
                             repository_member_by_scan_path[target_str] = target_repository_member
-                        shard_family_key = _shard_family_key_for_path(target_str)
+                        logical_target_str = str(
+                            _local_source_logical_path(
+                                target_str,
+                                bound_local_source_path,
+                                resolved_local_source_path,
+                            )
+                        )
+                        shard_family_key = _shard_family_key_for_path(logical_target_str)
                         is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
                         exclusion_path = (
                             str(resolved_file)
@@ -4591,8 +5739,14 @@ def scan_model_directory_or_file(
                             continue
                         if is_hf_shard_alias:
                             hf_shard_blob_paths.add(str(resolved_file))
+                        if is_hf_cache_symlink and target_path == scan_source:
+                            trusted_hf_alias_scan_paths.add(target_str)
+                            trusted_hf_alias_logical_paths[target_str] = str(logical_file_path)
+                            alias_target = _snapshot_regular_file_target(resolved_file)
+                            if alias_target is not None:
+                                trusted_hf_alias_targets[target_str] = alias_target
                         is_hf_onnx_alias = route_hf_onnx_alias and target_path == scan_source
-                        if is_hf_onnx_alias:
+                        if is_hf_onnx_alias and bound_local_source_path is None:
                             hf_onnx_alias_hash_sources[target_str] = str(resolved_file)
                         dedupe_target_str = (
                             str(resolved_file)
@@ -4624,7 +5778,9 @@ def scan_model_directory_or_file(
                         # Add to files to scan list instead of scanning immediately
                         if shard_family_key is not None:
                             raw_shard_family_key = shard_family_key
-                            normalized_shard_source = os.path.normcase(os.path.normpath(os.path.abspath(target_str)))
+                            normalized_shard_source = os.path.normcase(
+                                os.path.normpath(os.path.abspath(logical_target_str))
+                            )
                             if (
                                 raw_shard_family_key in covered_shard_family_keys
                                 or normalized_shard_source in covered_shard_sources
@@ -4633,7 +5789,14 @@ def scan_model_directory_or_file(
                             shard_is_in_hf_snapshot = bool(
                                 is_hf_cache
                                 and hf_cache_root is not None
-                                and _path_has_part(Path(target_str), "snapshots")
+                                and _path_has_part(
+                                    _local_source_logical_path(
+                                        target_str,
+                                        bound_local_source_path,
+                                        resolved_local_source_path,
+                                    ),
+                                    "snapshots",
+                                )
                             )
                             allowed_hf_shard_paths = None
                             if shard_is_in_hf_snapshot and hf_cache_root is not None:
@@ -4641,9 +5804,13 @@ def scan_model_directory_or_file(
                                     trusted_hf_shard_paths = _allowed_hf_shard_alias_paths(base_dir, hf_cache_root)
                                 allowed_hf_shard_paths = trusted_hf_shard_paths
                             shard_info = ShardedModelDetector.detect_shards(
-                                target_str,
+                                logical_target_str,
                                 allowed_paths=allowed_hf_shard_paths,
-                                index_search_root=base_dir,
+                                index_search_root=(
+                                    Path(resolved_local_source_path)
+                                    if resolved_local_source_path is not None
+                                    else base_dir
+                                ),
                             )
                             covered_shard_family_keys.add(raw_shard_family_key)
                             if shard_info is not None and not shard_info.get("safetensors_index_error"):
@@ -4661,10 +5828,10 @@ def scan_model_directory_or_file(
                                         expected_total,
                                     )
                             if shard_family_key not in shard_family_representatives:
-                                shard_family_representatives[shard_family_key] = target_str
+                                shard_family_representatives[shard_family_key] = logical_target_str
                                 family_paths = shard_family_paths.setdefault(shard_family_key, set())
                                 if shard_info is None:
-                                    family_paths.add(target_str)
+                                    family_paths.add(logical_target_str)
                                 else:
                                     validated_targets: ValidatedShardTargets = {}
                                     detected_targets = shard_info.get("shard_targets")
@@ -4813,6 +5980,9 @@ def scan_model_directory_or_file(
                                 str(symlink_dir),
                             )
 
+            if not directory_walk_skipped and observed_local_source_entries != set(initial_local_source_entries):
+                raise _LocalSourceBoundaryError("local source namespace was not fully traversed")
+
             for (affected_dvc_file, incomplete_reason), failed_paths in directory_coverage_gaps.items():
                 aggregate_hash_complete = False
                 _record_incomplete_dvc_resolution(
@@ -4875,7 +6045,7 @@ def scan_model_directory_or_file(
                     _entry_shard_family_key,
                     _repository_member,
                 ) in scan_entries:
-                    xml_path = Path(representative_file)
+                    xml_path = logical_local_path(representative_file)
                     companion_path = _openvino_xml_weights_companion(xml_path)
                     if companion_path is None:
                         continue
@@ -4898,16 +6068,16 @@ def scan_model_directory_or_file(
                         entry_shard_family_key,
                         repository_member,
                     ) in scan_entries:
-                        representative_key = _openvino_xml_companion_key(Path(representative_file))
+                        representative_key = _openvino_xml_companion_key(logical_local_path(representative_file))
                         if representative_key in covered_companions_by_key:
                             continue
 
                         expanded_scanned_file_paths = list(scanned_file_paths)
                         expanded_scanned_path_keys = {
-                            _openvino_xml_companion_key(Path(scanned_file_path))
+                            _openvino_xml_companion_key(logical_local_path(scanned_file_path))
                             for scanned_file_path in expanded_scanned_file_paths
                         }
-                        companion_path = _openvino_xml_weights_companion(Path(representative_file))
+                        companion_path = _openvino_xml_weights_companion(logical_local_path(representative_file))
                         if companion_path is not None:
                             companion_key = _openvino_xml_companion_key(companion_path)
                             covered_companion_path = covered_companions_by_key.get(companion_key)
@@ -5035,6 +6205,7 @@ def scan_model_directory_or_file(
                             directory_owner_class,
                             deadline=start_time + timeout,
                             max_entries=directory_owner_snapshot_max_entries,
+                            trusted_root_symlink=bound_local_source_owner_root_trusted,
                         )
                     except (OSError, RuntimeError, TimeoutError) as error:
                         owner_block_reason, owner_block_details = directory_owner_snapshot_failure(error)
@@ -5130,8 +6301,14 @@ def scan_model_directory_or_file(
                     if not _should_defer_hash_for_max_file_size(representative_hash_source, config):
                         representative_external_sources: list[str] = []
                         representative_external_bytes = 0
+                        onnx_discovery_path = Path(
+                            trusted_hf_alias_logical_paths.get(
+                                representative_file,
+                                str(logical_local_path(representative_file)),
+                            )
+                        )
                         discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(
-                            Path(representative_file),
+                            onnx_discovery_path,
                             deadline=start_time + timeout,
                         )
                         if discovered_external_data_paths is None:
@@ -5146,6 +6323,14 @@ def scan_model_directory_or_file(
                                 external_data_target_key is not None
                                 and external_data_target_key in scan_entry_target_keys
                             ):
+                                if external_data_identity is not None:
+                                    external_data_source = str(
+                                        Path(external_data_identity.resolved_path)
+                                        if external_data_identity.resolved_path is not None
+                                        else external_data_path
+                                    )
+                                    onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
+                                    representative_external_sources.append(external_data_source)
                                 continue
                             if _should_defer_hash_for_max_file_size(str(external_data_path), config):
                                 aggregate_hash_complete = False
@@ -5168,8 +6353,7 @@ def scan_model_directory_or_file(
                                 seen_hash_sources.add(external_data_source)
                                 if not representative_hash_deferred:
                                     hash_sources.append(external_data_source)
-                            if not representative_hash_deferred:
-                                onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
+                            onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
                             representative_external_sources.append(external_data_source)
                             if external_data_target_key is not None:
                                 scan_entry_target_keys.add(external_data_target_key)
@@ -5227,6 +6411,7 @@ def scan_model_directory_or_file(
                     hash_sources,
                     config=config,
                     routing_paths=routing_paths_by_source,
+                    follow_symlink_paths=trusted_hf_alias_scan_paths,
                     hashed_identities=hashed_identities_by_source,
                     deadline=start_time + timeout,
                 )
@@ -5314,7 +6499,10 @@ def scan_model_directory_or_file(
                                 }
                             else:
                                 try:
-                                    with _bound_directory_owner_scan_path(owner_root_path):
+                                    with _bound_directory_owner_scan_path(
+                                        owner_root_path,
+                                        trusted_root_symlink=bound_local_source_owner_root_trusted,
+                                    ):
                                         pass
                                 except OSError as error:
                                     owner_block_reason = "directory_owner_snapshot_incomplete"
@@ -5334,6 +6522,7 @@ def scan_model_directory_or_file(
                                 directory_owner_class,
                                 deadline=start_time + timeout,
                                 max_entries=directory_owner_snapshot_max_entries,
+                                trusted_root_symlink=bound_local_source_owner_root_trusted,
                             )
                         except (OSError, RuntimeError, TimeoutError) as error:
                             owner_block_reason, owner_block_details = directory_owner_snapshot_failure(error)
@@ -5395,6 +6584,7 @@ def scan_model_directory_or_file(
                                 force_staged=bool(directory_owner_content_source_paths),
                                 require_bound=allow_file_backed_hdf5_owner_hashes,
                                 source_paths_by_owner_path=directory_owner_content_source_paths,
+                                trusted_root_symlink=bound_local_source_owner_root_trusted,
                             ) as directory_owner_scan_path:
                                 owner_scan_started = True
                                 directory_owner_result = directory_owner_class(config=owner_config).scan(
@@ -5443,6 +6633,7 @@ def scan_model_directory_or_file(
                                 directory_owner_class,
                                 deadline=start_time + timeout,
                                 max_entries=directory_owner_snapshot_max_entries,
+                                trusted_root_symlink=bound_local_source_owner_root_trusted,
                             )
                         except (OSError, RuntimeError, TimeoutError) as error:
                             post_snapshot_reason, post_snapshot_details = directory_owner_snapshot_failure(error)
@@ -5576,6 +6767,24 @@ def scan_model_directory_or_file(
                         duplicate_paths_by_hash.setdefault(content_hash, []).append(file_path)
                 if len(scan_entries) > 1:
                     pickle_source_snapshot_stack.enter_context(shared_source_sensitive_caches())
+                authoritative_directory_index_paths = {
+                    os.path.normcase(os.path.normpath(os.path.abspath(index_path)))
+                    for target in directory_shard_targets.values()
+                    if isinstance((index_path := target.get("authoritative_shard_index_path")), str)
+                }
+                accounted_standard_targets: set[tuple[object, ...]] = set()
+
+                def stable_target_key(target: Mapping[str, int | str]) -> tuple[object, ...]:
+                    return tuple(target.get(field) for field in ("device", "inode", "size", "mtime_ns", "ctime_ns"))
+
+                def record_accounted_standard_source(source: str) -> None:
+                    target_values: Mapping[str, int | str] | None = hashed_identities_by_source.get(source)
+                    if target_values is None:
+                        snapshotted = _snapshot_regular_file_target(source)
+                        if snapshotted is None:
+                            return
+                        target_values = snapshotted
+                    accounted_standard_targets.add(stable_target_key(target_values))
 
                 for representative_file, scanned_file_paths, shard_family_key, repository_member in scan_entries:
                     # Check for interrupts
@@ -5625,18 +6834,340 @@ def scan_model_directory_or_file(
                                         shard_family_targets.get(shard_family_key, {}),
                                     )
                                 )
-                            openvino_owner = _openvino_weights_companion_owner(Path(representative_file))
+                            logical_representative_path = logical_local_path(representative_file)
+                            openvino_owner = _openvino_weights_companion_owner(logical_representative_path)
                             if (
                                 openvino_owner is not None
                                 and _openvino_xml_companion_key(openvino_owner) in covered_openvino_xml_companions
                             ):
                                 file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
-                            file_result = scan_file(representative_file, file_config)
-                            file_result.bytes_scanned += covered_openvino_companion_sizes.get(
-                                _openvino_xml_companion_key(Path(representative_file)),
-                                0,
+
+                            def pinned_companions(
+                                logical_root: str,
+                                family_paths: list[str],
+                                current_config: dict[str, Any],
+                            ) -> tuple[
+                                dict[str, tuple[str, dict[str, int | str]]],
+                                dict[str, str],
+                                tuple[str, int] | None,
+                            ]:
+                                nonlocal aggregate_hash_complete
+                                pinned_targets: dict[str, tuple[str, dict[str, int | str]]] = {}
+                                oversized_companion: tuple[str, int] | None = None
+                                logical_root_path = trusted_hf_alias_logical_paths.get(logical_root, logical_root)
+                                context_only_companions: set[Path] = set()
+                                logical_paths_by_source = {
+                                    source: onnx_external_data_routing_paths[source]
+                                    for source in onnx_external_data_sources_by_path.get(
+                                        logical_root,
+                                        (),
+                                    )
+                                    if source in onnx_external_data_routing_paths
+                                }
+                                if scanner_selection.allows("openvino"):
+                                    openvino_companion = _openvino_xml_weights_companion(Path(logical_root_path))
+                                    if (
+                                        openvino_companion is not None
+                                        and _openvino_weights_symlink_escape(
+                                            Path(logical_root_path),
+                                            openvino_companion,
+                                        )
+                                        is None
+                                    ):
+                                        logical_paths_by_source.setdefault(
+                                            str(openvino_companion),
+                                            str(openvino_companion),
+                                        )
+                                if scanner_selection.allows("mxnet"):
+                                    for mxnet_companion in _mxnet_companion_paths(Path(logical_root_path)):
+                                        logical_paths_by_source.setdefault(
+                                            str(mxnet_companion),
+                                            str(mxnet_companion),
+                                        )
+                                if scanner_selection.allows("oci_layer"):
+                                    context_only_companions.update(
+                                        _oci_manifest_layer_companion_paths(Path(logical_root_path))
+                                    )
+                                    for layer_companion in context_only_companions:
+                                        logical_paths_by_source.setdefault(
+                                            str(layer_companion),
+                                            str(layer_companion),
+                                        )
+                                for scanned_companion_path in family_paths[1:]:
+                                    companion_source = hash_source_by_path.get(scanned_companion_path)
+                                    if companion_source is not None:
+                                        logical_paths_by_source.setdefault(
+                                            companion_source,
+                                            scanned_companion_path,
+                                        )
+                                for companion_source, logical_companion_path in logical_paths_by_source.items():
+                                    try:
+                                        relative_companion_path = str(
+                                            Path(logical_companion_path).relative_to(Path(logical_root_path).parent)
+                                        )
+                                    except ValueError:
+                                        aggregate_hash_complete = False
+                                        continue
+                                    companion_target = _snapshot_regular_file_target(companion_source)
+                                    if companion_target is None:
+                                        aggregate_hash_complete = False
+                                        continue
+                                    hashed_companion_identity = hashed_identities_by_source.get(companion_source)
+                                    if hashed_companion_identity is not None:
+                                        companion_target.update(hashed_companion_identity)
+                                    context_only = Path(logical_companion_path) in context_only_companions
+                                    if context_only:
+                                        companion_target[CONTEXT_ONLY_COMPANION_TARGET_KEY] = 1
+                                    companion_size = companion_target.get("size")
+                                    if (
+                                        not context_only
+                                        and isinstance(companion_size, int)
+                                        and _should_defer_hash_for_max_file_size(
+                                            logical_companion_path,
+                                            current_config,
+                                            file_size=companion_size,
+                                        )
+                                    ):
+                                        oversized_companion = (logical_companion_path, companion_size)
+                                        continue
+                                    resolved_companion_target = os.path.realpath(str(companion_target["resolved_path"]))
+                                    companion_target["resolved_path"] = resolved_companion_target
+                                    pinned_targets[relative_companion_path] = (
+                                        resolved_companion_target,
+                                        companion_target,
+                                    )
+                                return pinned_targets, logical_paths_by_source, oversized_companion
+
+                            def scan_pinned_local_source(
+                                resolved_target: str,
+                                expected_target: dict[str, int | str],
+                                *,
+                                logical_path: str,
+                                report_path: str,
+                                family_paths: list[str],
+                                require_regular_path: bool,
+                                current_config: dict[str, Any],
+                                companion_root: str | None = None,
+                            ) -> tuple[ScanResult, dict[str, str]]:
+                                """Preflight budgets, scan one retained source, and preserve its logical report path."""
+                                nonlocal aggregate_hash_complete, limit_reached
+                                logical_companion_root = Path(companion_root or logical_path)
+                                escaped_openvino_companion: tuple[Path, Path] | None = None
+                                if scanner_selection.allows("openvino"):
+                                    openvino_companion = _openvino_xml_weights_companion(logical_companion_root)
+                                    if openvino_companion is not None:
+                                        resolved_escape = _openvino_weights_symlink_escape(
+                                            logical_companion_root,
+                                            openvino_companion,
+                                        )
+                                        if resolved_escape is not None:
+                                            escaped_openvino_companion = (
+                                                openvino_companion,
+                                                resolved_escape,
+                                            )
+                                source_size = expected_target.get("size")
+                                if not isinstance(source_size, int):
+                                    aggregate_hash_complete = False
+                                    return _local_source_boundary_failure_scan_result(report_path), {}
+                                if _should_defer_hash_for_max_file_size(
+                                    logical_path,
+                                    current_config,
+                                    file_size=source_size,
+                                ):
+                                    aggregate_hash_complete = False
+                                    return (
+                                        _max_file_size_failure_scan_result(report_path, source_size, max_file_size),
+                                        {},
+                                    )
+
+                                companion_targets, companion_paths_by_source, oversized_companion = pinned_companions(
+                                    companion_root or logical_path,
+                                    family_paths,
+                                    current_config,
+                                )
+                                if oversized_companion is not None:
+                                    aggregate_hash_complete = False
+                                    companion_path, companion_size = oversized_companion
+                                    return (
+                                        _max_file_size_failure_scan_result(
+                                            companion_path,
+                                            companion_size,
+                                            max_file_size,
+                                        ),
+                                        companion_paths_by_source,
+                                    )
+
+                                staged_targets = [expected_target]
+                                staged_targets.extend(target for _path, target in companion_targets.values())
+                                unique_staged_targets: dict[tuple[object, ...], int] = {}
+                                for staged_target in staged_targets:
+                                    staged_size = staged_target.get("size")
+                                    if not isinstance(staged_size, int):
+                                        aggregate_hash_complete = False
+                                        return _local_source_boundary_failure_scan_result(report_path), {}
+                                    if staged_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY):
+                                        continue
+                                    target_key = stable_target_key(staged_target)
+                                    unique_staged_targets.setdefault(target_key, staged_size)
+                                projected_total = results.bytes_scanned + sum(
+                                    staged_size
+                                    for target_key, staged_size in unique_staged_targets.items()
+                                    if target_key not in accounted_standard_targets
+                                )
+                                if max_total_size > 0 and projected_total > max_total_size:
+                                    aggregate_hash_complete = False
+                                    limit_reached = True
+                                    return (
+                                        _max_total_size_failure_scan_result(
+                                            report_path,
+                                            projected_total,
+                                            max_total_size,
+                                        ),
+                                        companion_paths_by_source,
+                                    )
+
+                                try:
+                                    with _pinned_shard_scan_path(
+                                        resolved_target,
+                                        expected_target,
+                                        logical_path=logical_path,
+                                        companion_targets=companion_targets,
+                                        require_regular_path=require_regular_path or bool(companion_targets),
+                                        copy_max_bytes=sum(
+                                            staged_size
+                                            for staged_target in staged_targets
+                                            if not staged_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY)
+                                            if isinstance((staged_size := staged_target.get("size")), int)
+                                        ),
+                                        deadline=start_time + timeout,
+                                    ) as pinned_source_scan:
+                                        with _trusted_logical_scan_path(pinned_source_scan.path, logical_path):
+                                            local_result = scan_file(pinned_source_scan.path, current_config)
+                                        _rebase_pinned_shard_result(
+                                            local_result,
+                                            pinned_source_scan.path,
+                                            report_path,
+                                        )
+                                        _rebase_pinned_shard_result(
+                                            local_result,
+                                            str(Path(pinned_source_scan.path).parent),
+                                            str(Path(report_path).parent),
+                                        )
+                                        pinned_source_parent = os.path.realpath(Path(pinned_source_scan.path).parent)
+                                        _rebase_pinned_shard_result(
+                                            local_result,
+                                            pinned_source_parent,
+                                            str(Path(report_path).parent),
+                                        )
+                                    if pinned_source_scan.changed_during_scan:
+                                        aggregate_hash_complete = False
+                                        local_result.merge(_local_source_boundary_failure_scan_result(report_path))
+                                except (_ShardPinUnavailableError, OSError) as error:
+                                    aggregate_hash_complete = False
+                                    local_result = _local_source_boundary_failure_scan_result(report_path, error)
+                                if escaped_openvino_companion is not None:
+                                    escaped_companion_path, escaped_companion_target = escaped_openvino_companion
+                                    local_result.metadata.pop("bin_size", None)
+                                    local_result.merge(
+                                        _openvino_weights_symlink_escape_result(
+                                            logical_companion_root,
+                                            escaped_companion_path,
+                                            escaped_companion_target,
+                                        )
+                                    )
+                                return local_result, companion_paths_by_source
+
+                            trusted_alias_target = (
+                                trusted_hf_alias_targets.get(representative_file)
+                                if shard_family_key is None and representative_file in trusted_hf_alias_scan_paths
+                                else None
                             )
-                            file_result.bytes_scanned += onnx_external_data_sizes_by_path.get(representative_file, 0)
+                            if shard_family_key is None and representative_file in trusted_hf_alias_scan_paths:
+                                if trusted_alias_target is None:
+                                    aggregate_hash_complete = False
+                                    file_result = _local_source_boundary_failure_scan_result(representative_file)
+                                else:
+                                    expected_alias_target = dict(trusted_alias_target)
+                                    alias_hash_source = hash_source_by_path.get(representative_file)
+                                    hashed_alias_identity = (
+                                        hashed_identities_by_source.get(alias_hash_source)
+                                        if alias_hash_source is not None
+                                        else None
+                                    )
+                                    if hashed_alias_identity is not None:
+                                        expected_alias_target.update(hashed_alias_identity)
+                                    resolved_alias_target = expected_alias_target.get("resolved_path")
+                                    if not isinstance(resolved_alias_target, str):
+                                        aggregate_hash_complete = False
+                                        file_result = _local_source_boundary_failure_scan_result(representative_file)
+                                    else:
+                                        file_config["cache_enabled"] = False
+                                        file_result, _companion_paths_by_source = scan_pinned_local_source(
+                                            resolved_alias_target,
+                                            expected_alias_target,
+                                            logical_path=trusted_hf_alias_logical_paths.get(
+                                                representative_file, representative_file
+                                            ),
+                                            report_path=representative_file,
+                                            family_paths=scanned_file_paths,
+                                            require_regular_path=False,
+                                            current_config=file_config,
+                                            companion_root=representative_file,
+                                        )
+                            elif (
+                                shard_family_key is None
+                                and os.path.normcase(
+                                    os.path.normpath(
+                                        os.path.abspath(
+                                            _local_source_logical_path(
+                                                representative_file,
+                                                bound_local_source_path,
+                                                resolved_local_source_path,
+                                            )
+                                        )
+                                    )
+                                )
+                                not in authoritative_directory_index_paths
+                            ):
+                                source_path = hash_source_by_path.get(representative_file, representative_file)
+                                expected_source_target = _snapshot_regular_file_target(source_path)
+                                hashed_source_identity = hashed_identities_by_source.get(source_path)
+                                if expected_source_target is not None and hashed_source_identity is not None:
+                                    expected_source_target.update(hashed_source_identity)
+                                resolved_source_target = (
+                                    expected_source_target.get("resolved_path")
+                                    if expected_source_target is not None
+                                    else None
+                                )
+                                if not isinstance(resolved_source_target, str):
+                                    aggregate_hash_complete = False
+                                    file_result = _local_source_boundary_failure_scan_result(representative_file)
+                                else:
+                                    assert expected_source_target is not None
+                                    resolved_source_target = os.path.realpath(resolved_source_target)
+                                    expected_source_target["resolved_path"] = resolved_source_target
+                                    file_config["cache_enabled"] = False
+                                    file_result, _companion_paths_by_source = scan_pinned_local_source(
+                                        resolved_source_target,
+                                        expected_source_target,
+                                        logical_path=representative_file,
+                                        report_path=representative_file,
+                                        family_paths=scanned_file_paths,
+                                        require_regular_path=True,
+                                        current_config=file_config,
+                                        companion_root=str(logical_representative_path),
+                                    )
+                            else:
+                                file_result = scan_file(representative_file, file_config)
+                            if file_result.scanner_name != "size_check":
+                                file_result.bytes_scanned += covered_openvino_companion_sizes.get(
+                                    _openvino_xml_companion_key(logical_representative_path),
+                                    0,
+                                )
+                                file_result.bytes_scanned += onnx_external_data_sizes_by_path.get(
+                                    representative_file,
+                                    0,
+                                )
                         finally:
                             _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -5647,6 +7178,18 @@ def scan_model_directory_or_file(
                         results.bytes_scanned += file_result.bytes_scanned
                         results.files_scanned += len(scanned_file_paths)
                         processed_files += len(scanned_file_paths)
+                        for scanned_file_path in scanned_file_paths:
+                            record_accounted_standard_source(
+                                hash_source_by_path.get(scanned_file_path, scanned_file_path)
+                            )
+                        for external_data_source in onnx_external_data_sources_by_path.get(
+                            representative_file,
+                            (),
+                        ):
+                            record_accounted_standard_source(external_data_source)
+                        openvino_companion = _openvino_xml_weights_companion(logical_representative_path)
+                        if openvino_companion is not None:
+                            record_accounted_standard_source(str(openvino_companion))
                         for scanned_file_path in scanned_file_paths:
                             path_content_hash = content_hashes.get(scanned_file_path)
                             if (
@@ -5772,6 +7315,8 @@ def scan_model_directory_or_file(
                             results.file_metadata[scanned_file_path] = FileMetadataModel(**combined_metadata)
                         _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
+                        if limit_reached:
+                            break
                         if max_total_size > 0 and results.bytes_scanned > max_total_size:
                             aggregate_hash_complete = False
                             _add_issue_to_model(
@@ -6121,6 +7666,128 @@ def scan_model_directory_or_file(
                     aggregate_hash_complete = False
                     continue
 
+                single_file_pin_target: dict[str, int | str] | None = None
+                single_file_pin_resolved_path: str | None = None
+                single_file_companion_targets: dict[str, tuple[str, dict[str, int | str]]] = {}
+                single_file_companion_sizes = 0
+                single_file_has_symlink_companion = False
+                single_file_preflight_result: ScanResult | None = None
+                single_file_logical_path = Path(target)
+                if (
+                    local_source_bound_guard is not None
+                    and target == bound_local_source_path
+                    and expected_local_source_receipt is not None
+                    and expected_local_source_receipt.get("mode_type") == stat.S_IFREG
+                    and resolved_local_source_path is not None
+                ):
+                    single_file_logical_path = Path(local_source_report_path)
+                    single_file_pin_target = _snapshot_regular_file_target(resolved_local_source_path)
+                    candidate_single_file_pin_resolved_path = (
+                        single_file_pin_target.get("resolved_path") if single_file_pin_target is not None else None
+                    )
+                    single_file_pin_resolved_path = (
+                        candidate_single_file_pin_resolved_path
+                        if isinstance(candidate_single_file_pin_resolved_path, str)
+                        else None
+                    )
+                    source_size = single_file_pin_target.get("size") if single_file_pin_target is not None else None
+                    if not isinstance(single_file_pin_resolved_path, str) or not isinstance(source_size, int):
+                        single_file_preflight_result = _local_source_boundary_failure_scan_result(
+                            local_source_report_path
+                        )
+                    elif _should_defer_hash_for_max_file_size(
+                        str(single_file_logical_path),
+                        target_config,
+                        file_size=source_size,
+                    ):
+                        single_file_preflight_result = _max_file_size_failure_scan_result(
+                            local_source_report_path,
+                            source_size,
+                            max_file_size,
+                        )
+                    else:
+                        companion_paths: list[Path] = []
+                        oci_layer_companions: tuple[Path, ...] = ()
+                        if not scanner_selection.active or scanner_selection.allows("openvino"):
+                            openvino_companion = _openvino_xml_weights_companion(single_file_logical_path)
+                            if openvino_companion is not None:
+                                companion_paths.append(openvino_companion)
+                        if not scanner_selection.active or scanner_selection.allows("onnx"):
+                            discovered_onnx_companions = _streamed_onnx_external_data_hash_paths(
+                                single_file_logical_path,
+                                deadline=start_time + timeout,
+                            )
+                            if discovered_onnx_companions is None:
+                                single_file_preflight_result = _local_source_boundary_failure_scan_result(
+                                    local_source_report_path
+                                )
+                            else:
+                                companion_paths.extend(discovered_onnx_companions)
+                        if not scanner_selection.active or scanner_selection.allows("mxnet"):
+                            companion_paths.extend(_mxnet_companion_paths(single_file_logical_path))
+                        if not scanner_selection.active or scanner_selection.allows("oci_layer"):
+                            oci_layer_companions = _oci_manifest_layer_companion_paths(single_file_logical_path)
+                            companion_paths.extend(oci_layer_companions)
+                        for companion_path in dict.fromkeys(companion_paths):
+                            try:
+                                relative_companion = companion_path.relative_to(single_file_logical_path.parent)
+                                resolved_companion = companion_path.resolve(strict=True)
+                            except (OSError, RuntimeError, ValueError):
+                                single_file_preflight_result = _local_source_boundary_failure_scan_result(
+                                    local_source_report_path
+                                )
+                                break
+                            single_file_has_symlink_companion = (
+                                single_file_has_symlink_companion or companion_path.is_symlink()
+                            )
+                            companion_target = _snapshot_regular_file_target(resolved_companion)
+                            companion_size = companion_target.get("size") if companion_target is not None else None
+                            if not isinstance(companion_size, int):
+                                single_file_preflight_result = _local_source_boundary_failure_scan_result(
+                                    local_source_report_path
+                                )
+                                break
+                            context_only = companion_path in oci_layer_companions
+                            if context_only:
+                                assert companion_target is not None
+                                companion_target[CONTEXT_ONLY_COMPANION_TARGET_KEY] = 1
+                            if not context_only and _should_defer_hash_for_max_file_size(
+                                str(companion_path),
+                                target_config,
+                                file_size=companion_size,
+                            ):
+                                single_file_preflight_result = _max_file_size_failure_scan_result(
+                                    str(companion_path),
+                                    companion_size,
+                                    max_file_size,
+                                )
+                                break
+                            assert companion_target is not None
+                            single_file_companion_targets[str(relative_companion)] = (
+                                str(resolved_companion),
+                                companion_target,
+                            )
+                            if not context_only:
+                                single_file_companion_sizes += companion_size
+                        if os.name == "nt" and single_file_has_symlink_companion:
+                            single_file_preflight_result = _local_source_boundary_failure_scan_result(
+                                local_source_report_path
+                            )
+                        projected_size = source_size + single_file_companion_sizes
+                        if (
+                            single_file_preflight_result is None
+                            and max_total_size > 0
+                            and projected_size > max_total_size
+                        ):
+                            single_file_preflight_result = _max_total_size_failure_scan_result(
+                                local_source_report_path,
+                                projected_size,
+                                max_total_size,
+                            )
+
+                if single_file_preflight_result is not None:
+                    aggregate_hash_complete = False
+
                 results.files_scanned += 1
 
                 # Hash the top-level target before scanning. Archive scanners merge
@@ -6160,7 +7827,14 @@ def scan_model_directory_or_file(
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
                         with suppress(OSError):
                             top_level_hashed_bytes += os.path.getsize(target)
-                        file_hash = _calculate_file_hash(target)
+                        file_hash = _calculate_file_hash(
+                            target,
+                            follow_validated_symlink=bool(
+                                local_source_bound_guard is not None
+                                and local_source_bound_guard.staging_fd is not None
+                                and target == bound_local_source_path
+                            ),
+                        )
                         if not is_dvc_pointer or file_hash not in file_hashes:
                             file_hashes.append(file_hash)
                     except Exception as e:
@@ -6170,7 +7844,72 @@ def scan_model_directory_or_file(
 
                 file_scan_started_at = _start_phase_timing(phase_timings)
                 try:
-                    file_result = scan_file(target, target_config)
+                    if single_file_preflight_result is not None:
+                        file_result = single_file_preflight_result
+                    elif (
+                        single_file_pin_target is not None
+                        and single_file_pin_resolved_path is not None
+                        and single_file_companion_targets
+                    ):
+                        single_file_copy_bytes = single_file_pin_target.get("size")
+                        assert isinstance(single_file_copy_bytes, int)
+                        single_file_copy_bytes += single_file_companion_sizes
+                        with _pinned_shard_scan_path(
+                            single_file_pin_resolved_path,
+                            single_file_pin_target,
+                            logical_path=str(single_file_logical_path),
+                            companion_targets=single_file_companion_targets,
+                            require_regular_path=not single_file_has_symlink_companion,
+                            copy_max_bytes=single_file_copy_bytes,
+                            deadline=start_time + timeout,
+                        ) as pinned_single_file:
+                            for relative_name, (
+                                _source_path,
+                                companion_target,
+                            ) in single_file_companion_targets.items():
+                                if companion_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY):
+                                    continue
+                                pinned_companion_path = Path(pinned_single_file.path).parent.joinpath(
+                                    *Path(relative_name).parts
+                                )
+                                try:
+                                    companion_hash = _calculate_file_hash(
+                                        str(pinned_companion_path),
+                                        deadline=start_time + timeout,
+                                        follow_validated_symlink=True,
+                                    )
+                                except Exception as error:
+                                    logger.debug(f"Failed to hash companion file {pinned_companion_path}: {error}")
+                                    aggregate_hash_complete = False
+                                else:
+                                    if companion_hash not in file_hashes:
+                                        file_hashes.append(companion_hash)
+                                    companion_size = companion_target.get("size")
+                                    if isinstance(companion_size, int):
+                                        top_level_hashed_bytes += companion_size
+                            with _trusted_logical_scan_path(
+                                pinned_single_file.path,
+                                str(single_file_logical_path),
+                            ):
+                                file_result = scan_file(pinned_single_file.path, target_config)
+                            _rebase_pinned_shard_result(file_result, pinned_single_file.path, target)
+                            _rebase_pinned_shard_result(
+                                file_result,
+                                str(Path(pinned_single_file.path).parent),
+                                str(single_file_logical_path.parent),
+                            )
+                            _rebase_pinned_shard_result(
+                                file_result,
+                                os.path.realpath(Path(pinned_single_file.path).parent),
+                                str(single_file_logical_path.parent),
+                            )
+                        if pinned_single_file.changed_during_scan:
+                            file_result.merge(_local_source_boundary_failure_scan_result(local_source_report_path))
+                    else:
+                        with _trusted_logical_scan_path(target, str(single_file_logical_path)):
+                            file_result = scan_file(target, target_config)
+                    if single_file_preflight_result is None:
+                        file_result.bytes_scanned += single_file_companion_sizes
                 finally:
                     _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -6306,9 +8045,31 @@ def scan_model_directory_or_file(
                     aggregate_hash_complete = False
                     _record_dvc_output_limit_incomplete(results, scan_metadata, path, single_dvc_resolution)
 
-        if expected_local_source_receipt is not None and not _local_source_receipts_match(
-            expected_local_source_receipt,
-            _snapshot_local_source_receipt(path),
+        if local_source_initial_namespace is not None:
+            try:
+                terminal_local_source_namespace = _capture_directory_owner_namespace(
+                    Path(path),
+                    None,
+                    deadline=start_time + timeout,
+                    max_entries=local_source_namespace_max_entries,
+                    trusted_root_symlink=bound_local_source_path is not None,
+                )
+            except (OSError, RuntimeError, TimeoutError) as error:
+                raise _LocalSourceBoundaryError("local source namespace changed after scanning") from error
+            if _directory_owner_snapshot_changed_paths(
+                local_source_initial_namespace,
+                terminal_local_source_namespace,
+            ):
+                raise _LocalSourceBoundaryError("local source namespace changed during scanning")
+        if local_source_bound_guard is not None and local_source_bound_guard.changed():
+            raise _LocalSourceBoundaryError("retained local source changed during scanning")
+        if (
+            local_source_bound_guard is None
+            and expected_local_source_receipt is not None
+            and not _local_source_receipts_match(
+                expected_local_source_receipt,
+                _snapshot_local_source_receipt(local_source_report_path),
+            )
         ):
             raise _LocalSourceBoundaryError("local source changed during scanning")
 
@@ -6320,33 +8081,15 @@ def scan_model_directory_or_file(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
         )
     except Exception as e:
-        report_path = _redacted_scan_path_for_reporting(path)
+        report_path = _redacted_scan_path_for_reporting(local_source_report_path)
         if isinstance(e, _LocalSourceBoundaryError):
-            from .scanner_results import Check as ScanCheck
-
             scan_metadata["success"] = False
             scan_metadata["has_operational_errors"] = True
-            results.checks.append(
-                ScanCheck(
-                    name="Local Source Boundary Check",
-                    status=CheckStatus.FAILED,
-                    message="Validated local source changed during scan dispatch; scan coverage is incomplete.",
-                    severity=IssueSeverity.INFO,
-                    location=report_path,
-                    details={
-                        "path": report_path,
-                        "reason": "local_source_changed_during_scan",
-                        "analysis_incomplete": True,
-                        "operational_error": True,
-                        "scan_outcome": "inconclusive",
-                        "scan_outcome_reason": "source_boundary_changed",
-                    },
-                )
-            )
+            _record_local_source_boundary_failure(results, local_source_report_path)
             aggregate_hash_complete = False
         else:
-            report_error = _redacted_scan_error_for_reporting(e, path)
-            if is_stream_url(path):
+            report_error = _redacted_scan_error_for_reporting(e, local_source_report_path)
+            if is_stream_url(local_source_report_path):
                 logger.error(f"Error during scan: {report_error}")
             else:
                 logger.exception(f"Error during scan: {report_error}")
@@ -6360,9 +8103,30 @@ def scan_model_directory_or_file(
             )
             _add_error_asset_to_results(results, report_path)
     finally:
-        _close_windows_shard_guards(windows_shard_guards)
-        pickle_source_snapshot_stack.close()
-        _deactivate_safetensors_index_inspection_context(index_context_token)
+        try:
+            if bound_local_source_path is not None and resolved_local_source_path is not None:
+                results = _rebase_local_source_result(
+                    results,
+                    bound_local_source_path,
+                    resolved_local_source_path,
+                    local_source_report_path,
+                )
+                if (
+                    bound_local_source_is_lexical_link
+                    and expected_local_source_receipt is not None
+                    and expected_local_source_receipt.get("mode_type") == stat.S_IFDIR
+                ):
+                    results = _rebase_symlinked_local_source_directory_descendants(
+                        results,
+                        local_source_report_path,
+                        resolved_local_source_path,
+                    )
+        finally:
+            path = local_source_report_path
+            local_source_boundary_stack.close()
+            _close_windows_shard_guards(windows_shard_guards)
+            pickle_source_snapshot_stack.close()
+            _deactivate_safetensors_index_inspection_context(index_context_token)
 
     # Final timing is handled by finalize_statistics()
 
@@ -6780,7 +8544,7 @@ def _preserve_hf_download_sidecar_asset(
     return _has_hf_download_metadata_sidecar(path)
 
 
-@cached_scan()
+@cached_scan(cache_identity_config_key=_BOUND_CACHE_IDENTITY_CONFIG_KEY)
 def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.
@@ -6803,7 +8567,13 @@ def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
 
     # Delegate to internal implementation - cache decorator handles caching
     try:
-        return _scan_file_internal(path, config)
+        result = _scan_file_internal(path, config)
+        cache_identity_binding = config.get(_BOUND_CACHE_IDENTITY_CONFIG_KEY)
+        if isinstance(cache_identity_binding, CacheIdentityBinding) and os.path.normcase(
+            os.path.abspath(cache_identity_binding.scan_path)
+        ) == os.path.normcase(os.path.abspath(path)):
+            _rebase_pinned_shard_result(result, path, cache_identity_binding.identity_path)
+        return result
     finally:
         _deactivate_safetensors_index_inspection_context(index_context_token)
 
@@ -7003,7 +8773,18 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         format_probe_error = e
 
     try:
-        header_format = "unknown" if format_probe_error is not None else detect_file_format(path)
+        follow_validated_symlink = _is_validated_bound_source_path(path, config)
+        if follow_validated_symlink:
+            config[VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY] = True
+        header_format = (
+            "unknown"
+            if format_probe_error is not None
+            else (
+                detect_file_format(path, follow_validated_symlink=True)
+                if follow_validated_symlink and detect_file_format is _VALIDATED_SYMLINK_DETECT_FILE_FORMAT
+                else detect_file_format(path)
+            )
+        )
     except OSError as e:
         # Dedicated scanners can produce a format-specific inconclusive result
         # once extension routing selects their ownership.
@@ -7031,7 +8812,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         magic_format = header_format
     else:
         try:
-            magic_format = detect_file_format_from_magic(path)
+            magic_format = (
+                detect_file_format_from_magic(path, follow_validated_symlink=True)
+                if follow_validated_symlink
+                and detect_file_format_from_magic is _VALIDATED_SYMLINK_DETECT_FILE_FORMAT_FROM_MAGIC
+                else detect_file_format_from_magic(path)
+            )
         except OSError as e:
             magic_format = "unknown"
             format_probe_error = e
@@ -7291,6 +9077,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
             else None
         )
+        if (
+            config.get(JAX_VERIFIED_ORBAX_SIBLING_CONFIG_KEY) is True
+            and Path(path).name.lower() == "metadata.json"
+            and scanner_selection.allows("jax_checkpoint")
+        ):
+            scanner_id = "jax_checkpoint"
     except ZipPreflightRejected as exc:
         merge_safetensors_overlap_analysis(
             path,
@@ -7802,6 +9594,35 @@ def scan_model_streaming(
 
     start_time = time.time()
     results = create_initial_audit_result()
+    local_source_report_root = str(scan_root) if scan_root is not None else None
+    local_source_boundary_stack = ExitStack()
+    bound_local_source_path: str | None = None
+    resolved_local_source_path: str | None = None
+    local_source_receipt_value = kwargs.pop(_LOCAL_SOURCE_RECEIPT_CONFIG_KEY, None)
+    expected_local_source_receipt = _validated_local_source_receipt(local_source_receipt_value)
+    local_source_bound_guard_value = kwargs.pop(_LOCAL_SOURCE_BOUND_GUARD_CONFIG_KEY, None)
+    local_source_bound_guard = (
+        local_source_bound_guard_value if isinstance(local_source_bound_guard_value, _BoundLocalSourceGuard) else None
+    )
+    owned_local_source_guard: _BoundLocalSourceGuard | None = None
+    bound_local_source_is_lexical_link = False
+    local_source_initial_namespace: tuple[_DirectoryOwnerSnapshotEntry, ...] | None = None
+    initial_local_source_entries: dict[tuple[str, ...], _DirectoryOwnerSnapshotEntry] = {}
+    original_local_source_entry_paths: set[tuple[str, ...]] = set()
+    observed_local_source_artifacts: set[tuple[str, ...]] = set()
+    local_source_namespace_was_extended = False
+    if expected_local_source_receipt is not None and local_source_bound_guard is None:
+        current_receipt = (
+            _snapshot_local_source_receipt(local_source_report_root) if local_source_report_root is not None else None
+        )
+        if not _local_source_receipts_match(expected_local_source_receipt, current_receipt):
+            _record_local_source_boundary_failure(results, local_source_report_root or "<local-stream>")
+            close_generator = getattr(file_generator, "close", None)
+            if callable(close_generator):
+                with suppress(Exception):
+                    close_generator()
+            results.finalize_statistics()
+            return results
     file_hashes: list[str] = []
     hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     hashed_stream_file_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
@@ -7810,15 +9631,35 @@ def scan_model_streaming(
     counted_onnx_external_data_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     counted_onnx_external_data_targets: set[_FileTargetIdentityKey] = set()
     consumed_onnx_external_data_aliases: dict[Path, _FileTargetIdentityKey] = {}
+    terminal_hf_alias_targets: dict[Path, dict[str, int | str]] = {}
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
     skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
     scan_kwargs = normalize_scanner_selection_config(kwargs)
+    local_source_snapshot_max_entries_value = scan_kwargs.get(
+        "max_directory_owner_snapshot_entries",
+        _DEFAULT_MAX_DIRECTORY_OWNER_SNAPSHOT_ENTRIES,
+    )
+    local_source_snapshot_max_entries = (
+        local_source_snapshot_max_entries_value
+        if isinstance(local_source_snapshot_max_entries_value, int)
+        and not isinstance(local_source_snapshot_max_entries_value, bool)
+        and local_source_snapshot_max_entries_value > 0
+        else _DEFAULT_MAX_DIRECTORY_OWNER_SNAPSHOT_ENTRIES
+    )
+    local_source_snapshot_max_entries = max(
+        local_source_snapshot_max_entries,
+        _DEFAULT_MAX_DIRECTORY_OWNER_SNAPSHOT_ENTRIES,
+    )
     try:
         max_total_size = int(scan_kwargs.get("max_total_size", 0) or 0)
     except (TypeError, ValueError):
         max_total_size = 0
+    try:
+        max_file_size = int(scan_kwargs.get("max_file_size", 0) or 0)
+    except (TypeError, ValueError):
+        max_file_size = 0
     scanner_selection = policy_from_config(scan_kwargs)
     scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
     if scanner_selection.active:
@@ -7832,6 +9673,7 @@ def scan_model_streaming(
     deleted_streamed_sources: set[str] = set()
     deleted_streamed_index_candidates: set[tuple[str, str]] = set()
     deferred_streamed_index_deletions: dict[Path, tuple[_FileIdentitySnapshot, str, bool]] = {}
+    deferred_streamed_index_logical_paths: dict[Path, set[str]] = {}
     observed_streamed_safetensors_shard_parents: set[str] = set()
     validated_shard_targets: ValidatedShardTargets = {}
     stream_windows_shard_guards: _WindowsShardGuards = []
@@ -8279,6 +10121,9 @@ def scan_model_streaming(
                     retained_content_hash,
                     delete_after_scan,
                 )
+            deferred_streamed_index_logical_paths.setdefault(retained_source_path, set()).add(
+                normalized_stream_path(source_path)
+            )
             return
         if not delete_after_scan:
             return
@@ -8354,7 +10199,10 @@ def scan_model_streaming(
                 expected_content_hash=expected_content_hash,
                 require_content_hash=True,
             )
+            if not (source_path.exists() or source_path.is_symlink()):
+                deleted_streamed_sources.update(deferred_streamed_index_logical_paths.get(source_path, set()))
         deferred_streamed_index_deletions.clear()
+        deferred_streamed_index_logical_paths.clear()
 
     def adjusted_streamed_bytes(bytes_scanned: object, source_bytes_preaccounted: int) -> int:
         """Return an item's new byte contribution after exact-once source accounting."""
@@ -8362,19 +10210,24 @@ def scan_model_streaming(
             raise ValueError("Streamed scan bytes must be a non-negative integer")
         return max(bytes_scanned - source_bytes_preaccounted, 0)
 
-    def record_max_total_size_failure(location: str) -> bool:
+    def record_max_total_size_failure(location: str, *, projected_total: int | None = None) -> bool:
         """Record the shared streaming size failure after any accounting contribution."""
         nonlocal aggregate_hash_complete, preserve_shard_reconciliation_errors
 
-        if max_total_size <= 0 or results.bytes_scanned <= max_total_size:
+        observed_total = results.bytes_scanned if projected_total is None else projected_total
+        if max_total_size <= 0 or observed_total <= max_total_size:
             return False
         aggregate_hash_complete = False
         _add_issue_to_model(
             results,
-            f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
+            f"Total scan size limit exceeded: {observed_total} bytes (max: {max_total_size})",
             severity=IssueSeverity.INFO.value,
             location=location,
-            details={"max_total_size": max_total_size, "analysis_incomplete": True},
+            details={
+                "max_total_size": max_total_size,
+                "projected_total_size": observed_total,
+                "analysis_incomplete": True,
+            },
         )
         results.has_errors = True
         preserve_shard_reconciliation_errors = True
@@ -8613,23 +10466,145 @@ def scan_model_streaming(
             progress_label=companion_path.name,
         )
 
-    base_dir = Path(scan_root).resolve() if scan_root is not None else None
-    configured_index_search_root = _shard_index_search_root_from_config(scan_kwargs)
-    stream_index_search_root = configured_index_search_root or (str(base_dir) if base_dir is not None else None)
-    canonical_stream_index_search_root = (
-        canonical_stream_directory(stream_index_search_root) if stream_index_search_root is not None else None
-    )
-    hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
-    is_hf_cache = base_dir is not None and hf_cache_root is not None
-    scanner_selection_skip_extensions = (
-        None if is_hf_cache and scanner_selection.active else scanner_selection_extensions
-    )
-    stream_started = False
-    configured_index_context = scan_kwargs.get(_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY)
-    index_context_token, index_inspection_context = _activate_safetensors_index_inspection_context(
-        configured_index_context if isinstance(configured_index_context, _SafetensorsIndexInspectionContext) else None
-    )
-    scan_kwargs[_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY] = index_inspection_context
+    try:
+        if (
+            local_source_bound_guard is None
+            and expected_local_source_receipt is None
+            and local_source_report_root is not None
+            and not is_stream_url(local_source_report_root)
+            and not (
+                isinstance(_trusted_shard_family_root, _TrustedStreamShardRoot)
+                and _trusted_shard_family_root.token is _TRUSTED_STREAM_SHARD_ROOT_TOKEN
+            )
+        ):
+            if os.name == "posix":
+                try:
+                    owned_local_source_guard = _open_bound_local_source(local_source_report_root)
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise _LocalSourceBoundaryError("local streaming source could not be retained") from error
+                local_source_bound_guard = owned_local_source_guard
+                expected_local_source_receipt = owned_local_source_guard.receipt
+                local_source_boundary_stack.callback(owned_local_source_guard.close)
+            elif os.name == "nt":
+                expected_local_source_receipt = _snapshot_local_source_receipt(local_source_report_root)
+                if expected_local_source_receipt is None:
+                    raise _LocalSourceBoundaryError("local streaming source could not be retained")
+        if local_source_bound_guard is not None:
+            if (
+                expected_local_source_receipt is None
+                or not _local_source_receipts_match(expected_local_source_receipt, local_source_bound_guard.receipt)
+                or local_source_bound_guard.changed()
+            ):
+                raise _LocalSourceBoundaryError("retained local source changed before streaming traversal")
+            bound_local_source_path = local_source_bound_guard.bound_path
+            resolved_path_value = expected_local_source_receipt.get("resolved_path")
+            if not isinstance(resolved_path_value, str):
+                raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
+            resolved_local_source_path = resolved_path_value
+            bound_local_source_is_lexical_link = bool(
+                local_source_bound_guard.guarded_entries
+                and local_source_bound_guard.guarded_entries[-1][3].get("mode_type") == stat.S_IFLNK
+            )
+            scan_root = bound_local_source_path
+        elif expected_local_source_receipt is not None:
+            current_receipt = (
+                _snapshot_local_source_receipt(local_source_report_root)
+                if local_source_report_root is not None
+                else None
+            )
+            if not _local_source_receipts_match(expected_local_source_receipt, current_receipt):
+                raise _LocalSourceBoundaryError("local source changed before streaming traversal")
+            local_source_boundary_stack.enter_context(
+                _retain_windows_local_source_guards(
+                    local_source_report_root or "<local-stream>",
+                    expected_local_source_receipt,
+                )
+            )
+            if expected_local_source_receipt.get("mode_type") == stat.S_IFDIR and os.name == "posix":
+                bound_local_source_path = local_source_boundary_stack.enter_context(
+                    _bound_local_source_directory(
+                        local_source_report_root or "<local-stream>", expected_local_source_receipt
+                    )
+                )
+                resolved_path_value = expected_local_source_receipt.get("resolved_path")
+                if not isinstance(resolved_path_value, str):
+                    raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
+                resolved_local_source_path = resolved_path_value
+                original_close = getattr(file_generator, "close", None)
+                if callable(original_close):
+                    original_close()
+                from .utils.helpers.file_iterator import iterate_files_streaming
+
+                file_generator = iterate_files_streaming(bound_local_source_path)
+                scan_root = bound_local_source_path
+    except Exception:
+        local_source_boundary_stack.close()
+        _record_local_source_boundary_failure(results, local_source_report_root or "<local-stream>")
+        close_generator = getattr(file_generator, "close", None)
+        if callable(close_generator):
+            with suppress(Exception):
+                close_generator()
+        results.finalize_statistics()
+        return results
+
+    try:
+        base_dir = (
+            Path(scan_root).absolute()
+            if scan_root is not None and bound_local_source_path is not None
+            else (Path(scan_root).resolve() if scan_root is not None else None)
+        )
+        if (
+            base_dir is not None
+            and expected_local_source_receipt is not None
+            and expected_local_source_receipt.get("mode_type") == stat.S_IFDIR
+        ):
+            try:
+                local_source_initial_namespace = _capture_directory_owner_namespace(
+                    base_dir,
+                    None,
+                    deadline=start_time + timeout,
+                    max_entries=local_source_snapshot_max_entries,
+                    trusted_root_symlink=bound_local_source_path is not None,
+                )
+            except (OSError, RuntimeError, TimeoutError) as error:
+                raise _LocalSourceBoundaryError("local streaming namespace could not be retained") from error
+            initial_local_source_entries = {entry.relative_parts: entry for entry in local_source_initial_namespace}
+            original_local_source_entry_paths = set(initial_local_source_entries)
+        configured_index_search_root = _shard_index_search_root_from_config(scan_kwargs)
+        stream_index_search_root = configured_index_search_root or (str(base_dir) if base_dir is not None else None)
+        canonical_stream_index_search_root = (
+            canonical_stream_directory(stream_index_search_root) if stream_index_search_root is not None else None
+        )
+        hf_cache_root = (
+            _find_hf_cache_root(
+                Path(resolved_local_source_path) if resolved_local_source_path is not None else base_dir
+            )
+            if base_dir is not None
+            else None
+        )
+        is_hf_cache = base_dir is not None and hf_cache_root is not None
+        scanner_selection_skip_extensions = (
+            None if is_hf_cache and scanner_selection.active else scanner_selection_extensions
+        )
+        stream_started = False
+        configured_index_context = scan_kwargs.get(_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY)
+        index_context_token, index_inspection_context = _activate_safetensors_index_inspection_context(
+            configured_index_context
+            if isinstance(configured_index_context, _SafetensorsIndexInspectionContext)
+            else None
+        )
+        scan_kwargs[_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY] = index_inspection_context
+    except Exception as error:
+        close_generator = getattr(file_generator, "close", None)
+        if callable(close_generator):
+            with suppress(Exception):
+                close_generator()
+        local_source_boundary_stack.close()
+        if isinstance(error, _LocalSourceBoundaryError):
+            _record_local_source_boundary_failure(results, local_source_report_root or "<local-stream>")
+            results.finalize_statistics()
+            return results
+        raise
 
     try:
         try:
@@ -8710,9 +10685,132 @@ def scan_model_streaming(
                 raise ValueError("Streamed items must contain two, three, or four values")
             if precomputed_result is not None and not isinstance(precomputed_result, ScanResult):
                 raise TypeError("Invalid precomputed streamed scan result")
-            source_path = Path(file_path)
-            report_path = reported_source_path or str(source_path)
             is_precomputed_streamed_result = precomputed_result is not None
+            yielded_source_path = Path(file_path)
+            yielded_source_key = Path(os.path.abspath(yielded_source_path))
+            report_path = reported_source_path or str(yielded_source_path)
+            source_path = yielded_source_path
+            logical_source_path = source_path
+            preserve_stream_family_path = bool(
+                ShardedModelDetector.match_shard_filename(yielded_source_path.name) is not None
+                or yielded_source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
+            )
+            if (
+                not is_precomputed_streamed_result
+                and bound_local_source_path is not None
+                and local_source_report_root is not None
+                and not preserve_stream_family_path
+            ):
+                try:
+                    relative_source = Path(os.path.abspath(yielded_source_path)).relative_to(
+                        Path(os.path.abspath(local_source_report_root))
+                    )
+                except ValueError:
+                    pass
+                else:
+                    source_path = Path(bound_local_source_path).joinpath(*relative_source.parts)
+            local_source_relative_parts: tuple[str, ...] | None = None
+            if initial_local_source_entries and not is_precomputed_streamed_result:
+                assert base_dir is not None
+                relative_roots = [
+                    Path(os.path.abspath(local_source_report_root)) if local_source_report_root is not None else None,
+                    Path(os.path.abspath(base_dir)) if base_dir is not None else None,
+                ]
+                for relative_root in relative_roots:
+                    if relative_root is None:
+                        continue
+                    try:
+                        relative_path = Path(os.path.abspath(yielded_source_path)).relative_to(relative_root)
+                    except ValueError:
+                        continue
+                    local_source_relative_parts = relative_path.parts
+                    break
+                if local_source_relative_parts is None:
+                    raise _LocalSourceBoundaryError("streamed local source escaped its retained root")
+                expected_stream_entry = initial_local_source_entries.get(local_source_relative_parts)
+                guarded_stream_path = Path(base_dir).joinpath(*local_source_relative_parts)
+                try:
+                    guarded_stream_entry = _directory_owner_snapshot_entry(
+                        guarded_stream_path,
+                        local_source_relative_parts,
+                    )
+                except OSError as error:
+                    raise _LocalSourceBoundaryError("streamed local source changed before processing") from error
+                extended_index_generation_changed = bool(
+                    expected_stream_entry is not None
+                    and local_source_relative_parts not in original_local_source_entry_paths
+                    and yielded_source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
+                    and not _directory_owner_snapshot_entries_match(expected_stream_entry, guarded_stream_entry)
+                )
+                if expected_stream_entry is None or extended_index_generation_changed:
+                    if guarded_stream_entry.entry_type not in {"file", "link"}:
+                        raise _LocalSourceBoundaryError("streamed local source changed before processing")
+                    for parent_depth in range(len(local_source_relative_parts)):
+                        parent_parts = local_source_relative_parts[:parent_depth]
+                        parent_path = Path(base_dir).joinpath(*parent_parts)
+                        try:
+                            parent_stat = os.stat(parent_path) if not parent_parts else parent_path.lstat()
+                            current_parent_entry = _directory_owner_snapshot_entry(
+                                parent_path,
+                                parent_parts,
+                                entry_stat=parent_stat,
+                            )
+                        except OSError as error:
+                            raise _LocalSourceBoundaryError(
+                                "streamed local source changed before processing"
+                            ) from error
+                        previous_parent_entry = initial_local_source_entries.get(parent_parts)
+                        if previous_parent_entry is not None:
+                            if previous_parent_entry.entry_type == "link" and current_parent_entry.entry_type == "link":
+                                if not _directory_owner_snapshot_entries_match(
+                                    previous_parent_entry,
+                                    current_parent_entry,
+                                ):
+                                    raise _LocalSourceBoundaryError("streamed local source changed before processing")
+                                try:
+                                    resolved_parent = parent_path.resolve(strict=True)
+                                except (OSError, RuntimeError) as error:
+                                    raise _LocalSourceBoundaryError(
+                                        "streamed local source changed before processing"
+                                    ) from error
+                                if not is_within_directory(str(base_dir), str(resolved_parent)):
+                                    raise _LocalSourceBoundaryError("streamed local source escaped its retained root")
+                                continue
+                            if (
+                                previous_parent_entry.entry_type != "directory"
+                                or current_parent_entry.entry_type != "directory"
+                                or any(
+                                    getattr(previous_parent_entry, field) != getattr(current_parent_entry, field)
+                                    for field in ("device", "inode", "mode", "raw_link_target")
+                                )
+                            ):
+                                raise _LocalSourceBoundaryError("streamed local source changed before processing")
+                        elif current_parent_entry.entry_type != "directory":
+                            raise _LocalSourceBoundaryError("streamed local source changed before processing")
+                        initial_local_source_entries[parent_parts] = current_parent_entry
+                    initial_local_source_entries[local_source_relative_parts] = guarded_stream_entry
+                    local_source_initial_namespace = tuple(
+                        sorted(initial_local_source_entries.values(), key=lambda entry: entry.relative_parts)
+                    )
+                    local_source_namespace_was_extended = True
+                elif not _directory_owner_snapshot_entries_match(expected_stream_entry, guarded_stream_entry):
+                    _record_local_source_boundary_failure(results, report_path)
+                    preserve_shard_reconciliation_errors = True
+                    aggregate_hash_complete = False
+                    if delete_after_scan:
+                        delete_streamed_source(
+                            yielded_source_path,
+                            "after pre-scan generation change",
+                            defer_safetensors_index=False,
+                            structural_index_identity=_snapshot_file_identity(yielded_source_path),
+                        )
+                    continue
+                observed_local_source_artifacts.add(local_source_relative_parts)
+                for parent_depth in range(1, len(local_source_relative_parts)):
+                    parent_parts = local_source_relative_parts[:parent_depth]
+                    parent_entry = initial_local_source_entries.get(parent_parts)
+                    if parent_entry is not None and parent_entry.entry_type == "link":
+                        observed_local_source_artifacts.add(parent_parts)
             source_key = Path(os.path.abspath(source_path))
             if pretransferred_bytes:
                 if received_pretransferred_bytes or streamed_item_count != 1:
@@ -8733,6 +10831,13 @@ def scan_model_streaming(
             scan_path = source_path
             pinned_scan_context: Any | None = None
             pinned_scan: Any | None = None
+            pinned_local_alias = False
+            pinned_local_source = False
+            pinned_local_alias_companion_paths: dict[str, Path] = {}
+            pinned_companion_targets: dict[str, tuple[str, dict[str, int | str]]] = {}
+            is_hf_cache_symlink = False
+            trusted_hf_alias_target: dict[str, int | str] | None = None
+            trusted_hf_alias_logical_path: str | None = None
             preserve_source_after_scan = is_precomputed_streamed_result
             openvino_scan_companion_path: Path | None = None
             openvino_scan_companion_key: Path | None = None
@@ -8744,6 +10849,7 @@ def scan_model_streaming(
             openvino_sidecar_needs_independent_scan = False
             independent_openvino_sidecar_result: ScanResult | None = None
             independent_openvino_sidecar_path: Path | None = None
+            preflight_scan_result: ScanResult | None = None
             file_hash: str | None = None
             structural_index_classification: bool | None = None
             structural_index_identity: _FileIdentitySnapshot | None = None
@@ -8817,18 +10923,28 @@ def scan_model_streaming(
                     continue
 
                 if base_dir is not None:
+                    logical_source_path = _local_source_logical_path(
+                        source_path,
+                        bound_local_source_path,
+                        resolved_local_source_path,
+                    )
                     resolved_path, is_hf_cache_symlink, entry_unavailable = _resolve_directory_scan_target(
                         source_path,
                         base_dir,
                         is_hf_cache=is_hf_cache,
                         hf_cache_root=hf_cache_root,
                         results=results,
+                        preserve_bound_path=bound_local_source_path is not None,
+                        hf_snapshot_path=logical_source_path,
                     )
                     if entry_unavailable:
                         results.has_errors = True
                         preserve_shard_reconciliation_errors = True
                     if resolved_path is None:
                         continue
+                    if is_hf_cache_symlink:
+                        trusted_hf_alias_target = _snapshot_regular_file_target(resolved_path)
+                        trusted_hf_alias_logical_path = str(logical_source_path)
                     scan_path = resolved_path
                     if not scan_path.is_file():
                         aggregate_hash_complete = False
@@ -8850,12 +10966,15 @@ def scan_model_streaming(
                         continue
                     snapshot_path = Path(os.path.abspath(source_path))
                     route_hf_onnx_alias = is_hf_cache_symlink and _should_scan_hf_cache_alias_lexically_for_onnx(
-                        snapshot_path,
+                        logical_source_path,
                         hf_cache_root,
                     )
-                    if route_hf_onnx_alias:
+                    if (is_hf_cache_symlink and bound_local_source_path is not None) or route_hf_onnx_alias:
                         scan_path = snapshot_path
-                consumed_onnx_external_data_target = consumed_onnx_external_data_aliases.get(source_key)
+                consumed_onnx_external_data_target = consumed_onnx_external_data_aliases.get(
+                    source_key,
+                    consumed_onnx_external_data_aliases.get(yielded_source_key),
+                )
                 if consumed_onnx_external_data_target is not None:
                     source_identity = _snapshot_file_identity(scan_path)
                     source_target_key = _file_target_identity_key(scan_path, source_identity)
@@ -8869,6 +10988,7 @@ def scan_model_streaming(
                         suppress_consumed_onnx_external_data_accounting = True
                     else:
                         consumed_onnx_external_data_aliases.pop(source_key, None)
+                        consumed_onnx_external_data_aliases.pop(yielded_source_key, None)
 
                 # Build config before skip filtering so bin-first OpenVINO
                 # sidecars can wait for their selected XML owner.
@@ -8880,7 +11000,7 @@ def scan_model_streaming(
                 if scan_repository_inventory_context.files:
                     scan_config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = scan_repository_inventory_context
 
-                openvino_sidecar_owner = _openvino_weights_companion_owner(scan_path)
+                openvino_sidecar_owner = _openvino_weights_companion_owner(logical_source_path)
                 if (
                     openvino_sidecar_owner is not None
                     and scanner_selection.allows("openvino")
@@ -8927,8 +11047,8 @@ def scan_model_streaming(
                         logger.debug(f"Skipping non-model file: {source_path}")
                     continue
 
-                if scanner_selection.allows("openvino") and _is_openvino_xml_path(scan_path):
-                    candidate_companion = _openvino_xml_weights_companion(scan_path)
+                if scanner_selection.allows("openvino") and _is_openvino_xml_path(logical_source_path):
+                    candidate_companion = _openvino_xml_weights_companion(logical_source_path)
                     if candidate_companion is not None:
                         openvino_scan_companion_path = candidate_companion
                         openvino_scan_companion_key = Path(os.path.abspath(candidate_companion))
@@ -9065,7 +11185,21 @@ def scan_model_streaming(
                                     str(source_path),
                                     initial_target,
                                 )
-                            pending_pinned_scan_context = _pinned_shard_scan_path(resolved_target, initial_target)
+                            initial_copy_size = initial_target.get("size")
+                            initial_copy_limit = initial_copy_size if isinstance(initial_copy_size, int) else None
+                            for configured_limit in (max_file_size, max_total_size):
+                                if configured_limit > 0:
+                                    initial_copy_limit = (
+                                        configured_limit
+                                        if initial_copy_limit is None
+                                        else min(initial_copy_limit, configured_limit)
+                                    )
+                            pending_pinned_scan_context = _pinned_shard_scan_path(
+                                resolved_target,
+                                initial_target,
+                                copy_max_bytes=initial_copy_limit,
+                                deadline=start_time + timeout,
+                            )
                             pinned_scan = pending_pinned_scan_context.__enter__()
                             pinned_scan_context = pending_pinned_scan_context
                             scan_path = Path(pinned_scan.path)
@@ -9115,6 +11249,299 @@ def scan_model_streaming(
                                 pinned_scan_context.__exit__(type(error), error, error.__traceback__)
                             pinned_scan_context = None
                             record_shard_pin_failure(source_path, error)
+                            preserve_shard_reconciliation_errors = True
+                            aggregate_hash_complete = False
+                            files_processed += 1
+                            continue
+
+                def initial_stream_target(candidate_path: Path) -> dict[str, int | str] | None:
+                    if base_dir is not None:
+                        try:
+                            relative_candidate = Path(os.path.abspath(candidate_path)).relative_to(
+                                Path(os.path.abspath(base_dir))
+                            )
+                        except ValueError:
+                            pass
+                        else:
+                            initial_entry = initial_local_source_entries.get(relative_candidate.parts)
+                            if initial_entry is not None and initial_entry.entry_type == "file":
+                                return {
+                                    "resolved_path": os.path.realpath(candidate_path),
+                                    "device": initial_entry.device,
+                                    "inode": initial_entry.inode,
+                                    "size": initial_entry.size,
+                                    "mtime_ns": initial_entry.mtime_ns,
+                                    "ctime_ns": initial_entry.ctime_ns,
+                                    "nlink": initial_entry.link_count,
+                                }
+                    return _snapshot_regular_file_target(candidate_path)
+
+                def stream_pinned_companions(
+                    logical_scan_path: Path,
+                    openvino_companion: Path | None,
+                    current_scan_config: dict[str, Any],
+                ) -> tuple[
+                    dict[str, tuple[str, dict[str, int | str]]],
+                    dict[str, Path],
+                    tuple[Path, int] | None,
+                ]:
+                    nonlocal aggregate_hash_complete
+                    targets: dict[str, tuple[str, dict[str, int | str]]] = {}
+                    logical_paths: dict[str, Path] = {}
+                    oversized_companion: tuple[Path, int] | None = None
+                    companion_paths: list[Path] = []
+                    context_only_companions: set[Path] = set()
+                    if openvino_companion is not None:
+                        companion_paths.append(openvino_companion)
+                    if scanner_selection.allows("mxnet"):
+                        companion_paths.extend(_mxnet_companion_paths(logical_scan_path))
+                    if scanner_selection.allows("oci_layer"):
+                        context_only_companions.update(_oci_manifest_layer_companion_paths(logical_scan_path))
+                        companion_paths.extend(context_only_companions)
+                    if scanner_selection.allows("onnx") and not _should_defer_hash_for_max_file_size(
+                        str(logical_scan_path),
+                        current_scan_config,
+                    ):
+                        discovered_paths = _streamed_onnx_external_data_hash_paths(
+                            logical_scan_path,
+                            deadline=start_time + timeout,
+                        )
+                        if discovered_paths is None:
+                            aggregate_hash_complete = False
+                        else:
+                            companion_paths.extend(discovered_paths)
+                    for companion_path in dict.fromkeys(companion_paths):
+                        try:
+                            relative_companion_path = str(companion_path.relative_to(logical_scan_path.parent))
+                        except ValueError:
+                            aggregate_hash_complete = False
+                            continue
+                        companion_source = companion_path
+                        if (
+                            is_hf_cache
+                            and hf_cache_root is not None
+                            and _is_hf_cache_snapshot_alias(companion_path, hf_cache_root)
+                        ):
+                            trusted_blobs_root = _trusted_hf_blobs_root(hf_cache_root)
+                            with suppress(OSError, RuntimeError):
+                                resolved_companion = companion_path.resolve(strict=True)
+                                if trusted_blobs_root is not None and is_within_directory(
+                                    str(trusted_blobs_root),
+                                    str(resolved_companion),
+                                ):
+                                    companion_source = resolved_companion
+                        companion_target = initial_stream_target(companion_source)
+                        if companion_target is None:
+                            aggregate_hash_complete = False
+                            continue
+                        context_only = companion_path in context_only_companions
+                        if context_only:
+                            companion_target[CONTEXT_ONLY_COMPANION_TARGET_KEY] = 1
+                        companion_size = companion_target.get("size")
+                        if (
+                            not context_only
+                            and isinstance(companion_size, int)
+                            and _should_defer_hash_for_max_file_size(
+                                str(companion_path),
+                                current_scan_config,
+                                file_size=companion_size,
+                            )
+                        ):
+                            oversized_companion = (companion_path, companion_size)
+                            continue
+                        targets[relative_companion_path] = (
+                            str(companion_target["resolved_path"]),
+                            companion_target,
+                        )
+                        logical_paths[relative_companion_path] = companion_path
+                    return targets, logical_paths, oversized_companion
+
+                def projected_stage_total(
+                    primary_path: Path,
+                    primary_target: dict[str, int | str],
+                    companion_targets: Mapping[str, tuple[str, dict[str, int | str]]],
+                    companion_paths: Mapping[str, Path],
+                    *,
+                    primary_already_accounted: bool,
+                ) -> int:
+                    """Project only unique, not-yet-accounted bytes that private staging would add."""
+                    staged_bytes = results.bytes_scanned
+                    seen_targets: set[tuple[object, ...]] = set()
+
+                    def contribution(
+                        path: Path,
+                        candidate_target: dict[str, int | str],
+                        already_accounted: bool,
+                    ) -> int:
+                        if candidate_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY):
+                            return 0
+                        target_key = _file_target_identity_key(path, _snapshot_file_identity(path))
+                        logical_path_key = Path(os.path.abspath(path))
+                        stable_key: tuple[object, ...] = (
+                            candidate_target.get("device"),
+                            candidate_target.get("inode"),
+                            candidate_target.get("size"),
+                            candidate_target.get("mtime_ns"),
+                            candidate_target.get("ctime_ns"),
+                        )
+                        if stable_key in seen_targets:
+                            return 0
+                        seen_targets.add(stable_key)
+                        accounted_target_keys = (
+                            hashed_stream_file_hashes_by_target.keys()
+                            | hashed_stream_source_hashes_by_target.keys()
+                            | counted_onnx_external_data_targets
+                        )
+                        accounted_by_validated_identity = any(
+                            len(accounted_key) >= 7
+                            and accounted_key[0] == "stat"
+                            and (
+                                accounted_key[1],
+                                accounted_key[2],
+                                accounted_key[4],
+                                accounted_key[5],
+                                accounted_key[6],
+                            )
+                            == stable_key
+                            for accounted_key in accounted_target_keys
+                        )
+                        if (
+                            already_accounted
+                            or (
+                                target_key is not None
+                                and consumed_onnx_external_data_aliases.get(logical_path_key) == target_key
+                            )
+                            or (
+                                target_key is not None
+                                and (
+                                    target_key in hashed_stream_file_hashes_by_target
+                                    or target_key in hashed_stream_source_hashes_by_target
+                                    or target_key in counted_onnx_external_data_targets
+                                )
+                            )
+                            or accounted_by_validated_identity
+                        ):
+                            return 0
+                        target_size = candidate_target.get("size")
+                        return target_size if isinstance(target_size, int) else 0
+
+                    staged_bytes += contribution(primary_path, primary_target, primary_already_accounted)
+                    for relative_name, (_resolved_path, companion_target) in companion_targets.items():
+                        companion_path = companion_paths.get(relative_name)
+                        if companion_path is None:
+                            continue
+                        staged_bytes += contribution(companion_path, companion_target, False)
+                    return staged_bytes
+
+                pin_target: dict[str, int | str] | None = None
+                pin_resolved_path: str | None = None
+                pin_logical_path = logical_source_path
+                pin_is_alias = False
+                pin_requires_regular_path = False
+                if is_hf_cache_symlink and not initial_shard_target:
+                    pin_target = trusted_hf_alias_target
+                    candidate_pin_resolved_path = pin_target.get("resolved_path") if pin_target is not None else None
+                    pin_resolved_path = (
+                        candidate_pin_resolved_path if isinstance(candidate_pin_resolved_path, str) else None
+                    )
+                    pin_logical_path = (
+                        Path(trusted_hf_alias_logical_path)
+                        if trusted_hf_alias_logical_path is not None
+                        else logical_source_path
+                    )
+                    pin_is_alias = True
+                elif (
+                    bound_local_source_path is not None and not initial_shard_target and not preserve_stream_family_path
+                ):
+                    pin_target = initial_stream_target(scan_path)
+                    candidate_pin_resolved_path = pin_target.get("resolved_path") if pin_target is not None else None
+                    pin_resolved_path = (
+                        candidate_pin_resolved_path if isinstance(candidate_pin_resolved_path, str) else None
+                    )
+                    pin_requires_regular_path = True
+
+                if pin_target is not None or pin_is_alias or pin_requires_regular_path:
+                    source_size = pin_target.get("size") if pin_target is not None else None
+                    if not isinstance(pin_resolved_path, str) or not isinstance(source_size, int):
+                        _record_local_source_boundary_failure(results, report_path)
+                        preserve_shard_reconciliation_errors = True
+                        aggregate_hash_complete = False
+                        files_processed += 1
+                        continue
+                    assert pin_target is not None
+                    oversized_companion: tuple[Path, int] | None = None
+                    pinned_companion_targets = {}
+                    if _should_defer_hash_for_max_file_size(
+                        str(pin_logical_path),
+                        scan_config,
+                        file_size=source_size,
+                    ):
+                        pinned_local_alias_companion_paths = {}
+                        preflight_scan_result = _max_file_size_failure_scan_result(
+                            report_path,
+                            source_size,
+                            max_file_size,
+                        )
+                        aggregate_hash_complete = False
+                    else:
+                        (
+                            pinned_companion_targets,
+                            pinned_local_alias_companion_paths,
+                            oversized_companion,
+                        ) = stream_pinned_companions(
+                            pin_logical_path,
+                            openvino_scan_companion_path,
+                            scan_config,
+                        )
+                    if oversized_companion is not None:
+                        oversized_path, oversized_size = oversized_companion
+                        preflight_scan_result = _max_file_size_failure_scan_result(
+                            str(oversized_path),
+                            oversized_size,
+                            max_file_size,
+                        )
+                        aggregate_hash_complete = False
+                    if preflight_scan_result is None:
+                        projected_stage_bytes = projected_stage_total(
+                            pin_logical_path,
+                            pin_target,
+                            pinned_companion_targets,
+                            pinned_local_alias_companion_paths,
+                            primary_already_accounted=suppress_consumed_onnx_external_data_accounting,
+                        )
+                        if record_max_total_size_failure(report_path, projected_total=projected_stage_bytes):
+                            break
+                        copy_targets = [
+                            pin_target,
+                            *(target for _path, target in pinned_companion_targets.values()),
+                        ]
+                        try:
+                            pending_pinned_scan_context = _pinned_shard_scan_path(
+                                pin_resolved_path,
+                                pin_target,
+                                logical_path=str(pin_logical_path),
+                                companion_targets=pinned_companion_targets,
+                                require_regular_path=pin_requires_regular_path or bool(pinned_companion_targets),
+                                copy_max_bytes=sum(
+                                    copy_size
+                                    for copy_target in copy_targets
+                                    if not copy_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY)
+                                    if isinstance((copy_size := copy_target.get("size")), int)
+                                ),
+                                deadline=start_time + timeout,
+                            )
+                            pinned_scan = pending_pinned_scan_context.__enter__()
+                            pinned_scan_context = pending_pinned_scan_context
+                            pinned_local_alias = pin_is_alias
+                            pinned_local_source = not pin_is_alias
+                            scan_path = Path(pinned_scan.path)
+                            selected_resolved_path = pin_resolved_path
+                            scan_config["cache_enabled"] = False
+                        except _ShardPinUnavailableError:
+                            if pinned_scan_context is not None:
+                                pinned_scan_context.__exit__(None, None, None)
+                            pinned_scan_context = None
+                            _record_local_source_boundary_failure(results, report_path)
                             preserve_shard_reconciliation_errors = True
                             aggregate_hash_complete = False
                             files_processed += 1
@@ -9214,10 +11641,14 @@ def scan_model_streaming(
                 if progress_callback:
                     progress_callback(f"Scanning {source_path.name}", (files_processed / (files_processed + 1)) * 100)
 
-                scan_result = scan_file(
-                    str(scan_path),
-                    config=scan_config,
-                )
+                if preflight_scan_result is not None:
+                    scan_result = preflight_scan_result
+                else:
+                    with _trusted_logical_scan_path(str(scan_path), str(logical_source_path)):
+                        scan_result = scan_file(
+                            str(scan_path),
+                            config=scan_config,
+                        )
                 if source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX):
                     structural_index_classification, structural_index_identity = classify_structural_safetensors_index(
                         source_path
@@ -9230,6 +11661,20 @@ def scan_model_streaming(
                 )
                 if pinned_scan_context is not None:
                     _rebase_pinned_shard_result(scan_result, str(scan_path), report_path)
+                    if pinned_local_alias or pinned_local_source:
+                        _rebase_pinned_shard_result(
+                            scan_result,
+                            str(scan_path.parent),
+                            str(logical_source_path.parent),
+                        )
+                        pinned_scan_parent = os.path.realpath(scan_path.parent)
+                        _rebase_pinned_shard_result(
+                            scan_result,
+                            pinned_scan_parent,
+                            str(logical_source_path.parent),
+                        )
+                    if (pinned_local_alias or pinned_local_source) and selected_resolved_path != str(scan_path):
+                        _rebase_pinned_shard_result(scan_result, selected_resolved_path, report_path)
                 if source_safetensors_shard_info is not None:
                     post_scan_safetensors_shard_info = ShardedModelDetector.detect_shards(
                         str(source_path),
@@ -9245,15 +11690,17 @@ def scan_model_streaming(
                 if suppress_consumed_onnx_external_data_accounting:
                     scan_result.bytes_scanned = 0
                 openvino_sidecar_needs_independent_scan = (
-                    openvino_scan_companion_path is not None
+                    preflight_scan_result is None
+                    and openvino_scan_companion_path is not None
                     and _openvino_weights_sidecar_needs_independent_scan(
                         openvino_scan_companion_path,
                         scanner_selection,
                     )
                 )
-                if not openvino_sidecar_needs_independent_scan:
-                    scan_result.bytes_scanned += openvino_companion_bytes_scanned
-                scan_result.bytes_scanned += onnx_external_data_bytes_scanned
+                if preflight_scan_result is None:
+                    if not openvino_sidecar_needs_independent_scan:
+                        scan_result.bytes_scanned += openvino_companion_bytes_scanned
+                    scan_result.bytes_scanned += onnx_external_data_bytes_scanned
                 if (
                     openvino_scan_companion_path is not None
                     and openvino_companion_pre_scan_identity is not None
@@ -9306,6 +11753,56 @@ def scan_model_streaming(
                         pinned_scan_context.__exit__(None, None, None)
                         pinned_scan_context = None
                     pinned_target_changed = bool(pinned_scan is not None and pinned_scan.changed_during_scan)
+                    if (
+                        pinned_local_alias
+                        and not pinned_target_changed
+                        and trusted_hf_alias_target is not None
+                        and trusted_hf_alias_logical_path is not None
+                        and (not delete_after_scan or preserve_source_after_scan)
+                    ):
+                        terminal_hf_alias_targets[Path(trusted_hf_alias_logical_path)] = dict(trusted_hf_alias_target)
+                    if (
+                        (pinned_local_alias or pinned_local_source)
+                        and not pinned_target_changed
+                        and is_hf_cache
+                        and (not delete_after_scan or preserve_source_after_scan)
+                    ):
+                        for relative_name, companion_alias_path in pinned_local_alias_companion_paths.items():
+                            companion_target_entry = pinned_companion_targets.get(relative_name)
+                            if companion_target_entry is not None and companion_alias_path.is_symlink():
+                                terminal_hf_alias_targets[companion_alias_path] = dict(companion_target_entry[1])
+                    if (pinned_local_alias or pinned_local_source) and not pinned_target_changed:
+                        for original_companion_path in pinned_local_alias_companion_paths.values():
+                            for companion_root in (
+                                Path(os.path.abspath(local_source_report_root))
+                                if local_source_report_root is not None
+                                else None,
+                                Path(os.path.abspath(base_dir)) if base_dir is not None else None,
+                            ):
+                                if companion_root is None:
+                                    continue
+                                try:
+                                    companion_relative_parts = (
+                                        Path(os.path.abspath(original_companion_path)).relative_to(companion_root).parts
+                                    )
+                                except ValueError:
+                                    continue
+                                if companion_relative_parts in initial_local_source_entries:
+                                    observed_local_source_artifacts.add(companion_relative_parts)
+                                break
+                            original_companion_key = Path(os.path.abspath(original_companion_path))
+                            original_companion_identity = _snapshot_file_identity(original_companion_path)
+                            original_companion_target = _file_target_identity_key(
+                                original_companion_path,
+                                original_companion_identity,
+                            )
+                            if original_companion_target is not None:
+                                consumed_onnx_external_data_aliases[original_companion_key] = original_companion_target
+                    if (pinned_local_alias or pinned_local_source) and pinned_target_changed:
+                        scan_result.merge(_local_source_boundary_failure_scan_result(report_path))
+                        operational_scan_failure = True
+                        preserve_shard_reconciliation_errors = True
+                        aggregate_hash_complete = False
                     final_shard_target = _snapshot_validated_shard_target(
                         str(source_path),
                         resolved_path=selected_resolved_path,
@@ -9447,6 +11944,8 @@ def scan_model_streaming(
                 results.has_errors = True
                 preserve_shard_reconciliation_errors = True
                 aggregate_hash_complete = False
+                if isinstance(e, _LocalSourceBoundaryError):
+                    _record_local_source_boundary_failure(results, report_path)
 
             finally:
                 if pinned_scan_context is not None:
@@ -9473,6 +11972,120 @@ def scan_model_streaming(
         # Source-owned cleanup may mutate retained artifacts. Run it before the
         # final authority proof and leave the outer finally as an exception fallback.
         close_streaming_generator()
+
+        deferred_local_namespace_validation = bool(delete_after_scan and deferred_streamed_index_deletions)
+        if local_source_initial_namespace is not None and base_dir is not None:
+            for validated_target in validated_shard_targets.values():
+                authoritative_index_path = validated_target.get("authoritative_shard_index_path")
+                if not isinstance(authoritative_index_path, str):
+                    continue
+                authority_paths = [Path(authoritative_index_path)]
+                with suppress(OSError, RuntimeError):
+                    resolved_authority_path = authority_paths[0].resolve(strict=True)
+                    if resolved_authority_path != authority_paths[0]:
+                        authority_paths.append(resolved_authority_path)
+                for authority_path in authority_paths:
+                    for source_root in (base_dir, Path(local_source_report_root or base_dir)):
+                        try:
+                            authority_relative = Path(os.path.abspath(authority_path)).relative_to(
+                                Path(os.path.abspath(source_root))
+                            )
+                        except ValueError:
+                            continue
+                        if authority_relative.parts in initial_local_source_entries:
+                            observed_local_source_artifacts.add(authority_relative.parts)
+                        break
+
+        def record_terminal_local_namespace_failure() -> None:
+            nonlocal preserve_shard_reconciliation_errors, aggregate_hash_complete
+            _record_local_source_boundary_failure(results, local_source_report_root or "<local-stream>")
+            preserve_shard_reconciliation_errors = True
+            aggregate_hash_complete = False
+
+        def deleted_local_source_relative_parts() -> set[tuple[str, ...]]:
+            if base_dir is None:
+                return set()
+            deleted_relative_parts: set[tuple[str, ...]] = set()
+            for deleted_source in deleted_streamed_sources:
+                for source_root in (base_dir, Path(local_source_report_root or base_dir)):
+                    try:
+                        deleted_relative = Path(os.path.abspath(deleted_source)).relative_to(
+                            Path(os.path.abspath(source_root))
+                        )
+                    except ValueError:
+                        continue
+                    deleted_relative_parts.add(deleted_relative.parts)
+                    break
+            return deleted_relative_parts
+
+        def validate_terminal_local_namespace() -> None:
+            if local_source_initial_namespace is None or base_dir is None:
+                return
+            expected_artifacts = {
+                entry.relative_parts for entry in local_source_initial_namespace if entry.entry_type in {"file", "link"}
+            }
+            namespace_changed = not expected_artifacts.issubset(observed_local_source_artifacts)
+            try:
+                terminal_namespace = _capture_directory_owner_namespace(
+                    base_dir,
+                    None,
+                    deadline=start_time + timeout,
+                    max_entries=local_source_snapshot_max_entries,
+                    trusted_root_symlink=bound_local_source_path is not None,
+                )
+            except (OSError, RuntimeError, TimeoutError):
+                namespace_changed = True
+            else:
+                namespace_changed = namespace_changed or _terminal_local_namespace_changed(
+                    local_source_initial_namespace,
+                    terminal_namespace,
+                    deleted_relative_parts=(deleted_local_source_relative_parts() if delete_after_scan else set()),
+                )
+            if namespace_changed:
+                record_terminal_local_namespace_failure()
+
+        if not deferred_local_namespace_validation:
+            validate_terminal_local_namespace()
+
+        if local_source_bound_guard is not None and local_source_bound_guard.changed(
+            allow_directory_content_changes=delete_after_scan or local_source_namespace_was_extended,
+        ):
+            _record_local_source_boundary_failure(results, local_source_report_root or "<local-stream>")
+            preserve_shard_reconciliation_errors = True
+            aggregate_hash_complete = False
+        if (
+            local_source_bound_guard is None
+            and expected_local_source_receipt is not None
+            and not _local_source_receipts_match(
+                expected_local_source_receipt,
+                (
+                    _snapshot_local_source_receipt(local_source_report_root)
+                    if local_source_report_root is not None
+                    else None
+                ),
+            )
+        ):
+            _record_local_source_boundary_failure(results, local_source_report_root or "<local-stream>")
+            preserve_shard_reconciliation_errors = True
+            aggregate_hash_complete = False
+
+        for alias_path, expected_target in terminal_hf_alias_targets.items():
+            try:
+                resolved_alias = alias_path.resolve(strict=True)
+                current_target_stat = os.stat(resolved_alias, follow_symlinks=False)
+                expected_resolved_path = expected_target.get("resolved_path")
+                alias_stable = isinstance(expected_resolved_path, str) and os.path.normcase(
+                    os.path.normpath(str(resolved_alias))
+                ) == os.path.normcase(os.path.normpath(expected_resolved_path))
+                alias_stable = alias_stable and _validated_stat_matches_target(
+                    current_target_stat,
+                    expected_target,
+                )
+            except (OSError, RuntimeError):
+                alias_stable = False
+            if not alias_stable:
+                record_terminal_local_namespace_failure()
+                break
 
         for guard_fd, guarded_source, guarded_target in stream_windows_shard_guards:
             if not _windows_shard_guard_is_stable(guard_fd, guarded_target):
@@ -9507,6 +12120,9 @@ def scan_model_streaming(
         revalidate_terminal_streamed_shards(force_content_revalidation=True)
         delete_deferred_streamed_indexes("after terminal SafeTensors authority validation")
 
+        if deferred_local_namespace_validation:
+            validate_terminal_local_namespace()
+
         # Compute aggregate hash from all file hashes
         if file_hashes and aggregate_hash_complete:
             results.content_hash = compute_aggregate_hash(file_hashes)
@@ -9516,6 +12132,14 @@ def scan_model_streaming(
         results.finalize_statistics()
         results.success = not _results_should_be_unsuccessful(results)
 
+    except _LocalSourceBoundaryError as e:
+        logger.error(f"Streaming scan failed: {e}")
+        results.has_errors = True
+        results.success = False
+        aggregate_hash_complete = False
+        preserve_shard_reconciliation_errors = True
+        _record_local_source_boundary_failure(results, local_source_report_root or "<local-stream>")
+        results.finalize_statistics()
     except Exception as e:
         logger.error(f"Streaming scan failed: {e}")
         results.has_errors = True
@@ -9541,5 +12165,29 @@ def scan_model_streaming(
                     "exception_type": type(delete_error).__name__,
                 },
             )
+        try:
+            if (
+                bound_local_source_path is not None
+                and resolved_local_source_path is not None
+                and local_source_report_root is not None
+            ):
+                results = _rebase_local_source_result(
+                    results,
+                    bound_local_source_path,
+                    resolved_local_source_path,
+                    local_source_report_root,
+                )
+                if (
+                    bound_local_source_is_lexical_link
+                    and expected_local_source_receipt is not None
+                    and expected_local_source_receipt.get("mode_type") == stat.S_IFDIR
+                ):
+                    results = _rebase_symlinked_local_source_directory_descendants(
+                        results,
+                        local_source_report_root,
+                        resolved_local_source_path,
+                    )
+        finally:
+            local_source_boundary_stack.close()
 
     return results
