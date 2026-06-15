@@ -9,6 +9,9 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper
 
+import modelaudit.core as core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import onnx_scanner as scanner
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
@@ -203,3 +206,55 @@ def test_quantized_identifiers_are_bounded(tmp_path: Path) -> None:
     context = _coverage(result)["eligible"][0]
     assert len(context["quantization_scale"]) <= 256
     assert context["quantization_scale_truncated"] is True
+
+
+def _external_package(tmp_path: Path) -> tuple[Path, Path]:
+    sidecar = tmp_path / "weights.bin"
+    sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
+    weight = onnx.TensorProto()
+    weight.name = "W"
+    weight.data_type = TensorProto.FLOAT
+    weight.dims.extend([100, 10])
+    weight.data_location = TensorProto.EXTERNAL
+    entry = weight.external_data.add()
+    entry.key = "location"
+    entry.value = sidecar.name
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["X", "W"], ["Y"])],
+        "external",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+        initializer=[weight],
+    )
+    return _save(helper.make_model(graph), tmp_path / "external.onnx", checked=False), sidecar
+
+
+def test_external_data_race_is_uncached_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path, sidecar = _external_package(tmp_path)
+    original = core.scan_file
+
+    def mutate_before_scan(path: str, config: dict[str, Any]) -> Any:
+        sidecar.write_bytes(b"changed")
+        return original(path, config)
+
+    monkeypatch.setattr(core, "scan_file", mutate_before_scan)
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        result = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["onnx"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+        )
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+        assert len(checks) == 1
+        assert checks[0].message == "ONNX external-data sources changed during the model scan"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
