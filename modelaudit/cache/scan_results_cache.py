@@ -3,7 +3,6 @@
 import hashlib
 import json
 import logging
-import marshal
 import os
 import stat
 import struct
@@ -11,26 +10,20 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
     EXTENSION_SUFFIXES,
     SOURCE_SUFFIXES,
-    BuiltinImporter,
-    ExtensionFileLoader,
-    FileFinder,
-    FrozenImporter,
     ModuleSpec,
-    PathFinder,
-    SourceFileLoader,
-    SourcelessFileLoader,
 )
 from pathlib import Path
-from types import CodeType, FunctionType, MethodType, ModuleType
-from typing import Any, BinaryIO, cast
-from zipimport import zipimporter
+from types import ModuleType
+from typing import Any, BinaryIO
+
+import modelaudit_picklescan.call_graph as _picklescan_call_graph
 
 from ..utils.helpers.secure_hasher import SecureFileHasher
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
@@ -45,30 +38,75 @@ _CALL_GRAPH_READ_FINGERPRINT_MAX_BYTES = 4 * _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_
 _MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
 _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
-_MAX_HOOK_IDENTITY_ITEMS = 16
-_MAX_HOOK_IDENTITY_DEPTH = 4
-_UNREUSABLE_HOOK_STATE_IDENTITY = "<unreusable-hook-state>"
 _PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
 _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
-_STANDARD_FILE_FINDER_LOADER_DETAILS = (
-    (ExtensionFileLoader, list(EXTENSION_SUFFIXES)),
-    (SourceFileLoader, list(SOURCE_SUFFIXES)),
-    (SourcelessFileLoader, list(BYTECODE_SUFFIXES)),
+_UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT = (
+    "modelaudit_picklescan.call_graph:unreusable:resolution-context-unavailable",
 )
-_STANDARD_FILE_FINDER_LOADER_IDENTITY = tuple(
-    (loader, tuple(suffixes)) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_DETAILS
+
+
+def _unavailable_source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    unavailable = _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
+    return unavailable, unavailable, unavailable
+
+
+def _unavailable_path_importer_resolution_context(_search_path: Iterable[str]) -> tuple[str, ...]:
+    return _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
+
+
+def _unavailable_current_module_source_path(_module_name: str) -> str | None:
+    return None
+
+
+def _unavailable_search_path_has_untrusted_importer(_search_path: Iterable[str]) -> bool:
+    return True
+
+
+def _unavailable_resolution_context_allows_trusted_cache_population(
+    _before: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    _after: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> bool:
+    return False
+
+
+# Older independent picklescan releases must fail closed as a group instead of
+# binding an earlier, incomplete subset of the resolution helpers.
+_PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE = all(
+    callable(getattr(_picklescan_call_graph, name, None))
+    for name in (
+        "_current_module_source_path",
+        "_path_importer_resolution_context",
+        "_resolution_context_allows_trusted_cache_population",
+        "_search_path_has_untrusted_importer",
+        "_source_resolution_context",
+    )
 )
-_STANDARD_FILE_FINDER_LOADERS = tuple(
-    (suffix, loader) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_IDENTITY for suffix in suffixes
-)
-_STANDARD_FILE_FINDER_PATH_HOOK_CODE = FileFinder.path_hook(*_STANDARD_FILE_FINDER_LOADER_DETAILS).__code__
-_TRUSTED_FILE_FINDER_METHODS = tuple(
-    (name, getattr(FileFinder, name)) for name in ("__init__", "find_spec", "_get_spec", "_fill_cache")
-)
-_TRUSTED_ZIPIMPORTER_METHODS = tuple(
-    (name, getattr(zipimporter, name))
-    for name in ("__init__", "find_spec", "get_code", "get_data", "get_filename", "get_source", "is_package")
-)
+_current_module_source_path: Callable[[str], str | None]
+_path_importer_resolution_context: Callable[[Iterable[str]], tuple[str, ...]]
+_resolution_context_allows_trusted_cache_population: Callable[
+    [
+        tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+        tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    ],
+    bool,
+]
+_search_path_has_untrusted_importer: Callable[[Iterable[str]], bool]
+if _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE:
+    _current_module_source_path = _picklescan_call_graph._current_module_source_path
+    _path_importer_resolution_context = _picklescan_call_graph._path_importer_resolution_context
+    _resolution_context_allows_trusted_cache_population = (
+        _picklescan_call_graph._resolution_context_allows_trusted_cache_population
+    )
+    _search_path_has_untrusted_importer = _picklescan_call_graph._search_path_has_untrusted_importer
+    _picklescan_source_resolution_context = _picklescan_call_graph._source_resolution_context
+else:
+    _current_module_source_path = _unavailable_current_module_source_path
+    _path_importer_resolution_context = _unavailable_path_importer_resolution_context
+    _resolution_context_allows_trusted_cache_population = (
+        _unavailable_resolution_context_allows_trusted_cache_population
+    )
+    _search_path_has_untrusted_importer = _unavailable_search_path_has_untrusted_importer
+    _picklescan_source_resolution_context = _unavailable_source_resolution_context
 
 AncestorEntry = tuple[str, int, int, int, int, int]
 _DARWIN_STABLE_SYMLINK_ALIASES = {
@@ -259,288 +297,44 @@ def _is_sampled_fingerprint(value: object) -> bool:
     return isinstance(value, str) and value.startswith("fingerprint:")
 
 
-def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
-    if value is None or isinstance(value, bool | int | float):
-        return repr(value)
-    if isinstance(value, str):
-        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
-    if isinstance(value, bytes):
-        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
-    if isinstance(value, type):
-        return f"{value.__module__}.{value.__qualname__}:{_UNREUSABLE_HOOK_STATE_IDENTITY}"
-    if isinstance(value, (CodeType, FunctionType, MethodType, ModuleType)):
-        return _UNREUSABLE_HOOK_STATE_IDENTITY
-    if depth >= _MAX_HOOK_IDENTITY_DEPTH:
-        return _UNREUSABLE_HOOK_STATE_IDENTITY
-    if isinstance(value, tuple | list):
-        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
-            return _UNREUSABLE_HOOK_STATE_IDENTITY
-        sequence_identity = ",".join(_bounded_hook_value_identity(item, depth + 1) for item in value)
-        return f"{type(value).__name__}({sequence_identity})"
-    if isinstance(value, dict):
-        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
-            return _UNREUSABLE_HOOK_STATE_IDENTITY
-        mapping_items = sorted(value.items(), key=lambda item: str(item[0]))
-        return (
-            "dict("
-            + ",".join(
-                f"{_bounded_hook_value_identity(key, depth + 1)}:{_bounded_hook_value_identity(item, depth + 1)}"
-                for key, item in mapping_items
-            )
-            + ")"
-        )
-    try:
-        instance_state = object.__getattribute__(value, "__dict__")
-    except (AttributeError, TypeError):
-        return _UNREUSABLE_HOOK_STATE_IDENTITY
-    if not isinstance(instance_state, dict):
-        return _UNREUSABLE_HOOK_STATE_IDENTITY
-    return (
-        f"<{type(value).__module__}.{type(value).__qualname__}:"
-        f"{_bounded_hook_value_identity(instance_state, depth + 1)}>"
-    )
-
-
-def _function_hook_state(function: FunctionType) -> str:
-    closure_values: list[object] = []
-    for cell in function.__closure__ or ():
-        try:
-            closure_values.append(cell.cell_contents)
-        except ValueError:
-            closure_values.append("<empty>")
-    referenced_globals = {
-        name: function.__globals__[name]
-        for name in sorted(set(function.__code__.co_names))
-        if name != "__builtins__" and name in function.__globals__
-    }
-    return "|".join(
-        (
-            f"closure={_bounded_hook_value_identity(tuple(closure_values))}",
-            f"defaults={_bounded_hook_value_identity(function.__defaults__ or ())}",
-            f"kwdefaults={_bounded_hook_value_identity(function.__kwdefaults__ or {})}",
-            f"globals={_bounded_hook_value_identity(referenced_globals)}",
-        )
-    )
-
-
-def _hook_type_methods(hook_type: type[object]) -> tuple[tuple[str, FunctionType], ...]:
-    methods: list[tuple[str, FunctionType]] = []
-    for method_name in ("find_spec", "__call__"):
-        for candidate_type in hook_type.__mro__:
-            method = candidate_type.__dict__.get(method_name)
-            if isinstance(method, (classmethod, staticmethod)):
-                method = method.__func__
-            if isinstance(method, FunctionType):
-                methods.append((method_name, method))
-                break
-    return tuple(methods)
-
-
-def _hook_type_code(hook_type: type[object]) -> bytes:
-    code_parts: list[bytes] = []
-    for _method_name, method in _hook_type_methods(hook_type):
-        code_parts.append(marshal.dumps(method.__code__))
-    return b"".join(code_parts)
-
-
-def _hook_type_state(hook_type: type[object]) -> str:
-    method_states: dict[str, str] = {}
-    class_attributes: dict[str, object] = {}
-    for method_name, method in _hook_type_methods(hook_type):
-        method_states[method_name] = _function_hook_state(method)
-        for attribute_name in sorted(set(method.__code__.co_names)):
-            for candidate_type in hook_type.__mro__:
-                if attribute_name not in candidate_type.__dict__:
-                    continue
-                class_attributes[f"{candidate_type.__module__}.{candidate_type.__qualname__}.{attribute_name}"] = (
-                    candidate_type.__dict__[attribute_name]
-                )
-                break
-    return _bounded_hook_value_identity({"methods": method_states, "class_attributes": class_attributes})
-
-
-def _import_hook_identity(hook: object) -> str:
-    if isinstance(hook, FunctionType):
-        module = hook.__module__
-        qualname = hook.__qualname__
-        code = marshal.dumps(hook.__code__)
-        state = _function_hook_state(hook)
-    elif isinstance(hook, MethodType):
-        function = cast(FunctionType, hook.__func__)
-        module = function.__module__
-        qualname = function.__qualname__
-        code = marshal.dumps(function.__code__)
-        bound_type = hook.__self__ if isinstance(hook.__self__, type) else type(hook.__self__)
-        state = "|".join(
-            (
-                f"type={_hook_type_state(bound_type)}",
-                f"self={_bounded_hook_value_identity(hook.__self__)}",
-                f"function={_function_hook_state(function)}",
-            )
-        )
-    elif isinstance(hook, type):
-        module = hook.__module__
-        qualname = hook.__qualname__
-        code = _hook_type_code(hook)
-        known_class_finder = hook in {BuiltinImporter, FrozenImporter, PathFinder}
-        state = "" if known_class_finder else f"{_UNREUSABLE_HOOK_STATE_IDENTITY}:{_hook_type_state(hook)}"
-    else:
-        hook_type = type(hook)
-        module = hook_type.__module__
-        qualname = hook_type.__qualname__
-        code = _hook_type_code(hook_type)
-        try:
-            instance_state = object.__getattribute__(hook, "__dict__")
-        except (AttributeError, TypeError):
-            instance_state = _UNREUSABLE_HOOK_STATE_IDENTITY
-        instance_identity = _bounded_hook_value_identity(instance_state)
-        virtualenv_module = sys.modules.get("_virtualenv")
-        virtualenv_finder_type = getattr(virtualenv_module, "_Finder", None) if virtualenv_module is not None else None
-        is_virtualenv_finder = isinstance(virtualenv_finder_type, type) and type(hook) is virtualenv_finder_type
-        state = (
-            f"self={instance_identity}"
-            if is_virtualenv_finder
-            else f"type={_hook_type_state(hook_type)}|self={instance_identity}"
-        )
-    digest = hashlib.sha256(code + state.encode()).hexdigest()
-    reuse_marker = "unreusable:" if _UNREUSABLE_HOOK_STATE_IDENTITY in state else ""
-    return f"{module}.{qualname}:{reuse_marker}{digest}"
-
-
-def _path_importer_methods_are_trusted(
-    importer_type: type[object],
-    trusted_methods: tuple[tuple[str, object], ...],
-) -> bool:
-    return all(getattr(importer_type, name, None) is method for name, method in trusted_methods)
-
-
-def _is_standard_file_finder_path_hook(hook: object) -> bool:
-    if not isinstance(hook, FunctionType) or hook.__code__ is not _STANDARD_FILE_FINDER_PATH_HOOK_CODE:
-        return False
-    closure = hook.__closure__ or ()
-    if len(closure) != len(hook.__code__.co_freevars):
-        return False
-    closure_values = dict(zip(hook.__code__.co_freevars, (cell.cell_contents for cell in closure), strict=True))
-    if closure_values.get("cls") is not FileFinder:
-        return False
-    loader_details = closure_values.get("loader_details")
-    if not isinstance(loader_details, tuple):
-        return False
-    try:
-        normalized_details = tuple((loader, tuple(suffixes)) for loader, suffixes in loader_details)
-    except (TypeError, ValueError):
-        return False
-    return normalized_details == _STANDARD_FILE_FINDER_LOADER_IDENTITY
-
-
-def _path_hook_resolution_identity(hook: object) -> str:
-    """Return a reusable identity only for unmodified standard path hooks."""
-    if hook is zipimporter:
-        if _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
-            return "trusted:zipimport.zipimporter"
-        return "zipimport.zipimporter:unreusable:methods-changed"
-    if _is_standard_file_finder_path_hook(hook):
-        if _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
-            return "trusted:importlib.machinery.FileFinder.path_hook"
-        return "importlib.machinery.FileFinder.path_hook:unreusable:methods-changed"
-    return f"untrusted:unreusable:{_import_hook_identity(hook)}"
-
-
-def _string_sequence_identity(values: Iterable[str]) -> str:
-    digest = hashlib.sha256()
-    count = 0
-    for value in values:
-        encoded = value.encode("utf-8", errors="surrogatepass")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
-        count += 1
-    return f"{count}:{digest.hexdigest()}"
-
-
-def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
-    rewrite_module = sys.modules.get("_pytest.assertion.rewrite")
-    finder_type = getattr(rewrite_module, "AssertionRewritingHook", None) if rewrite_module is not None else None
-    if not isinstance(finder_type, type) or type(finder) is not finder_type:
-        return None
-
-    basenames = {str(value) for value in getattr(finder, "_basenames_to_check_rewrite", ())}
-    session = getattr(finder, "session", None)
-    for initial_path in getattr(session, "_initialpaths", ()) if session is not None else ():
-        basenames.add(Path(str(initial_path)).stem)
-    state = "|".join(
-        (
-            _string_sequence_identity(sorted(str(value) for value in getattr(finder, "_must_rewrite", ()))),
-            _string_sequence_identity(str(value) for value in getattr(finder, "fnpats", ())),
-            _string_sequence_identity(sorted(basenames)),
-            repr(bool(getattr(finder, "_writing_pyc", False))),
-        )
-    )
-    digest = hashlib.sha256(_hook_type_code(finder_type) + state.encode()).hexdigest()
-    return f"{finder_type.__module__}.{finder_type.__qualname__}:{digest}"
-
-
-def _meta_path_finder_resolution_identity(finder: object) -> str:
-    return _pytest_assertion_rewrite_identity(finder) or _import_hook_identity(finder)
-
-
-def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
-    try:
-        instance_state = object.__getattribute__(finder, "__dict__")
-    except (AttributeError, TypeError):
-        return False
-    if not isinstance(instance_state, dict):
-        return False
-    if type(finder) is zipimporter:
-        if not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
-            return False
-        try:
-            expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
-        except (AttributeError, ImportError, OSError, TypeError):
-            return False
-        return (
-            isinstance(expected_state, dict)
-            and set(instance_state) == set(expected_state)
-            and instance_state.get("archive") == expected_state.get("archive")
-            and instance_state.get("prefix") == expected_state.get("prefix")
-            and instance_state.get("_files") is expected_state.get("_files")
-        )
-    if type(finder) is not FileFinder:
-        return False
-    if not _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
-        return False
-    finder_path = instance_state.get("path")
-    loaders = instance_state.get("_loaders")
-    return (
-        set(instance_state) <= {"_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache"}
-        and isinstance(finder_path, str)
-        and os.path.abspath(finder_path) == os.path.abspath(cache_key)
-        and isinstance(loaders, list)
-        and tuple(loaders) == _STANDARD_FILE_FINDER_LOADERS
-    )
-
-
 def _source_resolution_context() -> dict[str, list[str]]:
-    nonstandard_importers = []
-    for entry in sys.path:
-        cache_key = entry or os.getcwd()
-        finder = sys.path_importer_cache.get(cache_key)
-        if finder is None or _is_trusted_standard_path_importer(finder, cache_key):
-            continue
-        nonstandard_importers.append(f"{Path(cache_key).absolute()}={_import_hook_identity(finder)}")
+    meta_path, path_hooks, path_importers = _picklescan_source_resolution_context()
     return {
-        "meta_path": [_meta_path_finder_resolution_identity(finder) for finder in sys.meta_path],
-        "path_hooks": [_path_hook_resolution_identity(hook) for hook in sys.path_hooks],
-        "path_importers": nonstandard_importers,
+        "meta_path": list(meta_path),
+        "path_hooks": list(path_hooks),
+        "path_importers": list(path_importers),
     }
 
 
-def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
-    for entry in search_path:
-        cache_key = entry or os.getcwd()
-        finder = sys.path_importer_cache.get(cache_key)
-        if finder is not None and not _is_trusted_standard_path_importer(finder, cache_key):
-            return True
-    return False
+def _parse_resolution_context(
+    value: object,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None:
+    if not isinstance(value, dict):
+        return None
+    parts: list[tuple[str, ...]] = []
+    for name in ("meta_path", "path_hooks", "path_importers"):
+        raw_part = value.get(name)
+        if not isinstance(raw_part, list) or not all(isinstance(identity, str) for identity in raw_part):
+            return None
+        parts.append(tuple(raw_part))
+    return parts[0], parts[1], parts[2]
+
+
+def _path_importer_context_status(search_path: object, resolution_context: object) -> tuple[bool, bool]:
+    if (
+        not isinstance(search_path, list)
+        or not all(isinstance(entry, str) for entry in search_path)
+        or not isinstance(resolution_context, list)
+        or not all(isinstance(identity, str) for identity in resolution_context)
+        or _search_path_has_untrusted_importer(search_path)
+    ):
+        return False, False
+    expected = tuple(resolution_context)
+    current = _path_importer_resolution_context(search_path)
+    if current == expected:
+        return True, False
+    populated = _resolution_context_allows_trusted_cache_population(((), (), expected), ((), (), current))
+    return populated, populated
 
 
 def _loaded_module_source_override(module_name: str) -> tuple[bool, str | None]:
@@ -1894,25 +1688,45 @@ class ScanResultsCache:
         if not isinstance(fingerprint_metadata, dict):
             return False
         if fingerprint_metadata.get("source_independent") is True:
-            return isinstance(metadata, dict) and self._source_independent_call_graph_fingerprints_are_valid(
-                fingerprint_metadata,
-                metadata,
+            return (
+                isinstance(scan_result, dict)
+                and isinstance(metadata, dict)
+                and self._source_independent_call_graph_fingerprints_are_valid(
+                    fingerprint_metadata,
+                    metadata,
+                    scan_result,
+                )
             )
+        if not _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE:
+            return False
         if fingerprint_metadata.get("reusable") is not True:
             return False
         if fingerprint_metadata.get("search_context") != self._source_search_context():
             return False
-        if fingerprint_metadata.get("resolution_context") != _source_resolution_context():
-            return False
+        expected_resolution_context = fingerprint_metadata.get("resolution_context")
+        current_resolution_context = _source_resolution_context()
+        importer_cache_was_populated = expected_resolution_context != current_resolution_context
+        if expected_resolution_context != current_resolution_context:
+            expected_context = _parse_resolution_context(expected_resolution_context)
+            current_context = _parse_resolution_context(current_resolution_context)
+            if (
+                expected_context is None
+                or current_context is None
+                or not _resolution_context_allows_trusted_cache_population(expected_context, current_context)
+            ):
+                return False
         module_sources = fingerprint_metadata.get("module_sources")
         if not isinstance(module_sources, dict):
             return False
+        unresolved_module_sources: list[tuple[str, str]] = []
         for module_name, expected_source in module_sources.items():
             if not isinstance(module_name, str) or not isinstance(expected_source, str):
                 return False
             is_overridden, current_source = _loaded_module_source_override(module_name)
             if is_overridden and current_source != expected_source:
                 return False
+            if not is_overridden:
+                unresolved_module_sources.append((module_name, expected_source))
         loaded_module_sources = fingerprint_metadata.get("loaded_module_sources")
         if not isinstance(loaded_module_sources, dict):
             return False
@@ -1925,21 +1739,49 @@ class ScanResultsCache:
         loaded_package_paths = fingerprint_metadata.get("loaded_package_paths")
         if not isinstance(loaded_package_paths, dict):
             return False
+        loaded_package_resolution_contexts = fingerprint_metadata.get("loaded_package_resolution_contexts", {})
+        if not isinstance(loaded_package_resolution_contexts, dict):
+            return False
+        if set(loaded_package_resolution_contexts) != set(loaded_package_paths):
+            return False
         for module_name, expected_search_path in loaded_package_paths.items():
-            if not isinstance(module_name, str) or not isinstance(expected_search_path, list):
-                return False
-            if not all(isinstance(entry, str) for entry in expected_search_path):
+            if not isinstance(module_name, str):
                 return False
             current_search_path = _loaded_package_search_path(module_name)
             if current_search_path != expected_search_path:
                 return False
-            if current_search_path is None or _search_path_has_untrusted_importer(current_search_path):
+            expected_resolution_context = loaded_package_resolution_contexts.get(module_name)
+            context_is_current, context_was_populated = _path_importer_context_status(
+                current_search_path,
+                expected_resolution_context,
+            )
+            if not context_is_current:
                 return False
+            importer_cache_was_populated |= context_was_populated
         for module_name in module_sources:
             if any(
                 parent_name not in loaded_package_paths for parent_name in _loaded_parent_package_names(module_name)
             ):
                 return False
+        namespace_package_contexts = fingerprint_metadata.get("namespace_package_resolution_contexts")
+        if not isinstance(namespace_package_contexts, dict):
+            return False
+        for module_name, raw_context in namespace_package_contexts.items():
+            if not isinstance(module_name, str) or not isinstance(raw_context, dict):
+                return False
+            search_path = raw_context.get("search_path")
+            expected_resolution_context = raw_context.get("path_importers")
+            context_is_current, context_was_populated = _path_importer_context_status(
+                search_path,
+                expected_resolution_context,
+            )
+            if module_name in sys.modules or not context_is_current:
+                return False
+            importer_cache_was_populated |= context_was_populated
+        if importer_cache_was_populated or namespace_package_contexts:
+            for module_name, expected_source in unresolved_module_sources:
+                if _current_module_source_path(module_name) != expected_source:
+                    return False
         fingerprints = fingerprint_metadata.get("fingerprints")
         if not isinstance(fingerprints, dict) or len(fingerprints) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
             return False
@@ -1986,8 +1828,9 @@ class ScanResultsCache:
     def _source_independent_call_graph_fingerprints_are_valid(
         fingerprint_metadata: dict[str, Any],
         metadata: dict[str, Any],
+        scan_result: dict[str, Any],
     ) -> bool:
-        if fingerprint_metadata != {
+        expected_metadata: dict[str, Any] = {
             "reusable": True,
             "source_independent": True,
             "fingerprints": {},
@@ -1995,7 +1838,11 @@ class ScanResultsCache:
             "module_sources": {},
             "loaded_module_sources": {},
             "loaded_package_paths": {},
-        }:
+        }
+        critical_references_covered = fingerprint_metadata.get("critical_references_covered") is True
+        if critical_references_covered:
+            expected_metadata["critical_references_covered"] = True
+        if fingerprint_metadata != expected_metadata:
             return False
         if not _PICKLE_RESULT_METADATA_KEYS.intersection(metadata):
             return False
@@ -2009,8 +1856,55 @@ class ScanResultsCache:
         ):
             return False
         if metadata.get("container_type") == "pytorch_zip":
-            return True
+            return not critical_references_covered or ScanResultsCache._critical_call_graph_inputs_are_covered(
+                scan_result,
+                metadata,
+            )
+        if critical_references_covered:
+            return ScanResultsCache._critical_call_graph_inputs_are_covered(scan_result, metadata)
         return not any(metadata.get(key) for key in _PICKLE_CALL_GRAPH_INPUT_KEYS)
+
+    @staticmethod
+    def _critical_call_graph_inputs_are_covered(
+        scan_result: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> bool:
+        if metadata.get("pickle_report_status") != "complete" or metadata.get("pickle_verdict") != "malicious":
+            return False
+        references: set[tuple[str, str]] = set()
+        for key in _PICKLE_CALL_GRAPH_INPUT_KEYS:
+            raw_references = metadata.get(key, [])
+            if not isinstance(raw_references, list):
+                return False
+            for raw_reference in raw_references:
+                if not isinstance(raw_reference, dict):
+                    return False
+                module = raw_reference.get("module")
+                name = raw_reference.get("name")
+                if not isinstance(module, str) or not module or not isinstance(name, str) or not name:
+                    return False
+                references.add((module, name))
+        if not references:
+            return False
+
+        critical_references: set[tuple[str, str]] = set()
+        checks = scan_result.get("checks")
+        if not isinstance(checks, list):
+            return False
+        for check in checks:
+            if not isinstance(check, dict) or check.get("status") != "failed" or check.get("severity") != "critical":
+                continue
+            details = check.get("details")
+            if not isinstance(details, dict) or details.get("pickle_rule_code") not in {
+                "DANGEROUS_CALL",
+                "DANGEROUS_GLOBAL",
+            }:
+                continue
+            module = details.get("module")
+            name = details.get("name")
+            if isinstance(module, str) and isinstance(name, str):
+                critical_references.add((module, name))
+        return references <= critical_references
 
     @staticmethod
     def _legacy_pickle_call_graph_metadata_requires_fingerprints(metadata: dict[str, Any]) -> bool:
