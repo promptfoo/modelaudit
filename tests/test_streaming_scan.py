@@ -116,6 +116,57 @@ def test_local_source_receipt_is_runtime_only(tmp_path: Path, monkeypatch: pytes
     assert all(core_module._LOCAL_SOURCE_RECEIPT_CONFIG_KEY not in config for config in observed_configs)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_streaming_retained_regular_file_discovers_companions_from_retained_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming companion discovery remains bound to the source's retained parent."""
+    from modelaudit import core as core_module
+
+    staging = tmp_path / "staging"
+    alternate = tmp_path / "alternate"
+    staging.mkdir()
+    alternate.mkdir()
+    source = staging / "model.manifest"
+    source.write_text(json.dumps({"layers": ["layer.tar.gz"]}), encoding="utf-8")
+    (alternate / source.name).hardlink_to(source)
+    malicious_layer = b"malicious retained layer"
+    (staging / "layer.tar.gz").write_bytes(malicious_layer)
+    (alternate / "layer.tar.gz").write_bytes(b"benign replacement layer")
+    swap = tmp_path / "swap"
+    observed_layers: list[bytes] = []
+
+    def swap_ancestors() -> None:
+        staging.rename(swap)
+        alternate.rename(staging)
+        swap.rename(alternate)
+
+    def inspect_staged_companion(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        del config
+        swap_ancestors()
+        try:
+            observed_layers.append((Path(path).parent / "layer.tar.gz").read_bytes())
+        finally:
+            swap_ancestors()
+        scan_result = ScanResult(scanner_name="oci_layer")
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "scan_file", inspect_staged_companion)
+    result = scan_model_streaming(
+        iter([(source, True)]),
+        scan_root=str(source),
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["oci_layer"],
+        skip_file_types=False,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert observed_layers == [malicious_layer]
+
+
 @pytest.fixture
 def temp_test_files() -> Iterator[list[Path]]:
     """Create temporary test files for streaming."""

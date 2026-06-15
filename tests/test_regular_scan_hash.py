@@ -15,7 +15,7 @@ from typing import Any, BinaryIO, cast
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
@@ -1000,11 +1000,20 @@ class TestHashGenerationEdgeCases:
         original_hash = core._calculate_file_hash
         hashed: list[Path] = []
 
-        def track_hash(path: str, *, deadline: float | None = None) -> str:
+        def track_hash(
+            path: str,
+            *,
+            deadline: float | None = None,
+            follow_validated_symlink: bool = False,
+        ) -> str:
             hashed.append(Path(path))
-            if Path(path) in {model_path, sidecar}:
+            if Path(path).name in {model_path.name, sidecar.name}:
                 pytest.fail("file-backed ONNX owners and context sidecars must not be aggregate-hashed")
-            return original_hash(path, deadline=deadline)
+            return original_hash(
+                path,
+                deadline=deadline,
+                follow_validated_symlink=follow_validated_symlink,
+            )
 
         monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
 
@@ -1014,9 +1023,9 @@ class TestHashGenerationEdgeCases:
             onnx_raw_detector_max_bytes=1,
         )
 
-        assert safe_path in hashed
-        assert model_path not in hashed
-        assert sidecar not in hashed
+        assert safe_path.name in {path.name for path in hashed}
+        assert model_path.name not in {path.name for path in hashed}
+        assert sidecar.name not in {path.name for path in hashed}
         assert result.bytes_scanned == sum(path.stat().st_size for path in (model_path, sidecar, safe_path))
         assert result.content_hash is None
 
@@ -1080,9 +1089,18 @@ class TestHashGenerationEdgeCases:
         original_hash = core._calculate_file_hash
         hashed_paths: list[str] = []
 
-        def track_hash(path: str, *, deadline: float | None = None) -> str:
+        def track_hash(
+            path: str,
+            *,
+            deadline: float | None = None,
+            follow_validated_symlink: bool = False,
+        ) -> str:
             hashed_paths.append(path)
-            return original_hash(path, deadline=deadline)
+            return original_hash(
+                path,
+                deadline=deadline,
+                follow_validated_symlink=follow_validated_symlink,
+            )
 
         monkeypatch.setattr(core.BaseScanner, "default_max_file_read_size", 1_000_000)
         monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
@@ -1722,3 +1740,60 @@ class TestOnnxExternalDataContentHash:
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
         assert result.content_hash is None
         assert determine_exit_code(result) == 2
+
+    @pytest.mark.parametrize("mode", ["single", "directory", "streaming"])
+    @pytest.mark.parametrize("limit_kind", ["max_file_size", "max_total_size"])
+    def test_oci_context_layer_limits_fail_before_private_copy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mode: str,
+        limit_kind: str,
+    ) -> None:
+        """OCI context-only layers consume the same preflight and copy budgets as model files."""
+        from modelaudit.utils.file import handlers
+
+        manifest = tmp_path / "model.manifest"
+        manifest.write_text(json.dumps({"layers": ["layer.tar.gz"]}), encoding="utf-8")
+        layer = tmp_path / "layer.tar.gz"
+        layer.write_bytes(b"L" * 256)
+        if mode == "directory":
+            _skip_path_during_directory_prefilter(monkeypatch, layer)
+        layer_stat = layer.stat()
+        copied_layer = False
+        original_copy = handlers._copy_pinned_file_descriptor
+
+        def track_copy(source_fd: int, *args: Any, **kwargs: Any) -> str:
+            nonlocal copied_layer
+            source_stat = os.fstat(source_fd)
+            if source_stat.st_dev == layer_stat.st_dev and source_stat.st_ino == layer_stat.st_ino:
+                copied_layer = True
+            return original_copy(source_fd, *args, **kwargs)
+
+        monkeypatch.setattr(handlers, "_copy_pinned_file_descriptor", track_copy)
+        max_file_size = manifest.stat().st_size + 1 if limit_kind == "max_file_size" else 0
+        max_total_size = manifest.stat().st_size + layer.stat().st_size - 1 if limit_kind == "max_total_size" else 0
+        if mode == "streaming":
+            result = scan_model_streaming(
+                iter([(manifest, True)]),
+                scan_root=str(manifest),
+                delete_after_scan=False,
+                cache_enabled=False,
+                scanners=["oci_layer"],
+                skip_file_types=False,
+                max_file_size=max_file_size,
+                max_total_size=max_total_size,
+            )
+        else:
+            result = scan_model_directory_or_file(
+                str(manifest if mode == "single" else tmp_path),
+                skip_file_types=mode == "directory",
+                cache_enabled=False,
+                scanners=["oci_layer"],
+                max_file_size=max_file_size,
+                max_total_size=max_total_size,
+            )
+
+        assert copied_layer is False
+        assert determine_exit_code(result) == 2
+        assert result.content_hash is None

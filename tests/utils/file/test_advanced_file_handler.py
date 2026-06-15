@@ -1,6 +1,7 @@
 """Tests for advanced file handler."""
 
 import builtins
+import ctypes
 import errno
 import hashlib
 import json
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from collections import Counter
 from contextvars import ContextVar
 from pathlib import Path
@@ -23,6 +25,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.base import BaseScanner
 from modelaudit.utils.file.handlers import (
+    CONTEXT_ONLY_COMPANION_TARGET_KEY,
     MAX_RECORDED_MISSING_SHARD_INDICES,
     AdvancedFileHandler,
     MemoryMappedHandler,
@@ -30,13 +33,16 @@ from modelaudit.utils.file.handlers import (
     ShardedModelDetector,
     ValidatedShardTargets,
     _build_advanced_shard_family_cache_fingerprint,
+    _close_windows_staging_directory_guard,
     _copy_pinned_file_descriptor,
+    _open_windows_staging_directory_guard,
     _pinned_file_descriptor_changed,
     _pinned_shard_scan_path,
     _pinned_windows_logical_scan_path,
     _pinned_windows_shard_scan_path,
     _SafetensorsIndexInspectionContext,
     _ShardPinUnavailableError,
+    _WindowsStagingDirectoryGuard,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -68,6 +74,43 @@ def _track_created_staging_directories(monkeypatch: pytest.MonkeyPatch) -> list[
 
     monkeypatch.setattr("modelaudit.utils.file.handlers.tempfile.mkdtemp", track_mkdtemp)
     return created_directories
+
+
+def _install_simulated_windows_directory_guards(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_on_name: str | None = None,
+) -> tuple[list[_WindowsStagingDirectoryGuard], list[_WindowsStagingDirectoryGuard]]:
+    """Install pathname-backed directory guards for platform-independent Windows-flow tests."""
+    opened_guards: list[_WindowsStagingDirectoryGuard] = []
+    closed_guards: list[_WindowsStagingDirectoryGuard] = []
+
+    def open_guard(path: Path, expected_stat: os.stat_result) -> _WindowsStagingDirectoryGuard:
+        if path.name == fail_on_name:
+            raise OSError(errno.EMFILE, "descriptor table exhausted")
+        current_stat = os.stat(path, follow_symlinks=False)
+        if not os.path.samestat(expected_stat, current_stat):
+            raise _ShardPinUnavailableError("private staging directory changed while opening")
+        guard = _WindowsStagingDirectoryGuard(
+            handle=len(opened_guards) + 1,
+            bound_path=path,
+            expected_stat=current_stat,
+        )
+        opened_guards.append(guard)
+        return guard
+
+    def close_guard(guard: _WindowsStagingDirectoryGuard) -> None:
+        closed_guards.append(guard)
+
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_staging_directory_guard",
+        open_guard,
+    )
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._close_windows_staging_directory_guard",
+        close_guard,
+    )
+    return opened_guards, closed_guards
 
 
 def test_pinned_file_descriptor_change_fails_closed_on_fstat_error(
@@ -194,6 +237,83 @@ def test_regular_pinned_source_copy_detects_staged_mutation(tmp_path: Path) -> N
     assert source_path.read_bytes() == b"source"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_pinned_scan_uses_borrowed_source_and_companion_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Borrowed descriptors are duplicated and their source paths are never reopened."""
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "model.onnx_data"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+    source_fd = os.open(source_path, os.O_RDONLY)
+    companion_fd = os.open(companion_path, os.O_RDONLY)
+    original_open = os.open
+    descriptor_root = Path("/proc/self/fd") if Path("/proc/self/fd").exists() else Path("/dev/fd")
+
+    def reject_source_path_reopen(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> int:
+        dir_fd = kwargs.get("dir_fd")
+        if dir_fd is not None and os.fspath(path) in {source_path.name, companion_path.name}:
+            opened_parent = Path(os.path.realpath(descriptor_root / str(dir_fd)))
+            if opened_parent == tmp_path:
+                raise AssertionError("borrowed source path was reopened")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", reject_source_path_reopen)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, reject_source_path_reopen})
+    try:
+        with _pinned_shard_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            logical_path=str(source_path),
+            companion_targets={
+                companion_path.name: (str(companion_path), _target_for_path(companion_path)),
+            },
+            source_fd=source_fd,
+            companion_fds={companion_path.name: companion_fd},
+            require_regular_path=True,
+        ) as pinned_scan:
+            staged_source = Path(pinned_scan.path)
+            assert staged_source.read_bytes() == b"source"
+            assert staged_source.with_name(companion_path.name).read_bytes() == b"companion"
+
+        os.fstat(source_fd)
+        os.fstat(companion_fd)
+    finally:
+        os.close(companion_fd)
+        os.close(source_fd)
+
+
+def test_pinned_scan_rejects_borrowed_descriptors_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The borrowed-descriptor interface is intentionally POSIX-only."""
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    source_fd = os.open(source_path, os.O_RDONLY)
+    monkeypatch.setattr("modelaudit.utils.file.handlers.os.name", "nt")
+    try:
+        with (
+            pytest.raises(_ShardPinUnavailableError, match="unsupported on Windows"),
+            _pinned_shard_scan_path(
+                str(source_path),
+                _target_for_path(source_path),
+                source_fd=source_fd,
+            ),
+        ):
+            pytest.fail("Windows must reject borrowed source descriptors")
+        os.fstat(source_fd)
+    finally:
+        os.close(source_fd)
+
+
 @pytest.mark.skipif(
     os.name != "posix" or not Path("/dev/fd").exists(),
     reason="requires POSIX /dev/fd descriptor staging",
@@ -296,6 +416,31 @@ def test_regular_pinned_companion_rejects_source_mutation_during_copy(
         pytest.fail("mutated companion must be rejected before scanner dispatch")
     assert created_staging_directories
     assert all(not path.exists() for path in created_staging_directories)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_context_only_companion_consumes_posix_staging_byte_budget(tmp_path: Path) -> None:
+    """Context-only OCI companions must consume the physical staging copy budget."""
+    source_path = tmp_path / "manifest.json"
+    companion_path = tmp_path / "layer.tar"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+    companion_target = _target_for_path(companion_path)
+    companion_target[CONTEXT_ONLY_COMPANION_TARGET_KEY] = 1
+    copy_budget = source_path.stat().st_size + companion_path.stat().st_size - 1
+
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="regular companion scan path"),
+        _pinned_shard_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            logical_path=str(source_path),
+            companion_targets={companion_path.name: (str(companion_path), companion_target)},
+            require_regular_path=True,
+            copy_max_bytes=copy_budget,
+        ),
+    ):
+        pytest.fail("context-only companion copy must not exceed the aggregate staging budget")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
@@ -456,6 +601,328 @@ def test_regular_pinned_validation_hash_honors_dispatch_deadline(
         pytest.fail("an expired validation deadline must stop before dispatch")
 
 
+def test_windows_staging_directory_guard_uses_no_follow_delete_denying_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Directory guards allow child writes but deny namespace deletion and bind the opened path."""
+    staging_path = tmp_path / "staging"
+    staging_path.mkdir()
+    expected_stat = staging_path.stat()
+    captured: dict[str, object] = {}
+    handle_value = 1 << 40
+
+    def create_file(
+        path: str,
+        desired_access: int,
+        share_mode: int,
+        _security_attributes: object,
+        creation_disposition: int,
+        flags: int,
+        _template: object,
+    ) -> int:
+        captured.update(
+            path=path,
+            desired_access=desired_access,
+            share_mode=share_mode,
+            creation_disposition=creation_disposition,
+            flags=flags,
+        )
+        return handle_value
+
+    def get_file_information(
+        handle: int,
+        information_class: int,
+        information: Any,
+        _size: int,
+    ) -> bool:
+        assert handle == handle_value
+        assert information_class == 9
+        values = ctypes.cast(information, ctypes.POINTER(ctypes.c_uint32))
+        values[0] = 0x00000010
+        values[1] = 0
+        return True
+
+    def get_final_path(handle: int, buffer: Any, length: int, flags: int) -> int:
+        assert handle == handle_value
+        assert length == 32768
+        assert flags == 0
+        buffer.value = str(staging_path)
+        return len(buffer.value)
+
+    create_file_mock = MagicMock(side_effect=create_file)
+    get_file_information_mock = MagicMock(side_effect=get_file_information)
+    get_final_path_mock = MagicMock(side_effect=get_final_path)
+    close_handle_mock = MagicMock(return_value=True)
+    kernel32 = types.SimpleNamespace(
+        CreateFileW=create_file_mock,
+        GetFileInformationByHandleEx=get_file_information_mock,
+        GetFinalPathNameByHandleW=get_final_path_mock,
+        CloseHandle=close_handle_mock,
+    )
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+
+    guard = _open_windows_staging_directory_guard(staging_path, expected_stat)
+
+    assert guard.handle == handle_value
+    assert guard.bound_path == staging_path
+    assert os.path.samestat(guard.expected_stat, expected_stat)
+    assert captured == {
+        "path": str(staging_path),
+        "desired_access": 0x0020 | 0x0080,
+        "share_mode": 0x00000001 | 0x00000002,
+        "creation_disposition": 3,
+        "flags": 0x02000000 | 0x00200000,
+    }
+    assert close_handle_mock.call_count == 0
+
+    _close_windows_staging_directory_guard(guard)
+
+    close_handle_mock.assert_called_once_with(handle_value)
+
+
+@pytest.mark.parametrize(
+    "file_attributes",
+    [0, 0x00000010 | 0x00000400],
+    ids=["non-directory", "reparse-directory"],
+)
+def test_windows_staging_directory_guard_rejects_invalid_type_and_closes_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    file_attributes: int,
+) -> None:
+    """A non-directory or reparse handle is rejected without leaking the handle."""
+    staging_path = tmp_path / "staging"
+    staging_path.mkdir()
+    handle_value = 321
+
+    def get_file_information(
+        _handle: int,
+        _information_class: int,
+        information: Any,
+        _size: int,
+    ) -> bool:
+        values = ctypes.cast(information, ctypes.POINTER(ctypes.c_uint32))
+        values[0] = file_attributes
+        values[1] = 0xA000000C if file_attributes & 0x00000400 else 0
+        return True
+
+    close_handle_mock = MagicMock(return_value=True)
+    kernel32 = types.SimpleNamespace(
+        CreateFileW=MagicMock(return_value=handle_value),
+        GetFileInformationByHandleEx=MagicMock(side_effect=get_file_information),
+        GetFinalPathNameByHandleW=MagicMock(),
+        CloseHandle=close_handle_mock,
+    )
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+
+    with pytest.raises(_ShardPinUnavailableError, match="staging directory changed"):
+        _open_windows_staging_directory_guard(staging_path, staging_path.stat())
+
+    close_handle_mock.assert_called_once_with(handle_value)
+    kernel32.GetFinalPathNameByHandleW.assert_not_called()
+
+
+def test_windows_logical_pin_uses_handle_bound_staging_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scanner path is built from the path returned for the retained root handle."""
+    source_path = tmp_path / "blob"
+    source_path.write_bytes(b"malicious")
+    created_staging_directories = _track_created_staging_directories(monkeypatch)
+    bound_roots: list[Path] = []
+
+    def open_guard(path: Path, expected_stat: os.stat_result) -> _WindowsStagingDirectoryGuard:
+        bound_path = path.with_name(f"{path.name}-bound")
+        path.rename(bound_path)
+        bound_stat = bound_path.stat()
+        assert os.path.samestat(expected_stat, bound_stat)
+        bound_roots.append(bound_path)
+        return _WindowsStagingDirectoryGuard(1, bound_path, bound_stat)
+
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_staging_directory_guard",
+        open_guard,
+    )
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._close_windows_staging_directory_guard",
+        lambda _guard: None,
+    )
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+        lambda path, **_kwargs: os.open(path, os.O_RDONLY),
+    )
+
+    with _pinned_windows_logical_scan_path(
+        str(source_path),
+        _target_for_path(source_path),
+        "model.pkl",
+        None,
+    ) as pinned_scan:
+        assert bound_roots == [Path(pinned_scan.path).parent]
+        assert Path(pinned_scan.path).read_bytes() == b"malicious"
+
+    assert created_staging_directories
+    assert all(not path.exists() for path in created_staging_directories)
+    assert all(not path.exists() for path in bound_roots)
+
+
+def test_windows_logical_pin_retains_nested_guards_and_cleans_child_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Root and nested handles remain open through dispatch and close deepest-first for cleanup."""
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "data.bin"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+    created_staging_directories = _track_created_staging_directories(monkeypatch)
+    opened_guards, closed_guards = _install_simulated_windows_directory_guards(monkeypatch)
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+        lambda path, **_kwargs: os.open(path, os.O_RDONLY),
+    )
+
+    with _pinned_windows_logical_scan_path(
+        str(source_path),
+        _target_for_path(source_path),
+        source_path.name,
+        {"nested/deep/data.bin": (str(companion_path), _target_for_path(companion_path))},
+    ) as pinned_scan:
+        scan_root = Path(pinned_scan.path).parent
+        assert [guard.bound_path.name for guard in opened_guards] == [scan_root.name, "nested", "deep"]
+        assert closed_guards == []
+        assert Path(pinned_scan.path).read_bytes() == b"source"
+        assert (scan_root / "nested" / "deep" / "data.bin").read_bytes() == b"companion"
+
+    assert [guard.bound_path.name for guard in closed_guards] == ["deep", "nested", scan_root.name]
+    assert created_staging_directories
+    assert all(not path.exists() for path in created_staging_directories)
+
+
+def test_windows_nested_guard_open_failure_removes_created_staging_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent created before guard exhaustion remains cleanup-owned."""
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "data.bin"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+    created_staging_directories = _track_created_staging_directories(monkeypatch)
+    opened_guards, closed_guards = _install_simulated_windows_directory_guards(
+        monkeypatch,
+        fail_on_name="deep",
+    )
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+        lambda path, **_kwargs: os.open(path, os.O_RDONLY),
+    )
+
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="descriptor table exhausted"),
+        _pinned_windows_logical_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            source_path.name,
+            {"nested/deep/data.bin": (str(companion_path), _target_for_path(companion_path))},
+        ),
+    ):
+        pytest.fail("nested directory guard exhaustion must stop before dispatch")
+
+    assert [guard.bound_path.name for guard in opened_guards[1:]] == ["nested"]
+    assert [guard.bound_path.name for guard in closed_guards] == ["nested", opened_guards[0].bound_path.name]
+    assert created_staging_directories
+    assert all(not path.exists() for path in created_staging_directories)
+
+
+def test_windows_logical_pin_rejects_nested_directory_replacement_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-content replacement parent cannot become the scanner-visible companion namespace."""
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "data.bin"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+    companion_inode = companion_path.stat().st_ino
+    _install_simulated_windows_directory_guards(monkeypatch)
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+        lambda path, **_kwargs: os.open(path, os.O_RDONLY),
+    )
+    original_copy = _copy_pinned_file_descriptor
+    replacement_root: Path | None = None
+
+    def copy_then_replace_parent(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
+        nonlocal replacement_root
+        copied_hash = original_copy(source_fd, destination, **kwargs)
+        if os.fstat(source_fd).st_ino == companion_inode:
+            staged_companion = Path(destination)
+            staged_parent = staged_companion.parent
+            replacement_root = staged_parent.parent
+            staged_parent.rename(replacement_root / "held-nested")
+            staged_parent.mkdir()
+            staged_companion.write_bytes(b"companion")
+        return copied_hash
+
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._copy_pinned_file_descriptor",
+        copy_then_replace_parent,
+    )
+
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="staging directory changed before scanner dispatch"),
+        _pinned_windows_logical_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            source_path.name,
+            {"nested/data.bin": (str(companion_path), _target_for_path(companion_path))},
+        ),
+    ):
+        pytest.fail("a replacement nested namespace must be rejected before dispatch")
+
+    assert replacement_root is not None
+    for staged_directory in (replacement_root / "nested", replacement_root / "held-nested"):
+        if staged_directory.exists():
+            for child in staged_directory.iterdir():
+                child.unlink()
+            staged_directory.rmdir()
+    replacement_root.rmdir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows directory sharing semantics")
+def test_windows_logical_pin_blocks_root_and_nested_directory_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retained staging-directory handles deny root and nested namespace ABA through yield."""
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "data.bin"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+    created_staging_directories = _track_created_staging_directories(monkeypatch)
+
+    with _pinned_windows_logical_scan_path(
+        str(source_path),
+        _target_for_path(source_path),
+        source_path.name,
+        {"nested/data.bin": (str(companion_path), _target_for_path(companion_path))},
+    ) as pinned_scan:
+        scan_root = Path(pinned_scan.path).parent
+        nested_path = scan_root / "nested"
+        with pytest.raises(OSError):
+            scan_root.rename(scan_root.with_name(f"{scan_root.name}-held"))
+        with pytest.raises(OSError):
+            nested_path.rename(scan_root / "held-nested")
+        assert Path(pinned_scan.path).read_bytes() == b"source"
+        assert (nested_path / "data.bin").read_bytes() == b"companion"
+
+    assert created_staging_directories
+    assert all(not path.exists() for path in created_staging_directories)
+
+
 def test_windows_logical_pin_rejects_staged_source_mutation_during_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -463,6 +930,7 @@ def test_windows_logical_pin_rejects_staged_source_mutation_during_copy(
     source_path = tmp_path / "blob"
     source_path.write_bytes(b"malicious")
     target = _target_for_path(source_path)
+    _install_simulated_windows_directory_guards(monkeypatch)
     monkeypatch.setattr(
         "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
         lambda path, **_kwargs: os.open(path, os.O_RDONLY),
@@ -495,6 +963,7 @@ def test_windows_logical_pin_rejects_staged_companion_reparse(
     companion_path.write_bytes(b"malicious")
     benign_path.write_bytes(b"benign")
 
+    _install_simulated_windows_directory_guards(monkeypatch)
     monkeypatch.setattr(
         "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
         lambda path, **_kwargs: os.open(path, os.O_RDONLY),
@@ -522,6 +991,37 @@ def test_windows_logical_pin_rejects_staged_companion_reparse(
         ),
     ):
         pytest.fail("a staged companion reparse must fail before scanner dispatch")
+
+
+def test_context_only_companion_consumes_windows_staging_byte_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows context-only companions must share the physical staging copy budget."""
+    source_path = tmp_path / "manifest.json"
+    companion_path = tmp_path / "layer.tar"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+    companion_target = _target_for_path(companion_path)
+    companion_target[CONTEXT_ONLY_COMPANION_TARGET_KEY] = 1
+    copy_budget = source_path.stat().st_size + companion_path.stat().st_size - 1
+    _install_simulated_windows_directory_guards(monkeypatch)
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
+        lambda path, **_kwargs: os.open(path, os.O_RDONLY),
+    )
+
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="staging byte limit"),
+        _pinned_windows_logical_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            source_path.name,
+            {companion_path.name: (str(companion_path), companion_target)},
+            copy_max_bytes=copy_budget,
+        ),
+    ):
+        pytest.fail("context-only companion copy must not exceed the aggregate staging budget")
 
 
 def test_windows_pinned_source_preserves_existing_companion_change(
@@ -554,6 +1054,7 @@ def test_windows_logical_pin_scans_staged_descriptor_bytes(
     source_path.write_bytes(b"malicious")
     source_stat = source_path.stat()
     target = _target_for_path(source_path)
+    _install_simulated_windows_directory_guards(monkeypatch)
     monkeypatch.setattr(
         "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
         lambda path, **_kwargs: os.open(path, os.O_RDONLY),
@@ -579,6 +1080,7 @@ def test_windows_logical_pin_does_not_delete_replaced_staging_directory(
     source_path = tmp_path / "blob"
     source_path.write_bytes(b"model")
     target = _target_for_path(source_path)
+    _install_simulated_windows_directory_guards(monkeypatch)
     monkeypatch.setattr(
         "modelaudit.utils.file.handlers._open_windows_shard_guard_fd",
         lambda path, **_kwargs: os.open(path, os.O_RDONLY),
@@ -823,6 +1325,185 @@ class TestShardedModelDetector:
         assert "missing_shard_count" not in shard_info
         assert "unexpected_shard_count" not in shard_info
         assert result.success is True
+
+    def test_detect_safetensors_custom_stem_escapes_regex_metacharacters(self, tmp_path: Path) -> None:
+        """A custom stem is a literal family identity, not executable regex syntax."""
+        stem = "adapter+[v1](prod)"
+        shards = [tmp_path / f"{stem}-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        for shard in shards:
+            shard.write_bytes(shard.name.encode())
+        index_path = _write_safetensors_index(
+            tmp_path,
+            [shard.name for shard in shards],
+            index_name=f"{stem}.safetensors.index.json",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]))
+
+        assert shard_info is not None
+        assert shard_info["normalized_shard_stem"] == stem
+        assert set(shard_info["shards"]) == {str(shard) for shard in shards}
+        assert shard_info["safetensors_index_path"] == str(index_path)
+        assert "safetensors_index_error" not in shard_info
+
+    def test_detect_safetensors_custom_stem_is_case_insensitive(self, tmp_path: Path) -> None:
+        """Case variants of one custom stem must form one indexed family."""
+        shards = [
+            tmp_path / "Weights.V1-00001-of-00002.SAFETENSORS",
+            tmp_path / "weights.v1-00002-of-00002.safetensors",
+        ]
+        for shard in shards:
+            shard.write_bytes(shard.name.encode())
+        _write_safetensors_index(
+            tmp_path,
+            [shard.name for shard in shards],
+            index_name="WEIGHTS.V1.SAFETENSORS.INDEX.JSON",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]))
+
+        assert shard_info is not None
+        assert shard_info["normalized_shard_stem"] == "weights.v1"
+        assert set(shard_info["shards"]) == {str(shard) for shard in shards}
+        assert "missing_shard_count" not in shard_info
+        assert "safetensors_index_error" not in shard_info
+
+    @pytest.mark.skipif(os.name != "posix", reason="requires a POSIX newline-bearing basename")
+    def test_detect_safetensors_custom_stem_accepts_newline(self, tmp_path: Path) -> None:
+        """A newline in a POSIX stem must not bypass incomplete-family coverage."""
+        shard = tmp_path / "adapter\nv1-00001-of-00002.safetensors"
+        shard.write_bytes(b"first")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard))
+        result = AdvancedFileHandler(str(shard), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["normalized_shard_stem"] == "adapter\nv1"
+        assert shard_info["missing_shard_count"] == 1
+        assert shard_info["missing_shard_indices"] == [2]
+        assert result.success is False
+        assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("display_stem", "casefolded_stem"),
+        [("Straße", "STRASSE"), ("İTEM", "i\u0307tem")],
+        ids=["sharp-s", "dotted-capital-i"],
+    )
+    def test_detect_safetensors_custom_stem_uses_unicode_casefold(
+        self,
+        tmp_path: Path,
+        display_stem: str,
+        casefolded_stem: str,
+    ) -> None:
+        """Parsed family equality handles casefold expansions that regex ignore-case cannot."""
+        shards = [
+            tmp_path / f"{display_stem}-00001-of-00002.safetensors",
+            tmp_path / f"{casefolded_stem}-00002-of-00002.safetensors",
+        ]
+        for shard in shards:
+            shard.write_bytes(shard.name.encode())
+        _write_safetensors_index(
+            tmp_path,
+            [shard.name for shard in shards],
+            index_name=f"{casefolded_stem}.safetensors.index.json",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]))
+
+        assert shard_info is not None
+        assert shard_info["normalized_shard_stem"] == display_stem.casefold()
+        assert set(shard_info["shards"]) == {str(shard) for shard in shards}
+        assert "missing_shard_count" not in shard_info
+        assert "safetensors_index_error" not in shard_info
+
+    def test_detect_safetensors_keeps_distinct_same_total_stems_separate(self, tmp_path: Path) -> None:
+        """Equal shard totals cannot merge distinct custom stems into one family."""
+        families = {
+            stem: [tmp_path / f"{stem}-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+            for stem in ("alpha", "beta")
+        }
+        indexes: dict[str, Path] = {}
+        for stem, shards in families.items():
+            for shard in shards:
+                shard.write_bytes(shard.name.encode())
+            indexes[stem] = _write_safetensors_index(
+                tmp_path,
+                [shard.name for shard in shards],
+                index_name=f"{stem}.safetensors.index.json",
+            )
+
+        for stem, shards in families.items():
+            shard_info = ShardedModelDetector.detect_shards(str(shards[0]))
+
+            assert shard_info is not None
+            assert set(shard_info["shards"]) == {str(shard) for shard in shards}
+            assert shard_info["safetensors_index_path"] == str(indexes[stem])
+            assert "safetensors_index_error" not in shard_info
+
+    def test_safetensors_index_cache_is_shared_across_distinct_stems(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One stable index parse serves different family queries without recharging bytes."""
+        alpha = tmp_path / "alpha-00001-of-00001.safetensors"
+        beta = tmp_path / "beta-00001-of-00001.safetensors"
+        alpha.write_bytes(b"alpha")
+        beta.write_bytes(b"beta")
+        index_path = _write_safetensors_index(
+            tmp_path,
+            [alpha.name],
+            index_name="alpha.safetensors.index.json",
+        )
+        index_size = index_path.stat().st_size
+        context = _SafetensorsIndexInspectionContext()
+        original_open = Path.open
+        index_reads = 0
+
+        def count_index_reads(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            nonlocal index_reads
+            if path == index_path and mode == "rb":
+                index_reads += 1
+            return original_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", count_index_reads)
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers.MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES",
+            index_size,
+        )
+
+        alpha_info = ShardedModelDetector.detect_shards(str(alpha), index_inspection_context=context)
+        beta_info = ShardedModelDetector.detect_shards(str(beta), index_inspection_context=context)
+
+        assert alpha_info is not None
+        assert alpha_info["safetensors_index_path"] == str(index_path)
+        assert beta_info is not None
+        assert "safetensors_index_path" not in beta_info
+        assert "safetensors_index_error" not in beta_info
+        assert context.failure is None
+        assert context.bytes_read == index_size
+        assert index_reads == 1
+
+    def test_detect_safetensors_rejects_mixed_stem_index(self, tmp_path: Path) -> None:
+        """One index cannot combine same-total shards from different custom stems."""
+        alpha = tmp_path / "alpha-00001-of-00002.safetensors"
+        beta = tmp_path / "beta-00002-of-00002.safetensors"
+        alpha.write_bytes(b"alpha")
+        beta.write_bytes(b"beta")
+        index_path = _write_safetensors_index(
+            tmp_path,
+            [alpha.name, beta.name],
+            index_name="alpha.safetensors.index.json",
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(alpha))
+        result = AdvancedFileHandler(str(alpha), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_path"] == str(index_path)
+        assert shard_info["safetensors_index_error"] == ("safetensors index references multiple model shard families")
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
 
     @pytest.mark.parametrize(
         "index_name",

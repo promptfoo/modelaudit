@@ -69,6 +69,23 @@ def test_directory_scan_preserves_path_sensitive_yaml_routing(tmp_path: Path) ->
     assert not any(issue.location and str(misc_file) in issue.location for issue in result.issues)
 
 
+@pytest.mark.parametrize(("root_name", "expected_exit"), [("model", 1), ("misc", 0)])
+def test_directory_root_preserves_path_sensitive_yaml_routing(
+    tmp_path: Path,
+    root_name: str,
+    expected_exit: int,
+) -> None:
+    scan_root = tmp_path / root_name
+    scan_root.mkdir()
+    model_file = scan_root / "settings.yaml"
+    model_file.write_text("{{ cycler.__init__.__globals__.os.popen('id').read() }}\n", encoding="utf-8")
+
+    result = scan_model_directory_or_file(str(scan_root), cache_enabled=False, skip_file_types=False)
+
+    assert determine_exit_code(result) == expected_exit
+    assert any(issue.type == "jinja2_template_check" for issue in result.issues) is bool(expected_exit)
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["standard", "streaming"])
 @pytest.mark.parametrize(("parent_name", "expected_exit"), [("model", 1), ("misc", 0)])
 def test_retained_single_file_preserves_path_sensitive_yaml_routing(

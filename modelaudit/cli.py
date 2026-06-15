@@ -25,6 +25,7 @@ from yaspin import yaspin
 from yaspin.spinners import Spinners
 
 from . import __version__
+from ._safetensors_shards import is_safetensors_family_pattern
 from .auth.client import auth_client
 from .auth.config import (
     cloud_config,
@@ -41,6 +42,7 @@ from .config.local_config import find_local_config_for_paths
 from .core import (
     _LOCAL_SOURCE_BOUND_GUARD_CONFIG_KEY,
     _LOCAL_SOURCE_RECEIPT_CONFIG_KEY,
+    _PREVALIDATED_LOCAL_TARGETS_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY,
     _BoundLocalSourceGuard,
@@ -97,7 +99,6 @@ from .utils import resolve_dvc_file_with_metadata, should_skip_file
 from .utils.file.handlers import (
     _DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY,
     _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY,
-    SAFETENSORS_SHARD_PATTERN,
     ShardedModelDetector,
     ValidatedShardTargets,
     _count_expected_shard_indices,
@@ -1741,6 +1742,7 @@ def _record_shard_boundary_failure(scan_result: ModelAuditResultModel, path: str
     scan_result.file_metadata[path] = FileMetadataModel(**merged_metadata)
     scan_result.has_errors = True
     scan_result.success = False
+    scan_result.content_hash = None
 
 
 @dataclass
@@ -1767,6 +1769,7 @@ class _ScanPathState:
         self.has_errors_outside_reconciled_shards = True
         audit_result.has_errors = True
         audit_result.success = False
+        audit_result.content_hash = None
 
     def record_dry_run_preview(self, preview: dict[str, Any]) -> None:
         """Record a source that was previewed without scanning."""
@@ -2736,8 +2739,6 @@ def _explicit_local_shard_family_groups(
     index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
 ) -> dict[str, _ExplicitShardFamily]:
     """Map exact local file arguments to conservative explicit-family metadata."""
-    if index_inspection_context is None:
-        index_inspection_context = _SafetensorsIndexInspectionContext()
     grouped_paths: dict[tuple[str, int], list[tuple[str, Path, int]]] = {}
     seen_paths: set[str] = set()
     for path_str in paths:
@@ -2827,7 +2828,7 @@ def _explicit_local_shard_family_groups(
                     expected_total=expected_total,
                     index_inspection_context=discovery_context,
                 )
-                if _pattern == SAFETENSORS_SHARD_PATTERN
+                if is_safetensors_family_pattern(_pattern)
                 else (None, False)
             )
             inspection_failed = discovery_context.failure is not None
@@ -2867,7 +2868,7 @@ def _explicit_local_shard_family_groups(
                         pattern=_pattern,
                         expected_total=expected_total,
                         paths=invalid_paths,
-                        supports_index_authority=_pattern == SAFETENSORS_SHARD_PATTERN,
+                        supports_index_authority=is_safetensors_family_pattern(_pattern),
                         authority_invalid=True,
                     )
                     continue
@@ -2883,7 +2884,7 @@ def _explicit_local_shard_family_groups(
                     pattern=_pattern,
                     expected_total=expected_total,
                     paths=authoritative_index_paths,
-                    supports_index_authority=_pattern == SAFETENSORS_SHARD_PATTERN,
+                    supports_index_authority=is_safetensors_family_pattern(_pattern),
                     initial_index_proof=initial_index_proof,
                 )
     return groups
@@ -3710,17 +3711,24 @@ def _scan_local_or_downloaded_path(
     elif runtime.show_styled_output:
         click.echo(f"Scanning {display_path}...")
 
-    def revalidate_huggingface_safetensors_indexes() -> None:
+    def revalidate_huggingface_safetensors_indexes() -> dict[str, dict[str, int | str]]:
         if source_result.safetensors_index_proofs:
-            verify_downloaded_huggingface_safetensors_index_proofs(
+            return verify_downloaded_huggingface_safetensors_index_proofs(
                 source_result.source_model_id or display_path,
                 Path(actual_path),
                 source_result.safetensors_index_proofs,
                 deadline=proof_deadline,
             )
+        return {}
+
+    def require_stable_huggingface_targets(
+        expected: dict[str, dict[str, int | str]],
+    ) -> None:
+        if revalidate_huggingface_safetensors_indexes() != expected:
+            raise ValueError("Hugging Face SafeTensors index proof mismatch: downloaded shard changed")
 
     try:
-        revalidate_huggingface_safetensors_indexes()
+        prevalidated_huggingface_targets = revalidate_huggingface_safetensors_indexes()
         progress_callback = _create_path_progress_callback(
             spinner=spinner,
             progress_tracker=progress_tracker,
@@ -3730,6 +3738,8 @@ def _scan_local_or_downloaded_path(
             **_scanner_selection_overrides(runtime),
             _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
         }
+        if prevalidated_huggingface_targets:
+            dispatch_overrides[_PREVALIDATED_LOCAL_TARGETS_CONFIG_KEY] = prevalidated_huggingface_targets
         if source_result.initial_local_source_guard is not None:
             assert source_result.initial_local_source_receipt is not None
             dispatch_overrides[_LOCAL_SOURCE_RECEIPT_CONFIG_KEY] = source_result.initial_local_source_receipt
@@ -3768,7 +3778,7 @@ def _scan_local_or_downloaded_path(
             else:
                 path_state.record_non_shard_result_errors(streaming_result)
             audit_result.aggregate_scan_result(streaming_result.model_dump())
-            revalidate_huggingface_safetensors_indexes()
+            require_stable_huggingface_targets(prevalidated_huggingface_targets)
             path_state.record_dvc_coverage(actual_path, streaming_result, scanner_config=runtime.config)
             path_state.track_streaming_paths_for_sbom(streaming_result, actual_path)
 
@@ -3832,7 +3842,7 @@ def _scan_local_or_downloaded_path(
         else:
             path_state.record_non_shard_result_errors(scan_results)
         audit_result.aggregate_scan_result(scan_results.model_dump())
-        revalidate_huggingface_safetensors_indexes()
+        require_stable_huggingface_targets(prevalidated_huggingface_targets)
         if is_dvc_pointer and has_prior_dvc_coverage:
             audit_result.content_hash = None
         path_state.record_dvc_coverage(actual_path, scan_results, scanner_config=runtime.config)

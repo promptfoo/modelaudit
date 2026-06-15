@@ -918,31 +918,39 @@ class TestModelDownload:
         assert "evil.safetensors.index.json" in {call.args[1] for call in mock_detect.call_args_list}
 
     @pytest.mark.parametrize("streaming", [False, True], ids=["standard", "streaming"])
-    def test_exact_onnx_policy_metadata_only_ignores_unrelated_safetensors_index(self, streaming: bool) -> None:
-        """An ONNX-only metadata plan need not inspect unrelated SafeTensors index metadata."""
-        repo_files = ["model.onnx", "adapter.safetensors.index.json"]
-        with patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect:
+    @pytest.mark.parametrize(("scanner_id", "model_file"), [("onnx", "model.onnx"), ("pickle", "model.pkl")])
+    def test_exact_content_policy_metadata_only_refuses_index_suffixed_candidate(
+        self,
+        streaming: bool,
+        scanner_id: str,
+        model_file: str,
+    ) -> None:
+        """Metadata-only plans cannot know whether index-looking bytes hide selected content."""
+        repo_files = [model_file, "adapter.safetensors.index.json"]
+        with (
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect,
+            pytest.raises(ValueError, match="metadata-only dry-run selection incomplete"),
+        ):
             if streaming:
-                selected_files = _select_streamable_hf_files(
+                _select_streamable_hf_files(
                     "test/model",
                     repo_files,
                     _HF_TEST_REVISION,
-                    scannable_extensions={".onnx"},
-                    scannable_scanner_ids={"onnx"},
+                    scannable_extensions={Path(model_file).suffix},
+                    scannable_scanner_ids={scanner_id},
                     allow_content_probes=False,
-                ).filenames
+                )
             else:
-                selected_files = _select_huggingface_model_files(
+                _select_huggingface_model_files(
                     "test/model",
                     repo_files,
                     _HF_TEST_REVISION,
-                    {".onnx"},
-                    scannable_scanner_ids={"onnx"},
+                    {Path(model_file).suffix},
+                    scannable_scanner_ids={scanner_id},
                     allow_content_probes=False,
                     allow_safetensors_index_expansion=False,
                 )
 
-        assert selected_files == ["model.onnx"]
         mock_detect.assert_not_called()
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
@@ -1495,6 +1503,52 @@ class TestModelDownload:
                 [proof],
                 deadline=time.monotonic() - 1,
             )
+
+    def test_downloaded_safetensors_index_proof_returns_stable_target_receipts(self, tmp_path: Path) -> None:
+        """Each declared target is opened once and returned as a scalar pre-scan receipt."""
+        downloaded_path = tmp_path / "downloaded"
+        target_path = downloaded_path / "nested/model-00001-of-00001.safetensors"
+        index_path = downloaded_path / "weights.safetensors.index.json"
+        target_path.parent.mkdir(parents=True)
+        target_path.write_bytes(b"shard")
+        index_bytes = json.dumps(
+            {"weight_map": {"tensor": target_path.relative_to(downloaded_path).as_posix()}},
+            sort_keys=True,
+        ).encode()
+        index_path.write_bytes(index_bytes)
+        proof = HuggingFaceSafetensorsIndexProof(
+            index_file=index_path.name,
+            target_files=(target_path.relative_to(downloaded_path).as_posix(),),
+            index_base="one",
+            fingerprint=hashlib.sha256(index_bytes).hexdigest(),
+        )
+
+        receipts = verify_downloaded_huggingface_safetensors_index_proofs(
+            "test/model",
+            downloaded_path,
+            [proof, proof],
+        )
+
+        target_stat = target_path.stat()
+        assert receipts == {
+            str(target_path.absolute()): {
+                "resolved_path": str(target_path.resolve()),
+                "device": target_stat.st_dev,
+                "inode": target_stat.st_ino,
+                "size": target_stat.st_size,
+                "mtime_ns": target_stat.st_mtime_ns,
+                "ctime_ns": target_stat.st_ctime_ns,
+                "nlink": target_stat.st_nlink,
+            }
+        }
+        assert (
+            verify_downloaded_huggingface_safetensors_index_proofs(
+                "test/model",
+                downloaded_path,
+                [],
+            )
+            == {}
+        )
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode trust policy")
     @pytest.mark.parametrize("ancestor_mode", [0o700, 0o755])
@@ -5489,6 +5543,27 @@ class TestModelDownloadStreaming:
                 budget,
             )
 
+    def test_remote_safetensors_validation_rejects_mixed_same_directory_stems(self) -> None:
+        """One remote index cannot combine distinct same-total stems in one directory."""
+        index_file = "alpha.safetensors.index.json"
+        alpha = "alpha-00001-of-00002.safetensors"
+        beta = "beta-00002-of-00002.safetensors"
+        repo_files = [index_file, alpha, beta]
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+        payload = json.dumps({"weight_map": {"alpha": alpha, "beta": beta}}).encode()
+
+        with (
+            patch("requests.get", return_value=_FakeRangeResponse(payload)),
+            pytest.raises(ValueError, match="references multiple model shard families"),
+        ):
+            _validate_remote_safetensors_indexes(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                [alpha],
+                budget,
+            )
+
     def test_remote_safetensors_validation_accepts_non_model_shard_stem(self) -> None:
         """Remote index authority must support valid arbitrary SafeTensors shard stems."""
         shard_files = [
@@ -5750,8 +5825,8 @@ class TestModelDownloadStreaming:
                 allow_content_probes=False,
             )
 
-    def test_model_plan_metadata_only_ignores_lexically_disjoint_safetensors_index(self) -> None:
-        """A sibling-directory index cannot govern the selected shard without reading its content."""
+    def test_model_plan_metadata_only_refuses_lexically_disjoint_safetensors_index(self) -> None:
+        """An unread disjoint index name can still hide content routed to another selected scanner."""
         repo_files = [
             "selected/model-00001-of-00001.safetensors",
             "unrelated/model.safetensors.index.json",
@@ -5762,16 +5837,15 @@ class TestModelDownloadStreaming:
                 return_value=(repo_files, _HF_TEST_REVISION, None),
             ),
             patch("requests.get") as mock_requests_get,
+            pytest.raises(ValueError, match="metadata-only dry-run selection incomplete"),
         ):
-            plan = plan_huggingface_model_download(
+            plan_huggingface_model_download(
                 "https://huggingface.co/test/model",
                 allow_content_probes=False,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
             )
 
-        assert plan.selected_files == ["selected/model-00001-of-00001.safetensors"]
-        assert plan.safetensors_index_files == ()
         mock_requests_get.assert_not_called()
 
     def test_remote_safetensors_index_validation_checks_deadline_during_large_inventory(self) -> None:
@@ -10721,6 +10795,22 @@ class TestModelDownloadStreaming:
         assert set(details) == set(repo_files)
         assert all(detail["complete"] is expected_complete for detail in details.values())
         assert all(detail["missing_shard_indices"] == expected_missing for detail in details.values())
+
+    def test_remote_safetensors_filename_coverage_groups_nested_custom_stems_case_insensitively(self) -> None:
+        """Remote grouping uses parent, literal casefolded stem, and total as its family key."""
+        custom_family = [
+            "nested/Adapter+[V1]-00001-of-00002.SAFETENSORS",
+            "nested/adapter+[v1]-00002-of-00002.safetensors",
+        ]
+        other_family = ["nested/other-00001-of-00002.safetensors"]
+        repo_files = [*custom_family, *other_family]
+
+        details = _remote_safetensors_filename_shard_details_by_file(repo_files, repo_files)
+
+        assert set(details) == set(repo_files)
+        assert all(details[filename]["complete"] is True for filename in custom_family)
+        assert details[other_family[0]]["complete"] is False
+        assert details[other_family[0]]["missing_shard_indices"] == [2]
 
     @pytest.mark.parametrize(
         ("dimension", "constant_name", "constant_value", "metadata"),

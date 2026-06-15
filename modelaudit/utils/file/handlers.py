@@ -23,6 +23,12 @@ from pathlib import Path, PurePosixPath
 from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from ..._safetensors_shards import (
+    SAFETENSORS_SHARD_KIND,
+    is_safetensors_family_pattern,
+    parse_safetensors_shard_shape,
+    safetensors_family_pattern,
+)
 from ..helpers.cache_decorator import (
     add_optional_dependency_availability_to_version_context,
     should_bypass_cache_for_safetensors_header_limit,
@@ -53,7 +59,6 @@ MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
 _PREVALIDATED_SHARD_INFO_CONFIG_KEY = "_trusted_prevalidated_shard_info"
 _DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY = "_trusted_defer_safetensors_index_content_revalidation"
-SAFETENSORS_SHARD_PATTERN = r"model-(\d+)-of-(\d+)\.safetensors"
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
@@ -157,6 +162,7 @@ class _SafetensorsShardIndexInventory:
     expected_source_identities: frozenset[tuple[int | str, ...]] = frozenset()
     target_identities_observed: bool = False
     target_identity_error: str | None = None
+    normalized_shard_stem: str | None = None
 
 
 @dataclass
@@ -496,6 +502,150 @@ def _open_windows_shard_guard_fd(path: str, *, open_reparse_point: bool = False)
         raise
 
 
+@dataclass(frozen=True)
+class _WindowsStagingDirectoryGuard:
+    """Retained Windows directory handle plus its handle-bound pathname identity."""
+
+    handle: int
+    bound_path: Path
+    expected_stat: os.stat_result
+
+
+def _open_windows_staging_directory_guard(
+    path: Path,
+    expected_stat: os.stat_result,
+) -> _WindowsStagingDirectoryGuard:
+    """Open and bind one non-reparse Windows staging directory."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("file_attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    file_traverse = 0x0020
+    file_read_attributes = 0x0080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        str(path),
+        file_traverse | file_read_attributes,
+        file_share_read | file_share_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics | file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle_value):
+        raise ctypes_windows.WinError(ctypes_windows.get_last_error())
+
+    handle_value = handle if isinstance(handle, int) else int(handle.value)
+    try:
+        get_file_information = kernel32.GetFileInformationByHandleEx
+        get_file_information.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+        get_file_information.restype = wintypes.BOOL
+        tag_info = FileAttributeTagInfo()
+        if not get_file_information(
+            handle,
+            9,
+            ctypes.byref(tag_info),
+            ctypes.sizeof(tag_info),
+        ):
+            raise ctypes_windows.WinError(ctypes_windows.get_last_error())
+
+        file_attribute_directory = 0x00000010
+        file_attribute_reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+        if not tag_info.file_attributes & file_attribute_directory or (
+            tag_info.file_attributes & file_attribute_reparse_point
+        ):
+            raise _ShardPinUnavailableError("private staging directory changed while opening")
+
+        get_final_path = kernel32.GetFinalPathNameByHandleW
+        get_final_path.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        get_final_path.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        path_length = int(get_final_path(handle, buffer, len(buffer), 0))
+        if path_length <= 0 or path_length >= len(buffer):
+            raise _ShardPinUnavailableError("private staging directory path could not be bound")
+        bound_path_text = buffer.value
+        if bound_path_text.startswith("\\\\?\\UNC\\"):
+            bound_path_text = f"\\\\{bound_path_text[8:]}"
+        elif bound_path_text.startswith("\\\\?\\"):
+            bound_path_text = bound_path_text[4:]
+        bound_path = Path(bound_path_text)
+        bound_stat = os.stat(bound_path, follow_symlinks=False)
+        bound_attributes = getattr(bound_stat, "st_file_attributes", 0) or 0
+        if (
+            not stat.S_ISDIR(bound_stat.st_mode)
+            or bool(bound_attributes & file_attribute_reparse_point)
+            or not os.path.samestat(expected_stat, bound_stat)
+        ):
+            raise _ShardPinUnavailableError("private staging directory changed while opening")
+        return _WindowsStagingDirectoryGuard(
+            handle=handle_value,
+            bound_path=bound_path,
+            expected_stat=bound_stat,
+        )
+    except BaseException:
+        kernel32.CloseHandle(handle_value)
+        raise
+
+
+def _close_windows_staging_directory_guard(guard: _WindowsStagingDirectoryGuard) -> None:
+    """Release one retained Windows staging-directory handle."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(guard.handle)
+
+
+def _windows_staging_directory_identity_matches(path: Path, expected_stat: os.stat_result) -> bool:
+    """Return whether one staging pathname still names an expected ordinary directory."""
+    try:
+        current_stat = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+    current_attributes = getattr(current_stat, "st_file_attributes", 0) or 0
+    return (
+        stat.S_ISDIR(current_stat.st_mode)
+        and not bool(current_attributes & reparse_flag)
+        and os.path.samestat(expected_stat, current_stat)
+    )
+
+
+def _windows_staging_directory_guard_matches(guard: _WindowsStagingDirectoryGuard) -> bool:
+    """Return whether a retained staging directory still owns its bound path."""
+    return _windows_staging_directory_identity_matches(guard.bound_path, guard.expected_stat)
+
+
 @contextmanager
 def _pinned_windows_shard_scan_path(
     resolved_path: str,
@@ -760,9 +910,11 @@ def _pinned_windows_logical_scan_path(
     companion_fds: list[tuple[int, os.stat_result, str | None]] = []
     staged_companion_fds: list[tuple[int, os.stat_result, str]] = []
     staging_path: Path | None = None
+    staging_scan_root: Path | None = None
     initial_staging_stat: os.stat_result | None = None
     staged_file_stats: dict[Path, os.stat_result] = {}
-    staged_directories: set[Path] = set()
+    staging_directory_guards: dict[tuple[str, ...], _WindowsStagingDirectoryGuard] = {}
+    created_staging_directories: dict[tuple[str, ...], tuple[Path, os.stat_result | None]] = {}
     pinned_scan: _PinnedShardScan | None = None
     remaining_copy_bytes = copy_max_bytes
 
@@ -784,7 +936,10 @@ def _pinned_windows_logical_scan_path(
 
         staging_path = Path(tempfile.mkdtemp(prefix=".modelaudit_scan_"))
         initial_staging_stat = os.stat(staging_path, follow_symlinks=False)
-        staged_source = staging_path / pinned_name
+        opened_root_guard = _open_windows_staging_directory_guard(staging_path, initial_staging_stat)
+        staging_directory_guards[()] = opened_root_guard
+        staging_scan_root = opened_root_guard.bound_path
+        staged_source = staging_scan_root / pinned_name
         source_hash = _copy_pinned_file_descriptor(
             source_fd,
             staged_source,
@@ -832,7 +987,6 @@ def _pinned_windows_logical_scan_path(
 
         for relative_name, (companion_path, companion_target) in (companion_targets or {}).items():
             relative_path = Path(relative_name)
-            context_only_companion = bool(companion_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY))
             if (
                 relative_path.is_absolute()
                 or not relative_path.parts
@@ -845,24 +999,38 @@ def _pinned_windows_logical_scan_path(
                 os.close(companion_fd)
                 raise _ShardPinUnavailableError("validated companion target changed before pinning")
             companion_fds.append((companion_fd, companion_stat, None))
-            staged_companion = staging_path.joinpath(*relative_path.parts)
-            staged_companion.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            parent = staged_companion.parent
-            while parent != staging_path:
-                staged_directories.add(parent)
-                parent = parent.parent
+            parent_parts: tuple[str, ...] = ()
+            parent_guard = opened_root_guard
+            for parent_part in relative_path.parts[:-1]:
+                parent_parts = (*parent_parts, parent_part)
+                existing_parent_guard = staging_directory_guards.get(parent_parts)
+                if existing_parent_guard is not None:
+                    parent_guard = existing_parent_guard
+                    continue
+                staged_directory = parent_guard.bound_path / parent_part
+                try:
+                    staged_directory.mkdir(mode=0o700)
+                except FileExistsError as error:
+                    raise _ShardPinUnavailableError("validated companion staging directory changed") from error
+                created_staging_directories[parent_parts] = (staged_directory, None)
+                staged_directory_stat = os.stat(staged_directory, follow_symlinks=False)
+                created_staging_directories[parent_parts] = (staged_directory, staged_directory_stat)
+                created_parent_guard = _open_windows_staging_directory_guard(
+                    staged_directory,
+                    staged_directory_stat,
+                )
+                staging_directory_guards[parent_parts] = created_parent_guard
+                parent_guard = created_parent_guard
+            staged_companion = parent_guard.bound_path / relative_path.name
             staged_companion_hash = _copy_pinned_file_descriptor(
                 companion_fd,
                 staged_companion,
-                max_bytes=(
-                    companion_stat.st_size if context_only_companion else bounded_copy_limit(companion_stat.st_size)
-                ),
+                max_bytes=bounded_copy_limit(companion_stat.st_size),
                 deadline=deadline,
             )
             companion_fds[-1] = (companion_fd, companion_stat, staged_companion_hash)
             staged_companion_path_stat = os.stat(staged_companion, follow_symlinks=False)
-            if not context_only_companion:
-                record_copied_bytes(staged_companion_path_stat.st_size)
+            record_copied_bytes(staged_companion_path_stat.st_size)
             staged_file_stats[staged_companion] = staged_companion_path_stat
             if _pinned_file_descriptor_changed(
                 companion_fd,
@@ -898,6 +1066,11 @@ def _pinned_windows_logical_scan_path(
                 raise _ShardPinUnavailableError("staged companion content changed while staging")
             staged_companion_fds.append((staged_companion_fd, staged_companion_stat, staged_companion_hash))
 
+        if any(
+            not _windows_staging_directory_guard_matches(directory_guard)
+            for directory_guard in staging_directory_guards.values()
+        ):
+            raise _ShardPinUnavailableError("private staging directory changed before scanner dispatch")
         if deadline is not None and time.time() > deadline:
             raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
         with _pinned_windows_shard_scan_path(str(staged_source), staged_source_target) as pinned_scan:
@@ -963,13 +1136,17 @@ def _pinned_windows_logical_scan_path(
             os.close(companion_fd)
         if source_fd is not None:
             os.close(source_fd)
-        if staging_path is not None and initial_staging_stat is not None:
-            current_staging_stat: os.stat_result | None
-            try:
-                current_staging_stat = os.stat(staging_path, follow_symlinks=False)
-            except OSError:
-                current_staging_stat = None
-            if current_staging_stat is not None and os.path.samestat(initial_staging_stat, current_staging_stat):
+        try:
+            cleanup_root_guard: _WindowsStagingDirectoryGuard | None = staging_directory_guards.get(())
+            root_is_stable = cleanup_root_guard is not None and _windows_staging_directory_guard_matches(
+                cleanup_root_guard
+            )
+            if cleanup_root_guard is None and staging_path is not None and initial_staging_stat is not None:
+                root_is_stable = _windows_staging_directory_identity_matches(
+                    staging_path,
+                    initial_staging_stat,
+                )
+            if root_is_stable:
                 for staged_file, expected_stat in reversed(staged_file_stats.items()):
                     try:
                         current_file_stat = os.stat(staged_file, follow_symlinks=False)
@@ -978,17 +1155,57 @@ def _pinned_windows_logical_scan_path(
                     if stat.S_ISREG(current_file_stat.st_mode) and os.path.samestat(expected_stat, current_file_stat):
                         with suppress(OSError):
                             staged_file.unlink()
-                for staged_directory in sorted(
-                    staged_directories,
-                    key=lambda path: len(path.parts),
-                    reverse=True,
+                for directory_parts in sorted(created_staging_directories, key=len, reverse=True):
+                    created_path, created_stat = created_staging_directories[directory_parts]
+                    directory_guard = staging_directory_guards.pop(directory_parts, None)
+                    directory_stat: os.stat_result | None
+                    if directory_guard is not None:
+                        directory_path = directory_guard.bound_path
+                        directory_stat = directory_guard.expected_stat
+                        directory_is_stable = _windows_staging_directory_guard_matches(directory_guard)
+                        _close_windows_staging_directory_guard(directory_guard)
+                    else:
+                        directory_path = created_path
+                        directory_stat = created_stat
+                        directory_is_stable = created_stat is not None and (
+                            _windows_staging_directory_identity_matches(created_path, created_stat)
+                        )
+                    if (
+                        directory_is_stable
+                        and directory_stat is not None
+                        and _windows_staging_directory_identity_matches(directory_path, directory_stat)
+                    ):
+                        with suppress(OSError):
+                            directory_path.rmdir()
+
+                cleanup_root_guard = staging_directory_guards.get(())
+                root_path: Path | None
+                root_stat: os.stat_result | None
+                if cleanup_root_guard is not None:
+                    del staging_directory_guards[()]
+                    root_path = cleanup_root_guard.bound_path
+                    root_stat = cleanup_root_guard.expected_stat
+                    root_is_stable = _windows_staging_directory_guard_matches(cleanup_root_guard)
+                    _close_windows_staging_directory_guard(cleanup_root_guard)
+                else:
+                    root_path = staging_path
+                    root_stat = initial_staging_stat
+                if (
+                    root_is_stable
+                    and root_path is not None
+                    and root_stat is not None
+                    and _windows_staging_directory_identity_matches(root_path, root_stat)
                 ):
                     with suppress(OSError):
-                        staged_directory.rmdir()
-                with suppress(OSError):
-                    final_staging_stat = os.stat(staging_path, follow_symlinks=False)
-                    if os.path.samestat(initial_staging_stat, final_staging_stat):
-                        staging_path.rmdir()
+                        root_path.rmdir()
+        finally:
+            for _directory_parts, directory_guard in sorted(
+                staging_directory_guards.items(),
+                key=lambda item: len(item[0]),
+                reverse=True,
+            ):
+                _close_windows_staging_directory_guard(directory_guard)
+            staging_directory_guards.clear()
 
 
 @contextmanager
@@ -998,12 +1215,16 @@ def _pinned_shard_scan_path(
     *,
     logical_path: str | None = None,
     companion_targets: Mapping[str, tuple[str, dict[str, int | str]]] | None = None,
+    source_fd: int | None = None,
+    companion_fds: Mapping[str, int] | None = None,
     require_regular_path: bool = False,
     copy_max_bytes: int | None = None,
     deadline: float | None = None,
 ) -> Iterator[_PinnedShardScan]:
     """Expose a validated shard through a directory descriptor immune to pathname ABA swaps."""
     if os.name == "nt":
+        if source_fd is not None or companion_fds:
+            raise _ShardPinUnavailableError("borrowed source descriptors are unsupported on Windows")
         if logical_path is not None or companion_targets:
             pinned_name = Path(logical_path).name if logical_path is not None else Path(resolved_path).name
             if not pinned_name or pinned_name in {".", ".."}:
@@ -1022,9 +1243,21 @@ def _pinned_shard_scan_path(
                 yield windows_pinned_scan
         return
 
+    borrowed_source_fd = source_fd
+    borrowed_companion_fds = dict(companion_fds or {})
+    if borrowed_source_fd is not None and (
+        not isinstance(borrowed_source_fd, int) or isinstance(borrowed_source_fd, bool) or borrowed_source_fd < 0
+    ):
+        raise _ShardPinUnavailableError("borrowed source descriptor is invalid")
+    target_companion_names = set(companion_targets or {})
+    if set(borrowed_companion_fds).difference(target_companion_names) or any(
+        not isinstance(fd, int) or isinstance(fd, bool) or fd < 0 for fd in borrowed_companion_fds.values()
+    ):
+        raise _ShardPinUnavailableError("borrowed companion descriptor is invalid")
+
     source_path = Path(resolved_path)
     parent_fd: int | None = None
-    source_fd: int | None = None
+    source_fd = None
     staging_fd: int | None = None
     staging_parent_fd: int | None = None
     staging_path: Path | None = None
@@ -1086,12 +1319,15 @@ def _pinned_shard_scan_path(
             raise _ShardPinUnavailableError("descriptor-bound shard scans are unsupported on this platform")
 
         directory_flags = os.O_RDONLY | directory | nofollow | cloexec
-        parent_fd = os.open(source_path.parent, directory_flags)
-        source_fd = os.open(
-            source_name,
-            os.O_RDONLY | nofollow | nonblock | cloexec,
-            dir_fd=parent_fd,
-        )
+        if borrowed_source_fd is not None:
+            source_fd = os.dup(borrowed_source_fd)
+        else:
+            parent_fd = os.open(source_path.parent, directory_flags)
+            source_fd = os.open(
+                source_name,
+                os.O_RDONLY | nofollow | nonblock | cloexec,
+                dir_fd=parent_fd,
+            )
         source_stat = os.fstat(source_fd)
         if not _validated_stat_matches_target(source_stat, target):
             raise _ShardPinUnavailableError("validated shard target changed before pinning")
@@ -1183,13 +1419,17 @@ def _pinned_shard_scan_path(
             ):
                 raise _ShardPinUnavailableError("validated companion path escaped its scan directory")
             companion_source = Path(companion_path)
-            companion_parent_fd = os.open(companion_source.parent, directory_flags)
-            companion_parent_fds.append(companion_parent_fd)
-            companion_fd = os.open(
-                companion_source.name,
-                os.O_RDONLY | nofollow | nonblock | cloexec,
-                dir_fd=companion_parent_fd,
-            )
+            borrowed_companion_fd = borrowed_companion_fds.get(relative_name)
+            if borrowed_companion_fd is not None:
+                companion_fd = os.dup(borrowed_companion_fd)
+            else:
+                companion_parent_fd = os.open(companion_source.parent, directory_flags)
+                companion_parent_fds.append(companion_parent_fd)
+                companion_fd = os.open(
+                    companion_source.name,
+                    os.O_RDONLY | nofollow | nonblock | cloexec,
+                    dir_fd=companion_parent_fd,
+                )
             companion_stat = os.fstat(companion_fd)
             if not _validated_stat_matches_target(companion_stat, companion_target):
                 os.close(companion_fd)
@@ -1230,11 +1470,7 @@ def _pinned_shard_scan_path(
                         companion_fd,
                         relative_path.name,
                         destination_dir_fd=companion_staging_parent_fd,
-                        max_bytes=(
-                            companion_stat.st_size
-                            if context_only_companion
-                            else bounded_copy_limit(companion_stat.st_size)
-                        ),
+                        max_bytes=bounded_copy_limit(companion_stat.st_size),
                         deadline=deadline,
                     )
                 except OSError as error:
@@ -1253,7 +1489,7 @@ def _pinned_shard_scan_path(
                 os.symlink(companion_descriptor_path, relative_path.name, dir_fd=companion_staging_parent_fd)
                 created_staging_entries.append((companion_staging_parent_fd, relative_path.name))
             pinned_companion_stat = os.stat(relative_path.name, dir_fd=companion_staging_parent_fd)
-            if companion_use_regular_copy and not context_only_companion:
+            if companion_use_regular_copy:
                 record_copied_bytes(pinned_companion_stat.st_size)
             if (
                 companion_use_regular_copy
@@ -1615,7 +1851,6 @@ class ShardedModelDetector:
     # Common sharding patterns for large models
     SHARD_PATTERNS: ClassVar[list[str]] = [
         r"pytorch_model-(\d+)-of-(\d+)\.bin",  # HuggingFace PyTorch sharding
-        SAFETENSORS_SHARD_PATTERN,  # SafeTensors sharding
         r"model\.ckpt-(\d+)\.data-\d+-of-\d+",  # TensorFlow sharding
         r"model_weights_(\d+)\.h5",  # Keras sharding
         r"checkpoint_(\d+)\.pt",  # PyTorch checkpoint sharding
@@ -1657,9 +1892,47 @@ class ShardedModelDetector:
         # zero-based. Only a validated SafeTensors index may change the base.
         return one_based, "one"
 
+    @staticmethod
+    def _match_family_filename(
+        file_name: str,
+        pattern: str,
+        *,
+        expected_total: int | None,
+        normalized_safetensors_stem: str | None,
+    ) -> tuple[int | None, int | None] | None:
+        """Match one filename without using regex case folding for SafeTensors stems."""
+        if is_safetensors_family_pattern(pattern):
+            parsed = parse_safetensors_shard_shape(file_name)
+            if (
+                parsed is None
+                or normalized_safetensors_stem is None
+                or parsed.normalized_stem != normalized_safetensors_stem
+                or (expected_total is not None and parsed.total != expected_total)
+            ):
+                return None
+            return parsed.index, parsed.total
+
+        match = re.fullmatch(pattern, file_name)
+        if match is None:
+            return None
+        current_index: int | None = None
+        current_total: int | None = None
+        if match.lastindex:
+            with suppress(IndexError, ValueError):
+                current_index = int(match.group(1))
+        if (match.lastindex or 0) >= 2:
+            with suppress(IndexError, ValueError):
+                current_total = int(match.group(2))
+        if expected_total is not None and current_total != expected_total:
+            return None
+        return current_index, current_total
+
     @classmethod
     def match_shard_filename(cls, file_name: str) -> dict[str, int | str | None] | None:
         """Return shard metadata for a filename when it matches a known shard pattern."""
+        safetensors_match = cls.match_safetensors_shard_filename(file_name)
+        if safetensors_match is not None:
+            return safetensors_match
         for pattern in cls.SHARD_PATTERNS:
             match = re.fullmatch(pattern, file_name)
             if not match:
@@ -1683,20 +1956,18 @@ class ShardedModelDetector:
         return None
 
     @staticmethod
-    def match_safetensors_shard_filename(file_name: str) -> dict[str, int | str] | None:
-        """Return SafeTensors shard metadata for the exact SafeTensors shard pattern."""
-        match = re.fullmatch(SAFETENSORS_SHARD_PATTERN, file_name)
-        if match is None or (match.lastindex or 0) < 2:
-            return None
-        try:
-            shard_index = int(match.group(1))
-            expected_total = int(match.group(2))
-        except (IndexError, ValueError):
+    def match_safetensors_shard_filename(file_name: str) -> dict[str, int | str | None] | None:
+        """Return stem-safe metadata for an arbitrary-width SafeTensors shard basename."""
+        parsed = parse_safetensors_shard_shape(file_name)
+        if parsed is None:
             return None
         return {
-            "pattern": SAFETENSORS_SHARD_PATTERN,
-            "current_shard_index": shard_index,
-            "expected_total_shards": expected_total,
+            "pattern": safetensors_family_pattern(parsed.normalized_stem),
+            "shard_kind": SAFETENSORS_SHARD_KIND,
+            "shard_stem": parsed.stem,
+            "normalized_shard_stem": parsed.normalized_stem,
+            "current_shard_index": parsed.index,
+            "expected_total_shards": parsed.total,
         }
 
     @staticmethod
@@ -1783,8 +2054,6 @@ class ShardedModelDetector:
         cls,
         index_dir: Path,
         index_path: Path,
-        pattern: str,
-        expected_total: int | None,
         inspection_context: _SafetensorsIndexInspectionContext,
         *,
         force_content_revalidation: bool = False,
@@ -1793,6 +2062,7 @@ class ShardedModelDetector:
         """Parse one SafeTensors index, returning its shard inventory or a validation error."""
         expected_paths: set[str] = set()
         target_scope_complete = False
+        inventory_normalized_stem: str | None = None
         cache_key: tuple[Any, ...] | None = None
         observation_prefix: tuple[Any, ...] | None = None
         index_fingerprint: str | None = None
@@ -1813,8 +2083,6 @@ class ShardedModelDetector:
             observation_prefix = _safetensors_index_observation_prefix(index_path, resolved_index, pre_read_stat)
             cache_key = (
                 _normalized_absolute_path(index_dir),
-                pattern,
-                expected_total,
                 *observation_prefix,
             )
             cached = inspection_context.cached_inventory(cache_key)
@@ -1886,7 +2154,7 @@ class ShardedModelDetector:
                 raise ValueError("safetensors index weight_map must be a non-empty object")
 
             target_indices: set[int] = set()
-            index_expected_total: int | None = expected_total
+            index_expected_total: int | None = None
             raw_targets: list[Any] = []
             for weight_map in weight_maps:
                 raw_targets.extend(weight_map.values())
@@ -1925,7 +2193,7 @@ class ShardedModelDetector:
                 inventory = _SafetensorsShardIndexInventory(
                     index_path=index_path,
                     expected_source_paths=frozenset(expected_paths),
-                    expected_indices=cls._expected_index_range(expected_total or 1, zero_based=False),
+                    expected_indices=cls._expected_index_range(1, zero_based=False),
                     index_base="invalid",
                     fingerprint=index_fingerprint,
                     error="safetensors index target does not match shard filename pattern",
@@ -1946,8 +2214,17 @@ class ShardedModelDetector:
                     raise ValueError("safetensors index target does not match shard filename pattern")
                 target_index = target_match["current_shard_index"]
                 target_total = target_match["expected_total_shards"]
-                if not isinstance(target_index, int) or not isinstance(target_total, int):
+                target_stem = target_match.get("normalized_shard_stem")
+                if (
+                    not isinstance(target_index, int)
+                    or not isinstance(target_total, int)
+                    or not isinstance(target_stem, str)
+                ):
                     raise ValueError("safetensors index target does not match shard filename pattern")
+                if inventory_normalized_stem is None:
+                    inventory_normalized_stem = target_stem
+                elif target_stem != inventory_normalized_stem:
+                    raise ValueError("safetensors index references multiple model shard families")
                 if index_expected_total is None:
                     index_expected_total = target_total
                 elif target_total != index_expected_total:
@@ -1969,6 +2246,7 @@ class ShardedModelDetector:
                     index_base="zero",
                     fingerprint=index_fingerprint,
                     target_scope_complete=True,
+                    normalized_shard_stem=inventory_normalized_stem,
                 )
                 inventory = cls._observe_safetensors_inventory_target_identities(inventory)
                 assert cache_key is not None and observation_prefix is not None
@@ -1986,6 +2264,7 @@ class ShardedModelDetector:
                     index_base="one",
                     fingerprint=index_fingerprint,
                     target_scope_complete=True,
+                    normalized_shard_stem=inventory_normalized_stem,
                 )
                 inventory = cls._observe_safetensors_inventory_target_identities(inventory)
                 assert cache_key is not None and observation_prefix is not None
@@ -2000,11 +2279,12 @@ class ShardedModelDetector:
             inventory = _SafetensorsShardIndexInventory(
                 index_path=index_path,
                 expected_source_paths=frozenset(expected_paths),
-                expected_indices=cls._expected_index_range(expected_total or 1, zero_based=False),
+                expected_indices=cls._expected_index_range(1, zero_based=False),
                 index_base="invalid",
                 fingerprint=index_fingerprint,
                 error=str(exc),
                 target_scope_complete=target_scope_complete,
+                normalized_shard_stem=inventory_normalized_stem,
             )
             if target_scope_complete:
                 inventory = cls._observe_safetensors_inventory_target_identities(inventory)
@@ -2048,17 +2328,17 @@ class ShardedModelDetector:
         expected_total: int,
     ) -> bool | None:
         """Return index authority, or None when target identity is indeterminate."""
+        if not is_safetensors_family_pattern(pattern):
+            return False
         normalized_current = _normalized_absolute_path(current_file)
         if normalized_current in inventory.expected_source_paths:
             return True
-        current_match = re.fullmatch(pattern, current_file.name)
-        if current_match is None or (current_match.lastindex or 0) < 2:
+        current_match = parse_safetensors_shard_shape(current_file.name)
+        if current_match is None:
             return False
-        try:
-            current_total = int(current_match.group(2))
-        except (IndexError, ValueError):
+        if inventory.normalized_shard_stem is None:
             return False
-        if current_total != expected_total:
+        if current_match.family != (inventory.normalized_shard_stem, expected_total):
             return False
         if _count_expected_shard_indices(inventory.expected_indices) != expected_total:
             return False
@@ -2080,6 +2360,11 @@ class ShardedModelDetector:
         index_name = inventory.index_path.name
         if index_name.casefold() == SAFETENSORS_INDEX_NAME:
             return False
+        current_match = parse_safetensors_shard_shape(current_file.name)
+        if current_match is not None and index_name.casefold().endswith(SAFETENSORS_INDEX_SUFFIX):
+            index_stem = index_name[: -len(SAFETENSORS_INDEX_SUFFIX)]
+            if index_stem.casefold() == current_match.normalized_stem:
+                return False
         normalized_current = _normalized_absolute_path(current_file)
         for source_path in inventory.expected_source_paths:
             if source_path == normalized_current:
@@ -2156,7 +2441,7 @@ class ShardedModelDetector:
         target_identity_refreshes: dict[str, _SafetensorsShardIndexInventory] | None = None,
     ) -> _SafetensorsShardIndexInventory | None:
         """Load a governing SafeTensors index inventory or captured validation error."""
-        if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
+        if not is_safetensors_family_pattern(pattern) or not isinstance(expected_total, int):
             return None
 
         try:
@@ -2270,8 +2555,6 @@ class ShardedModelDetector:
                 inventory = cls._read_safetensors_index_inventory(
                     index_dir,
                     index_path,
-                    pattern,
-                    None,
                     inspection_context,
                     force_content_revalidation=force_content_revalidation,
                     content_revalidated_paths=content_revalidated_paths,
@@ -2360,7 +2643,12 @@ class ShardedModelDetector:
         if shard_match is None:
             return None, False
         expected_total = shard_match.get("expected_total_shards")
-        if not isinstance(expected_total, int) or isinstance(expected_total, bool):
+        family_pattern = shard_match.get("pattern")
+        if (
+            not isinstance(expected_total, int)
+            or isinstance(expected_total, bool)
+            or not isinstance(family_pattern, str)
+        ):
             return None, False
         dir_path = Path(file_path).parent
         effective_search_root = Path(index_search_root) if index_search_root is not None else dir_path.absolute()
@@ -2369,7 +2657,7 @@ class ShardedModelDetector:
         )
         inventory = cls._load_safetensors_index_inventory(
             dir_path,
-            SAFETENSORS_SHARD_PATTERN,
+            family_pattern,
             expected_total,
             Path(file_path),
             effective_search_root,
@@ -2415,13 +2703,21 @@ class ShardedModelDetector:
         )
         search_root = Path(index_search_root)
         files_by_parent: dict[str, list[Path]] = {}
+        family_pattern: str | None = None
         for file_path in file_paths:
             path = Path(file_path)
             shard_match = cls.match_safetensors_shard_filename(path.name)
             if shard_match is None or shard_match.get("expected_total_shards") != expected_total:
                 return None, False
+            path_pattern = shard_match.get("pattern")
+            if not isinstance(path_pattern, str):
+                return None, False
+            if family_pattern is None:
+                family_pattern = path_pattern
+            elif path_pattern != family_pattern:
+                return None, False
             files_by_parent.setdefault(_normalized_absolute_path(path.parent), []).append(path)
-        if not files_by_parent:
+        if not files_by_parent or family_pattern is None:
             return None, False
 
         agreed_proof: tuple[str, str, str, int] | None = None
@@ -2432,7 +2728,7 @@ class ShardedModelDetector:
             current_file = parent_files[0]
             inventory = cls._load_safetensors_index_inventory(
                 current_file.parent,
-                SAFETENSORS_SHARD_PATTERN,
+                family_pattern,
                 expected_total,
                 current_file,
                 search_root,
@@ -2526,11 +2822,27 @@ class ShardedModelDetector:
         elif normalized_allowed_targets is None:
             allowed_path_set = cls._direct_hf_shard_allowed_paths(Path(file_path))
 
-        for pattern in cls.SHARD_PATTERNS:
-            match = re.fullmatch(pattern, file_name)
-            if match:
+        safetensors_match = cls.match_safetensors_shard_filename(file_name)
+        candidate_patterns = (
+            [str(safetensors_match["pattern"])] if safetensors_match is not None else cls.SHARD_PATTERNS
+        )
+        for pattern in candidate_patterns:
+            match = re.fullmatch(pattern, file_name) if safetensors_match is None else None
+            if safetensors_match is not None or match is not None:
                 # Found a sharded model
                 shard_info: dict[str, Any] = {"pattern": pattern, "current_file": file_path, "shards": []}
+                normalized_safetensors_stem: str | None = None
+                if safetensors_match is not None:
+                    raw_normalized_stem = safetensors_match["normalized_shard_stem"]
+                    assert isinstance(raw_normalized_stem, str)
+                    normalized_safetensors_stem = raw_normalized_stem
+                    shard_info.update(
+                        {
+                            "shard_kind": SAFETENSORS_SHARD_KIND,
+                            "shard_stem": safetensors_match["shard_stem"],
+                            "normalized_shard_stem": normalized_safetensors_stem,
+                        }
+                    )
                 expected_totals: set[int] = set()
                 present_indices: set[int] = set()
                 unreadable_shards: list[str] = []
@@ -2541,7 +2853,12 @@ class ShardedModelDetector:
                 seen_target_identities: set[tuple[int | str, ...]] = set()
                 total_size = 0
                 requested_expected_total: int | None = None
-                if (match.lastindex or 0) >= 2:
+                if safetensors_match is not None:
+                    raw_expected_total = safetensors_match["expected_total_shards"]
+                    if isinstance(raw_expected_total, int):
+                        requested_expected_total = raw_expected_total
+                        expected_totals.add(raw_expected_total)
+                elif match is not None and (match.lastindex or 0) >= 2:
                     with suppress(IndexError, ValueError):
                         requested_expected_total = int(match.group(2))
                         expected_totals.add(requested_expected_total)
@@ -2576,7 +2893,15 @@ class ShardedModelDetector:
                 if index_inventory is not None and index_inventory.error is None:
                     candidate_aliases_by_name: dict[str, list[Path]] = {}
                     for candidate in candidate_paths.values():
-                        if re.fullmatch(pattern, candidate.name) is None:
+                        if (
+                            cls._match_family_filename(
+                                candidate.name,
+                                pattern,
+                                expected_total=requested_expected_total,
+                                normalized_safetensors_stem=normalized_safetensors_stem,
+                            )
+                            is None
+                        ):
                             continue
                         candidate_aliases_by_name.setdefault(os.path.normcase(candidate.name), []).append(candidate)
                     alias_comparisons = 0
@@ -2615,17 +2940,14 @@ class ShardedModelDetector:
 
                 shard_indices: dict[str, int] = {}
                 for file in sorted(candidate_paths.values(), key=str):
-                    file_match = re.fullmatch(pattern, file.name)
-                    if file_match:
-                        candidate_expected_total: int | None = None
-                        if (file_match.lastindex or 0) >= 2:
-                            with suppress(IndexError, ValueError):
-                                candidate_expected_total = int(file_match.group(2))
-                        if (
-                            requested_expected_total is not None
-                            and candidate_expected_total != requested_expected_total
-                        ):
-                            continue
+                    family_match = cls._match_family_filename(
+                        file.name,
+                        pattern,
+                        expected_total=requested_expected_total,
+                        normalized_safetensors_stem=normalized_safetensors_stem,
+                    )
+                    if family_match is not None:
+                        candidate_shard_index, _candidate_expected_total = family_match
                         try:
                             resolved_file = str(file.resolve(strict=True))
                         except (OSError, RuntimeError):
@@ -2722,11 +3044,9 @@ class ShardedModelDetector:
                             "nlink": shard_stat.st_nlink,
                         }
                         total_size += shard_size
-                        if file_match.lastindex:
-                            with suppress(IndexError, ValueError):
-                                shard_index = int(file_match.group(1))
-                                present_indices.add(shard_index)
-                                shard_indices[str(file)] = shard_index
+                        if candidate_shard_index is not None:
+                            present_indices.add(candidate_shard_index)
+                            shard_indices[str(file)] = candidate_shard_index
 
                 if not shard_info["shards"]:
                     return None
@@ -2865,7 +3185,7 @@ def _safetensors_shard_info_authority_is_stable(
     force_content_revalidation: bool,
 ) -> bool:
     """Require every SafeTensors shard parent to retain one agreed index proof."""
-    if not isinstance(shard_info, dict) or shard_info.get("pattern") != SAFETENSORS_SHARD_PATTERN:
+    if not isinstance(shard_info, dict) or shard_info.get("shard_kind") != SAFETENSORS_SHARD_KIND:
         return True
     expected_total = shard_info.get("expected_total_shards")
     raw_shards = shard_info.get("shards")
@@ -3440,6 +3760,7 @@ class ParallelShardHandler:
         members: set[str] = set()
         pattern = self.shard_info.get("pattern")
         expected_total = self.shard_info.get("expected_total_shards")
+        normalized_safetensors_stem = self.shard_info.get("normalized_shard_stem")
         for key in (
             "shards",
             "unreadable_shards",
@@ -3453,13 +3774,18 @@ class ParallelShardHandler:
                 for value in values:
                     if not isinstance(value, str) or not isinstance(pattern, str):
                         continue
-                    match = re.fullmatch(pattern, Path(value).name)
-                    if match is None:
+                    if (
+                        ShardedModelDetector._match_family_filename(
+                            Path(value).name,
+                            pattern,
+                            expected_total=expected_total if isinstance(expected_total, int) else None,
+                            normalized_safetensors_stem=(
+                                normalized_safetensors_stem if isinstance(normalized_safetensors_stem, str) else None
+                            ),
+                        )
+                        is None
+                    ):
                         continue
-                    if isinstance(expected_total, int) and (match.lastindex or 0) >= 2:
-                        with suppress(IndexError, ValueError):
-                            if int(match.group(2)) != expected_total:
-                                continue
                     members.add(str(Path(value).absolute()))
         return members
 
@@ -3468,6 +3794,7 @@ class ParallelShardHandler:
         current_file = Path(self.shard_info["current_file"])
         pattern = self.shard_info["pattern"]
         expected_total = self.shard_info.get("expected_total_shards")
+        normalized_safetensors_stem = self.shard_info.get("normalized_shard_stem")
         members: set[str] = set()
         family_directories = {current_file.parent}
         shard_targets = self.shard_info.get("shard_targets")
@@ -3477,15 +3804,18 @@ class ParallelShardHandler:
             )
         for family_directory in family_directories:
             for candidate in family_directory.glob("*"):
-                match = re.fullmatch(pattern, candidate.name)
-                if match is None:
+                if (
+                    ShardedModelDetector._match_family_filename(
+                        candidate.name,
+                        pattern,
+                        expected_total=expected_total if isinstance(expected_total, int) else None,
+                        normalized_safetensors_stem=(
+                            normalized_safetensors_stem if isinstance(normalized_safetensors_stem, str) else None
+                        ),
+                    )
+                    is None
+                ):
                     continue
-                if isinstance(expected_total, int) and (match.lastindex or 0) >= 2:
-                    try:
-                        if int(match.group(2)) != expected_total:
-                            continue
-                    except (IndexError, ValueError):
-                        continue
                 members.add(str(candidate.absolute()))
         return members
 

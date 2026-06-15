@@ -27,6 +27,10 @@ from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, Literal, cast, overload
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
+from ..._safetensors_shards import (
+    parse_canonical_safetensors_shard,
+    parse_safetensors_shard_shape,
+)
 from .._path_hardening import _ensure_secure_directory
 from ..file.detection import detect_file_format_for_skip_filter
 from ..file.streaming import StreamedSourceByteAccounting
@@ -83,10 +87,6 @@ _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _HF_ACQUIRED_SAFETENSORS_INDEX_BASENAME = "acquired.safetensors.index.json"
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
-_HF_SAFETENSORS_SHARD_PATTERN = re.compile(
-    r"(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors",
-    re.IGNORECASE,
-)
 _HF_SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 _HF_SAFETENSORS_SHARD_SHAPE_PATTERN = re.compile(
     r"(?P<stem>.+)-(?P<index>\d+)-of-(?P<total>\d+)\.safetensors",
@@ -1170,7 +1170,7 @@ def _remote_safetensors_filename_shard_details_by_file(
     """Return per-shard filename coverage details derived from the immutable repository listing."""
     from modelaudit.utils.file.handlers import _summarize_missing_shard_indices
 
-    grouped: dict[tuple[str, int], dict[int, list[str]]] = {}
+    grouped: dict[tuple[str, str, int], dict[int, list[str]]] = {}
     selected = set(model_files)
     for filename in repo_files:
         parsed = _parse_hf_safetensors_shard(filename) or _parse_hf_safetensors_shard_shape(filename)
@@ -1179,11 +1179,11 @@ def _remote_safetensors_filename_shard_details_by_file(
         stem, shard_index, expected_total = parsed
         if expected_total <= 0:
             continue
-        key = (stem, expected_total)
+        key = (PurePosixPath(filename).parent.as_posix(), stem.casefold(), expected_total)
         grouped.setdefault(key, {}).setdefault(shard_index, []).append(filename)
 
     details_by_file: dict[str, dict[str, Any]] = {}
-    for (_stem, expected_total), by_index in grouped.items():
+    for (_parent, _stem, expected_total), by_index in grouped.items():
         missing_indices, missing_count, missing_truncated = _summarize_missing_shard_indices(
             set(by_index), range(1, expected_total + 1)
         )
@@ -3248,21 +3248,6 @@ def _is_hf_safetensors_index_filename(filename: str) -> bool:
     return _hf_safetensors_index_stem(filename) is not None
 
 
-def _metadata_only_hf_candidate_requires_probe(
-    filename: str,
-    selected_files: Collection[str],
-    *,
-    allow_safetensors_index_expansion: bool,
-) -> bool:
-    """Return whether metadata alone cannot safely exclude one content-route candidate."""
-    if not _is_hf_safetensors_index_filename(filename):
-        return True
-    return allow_safetensors_index_expansion and _metadata_only_hf_index_may_govern_selected_shard(
-        filename,
-        selected_files,
-    )
-
-
 def _select_huggingface_model_files(
     repo_id: str,
     repo_files: list[str],
@@ -3323,19 +3308,6 @@ def _select_huggingface_model_files(
         else set()
     )
     if not allow_content_probes:
-        deferred_index_route_scanner_ids = (
-            selected_route_scanner_ids
-            if selected_route_scanner_ids is not None
-            else (
-                None
-                if selected_route_formats is None
-                else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
-            )
-        )
-        index_content_probe_required = bool(
-            deferred_index_route_scanner_ids is not None
-            and deferred_index_route_scanner_ids.difference({"safetensors"})
-        )
         selected_safetensors_indexes = [
             filename for filename in model_files if _is_hf_safetensors_index_filename(filename)
         ]
@@ -3346,14 +3318,6 @@ def _select_huggingface_model_files(
                 filename
                 for filename in _metadata_only_hf_content_probe_candidates(repo_files, model_files)
                 if filename not in exact_openvino_companion_candidates
-                if (
-                    _metadata_only_hf_candidate_requires_probe(
-                        filename,
-                        model_files,
-                        allow_safetensors_index_expansion=allow_safetensors_index_expansion,
-                    )
-                    or (allow_safetensors_index_expansion and index_content_probe_required)
-                )
             ]
             if content_probes_relevant
             else []
@@ -3542,7 +3506,7 @@ def _remote_safetensors_family_files(filenames: Collection[str]) -> dict[tuple[s
         if shard_parts is None:
             continue
         shard_stem, _shard_index, shard_total = shard_parts
-        families.setdefault((remote_path.parent.as_posix(), shard_stem, shard_total), set()).add(filename)
+        families.setdefault((remote_path.parent.as_posix(), shard_stem.casefold(), shard_total), set()).add(filename)
     return families
 
 
@@ -3696,7 +3660,8 @@ def _validate_remote_safetensors_indexes(
                 )
             parsed_targets[scoped_target] = scoped_parts
         scoped_target_families = {
-            (PurePosixPath(target).parent.as_posix(), parts[0], parts[2]) for target, parts in parsed_targets.items()
+            (PurePosixPath(target).parent.as_posix(), parts[0].casefold(), parts[2])
+            for target, parts in parsed_targets.items()
         }
         targets_overlap_selection = not selected_files.isdisjoint(scoped_targets)
         families_overlap_selection = not selected_family_keys.isdisjoint(scoped_target_families)
@@ -3732,7 +3697,10 @@ def _validate_remote_safetensors_indexes(
                     f"SafeTensors index {repo_id}/{index_file} has inconsistent shard totals"
                 )
             target_indices.add(shard_index)
-            target_families.setdefault((target_path.parent.as_posix(), shard_stem, shard_total), set()).add(target_file)
+            target_families.setdefault(
+                (target_path.parent.as_posix(), shard_stem.casefold(), shard_total),
+                set(),
+            ).add(target_file)
 
         if len(target_families) > 1:
             raise ValueError(
@@ -4079,21 +4047,17 @@ def _hf_route_scanner_ids_for_formats(format_names: frozenset[str]) -> frozenset
 
 
 def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
-    match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(filename)
-    if match is None:
+    parsed = parse_canonical_safetensors_shard(PurePosixPath(filename).name)
+    if parsed is None:
         return None
-    index = int(match.group("index"))
-    total = int(match.group("total"))
-    if index < 1 or total < 2 or index > total:
-        return None
-    return match.group("stem"), index, total
+    return parsed.stem, parsed.index, parsed.total
 
 
 def _parse_hf_safetensors_shard_shape(filename: str) -> tuple[str, int, int] | None:
-    match = _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename)
-    if match is None:
+    parsed = parse_safetensors_shard_shape(PurePosixPath(filename).name)
+    if parsed is None:
         return None
-    return match.group("stem"), int(match.group("index")), int(match.group("total"))
+    return parsed.stem, parsed.index, parsed.total
 
 
 def _has_hf_safetensors_shard_shape(filename: str) -> bool:
@@ -4331,35 +4295,11 @@ def _select_streamable_hf_files(
     )
 
     if not allow_content_probes and sniff_renamed_files_would_be_active:
-        deferred_index_route_scanner_ids = (
-            selected_route_scanner_ids
-            if selected_route_scanner_ids is not None
-            else (
-                None
-                if selected_route_formats is None
-                else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
-            )
-        )
-        index_content_probe_required = bool(
-            allow_safetensors_index_expansion
-            and deferred_index_route_scanner_ids is not None
-            and deferred_index_route_scanner_ids.difference({"safetensors"})
-        )
         candidate_files = _streamable_hf_content_probe_candidates(
             repo_files,
             model_files,
             exact_openvino_companion_candidates,
         )
-        candidate_files = [
-            filename
-            for filename in candidate_files
-            if _metadata_only_hf_candidate_requires_probe(
-                filename,
-                model_files,
-                allow_safetensors_index_expansion=allow_safetensors_index_expansion,
-            )
-            or index_content_probe_required
-        ]
         if candidate_files:
             _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
 
@@ -5350,9 +5290,11 @@ def verify_downloaded_huggingface_safetensors_index_proofs(
     proofs: Collection[HuggingFaceSafetensorsIndexProof],
     *,
     deadline: float | None = None,
-) -> None:
-    """Require downloaded indexes to match the immutable bytes validated during planning."""
+) -> dict[str, dict[str, int | str]]:
+    """Require immutable index bytes and return stable receipts for every declared target."""
     from modelaudit.utils.file.handlers import MAX_SAFETENSORS_SHARD_INDEX_BYTES
+
+    target_receipts: dict[str, dict[str, int | str]] = {}
 
     def check_deadline() -> None:
         if deadline is not None and time.monotonic() >= deadline:
@@ -5414,7 +5356,6 @@ def verify_downloaded_huggingface_safetensors_index_proofs(
             try:
                 resolved_target = lexical_target.resolve(strict=True)
                 target_parent = lexical_target.parent.resolve(strict=True)
-                target_stat = os.stat(resolved_target, follow_symlinks=False)
             except (OSError, RuntimeError) as exc:
                 raise ValueError(
                     f"Hugging Face SafeTensors index proof mismatch: downloaded shard is missing: {target_file}"
@@ -5430,11 +5371,67 @@ def verify_downloaded_huggingface_safetensors_index_proofs(
                 raise ValueError(
                     f"Hugging Face SafeTensors index proof mismatch: downloaded shard target escaped: {target_file}"
                 )
-            if not stat.S_ISREG(target_stat.st_mode):
+            try:
+                pre_open_stat = os.stat(resolved_target, follow_symlinks=False)
+                if not stat.S_ISREG(pre_open_stat.st_mode):
+                    raise ValueError(
+                        f"Hugging Face SafeTensors index proof mismatch: downloaded shard is invalid: {target_file}"
+                    )
+                with resolved_target.open("rb") as target_handle:
+                    opened_stat = os.fstat(target_handle.fileno())
+                    if not os.path.samestat(pre_open_stat, opened_stat):
+                        raise ValueError(
+                            "Hugging Face SafeTensors index proof mismatch: "
+                            f"downloaded shard changed while opening: {target_file}"
+                        )
+                post_open_stat = os.stat(resolved_target, follow_symlinks=False)
+            except ValueError:
+                raise
+            except OSError as exc:
+                raise ValueError(
+                    f"Hugging Face SafeTensors index proof mismatch: downloaded shard is missing: {target_file}"
+                ) from exc
+            target_identity_fields = (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+                "st_nlink",
+            )
+            if (
+                not stat.S_ISREG(pre_open_stat.st_mode)
+                or not stat.S_ISREG(opened_stat.st_mode)
+                or not stat.S_ISREG(post_open_stat.st_mode)
+                or not os.path.samestat(pre_open_stat, post_open_stat)
+                or any(
+                    getattr(pre_open_stat, field) != getattr(observed_stat, field)
+                    for observed_stat in (opened_stat, post_open_stat)
+                    for field in target_identity_fields
+                )
+            ):
                 raise ValueError(
                     f"Hugging Face SafeTensors index proof mismatch: downloaded shard is invalid: {target_file}"
                 )
+            target_receipt: dict[str, int | str] = {
+                "resolved_path": str(resolved_target),
+                "device": opened_stat.st_dev,
+                "inode": opened_stat.st_ino,
+                "size": opened_stat.st_size,
+                "mtime_ns": opened_stat.st_mtime_ns,
+                "ctime_ns": opened_stat.st_ctime_ns,
+                "nlink": opened_stat.st_nlink,
+            }
+            receipt_key = str(lexical_target.absolute())
+            existing_receipt = target_receipts.get(receipt_key)
+            if existing_receipt is not None and existing_receipt != target_receipt:
+                raise ValueError(
+                    f"Hugging Face SafeTensors index proof mismatch: downloaded shard changed: {target_file}"
+                )
+            target_receipts[receipt_key] = target_receipt
         check_deadline()
+    return target_receipts
 
 
 def _should_cleanup_hf_streaming_context_file(

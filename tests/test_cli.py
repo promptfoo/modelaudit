@@ -14,14 +14,14 @@ import sys
 import tempfile
 import types
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from modelaudit import __version__
 from modelaudit import cli as cli_module
@@ -170,6 +170,19 @@ def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
     for created_parent in missing_parents:
         created_parent.chmod(0o755)
     path.chmod(0o755)
+
+
+def _invoke_assumed_shard_family(
+    paths: Iterable[str | os.PathLike[str]],
+    *,
+    scanners: str | None = None,
+) -> Result:
+    """Invoke the common explicit-family JSON scan used by shard regressions."""
+    arguments = ["scan", *(os.fspath(path) for path in paths), "--assume-shard-family"]
+    if scanners is not None:
+        arguments.extend(["--scanners", scanners])
+    arguments.extend(["--format", "json", "--no-cache"])
+    return CliRunner().invoke(cli, arguments, catch_exceptions=False)
 
 
 def _write_ordered_hf_tokenizer_json(
@@ -961,11 +974,7 @@ def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_pat
         shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
         shard_paths.append(str(shard_path))
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(shard_paths)
 
     assert result.exit_code == 0, result.output
     output_payload = parse_click_json_output(result.output)
@@ -1052,11 +1061,7 @@ def test_scan_multiple_cross_directory_zero_based_shards_requires_index_authorit
         )
         index_path.chmod(0o644)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(shard_paths)
 
     assert result.exit_code == expected_exit_code, result.output
     output_payload = parse_click_json_output(result.output)
@@ -1104,20 +1109,7 @@ def test_scan_multiple_explicit_shards_revalidates_windows_index_once_per_family
         [str(shard) for shard in shard_paths] if input_style == "explicit" else [str(tmp_path / "model-*.safetensors")]
     )
 
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *scan_inputs,
-            "--assume-shard-family",
-            "--scanners",
-            "safetensors",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(scan_inputs, scanners="safetensors")
 
     assert result.exit_code == 0, result.output
     output_payload = parse_click_json_output(result.output)
@@ -1160,11 +1152,7 @@ def test_explicit_shard_index_authority_is_order_independent(
     if reverse_inputs:
         inputs.reverse()
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", *inputs, "--assume-shard-family", "--scanners", "safetensors", "--format", "json", "--no-cache"],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(inputs, scanners="safetensors")
 
     assert result.exit_code == 2, result.output
     assert parse_click_json_output(result.output)["success"] is False
@@ -1194,20 +1182,7 @@ def test_explicit_shard_family_does_not_ignore_governing_ancestor_index(tmp_path
         encoding="utf-8",
     )
 
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *(str(shard) for shard in selected),
-            "--assume-shard-family",
-            "--scanners",
-            "safetensors",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(selected, scanners="safetensors")
 
     assert result.exit_code == 2, result.output
     assert parse_click_json_output(result.output)["success"] is False
@@ -1236,24 +1211,12 @@ def test_explicit_shard_family_rejects_overlapping_duplicate_ancestor_index(tmp_
         encoding="utf-8",
     )
 
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *(str(shard) for shard in selected),
-            "--assume-shard-family",
-            "--scanners",
-            "safetensors",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(selected, scanners="safetensors")
 
     assert result.exit_code == 2, result.output
     output_payload = parse_click_json_output(result.output)
     assert output_payload["success"] is False
+    assert output_payload.get("content_hash") is None
     assert any(
         check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
         for check in output_payload["checks"]
@@ -1338,24 +1301,12 @@ def test_explicit_shard_family_rejects_incompletely_scoped_ancestor_index(
     else:
         index_path.write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
 
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *(str(shard) for shard in selected),
-            "--assume-shard-family",
-            "--scanners",
-            "safetensors",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(selected, scanners="safetensors")
 
     assert result.exit_code == 2, result.output
     output_payload = parse_click_json_output(result.output)
     assert output_payload["success"] is False
+    assert output_payload.get("content_hash") is None
     assert any(
         check.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
         for check in output_payload["checks"]
@@ -1391,11 +1342,7 @@ def test_explicit_zero_based_index_authority_requires_trusted_scope(
     index_path.write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
     index_path.chmod(index_mode)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", *(str(shard) for shard in shards), "--assume-shard-family", "--format", "json", "--no-cache"],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(shards)
 
     assert result.exit_code == expected_exit, result.output
     assert parse_click_json_output(result.output)["success"] is (expected_exit == 0)
@@ -1483,18 +1430,7 @@ def test_scan_multiple_cross_directory_shards_refreshes_index_authority(
         return original_resolve_source(*args, **kwargs)
 
     monkeypatch.setattr(cli_module, "_resolve_scan_source_for_path", replace_index_before_each_scan)
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *(str(shard) for shard in selected_shards),
-            "--assume-shard-family",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(selected_shards)
 
     assert result.exit_code == expected_exit_code, result.output
     output_payload = parse_click_json_output(result.output)
@@ -1562,18 +1498,7 @@ def test_scan_multiple_cross_directory_shards_revalidate_authority_before_reconc
         write_index(decoy_shards)
 
     monkeypatch.setattr(cli_module, "_complete_progress_tracking", replace_index_before_reconciliation)
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *(str(shard) for shard in selected_shards),
-            "--assume-shard-family",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(selected_shards)
 
     assert result.exit_code == 2, result.output
     output_payload = parse_click_json_output(result.output)
@@ -1585,6 +1510,7 @@ def test_scan_multiple_cross_directory_shards_revalidate_authority_before_reconc
     assert set(json.loads(index_path.read_text(encoding="utf-8"))["weight_map"].values()) == {
         shard.relative_to(tmp_path).as_posix() for shard in decoy_shards
     }
+    assert output_payload.get("content_hash") is None
     assert index_reads == 3
 
 
@@ -1636,18 +1562,7 @@ def test_scan_multiple_cross_directory_shards_rechecks_authority_after_reconcili
         replace_index_after_reconciliation,
     )
 
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *(str(shard) for shard in selected_shards),
-            "--assume-shard-family",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(selected_shards)
 
     assert reconciliation_count == 1
     assert result.exit_code == 2, result.output
@@ -1696,18 +1611,7 @@ def test_scan_multiple_cross_directory_shards_recheck_unindexed_authority_before
             )
 
     monkeypatch.setattr(cli_module, "_complete_progress_tracking", create_index_after_scans)
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *(str(shard) for shard in selected_shards),
-            "--assume-shard-family",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(selected_shards)
 
     expected_exit_code = 2 if create_index_before_reconciliation else 0
     assert result.exit_code == expected_exit_code, result.output
@@ -1771,18 +1675,7 @@ def test_scan_same_directory_shards_rejects_split_index_authority(
         return original_resolve_source(*args, **kwargs)
 
     monkeypatch.setattr(cli_module, "_resolve_scan_source_for_path", replace_index_before_each_scan)
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *(str(shard) for shard in selected_shards),
-            "--assume-shard-family",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(selected_shards)
 
     assert result.exit_code == 2, result.output
     output_payload = parse_click_json_output(result.output)
@@ -2447,6 +2340,56 @@ def test_cli_retained_regular_file_survives_ordinary_ancestor_aba(
     assert "/dev/fd/" not in result.output
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_cli_retained_regular_file_discovers_companions_from_retained_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ancestor swap cannot splice a benign companion beside a retained primary."""
+    from modelaudit import core as core_module
+
+    staging = tmp_path / "staging"
+    alternate = tmp_path / "alternate"
+    staging.mkdir()
+    alternate.mkdir()
+    source = staging / "model.manifest"
+    source.write_text(json.dumps({"layers": ["layer.tar.gz"]}), encoding="utf-8")
+    alternate_source = alternate / source.name
+    alternate_source.hardlink_to(source)
+    malicious_layer = b"malicious retained layer"
+    (staging / "layer.tar.gz").write_bytes(malicious_layer)
+    (alternate / "layer.tar.gz").write_bytes(b"benign replacement layer")
+    swap = tmp_path / "swap"
+    observed_layers: list[bytes] = []
+
+    def swap_ancestors() -> None:
+        staging.rename(swap)
+        alternate.rename(staging)
+        swap.rename(alternate)
+
+    def inspect_staged_companion(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        del config
+        swap_ancestors()
+        try:
+            observed_layers.append((Path(path).parent / "layer.tar.gz").read_bytes())
+        finally:
+            swap_ancestors()
+        scan_result = ScanResult(scanner_name="oci_layer")
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "scan_file", inspect_staged_companion)
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(source), "--scanners", "oci_layer", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    output = parse_click_json_output(result.output)
+    assert result.exit_code == 0, output
+    assert observed_layers == [malicious_layer]
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
 def test_scan_receipt_bound_hf_snapshot_preserves_blob_alias(
     tmp_path: Path,
@@ -2688,19 +2631,7 @@ def test_scan_cross_directory_shards_ignores_duplicate_explicit_argument(tmp_pat
         shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
         shard_paths.append(str(shard_path))
 
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *shard_paths,
-            shard_paths[0],
-            "--assume-shard-family",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family([*shard_paths, shard_paths[0]])
 
     assert result.exit_code == 0, result.output
     output_payload = parse_click_json_output(result.output)
@@ -2724,19 +2655,7 @@ def test_scan_cross_directory_shards_preserves_nonexistent_path_error(tmp_path: 
         shard_paths.append(str(shard_path))
     nonexistent_path = tmp_path / "missing.safetensors"
 
-    result = CliRunner().invoke(
-        cli,
-        [
-            "scan",
-            *shard_paths,
-            str(nonexistent_path),
-            "--assume-shard-family",
-            "--format",
-            "json",
-            "--no-cache",
-        ],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family([*shard_paths, nonexistent_path])
 
     assert result.exit_code == 2, result.output
     assert f"Path does not exist: {nonexistent_path}" in result.output
@@ -2765,11 +2684,7 @@ def test_scan_multiple_cross_directory_shards_reconciles_independent_families(tm
             shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
             shard_paths.append(str(shard_path))
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(shard_paths)
 
     assert result.exit_code == 0, result.output
     output_payload = parse_click_json_output(result.output)
@@ -2804,11 +2719,7 @@ def test_scan_cross_directory_shards_keeps_ambiguous_incomplete_families(tmp_pat
         if family_name.startswith("incomplete-"):
             incomplete_paths.add(str(shard_path))
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family(shard_paths)
 
     assert result.exit_code == 2, result.output
     output_payload = parse_click_json_output(result.output)
@@ -2831,11 +2742,7 @@ def test_scan_directory_does_not_assume_cross_directory_shard_family(tmp_path: P
         shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
         shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", str(tmp_path), "--assume-shard-family", "--format", "json", "--no-cache"],
-        catch_exceptions=False,
-    )
+    result = _invoke_assumed_shard_family([tmp_path])
 
     assert result.exit_code == 2, result.output
     output_payload = parse_click_json_output(result.output)
@@ -5827,7 +5734,9 @@ def test_scan_huggingface_standard_revalidates_index_proof_after_local_scan(
             index_path.write_text('{"weight_map":{"tensor":"other/model-00001-of-00001.safetensors"}}')
         else:
             target_path.unlink()
-        return create_mock_scan_result(files_scanned=1, issues=[])
+        scan_result = create_mock_scan_result(files_scanned=1, issues=[])
+        scan_result.content_hash = "a" * 64
+        return scan_result
 
     with (
         patch("modelaudit.cli.is_huggingface_url", return_value=True),
@@ -5837,12 +5746,96 @@ def test_scan_huggingface_standard_revalidates_index_proof_after_local_scan(
     ):
         result = CliRunner().invoke(
             cli,
-            ["scan", "--quiet", "--no-cache", "--scanners", "safetensors", "hf://test/model"],
+            [
+                "scan",
+                "--quiet",
+                "--no-cache",
+                "--format",
+                "json",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
             catch_exceptions=False,
         )
 
     assert result.exit_code == 2, result.output
     assert "SafeTensors index proof mismatch" in result.output
+    assert parse_click_json_output(result.output).get("content_hash") is None
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    ["model-00001-of-00001.safetensors", "adapter-00000-of-00001.safetensors"],
+    ids=["canonical", "custom-zero-based"],
+)
+def test_scan_huggingface_standard_binds_declared_target_receipts_during_local_scan(
+    tmp_path: Path,
+    target_name: str,
+) -> None:
+    """A same-UID target swap cannot make the local scan consume a different shard generation."""
+    from modelaudit.utils.sources.huggingface import HuggingFaceSafetensorsIndexProof
+
+    downloaded_dir = tmp_path / "downloaded"
+    target_path = downloaded_dir / "nested" / target_name
+    target_path.parent.mkdir(parents=True)
+    target_path.write_bytes(_minimal_safetensors_bytes())
+    replacement_path = target_path.with_name("replacement.safetensors")
+    replacement_path.write_bytes(_minimal_safetensors_bytes())
+    saved_path = target_path.with_name("saved.safetensors")
+    index_path = downloaded_dir / "weights.safetensors.index.json"
+    relative_target = target_path.relative_to(downloaded_dir).as_posix()
+    index_bytes = json.dumps({"weight_map": {"tensor": relative_target}}, separators=(",", ":")).encode()
+    index_path.write_bytes(index_bytes)
+    proof = HuggingFaceSafetensorsIndexProof(
+        index_file=index_path.name,
+        fingerprint=hashlib.sha256(index_bytes).hexdigest(),
+        target_files=(relative_target,),
+        index_base="zero" if "-00000-" in target_name else "one",
+    )
+
+    def download_with_proof(*_args: Any, **kwargs: Any) -> Path:
+        kwargs["safetensors_index_proofs"].append(proof)
+        return downloaded_dir
+
+    original_scan = cli_module.scan_model_directory_or_file
+
+    def scan_during_target_swap(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
+        target_path.rename(saved_path)
+        replacement_path.rename(target_path)
+        try:
+            return original_scan(path, *args, **kwargs)
+        finally:
+            target_path.rename(replacement_path)
+            saved_path.rename(target_path)
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch("modelaudit.cli.download_model", side_effect=download_with_proof),
+        patch("modelaudit.cli.scan_model_directory_or_file", side_effect=scan_during_target_swap),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--quiet",
+                "--no-cache",
+                "--format",
+                "json",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
+            catch_exceptions=False,
+        )
+
+    output = parse_click_json_output(result.output)
+    assert result.exit_code == 2, output
+    assert output["success"] is False
+    assert output.get("content_hash") is None
+    assert any(check.get("name") == "Local Source Boundary Check" for check in output["checks"])
+    assert target_path.read_bytes() == _minimal_safetensors_bytes()
 
 
 def test_scan_huggingface_index_proof_revalidation_shares_scan_deadline(tmp_path: Path) -> None:
