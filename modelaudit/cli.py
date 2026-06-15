@@ -2689,8 +2689,6 @@ def _explicit_local_shard_family_groups(
     index_inspection_context: _SafetensorsIndexInspectionContext | None = None,
 ) -> dict[str, _ExplicitShardFamily]:
     """Map exact local file arguments to conservative explicit-family metadata."""
-    if index_inspection_context is None:
-        index_inspection_context = _SafetensorsIndexInspectionContext()
     grouped_paths: dict[tuple[str, int], list[tuple[str, Path, int]]] = {}
     seen_paths: set[str] = set()
     for path_str in paths:

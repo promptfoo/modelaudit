@@ -52,7 +52,7 @@ MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
 _PREVALIDATED_SHARD_INFO_CONFIG_KEY = "_trusted_prevalidated_shard_info"
 _DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY = "_trusted_defer_safetensors_index_content_revalidation"
-SAFETENSORS_SHARD_PATTERN = r"model-(\d+)-of-(\d+)\.safetensors"
+SAFETENSORS_SHARD_PATTERN = r".+-(\d+)-of-(\d+)\.safetensors"
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
@@ -875,7 +875,7 @@ class ShardedModelDetector:
 
     @staticmethod
     def match_safetensors_shard_filename(file_name: str) -> dict[str, int | str] | None:
-        """Return SafeTensors shard metadata for the exact SafeTensors shard pattern."""
+        """Return SafeTensors shard metadata for an arbitrary-stem shard name."""
         match = re.fullmatch(SAFETENSORS_SHARD_PATTERN, file_name)
         if match is None or (match.lastindex or 0) < 2:
             return None

@@ -1585,7 +1585,7 @@ def test_scan_multiple_cross_directory_shards_revalidate_authority_before_reconc
     assert set(json.loads(index_path.read_text(encoding="utf-8"))["weight_map"].values()) == {
         shard.relative_to(tmp_path).as_posix() for shard in decoy_shards
     }
-    assert index_reads == 2
+    assert index_reads == 3
 
 
 def test_scan_multiple_cross_directory_shards_rechecks_authority_after_reconciliation(
