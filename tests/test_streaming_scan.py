@@ -801,11 +801,15 @@ def test_scan_model_streaming_hf_shared_onnx_external_data_counts_bytes_once(
     }
     remote_sizes = {filename: len(payload) for filename, payload in remote_payloads.items()}
     unique_bytes = sum(remote_sizes.values())
+    sidecar_hash = hashlib.sha256(sidecar_payload).hexdigest()
     expected_hash = compute_aggregate_hash(
         [
-            hashlib.sha256(model_a_payload).hexdigest(),
-            hashlib.sha256(sidecar_payload).hexdigest(),
-            hashlib.sha256(model_b_payload).hexdigest(),
+            _onnx_package_content_hash(
+                hashlib.sha256(model_a_payload).hexdigest(), [("shared.onnx_data", sidecar_hash)]
+            ),
+            _onnx_package_content_hash(
+                hashlib.sha256(model_b_payload).hexdigest(), [("shared.onnx_data", sidecar_hash)]
+            ),
         ]
     )
 
