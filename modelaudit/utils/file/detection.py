@@ -9604,9 +9604,6 @@ def detect_file_format(path: str) -> str:
         return "unknown"
 
     if ext in _COMPRESSED_EXTENSION_CODECS:
-        expected_codec = _COMPRESSED_EXTENSION_CODECS[ext]
-        if compression_format == expected_codec:
-            return "compressed"
         tar_route = _detect_tar_route(path)
         if tar_route is not None:
             return tar_route
@@ -10021,7 +10018,12 @@ def validate_file_type_with_formats(
             expected_codec = _COMPRESSED_EXTENSION_CODECS.get(file_extension)
             if expected_codec is None:
                 return False
-            return header_format == expected_codec
+            if header_format == expected_codec:
+                return True
+            return (
+                header_format in {"tar", "nemo"}
+                and _detect_compression_format(read_magic_bytes(path, 8)) == expected_codec
+            )
 
         # NeMo files are TAR archives, commonly carried in gzip-compressed TAR wrappers.
         if ext_format == "nemo":
