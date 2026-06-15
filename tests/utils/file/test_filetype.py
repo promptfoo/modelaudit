@@ -4864,7 +4864,7 @@ def test_structured_xml_model_named_license_precedes_legal_text_fallback(
     ("payload", "expected_format"),
     [
         pytest.param(
-            _lightgbm_text_payload("license=MIT License", "metadata=os.system('id')"),
+            _lightgbm_text_payload("legal=MIT License", "metadata=os.system('id')"),
             "lightgbm",
             id="lightgbm",
         ),
@@ -4939,7 +4939,7 @@ def test_structured_model_named_license_precedes_legal_text_fallback(
 @pytest.mark.parametrize(
     ("payload", "expected_format"),
     [
-        pytest.param(_lightgbm_text_payload("license=MIT License"), "lightgbm", id="lightgbm"),
+        pytest.param(_lightgbm_text_payload("legal=MIT License"), "lightgbm", id="lightgbm"),
         pytest.param(
             b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions",
             "cntk",

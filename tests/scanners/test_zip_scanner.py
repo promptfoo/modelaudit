@@ -208,7 +208,7 @@ def _malicious_lightgbm_legal_payload() -> bytes:
         b"feature_names=f0 f1 f2\nfeature_infos=[0:1] [0:1] [0:1]\ntree_sizes=12\n"
         b"Tree=0\nnum_leaves=2\nsplit_feature=0\nsplit_gain=1.0\nthreshold=0.5\n"
         b"decision_type=<=\nleft_child=-1\nright_child=-2\nleaf_value=0.1 0.2\n"
-        b"license=MIT License\nmetadata=os.system('id')\n"
+        b"legal=MIT License\nmetadata=os.system('id')\n"
     )
 
 
