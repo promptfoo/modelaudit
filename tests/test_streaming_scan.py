@@ -2922,7 +2922,7 @@ def test_scan_model_streaming_preserves_metadata_for_scanned_legal_sidecar(tmp_p
     """A real TextScanner result should be enriched with collected license metadata."""
     license_file = tmp_path / "LICENSE"
     license_file.write_text(
-        "MIT License\nCopyright (c) 2026 Example\nPermission is hereby granted.\n",
+        "MIT License\nCopyright (c) 2026 Example\nRights are hereby granted.\n",
         encoding="utf-8",
     )
 
