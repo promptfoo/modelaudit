@@ -11,6 +11,8 @@ on:
   push:
     branches:
       - main
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
@@ -19,7 +21,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
 
 jobs:
   # First, determine what changed to optimize subsequent jobs
@@ -58,8 +60,8 @@ jobs:
   lint:
     name: Lint and Format
     needs: changes
-    # Always run on main branch, otherwise only if Python files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    # Always run on main and merge_group, otherwise only if Python/workflow files changed
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -111,7 +113,7 @@ jobs:
   dependency-audit:
     name: Dependency Audit
     needs: changes
-    if: github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -156,7 +158,7 @@ jobs:
   license-check:
     name: License Compliance
     needs: changes
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -302,7 +304,7 @@ jobs:
   uv-lock-check:
     name: Lock File Consistency
     needs: changes
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -326,8 +328,8 @@ jobs:
   type-check:
     name: Type Check
     needs: changes
-    # Only run if Python files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    # Always run on main and merge_group, otherwise only if Python/workflow files changed
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -373,60 +375,16 @@ jobs:
           set -euo pipefail
           python scripts/minimal_circular_check.py
 
-  # Fast feedback job for immediate results
-  quick-feedback:
-    name: Quick Feedback (Python 3.12)
-    needs: changes
-    # Always run for fastest feedback
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
-    runs-on: ubuntu-latest
-    # The full fast suite can approach 40 minutes on hosted runners when the
-    # bounded-replay security regressions land on the long-running worker.
-    timeout-minutes: 50
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          enable-cache: true
-
-      - name: Pin Python version
-        run: |
-          uv python pin 3.12
-
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Cache Python dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
-        with:
-          path: |
-            .venv
-            ~/.cache/pip
-            ~/.cache/uv
-          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-uv-py3.12-
-            ${{ runner.os }}-uv-
-
-      - name: Sync dependencies
-        run: |
-          uv sync --extra all-ci
-
-      - name: Run fast tests with fail-fast
-        run: |
-          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
-
   windows-tests:
-    name: Windows Tests (Python 3.11)
+    name: Windows Tests (Python 3.11, Shard ${{ matrix.shard-name }})
     needs: changes
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: windows-latest
     timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"shard-count":2,"shard-index":0,"shard-name":"1/2"},{"shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -448,25 +406,28 @@ jobs:
           uv sync --extra all-ci-windows
 
       - name: Run fast tests with fail-fast
+        if: github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'
         run: |
-          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
+          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
+
+      - name: Run exhaustive fast-test shard
+        if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
+        run: |
+          uv run pytest tests -n auto -m "not slow and not integration and not performance" --modelaudit-shard-count ${{ matrix.shard-count }} --modelaudit-shard-index ${{ matrix.shard-index }} --tb=short --durations=10
 
   test:
-    name: Test Python ${{ matrix.python-version }}
+    name: Fast Tests (Python ${{ matrix.python-version }}, Shard ${{ matrix.shard-name }})
     needs: changes
-    # Only run if Python files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    # Always run on main and merge_group, otherwise only if Python/workflow files changed
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    # Coverage runs in dedicated shards below. Keep enough time here for the
-    # full uninstrumented matrix and the Python 3.12 slow/integration step.
+    # Coverage runs in dedicated shards below, and the Python 3.12
+    # slow/integration/performance suite now runs in a separate parallel job.
     timeout-minutes: 75
     strategy:
+      fail-fast: false
       matrix:
-        # For PRs, only test min and max Python versions to save time
-        # For main branch, test all versions
-        # Note: Python 3.10+ supported (see pyproject.toml)
-        # Python 3.10 gets NumPy 1.x, Python 3.11+ gets NumPy 2.x
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
+        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"python-version":"3.10","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.12","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.13","shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"python-version":"3.10","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.10","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.11","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.11","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.12","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.12","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.13","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.13","shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -501,41 +462,74 @@ jobs:
         run: |
           uv sync --extra all-ci
 
-      - name: Run fast tests with fail-fast (PRs)
-        if: github.event_name == 'pull_request'
+      - name: Run fast tests with fail-fast
+        if: github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'
         run: |
-          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+          uv run pytest tests -x --maxfail=1 -n auto \
+            -m "not slow and not integration and not performance" \
+            --modelaudit-shard-count ${{ matrix.shard-count }} \
+            --modelaudit-shard-index ${{ matrix.shard-index }} \
+            --tb=short --durations=15
 
-      - name: Run slow/integration tests on PR (if labeled)
-        # Run slow tests on PRs when the 'run-slow-tests' label is added
-        # This allows developers to validate slow tests before merging
-        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests') && matrix.python-version == '3.12'
-        timeout-minutes: 20
+      - name: Run exhaustive fast-test shard
+        if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
         run: |
-          echo "Running slow/integration tests due to 'run-slow-tests' label"
-          uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
+          uv run pytest tests -n auto \
+            -m "not slow and not integration and not performance" \
+            --modelaudit-shard-count ${{ matrix.shard-count }} \
+            --modelaudit-shard-index ${{ matrix.shard-index }} \
+            --tb=short --durations=15
 
-      - name: Run fast tests (main branch)
-        if: github.ref == 'refs/heads/main'
-        run: |
-          uv run pytest tests -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+  slow-tests:
+    name: Slow/Integration Tests (Python 3.12)
+    needs: changes
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Run slow/integration tests (main branch only)
-        # Run ALL slow/integration/performance tests on main branch.
-        # Tests with missing dependencies auto-skip via pytest.importorskip() or framework markers.
-        # Runs on Python 3.12 only to keep CI time reasonable.
-        if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
-        timeout-minutes: 20
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
         run: |
-          # Run all slow, integration, and performance tests
+          uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Python dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-py3.12-
+            ${{ runner.os }}-uv-
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci
+
+      - name: Run slow, integration, and performance tests
+        run: |
           uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
 
   coverage:
     name: Coverage (${{ matrix.shard }})
     needs: changes
-    # Prove workflow changes on their PR, but avoid adding five expensive jobs
-    # to ordinary Python PRs. Main always receives the sharded coverage gate.
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.workflows == 'true'
+    # Prove workflow changes on their PR, but avoid adding the expensive
+    # sharded coverage gate to ordinary Python PRs.
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.workflows == 'true'
     permissions:
       contents: read
       id-token: write
@@ -546,7 +540,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -585,7 +579,7 @@ jobs:
         run: |
           uv run pytest tests -n auto \
             -m "not slow and not integration and not performance" \
-            --modelaudit-shard-count 5 --modelaudit-shard-index ${{ matrix.shard }} \
+            --modelaudit-shard-count 10 --modelaudit-shard-index ${{ matrix.shard }} \
             --cov=modelaudit --cov-report=xml:coverage.xml --tb=short --durations=15
           test -s coverage.xml
 
@@ -602,8 +596,8 @@ jobs:
   test-numpy-compatibility:
     name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
     needs: changes
-    # Only run on main branch or if dependencies changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
+    # Always run on main and merge_group, otherwise only if dependencies changed
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -611,7 +605,7 @@ jobs:
         # Test both NumPy versions with appropriate Python versions:
         # - NumPy 1.x on Python 3.10 (last version supporting NumPy 1.x)
         # - NumPy 2.x on Python 3.11+ (requires Python >=3.11)
-        # Reduced matrix for PRs, full matrix for main branch
+        # Reduced matrix for PRs, full matrix for main and merge_group runs
         include: ${{ github.event_name == 'pull_request' && fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"}]') || fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"},{"python-version":"3.12","numpy-mode":"2.x"},{"python-version":"3.13","numpy-mode":"2.x"}]') }}
     steps:
       - name: Checkout repo
@@ -675,8 +669,8 @@ jobs:
   test-vendored-protos:
     name: Test Vendored TensorFlow Protos
     needs: changes
-    # Run on main branch or if Python/dependency files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
+    # Run for merge queue candidates and main, or if Python/dependency files changed.
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -736,8 +730,8 @@ jobs:
   test-proto-reproducibility:
     name: Verify Vendored Proto Reproducibility
     needs: changes
-    # Only run on main or when proto-related files change
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
+    # Run for merge queue candidates and main, or if Python/dependency files changed.
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -784,8 +778,8 @@ jobs:
   test-extras-smoke:
     name: Extras Smoke Test (${{ matrix.extra }})
     needs: changes
-    # Only run on main or when dependencies change
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
+    # Always run on main and merge_group, otherwise only when dependencies change
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -840,8 +834,8 @@ jobs:
   build:
     name: Build and Package
     needs: changes
-    # Always build on main, otherwise only if Python/dependency/workflow files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    # Always build on main and merge_group, otherwise only if Python/dependency/workflow files changed
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -903,7 +897,7 @@ jobs:
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
-            PYTHONPATH= /tmp/modelaudit-wheel-smoke/bin/python -I - <<'PY'
+            PYTHONPATH='' /tmp/modelaudit-wheel-smoke/bin/python -I - <<'PY'
           import importlib.util
 
           import modelaudit
@@ -925,7 +919,7 @@ jobs:
   picklescan-package:
     name: Standalone Pickle Package (${{ matrix.python-version }})
     needs: changes
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -1036,7 +1030,7 @@ jobs:
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
-            PYTHONPATH= /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
+            PYTHONPATH='' /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
           import importlib.util
 
           import modelaudit_picklescan
@@ -1057,7 +1051,6 @@ jobs:
     needs:
       [
         changes,
-        quick-feedback,
         lint,
         dependency-audit,
         license-check,
@@ -1065,6 +1058,7 @@ jobs:
         type-check,
         windows-tests,
         test,
+        slow-tests,
         coverage,
         test-numpy-compatibility,
         test-vendored-protos,
@@ -1079,8 +1073,8 @@ jobs:
       - name: Check if all jobs succeeded
         run: |
           # Most jobs may be skipped when their path conditions are not met.
-          # Jobs required for the current event are checked separately below.
-          QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
+          # The aggregate below requires the exact jobs scheduled for pull
+          # requests, merge queue candidates, and main pushes.
           LINT_RESULT="${{ needs.lint.result }}"
           DEPENDENCY_AUDIT_RESULT="${{ needs.dependency-audit.result }}"
           LICENSE_RESULT="${{ needs.license-check.result }}"
@@ -1088,6 +1082,7 @@ jobs:
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           TEST_RESULT="${{ needs.test.result }}"
+          SLOW_RESULT="${{ needs.slow-tests.result }}"
           COVERAGE_RESULT="${{ needs.coverage.result }}"
           NUMPY_RESULT="${{ needs.test-numpy-compatibility.result }}"
           PROTOS_RESULT="${{ needs.test-vendored-protos.result }}"
@@ -1099,12 +1094,14 @@ jobs:
 
           # Check if conditional jobs should have run
           ON_MAIN_BRANCH="${{ github.ref == 'refs/heads/main' }}"
+          ON_MERGE_GROUP="${{ github.event_name == 'merge_group' }}"
+          ON_PULL_REQUEST="${{ github.event_name == 'pull_request' }}"
+          RUN_SLOW_LABEL="${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests') }}"
           DEPENDENCIES_CHANGED="${{ needs.changes.outputs.dependencies == 'true' }}"
           PICKLESCAN_CHANGED="${{ needs.changes.outputs.picklescan == 'true' }}"
           PYTHON_CHANGED="${{ needs.changes.outputs.python == 'true' }}"
           WORKFLOWS_CHANGED="${{ needs.changes.outputs.workflows == 'true' }}"
           echo "Job results:"
-          echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
           echo "  dependency-audit: $DEPENDENCY_AUDIT_RESULT"
           echo "  license-check: $LICENSE_RESULT"
@@ -1112,6 +1109,7 @@ jobs:
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
+          echo "  slow-tests: $SLOW_RESULT"
           echo "  coverage: $COVERAGE_RESULT"
           echo "  test-numpy-compatibility: $NUMPY_RESULT"
           echo "  test-vendored-protos: $PROTOS_RESULT"
@@ -1124,38 +1122,57 @@ jobs:
           # Check if any job failed or was cancelled
           FAILED=false
 
-          [[ "$CHANGES_RESULT" == "failure" || "$CHANGES_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$DEPENDENCY_AUDIT_RESULT" == "failure" || "$DEPENDENCY_AUDIT_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]] && FAILED=true
-          [[ "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]] && FAILED=true
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            FAILED=true
+          fi
+
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
+            [[ "$LINT_RESULT" != "success" ]] && FAILED=true
+            [[ "$TYPE_CHECK_RESULT" != "success" ]] && FAILED=true
+            [[ "$WINDOWS_RESULT" != "success" ]] && FAILED=true
+            [[ "$TEST_RESULT" != "success" ]] && FAILED=true
+          fi
+
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
+            [[ "$BUILD_RESULT" != "success" ]] && FAILED=true
+          fi
+
+          if [[ "$ON_MERGE_GROUP" == "true" || ( "$ON_PULL_REQUEST" == "true" && ( "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" || "$PYTHON_CHANGED" == "true" || "$PICKLESCAN_CHANGED" == "true" ) ) ]]; then
+            [[ "$DEPENDENCY_AUDIT_RESULT" != "success" ]] && FAILED=true
+          fi
 
           # Conditional jobs: only fail if they should have run
-          # Coverage is mandatory on main and for workflow changes. Requiring
-          # exact success prevents a skipped shard matrix from passing the gate.
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
+          # Coverage is mandatory for merge queue candidates, main, and workflow
+          # changes. Exact success prevents a skipped shard matrix from passing.
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
             [[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true
           fi
 
-          # License/lock checks run on main or when dependencies change
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
-            [[ "$LICENSE_RESULT" == "failure" || "$LICENSE_RESULT" == "cancelled" ]] && FAILED=true
-            [[ "$UV_LOCK_RESULT" == "failure" || "$UV_LOCK_RESULT" == "cancelled" ]] && FAILED=true
-            [[ "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ]] && FAILED=true
-            [[ "$EXTRAS_RESULT" == "failure" || "$EXTRAS_RESULT" == "cancelled" ]] && FAILED=true
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$RUN_SLOW_LABEL" == "true" ]]; then
+            [[ "$SLOW_RESULT" != "success" ]] && FAILED=true
           fi
 
-          # Vendored protos jobs run on main or when python/dependencies change
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
-            [[ "$PROTOS_RESULT" == "failure" || "$PROTOS_RESULT" == "cancelled" ]] && FAILED=true
-            [[ "$PROTO_REPRO_RESULT" == "failure" || "$PROTO_REPRO_RESULT" == "cancelled" ]] && FAILED=true
+          # License/lock checks run for the merge queue and main, or when
+          # dependency/workflow files change.
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
+            [[ "$LICENSE_RESULT" != "success" ]] && FAILED=true
+            [[ "$UV_LOCK_RESULT" != "success" ]] && FAILED=true
           fi
 
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$PICKLESCAN_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
-            [[ "$PICKLESCAN_RESULT" == "failure" || "$PICKLESCAN_RESULT" == "cancelled" ]] && FAILED=true
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
+            [[ "$NUMPY_RESULT" != "success" ]] && FAILED=true
+            [[ "$EXTRAS_RESULT" != "success" ]] && FAILED=true
+          fi
+
+          # Vendored proto jobs run for the merge queue and main, or when
+          # Python/dependency files change.
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
+            [[ "$PROTOS_RESULT" != "success" ]] && FAILED=true
+            [[ "$PROTO_REPRO_RESULT" != "success" ]] && FAILED=true
+          fi
+
+          if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$PICKLESCAN_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
+            [[ "$PICKLESCAN_RESULT" != "success" ]] && FAILED=true
           fi
 
           if [[ "$FAILED" == "true" ]]; then
