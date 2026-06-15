@@ -204,7 +204,7 @@ def test_typed_field_decoder_reserves_before_decode(tmp_path: Path, monkeypatch:
         return original(tensor, *args, **kwargs)
 
     monkeypatch.setattr(onnx.numpy_helper, "to_array", record)
-    plan = scanner._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=8_000_000)
+    plan = scanner._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=8_000)
     assert decoded is False
     assert plan.oversized_initializers_skipped == 1
 
