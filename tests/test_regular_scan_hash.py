@@ -3,6 +3,7 @@
 import builtins
 import hashlib
 import json
+import logging
 import os
 import pickle
 import tarfile
@@ -1501,7 +1502,12 @@ class TestHashGenerationEdgeCases:
         assert result.has_errors is True
         assert result.content_hash is None
 
-    def test_unhashable_files_excluded_from_hash(self, tmp_path, monkeypatch):
+    def test_unhashable_files_excluded_from_hash(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """Test that files failing to hash are excluded from aggregate hash."""
         # Create a valid file
         valid_file = tmp_path / "valid.pkl"
@@ -1509,7 +1515,9 @@ class TestHashGenerationEdgeCases:
             pickle.dump({"data": "valid"}, f)
 
         # Create a file that will fail to hash
-        bad_file = tmp_path / "bad.pkl"
+        sensitive_path_fragment = "secret-token-value"
+        sensitive_error_fragment = "secret-error-value"
+        bad_file = tmp_path / f"{sensitive_path_fragment}.pkl"
         with open(bad_file, "wb") as f:
             pickle.dump({"data": "bad"}, f)
 
@@ -1519,19 +1527,23 @@ class TestHashGenerationEdgeCases:
         original_hash = core._calculate_file_hash
 
         def mock_hash(path: str, *, deadline: float | None = None) -> str:
-            if "bad.pkl" in str(path):
-                raise OSError("Simulated hash failure")
+            if Path(path).name == bad_file.name:
+                raise OSError(sensitive_error_fragment)
             return original_hash(path, deadline=deadline)
 
         monkeypatch.setattr(core, "_calculate_file_hash", mock_hash)
 
         # Scan directory
-        result = scan_model_directory_or_file(str(tmp_path))
+        with caplog.at_level(logging.WARNING, logger="modelaudit.core"):
+            result = scan_model_directory_or_file(str(tmp_path))
 
         # Should have a hash based only on the valid file
         assert result.content_hash is not None
         # files_scanned should include both files
         assert result.files_scanned == 2
+        assert "Failed to hash a directory member" in caplog.text
+        assert sensitive_path_fragment not in caplog.text
+        assert sensitive_error_fragment not in caplog.text
 
     def test_hash_generation_performance(self, tmp_path):
         """Test that hash generation doesn't significantly impact performance."""

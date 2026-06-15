@@ -4919,9 +4919,9 @@ def _hash_files_by_path(
                 }
             if inode_key is not None:
                 hashes_by_inode[inode_key] = content_hashes[file_path]
-        except Exception as e:
+        except Exception:
             # Log error but continue with other files to prevent single I/O failure from aborting entire scan
-            logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
+            logger.warning("Failed to hash a directory member; skipping deduplication for this file.")
             content_hashes[file_path] = f"unhashable_{id(file_path)}"
 
     return content_hashes
