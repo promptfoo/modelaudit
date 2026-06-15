@@ -375,55 +375,6 @@ jobs:
           set -euo pipefail
           python scripts/minimal_circular_check.py
 
-  # Fast feedback job for immediate results
-  quick-feedback:
-    name: Quick Feedback (Python 3.12)
-    needs: changes
-    # PR-only: main and merge_group runs already execute the Python 3.12 fast
-    # suite via the sharded compatibility matrix and coverage jobs below.
-    if: github.event_name == 'pull_request' && (needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true')
-    runs-on: ubuntu-latest
-    # The full fast suite can approach 40 minutes on hosted runners when the
-    # bounded-replay security regressions land on the long-running worker.
-    timeout-minutes: 50
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          enable-cache: true
-
-      - name: Pin Python version
-        run: |
-          uv python pin 3.12
-
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Cache Python dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
-        with:
-          path: |
-            .venv
-            ~/.cache/pip
-            ~/.cache/uv
-          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-uv-py3.12-
-            ${{ runner.os }}-uv-
-
-      - name: Sync dependencies
-        run: |
-          uv sync --extra all-ci
-
-      - name: Run fast tests with fail-fast
-        run: |
-          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
-
   windows-tests:
     name: Windows Tests (Python 3.11, Shard ${{ matrix.shard-name }})
     needs: changes
@@ -476,7 +427,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"python-version":"3.10","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.13","shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"python-version":"3.10","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.10","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.11","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.11","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.12","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.12","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.13","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.13","shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
+        include: ${{ github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true' && fromJSON('[{"python-version":"3.10","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.12","shard-count":1,"shard-index":0,"shard-name":"1/1"},{"python-version":"3.13","shard-count":1,"shard-index":0,"shard-name":"1/1"}]') || fromJSON('[{"python-version":"3.10","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.10","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.11","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.11","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.12","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.12","shard-count":2,"shard-index":1,"shard-name":"2/2"},{"python-version":"3.13","shard-count":2,"shard-index":0,"shard-name":"1/2"},{"python-version":"3.13","shard-count":2,"shard-index":1,"shard-name":"2/2"}]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -718,7 +669,7 @@ jobs:
   test-vendored-protos:
     name: Test Vendored TensorFlow Protos
     needs: changes
-    # Run on main branch or if Python/dependency files changed
+    # Run for merge queue candidates and main, or if Python/dependency files changed.
     if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -779,7 +730,7 @@ jobs:
   test-proto-reproducibility:
     name: Verify Vendored Proto Reproducibility
     needs: changes
-    # Only run on main or when proto-related files change
+    # Run for merge queue candidates and main, or if Python/dependency files changed.
     if: github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1100,7 +1051,6 @@ jobs:
     needs:
       [
         changes,
-        quick-feedback,
         lint,
         dependency-audit,
         license-check,
@@ -1123,8 +1073,8 @@ jobs:
       - name: Check if all jobs succeeded
         run: |
           # Most jobs may be skipped when their path conditions are not met.
-          # Jobs required for the current event are checked separately below.
-          QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
+          # The aggregate below requires the exact jobs scheduled for pull
+          # requests, merge queue candidates, and main pushes.
           LINT_RESULT="${{ needs.lint.result }}"
           DEPENDENCY_AUDIT_RESULT="${{ needs.dependency-audit.result }}"
           LICENSE_RESULT="${{ needs.license-check.result }}"
@@ -1152,7 +1102,6 @@ jobs:
           PYTHON_CHANGED="${{ needs.changes.outputs.python == 'true' }}"
           WORKFLOWS_CHANGED="${{ needs.changes.outputs.workflows == 'true' }}"
           echo "Job results:"
-          echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
           echo "  dependency-audit: $DEPENDENCY_AUDIT_RESULT"
           echo "  license-check: $LICENSE_RESULT"
@@ -1177,10 +1126,6 @@ jobs:
             FAILED=true
           fi
 
-          if [[ "$ON_PULL_REQUEST" == "true" && ( "$PYTHON_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ) ]]; then
-            [[ "$QUICK_FEEDBACK_RESULT" != "success" ]] && FAILED=true
-          fi
-
           if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
             [[ "$LINT_RESULT" != "success" ]] && FAILED=true
             [[ "$TYPE_CHECK_RESULT" != "success" ]] && FAILED=true
@@ -1197,8 +1142,8 @@ jobs:
           fi
 
           # Conditional jobs: only fail if they should have run
-          # Coverage is mandatory on main and for workflow changes. Requiring
-          # exact success prevents a skipped shard matrix from passing the gate.
+          # Coverage is mandatory for merge queue candidates, main, and workflow
+          # changes. Exact success prevents a skipped shard matrix from passing.
           if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
             [[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true
           fi
@@ -1207,7 +1152,8 @@ jobs:
             [[ "$SLOW_RESULT" != "success" ]] && FAILED=true
           fi
 
-          # License/lock checks run on main or when dependencies change
+          # License/lock checks run for the merge queue and main, or when
+          # dependency/workflow files change.
           if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
             [[ "$LICENSE_RESULT" != "success" ]] && FAILED=true
             [[ "$UV_LOCK_RESULT" != "success" ]] && FAILED=true
@@ -1218,7 +1164,8 @@ jobs:
             [[ "$EXTRAS_RESULT" != "success" ]] && FAILED=true
           fi
 
-          # Vendored protos jobs run on main or when python/dependencies change
+          # Vendored proto jobs run for the merge queue and main, or when
+          # Python/dependency files change.
           if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
             [[ "$PROTOS_RESULT" != "success" ]] && FAILED=true
             [[ "$PROTO_REPRO_RESULT" != "success" ]] && FAILED=true
