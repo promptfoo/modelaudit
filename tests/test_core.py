@@ -339,6 +339,127 @@ def test_windows_missing_reparse_attributes_and_mode_are_treated_as_absent() -> 
     assert not JaxCheckpointScanner._is_link_like_entry(unknown_mode_stat)
 
 
+def test_local_source_lexical_identity_ignores_ordinary_directory_content_metadata() -> None:
+    """Unrelated sibling changes cannot invalidate an ordinary ancestor identity."""
+
+    def fake_stat(
+        *,
+        inode: int,
+        mode: int,
+        size: int,
+        mtime_ns: int,
+        ctime_ns: int,
+        file_attributes: int = 0,
+    ) -> os.stat_result:
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=1,
+                st_ino=inode,
+                st_mode=mode,
+                st_size=size,
+                st_mtime_ns=mtime_ns,
+                st_ctime_ns=ctime_ns,
+                st_nlink=1,
+                st_file_attributes=file_attributes,
+            ),
+        )
+
+    parent_path = Path("ordinary-parent")
+    source_path = parent_path / "model.bin"
+    source_stat = fake_stat(inode=20, mode=stat.S_IFREG | 0o600, size=5, mtime_ns=6, ctime_ns=7)
+    initial_parent = fake_stat(inode=10, mode=stat.S_IFDIR | 0o700, size=1, mtime_ns=2, ctime_ns=3)
+    changed_parent_contents = fake_stat(inode=10, mode=stat.S_IFDIR | 0o700, size=9, mtime_ns=8, ctime_ns=7)
+    replaced_parent = fake_stat(inode=11, mode=stat.S_IFDIR | 0o700, size=9, mtime_ns=8, ctime_ns=7)
+
+    initial_identity = core_module._local_source_lexical_identity(
+        [(parent_path, initial_parent), (source_path, source_stat)]
+    )
+
+    assert initial_identity == core_module._local_source_lexical_identity(
+        [(parent_path, changed_parent_contents), (source_path, source_stat)]
+    )
+    assert initial_identity != core_module._local_source_lexical_identity(
+        [(parent_path, replaced_parent), (source_path, source_stat)]
+    )
+
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+    initial_reparse = fake_stat(
+        inode=30,
+        mode=stat.S_IFDIR | 0o700,
+        size=1,
+        mtime_ns=2,
+        ctime_ns=3,
+        file_attributes=reparse_flag,
+    )
+    changed_reparse = fake_stat(
+        inode=30,
+        mode=stat.S_IFDIR | 0o700,
+        size=1,
+        mtime_ns=4,
+        ctime_ns=5,
+        file_attributes=reparse_flag,
+    )
+
+    assert core_module._local_source_lexical_identity(
+        [(parent_path, initial_reparse), (source_path, source_stat)]
+    ) != core_module._local_source_lexical_identity([(parent_path, changed_reparse), (source_path, source_stat)])
+
+
+def test_windows_local_source_guard_paths_allow_ordinary_directory_writers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ancestor guards deny rename while permitting unrelated directory writes."""
+    parent_path = tmp_path / "parent"
+    reparse_path = parent_path / "alias"
+    source_path = reparse_path / "model.bin"
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+
+    def fake_stat(*, inode: int, mode: int, file_attributes: int = 0) -> os.stat_result:
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=1,
+                st_ino=inode,
+                st_mode=mode,
+                st_size=1,
+                st_mtime_ns=2,
+                st_ctime_ns=3,
+                st_nlink=1,
+                st_file_attributes=file_attributes,
+            ),
+        )
+
+    monkeypatch.setattr(
+        core_module,
+        "_local_source_lexical_identity_entries",
+        lambda _path: [
+            (parent_path, fake_stat(inode=10, mode=stat.S_IFDIR | 0o700)),
+            (
+                reparse_path,
+                fake_stat(
+                    inode=11,
+                    mode=stat.S_IFDIR | 0o700,
+                    file_attributes=reparse_flag,
+                ),
+            ),
+            (source_path, fake_stat(inode=12, mode=stat.S_IFREG | 0o600)),
+        ],
+    )
+
+    guard_paths = core_module._windows_local_source_guard_paths(
+        source_path,
+        {"resolved_path": str(source_path), "mode_type": stat.S_IFREG},
+    )
+
+    assert guard_paths == [
+        (parent_path, False, 0x00000001 | 0x00000002),
+        (reparse_path, True, 0x00000001),
+        (source_path, False, 0x00000001),
+    ]
+
+
 @pytest.mark.usefixtures("requires_symlinks")
 @pytest.mark.skipif(os.name == "nt", reason="Windows replacement is covered by retained-handle tests")
 def test_local_source_receipt_retries_mixed_symlink_snapshot(

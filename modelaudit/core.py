@@ -1541,23 +1541,34 @@ def _retained_companion_relative_path(
 
 def _local_source_lexical_identity(entries: list[tuple[Path, os.stat_result]]) -> str:
     """Hash the lexical path entries observed around local source resolution."""
+
+    def entry_identity(entry_path: Path, entry_stat: os.stat_result) -> tuple[int | str, ...]:
+        normalized_path = os.path.normcase(os.path.normpath(str(entry_path)))
+        mode_type = stat.S_IFMT(entry_stat.st_mode)
+        file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+        common_identity: tuple[int | str, ...] = (
+            normalized_path,
+            entry_stat.st_dev,
+            entry_stat.st_ino,
+            mode_type,
+        )
+        if mode_type == stat.S_IFDIR and not (file_attributes & reparse_flag):
+            return (*common_identity, file_attributes)
+        return (
+            *common_identity,
+            entry_stat.st_size,
+            entry_stat.st_mtime_ns,
+            entry_stat.st_ctime_ns,
+            entry_stat.st_nlink,
+            file_attributes,
+        )
+
     return hashlib.sha256(
-        repr(
-            [
-                (
-                    os.path.normcase(os.path.normpath(str(entry_path))),
-                    entry_stat.st_dev,
-                    entry_stat.st_ino,
-                    stat.S_IFMT(entry_stat.st_mode),
-                    entry_stat.st_size,
-                    entry_stat.st_mtime_ns,
-                    entry_stat.st_ctime_ns,
-                    entry_stat.st_nlink,
-                    getattr(entry_stat, "st_file_attributes", 0) or 0,
-                )
-                for entry_path, entry_stat in entries
-            ]
-        ).encode("utf-8", errors="surrogateescape")
+        repr([entry_identity(entry_path, entry_stat) for entry_path, entry_stat in entries]).encode(
+            "utf-8",
+            errors="surrogateescape",
+        )
     ).hexdigest()
 
 
@@ -2323,24 +2334,17 @@ def _retain_windows_local_source_guards(
     close_handle.argtypes = (wintypes.HANDLE,)
     close_handle.restype = wintypes.BOOL
 
-    guard_paths: list[tuple[Path, bool]] = []
-    for entry_path, entry_stat in _local_source_lexical_identity_entries(source_path):
-        is_reparse_point = stat.S_ISLNK(entry_stat.st_mode) or _stat_is_windows_reparse_point(entry_stat)
-        guard_paths.append((entry_path, is_reparse_point))
-    resolved_path = expected_receipt.get("resolved_path")
-    if not isinstance(resolved_path, str):
-        raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
-    guard_paths.append((Path(resolved_path), False))
+    guard_paths = _windows_local_source_guard_paths(source_path, expected_receipt)
 
     handles: list[int] = []
     invalid_handle_value = ctypes.c_void_p(-1).value
     try:
-        for guard_path, open_reparse_point in dict.fromkeys(guard_paths):
+        for guard_path, open_reparse_point, share_mode in guard_paths:
             flags = 0x02000000 | (0x00200000 if open_reparse_point else 0)
             handle = create_file(
                 str(guard_path),
                 0,
-                0x00000001,
+                share_mode,
                 None,
                 3,
                 flags,
@@ -2355,6 +2359,26 @@ def _retain_windows_local_source_guards(
     finally:
         for handle in reversed(handles):
             close_handle(handle)
+
+
+def _windows_local_source_guard_paths(
+    source_path: str | os.PathLike[str],
+    expected_receipt: dict[str, int | str],
+) -> list[tuple[Path, bool, int]]:
+    """Return Windows source guards with directory-content-compatible sharing."""
+    guard_paths: list[tuple[Path, bool, int]] = []
+    for entry_path, entry_stat in _local_source_lexical_identity_entries(source_path):
+        is_reparse_point = stat.S_ISLNK(entry_stat.st_mode) or _stat_is_windows_reparse_point(entry_stat)
+        is_ordinary_directory = stat.S_ISDIR(entry_stat.st_mode) and not is_reparse_point
+        share_mode = 0x00000001 | (0x00000002 if is_ordinary_directory else 0)
+        guard_paths.append((entry_path, is_reparse_point, share_mode))
+    resolved_path = expected_receipt.get("resolved_path")
+    if not isinstance(resolved_path, str):
+        raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
+    resolved_is_directory = expected_receipt.get("mode_type") == stat.S_IFDIR
+    resolved_share_mode = 0x00000001 | (0x00000002 if resolved_is_directory else 0)
+    guard_paths.append((Path(resolved_path), False, resolved_share_mode))
+    return list(dict.fromkeys(guard_paths))
 
 
 def _record_local_source_boundary_failure(results: ModelAuditResultModel, source_path: FilePath) -> None:
