@@ -7383,6 +7383,7 @@ def scan_model_streaming(
     """
     from .models import convert_assets_to_models
     from .utils.helpers.assets import asset_from_scan_result
+    from .utils.helpers.file_hash import compute_sha256_hash
     from .utils.helpers.secure_hasher import compute_aggregate_hash
 
     start_time = time.time()
@@ -7624,7 +7625,11 @@ def scan_model_streaming(
             )
         with suppress(OSError):
             top_level_hashed_bytes += scan_path.stat().st_size
-        file_hash = _hash_streamed_file_instance(scan_path, scan_path_identity)
+        file_hash = (
+            _hash_streamed_file_instance(scan_path, scan_path_identity)
+            if expected_identity is not None
+            else compute_sha256_hash(scan_path)
+        )
         if file_hash is None:
             unstable_stream_hash_paths.add(scan_path_key)
             aggregate_hash_complete = False
