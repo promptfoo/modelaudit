@@ -76,6 +76,9 @@ def _matmul_integer_scale_path(tmp_path: Path, *, suffix: str) -> Path:
         _tensor("W", _extreme_int8(True)),
         _tensor("X_scale", np.asarray(1, dtype=np.float32)),
         _tensor("W_scale", np.asarray([1, 1, 1, 100, 1, 1, 1, 1, 1, 1], dtype=np.float32)),
+        _tensor("sqrt2", np.asarray(np.sqrt(2), dtype=np.float32)),
+        _tensor("one", np.asarray(1, dtype=np.float32)),
+        _tensor("half", np.asarray(0.5, dtype=np.float32)),
     ]
     nodes = [
         helper.make_node("MatMulInteger", ["X", "W"], ["I"]),
@@ -92,6 +95,19 @@ def _matmul_integer_scale_path(tmp_path: Path, *, suffix: str) -> Path:
         nodes.append(helper.make_node("DynamicQuantizeLinear", [current], ["Q", "Q_scale", "Q_zero"]))
         nodes.append(helper.make_node("Cast", ["Q"], ["B"], to=TensorProto.FLOAT))
         current = "B"
+    elif suffix == "gelu":
+        inputs.append(helper.make_tensor_value_info("bias", TensorProto.FLOAT, [1, 10]))
+        nodes.extend(
+            [
+                helper.make_node("Add", [current, "bias"], ["B"]),
+                helper.make_node("Div", ["B", "sqrt2"], ["D"]),
+                helper.make_node("Erf", ["D"], ["E"]),
+                helper.make_node("Add", ["E", "one"], ["E1"]),
+                helper.make_node("Mul", ["B", "E1"], ["P"]),
+                helper.make_node("Mul", ["P", "half"], ["G"]),
+            ]
+        )
+        current = "G"
     elif suffix == "shape":
         inputs.append(helper.make_tensor_value_info("bias", TensorProto.FLOAT, [1, 10]))
         nodes.extend(
@@ -156,7 +172,7 @@ def test_blocked_dequantize_lineage_fails_closed(tmp_path: Path) -> None:
     assert _coverage(result)["unresolved_lineage_samples"][0]["reason"] == "blocked_dequantize_lineage_unsupported"
 
 
-@pytest.mark.parametrize("suffix", ["dynamic_add", "dynamic_quantize", "shape"])
+@pytest.mark.parametrize("suffix", ["dynamic_add", "dynamic_quantize", "gelu", "shape"])
 def test_live_terminal_descendants_fail_closed(tmp_path: Path, suffix: str) -> None:
     result = OnnxScanner().scan(str(_matmul_integer_scale_path(tmp_path, suffix=suffix)))
     _failed_coverage(result)
