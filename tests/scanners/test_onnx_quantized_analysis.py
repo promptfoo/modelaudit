@@ -273,3 +273,37 @@ def test_external_data_race_is_uncached_fail_closed(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_external_data_scan_does_not_reuse_primary_only_cache(tmp_path: Path) -> None:
+    model_path, sidecar = _external_package(tmp_path)
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["onnx"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+        )
+        sidecar.write_bytes(np.zeros((100, 10), dtype=np.float32).tobytes())
+        second = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["onnx"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+        )
+        assert first.content_hash != second.content_hash
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_standalone_weight_distribution_clusters_identical_onnx_exports(tmp_path: Path) -> None:
+    first = _qlinear_matmul(tmp_path, malicious=True)
+    second = tmp_path / "copy.onnx"
+    second.write_bytes(first.read_bytes())
+    result = scan_model_directory_or_file(str(tmp_path), scanners=["weight_distribution"])
+    anomalies = [issue for issue in result.issues if issue.type == "weight_distribution_check"]
+    assert len(anomalies) == 1
+    assert anomalies[0].details["cluster_size"] == 2

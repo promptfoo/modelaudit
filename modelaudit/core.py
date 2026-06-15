@@ -1975,7 +1975,7 @@ def _onnx_weight_anomaly_cluster_key(
     *,
     content_hash: str | None = None,
 ) -> tuple[Any, ...] | None:
-    if getattr(issue, "type", None) != "onnx_check":
+    if getattr(issue, "type", None) not in {"onnx_check", "weight_distribution_check"}:
         return None
     if not content_hash:
         return None
@@ -5316,6 +5316,8 @@ def scan_model_directory_or_file(
                                 if representative_file in onnx_package_hash_complete_by_path
                                 else None
                             )
+                            if pre_scan_model_identity is not None:
+                                file_config["cache_enabled"] = False
                             file_result = scan_file(representative_file, file_config)
                             changed_onnx_sidecars = [
                                 str(external_data_path)
@@ -5801,6 +5803,21 @@ def scan_model_directory_or_file(
                     target,
                     config,
                 )
+                file_hash: str | None = None
+                onnx_external_data_pre_scan_identities: list[tuple[Path, _FileIdentitySnapshot]] = []
+                onnx_external_data_hashes: list[tuple[str, str]] = []
+                onnx_external_data_bytes_scanned = 0
+                onnx_package_hash_complete: bool | None = None
+                onnx_package_hash: str | None = None
+                pre_scan_onnx_model_identity: _FileIdentitySnapshot | None = None
+                onnx_package_candidate = scanner_selection.allows(
+                    "onnx"
+                ) and _is_streamed_onnx_external_data_hash_candidate(Path(target))
+                if onnx_package_candidate:
+                    target_config = dict(target_config)
+                    target_config["cache_enabled"] = False
+                    pre_scan_onnx_model_identity = _snapshot_file_identity(Path(target))
+                    onnx_package_hash_complete = not defer_hash_for_file_backed_onnx
                 if (
                     defer_hash_for_max_total_size
                     or defer_hash_for_max_file_size
@@ -5825,18 +5842,72 @@ def scan_model_directory_or_file(
                         with suppress(OSError):
                             top_level_hashed_bytes += os.path.getsize(target)
                         file_hash = _calculate_file_hash(target)
-                        if not is_dvc_pointer or file_hash not in file_hashes:
-                            file_hashes.append(file_hash)
                     except Exception as e:
                         logger.debug(f"Failed to hash file {target}: {e}")
                     finally:
                         _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
+                if onnx_package_candidate and onnx_package_hash_complete:
+                    discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(
+                        Path(target),
+                        deadline=start_time + timeout,
+                    )
+                    if discovered_external_data_paths is None or file_hash is None:
+                        aggregate_hash_complete = False
+                        onnx_package_hash_complete = False
+                    for external_data_path, external_data_identity in discovered_external_data_paths or ():
+                        onnx_external_data_pre_scan_identities.append((external_data_path, external_data_identity))
+                        external_data_size = _snapshot_file_size(external_data_identity)
+                        onnx_external_data_bytes_scanned += external_data_size
+                        if _should_defer_hash_for_max_file_size(str(external_data_path), config) or (
+                            max_total_size > 0 and top_level_hashed_bytes + external_data_size > max_total_size
+                        ):
+                            aggregate_hash_complete = False
+                            onnx_package_hash_complete = False
+                            continue
+                        external_data_hash = _hash_streamed_file_instance(external_data_path, external_data_identity)
+                        if external_data_hash is None:
+                            aggregate_hash_complete = False
+                            onnx_package_hash_complete = False
+                            continue
+                        top_level_hashed_bytes += external_data_size
+                        onnx_external_data_hashes.append(
+                            (_onnx_external_data_role(Path(target), external_data_path), external_data_hash)
+                        )
+                    if onnx_package_hash_complete and file_hash is not None:
+                        onnx_package_hash = (
+                            _onnx_package_content_hash(file_hash, onnx_external_data_hashes)
+                            if onnx_external_data_hashes
+                            else file_hash
+                        )
+                if file_hash is not None:
+                    recorded_file_hash = onnx_package_hash if onnx_package_hash_complete else file_hash
+                    if recorded_file_hash is not None and (not is_dvc_pointer or recorded_file_hash not in file_hashes):
+                        file_hashes.append(recorded_file_hash)
 
                 file_scan_started_at = _start_phase_timing(phase_timings)
                 try:
                     file_result = scan_file(target, target_config)
                 finally:
                     _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
+                file_result.bytes_scanned += onnx_external_data_bytes_scanned
+                changed_onnx_sources = [
+                    str(external_data_path)
+                    for external_data_path, pre_scan_identity in onnx_external_data_pre_scan_identities
+                    if _snapshot_file_identity(external_data_path) != pre_scan_identity
+                ]
+                if pre_scan_onnx_model_identity is not None and (
+                    _snapshot_file_identity(Path(target)) != pre_scan_onnx_model_identity
+                ):
+                    changed_onnx_sources.append(target)
+                if changed_onnx_sources:
+                    aggregate_hash_complete = False
+                    onnx_package_hash_complete = False
+                    onnx_package_hash = None
+                    _mark_onnx_external_data_stability_failure(file_result, target, len(changed_onnx_sources))
+                if onnx_package_hash_complete is not None:
+                    file_result.metadata["onnx_package_hash_complete"] = onnx_package_hash_complete
+                    if onnx_package_hash_complete and onnx_package_hash is not None:
+                        file_result.metadata["content_hash"] = onnx_package_hash
 
                 # Use helper function to add scan result to Pydantic model
                 result_merge_started_at = _start_phase_timing(phase_timings)
@@ -8086,6 +8157,9 @@ def scan_model_streaming(
                 onnx_package_candidate = scanner_selection.allows(
                     "onnx"
                 ) and _is_streamed_onnx_external_data_hash_candidate(scan_path)
+                if onnx_package_candidate:
+                    scan_config = dict(scan_config)
+                    scan_config["cache_enabled"] = False
                 if onnx_package_candidate and not _should_defer_hash_for_max_file_size(
                     str(scan_path),
                     scan_config,
