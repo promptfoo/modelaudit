@@ -3552,7 +3552,7 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_dedupes_yielded_alias_
     assert yielded_paths == {model_link, sidecar_link}
 
     unique_bytes = model_blob.stat().st_size + sidecar_blob.stat().st_size
-    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_link), compute_sha256_hash(sidecar_link)])
+    expected_hash = _onnx_external_package_aggregate_hash(model_link, sidecar_link)
 
     def scan_file_side_effect(path: str, config: dict[str, Any]) -> ScanResult:
         return create_mock_scan_result(bytes_scanned=Path(path).stat().st_size)
@@ -3581,9 +3581,15 @@ def test_scan_model_streaming_scans_consumed_scannable_onnx_external_data_alias(
     sidecar_path = tmp_path / "payload.bin"
     model_path.write_bytes(create_external_onnx_payload(tmp_path, external_path=sidecar_path.name))
     create_malicious_pickle(sidecar_path)
-    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+    expected_hash = _onnx_external_package_aggregate_hash(model_path, sidecar_path)
     duplicate_sidecar_hash = compute_aggregate_hash(
-        [compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path), compute_sha256_hash(sidecar_path)]
+        [
+            _onnx_package_content_hash(
+                compute_sha256_hash(model_path),
+                [(_onnx_external_data_role(model_path, sidecar_path), compute_sha256_hash(sidecar_path))],
+            ),
+            compute_sha256_hash(sidecar_path),
+        ]
     )
 
     result = scan_model_streaming(
@@ -3626,7 +3632,7 @@ def test_scan_model_streaming_hf_cache_context_only_onnx_external_data_contribut
     sidecar_link = snapshot_dir / "model.onnx_data"
     model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
     sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
-    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_link), compute_sha256_hash(sidecar_link)])
+    expected_hash = _onnx_external_package_aggregate_hash(model_link, sidecar_link)
 
     result = scan_model_streaming(
         file_generator=iter([(model_link, True)]),
