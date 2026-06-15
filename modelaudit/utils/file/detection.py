@@ -5877,7 +5877,7 @@ def _iter_pickle_candidate_offsets(
             )
         yield from maybe_add(
             offset,
-            prevalidated=True,
+            prevalidated=line_start == offset or _is_plausible_pickle_candidate(payload, offset),
             require_continuation=require_continuation,
             require_strong_continuation=has_nontrivial_prefix,
         )

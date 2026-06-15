@@ -3638,13 +3638,8 @@ def test_detect_file_format_routes_complete_legal_text_sidecars_to_text(
 
 
 def test_detect_file_format_does_not_treat_license_prose_as_encoded_payload_budget(tmp_path: Path) -> None:
-    def alpha_word(index: int) -> str:
-        letters = []
-        value = index
-        for _ in range(3):
-            letters.append(chr(ord("a") + (value % 26)))
-            value //= 26
-        return "documentation" + "".join(letters)
+    def alpha_word(_index: int) -> str:
+        return "zzzz.word"
 
     path = tmp_path / "LICENSE"
     path.write_text(
@@ -4594,6 +4589,16 @@ def test_legal_sidecar_structural_candidate_routing_preserves_benign_near_matche
         b"MIT License\nPermission is\ngranted to\nall users\n",
         b"MIT License\ncwebbrowser\nopen \nOrdinary prose follows\n",
         b"MIT License\niwebbrowser\nopen \nOrdinary prose follows\n",
+        b"MIT License\n" + (b"copyright\nconditions\n" * 4096),
+        b"MIT License\ncopyright\nconditions\n",
+        b"MIT License\nPURPOSE\nARE DISCLAIMED. IN NO EVENT SHALL THE AUTHORS BE LIABLE.\n",
+        b"MIT License\ncopyright\ncopyright\nconditions\ninclude\n",
+        b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
+        b"MIT License\nNcopyright\nconditions\ninclude\n",
+        b"MIT License\nAcopyright\nconditions\ninclude\n",
+        b"MIT License\nNPermission\nterms\n",
+        b"MIT License\nPPermission is granted.\nOrdinary prose follows\n",
+        _long_context_opcode_prose(),
     }
     expected_format = PICKLE_ROUTING_INCONCLUSIVE_FORMAT if payload in grammar_owned else "text"
     if payload in {b"copyright\nnotice\n", b"copyright\r\nnotice\r\n"}:
