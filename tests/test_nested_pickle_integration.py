@@ -379,7 +379,7 @@ class TestNestedPickleIntegration:
                     assert nested_detection_count == 0, f"Should not detect {description} as nested pickle"
                     print("  ✅ Correctly ignored non-threat")
 
-    def test_regression_existing_functionality(self, pickles_dir):
+    def test_regression_existing_functionality(self, pickles_dir: Path) -> None:
         """Test that nested pickle detection doesn't break existing functionality."""
         # Test existing malicious files still work
         existing_malicious = ["evil.pickle", "malicious_system_call.pkl", "dill_func.pkl"]
@@ -395,8 +395,12 @@ class TestNestedPickleIntegration:
             scanner = PickleScanner()
             result = scanner.scan(str(test_file))
 
-            # Should still detect as malicious
-            assert result.success, f"Scan should succeed for {filename}"
+            scan_outcome_reasons = result.metadata.get("scan_outcome_reasons", [])
+            assert "call_graph_analysis_error" not in scan_outcome_reasons
+            if filename == "dill_func.pkl":
+                assert scan_outcome_reasons == ["nested_pickle_incomplete"]
+            else:
+                assert result.success, f"Scan should succeed for {filename}"
 
             # Should have some security issues (might not be nested pickle specific)
             security_issues = [

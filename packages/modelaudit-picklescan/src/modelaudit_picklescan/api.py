@@ -2425,81 +2425,65 @@ def _combine_call_graph_source_fingerprint_private_metadata(
     if missing_member_fingerprints:
         combined = dict(combined or {})
         combined.pop("source_independent", None)
+        combined.pop("critical_references_covered", None)
         combined["reusable"] = False
     return {_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: combined} if combined is not None else {}
+
+
+_CALL_GRAPH_FINGERPRINT_MAPPING_KEYS = (
+    "fingerprints",
+    "read_fingerprints",
+    "module_sources",
+    "loaded_module_sources",
+    "loaded_package_paths",
+    "loaded_package_resolution_contexts",
+    "namespace_package_resolution_contexts",
+)
+
+
+def _merge_call_graph_fingerprint_mapping(
+    existing: Mapping[str, Any] | None,
+    incoming: Mapping[str, Any],
+    key: str,
+) -> tuple[dict[str, Any], bool]:
+    existing_value = existing.get(key) if existing is not None else None
+    incoming_value = incoming.get(key)
+    merged = dict(existing_value) if isinstance(existing_value, Mapping) else {}
+    conflict = False
+    if isinstance(incoming_value, Mapping):
+        for item_key, value in incoming_value.items():
+            if item_key in merged and merged[item_key] != value:
+                conflict = True
+            else:
+                merged[item_key] = value
+    return merged, conflict
 
 
 def _merge_call_graph_source_fingerprint_metadata(
     existing: Mapping[str, Any] | None,
     incoming: Mapping[str, Any],
 ) -> dict[str, Any]:
-    if _is_source_independent_call_graph_fingerprint_metadata(incoming):
+    incoming_is_source_independent = _is_source_independent_call_graph_fingerprint_metadata(incoming)
+    existing_is_source_independent = existing is not None and _is_source_independent_call_graph_fingerprint_metadata(
+        existing
+    )
+    if incoming_is_source_independent and existing_is_source_independent:
+        return _source_independent_call_graph_fingerprint_metadata(
+            critical_references=(
+                incoming.get("critical_references_covered") is True
+                or (existing or {}).get("critical_references_covered") is True
+            )
+        )
+    if incoming_is_source_independent:
         return dict(existing) if existing is not None else dict(incoming)
-    if existing is not None and _is_source_independent_call_graph_fingerprint_metadata(existing):
+    if existing_is_source_independent:
         return dict(incoming)
 
     merged = dict(existing or {})
-    existing_fingerprints = existing.get("fingerprints") if existing is not None else None
-    incoming_fingerprints = incoming.get("fingerprints")
-    fingerprints = dict(existing_fingerprints) if isinstance(existing_fingerprints, Mapping) else {}
-    fingerprint_conflict = False
-    if isinstance(incoming_fingerprints, Mapping):
-        for path, fingerprint in incoming_fingerprints.items():
-            if path in fingerprints and fingerprints[path] != fingerprint:
-                fingerprint_conflict = True
-                continue
-            fingerprints[path] = fingerprint
-    merged["fingerprints"] = fingerprints
-
-    existing_read_fingerprints = existing.get("read_fingerprints") if existing is not None else None
-    incoming_read_fingerprints = incoming.get("read_fingerprints")
-    read_fingerprints = dict(existing_read_fingerprints) if isinstance(existing_read_fingerprints, Mapping) else {}
-    read_fingerprint_conflict = False
-    if isinstance(incoming_read_fingerprints, Mapping):
-        for path, fingerprint_record in incoming_read_fingerprints.items():
-            if path in read_fingerprints and read_fingerprints[path] != fingerprint_record:
-                read_fingerprint_conflict = True
-                continue
-            read_fingerprints[path] = fingerprint_record
-    merged["read_fingerprints"] = read_fingerprints
-
-    existing_module_sources = existing.get("module_sources") if existing is not None else None
-    incoming_module_sources = incoming.get("module_sources")
-    module_sources = dict(existing_module_sources) if isinstance(existing_module_sources, Mapping) else {}
-    module_source_conflict = False
-    if isinstance(incoming_module_sources, Mapping):
-        for module_name, source_path in incoming_module_sources.items():
-            if module_name in module_sources and module_sources[module_name] != source_path:
-                module_source_conflict = True
-                continue
-            module_sources[module_name] = source_path
-    merged["module_sources"] = module_sources
-
-    existing_loaded_sources = existing.get("loaded_module_sources") if existing is not None else None
-    incoming_loaded_sources = incoming.get("loaded_module_sources")
-    loaded_sources = dict(existing_loaded_sources) if isinstance(existing_loaded_sources, Mapping) else {}
-    loaded_source_conflict = False
-    if isinstance(incoming_loaded_sources, Mapping):
-        for module_name, source_path in incoming_loaded_sources.items():
-            if module_name in loaded_sources and loaded_sources[module_name] != source_path:
-                loaded_source_conflict = True
-                continue
-            loaded_sources[module_name] = source_path
-    merged["loaded_module_sources"] = loaded_sources
-
-    existing_loaded_package_paths = existing.get("loaded_package_paths") if existing is not None else None
-    incoming_loaded_package_paths = incoming.get("loaded_package_paths")
-    loaded_package_paths = (
-        dict(existing_loaded_package_paths) if isinstance(existing_loaded_package_paths, Mapping) else {}
-    )
-    loaded_package_path_conflict = False
-    if isinstance(incoming_loaded_package_paths, Mapping):
-        for module_name, search_path in incoming_loaded_package_paths.items():
-            if module_name in loaded_package_paths and loaded_package_paths[module_name] != search_path:
-                loaded_package_path_conflict = True
-                continue
-            loaded_package_paths[module_name] = search_path
-    merged["loaded_package_paths"] = loaded_package_paths
+    mapping_conflict = False
+    for key in _CALL_GRAPH_FINGERPRINT_MAPPING_KEYS:
+        merged[key], conflict = _merge_call_graph_fingerprint_mapping(existing, incoming, key)
+        mapping_conflict = mapping_conflict or conflict
 
     existing_search_context = existing.get("search_context") if existing is not None else incoming.get("search_context")
     incoming_search_context = incoming.get("search_context")
@@ -2515,23 +2499,10 @@ def _merge_call_graph_source_fingerprint_metadata(
     else:
         merged["search_context"] = incoming_search_context
         merged["resolution_context"] = incoming_resolution_context
-        merged["reusable"] = (
-            incoming.get("reusable") is True
-            and not fingerprint_conflict
-            and not read_fingerprint_conflict
-            and not module_source_conflict
-            and not loaded_source_conflict
-            and not loaded_package_path_conflict
-        )
+        merged["reusable"] = incoming.get("reusable") is True and not mapping_conflict
         if existing is not None:
             merged["reusable"] = merged["reusable"] and existing.get("reusable") is True
-    if (
-        fingerprint_conflict
-        or read_fingerprint_conflict
-        or module_source_conflict
-        or loaded_source_conflict
-        or loaded_package_path_conflict
-    ):
+    if mapping_conflict:
         merged["reusable"] = False
     return merged
 
@@ -2867,14 +2838,12 @@ def _scan_pickle_payload_native(
         )
         if enrich_call_graph:
             if _call_graph_enrichment_is_redundant(report):
-                if _call_graph_has_no_source_inputs(report):
-                    return _with_call_graph_source_fingerprint_metadata(
-                        report,
-                        _source_independent_call_graph_fingerprint_metadata(),
-                    )
-                with shared_source_sensitive_caches():
-                    source_fingerprints = shared_source_fingerprint_metadata()
-                return _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
+                return _with_call_graph_source_fingerprint_metadata(
+                    report,
+                    _source_independent_call_graph_fingerprint_metadata(
+                        critical_references=not _call_graph_has_no_source_inputs(report)
+                    ),
+                )
             return _with_call_graph_findings(report, payload=payload)
         return _with_import_origin_findings(report)
     except Exception as error:
@@ -3087,8 +3056,8 @@ def _call_graph_has_no_source_inputs(report: PickleReport) -> bool:
     )
 
 
-def _source_independent_call_graph_fingerprint_metadata() -> dict[str, Any]:
-    return {
+def _source_independent_call_graph_fingerprint_metadata(*, critical_references: bool = False) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
         "reusable": True,
         "source_independent": True,
         "fingerprints": {},
@@ -3097,10 +3066,17 @@ def _source_independent_call_graph_fingerprint_metadata() -> dict[str, Any]:
         "loaded_module_sources": {},
         "loaded_package_paths": {},
     }
+    if critical_references:
+        metadata["critical_references_covered"] = True
+    return metadata
 
 
 def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str, Any]) -> bool:
-    return dict(metadata) == _source_independent_call_graph_fingerprint_metadata()
+    normalized = dict(metadata)
+    return normalized in (
+        _source_independent_call_graph_fingerprint_metadata(),
+        _source_independent_call_graph_fingerprint_metadata(critical_references=True),
+    )
 
 
 def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = None) -> PickleReport:

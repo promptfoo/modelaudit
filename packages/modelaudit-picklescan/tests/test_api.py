@@ -3912,6 +3912,9 @@ def test_merge_call_graph_source_fingerprint_metadata_marks_read_conflict_unreus
 
 def test_merge_call_graph_source_fingerprints_preserves_source_independence_only_when_all_members_are() -> None:
     source_independent = package_api._source_independent_call_graph_fingerprint_metadata()
+    critical_source_independent = package_api._source_independent_call_graph_fingerprint_metadata(
+        critical_references=True
+    )
     source_sensitive = {
         "reusable": True,
         "search_context": ["source-root"],
@@ -3921,6 +3924,7 @@ def test_merge_call_graph_source_fingerprints_preserves_source_independence_only
         "module_sources": {"source": "source.py"},
         "loaded_module_sources": {},
         "loaded_package_paths": {},
+        "loaded_package_resolution_contexts": {},
     }
 
     assert package_api._merge_call_graph_source_fingerprint_metadata(None, source_independent) == source_independent
@@ -3935,6 +3939,14 @@ def test_merge_call_graph_source_fingerprints_preserves_source_independence_only
     assert (
         package_api._merge_call_graph_source_fingerprint_metadata(source_sensitive, source_independent)
         == source_sensitive
+    )
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(source_independent, critical_source_independent)
+        == critical_source_independent
+    )
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(critical_source_independent, source_independent)
+        == critical_source_independent
     )
 
 
@@ -4002,6 +4014,7 @@ def test_merge_call_graph_source_fingerprints_rejects_conflicting_read_records()
         "module_sources": {},
         "loaded_module_sources": {},
         "loaded_package_paths": {},
+        "loaded_package_resolution_contexts": {},
         "fingerprints": {},
         "read_fingerprints": {
             "/tmp/src/__pycache__": {"read_limit": 1048576, "require_complete": True, "fingerprint": "1111"}
@@ -10878,6 +10891,7 @@ def test_loaded_parent_package_path_controls_child_source_resolution(
     source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
     assert source_fingerprints["reusable"] is True
     assert source_fingerprints["loaded_package_paths"]["loaded_parent_pkg"] == (str(runtime_package.absolute()),)
+    assert "loaded_parent_pkg" in source_fingerprints["loaded_package_resolution_contexts"]
 
 
 def test_loaded_parent_package_custom_importer_fails_closed(
@@ -11241,6 +11255,9 @@ def test_scan_bytes_skips_call_graph_enrichment_for_already_critical_references(
     assert any(
         finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
         for finding in report.findings
+    )
+    assert report.private_metadata["call_graph_source_fingerprints"] == (
+        package_api._source_independent_call_graph_fingerprint_metadata(critical_references=True)
     )
 
 
