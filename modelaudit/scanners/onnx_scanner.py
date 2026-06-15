@@ -1244,6 +1244,18 @@ def _bounded_onnx_integer_sequence(field_name: str, values: Any) -> dict[str, An
     }
 
 
+def _onnx_typed_field_element_count(initializer: Any) -> int:
+    return sum(
+        len(getattr(initializer, field_name, ()))
+        for field_name in ("float_data", "int32_data", "int64_data", "double_data", "uint64_data", "string_data")
+    )
+
+
+def _onnx_decoder_working_nbytes(initializer: Any, decoded_bytes: int, inline_bytes: int) -> int:
+    """Reserve decoded bytes plus conservative protobuf typed-field conversion temporaries."""
+    return decoded_bytes + inline_bytes + _onnx_typed_field_element_count(initializer) * 32
+
+
 def _onnx_inline_storage_nbytes(initializer: Any) -> int:
     raw_bytes = len(getattr(initializer, "raw_data", b""))
     typed_bytes = 0
@@ -1636,6 +1648,9 @@ def _build_onnx_weight_analysis_plan(
         )
         if hasattr(onnx.TensorProto, name)
     }
+    quantized_scale_types = floating_types | {
+        int(getattr(onnx.TensorProto, name)) for name in ("FLOAT8E8M0",) if hasattr(onnx.TensorProto, name)
+    }
     quantized_integer_types = {
         int(getattr(onnx.TensorProto, name))
         for name in (
@@ -1889,7 +1904,7 @@ def _build_onnx_weight_analysis_plan(
                 tensor = constants[value_name]
                 result: tuple[tuple[str, ...], bool] | None
                 try:
-                    result = ((value_name,), False) if int(tensor.data_type) in floating_types else None
+                    result = ((value_name,), False) if int(tensor.data_type) in quantized_scale_types else None
                 except (AttributeError, TypeError, ValueError):
                     result = None
                 scale_expression_cache[value_name] = result
@@ -1913,11 +1928,17 @@ def _build_onnx_weight_analysis_plan(
             ):
                 scale_expression_cache[value_name] = None
                 return None
+            producer_inputs = [str(source) for source in getattr(producer, "input", ()) if source]
+            if (producer.op_type == "Identity" and len(producer_inputs) != 1) or (
+                producer.op_type == "Mul" and len(producer_inputs) != 2
+            ):
+                scale_expression_cache[value_name] = None
+                return None
             discovered: list[str] = []
             discovered_by_source: list[tuple[str, ...]] = []
             has_dynamic_quantize_scale = False
             next_visited = frozenset((*visited, value_name))
-            for source_name in (str(source) for source in getattr(producer, "input", ()) if source):
+            for source_name in producer_inputs:
                 source_scale = scale_initializer_names_in_expression(
                     source_name,
                     depth=depth + 1,
@@ -1928,6 +1949,9 @@ def _build_onnx_weight_analysis_plan(
                     return None
                 source_names, source_has_dynamic_quantize_scale = source_scale
                 discovered_by_source.append(source_names)
+                if len(discovered) + len(source_names) > _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT:
+                    scale_expression_cache[value_name] = None
+                    return None
                 discovered.extend(source_names)
                 has_dynamic_quantize_scale |= source_has_dynamic_quantize_scale
             if producer.op_type == "Mul" and sum(bool(names) for names in discovered_by_source) != 1:
@@ -2158,6 +2182,9 @@ def _build_onnx_weight_analysis_plan(
                             for source in metadata_inputs
                         )
                     )
+                    output_shape = known_value_shapes.get(value_name)
+                    shape_is_scalar = output_shape is not None and all(dimension == 1 for dimension in output_shape)
+                    valid_root = valid_root and (producer.op_type == "Size" or shape_is_scalar)
                     result = valid_root, valid_root
                     metadata_expression_cache[cache_key] = result
                     return result
@@ -2235,6 +2262,8 @@ def _build_onnx_weight_analysis_plan(
                                 and add_inputs.count(value_name) == 1
                                 and len(bias_names) == 1
                                 and bias_names[0] not in constants
+                                and all(output_name in graph_output_names for output_name in next_values)
+                                and not semantically_live_consumers(next_values)
                             ):
                                 reached_terminal = True
                                 continue
@@ -2267,8 +2296,10 @@ def _build_onnx_weight_analysis_plan(
                                     return None, "unresolved_quantized_weight_scale"
                             elif len(downstream_consumers) > 1:
                                 if is_canonical_post_bias_gelu_fanout(bias_outputs, downstream_consumers):
-                                    reached_terminal = True
-                                    continue
+                                    later_scale = downstream_has_static_scale(bias_outputs)
+                                    if later_scale is False:
+                                        reached_terminal = True
+                                        continue
                                 return None, "unresolved_quantized_weight_scale"
                             passed_complete_dynamic_bias = True
                     elif consumer.op_type == "Cast":
@@ -2300,8 +2331,12 @@ def _build_onnx_weight_analysis_plan(
                     and scale_data_type is not None
                     and graph_outputs_are_authoritative
                 ):
-                    reached_terminal = True
-                    continue
+                    if all(
+                        output_name in graph_output_names for output_name in next_values
+                    ) and not semantically_live_consumers(next_values):
+                        reached_terminal = True
+                        continue
+                    return None, "unresolved_quantized_weight_scale"
                 if consumer.op_type != "Mul":
                     return None, "unresolved_quantized_weight_scale"
                 mul_inputs = [str(source) for source in consumer.input if source]
@@ -2553,6 +2588,7 @@ def _build_onnx_weight_analysis_plan(
             if _onnx_int_attribute(node, "block_size", 0):
                 return replace(
                     lineage,
+                    data_type=None,
                     unresolved_reason=lineage.unresolved_reason or "blocked_dequantize_lineage_unsupported",
                 )
             scale_is_scalar = math.prod(int(dimension) for dimension in constants[scale_name].dims) == 1
@@ -2771,7 +2807,7 @@ def _build_onnx_weight_analysis_plan(
             )
 
     class RetainedArrayCharge:
-        def __init__(self, name: str):
+        def __init__(self, name: str) -> None:
             self.name = name
             self.bytes = 0
 
@@ -2812,7 +2848,7 @@ def _build_onnx_weight_analysis_plan(
                 raise ValueError("external constant storage")
             inline_bytes = _onnx_inline_storage_nbytes(tensor)
             decoded_bytes = _onnx_tensor_decoded_nbytes(tensor)
-            estimated_bytes = max(decoded_bytes, inline_bytes)
+            estimated_bytes = _onnx_decoder_working_nbytes(tensor, decoded_bytes, inline_bytes)
             proof_limit = _ONNX_GENERATED_VALUE_PROOF_MAX_BYTES
             if max_array_size is not None and max_array_size > 0:
                 proof_limit = min(proof_limit, max_array_size)
@@ -2826,7 +2862,7 @@ def _build_onnx_weight_analysis_plan(
             ):
                 raise ValueError("constant proof exceeds materialization limit")
             charge = RetainedArrayCharge(bounded_name)
-            if not charge.resize(decoded_bytes + inline_bytes):
+            if not charge.resize(estimated_bytes):
                 raise ValueError("constant proof exceeds cumulative array limit")
             array = onnx.numpy_helper.to_array(tensor)
             actual_bytes = int(array.nbytes)
@@ -3022,7 +3058,7 @@ def _build_onnx_weight_analysis_plan(
             scale_summary = constant_proof_summary(scale) if scale is not None else None
             if (
                 scale is None
-                or int(scale.data_type) not in floating_types
+                or int(scale.data_type) not in quantized_scale_types
                 or not parameter_shape_is_valid(scale)
                 or scale_summary is None
                 or not scale_summary.all_positive
@@ -4257,7 +4293,7 @@ def _build_onnx_weight_analysis_plan(
         itemsize = int(_tensor_data_type_to_np_dtype(parameter.data_type).itemsize)
         decoded_bytes = numel * itemsize
         inline_bytes = _onnx_inline_storage_nbytes(parameter)
-        estimated_bytes = max(decoded_bytes, inline_bytes)
+        estimated_bytes = _onnx_decoder_working_nbytes(parameter, decoded_bytes, inline_bytes)
         bounded_name, _, _ = _bounded_onnx_metadata_text(plan, name or parameter.name)
         if (
             estimated_bytes < 0
@@ -4270,7 +4306,7 @@ def _build_onnx_weight_analysis_plan(
             raise ValueError(f"Quantized weight {role} initializer exceeds analysis budget")
         charge = RetainedArrayCharge(bounded_name)
         try:
-            if not charge.resize(decoded_bytes + inline_bytes):
+            if not charge.resize(estimated_bytes):
                 raise ValueError(f"Quantized weight {role} initializer exceeds retained array budget")
             array = onnx.numpy_helper.to_array(parameter)
             actual_bytes = int(array.nbytes)
@@ -4366,7 +4402,7 @@ def _build_onnx_weight_analysis_plan(
             for _, scale_initializer_index in scale_factor_pairs:
                 if scale_initializer_index is None:
                     raise ValueError("Quantized weight scale initializer is unavailable")
-                if int(initializers[scale_initializer_index].data_type) not in floating_types:
+                if int(initializers[scale_initializer_index].data_type) not in quantized_scale_types:
                     raise ValueError("Quantized weight scale must use a floating-point data type")
             if quantization.zero_point_initializer_index is not None and quantization.input_data_type is not None:
                 zero_point_initializer = initializers[quantization.zero_point_initializer_index]
@@ -4480,7 +4516,8 @@ def _build_onnx_weight_analysis_plan(
             decoded_bytes = numel * itemsize
             inline_bytes = _onnx_inline_storage_nbytes(initializer)
             array_charge = RetainedArrayCharge(bounded_name)
-            if not array_charge.resize(decoded_bytes + inline_bytes):
+            decoder_working_bytes = _onnx_decoder_working_nbytes(initializer, decoded_bytes, inline_bytes)
+            if not array_charge.resize(decoder_working_bytes):
                 plan.oversized_initializers_skipped += 1
                 continue
             array = onnx.numpy_helper.to_array(initializer)
@@ -4605,11 +4642,27 @@ def _build_onnx_weight_analysis_plan(
                 quantization_context = (
                     {
                         "quantization_kind": consumer_group.quantization.kind,
-                        "quantization_scale": consumer_group.quantization.scale_name,
-                        "quantization_zero_point": consumer_group.quantization.zero_point_name,
+                        **_bounded_onnx_metadata_fields(
+                            plan,
+                            "quantization_scale",
+                            consumer_group.quantization.scale_name,
+                        ),
+                        **_bounded_onnx_metadata_fields(
+                            plan,
+                            "quantization_zero_point",
+                            consumer_group.quantization.zero_point_name,
+                        ),
                         "quantization_axis": consumer_group.quantization.axis,
                         "quantization_scale_initializer_index": consumer_group.quantization.scale_initializer_index,
-                        "quantization_scale_factor_names": list(consumer_group.quantization.scale_factor_names),
+                        "quantization_scale_factor_names": [
+                            _bounded_onnx_metadata_text(plan, name)[0]
+                            for name in consumer_group.quantization.scale_factor_names[
+                                :_ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT
+                            ]
+                        ],
+                        "quantization_scale_factor_name_count": len(consumer_group.quantization.scale_factor_names),
+                        "quantization_scale_factor_names_truncated": len(consumer_group.quantization.scale_factor_names)
+                        > _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT,
                         "quantization_scale_factor_initializer_indexes": list(
                             consumer_group.quantization.scale_factor_initializer_indexes
                         ),

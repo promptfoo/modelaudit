@@ -23,7 +23,6 @@ import pytest
 
 from modelaudit.core import (
     _complete_validated_shard_family_sources,
-    _onnx_package_content_hash,
     _reconcile_cross_directory_shard_coverage,
     _snapshot_validated_shard_target,
     determine_exit_code,
@@ -44,13 +43,6 @@ from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from modelaudit.utils.sources.huggingface import download_model_streaming
 from tests.helpers import create_malicious_pickle, create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
-
-
-def _onnx_external_package_aggregate_hash(model_path: Path, sidecar_path: Path) -> str:
-    model_hash = compute_sha256_hash(model_path)
-    sidecar_hash = compute_sha256_hash(sidecar_path)
-    package_hash = _onnx_package_content_hash(model_hash, [(sidecar_path.name, sidecar_hash)])
-    return compute_aggregate_hash([model_hash, sidecar_hash, package_hash])
 
 
 class _StreamingMaliciousPicklePayload:
@@ -799,16 +791,11 @@ def test_scan_model_streaming_hf_shared_onnx_external_data_counts_bytes_once(
     }
     remote_sizes = {filename: len(payload) for filename, payload in remote_payloads.items()}
     unique_bytes = sum(remote_sizes.values())
-    model_a_hash = hashlib.sha256(model_a_payload).hexdigest()
-    model_b_hash = hashlib.sha256(model_b_payload).hexdigest()
-    sidecar_hash = hashlib.sha256(sidecar_payload).hexdigest()
     expected_hash = compute_aggregate_hash(
         [
-            model_a_hash,
-            sidecar_hash,
-            model_b_hash,
-            _onnx_package_content_hash(model_a_hash, [("shared.onnx_data", sidecar_hash)]),
-            _onnx_package_content_hash(model_b_hash, [("shared.onnx_data", sidecar_hash)]),
+            hashlib.sha256(model_a_payload).hexdigest(),
+            hashlib.sha256(sidecar_payload).hexdigest(),
+            hashlib.sha256(model_b_payload).hexdigest(),
         ]
     )
 
@@ -2233,7 +2220,7 @@ def test_scan_model_streaming_onnx_external_data_contributes_content_hash(
     sidecar_path = tmp_path / "model.onnx_data"
     model_path.write_bytes(create_external_onnx_payload(tmp_path))
     sidecar_path.write_bytes(struct.pack("f", 1.0))
-    expected_hash = _onnx_external_package_aggregate_hash(model_path, sidecar_path)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
     onnx = pytest.importorskip("onnx")
     monkeypatch.setattr(
         onnx,
@@ -2254,7 +2241,7 @@ def test_scan_model_streaming_onnx_external_data_contributes_content_hash(
     assert result.content_hash == expected_hash
 
     sidecar_path.write_bytes(struct.pack("f", 2.0))
-    changed_hash = _onnx_external_package_aggregate_hash(model_path, sidecar_path)
+    changed_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
     changed_result = scan_model_streaming(
         file_generator=iter([(model_path, True)]),
         timeout=30,
@@ -2452,7 +2439,7 @@ def test_scan_model_streaming_onnx_external_data_refetch_does_not_duplicate_cont
 
     model_path.write_bytes(model_payload)
     sidecar_path.write_bytes(sidecar_payload)
-    expected_hash = _onnx_external_package_aggregate_hash(model_path, sidecar_path)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(sidecar_path), compute_sha256_hash(model_path)])
     model_path.unlink()
     sidecar_path.unlink()
 
@@ -2519,13 +2506,13 @@ def test_scan_model_streaming_onnx_external_data_over_total_cap_skips_sidecar_ha
     max_total_size = model_path.stat().st_size + sidecar_size - 1
     hashed_paths: list[Path] = []
 
-    def track_hash(path: Path, _expected_identity: object) -> str:
+    def track_hash(path: Path) -> str:
         hashed_paths.append(path)
         if path == sidecar_path:
             pytest.fail("streaming ONNX external_data sidecar must not be hashed past max_total_size")
         return "a" * 64
 
-    monkeypatch.setattr("modelaudit.core._hash_streamed_file_instance", track_hash)
+    monkeypatch.setattr("modelaudit.utils.helpers.file_hash.compute_sha256_hash", track_hash)
 
     result = scan_model_streaming(
         file_generator=iter([(model_path, True)]),
@@ -3555,7 +3542,7 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_dedupes_yielded_alias_
     assert yielded_paths == {model_link, sidecar_link}
 
     unique_bytes = model_blob.stat().st_size + sidecar_blob.stat().st_size
-    expected_hash = _onnx_external_package_aggregate_hash(model_link, sidecar_link)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_link), compute_sha256_hash(sidecar_link)])
 
     def scan_file_side_effect(path: str, config: dict[str, Any]) -> ScanResult:
         return create_mock_scan_result(bytes_scanned=Path(path).stat().st_size)
@@ -3584,7 +3571,7 @@ def test_scan_model_streaming_scans_consumed_scannable_onnx_external_data_alias(
     sidecar_path = tmp_path / "payload.bin"
     model_path.write_bytes(create_external_onnx_payload(tmp_path, external_path=sidecar_path.name))
     create_malicious_pickle(sidecar_path)
-    expected_hash = _onnx_external_package_aggregate_hash(model_path, sidecar_path)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
     duplicate_sidecar_hash = compute_aggregate_hash(
         [compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path), compute_sha256_hash(sidecar_path)]
     )
@@ -3629,7 +3616,7 @@ def test_scan_model_streaming_hf_cache_context_only_onnx_external_data_contribut
     sidecar_link = snapshot_dir / "model.onnx_data"
     model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
     sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
-    expected_hash = _onnx_external_package_aggregate_hash(model_link, sidecar_link)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_link), compute_sha256_hash(sidecar_link)])
 
     result = scan_model_streaming(
         file_generator=iter([(model_link, True)]),
@@ -4205,11 +4192,11 @@ def test_scan_model_streaming_fails_closed_after_max_total_size(
     hashed_paths: list[Path] = []
     file_hash = "a" * 64
 
-    def track_hash(path: Path, _expected_identity: object) -> str:
+    def track_hash(path: Path) -> str:
         hashed_paths.append(path)
         return file_hash
 
-    monkeypatch.setattr("modelaudit.core._hash_streamed_file_instance", track_hash)
+    monkeypatch.setattr("modelaudit.utils.helpers.file_hash.compute_sha256_hash", track_hash)
     monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: scan_result)
 
     result = scan_model_streaming(
@@ -4241,11 +4228,11 @@ def test_scan_model_streaming_stops_hashing_at_max_total_size(
     hashed_paths: list[Path] = []
     first_hash = "a" * 64
 
-    def track_hash(path: Path, _expected_identity: object) -> str:
+    def track_hash(path: Path) -> str:
         hashed_paths.append(path)
         return first_hash
 
-    monkeypatch.setattr("modelaudit.core._hash_streamed_file_instance", track_hash)
+    monkeypatch.setattr("modelaudit.utils.helpers.file_hash.compute_sha256_hash", track_hash)
     monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: create_mock_scan_result(bytes_scanned=1))
 
     result = scan_model_streaming(

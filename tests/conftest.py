@@ -185,6 +185,7 @@ def pytest_runtest_setup(item):
             "test_nemo_scanner.py",  # NeMo scanner CVE-2025-23304 tests
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
+            "test_onnx_quantized_analysis.py",  # Quantized ONNX bounded lineage regressions
             "test_pmml_scanner.py",  # PMML suspicious-content false-positive regressions
             "test_pmml_dependency_handling.py",  # PMML safe-parser fail-closed regressions
             "test_safetensors_scanner.py",  # SafeTensors scanner dtype and metadata tests

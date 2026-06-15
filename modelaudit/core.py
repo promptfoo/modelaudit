@@ -1985,8 +1985,9 @@ def _onnx_weight_anomaly_cluster_key(
     context_key = _onnx_weight_issue_context_key(issue)
     if context_key is None:
         return None
+    base_message = issue.message.split(" (clustered across ", 1)[0]
     return (
-        issue.message,
+        base_message,
         issue.severity,
         content_hash,
         *context_key,
@@ -2061,21 +2062,29 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
             continue
         emitted.add(key)
 
-        exports_by_file = {clustered.location: clustered for clustered in cluster if clustered.location is not None}
-        unique_exports = list(exports_by_file.values())
-        representative = unique_exports[0]
-        provenance = [
-            _onnx_weight_anomaly_provenance(results, clustered)
-            for clustered in unique_exports[:_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT]
-        ]
+        provenance_by_file: dict[str, dict[str, Any]] = {}
+        representative = cluster[0]
+        for clustered in cluster:
+            details = clustered.details if isinstance(clustered.details, dict) else {}
+            prior_provenance = details.get("export_provenance")
+            entries = (
+                prior_provenance
+                if isinstance(prior_provenance, list)
+                else [_onnx_weight_anomaly_provenance(results, clustered)]
+            )
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("file"), str):
+                    provenance_by_file.setdefault(entry["file"], entry)
+        provenance = list(provenance_by_file.values())[:_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT]
+        unique_export_count = len(provenance_by_file)
         content_hash = _file_content_hash(results, representative.location)
         files = [item.get("file") for item in provenance]
         byte_identical_groups = [
             {
                 "content_hash": content_hash,
-                "export_count": len(unique_exports),
+                "export_count": unique_export_count,
                 "files": files,
-                "files_truncated": len(unique_exports) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
+                "files_truncated": unique_export_count > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
             }
         ]
 
@@ -2083,10 +2092,10 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
         details.update(
             {
                 "clustered_onnx_weight_anomaly": True,
-                "cluster_size": len(unique_exports),
+                "cluster_size": unique_export_count,
                 "representative_file": representative.location,
                 "export_provenance": provenance,
-                "export_provenance_truncated": len(unique_exports) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
+                "export_provenance_truncated": unique_export_count > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
                 "byte_identical_export_groups": byte_identical_groups,
                 "byte_identical_export_groups_truncated": False,
             }
@@ -2094,7 +2103,8 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
         retained_issues.append(
             Issue(
                 message=(
-                    f"{representative.message} (clustered across {len(unique_exports)} byte-identical ONNX exports)"
+                    f"{representative.message.split(' (clustered across ', 1)[0]} "
+                    f"(clustered across {unique_export_count} byte-identical ONNX exports)"
                 ),
                 severity=representative.severity,
                 location=representative.location,
@@ -5301,6 +5311,11 @@ def scan_model_directory_or_file(
                                 and _openvino_xml_companion_key(openvino_owner) in covered_openvino_xml_companions
                             ):
                                 file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
+                            pre_scan_model_identity = (
+                                _snapshot_file_identity(Path(representative_file))
+                                if representative_file in onnx_package_hash_complete_by_path
+                                else None
+                            )
                             file_result = scan_file(representative_file, file_config)
                             changed_onnx_sidecars = [
                                 str(external_data_path)
@@ -5310,6 +5325,10 @@ def scan_model_directory_or_file(
                                 )
                                 if _snapshot_file_identity(external_data_path) != pre_scan_identity
                             ]
+                            if pre_scan_model_identity is not None and (
+                                _snapshot_file_identity(Path(representative_file)) != pre_scan_model_identity
+                            ):
+                                changed_onnx_sidecars.append(representative_file)
                             if changed_onnx_sidecars:
                                 aggregate_hash_complete = False
                                 onnx_package_hash_complete_by_path[representative_file] = False
@@ -5688,14 +5707,8 @@ def scan_model_directory_or_file(
                         nested_result.files_scanned > 0 and nested_result.content_hash is None
                     ):
                         aggregate_hash_complete = False
-                    for nested_metadata in nested_result.file_metadata.values():
-                        nested_content_hash = nested_metadata.get("content_hash")
-                        if (
-                            isinstance(nested_content_hash, str)
-                            and nested_content_hash
-                            and nested_content_hash not in file_hashes
-                        ):
-                            file_hashes.append(nested_content_hash)
+                    if nested_result.content_hash and nested_result.content_hash not in file_hashes:
+                        file_hashes.append(nested_result.content_hash)
                     if nested_result.has_errors:
                         scan_metadata["has_operational_errors"] = True
                     if is_dvc_pointer and max_total_size > 0 and results.bytes_scanned > max_total_size:
