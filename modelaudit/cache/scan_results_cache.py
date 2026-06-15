@@ -25,6 +25,7 @@ from typing import Any, BinaryIO
 
 import modelaudit_picklescan.call_graph as _picklescan_call_graph
 
+from ..utils._path_hardening import _is_private_descriptor_bound_regular_file
 from ..utils.helpers.secure_hasher import SecureFileHasher
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .optimized_config import build_cache_version_context
@@ -478,9 +479,7 @@ class ScanResultsCache:
         """Return a cache lookup plus the monitored identity reusable by a miss scan."""
         file_identity: ScannedFileIdentity | None = None
         try:
-            trusted_descriptor_path = trusted_descriptor_path and self._is_private_descriptor_bound_path(
-                Path(file_path)
-            )
+            trusted_descriptor_path = trusted_descriptor_path and _is_private_descriptor_bound_regular_file(file_path)
             if not trusted_descriptor_path and self._path_has_symlink_component(file_path):
                 logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
                 return None, None
@@ -726,9 +725,7 @@ class ScanResultsCache:
         """
         temporary_cache_path: Path | None = None
         try:
-            trusted_descriptor_path = trusted_descriptor_path and self._is_private_descriptor_bound_path(
-                Path(file_path)
-            )
+            trusted_descriptor_path = trusted_descriptor_path and _is_private_descriptor_bound_regular_file(file_path)
             if not trusted_descriptor_path and self._path_has_symlink_component(file_path):
                 logger.debug("Skipping cache store for symlinked path %s", file_path)
                 return False
@@ -892,7 +889,7 @@ class ScanResultsCache:
         trusted_descriptor_path: bool = False,
     ) -> ScannedFileIdentity:
         """Capture a stable stat, content hash, and platform change token before scanning."""
-        trusted_descriptor_path = trusted_descriptor_path and self._is_private_descriptor_bound_path(Path(file_path))
+        trusted_descriptor_path = trusted_descriptor_path and _is_private_descriptor_bound_regular_file(file_path)
         if not trusted_descriptor_path and self._path_has_symlink_component(file_path):
             raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
 
@@ -1097,7 +1094,7 @@ class ScanResultsCache:
         """Capture lexical ancestors, including a change token for the direct parent."""
         file_device = os.stat(file_path).st_dev
         ancestor = Path(os.path.abspath(file_path)).parent
-        if trusted_descriptor_path and self._is_private_descriptor_bound_path(Path(file_path)):
+        if trusted_descriptor_path and _is_private_descriptor_bound_regular_file(file_path):
             ancestor_stat = os.stat(ancestor)
             return AncestorIdentity(
                 (
@@ -1222,35 +1219,6 @@ class ScanResultsCache:
             return False
         expected_target = _DARWIN_STABLE_SYMLINK_ALIASES.get(str(path))
         return expected_target is not None and os.path.realpath(path) == expected_target
-
-    @staticmethod
-    def _is_private_descriptor_bound_path(path: Path) -> bool:
-        """Recognize one retained filename below this process's private directory descriptor."""
-        parts = path.parts
-        descriptor_index: int | None = None
-        if len(parts) == 6 and parts[1] == "proc" and parts[3] == "fd":
-            if parts[2] not in {"self", str(os.getpid())}:
-                return False
-            descriptor_index = 4
-        elif len(parts) == 5 and parts[1:3] == ("dev", "fd"):
-            descriptor_index = 3
-        if descriptor_index is None or parts[-1] in {"", ".", ".."}:
-            return False
-        try:
-            descriptor = int(parts[descriptor_index])
-            root_stat = os.fstat(descriptor)
-            entry_stat = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
-            target_stat = os.stat(parts[-1], dir_fd=descriptor)
-        except (OSError, ValueError):
-            return False
-        effective_uid = getattr(os, "geteuid", lambda: root_stat.st_uid)()
-        return bool(
-            stat.S_ISDIR(root_stat.st_mode)
-            and root_stat.st_uid == effective_uid
-            and not stat.S_IMODE(root_stat.st_mode) & 0o077
-            and stat.S_ISLNK(entry_stat.st_mode)
-            and stat.S_ISREG(target_stat.st_mode)
-        )
 
     @staticmethod
     def _path_has_symlink_component(file_path: str) -> bool:

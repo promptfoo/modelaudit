@@ -731,7 +731,7 @@ class _StagingMutationMonitor:
             monitor_fd = inotify_init1(os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
             if monitor_fd < 0:
                 raise _ShardPinUnavailableError("private staging mutation monitoring is unavailable")
-            mutation_mask = 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
+            mutation_mask = 0x00000002 | 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
             mutation_mask |= 0x00000400 | 0x00000800 | 0x00002000 | 0x00004000 | 0x00008000
             try:
                 for descriptor in descriptors:
@@ -1533,6 +1533,8 @@ def _pinned_shard_scan_path(
                 *staging_directory_fds.values(),
                 source_fd,
                 *(companion_fd for companion_fd, _stat, _hash in pinned_companion_fds),
+                *([pinned_source_copy_fd] if pinned_source_copy_fd is not None else []),
+                *(companion_fd for companion_fd, _stat, _hash in pinned_companion_copy_fds),
             ]
         )
         if staged_bindings_changed():
@@ -2629,6 +2631,27 @@ class ShardedModelDetector:
             index_dir = index_dir.parent
         return None
 
+    @staticmethod
+    def _safetensors_inventory_proof(
+        inventory: _SafetensorsShardIndexInventory,
+    ) -> tuple[str, str, str, int] | None:
+        if (
+            inventory.error is not None
+            or inventory.index_base not in {"zero", "one"}
+            or not isinstance(inventory.fingerprint, str)
+            or not inventory.fingerprint
+            or not isinstance(inventory.generation, int)
+            or isinstance(inventory.generation, bool)
+            or inventory.generation <= 0
+        ):
+            return None
+        return (
+            inventory.index_base,
+            _normalized_absolute_path(inventory.index_path),
+            inventory.fingerprint,
+            inventory.generation,
+        )
+
     @classmethod
     def refresh_safetensors_index_proof(
         cls,
@@ -2666,25 +2689,10 @@ class ShardedModelDetector:
         )
         if inventory is None:
             return None, False
-        if (
-            inventory.error is not None
-            or inventory.index_base not in {"zero", "one"}
-            or not isinstance(inventory.fingerprint, str)
-            or not inventory.fingerprint
-            or not isinstance(inventory.generation, int)
-            or isinstance(inventory.generation, bool)
-            or inventory.generation <= 0
-        ):
+        proof = cls._safetensors_inventory_proof(inventory)
+        if proof is None:
             return None, True
-        return (
-            (
-                inventory.index_base,
-                _normalized_absolute_path(inventory.index_path),
-                inventory.fingerprint,
-                inventory.generation,
-            ),
-            True,
-        )
+        return proof, True
 
     @classmethod
     def refresh_safetensors_index_proofs(
@@ -2741,27 +2749,14 @@ class ShardedModelDetector:
             authority_by_parent.append(authority_present)
             if inventory is None:
                 continue
-            if (
-                inventory.error is not None
-                or inventory.index_base not in {"zero", "one"}
-                or not isinstance(inventory.fingerprint, str)
-                or not inventory.fingerprint
-                or not isinstance(inventory.generation, int)
-                or isinstance(inventory.generation, bool)
-                or inventory.generation <= 0
-            ):
+            proof = cls._safetensors_inventory_proof(inventory)
+            if proof is None:
                 return None, True
             if require_declared_files and any(
                 cls._safetensors_inventory_file_relationship(inventory, file_path) is not True
                 for file_path in parent_files
             ):
                 return None, True
-            proof = (
-                inventory.index_base,
-                _normalized_absolute_path(inventory.index_path),
-                inventory.fingerprint,
-                inventory.generation,
-            )
             if agreed_proof is None:
                 agreed_proof = proof
             elif proof != agreed_proof:

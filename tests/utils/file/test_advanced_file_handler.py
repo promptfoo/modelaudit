@@ -5,6 +5,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import mmap
 import os
 import struct
 import subprocess
@@ -13,6 +14,7 @@ import tempfile
 import time
 import types
 from collections import Counter
+from contextlib import ExitStack
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, cast
@@ -235,6 +237,31 @@ def test_regular_pinned_source_copy_detects_staged_mutation(tmp_path: Path) -> N
 
     assert pinned_scan.changed_during_scan is True
     assert source_path.read_bytes() == b"source"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux inotify")
+def test_regular_pinned_source_copy_detects_transient_mmap_mutation(tmp_path: Path) -> None:
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"MALICIOUS")
+    with (
+        ExitStack() as staged_resources,
+        _pinned_shard_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            logical_path=str(source_path),
+            require_regular_path=True,
+        ) as pinned_scan,
+    ):
+        staged_handle = staged_resources.enter_context(Path(pinned_scan.path).open("r+b"))
+        staged_mapping = staged_resources.enter_context(mmap.mmap(staged_handle.fileno(), 0))
+        staged_mapping[:] = b"BENIGN!!!"
+        staged_mapping.flush()
+        assert Path(pinned_scan.path).read_bytes() == b"BENIGN!!!"
+        staged_mapping[:] = b"MALICIOUS"
+        staged_mapping.flush()
+
+    assert pinned_scan.changed_during_scan is True
+    assert source_path.read_bytes() == b"MALICIOUS"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
