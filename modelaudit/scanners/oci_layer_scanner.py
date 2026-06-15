@@ -15,11 +15,9 @@ from urllib.parse import urlparse
 
 from ..scanner_results import mark_inconclusive_scan_result
 from ..utils import is_absolute_archive_path, is_critical_system_path, is_within_directory, sanitize_archive_path
-from ..utils._path_hardening import _is_private_descriptor_bound_regular_file
 from ..utils.file.detection import (
     MARKED_PROTOCOL0_GLOBAL_RE,
     PROTOCOL0_GLOBAL_RE,
-    VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY,
     detect_file_format,
 )
 from ..utils.model_extensions import get_model_extensions
@@ -1403,11 +1401,8 @@ class OciLayerScanner(BaseScanner):
         for layer_ref in layer_paths:
             normalized_layer_ref = self._normalize_layer_ref(layer_ref)
             layer_path, is_safe = sanitize_archive_path(layer_ref, manifest_dir)
-            trusted_descriptor_layer = self.config.get(
-                VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY
-            ) is True and _is_private_descriptor_bound_regular_file(layer_path)
 
-            if not is_safe or (not trusted_descriptor_layer and not is_within_directory(manifest_dir, layer_path)):
+            if not is_safe or not is_within_directory(manifest_dir, layer_path):
                 scan_complete = False
                 result.add_check(
                     name="Layer Path Traversal Protection",

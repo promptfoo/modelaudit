@@ -76,7 +76,6 @@ from modelaudit.scanners.base import (
     DEFAULT_MAX_FILE_READ_SIZE,
     FORMAT_VALIDATION_CONFIG_KEY,
     BaseScanner,
-    _trusted_logical_path_for_scan,
     _trusted_logical_scan_path,
 )
 from modelaudit.scanners.jax_checkpoint_scanner import JAX_VERIFIED_ORBAX_SIBLING_CONFIG_KEY
@@ -3652,17 +3651,15 @@ def _resolve_discovered_shard_path(shard_path: str, results: ModelAuditResultMod
 
 
 def _is_validated_bound_source_path(path: str, config: dict[str, Any] | None) -> bool:
-    """Return whether internal scan state authorizes this private descriptor-backed path."""
+    """Return whether a cache binding names this private descriptor-backed source path."""
     if config is None:
         return False
     binding = config.get(_BOUND_CACHE_IDENTITY_CONFIG_KEY)
     return bool(
-        (
-            isinstance(binding, CacheIdentityBinding)
-            and os.path.normcase(os.path.abspath(binding.scan_path)) == os.path.normcase(os.path.abspath(path))
-        )
-        or _trusted_logical_path_for_scan(path) is not None
-    ) and _is_private_descriptor_bound_regular_file(path)
+        isinstance(binding, CacheIdentityBinding)
+        and os.path.normcase(os.path.abspath(binding.scan_path)) == os.path.normcase(os.path.abspath(path))
+        and _is_private_descriptor_bound_regular_file(path)
+    )
 
 
 def _select_non_hdf5_preferred_scanner_id(

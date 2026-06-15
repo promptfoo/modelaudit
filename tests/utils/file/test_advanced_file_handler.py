@@ -5,7 +5,6 @@ import ctypes
 import errno
 import hashlib
 import json
-import mmap
 import os
 import struct
 import subprocess
@@ -37,6 +36,7 @@ from modelaudit.utils.file.handlers import (
     _close_windows_staging_directory_guard,
     _copy_pinned_file_descriptor,
     _copy_pinned_file_descriptor_contents,
+    _LinuxWriteLeaseGuard,
     _open_windows_staging_directory_guard,
     _pinned_file_descriptor_changed,
     _pinned_shard_scan_path,
@@ -223,7 +223,7 @@ def test_copy_pinned_file_descriptor_enforces_byte_and_deadline_bounds(tmp_path:
 
 @pytest.mark.skipif(
     os.name != "posix" or sys.platform.startswith("linux"),
-    reason="requires unsealed POSIX descriptor staging",
+    reason="requires non-Linux POSIX descriptor staging",
 )
 def test_regular_pinned_source_copy_detects_staged_mutation(tmp_path: Path) -> None:
     source_path = tmp_path / "model.onnx"
@@ -242,8 +242,8 @@ def test_regular_pinned_source_copy_detects_staged_mutation(tmp_path: Path) -> N
     assert source_path.read_bytes() == b"source"
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux file seals")
-def test_regular_pinned_copies_prevent_transient_mmap_mutation(tmp_path: Path) -> None:
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux file leases")
+def test_linux_staged_copies_reject_writer_open_without_leasing_sources(tmp_path: Path) -> None:
     source_path = tmp_path / "model.onnx"
     companion_path = tmp_path / "model.onnx_data"
     source_path.write_bytes(b"MALICIOUS")
@@ -257,22 +257,105 @@ def test_regular_pinned_copies_prevent_transient_mmap_mutation(tmp_path: Path) -
         },
         require_regular_path=True,
     ) as pinned_scan:
-        staged_paths = [Path(pinned_scan.path), Path(pinned_scan.path).with_name(companion_path.name)]
-        for staged_path, expected_bytes in zip(
-            staged_paths,
+        for source in (source_path, companion_path):
+            writer_fd = os.open(source, os.O_RDWR | os.O_NONBLOCK)
+            os.close(writer_fd)
+
+        protected_paths = [
+            Path(pinned_scan.path),
+            Path(pinned_scan.path).with_name(companion_path.name),
+        ]
+        for protected_path, expected_bytes in zip(
+            protected_paths,
             (b"MALICIOUS", b"COMPANION"),
             strict=True,
         ):
-            assert staged_path.read_bytes() == expected_bytes
-            with staged_path.open("r+b") as staged_handle:
-                with pytest.raises(OSError):
-                    os.write(staged_handle.fileno(), b"BENIGN!!!")
-                with pytest.raises(OSError):
-                    mmap.mmap(staged_handle.fileno(), 0)
-            assert staged_path.read_bytes() == expected_bytes
+            assert protected_path.read_bytes() == expected_bytes
+            with pytest.raises(BlockingIOError):
+                os.open(protected_path, os.O_RDWR | os.O_NONBLOCK)
+            assert protected_path.read_bytes() == expected_bytes
 
+    assert pinned_scan.changed_during_scan is True
     assert source_path.read_bytes() == b"MALICIOUS"
     assert companion_path.read_bytes() == b"COMPANION"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux file leases")
+def test_linux_write_lease_guard_rejects_preexisting_writer(tmp_path: Path) -> None:
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    source_fd = os.open(source_path, os.O_RDONLY)
+    writer_fd = os.open(source_path, os.O_RDWR)
+    try:
+        with pytest.raises(_ShardPinUnavailableError, match="write protection is unavailable"):
+            _LinuxWriteLeaseGuard.arm([source_fd])
+    finally:
+        os.close(writer_fd)
+        os.close(source_fd)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux file leases")
+def test_linux_write_lease_guard_uses_isolated_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    import_marker = tmp_path / "untrusted-import-ran"
+    (tmp_path / "fcntl.py").write_text(
+        f"from pathlib import Path\nPath({str(import_marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    source_fd = os.open(source_path, os.O_RDONLY)
+    try:
+        guard = _LinuxWriteLeaseGuard.arm([source_fd])
+        assert guard.finish() is False
+    finally:
+        os.close(source_fd)
+
+    assert not import_marker.exists()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not Path("/proc/self/fd").exists(),
+    reason="requires Linux file leases and process descriptors",
+)
+def test_linux_pinned_copy_is_revalidated_after_write_lease_arming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"MALICIOUS")
+    original_arm = _LinuxWriteLeaseGuard.arm
+
+    def mutate_then_arm(
+        descriptors: Any,
+        *,
+        deadline: float | None = None,
+    ) -> _LinuxWriteLeaseGuard:
+        retained_descriptors = list(descriptors)
+        writer_fd = os.open(f"/proc/self/fd/{retained_descriptors[0]}", os.O_RDWR)
+        try:
+            os.pwrite(writer_fd, b"BENIGN!!!", 0)
+        finally:
+            os.close(writer_fd)
+        return original_arm(retained_descriptors, deadline=deadline)
+
+    monkeypatch.setattr(_LinuxWriteLeaseGuard, "arm", mutate_then_arm)
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="pinned shard content changed before scanner dispatch"),
+        _pinned_shard_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            logical_path=str(source_path),
+            require_regular_path=True,
+        ),
+    ):
+        pytest.fail("a staged mutation before lease arming must prevent scanner dispatch")
+
+    assert source_path.read_bytes() == b"MALICIOUS"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
@@ -356,7 +439,7 @@ def test_pinned_scan_rejects_borrowed_descriptors_on_windows(
     os.name != "posix" or not Path("/dev/fd").exists(),
     reason="requires POSIX /dev/fd descriptor staging",
 )
-def test_dev_fd_fallback_is_portable_or_fails_closed(
+def test_dev_fd_fallback_exposes_subprocess_portable_regular_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -373,44 +456,8 @@ def test_dev_fd_fallback_is_portable_or_fails_closed(
     monkeypatch.setattr(os, "stat", stat_without_proc)
     monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, stat_without_proc})
 
-    if getattr(sys, "platform", "").startswith("linux"):
-        with (
-            pytest.raises(_ShardPinUnavailableError, match="cannot expose a scanner path"),
-            _pinned_shard_scan_path(str(source_path), target),
-        ):
-            pytest.fail("Linux staging without /proc must fail closed")
-        return
-
     with _pinned_shard_scan_path(str(source_path), target) as pinned_scan:
         assert not pinned_scan.path.startswith("/dev/fd/")
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "from pathlib import Path; import sys; print(Path(sys.argv[1]).read_text())",
-                pinned_scan.path,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-    assert completed.stdout.strip() == "source"
-
-
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux") or not (Path("/proc") / str(os.getpid()) / "fd").exists(),
-    reason="requires Linux process descriptor paths",
-)
-def test_linux_sealed_copy_exposes_subprocess_portable_regular_path(tmp_path: Path) -> None:
-    source_path = tmp_path / "model.onnx"
-    source_path.write_bytes(b"source")
-
-    with _pinned_shard_scan_path(
-        str(source_path),
-        _target_for_path(source_path),
-        require_regular_path=True,
-    ) as pinned_scan:
         completed = subprocess.run(
             [
                 sys.executable,
@@ -529,12 +576,14 @@ def test_regular_pinned_nested_companion_rejects_parent_replacement_during_copy(
     companion_path.write_bytes(b"companion")
 
     original_copy = _copy_pinned_file_descriptor
-    original_symlink = os.symlink
     companion_inode = companion_path.stat().st_ino
     replacement_root: Path | None = None
 
-    def replace_staging_parent(destination_fd: int, destination: os.PathLike[str] | str) -> None:
+    def copy_after_parent_replacement(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
         nonlocal replacement_root
+        if os.fstat(source_fd).st_ino != companion_inode:
+            return original_copy(source_fd, destination, **kwargs)
+        destination_fd = cast(int, kwargs["destination_dir_fd"])
         descriptor_root = Path("/proc/self/fd") if Path("/proc/self/fd").exists() else Path("/dev/fd")
         opened_parent = Path(os.path.realpath(descriptor_root / str(destination_fd)))
         replacement_root = opened_parent.parent
@@ -542,34 +591,12 @@ def test_regular_pinned_nested_companion_rejects_parent_replacement_during_copy(
         opened_parent.rename(held_parent)
         opened_parent.mkdir()
         (opened_parent / os.fspath(destination)).write_bytes(b"substitute")
-
-    def copy_after_parent_replacement(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
-        if os.fstat(source_fd).st_ino == companion_inode:
-            replace_staging_parent(cast(int, kwargs["destination_dir_fd"]), destination)
         return original_copy(source_fd, destination, **kwargs)
-
-    def symlink_after_parent_replacement(
-        source: os.PathLike[str] | str,
-        destination: os.PathLike[str] | str,
-        *,
-        target_is_directory: bool = False,
-        dir_fd: int | None = None,
-    ) -> None:
-        if sys.platform.startswith("linux") and os.fspath(destination) == companion_path.name and dir_fd is not None:
-            replace_staging_parent(dir_fd, destination)
-        original_symlink(
-            source,
-            destination,
-            target_is_directory=target_is_directory,
-            dir_fd=dir_fd,
-        )
 
     monkeypatch.setattr(
         "modelaudit.utils.file.handlers._copy_pinned_file_descriptor",
         copy_after_parent_replacement,
     )
-    monkeypatch.setattr(os, "symlink", symlink_after_parent_replacement)
-    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, symlink_after_parent_replacement})
 
     with (
         pytest.raises(_ShardPinUnavailableError, match="private staging entry changed"),

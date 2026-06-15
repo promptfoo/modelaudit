@@ -7,9 +7,8 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
-from contextvars import ContextVar
+from collections.abc import Callable
+from contextlib import suppress
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -28,8 +27,6 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
-from ..utils._path_hardening import _is_private_descriptor_bound_regular_file
-from ..utils.file.detection import VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY
 from ..utils.file.hdf5 import find_hdf5_signature_offset
 from ._evidence_redaction import (
     redact_evidence_mapping_key,
@@ -55,33 +52,11 @@ try:
 except Exception:
     HAS_H5PY = False
 
-_DESCRIPTOR_BOUND_HDF5_PATH: ContextVar[str | None] = ContextVar(
-    "modelaudit_descriptor_bound_hdf5_path",
-    default=None,
-)
-
-
-@contextmanager
-def _open_hdf5_file(path: str, *, descriptor_bound: bool) -> Iterator[Any]:
-    """Open descriptor-backed HDF5 inputs through h5py's file-object driver."""
-    if descriptor_bound:
-        token = _DESCRIPTOR_BOUND_HDF5_PATH.set(path)
-        try:
-            with open(path, "rb") as source, h5py.File(source, "r") as h5_file:
-                yield h5_file
-        finally:
-            _DESCRIPTOR_BOUND_HDF5_PATH.reset(token)
-        return
-    with h5py.File(path, "r") as h5_file:
-        yield h5_file
-
-
 _HDF5_ATTRIBUTE_WORKER_CODE = r"""
 import base64
 import json
 import os
 import sys
-from contextlib import ExitStack
 
 for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_name, "1")
@@ -236,12 +211,7 @@ def _read_one_attribute(h5_file, request):
 
 try:
     file_path = _request["file_path"]
-    with ExitStack() as stack:
-        if _request.get("use_file_object"):
-            source = stack.enter_context(open(file_path, "rb"))
-            h5_file = stack.enter_context(h5py.File(source, "r"))
-        else:
-            h5_file = stack.enter_context(h5py.File(file_path, "r"))
+    with h5py.File(file_path, "r") as h5_file:
         requests = _request.get("attributes")
         if requests is not None:
             _emit({"status": "batch", "results": [_read_one_attribute(h5_file, request) for request in requests]})
@@ -603,7 +573,7 @@ class KerasH5Scanner(BaseScanner):
 
         # Try to open as HDF5 file
         try:
-            with _open_hdf5_file(path, descriptor_bound=_is_private_descriptor_bound_regular_file(path)):
+            with h5py.File(path, "r") as _:
                 return True
         except Exception:
             return False
@@ -659,13 +629,7 @@ class KerasH5Scanner(BaseScanner):
             # Store the file path for use in issue locations
             self.current_file_path = path
 
-            with _open_hdf5_file(
-                path,
-                descriptor_bound=(
-                    self.config.get(VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY) is True
-                    and _is_private_descriptor_bound_regular_file(path)
-                ),
-            ) as f:
+            with h5py.File(path, "r") as f:
                 result.bytes_scanned = file_size
                 raw_keras_version: str | None = None
                 keras_version_attr = self._read_bounded_hdf5_attribute(
@@ -1057,9 +1021,6 @@ class KerasH5Scanner(BaseScanner):
             object_path = os.fsdecode(h5i.get_name(object_id)) or "/"
         except Exception:
             return None
-        descriptor_bound_path = _DESCRIPTOR_BOUND_HDF5_PATH.get()
-        if descriptor_bound_path is not None:
-            file_path = descriptor_bound_path
         if not file_path:
             return None
         return file_path, object_path
@@ -1127,7 +1088,6 @@ class KerasH5Scanner(BaseScanner):
                 "attributes": attribute_requests,
                 "max_text_chars": cls._MAX_HDF5_REFERENCE_TEXT_CHARS,
                 "memory_limit_bytes": cls._HDF5_ATTRIBUTE_WORKER_MEMORY_BYTES,
-                "use_file_object": _DESCRIPTOR_BOUND_HDF5_PATH.get() == file_path,
             }
         )
         if worker_result.get("status") == "batch" and isinstance(worker_result.get("results"), list):
@@ -3674,13 +3634,7 @@ class KerasH5Scanner(BaseScanner):
             return metadata
 
         try:
-            with _open_hdf5_file(
-                file_path,
-                descriptor_bound=(
-                    self.config.get(VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY) is True
-                    and _is_private_descriptor_bound_regular_file(file_path)
-                ),
-            ) as h5_file:
+            with h5py.File(file_path, "r") as h5_file:
                 model_weights_link = h5_file.get("model_weights", getlink=True)
                 # Basic H5 structure
                 metadata.update(

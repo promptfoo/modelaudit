@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -59,14 +60,6 @@ MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
 _PREVALIDATED_SHARD_INFO_CONFIG_KEY = "_trusted_prevalidated_shard_info"
 _DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY = "_trusted_defer_safetensors_index_content_revalidation"
-_LINUX_F_ADD_SEALS = 1033
-_LINUX_F_GET_SEALS = 1034
-_LINUX_F_SEAL_SEAL = 0x0001
-_LINUX_F_SEAL_SHRINK = 0x0002
-_LINUX_F_SEAL_GROW = 0x0004
-_LINUX_F_SEAL_WRITE = 0x0008
-_LINUX_MFD_CLOEXEC = 0x0001
-_LINUX_MFD_ALLOW_SEALING = 0x0002
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
@@ -827,6 +820,129 @@ class _StagingMutationMonitor:
             self._kqueue = None
 
 
+_LINUX_WRITE_LEASE_GUARD_CODE = r"""
+import fcntl
+import os
+import signal
+import sys
+
+broken = False
+reported = False
+
+
+def report_break(_signal_number, _frame):
+    global broken, reported
+    broken = True
+    if not reported:
+        os.write(1, b"B")
+        reported = True
+
+
+try:
+    signal.signal(signal.SIGIO, report_break)
+    descriptors = [int(value) for value in sys.argv[1:]]
+    for descriptor in descriptors:
+        fcntl.fcntl(descriptor, fcntl.F_SETOWN, os.getpid())
+        fcntl.fcntl(descriptor, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+    os.write(1, b"R")
+    while True:
+        try:
+            command = os.read(0, 1)
+        except InterruptedError:
+            continue
+        if not command or command == b"X":
+            break
+    for descriptor in descriptors:
+        try:
+            fcntl.fcntl(descriptor, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+        except OSError:
+            broken = True
+    os.write(1, b"B" if broken else b"C")
+except BaseException:
+    try:
+        os.write(1, b"E")
+    except Exception:
+        pass
+    raise SystemExit(1)
+"""
+
+
+class _LinuxWriteLeaseGuard:
+    """Hold read leases in a helper process and report every attempted writer."""
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self._process = process
+        self._changed: bool | None = None
+
+    @classmethod
+    def arm(cls, descriptors: Iterable[int], *, deadline: float | None = None) -> "_LinuxWriteLeaseGuard":
+        import select
+
+        unique_descriptors: list[int] = []
+        identities: set[tuple[int, int]] = set()
+        for descriptor in descriptors:
+            descriptor_stat = os.fstat(descriptor)
+            identity = descriptor_stat.st_dev, descriptor_stat.st_ino
+            if identity in identities:
+                continue
+            identities.add(identity)
+            unique_descriptors.append(descriptor)
+        if not unique_descriptors:
+            raise _ShardPinUnavailableError("private staging write protection is unavailable")
+
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                _LINUX_WRITE_LEASE_GUARD_CODE,
+                *(str(fd) for fd in unique_descriptors),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=tuple(unique_descriptors),
+        )
+        assert process.stdout is not None
+        handshake_timeout = 5.0
+        if deadline is not None:
+            handshake_timeout = min(handshake_timeout, max(deadline - time.time(), 0.0))
+        try:
+            readable, _, _ = select.select([process.stdout.fileno()], [], [], handshake_timeout)
+            marker = os.read(process.stdout.fileno(), 1) if readable else b""
+            if marker != b"R":
+                raise _ShardPinUnavailableError("private staging write protection is unavailable")
+            return cls(process)
+        except BaseException:
+            with suppress(OSError):
+                process.kill()
+            with suppress(OSError, subprocess.SubprocessError):
+                process.communicate()
+            raise
+
+    def finish(self) -> bool:
+        """Release leases and return whether any writer attempted to break them."""
+        if self._changed is not None:
+            return self._changed
+        try:
+            if self._process.poll() is None:
+                stdout, _stderr = self._process.communicate(input=b"X", timeout=5)
+            else:
+                stdout, _stderr = self._process.communicate()
+            self._changed = self._process.returncode != 0 or stdout != b"C"
+        except (OSError, subprocess.SubprocessError):
+            with suppress(OSError):
+                self._process.kill()
+            with suppress(OSError, subprocess.SubprocessError):
+                self._process.communicate()
+            self._changed = True
+        return self._changed
+
+    def close(self) -> None:
+        self.finish()
+
+
 def _is_linux_platform() -> bool:
     """Return the runtime platform check without type-checker constant folding."""
     return sys.platform.startswith("linux")
@@ -916,59 +1032,6 @@ def _copy_pinned_file_descriptor_contents(
     finally:
         if copied_fd >= 0:
             os.close(copied_fd)
-
-
-def _copy_pinned_file_descriptor_to_sealed_memfd(
-    source_fd: int,
-    *,
-    max_bytes: int | None = None,
-    deadline: float | None = None,
-) -> tuple[int, str]:
-    """Copy into immutable Linux memory-backed storage before exposing a scanner path."""
-    if not _is_linux_platform():
-        raise _ShardPinUnavailableError("immutable private staging is unavailable")
-
-    import ctypes
-    import fcntl
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    memfd_create = getattr(libc, "memfd_create", None)
-    if memfd_create is None:
-        raise _ShardPinUnavailableError("immutable private staging is unavailable")
-    memfd_create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
-    memfd_create.restype = ctypes.c_int
-    memfd_fd = int(memfd_create(b"modelaudit-staged-scan", _LINUX_MFD_CLOEXEC | _LINUX_MFD_ALLOW_SEALING))
-    if memfd_fd < 0:
-        error_number = ctypes.get_errno()
-        raise _ShardPinUnavailableError("immutable private staging is unavailable") from OSError(
-            error_number,
-            os.strerror(error_number),
-        )
-
-    try:
-        with os.fdopen(os.dup(memfd_fd), "wb", closefd=True) as target:
-            copied_hash = _copy_pinned_file_descriptor_contents(
-                source_fd,
-                target,
-                max_bytes=max_bytes,
-                deadline=deadline,
-            )
-        required_seals = _LINUX_F_SEAL_SEAL | _LINUX_F_SEAL_SHRINK | _LINUX_F_SEAL_GROW | _LINUX_F_SEAL_WRITE
-        fcntl.fcntl(memfd_fd, _LINUX_F_ADD_SEALS, required_seals)
-        applied_seals = int(fcntl.fcntl(memfd_fd, _LINUX_F_GET_SEALS))
-        if applied_seals & required_seals != required_seals:
-            raise OSError("immutable staging seals were not applied")
-        os.lseek(memfd_fd, 0, os.SEEK_SET)
-        retained_fd = memfd_fd
-        memfd_fd = -1
-        return retained_fd, copied_hash
-    except _ShardPinUnavailableError:
-        raise
-    except (AttributeError, OSError, TypeError, ValueError) as error:
-        raise _ShardPinUnavailableError("immutable private staging is unavailable") from error
-    finally:
-        if memfd_fd >= 0:
-            os.close(memfd_fd)
 
 
 @contextmanager
@@ -1361,6 +1424,7 @@ def _pinned_shard_scan_path(
     staging_directory_fds: dict[tuple[str, ...], int] = {}
     staging_directory_stats: dict[int, os.stat_result] = {}
     staging_mutation_monitor: _StagingMutationMonitor | None = None
+    linux_write_lease_guard: _LinuxWriteLeaseGuard | None = None
     created_staging_directories: set[tuple[str, ...]] = set()
     remaining_copy_bytes = copy_max_bytes
 
@@ -1438,25 +1502,9 @@ def _pinned_shard_scan_path(
 
         portable_regular_fallback = staging_descriptor_root.parts[:3] == ("/", "dev", "fd")
         use_regular_copy = require_regular_path or portable_regular_fallback
-        use_sealed_regular_copy = use_regular_copy and _is_linux_platform()
         scan_root = staging_path if portable_regular_fallback else staging_descriptor_root
 
-        if use_sealed_regular_copy:
-            try:
-                pinned_source_copy_fd, pinned_source_copy_hash = _copy_pinned_file_descriptor_to_sealed_memfd(
-                    source_fd,
-                    max_bytes=bounded_copy_limit(source_stat.st_size),
-                    deadline=deadline,
-                )
-            except OSError as error:
-                raise _ShardPinUnavailableError("platform cannot retain a regular source scan path") from error
-            sealed_source_descriptor_path = _descriptor_path_for_open_file(pinned_source_copy_fd)
-            if sealed_source_descriptor_path is None or not sealed_source_descriptor_path.startswith(
-                f"/proc/{os.getpid()}/fd/"
-            ):
-                raise _ShardPinUnavailableError("immutable private staging cannot expose a scanner path")
-            os.symlink(sealed_source_descriptor_path, pinned_name, dir_fd=staging_fd)
-        elif use_regular_copy:
+        if use_regular_copy:
             try:
                 pinned_source_copy_hash = _copy_pinned_file_descriptor(
                     source_fd,
@@ -1486,21 +1534,12 @@ def _pinned_shard_scan_path(
         ):
             raise _ShardPinUnavailableError("validated shard target changed while staging")
         if use_regular_copy:
-            if pinned_source_copy_fd is None:
-                pinned_source_copy_fd = os.open(
-                    pinned_name,
-                    os.O_RDONLY | nofollow | nonblock | cloexec,
-                    dir_fd=staging_fd,
-                )
+            pinned_source_copy_fd = os.open(
+                pinned_name,
+                os.O_RDONLY | nofollow | nonblock | cloexec,
+                dir_fd=staging_fd,
+            )
             pinned_source_copy_stat = os.fstat(pinned_source_copy_fd)
-            if _pinned_file_descriptor_changed(
-                pinned_source_copy_fd,
-                pinned_source_copy_stat,
-                pinned_source_copy_hash,
-                max_bytes=pinned_source_copy_stat.st_size,
-                deadline=deadline,
-            ):
-                raise _ShardPinUnavailableError("pinned shard content changed while staging")
             staged_entry_bindings.append((staging_fd, pinned_name, pinned_source_copy_fd))
         else:
             staged_entry_bindings.append((staging_fd, pinned_name, source_fd))
@@ -1561,45 +1600,17 @@ def _pinned_shard_scan_path(
             if companion_descriptor_path is None:
                 raise _ShardPinUnavailableError("platform cannot expose an opened companion descriptor")
             companion_copy_hash: str | None = None
-            pinned_companion_copy: tuple[int, os.stat_result, str] | None = None
             if companion_use_regular_copy:
-                if _is_linux_platform():
-                    try:
-                        companion_copy_fd, companion_copy_hash = _copy_pinned_file_descriptor_to_sealed_memfd(
-                            companion_fd,
-                            max_bytes=bounded_copy_limit(companion_stat.st_size),
-                            deadline=deadline,
-                        )
-                    except OSError as error:
-                        raise _ShardPinUnavailableError(
-                            "platform cannot retain a regular companion scan path"
-                        ) from error
-                    companion_copy_stat = os.fstat(companion_copy_fd)
-                    pinned_companion_copy = (companion_copy_fd, companion_copy_stat, companion_copy_hash)
-                    pinned_companion_copy_fds.append(pinned_companion_copy)
-                    sealed_companion_descriptor_path = _descriptor_path_for_open_file(companion_copy_fd)
-                    if sealed_companion_descriptor_path is None or not sealed_companion_descriptor_path.startswith(
-                        f"/proc/{os.getpid()}/fd/"
-                    ):
-                        raise _ShardPinUnavailableError("immutable private staging cannot expose a companion path")
-                    os.symlink(
-                        sealed_companion_descriptor_path,
+                try:
+                    companion_copy_hash = _copy_pinned_file_descriptor(
+                        companion_fd,
                         relative_path.name,
-                        dir_fd=companion_staging_parent_fd,
+                        destination_dir_fd=companion_staging_parent_fd,
+                        max_bytes=bounded_copy_limit(companion_stat.st_size),
+                        deadline=deadline,
                     )
-                else:
-                    try:
-                        companion_copy_hash = _copy_pinned_file_descriptor(
-                            companion_fd,
-                            relative_path.name,
-                            destination_dir_fd=companion_staging_parent_fd,
-                            max_bytes=bounded_copy_limit(companion_stat.st_size),
-                            deadline=deadline,
-                        )
-                    except OSError as error:
-                        raise _ShardPinUnavailableError(
-                            "platform cannot retain a regular companion scan path"
-                        ) from error
+                except OSError as error:
+                    raise _ShardPinUnavailableError("platform cannot retain a regular companion scan path") from error
                 created_staging_entries.append((companion_staging_parent_fd, relative_path.name))
                 pinned_companion_fds[-1] = (companion_fd, companion_stat, companion_copy_hash)
                 if _pinned_file_descriptor_changed(
@@ -1626,30 +1637,15 @@ def _pinned_shard_scan_path(
                 raise _ShardPinUnavailableError("pinned companion scan path resolved to a different file")
             if companion_use_regular_copy:
                 assert companion_copy_hash is not None
-                if pinned_companion_copy is None:
-                    pinned_companion_copy_fd = os.open(
-                        relative_path.name,
-                        os.O_RDONLY | nofollow | nonblock | cloexec,
-                        dir_fd=companion_staging_parent_fd,
-                    )
-                    pinned_companion_copy_stat = os.fstat(pinned_companion_copy_fd)
-                    pinned_companion_copy = (
-                        pinned_companion_copy_fd,
-                        pinned_companion_copy_stat,
-                        companion_copy_hash,
-                    )
-                    pinned_companion_copy_fds.append(pinned_companion_copy)
-                pinned_companion_copy_fd, pinned_companion_copy_stat, _copy_hash = pinned_companion_copy
-                if _pinned_file_descriptor_changed(
-                    pinned_companion_copy_fd,
-                    pinned_companion_copy_stat,
-                    companion_copy_hash,
-                    max_bytes=pinned_companion_copy_stat.st_size,
-                    deadline=deadline,
-                ):
-                    os.close(pinned_companion_copy_fd)
-                    pinned_companion_copy_fds.remove(pinned_companion_copy)
-                    raise _ShardPinUnavailableError("pinned companion content changed while staging")
+                pinned_companion_copy_fd = os.open(
+                    relative_path.name,
+                    os.O_RDONLY | nofollow | nonblock | cloexec,
+                    dir_fd=companion_staging_parent_fd,
+                )
+                pinned_companion_copy_stat = os.fstat(pinned_companion_copy_fd)
+                pinned_companion_copy_fds.append(
+                    (pinned_companion_copy_fd, pinned_companion_copy_stat, companion_copy_hash)
+                )
                 staged_entry_bindings.append(
                     (companion_staging_parent_fd, relative_path.name, pinned_companion_copy_fd)
                 )
@@ -1659,6 +1655,15 @@ def _pinned_shard_scan_path(
         staging_directory_stats = {
             directory_fd: os.fstat(directory_fd) for directory_fd in staging_directory_fds.values()
         }
+        write_lease_descriptors = [
+            *([pinned_source_copy_fd] if pinned_source_copy_fd is not None else []),
+            *(companion_fd for companion_fd, _stat, _hash in pinned_companion_copy_fds),
+        ]
+        if _is_linux_platform() and write_lease_descriptors:
+            linux_write_lease_guard = _LinuxWriteLeaseGuard.arm(
+                write_lease_descriptors,
+                deadline=deadline,
+            )
         staging_mutation_monitor = _StagingMutationMonitor.arm(
             [
                 *staging_directory_fds.values(),
@@ -1668,6 +1673,29 @@ def _pinned_shard_scan_path(
                 *(companion_fd for companion_fd, _stat, _hash in pinned_companion_copy_fds),
             ]
         )
+        if (
+            pinned_source_copy_fd is not None
+            and pinned_source_copy_stat is not None
+            and _pinned_file_descriptor_changed(
+                pinned_source_copy_fd,
+                pinned_source_copy_stat,
+                pinned_source_copy_hash,
+                max_bytes=pinned_source_copy_stat.st_size,
+                deadline=deadline,
+            )
+        ):
+            raise _ShardPinUnavailableError("pinned shard content changed before scanner dispatch")
+        for companion_fd, companion_stat, copy_hash in pinned_companion_copy_fds:
+            if _pinned_file_descriptor_changed(
+                companion_fd,
+                companion_stat,
+                copy_hash,
+                max_bytes=companion_stat.st_size,
+                deadline=deadline,
+            ):
+                raise _ShardPinUnavailableError("pinned companion content changed before scanner dispatch")
+        if staging_mutation_monitor.changed():
+            raise _ShardPinUnavailableError("private staging content changed before scanner dispatch")
         if staged_bindings_changed():
             raise _ShardPinUnavailableError("private staging entry changed before scanner dispatch")
         if deadline is not None and time.time() > deadline:
@@ -1736,6 +1764,10 @@ def _pinned_shard_scan_path(
                     pinned_scan.changed_during_scan = True
                     break
             pinned_scan.changed_during_scan = pinned_scan.changed_during_scan or staged_bindings_changed()
+            if linux_write_lease_guard is not None and linux_write_lease_guard.finish():
+                pinned_scan.changed_during_scan = True
+        if linux_write_lease_guard is not None:
+            linux_write_lease_guard.close()
         if pinned_source_copy_fd is not None:
             os.close(pinned_source_copy_fd)
         if staging_mutation_monitor is not None:
