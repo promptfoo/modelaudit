@@ -2809,13 +2809,14 @@ def _detect_huggingface_text_owner_embedded_binary_route(
             sample_is_prefix=True,
             incomplete_prefix_is_inconclusive=True,
         )
-        if flax_state is True:
+        if flax_state is True and route_is_active("flax_msgpack"):
             return "flax_msgpack"
-        if _starts_with_non_ascii_length_delimited_proto_prefix(
-            sample
-        ) or _has_bounded_protobuf_model_text_candidate_signal_bytes(sample):
+        if (
+            _starts_with_non_ascii_length_delimited_proto_prefix(sample)
+            or _has_bounded_protobuf_model_text_candidate_signal_bytes(sample)
+        ) and route_is_active(PROTOBUF_MODEL_CANDIDATE_FORMAT):
             return PROTOBUF_MODEL_CANDIDATE_FORMAT
-        if _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True):
+        if _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True) and route_is_active("pickle"):
             return "pickle"
         detected_format = detect_format_from_magic_bytes(
             sample[:4],
@@ -2826,7 +2827,7 @@ def _detect_huggingface_text_owner_embedded_binary_route(
             pickle_probe_sample=sample,
             pickle_probe_is_prefix=True,
         )
-        if detected_format != "unknown":
+        if detected_format != "unknown" and route_is_active(detected_format):
             return detected_format
 
         if not route_is_active("zip"):
@@ -2839,7 +2840,7 @@ def _detect_huggingface_text_owner_embedded_binary_route(
     sample_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
     post_prefix = _read_huggingface_range(repo_id, filename, revision, budget, prefix, len(prefix), sample_size)
     post_prefix_route = detect_sample_route(post_prefix)
-    if post_prefix_route is not None:
+    if post_prefix_route is not None and route_is_active(post_prefix_route):
         return post_prefix_route
 
     if route_is_active("keras_h5"):
@@ -2876,7 +2877,8 @@ def _detect_huggingface_text_owner_embedded_binary_route(
     if tail_start <= len(prefix) + len(post_prefix):
         return None
     tail = _read_huggingface_tail(repo_id, filename, revision, budget, prefix, sample_size)
-    return detect_sample_route(tail)
+    tail_route = detect_sample_route(tail)
+    return tail_route if tail_route is not None and route_is_active(tail_route) else None
 
 
 def _is_complete_huggingface_text_owner_or_json_probe(
@@ -3346,14 +3348,9 @@ def _select_huggingface_model_files(
         if selected_route_scanner_ids is not None
         else selected_route_formats is None or bool(selected_route_formats)
     )
-    active_content_route_scanner_ids = (
-        selected_route_scanner_ids
-        if selected_route_scanner_ids is not None
-        else (
-            None
-            if selected_route_formats is None
-            else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
-        )
+    active_content_route_scanner_ids = _active_hf_content_route_scanner_ids(
+        selected_route_scanner_ids,
+        selected_route_formats,
     )
     exact_openvino_companion_candidates = (
         {
@@ -3388,9 +3385,7 @@ def _select_huggingface_model_files(
     probe_budget = _HuggingFaceProbeBudget(
         remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
         deadline=deadline,
-        active_scanner_ids=(
-            None if active_content_route_scanner_ids is None else frozenset(active_content_route_scanner_ids)
-        ),
+        active_scanner_ids=active_content_route_scanner_ids,
     )
 
     for filename in repo_files if content_probes_relevant else ():
@@ -4092,6 +4087,18 @@ def _hf_route_scanner_ids_for_formats(format_names: frozenset[str]) -> frozenset
     return frozenset(scanner_ids)
 
 
+def _active_hf_content_route_scanner_ids(
+    selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
+) -> frozenset[str] | None:
+    """Return the active scanner policy shared by all bounded HF content probes."""
+    if selected_route_scanner_ids is not None:
+        return frozenset(selected_route_scanner_ids)
+    if selected_route_formats is None:
+        return None
+    return _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+
+
 def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
     parsed = parse_canonical_safetensors_shard(PurePosixPath(filename).name)
     if parsed is None:
@@ -4251,14 +4258,9 @@ def _select_streamable_hf_files(
         else selected_route_formats is None or bool(selected_route_formats)
     )
     sniff_renamed_files = allow_content_probes and sniff_renamed_files_would_be_active
-    active_content_route_scanner_ids = (
-        selected_route_scanner_ids
-        if selected_route_scanner_ids is not None
-        else (
-            None
-            if selected_route_formats is None
-            else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
-        )
+    active_content_route_scanner_ids = _active_hf_content_route_scanner_ids(
+        selected_route_scanner_ids,
+        selected_route_formats,
     )
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
@@ -4364,34 +4366,24 @@ def _select_streamable_hf_files(
             probe_budget = _HuggingFaceProbeBudget(
                 remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
                 deadline=deadline,
-                active_scanner_ids=(
-                    None if active_content_route_scanner_ids is None else frozenset(active_content_route_scanner_ids)
-                ),
+                active_scanner_ids=active_content_route_scanner_ids,
             )
         else:
-            probe_budget.active_scanner_ids = (
-                None if active_content_route_scanner_ids is None else frozenset(active_content_route_scanner_ids)
-            )
+            probe_budget.active_scanner_ids = active_content_route_scanner_ids
         for file_name in _streamable_hf_content_probe_candidates(
             repo_files,
             model_files,
             exact_openvino_companion_candidates,
         ):
-            if _is_safetensors_index_file(file_name):
-                deferred_index_route_scanner_ids = (
-                    selected_route_scanner_ids
-                    if selected_route_scanner_ids is not None
-                    else (
-                        None
-                        if selected_route_formats is None
-                        else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
-                    )
+            if (
+                _is_safetensors_index_file(file_name)
+                and defer_safetensors_index_validation
+                and (
+                    active_content_route_scanner_ids is None
+                    or not active_content_route_scanner_ids.difference({"safetensors"})
                 )
-                if defer_safetensors_index_validation and (
-                    deferred_index_route_scanner_ids is None
-                    or not deferred_index_route_scanner_ids.difference({"safetensors"})
-                ):
-                    continue
+            ):
+                continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "

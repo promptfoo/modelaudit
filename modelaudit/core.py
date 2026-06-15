@@ -1387,6 +1387,7 @@ def _snapshot_regular_file_target(path: str | os.PathLike[str]) -> dict[str, int
         "resolved_path": str(resolved_path),
         "device": target_stat.st_dev,
         "inode": target_stat.st_ino,
+        "mode": target_stat.st_mode,
         "size": target_stat.st_size,
         "mtime_ns": target_stat.st_mtime_ns,
         "ctime_ns": target_stat.st_ctime_ns,
@@ -1416,11 +1417,22 @@ def _snapshot_regular_file_descriptor(file_fd: int) -> dict[str, int | str] | No
         "resolved_path": descriptor_path,
         "device": target_stat.st_dev,
         "inode": target_stat.st_ino,
+        "mode": target_stat.st_mode,
         "size": target_stat.st_size,
         "mtime_ns": target_stat.st_mtime_ns,
         "ctime_ns": target_stat.st_ctime_ns,
         "nlink": target_stat.st_nlink,
     }
+
+
+def _regular_file_target_identity_key(
+    target: Mapping[str, int | str],
+) -> _FileTargetIdentityKey | None:
+    """Return the target key used to deduplicate a descriptor-bound regular file."""
+    identity = tuple(target.get(field) for field in ("device", "inode", "mode", "size", "mtime_ns", "ctime_ns"))
+    if not all(isinstance(value, int) for value in identity):
+        return None
+    return ("stat", *identity)
 
 
 def _descriptor_alias_matches_stat(path: Path, expected: os.stat_result) -> bool:
@@ -1457,18 +1469,74 @@ def _open_retained_relative_regular_file(parent_fd: int, relative_path: Path) ->
         or any(part in {"", ".", ".."} for part in relative_path.parts)
     ):
         raise OSError("retained companion path escaped its source directory")
-    file_fd = os.open(
-        os.fspath(relative_path),
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0),
-        dir_fd=parent_fd,
+    if len(relative_path.parts) != 1:
+        raise OSError("nested retained companion lacks a source-bound namespace receipt")
+
+    lexical_path = os.fspath(relative_path)
+    lexical_stat = os.stat(lexical_path, dir_fd=parent_fd, follow_symlinks=False)
+    target_path = relative_path
+    symlink_target: str | None = None
+    if stat.S_ISLNK(lexical_stat.st_mode):
+        symlink_target = os.readlink(lexical_path, dir_fd=parent_fd)
+        target_path = Path(symlink_target)
+        if (
+            target_path.is_absolute()
+            or not target_path.parts
+            or any(part in {"", ".", ".."} for part in target_path.parts)
+        ):
+            raise OSError("retained companion symlink escaped its source directory")
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
     )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    opened_directories: list[int] = []
+    current_parent_fd = parent_fd
+    file_fd = -1
     try:
-        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+        for directory_name in target_path.parts[:-1]:
+            directory_fd = os.open(directory_name, directory_flags, dir_fd=current_parent_fd)
+            opened_directories.append(directory_fd)
+            current_parent_fd = directory_fd
+        file_fd = os.open(target_path.parts[-1], file_flags, dir_fd=current_parent_fd)
+        opened_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
             raise OSError("retained companion is not a regular file")
+        current_lexical_stat = os.stat(lexical_path, dir_fd=parent_fd, follow_symlinks=False)
+        current_target_stat = os.stat(lexical_path, dir_fd=parent_fd)
+        if not os.path.samestat(lexical_stat, current_lexical_stat) or not os.path.samestat(
+            opened_stat,
+            current_target_stat,
+        ):
+            raise OSError("retained companion changed while opening")
+        if symlink_target is not None and os.readlink(lexical_path, dir_fd=parent_fd) != symlink_target:
+            raise OSError("retained companion symlink changed while opening")
     except BaseException:
-        os.close(file_fd)
+        if file_fd >= 0:
+            os.close(file_fd)
         raise
+    finally:
+        for directory_fd in reversed(opened_directories):
+            os.close(directory_fd)
     return file_fd
+
+
+def _retained_companion_relative_path(
+    companion_path: Path,
+    discovery_parent: Path,
+    logical_parent: Path,
+) -> Path:
+    """Map a descriptor-lexical or resolved companion back beneath its retained parent."""
+    for candidate_parent in dict.fromkeys((discovery_parent, logical_parent)):
+        try:
+            return companion_path.relative_to(candidate_parent)
+        except ValueError:
+            continue
+    raise ValueError("retained companion escaped its discovery and logical parents")
 
 
 def _local_source_lexical_identity(entries: list[tuple[Path, os.stat_result]]) -> str:
@@ -1561,12 +1629,181 @@ class _BoundLocalSourceGuard:
     staged_entry_stat: os.stat_result | None = None
     staging_mutation_monitor: _StagingMutationMonitor | None = None
     staging_changed: bool = False
+    source_parent_mutation_monitor: _StagingMutationMonitor | None = None
+    source_parent_changed: bool = False
+    source_parent_entry_name: str | None = None
+    guarded_companion_entries: tuple[tuple[int, Path, int, os.stat_result], ...] = ()
+    companion_watch_names: tuple[str, ...] = ()
+    companion_namespace_monitors: tuple[tuple[_StagingMutationMonitor, str], ...] = ()
+    companion_namespace_fds: tuple[int, ...] = ()
+    prepared_companion_names: tuple[str, ...] = ()
+    companion_namespace_changed: bool = False
     closed: bool = False
+
+    def prepare_companion_namespace(
+        self,
+        parent_fd: int,
+        relative_path: Path,
+        *,
+        allow_new_nested: bool = False,
+    ) -> bool:
+        """Watch every internal symlink-target directory before companion discovery."""
+        relative_name = os.fspath(relative_path)
+        if relative_name in self.prepared_companion_names:
+            return True
+        try:
+            lexical_stat = os.stat(relative_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            self.prepared_companion_names += (relative_name,)
+            return True
+        except OSError:
+            return False
+        if not stat.S_ISLNK(lexical_stat.st_mode):
+            self.prepared_companion_names += (relative_name,)
+            return True
+        opened_fds: list[int] = []
+        opened_monitors: list[tuple[_StagingMutationMonitor, str]] = []
+        try:
+            target_path = Path(os.readlink(relative_name, dir_fd=parent_fd))
+            if (
+                target_path.is_absolute()
+                or not target_path.parts
+                or any(part in {"", ".", ".."} for part in target_path.parts)
+            ):
+                self.prepared_companion_names += (relative_name,)
+                return True
+            if len(target_path.parts) > 1 and not allow_new_nested:
+                return False
+            self.companion_watch_names += (target_path.parts[0],)
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            current_parent_fd = parent_fd
+            for index, directory_name in enumerate(target_path.parts[:-1]):
+                directory_fd = os.open(directory_name, directory_flags, dir_fd=current_parent_fd)
+                opened_fds.append(directory_fd)
+                relevant_name = target_path.parts[index + 1]
+                directory_before = os.fstat(directory_fd)
+                child_before = os.stat(
+                    relevant_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                monitor = _StagingMutationMonitor.arm((directory_fd,))
+                opened_monitors.append((monitor, relevant_name))
+                directory_after = os.fstat(directory_fd)
+                child_after = os.stat(
+                    relevant_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                receipt_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+                if any(
+                    getattr(directory_before, field) != getattr(directory_after, field)
+                    or getattr(child_before, field) != getattr(child_after, field)
+                    for field in receipt_fields
+                ):
+                    raise OSError("retained companion namespace changed while arming monitoring")
+                current_parent_fd = directory_fd
+        except OSError:
+            for monitor, _relevant_name in reversed(opened_monitors):
+                with suppress(OSError):
+                    monitor.close()
+            for directory_fd in reversed(opened_fds):
+                with suppress(OSError):
+                    os.close(directory_fd)
+            return False
+        self.companion_namespace_fds += tuple(opened_fds)
+        self.companion_namespace_monitors += tuple(opened_monitors)
+        self.prepared_companion_names += (relative_name,)
+        return True
+
+    def bind_companion(self, parent_fd: int, relative_path: Path, companion_fd: int) -> bool:
+        """Retain a terminal namespace receipt for one descriptor-bound companion."""
+        try:
+            lexical_stat = os.stat(
+                os.fspath(relative_path),
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            current_target = os.stat(os.fspath(relative_path), dir_fd=parent_fd)
+            opened_target = os.fstat(companion_fd)
+            if not stat.S_ISREG(opened_target.st_mode) or not os.path.samestat(current_target, opened_target):
+                return False
+            if stat.S_ISLNK(lexical_stat.st_mode):
+                symlink_target = Path(os.readlink(os.fspath(relative_path), dir_fd=parent_fd))
+                if symlink_target.parts:
+                    self.companion_watch_names += (symlink_target.parts[0],)
+            retained_fd = os.dup(companion_fd)
+        except OSError:
+            return False
+        self.guarded_companion_entries += ((parent_fd, relative_path, retained_fd, lexical_stat),)
+        return True
+
+    def finish_companion_discovery(self, relevant_names: Collection[str]) -> bool:
+        """Seal companion discovery before descriptor-bound private staging begins."""
+        previous_parent_monitor = self.source_parent_mutation_monitor
+        if previous_parent_monitor is not None:
+            watched_names = {
+                Path(name).parts[0]
+                for name in (*relevant_names, *self.companion_watch_names)
+                if Path(name).parts and Path(name).parts[0] not in {"", ".", ".."}
+            }
+            self.source_parent_changed = self.source_parent_changed or previous_parent_monitor.changed(
+                relevant_names=watched_names
+            )
+            with suppress(OSError):
+                previous_parent_monitor.close()
+            self.source_parent_mutation_monitor = None
+        for monitor, relevant_name in self.companion_namespace_monitors:
+            self.companion_namespace_changed = self.companion_namespace_changed or monitor.changed(
+                relevant_names={relevant_name}
+            )
+        if self.companion_namespace_changed:
+            self.source_parent_changed = True
+        return not self.source_parent_changed
 
     def changed(self, *, allow_directory_content_changes: bool = False) -> bool:
         """Return whether any retained path component changed after acquisition."""
         if self.closed:
             return True
+        if self.source_parent_mutation_monitor is not None:
+            relevant_names = {
+                name
+                for name in (self.source_parent_entry_name, *self.companion_watch_names)
+                if isinstance(name, str) and name
+            }
+            self.source_parent_changed = self.source_parent_changed or self.source_parent_mutation_monitor.changed(
+                relevant_names=relevant_names
+            )
+            if self.source_parent_changed:
+                return True
+        for monitor, relevant_name in self.companion_namespace_monitors:
+            self.companion_namespace_changed = self.companion_namespace_changed or monitor.changed(
+                relevant_names={relevant_name}
+            )
+        if self.companion_namespace_changed:
+            return True
+        for parent_fd, relative_path, companion_fd, expected_lexical in self.guarded_companion_entries:
+            try:
+                current_lexical = os.stat(
+                    os.fspath(relative_path),
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                current_target = os.stat(os.fspath(relative_path), dir_fd=parent_fd)
+                retained_target = os.fstat(companion_fd)
+            except OSError:
+                return True
+            if any(
+                getattr(current_lexical, field) != getattr(expected_lexical, field)
+                for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+            ) or not os.path.samestat(current_target, retained_target):
+                return True
         for descriptor, expected in self.guarded_descriptors:
             try:
                 current = os.fstat(descriptor)
@@ -1647,6 +1884,18 @@ class _BoundLocalSourceGuard:
         if self.staging_mutation_monitor is not None:
             with suppress(OSError):
                 self.staging_mutation_monitor.close()
+        if self.source_parent_mutation_monitor is not None:
+            with suppress(OSError):
+                self.source_parent_mutation_monitor.close()
+        for monitor, _relevant_name in reversed(self.companion_namespace_monitors):
+            with suppress(OSError):
+                monitor.close()
+        for directory_fd in reversed(self.companion_namespace_fds):
+            with suppress(OSError):
+                os.close(directory_fd)
+        for _parent_fd, _relative_path, companion_fd, _lexical_stat in self.guarded_companion_entries:
+            with suppress(OSError):
+                os.close(companion_fd)
         if self.staging_fd is not None and self.staged_name is not None:
             with suppress(OSError):
                 os.unlink(self.staged_name, dir_fd=self.staging_fd)
@@ -1789,8 +2038,30 @@ def _open_bound_local_source(source_path: str | os.PathLike[str]) -> _BoundLocal
             guarded_entries=tuple(opened_entries),
         )
         if stat.S_ISREG(final_stat.st_mode):
+            if not opened_entries:
+                raise _LocalSourceBoundaryError("local file source omitted a retained parent")
+            source_parent_fd = opened_entries[-1][0]
+            source_parent_stat = os.fstat(source_parent_fd)
+            guard.source_parent_entry_name = absolute_source.name
+            guard.source_parent_mutation_monitor = _StagingMutationMonitor.arm((source_parent_fd,))
             nofollow = getattr(os, "O_NOFOLLOW", 0)
-            staging_path = Path(tempfile.mkdtemp(prefix=".modelaudit_source_"))
+            staging_path: Path | None = None
+            for staging_parent_candidate in dict.fromkeys((Path(tempfile.gettempdir()), Path("/var/tmp"), Path.home())):
+                try:
+                    staging_parent_candidate = staging_parent_candidate.resolve(strict=True)
+                    if os.path.samestat(staging_parent_candidate.stat(), source_parent_stat):
+                        continue
+                    staging_path = Path(
+                        tempfile.mkdtemp(
+                            prefix=".modelaudit_source_",
+                            dir=staging_parent_candidate,
+                        )
+                    )
+                    break
+                except OSError:
+                    continue
+            if staging_path is None:
+                raise _LocalSourceBoundaryError("private source staging is unavailable outside the source parent")
             guard.staging_path = staging_path
             guard.staging_stat = os.stat(staging_path, follow_symlinks=False)
             guard.staging_parent_fd = os.open(staging_path.parent, directory_flags)
@@ -4604,6 +4875,7 @@ def _hash_files_by_path(
                             hashed_identities[file_path] = {
                                 "device": pre_hash_stat.st_dev,
                                 "inode": pre_hash_stat.st_ino,
+                                "mode": pre_hash_stat.st_mode,
                                 "size": pre_hash_stat.st_size,
                                 "mtime_ns": pre_hash_stat.st_mtime_ns,
                                 "ctime_ns": pre_hash_stat.st_ctime_ns,
@@ -4640,6 +4912,7 @@ def _hash_files_by_path(
                 hashed_identities[file_path] = {
                     "device": post_hash_stat.st_dev,
                     "inode": post_hash_stat.st_ino,
+                    "mode": post_hash_stat.st_mode,
                     "size": post_hash_stat.st_size,
                     "mtime_ns": post_hash_stat.st_mtime_ns,
                     "ctime_ns": post_hash_stat.st_ctime_ns,
@@ -6421,7 +6694,19 @@ def scan_model_directory_or_file(
                 hash_budget_bytes = 0
                 onnx_external_data_sources_by_path: dict[str, list[str]] = {}
                 onnx_external_data_sizes_by_path: dict[str, int] = {}
-                onnx_external_data_routing_paths: dict[str, str] = {}
+                onnx_external_data_bindings_by_path: dict[str, list[tuple[str, str]]] = {}
+                onnx_external_data_hash_routing_paths: dict[str, str] = {}
+
+                def record_onnx_external_data_binding(
+                    representative_path: str,
+                    discovery_path: Path,
+                    binding: tuple[str, str],
+                ) -> None:
+                    for binding_root in dict.fromkeys((representative_path, str(discovery_path))):
+                        root_bindings = onnx_external_data_bindings_by_path.setdefault(binding_root, [])
+                        if binding not in root_bindings:
+                            root_bindings.append(binding)
+
                 scan_entry_target_keys: set[_FileTargetIdentityKey] = set()
                 scan_entry_hash_sources_by_target_key: dict[_FileTargetIdentityKey, str] = {}
                 for (
@@ -6499,7 +6784,17 @@ def scan_model_directory_or_file(
                                     external_data_target_key
                                 )
                                 if external_data_source is not None:
-                                    onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
+                                    logical_external_data_path = str(external_data_path)
+                                    binding = (external_data_source, logical_external_data_path)
+                                    record_onnx_external_data_binding(
+                                        representative_file,
+                                        onnx_discovery_path,
+                                        binding,
+                                    )
+                                    onnx_external_data_hash_routing_paths.setdefault(
+                                        external_data_source,
+                                        logical_external_data_path,
+                                    )
                                     representative_external_sources.append(external_data_source)
                                 continue
                             if _should_defer_hash_for_max_file_size(str(external_data_path), config):
@@ -6523,10 +6818,24 @@ def scan_model_directory_or_file(
                                 seen_hash_sources.add(external_data_source)
                                 if not representative_hash_deferred:
                                     hash_sources.append(external_data_source)
-                            onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
+                            logical_external_data_path = str(external_data_path)
+                            binding = (external_data_source, logical_external_data_path)
+                            record_onnx_external_data_binding(
+                                representative_file,
+                                onnx_discovery_path,
+                                binding,
+                            )
+                            onnx_external_data_hash_routing_paths.setdefault(
+                                external_data_source,
+                                logical_external_data_path,
+                            )
                             representative_external_sources.append(external_data_source)
                             if external_data_target_key is not None:
                                 scan_entry_target_keys.add(external_data_target_key)
+                                scan_entry_hash_sources_by_target_key.setdefault(
+                                    external_data_target_key,
+                                    external_data_source,
+                                )
                         if representative_external_sources:
                             onnx_external_data_sources_by_path[representative_file] = representative_external_sources
                         if representative_external_bytes:
@@ -6568,7 +6877,7 @@ def scan_model_directory_or_file(
                 routing_paths_by_source = {
                     hash_source: scanned_file_path for scanned_file_path, hash_source in hash_source_by_path.items()
                 }
-                routing_paths_by_source.update(onnx_external_data_routing_paths)
+                routing_paths_by_source.update(onnx_external_data_hash_routing_paths)
                 routing_paths_by_source.update(
                     {
                         owner_source: owner_source
@@ -6943,6 +7252,7 @@ def scan_model_directory_or_file(
                     if isinstance((index_path := target.get("authoritative_shard_index_path")), str)
                 }
                 accounted_standard_targets: set[tuple[object, ...]] = set()
+                accounted_context_only_targets: set[_FileTargetIdentityKey] = set()
 
                 def stable_target_key(target: Mapping[str, int | str]) -> tuple[object, ...]:
                     return tuple(target.get(field) for field in ("device", "inode", "size", "mtime_ns", "ctime_ns"))
@@ -7026,14 +7336,9 @@ def scan_model_directory_or_file(
                                 oversized_companion: tuple[str, int, str | None] | None = None
                                 logical_root_path = trusted_hf_alias_logical_paths.get(logical_root, logical_root)
                                 context_only_companions: set[Path] = set()
-                                logical_paths_by_source = {
-                                    source: onnx_external_data_routing_paths[source]
-                                    for source in onnx_external_data_sources_by_path.get(
-                                        logical_root,
-                                        (),
-                                    )
-                                    if source in onnx_external_data_routing_paths
-                                }
+                                logical_companion_bindings = dict.fromkeys(
+                                    onnx_external_data_bindings_by_path.get(logical_root, ())
+                                )
                                 if scanner_selection.allows("openvino"):
                                     openvino_companion = _openvino_xml_weights_companion(Path(logical_root_path))
                                     if (
@@ -7044,33 +7349,27 @@ def scan_model_directory_or_file(
                                         )
                                         is None
                                     ):
-                                        logical_paths_by_source.setdefault(
-                                            str(openvino_companion),
-                                            str(openvino_companion),
-                                        )
+                                        companion_text = str(openvino_companion)
+                                        logical_companion_bindings.setdefault((companion_text, companion_text), None)
                                 if scanner_selection.allows("mxnet"):
                                     for mxnet_companion in _mxnet_companion_paths(Path(logical_root_path)):
-                                        logical_paths_by_source.setdefault(
-                                            str(mxnet_companion),
-                                            str(mxnet_companion),
-                                        )
+                                        companion_text = str(mxnet_companion)
+                                        logical_companion_bindings.setdefault((companion_text, companion_text), None)
                                 if scanner_selection.allows("oci_layer"):
                                     context_only_companions.update(
                                         _oci_manifest_layer_companion_paths(Path(logical_root_path))
                                     )
                                     for layer_companion in context_only_companions:
-                                        logical_paths_by_source.setdefault(
-                                            str(layer_companion),
-                                            str(layer_companion),
-                                        )
+                                        companion_text = str(layer_companion)
+                                        logical_companion_bindings.setdefault((companion_text, companion_text), None)
                                 for scanned_companion_path in family_paths[1:]:
                                     companion_source = hash_source_by_path.get(scanned_companion_path)
                                     if companion_source is not None:
-                                        logical_paths_by_source.setdefault(
-                                            companion_source,
-                                            scanned_companion_path,
+                                        logical_companion_bindings.setdefault(
+                                            (companion_source, scanned_companion_path),
+                                            None,
                                         )
-                                for companion_source, logical_companion_path in logical_paths_by_source.items():
+                                for companion_source, logical_companion_path in logical_companion_bindings:
                                     try:
                                         relative_companion_path = str(
                                             Path(logical_companion_path).relative_to(Path(logical_root_path).parent)
@@ -7106,7 +7405,10 @@ def scan_model_directory_or_file(
                                         resolved_companion_target,
                                         companion_target,
                                     )
-                                return pinned_targets, logical_paths_by_source, oversized_companion
+                                companion_paths_by_source = {
+                                    logical_path: source for source, logical_path in logical_companion_bindings
+                                }
+                                return pinned_targets, companion_paths_by_source, oversized_companion
 
                             def scan_pinned_local_source(
                                 resolved_target: str,
@@ -7173,11 +7475,25 @@ def scan_model_directory_or_file(
                                 staged_targets = [expected_target]
                                 staged_targets.extend(target for _path, target in companion_targets.values())
                                 staged_copy_bytes = 0
-                                for staged_target in staged_targets:
+                                for staged_index, staged_target in enumerate(staged_targets):
                                     staged_size = staged_target.get("size")
                                     if not isinstance(staged_size, int):
                                         aggregate_hash_complete = False
                                         return _local_source_boundary_failure_scan_result(report_path), {}
+                                    if (
+                                        staged_index > 0
+                                        and stable_target_key(staged_target) in accounted_standard_targets
+                                    ):
+                                        continue
+                                    staged_target_key = _regular_file_target_identity_key(staged_target)
+                                    if staged_target_key is not None and (
+                                        staged_target_key in accounted_context_only_targets
+                                        or (
+                                            staged_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY)
+                                            and staged_target_key in scan_entry_target_keys
+                                        )
+                                    ):
+                                        continue
                                     staged_copy_bytes += staged_size
                                 projected_total = results.bytes_scanned + staged_copy_bytes
                                 if max_total_size > 0 and projected_total > max_total_size:
@@ -7216,8 +7532,46 @@ def scan_model_directory_or_file(
                                         ),
                                         deadline=start_time + timeout,
                                     ) as pinned_source_scan:
+                                        context_only_bytes_scanned = 0
+                                        for relative_name, (
+                                            _companion_source,
+                                            companion_target,
+                                        ) in companion_targets.items():
+                                            if not companion_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY):
+                                                continue
+                                            target_key = _regular_file_target_identity_key(companion_target)
+                                            if target_key is not None and (
+                                                target_key in scan_entry_target_keys
+                                                or target_key in accounted_context_only_targets
+                                            ):
+                                                continue
+                                            if target_key is not None:
+                                                accounted_context_only_targets.add(target_key)
+                                            pinned_companion_path = Path(pinned_source_scan.path).parent.joinpath(
+                                                *Path(relative_name).parts
+                                            )
+                                            try:
+                                                companion_hash = _calculate_file_hash(
+                                                    str(pinned_companion_path),
+                                                    deadline=start_time + timeout,
+                                                )
+                                            except Exception as error:
+                                                logger.debug(
+                                                    "Failed to hash context-only companion %s: %s",
+                                                    pinned_companion_path,
+                                                    error,
+                                                )
+                                                aggregate_hash_complete = False
+                                            else:
+                                                if companion_hash not in recorded_content_hashes:
+                                                    file_hashes.append(companion_hash)
+                                                    recorded_content_hashes.add(companion_hash)
+                                            context_size = companion_target.get("size")
+                                            if isinstance(context_size, int):
+                                                context_only_bytes_scanned += context_size
                                         with _trusted_logical_scan_path(pinned_source_scan.path, logical_path):
                                             local_result = scan_file(pinned_source_scan.path, current_config)
+                                        local_result.bytes_scanned += context_only_bytes_scanned
                                         _rebase_pinned_shard_result(
                                             local_result,
                                             pinned_source_scan.path,
@@ -7350,6 +7704,11 @@ def scan_model_directory_or_file(
                         _normalize_unclassified_scan_failure(file_result)
                         if _scan_result_has_operational_error(file_result):
                             scan_metadata["has_operational_errors"] = True
+                            aggregate_hash_complete = False
+                        if file_result.scanner_name == "oci_layer" and _metadata_has_incomplete_coverage(
+                            file_result.metadata or {}
+                        ):
+                            aggregate_hash_complete = False
                         results.bytes_scanned += file_result.bytes_scanned
                         results.files_scanned += len(scanned_file_paths)
                         processed_files += len(scanned_file_paths)
@@ -7901,19 +8260,34 @@ def scan_model_directory_or_file(
                     else:
                         companion_paths: list[Path] = []
                         oci_layer_companions: tuple[Path, ...] = ()
+                        single_file_openvino_companion: Path | None = None
                         if not scanner_selection.active or scanner_selection.allows("openvino"):
-                            openvino_companion = _openvino_xml_weights_companion(single_file_discovery_path)
-                            if openvino_companion is not None:
-                                companion_paths.append(openvino_companion)
+                            openvino_candidate = single_file_discovery_path.with_suffix(".bin")
+                            if (
+                                retained_parent_fd is not None
+                                and single_file_discovery_path.suffix.lower() == ".xml"
+                                and not local_source_bound_guard.prepare_companion_namespace(
+                                    retained_parent_fd,
+                                    Path(openvino_candidate.name),
+                                    allow_new_nested=True,
+                                )
+                            ):
+                                single_file_preflight_result = _local_source_boundary_failure_scan_result(
+                                    local_source_report_path
+                                )
+                            else:
+                                single_file_openvino_companion = _openvino_xml_weights_companion(
+                                    single_file_discovery_path
+                                )
+                                if single_file_openvino_companion is not None:
+                                    companion_paths.append(single_file_openvino_companion)
                         if not scanner_selection.active or scanner_selection.allows("onnx"):
                             discovered_onnx_companions = _streamed_onnx_external_data_hash_paths(
                                 single_file_discovery_path,
                                 deadline=start_time + timeout,
                             )
                             if discovered_onnx_companions is None:
-                                single_file_preflight_result = _local_source_boundary_failure_scan_result(
-                                    local_source_report_path
-                                )
+                                aggregate_hash_complete = False
                             else:
                                 companion_paths.extend(discovered_onnx_companions)
                         if not scanner_selection.active or scanner_selection.allows("mxnet"):
@@ -7922,24 +8296,59 @@ def scan_model_directory_or_file(
                             oci_layer_companions = _oci_manifest_layer_companion_paths(single_file_discovery_path)
                             companion_paths.extend(oci_layer_companions)
                         for companion_path in dict.fromkeys(companion_paths):
+                            if (
+                                single_file_openvino_companion is not None
+                                and companion_path == single_file_openvino_companion
+                            ):
+                                escaped_companion = _openvino_weights_symlink_escape(
+                                    single_file_discovery_path,
+                                    companion_path,
+                                )
+                                if escaped_companion is not None:
+                                    single_file_preflight_result = _openvino_weights_symlink_escape_result(
+                                        single_file_logical_path,
+                                        single_file_logical_path.with_suffix(".bin"),
+                                        escaped_companion,
+                                    )
+                                    break
                             try:
-                                relative_companion = companion_path.relative_to(single_file_discovery_path.parent)
+                                relative_companion = (
+                                    _retained_companion_relative_path(
+                                        companion_path,
+                                        single_file_discovery_path.parent,
+                                        single_file_logical_path.parent,
+                                    )
+                                    if retained_parent_fd is not None
+                                    else companion_path.relative_to(single_file_discovery_path.parent)
+                                )
                                 if retained_parent_fd is not None:
+                                    if not local_source_bound_guard.prepare_companion_namespace(
+                                        retained_parent_fd,
+                                        relative_companion,
+                                    ):
+                                        raise OSError("retained companion namespace could not be prepared")
+                                    lexical_companion_stat = os.stat(
+                                        os.fspath(relative_companion),
+                                        dir_fd=retained_parent_fd,
+                                        follow_symlinks=False,
+                                    )
                                     companion_fd = _open_retained_relative_regular_file(
                                         retained_parent_fd,
                                         relative_companion,
                                     )
+                                    if not local_source_bound_guard.bind_companion(
+                                        retained_parent_fd,
+                                        relative_companion,
+                                        companion_fd,
+                                    ):
+                                        os.close(companion_fd)
+                                        raise OSError("retained companion namespace could not be bound")
                                     companion_target = _snapshot_regular_file_descriptor(companion_fd)
                                     if companion_target is None:
                                         os.close(companion_fd)
                                         raise OSError("retained companion could not be snapshotted")
                                     single_file_companion_fds[str(relative_companion)] = companion_fd
                                     resolved_companion = Path(str(companion_target["resolved_path"]))
-                                    lexical_companion_stat = os.stat(
-                                        os.fspath(relative_companion),
-                                        dir_fd=retained_parent_fd,
-                                        follow_symlinks=False,
-                                    )
                                     single_file_has_symlink_companion = (
                                         single_file_has_symlink_companion
                                         or stat.S_ISLNK(lexical_companion_stat.st_mode)
@@ -8010,6 +8419,16 @@ def scan_model_directory_or_file(
                                     else None
                                 ),
                             )
+
+                    if local_source_bound_guard is not None and not local_source_bound_guard.finish_companion_discovery(
+                        {
+                            single_file_logical_path.name,
+                            *single_file_companion_targets,
+                        }
+                    ):
+                        single_file_preflight_result = _local_source_boundary_failure_scan_result(
+                            local_source_report_path
+                        )
 
                 if single_file_preflight_result is not None:
                     aggregate_hash_complete = False
@@ -8089,7 +8508,7 @@ def scan_model_directory_or_file(
                             companion_targets=single_file_companion_targets,
                             source_fd=single_file_pin_source_fd,
                             companion_fds=single_file_companion_fds,
-                            require_regular_path=not single_file_has_symlink_companion,
+                            require_regular_path=True,
                             copy_max_bytes=single_file_copy_bytes,
                             deadline=start_time + timeout,
                         ) as pinned_single_file:
@@ -8097,8 +8516,6 @@ def scan_model_directory_or_file(
                                 _source_path,
                                 companion_target,
                             ) in single_file_companion_targets.items():
-                                if companion_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY):
-                                    continue
                                 pinned_companion_path = Path(pinned_single_file.path).parent.joinpath(
                                     *Path(relative_name).parts
                                 )
@@ -8145,6 +8562,12 @@ def scan_model_directory_or_file(
                         with suppress(OSError):
                             os.close(companion_fd)
                     _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
+
+                if _scan_result_has_operational_error(file_result) or (
+                    file_result.scanner_name == "oci_layer"
+                    and _metadata_has_incomplete_coverage(file_result.metadata or {})
+                ):
+                    aggregate_hash_complete = False
 
                 # Use helper function to add scan result to Pydantic model
                 result_merge_started_at = _start_phase_timing(phase_timings)
@@ -9867,6 +10290,7 @@ def scan_model_streaming(
     counted_onnx_external_data_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     counted_onnx_external_data_targets: set[_FileTargetIdentityKey] = set()
     consumed_onnx_external_data_aliases: dict[Path, _FileTargetIdentityKey] = {}
+    accounted_context_only_targets: set[_FileTargetIdentityKey] = set()
     terminal_hf_alias_targets: dict[Path, dict[str, int | str]] = {}
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
@@ -11107,10 +11531,12 @@ def scan_model_streaming(
             openvino_companion_bytes_scanned = 0
             onnx_external_data_pre_scan_identities: dict[Path, _FileIdentitySnapshot] = {}
             onnx_external_data_bytes_scanned = 0
+            context_only_companion_bytes_scanned = 0
             suppress_consumed_onnx_external_data_accounting = False
             openvino_sidecar_needs_independent_scan = False
             independent_openvino_sidecar_result: ScanResult | None = None
             independent_openvino_sidecar_path: Path | None = None
+            escaped_openvino_cleanup_path: Path | None = None
             preflight_scan_result: ScanResult | None = None
             file_hash: str | None = None
             structural_index_classification: bool | None = None
@@ -11311,30 +11737,62 @@ def scan_model_streaming(
 
                 openvino_discovery_path = retained_stream_discovery_path or logical_source_path
                 if scanner_selection.allows("openvino") and _is_openvino_xml_path(openvino_discovery_path):
-                    candidate_companion = _openvino_xml_weights_companion(openvino_discovery_path)
-                    if candidate_companion is not None:
-                        try:
-                            candidate_relative = candidate_companion.relative_to(openvino_discovery_path.parent)
-                        except ValueError:
-                            candidate_relative = Path(candidate_companion.name)
-                        logical_candidate_companion = logical_source_path.parent.joinpath(*candidate_relative.parts)
-                        openvino_scan_companion_path = logical_candidate_companion
-                        openvino_scan_companion_key = Path(os.path.abspath(logical_candidate_companion))
-                        openvino_companion_pre_scan_identity = _snapshot_file_identity(candidate_companion)
-                        openvino_companion_bytes_scanned = _snapshot_file_size(openvino_companion_pre_scan_identity)
-                        preserved_snapshot = preserved_openvino_companion_snapshots.get(openvino_scan_companion_key)
-                        if (
-                            preserved_snapshot is not None
-                            and openvino_companion_pre_scan_identity is not None
-                            and preserved_snapshot != openvino_companion_pre_scan_identity
-                        ):
-                            record_openvino_companion_stability_failure(
-                                scan_path,
+                    openvino_candidate = openvino_discovery_path.with_suffix(".bin")
+                    if (
+                        retained_stream_parent_fd is not None
+                        and local_source_bound_guard is not None
+                        and not local_source_bound_guard.prepare_companion_namespace(
+                            retained_stream_parent_fd,
+                            Path(openvino_candidate.name),
+                            allow_new_nested=True,
+                        )
+                    ):
+                        preflight_scan_result = _local_source_boundary_failure_scan_result(report_path)
+                        aggregate_hash_complete = False
+                    else:
+                        candidate_companion = _openvino_xml_weights_companion(openvino_discovery_path)
+                        if candidate_companion is not None:
+                            escaped_companion = _openvino_weights_symlink_escape(
+                                openvino_discovery_path,
                                 candidate_companion,
-                                "openvino_weights_changed_before_xml_scan",
                             )
-                            preserve_shard_reconciliation_errors = True
-                            aggregate_hash_complete = False
+                            if escaped_companion is not None:
+                                escaped_openvino_cleanup_path = logical_source_path.with_suffix(".bin")
+                                preflight_scan_result = _openvino_weights_symlink_escape_result(
+                                    logical_source_path,
+                                    escaped_openvino_cleanup_path,
+                                    escaped_companion,
+                                )
+                                aggregate_hash_complete = False
+                            else:
+                                try:
+                                    candidate_relative = candidate_companion.relative_to(openvino_discovery_path.parent)
+                                except ValueError:
+                                    candidate_relative = Path(candidate_companion.name)
+                                logical_candidate_companion = logical_source_path.parent.joinpath(
+                                    *candidate_relative.parts
+                                )
+                                openvino_scan_companion_path = logical_candidate_companion
+                                openvino_scan_companion_key = Path(os.path.abspath(logical_candidate_companion))
+                                openvino_companion_pre_scan_identity = _snapshot_file_identity(candidate_companion)
+                                openvino_companion_bytes_scanned = _snapshot_file_size(
+                                    openvino_companion_pre_scan_identity
+                                )
+                                preserved_snapshot = preserved_openvino_companion_snapshots.get(
+                                    openvino_scan_companion_key
+                                )
+                                if (
+                                    preserved_snapshot is not None
+                                    and openvino_companion_pre_scan_identity is not None
+                                    and preserved_snapshot != openvino_companion_pre_scan_identity
+                                ):
+                                    record_openvino_companion_stability_failure(
+                                        scan_path,
+                                        candidate_companion,
+                                        "openvino_weights_changed_before_xml_scan",
+                                    )
+                                    preserve_shard_reconciliation_errors = True
+                                    aggregate_hash_complete = False
 
                 # Build config dict for scan_file
                 scan_config = {
@@ -11568,6 +12026,7 @@ def scan_model_streaming(
                                     "resolved_path": os.path.realpath(candidate_path),
                                     "device": initial_entry.device,
                                     "inode": initial_entry.inode,
+                                    "mode": initial_entry.mode,
                                     "size": initial_entry.size,
                                     "mtime_ns": initial_entry.mtime_ns,
                                     "ctime_ns": initial_entry.ctime_ns,
@@ -11618,22 +12077,50 @@ def scan_model_streaming(
                             companion_paths.extend(discovered_paths)
                     for companion_path in dict.fromkeys(companion_paths):
                         try:
-                            relative_path = companion_path.relative_to(discovery_scan_path.parent)
+                            relative_path = (
+                                _retained_companion_relative_path(
+                                    companion_path,
+                                    discovery_scan_path.parent,
+                                    logical_scan_path.parent,
+                                )
+                                if retained_parent_fd is not None
+                                else companion_path.relative_to(discovery_scan_path.parent)
+                            )
                             relative_companion_path = str(relative_path)
-                        except ValueError:
+                        except ValueError as error:
+                            if retained_parent_fd is not None:
+                                raise _LocalSourceBoundaryError(
+                                    "retained companion escaped the source namespace"
+                                ) from error
                             aggregate_hash_complete = False
                             continue
                         companion_source = companion_path
                         companion_target: dict[str, int | str] | None = None
                         if retained_parent_fd is not None:
                             try:
+                                if (
+                                    local_source_bound_guard is None
+                                    or not local_source_bound_guard.prepare_companion_namespace(
+                                        retained_parent_fd,
+                                        relative_path,
+                                    )
+                                ):
+                                    raise OSError("retained companion namespace could not be prepared")
                                 companion_fd = _open_retained_relative_regular_file(
                                     retained_parent_fd,
                                     relative_path,
                                 )
-                            except OSError:
-                                aggregate_hash_complete = False
-                                continue
+                                if local_source_bound_guard is None or not local_source_bound_guard.bind_companion(
+                                    retained_parent_fd,
+                                    relative_path,
+                                    companion_fd,
+                                ):
+                                    os.close(companion_fd)
+                                    raise OSError("retained companion namespace could not be bound")
+                            except OSError as error:
+                                raise _LocalSourceBoundaryError(
+                                    "retained companion could not be bound to the source namespace"
+                                ) from error
                             companion_target = _snapshot_regular_file_descriptor(companion_fd)
                             if companion_target is None:
                                 os.close(companion_fd)
@@ -11685,12 +12172,15 @@ def scan_model_streaming(
                     primary_target: dict[str, int | str],
                     companion_targets: Mapping[str, tuple[str, dict[str, int | str]]],
                 ) -> int:
-                    """Project every byte that private staging will physically copy."""
+                    """Project unique logical inputs while physical copies remain separately bounded."""
                     staged_bytes = results.bytes_scanned
                     for staged_target in (
                         primary_target,
                         *(target for _path, target in companion_targets.values()),
                     ):
+                        target_key = _regular_file_target_identity_key(staged_target)
+                        if target_key is not None and target_key in accounted_context_only_targets:
+                            continue
                         staged_size = staged_target.get("size")
                         if isinstance(staged_size, int):
                             staged_bytes += staged_size
@@ -11771,6 +12261,14 @@ def scan_model_streaming(
                             oversized_reason,
                         )
                         aggregate_hash_complete = False
+                    if local_source_bound_guard is not None and not local_source_bound_guard.finish_companion_discovery(
+                        {
+                            pin_logical_path.name,
+                            *pinned_companion_targets,
+                        }
+                    ):
+                        preflight_scan_result = _local_source_boundary_failure_scan_result(report_path)
+                        aggregate_hash_complete = False
                     if preflight_scan_result is None:
                         projected_stage_bytes = projected_stage_total(
                             pin_target,
@@ -11811,6 +12309,31 @@ def scan_model_streaming(
                             pinned_local_alias = pin_is_alias
                             pinned_local_source = not pin_is_alias
                             scan_path = Path(pinned_scan.path)
+                            for relative_name, (
+                                _companion_source,
+                                companion_target,
+                            ) in pinned_companion_targets.items():
+                                if not companion_target.get(CONTEXT_ONLY_COMPANION_TARGET_KEY):
+                                    continue
+                                target_key = _regular_file_target_identity_key(companion_target)
+                                if target_key is not None and (
+                                    target_key in accounted_context_only_targets
+                                    or target_key in hashed_stream_file_hashes_by_target
+                                ):
+                                    continue
+                                if target_key is not None:
+                                    accounted_context_only_targets.add(target_key)
+                                pinned_companion_path = scan_path.parent.joinpath(*Path(relative_name).parts)
+                                companion_hash = append_streamed_file_hash(
+                                    pinned_companion_path,
+                                    scan_config,
+                                    progress_label=Path(relative_name).name,
+                                )
+                                if companion_hash is not None and target_key is not None:
+                                    hashed_stream_file_hashes_by_target.setdefault(target_key, companion_hash)
+                                companion_size = companion_target.get("size")
+                                if isinstance(companion_size, int):
+                                    context_only_companion_bytes_scanned += companion_size
                             selected_resolved_path = pin_resolved_path
                             scan_config["cache_enabled"] = False
                         except _ShardPinUnavailableError:
@@ -11845,13 +12368,29 @@ def scan_model_streaming(
                     scan_config = dict(scan_config)
                     scan_config["cache_enabled"] = False
 
-                file_hash = append_streamed_file_hash(
-                    scan_path,
-                    scan_config,
-                    progress_label=source_path.name,
-                    track_stream_source=True,
-                    skip_if_stream_target_seen=suppress_consumed_onnx_external_data_accounting,
+                accounting_target_key = (
+                    _regular_file_target_identity_key(pin_target)
+                    if pin_target is not None
+                    else (
+                        _file_target_identity_key(scan_path, _snapshot_file_identity(scan_path))
+                        if accounted_context_only_targets
+                        else None
+                    )
                 )
+                suppress_context_only_input_accounting = bool(
+                    accounting_target_key is not None and accounting_target_key in accounted_context_only_targets
+                )
+                if suppress_context_only_input_accounting:
+                    assert accounting_target_key is not None
+                    file_hash = hashed_stream_file_hashes_by_target.get(accounting_target_key)
+                else:
+                    file_hash = append_streamed_file_hash(
+                        scan_path,
+                        scan_config,
+                        progress_label=source_path.name,
+                        track_stream_source=True,
+                        skip_if_stream_target_seen=suppress_consumed_onnx_external_data_accounting,
+                    )
                 if openvino_scan_companion_path is not None:
                     append_streamed_openvino_companion_hash(
                         scan_path,
@@ -11973,7 +12512,7 @@ def scan_model_streaming(
                             str(source_path),
                             {"path": str(source_path), "reason": "shard_family_changed_during_scan"},
                         )
-                if suppress_consumed_onnx_external_data_accounting:
+                if suppress_consumed_onnx_external_data_accounting or suppress_context_only_input_accounting:
                     scan_result.bytes_scanned = 0
                 openvino_sidecar_needs_independent_scan = (
                     preflight_scan_result is None
@@ -11987,6 +12526,7 @@ def scan_model_streaming(
                     if not openvino_sidecar_needs_independent_scan:
                         scan_result.bytes_scanned += openvino_companion_bytes_scanned
                     scan_result.bytes_scanned += onnx_external_data_bytes_scanned
+                    scan_result.bytes_scanned += context_only_companion_bytes_scanned
                 if (
                     openvino_scan_companion_path is not None
                     and openvino_companion_pre_scan_identity is not None
@@ -12021,6 +12561,11 @@ def scan_model_streaming(
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
                     if operational_scan_failure:
                         preserve_shard_reconciliation_errors = True
+                        aggregate_hash_complete = False
+                    if scan_result.scanner_name == "oci_layer" and _metadata_has_incomplete_coverage(
+                        scan_result.metadata or {}
+                    ):
+                        aggregate_hash_complete = False
                     post_scan_shard_target = _snapshot_validated_shard_target(
                         str(source_path),
                         resolved_path=selected_resolved_path,
@@ -12254,6 +12799,11 @@ def scan_model_streaming(
                     consumed_openvino_companions.add(openvino_scan_companion_key)
                     deferred_openvino_sidecars.pop(openvino_scan_companion_key, None)
                     preserved_openvino_companion_snapshots.pop(openvino_scan_companion_key, None)
+                if escaped_openvino_cleanup_path is not None:
+                    delete_streamed_source(
+                        escaped_openvino_cleanup_path,
+                        "after escaped OpenVINO XML scan",
+                    )
 
         # Source-owned cleanup may mutate retained artifacts. Run it before the
         # final authority proof and leave the outer finally as an exception fallback.
@@ -12410,7 +12960,9 @@ def scan_model_streaming(
             validate_terminal_local_namespace()
 
         # Compute aggregate hash from all file hashes
-        if file_hashes and aggregate_hash_complete:
+        if not aggregate_hash_complete:
+            results.content_hash = None
+        elif file_hashes:
             results.content_hash = compute_aggregate_hash(file_hashes)
             logger.info(f"Computed aggregate content hash: {results.content_hash}")
 

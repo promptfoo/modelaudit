@@ -85,6 +85,30 @@ def _streaming_member_record(metadata: dict[str, Any], path_segments: list[str])
     return records[0]
 
 
+def _scan_explicit_test_source(source: Path, mode: str, scanner: str) -> Any:
+    scan_kwargs: dict[str, Any] = {
+        "cache_enabled": False,
+        "scanners": [scanner],
+        "skip_file_types": False,
+    }
+    if mode == "standard":
+        return scan_model_directory_or_file(str(source), **scan_kwargs)
+    return scan_model_streaming(
+        iter([(source, True)]),
+        scan_root=str(source),
+        delete_after_scan=False,
+        **scan_kwargs,
+    )
+
+
+def _assert_local_source_boundary_failure(result: Any) -> None:
+    assert determine_exit_code(result) == 2
+    assert result.content_hash is None
+    assert any(
+        check.name == "Local Source Boundary Check" and check.status.value == "failed" for check in result.checks
+    )
+
+
 def test_local_source_receipt_is_runtime_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The private dispatch receipt must not reach scanner or cache configuration."""
     from modelaudit import core as core_module
@@ -117,11 +141,27 @@ def test_local_source_receipt_is_runtime_only(tmp_path: Path, monkeypatch: pytes
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_bound_regular_source_stages_outside_its_watched_parent() -> None:
+    """A file directly under the temp root must not trigger its own parent watcher."""
+    from modelaudit import core as core_module
+
+    source = Path(tempfile.gettempdir()) / f"modelaudit-bound-source-{uuid.uuid4().hex}.bin"
+    source.write_bytes(b"source")
+    guard = core_module._open_bound_local_source(source)
+    try:
+        assert guard.changed() is False
+        assert Path(guard.bound_path).read_bytes() == b"source"
+    finally:
+        guard.close()
+        source.unlink()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
 def test_streaming_retained_regular_file_discovers_companions_from_retained_parent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Streaming companion discovery remains bound to the source's retained parent."""
+    """Post-binding ancestor swaps cannot replace the retained companion bytes."""
     from modelaudit import core as core_module
 
     staging = tmp_path / "staging"
@@ -163,8 +203,727 @@ def test_streaming_retained_regular_file_discovers_companions_from_retained_pare
         skip_file_types=False,
     )
 
-    assert determine_exit_code(result) == 0
     assert observed_layers == [malicious_layer]
+    assert determine_exit_code(result) == 0
+    assert result.success is True
+    assert not any(check.name == "Local Source Boundary Check" for check in result.checks)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+def test_retained_regular_file_detects_companion_substitution_before_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """Sibling ABA around companion discovery must fail the source boundary."""
+    from modelaudit import core as core_module
+
+    source = tmp_path / "model.manifest"
+    source.write_text(json.dumps({"layers": ["layer.tar.gz"]}), encoding="utf-8")
+    layer = tmp_path / "layer.tar.gz"
+    held_layer = tmp_path / "held-layer.tar.gz"
+    benign_layer = tmp_path / "benign-layer.tar.gz"
+    malicious_payload = b"malicious retained layer"
+    benign_payload = b"benign replacement layer"
+    layer.write_bytes(malicious_payload)
+    benign_layer.write_bytes(benign_payload)
+    original_discovery = core_module._oci_manifest_layer_companion_paths
+    observed_layers: list[bytes] = []
+    swapped = False
+
+    def substitute_before_discovery(path: Path) -> tuple[Path, ...]:
+        nonlocal swapped
+        if not swapped:
+            layer.rename(held_layer)
+            benign_layer.rename(layer)
+            swapped = True
+        discovered = original_discovery(path)
+        layer.rename(benign_layer)
+        held_layer.rename(layer)
+        return discovered
+
+    def inspect_then_restore(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        del config
+        observed_layers.append((Path(path).parent / layer.name).read_bytes())
+        scan_result = ScanResult(scanner_name="oci_layer")
+        scan_result.bytes_scanned = Path(path).stat().st_size
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "_oci_manifest_layer_companion_paths", substitute_before_discovery)
+    monkeypatch.setattr(core_module, "scan_file", inspect_then_restore)
+
+    result = _scan_explicit_test_source(source, mode, "oci_layer")
+
+    assert observed_layers == []
+    assert layer.read_bytes() == malicious_payload
+    _assert_local_source_boundary_failure(result)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+def test_retained_regular_file_rejects_nested_companion_without_namespace_receipt(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    """Nested explicit-file companions fail closed without a retained subtree receipt."""
+    source = tmp_path / "model.manifest"
+    source.write_text(json.dumps({"layers": ["nested/layer.tar.gz"]}), encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "layer.tar.gz").write_bytes(b"layer")
+
+    result = _scan_explicit_test_source(source, mode, "oci_layer")
+
+    _assert_local_source_boundary_failure(result)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+@pytest.mark.parametrize(
+    ("source_name", "companion_name"),
+    [
+        ("model-0000.params", "model-symbol.json"),
+        ("model-symbol.json", "model-0000.params"),
+    ],
+)
+def test_retained_mxnet_companion_symlink_fails_closed(
+    tmp_path: Path,
+    requires_symlinks: None,
+    mode: str,
+    source_name: str,
+    companion_name: str,
+) -> None:
+    """Explicit MXNet scans must not read companion targets outside the model directory."""
+    model_dir = tmp_path / "model"
+    outside_dir = tmp_path / "outside"
+    model_dir.mkdir()
+    outside_dir.mkdir()
+    source = model_dir / source_name
+    source.write_bytes(b"selected model bytes")
+    external_target = outside_dir / companion_name
+    external_target.write_bytes(b"out-of-scope secret bytes")
+    (model_dir / companion_name).symlink_to(external_target)
+
+    result = _scan_explicit_test_source(source, mode, "mxnet")
+
+    assert result.bytes_scanned == 0
+    _assert_local_source_boundary_failure(result)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+@pytest.mark.parametrize("nested_target", [False, True], ids=["same-parent", "nested"])
+def test_retained_openvino_companion_allows_internal_symlink(
+    tmp_path: Path,
+    requires_symlinks: None,
+    mode: str,
+    nested_target: bool,
+) -> None:
+    """Descriptor binding preserves an OpenVINO sidecar symlink that stays under the model directory."""
+    del requires_symlinks
+    source = tmp_path / "model.xml"
+    weights_parent = tmp_path / "weights" if nested_target else tmp_path
+    weights_parent.mkdir(exist_ok=True)
+    weights = weights_parent / "weights.bin"
+    source.write_text("<net version='10'></net>", encoding="utf-8")
+    weights.write_bytes(b"safe weights")
+    symlink_target = Path(weights_parent.name) / weights.name if nested_target else Path(weights.name)
+    (tmp_path / "model.bin").symlink_to(symlink_target)
+
+    result = _scan_explicit_test_source(source, mode, "openvino")
+
+    assert determine_exit_code(result) == 0
+    assert result.success is True
+    assert result.bytes_scanned == source.stat().st_size + weights.stat().st_size
+    if mode == "standard":
+        assert result.content_hash is not None
+    assert not any(check.name == "Local Source Boundary Check" for check in result.checks)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+def test_retained_companion_symlink_rejects_target_aba_during_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+    mode: str,
+) -> None:
+    """A symlink target substituted only for descriptor opening cannot be attributed to the source path."""
+    del requires_symlinks
+    from modelaudit import core as core_module
+
+    source = tmp_path / "model.xml"
+    target = tmp_path / "actual.bin"
+    held = tmp_path / "held.bin"
+    benign = tmp_path / "benign.bin"
+    source.write_text("<net version='10'></net>", encoding="utf-8")
+    target.write_bytes(b"malicious weights")
+    benign.write_bytes(b"benign weights")
+    (tmp_path / "model.bin").symlink_to(target.name)
+    original_open = core_module._open_retained_relative_regular_file
+    scan_calls = 0
+
+    def open_during_target_substitution(parent_fd: int, relative_path: Path) -> int:
+        target.rename(held)
+        benign.rename(target)
+        try:
+            return original_open(parent_fd, relative_path)
+        finally:
+            target.rename(benign)
+            held.rename(target)
+
+    def track_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal scan_calls
+        del path, config
+        scan_calls += 1
+        scan_result = ScanResult(scanner_name="openvino")
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "_open_retained_relative_regular_file", open_during_target_substitution)
+    monkeypatch.setattr(core_module, "scan_file", track_scan)
+
+    result = _scan_explicit_test_source(source, mode, "openvino")
+
+    assert scan_calls == 0
+    assert target.read_bytes() == b"malicious weights"
+    _assert_local_source_boundary_failure(result)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+@pytest.mark.parametrize("restore_before_return", [False, True], ids=["persistent", "restored"])
+@pytest.mark.parametrize("nested_target", [False, True], ids=["same-parent", "nested"])
+def test_retained_companion_symlink_watches_target_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+    mode: str,
+    restore_before_return: bool,
+    nested_target: bool,
+) -> None:
+    """Pre-discovery receipts retain internal symlink targets through queued mutations."""
+    del requires_symlinks
+    from modelaudit import core as core_module
+
+    source = tmp_path / "model.xml"
+    target_parent = tmp_path / "weights" if nested_target else tmp_path
+    target_parent.mkdir(exist_ok=True)
+    target = target_parent / "actual.bin"
+    held = target_parent / "held.bin"
+    benign = target_parent / "benign.bin"
+    source.write_text("<net version='10'></net>", encoding="utf-8")
+    target.write_bytes(b"malicious weights")
+    benign.write_bytes(b"benign weights")
+    symlink_target = Path(target_parent.name) / target.name if nested_target else Path(target.name)
+    (tmp_path / "model.bin").symlink_to(symlink_target)
+    original_discovery = core_module._openvino_xml_weights_companion
+    scan_calls = 0
+
+    def discover_during_target_substitution(path: Path) -> Path | None:
+        target.rename(held)
+        benign.rename(target)
+        discovered = original_discovery(path)
+        if restore_before_return:
+            target.rename(benign)
+            held.rename(target)
+        return discovered
+
+    def track_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal scan_calls
+        del path, config
+        scan_calls += 1
+        scan_result = ScanResult(scanner_name="openvino")
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "_openvino_xml_weights_companion", discover_during_target_substitution)
+    monkeypatch.setattr(core_module, "scan_file", track_scan)
+
+    result = _scan_explicit_test_source(source, mode, "openvino")
+
+    assert scan_calls == 0
+    _assert_local_source_boundary_failure(result)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+@pytest.mark.parametrize("restore_before_return", [False, True], ids=["persistent", "restored"])
+def test_retained_companion_symlink_watches_nested_target_parent_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+    mode: str,
+    restore_before_return: bool,
+) -> None:
+    """Discovery monitors the first namespace component of an internal symlink target."""
+    del requires_symlinks
+    from modelaudit import core as core_module
+
+    source = tmp_path / "model.xml"
+    weights = tmp_path / "weights"
+    alternate = tmp_path / "alternate"
+    swap = tmp_path / "swap"
+    weights.mkdir()
+    alternate.mkdir()
+    source.write_text("<net version='10'></net>", encoding="utf-8")
+    (weights / "model.bin").write_bytes(b"malicious weights")
+    (alternate / "model.bin").write_bytes(b"benign weights")
+    (tmp_path / "model.bin").symlink_to(Path(weights.name) / "model.bin")
+    original_discovery = core_module._openvino_xml_weights_companion
+    scan_calls = 0
+
+    def swap_target_parent() -> None:
+        weights.rename(swap)
+        alternate.rename(weights)
+        swap.rename(alternate)
+
+    def discover_during_parent_substitution(path: Path) -> Path | None:
+        swap_target_parent()
+        discovered = original_discovery(path)
+        if restore_before_return:
+            swap_target_parent()
+        return discovered
+
+    def track_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal scan_calls
+        del path, config
+        scan_calls += 1
+        scan_result = ScanResult(scanner_name="openvino")
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "_openvino_xml_weights_companion", discover_during_parent_substitution)
+    monkeypatch.setattr(core_module, "scan_file", track_scan)
+
+    result = _scan_explicit_test_source(source, mode, "openvino")
+
+    assert scan_calls == 0
+    _assert_local_source_boundary_failure(result)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+@pytest.mark.parametrize("restore_after_arm", [False, True], ids=["persistent", "restored"])
+def test_nested_companion_monitor_rejects_target_swap_during_arm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+    mode: str,
+    restore_after_arm: bool,
+) -> None:
+    """Before/after receipts close the gap before nested inotify registration."""
+    del requires_symlinks
+    from modelaudit import core as core_module
+
+    source = tmp_path / "model.xml"
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    target = weights / "actual.bin"
+    held = weights / "held.bin"
+    benign = weights / "benign.bin"
+    source.write_text("<net version='10'></net>", encoding="utf-8")
+    target.write_bytes(b"malicious weights")
+    benign.write_bytes(b"benign weights")
+    (tmp_path / "model.bin").symlink_to(Path(weights.name) / target.name)
+    original_arm = core_module._StagingMutationMonitor.arm
+    content_arm_calls = 0
+    weights_stat = weights.stat()
+    nested_arm_swapped = False
+    scan_calls = 0
+
+    def arm_during_target_substitution(
+        directory_fds: Any,
+        *,
+        watch_contents: bool = True,
+    ) -> Any:
+        nonlocal content_arm_calls, nested_arm_swapped
+        descriptors = tuple(directory_fds)
+        if watch_contents:
+            content_arm_calls += 1
+        monitors_weights = any(os.path.samestat(os.fstat(descriptor), weights_stat) for descriptor in descriptors)
+        if watch_contents and monitors_weights and not nested_arm_swapped:
+            nested_arm_swapped = True
+            target.rename(held)
+            benign.rename(target)
+            monitor = original_arm(descriptors, watch_contents=True)
+            if restore_after_arm:
+                target.rename(benign)
+                held.rename(target)
+            return monitor
+        return original_arm(descriptors, watch_contents=watch_contents)
+
+    def track_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal scan_calls
+        del path, config
+        scan_calls += 1
+        scan_result = ScanResult(scanner_name="openvino")
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(
+        core_module._StagingMutationMonitor,
+        "arm",
+        staticmethod(arm_during_target_substitution),
+    )
+    monkeypatch.setattr(core_module, "scan_file", track_scan)
+
+    result = _scan_explicit_test_source(source, mode, "openvino")
+
+    assert content_arm_calls >= 2
+    assert nested_arm_swapped is True
+    assert scan_calls == 0
+    _assert_local_source_boundary_failure(result)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+def test_dynamically_discovered_nested_symlink_requires_pre_discovery_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+    mode: str,
+) -> None:
+    """A nested ONNX sidecar alias learned after discovery cannot inherit a late receipt."""
+    del requires_symlinks
+    from modelaudit import core as core_module
+
+    source = tmp_path / "model.onnx"
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    target = weights / "data.bin"
+    held = weights / "held.bin"
+    benign = weights / "benign.bin"
+    alias = tmp_path / "model.onnx_data"
+    source.write_bytes(b"model")
+    target.write_bytes(b"malicious data")
+    benign.write_bytes(b"benign data")
+    alias.symlink_to(Path(weights.name) / target.name)
+    scan_calls = 0
+    swapped = False
+
+    def discover_during_target_substitution(*_args: Any, **_kwargs: Any) -> list[Path]:
+        nonlocal swapped
+        if not swapped:
+            target.rename(held)
+            benign.rename(target)
+            swapped = True
+        return [alias]
+
+    def track_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        nonlocal scan_calls
+        del path, config
+        scan_calls += 1
+        scan_result = ScanResult(scanner_name="onnx")
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(
+        core_module,
+        "_streamed_onnx_external_data_hash_paths",
+        discover_during_target_substitution,
+    )
+    monkeypatch.setattr(core_module, "scan_file", track_scan)
+
+    result = _scan_explicit_test_source(source, mode, "onnx")
+
+    assert scan_calls == 0
+    _assert_local_source_boundary_failure(result)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+def test_retained_openvino_escaped_symlink_preserves_critical_finding(
+    tmp_path: Path,
+    requires_symlinks: None,
+    mode: str,
+) -> None:
+    """Descriptor preflight preserves confirmed OpenVINO escape evidence over generic failure."""
+    del requires_symlinks
+    model_dir = tmp_path / "model"
+    outside_dir = tmp_path / "outside"
+    model_dir.mkdir()
+    outside_dir.mkdir()
+    source = model_dir / "model.xml"
+    escaped_target = outside_dir / "secret.bin"
+    source.write_text("<net version='10'></net>", encoding="utf-8")
+    escaped_target.write_bytes(b"secret weights")
+    (model_dir / "model.bin").symlink_to(escaped_target)
+
+    result = _scan_explicit_test_source(source, mode, "openvino")
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        check.rule_code == "S701"
+        and check.name == "OpenVINO Weights Symlink Boundary Check"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert not any(check.name == "Local Source Boundary Check" for check in result.checks)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires name-bearing inotify events")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+def test_retained_companion_discovery_ignores_unrelated_sibling_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """Discovery monitoring filters sibling events that cannot affect selected inputs."""
+    from modelaudit import core as core_module
+
+    source = tmp_path / "model.xml"
+    weights = tmp_path / "model.bin"
+    unrelated = tmp_path / "unrelated.part"
+    renamed = tmp_path / "unrelated.ready"
+    source.write_text("<net version='10'></net>", encoding="utf-8")
+    weights.write_bytes(b"safe weights")
+    unrelated.write_bytes(b"unrelated")
+    original_discovery = core_module._openvino_xml_weights_companion
+
+    def rename_unrelated_during_discovery(path: Path) -> Path | None:
+        unrelated.rename(renamed)
+        renamed.rename(unrelated)
+        return original_discovery(path)
+
+    monkeypatch.setattr(core_module, "_openvino_xml_weights_companion", rename_unrelated_during_discovery)
+
+    result = _scan_explicit_test_source(source, mode, "openvino")
+
+    assert determine_exit_code(result) == 0
+    assert result.success is True
+    assert result.bytes_scanned == source.stat().st_size + weights.stat().st_size
+    assert result.content_hash is not None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+def test_oci_context_layer_contributes_bytes_and_content_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """Changing only a consumed OCI layer must change the full-input aggregate hash."""
+    from modelaudit import core as core_module
+
+    source = tmp_path / "model.manifest"
+    source.write_text(json.dumps({"layers": ["layer.tar.gz"]}), encoding="utf-8")
+    layer = tmp_path / "layer.tar.gz"
+
+    def successful_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        del config
+        scan_result = ScanResult(scanner_name="oci_layer")
+        scan_result.bytes_scanned = Path(path).stat().st_size
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "scan_file", successful_scan)
+
+    def run_scan() -> Any:
+        return _scan_explicit_test_source(source, mode, "oci_layer")
+
+    layer.write_bytes(b"A" * 64)
+    first = run_scan()
+    first_expected_hash = compute_aggregate_hash([compute_sha256_hash(source), compute_sha256_hash(layer)])
+    layer.write_bytes(b"B" * 64)
+    second = run_scan()
+    second_expected_hash = compute_aggregate_hash([compute_sha256_hash(source), compute_sha256_hash(layer)])
+
+    assert first.content_hash == first_expected_hash
+    assert second.content_hash == second_expected_hash
+    assert first.content_hash != second.content_hash
+    assert first.bytes_scanned == source.stat().st_size + layer.stat().st_size
+    assert second.bytes_scanned == source.stat().st_size + layer.stat().st_size
+
+
+def test_oci_filtered_directory_context_contributes_bytes_and_content_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumed OCI layer omitted by directory prefiltering remains a hashed input."""
+    from modelaudit import core as core_module
+
+    source = tmp_path / "model.manifest"
+    source.write_text(json.dumps({"layers": ["layer.tar.gz"]}), encoding="utf-8")
+    layer = tmp_path / "layer.tar.gz"
+    original_should_skip_file = core_module.should_skip_file
+
+    def skip_layer(path: str, *args: Any, **kwargs: Any) -> bool:
+        if Path(path).resolve() == layer.resolve():
+            return True
+        return original_should_skip_file(path, *args, **kwargs)
+
+    def successful_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        del config
+        scan_result = ScanResult(scanner_name="oci_layer")
+        scan_result.bytes_scanned = Path(path).stat().st_size
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "should_skip_file", skip_layer)
+    monkeypatch.setattr(core_module, "scan_file", successful_scan)
+
+    def run_scan() -> Any:
+        return scan_model_directory_or_file(
+            str(tmp_path),
+            cache_enabled=False,
+            scanners=["oci_layer"],
+            skip_file_types=True,
+        )
+
+    layer.write_bytes(b"A" * 64)
+    first = run_scan()
+    first_expected_hash = compute_aggregate_hash([compute_sha256_hash(source), compute_sha256_hash(layer)])
+    layer.write_bytes(b"B" * 64)
+    second = run_scan()
+    second_expected_hash = compute_aggregate_hash([compute_sha256_hash(source), compute_sha256_hash(layer)])
+
+    assert first.content_hash == first_expected_hash
+    assert second.content_hash == second_expected_hash
+    assert first.content_hash != second.content_hash
+    assert first.bytes_scanned == source.stat().st_size + layer.stat().st_size
+    assert second.bytes_scanned == source.stat().st_size + layer.stat().st_size
+
+
+def test_streaming_oci_shared_context_layer_is_hashed_and_counted_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple manifests sharing one retained layer contribute one unique layer input."""
+    from modelaudit import core as core_module
+
+    first_manifest = tmp_path / "a.manifest"
+    second_manifest = tmp_path / "b.manifest"
+    layer = tmp_path / "layer.tar.gz"
+    first_manifest.write_text(json.dumps({"name": "a", "layers": [layer.name]}), encoding="utf-8")
+    second_manifest.write_text(json.dumps({"name": "b", "layers": [layer.name]}), encoding="utf-8")
+    layer.write_bytes(b"shared layer")
+
+    def successful_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        del config
+        scan_result = ScanResult(scanner_name="oci_layer")
+        scan_result.bytes_scanned = Path(path).stat().st_size
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "scan_file", successful_scan)
+    unique_input_bytes = first_manifest.stat().st_size + second_manifest.stat().st_size + layer.stat().st_size
+    result = scan_model_streaming(
+        iter([(first_manifest, True), (second_manifest, True)]),
+        scan_root=str(tmp_path),
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["oci_layer"],
+        skip_file_types=False,
+        max_total_size=unique_input_bytes,
+    )
+
+    assert result.content_hash == compute_aggregate_hash(
+        [
+            compute_sha256_hash(first_manifest),
+            compute_sha256_hash(second_manifest),
+            compute_sha256_hash(layer),
+        ]
+    )
+    assert result.bytes_scanned == unique_input_bytes
+
+
+def test_oci_filtered_directory_shared_context_layer_respects_unique_exact_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Filtered directory companions share one logical byte budget across manifests."""
+    from modelaudit import core as core_module
+
+    first_manifest = tmp_path / "a.manifest"
+    second_manifest = tmp_path / "b.manifest"
+    layer = tmp_path / "layer.tar.gz"
+    first_manifest.write_text(json.dumps({"name": "a", "layers": [layer.name]}), encoding="utf-8")
+    second_manifest.write_text(json.dumps({"name": "b", "layers": [layer.name]}), encoding="utf-8")
+    layer.write_bytes(b"shared layer")
+    original_should_skip_file = core_module.should_skip_file
+
+    def skip_layer(path: str, *args: Any, **kwargs: Any) -> bool:
+        if Path(path).resolve() == layer.resolve():
+            return True
+        return original_should_skip_file(path, *args, **kwargs)
+
+    def successful_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        del config
+        scan_result = ScanResult(scanner_name="oci_layer")
+        scan_result.bytes_scanned = Path(path).stat().st_size
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "should_skip_file", skip_layer)
+    monkeypatch.setattr(core_module, "scan_file", successful_scan)
+    unique_input_bytes = first_manifest.stat().st_size + second_manifest.stat().st_size + layer.stat().st_size
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_enabled=False,
+        scanners=["oci_layer"],
+        skip_file_types=True,
+        max_total_size=unique_input_bytes,
+    )
+
+    assert result.content_hash == compute_aggregate_hash(
+        [
+            compute_sha256_hash(first_manifest),
+            compute_sha256_hash(second_manifest),
+            compute_sha256_hash(layer),
+        ]
+    )
+    assert result.bytes_scanned == unique_input_bytes
+
+
+def test_streaming_oci_context_layer_is_not_recounted_as_later_stream_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumed OCI layer later yielded for scanning keeps unique-input hash semantics."""
+    from modelaudit import core as core_module
+
+    manifest = tmp_path / "model.manifest"
+    layer = tmp_path / "layer.tar.gz"
+    manifest.write_text(json.dumps({"layers": [layer.name]}), encoding="utf-8")
+    layer.write_bytes(b"shared layer")
+
+    def successful_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        del config
+        scan_result = ScanResult(scanner_name="oci_layer")
+        scan_result.bytes_scanned = Path(path).stat().st_size
+        scan_result.finish(success=True)
+        return scan_result
+
+    monkeypatch.setattr(core_module, "scan_file", successful_scan)
+    result = scan_model_streaming(
+        iter([(manifest, False), (layer, True)]),
+        scan_root=str(tmp_path),
+        delete_after_scan=False,
+        cache_enabled=False,
+        skip_file_types=False,
+    )
+
+    assert result.content_hash == compute_aggregate_hash([compute_sha256_hash(manifest), compute_sha256_hash(layer)])
+    assert result.bytes_scanned == manifest.stat().st_size + layer.stat().st_size
+
+
+@pytest.mark.parametrize("mode", ["standard", "streaming"])
+def test_oci_missing_layer_does_not_publish_primary_only_content_hash(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    """Incomplete OCI coverage must not be cached under a manifest-only hash."""
+    source = tmp_path / "model.manifest"
+    source.write_text(json.dumps({"layers": ["missing-layer.tar.gz"]}), encoding="utf-8")
+
+    result = _scan_explicit_test_source(source, mode, "oci_layer")
+
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.content_hash is None
 
 
 @pytest.fixture
@@ -215,7 +974,7 @@ def create_external_onnx_payload(tmp_path: Path, external_path: str = "model.onn
     return model_path.read_bytes()
 
 
-def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
+def assert_only_onnx_external_schema_validation_skipped(result: Any, *, expected_count: int = 1) -> None:
     schema_issues = [
         issue
         for issue in result.issues
@@ -223,7 +982,7 @@ def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
         and issue.details.get("checker_available") is True
         and issue.details.get("external_data_present") is True
     ]
-    assert len(schema_issues) == 1
+    assert len(schema_issues) == expected_count
     assert result.issues == schema_issues
     assert determine_exit_code(result) == 2
 
@@ -1301,6 +2060,65 @@ def test_scan_model_directory_hf_cache_onnx_external_data_keeps_snapshot_alias_i
     assert len(failed_sizes) == 1
     assert failed_sizes[0].details["actual_size"] == 1
     assert determine_exit_code(result) == 1
+
+
+@pytest.mark.parametrize(
+    ("sidecar_name", "skip_file_types"),
+    [("model.onnx_data", False), ("weights.txt", True)],
+    ids=["scannable-sidecar", "prefiltered-sidecar"],
+)
+def test_scan_model_directory_hf_cache_onnx_shared_blobs_keep_each_snapshot_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+    sidecar_name: str,
+    skip_file_types: bool,
+) -> None:
+    """Shared model and sidecar blobs retain sidecar context beside every logical alias."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    blobs_dir.mkdir(parents=True)
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path, sidecar_name))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+
+    for revision in ("a" * 40, "b" * 40):
+        snapshot_dir = cache_root / "snapshots" / revision / "onnx"
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+        (snapshot_dir / sidecar_name).symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    expected_bytes = (2 * model_blob.stat().st_size) + sidecar_blob.stat().st_size
+    result = scan_model_directory_or_file(
+        str(cache_root / "snapshots"),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=skip_file_types,
+        max_total_size=expected_bytes,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == sidecar_name
+    ]
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_blob), compute_sha256_hash(sidecar_blob)])
+
+    assert failed_external == []
+    assert len(passed_external) == 2
+    assert result.content_hash == expected_hash
+    assert result.bytes_scanned == expected_bytes
+    assert_only_onnx_external_schema_validation_skipped(result, expected_count=2)
 
 
 @pytest.mark.parametrize("delete_after_scan", [False, True])

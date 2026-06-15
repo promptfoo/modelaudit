@@ -10,12 +10,14 @@ import json
 import logging
 import os
 import re
+import secrets
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar, copy_context
@@ -709,6 +711,44 @@ def _hash_pinned_file_descriptor(
             os.close(copied_fd)
 
 
+def _open_posix_directory_chain(
+    path: Path,
+    directory_flags: int,
+) -> tuple[Path, list[tuple[Path, int]]]:
+    """Open every component of an absolute directory path without following later swaps."""
+    resolved_path = Path(os.path.realpath(os.path.abspath(path)))
+    if not resolved_path.is_absolute() or resolved_path.anchor != os.path.sep:
+        raise _ShardPinUnavailableError("private staging parent is not an absolute POSIX path")
+
+    opened: list[tuple[Path, int]] = []
+    current_path = Path(resolved_path.anchor)
+    try:
+        current_fd = os.open(current_path, directory_flags)
+        opened.append((current_path, current_fd))
+        for part in resolved_path.parts[1:]:
+            current_path /= part
+            current_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            opened.append((current_path, current_fd))
+    except BaseException:
+        for _opened_path, opened_fd in reversed(opened):
+            with suppress(OSError):
+                os.close(opened_fd)
+        raise
+    return resolved_path, opened
+
+
+def _create_private_staging_directory(parent_fd: int) -> str:
+    """Create a private random child relative to a retained parent descriptor."""
+    for _attempt in range(128):
+        staging_name = f".modelaudit_scan_{secrets.token_hex(16)}"
+        try:
+            os.mkdir(staging_name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        return staging_name
+    raise _ShardPinUnavailableError("could not allocate a private staging directory")
+
+
 class _StagingMutationMonitor:
     """Watch private staging directories so pathname ABA cannot be erased by restoration."""
 
@@ -717,7 +757,12 @@ class _StagingMutationMonitor:
         self._kqueue = kqueue
 
     @classmethod
-    def arm(cls, directory_fds: Iterable[int]) -> "_StagingMutationMonitor":
+    def arm(
+        cls,
+        directory_fds: Iterable[int],
+        *,
+        watch_contents: bool = True,
+    ) -> "_StagingMutationMonitor":
         descriptors = tuple(directory_fds)
         if _is_linux_platform():
             import ctypes
@@ -732,8 +777,11 @@ class _StagingMutationMonitor:
             monitor_fd = inotify_init1(os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
             if monitor_fd < 0:
                 raise _ShardPinUnavailableError("private staging mutation monitoring is unavailable")
-            mutation_mask = 0x00000002 | 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
-            mutation_mask |= 0x00000400 | 0x00000800 | 0x00002000 | 0x00004000 | 0x00008000
+            mutation_mask = 0x00000400 | 0x00000800 | 0x00002000 | 0x00004000 | 0x00008000
+            if watch_contents:
+                mutation_mask |= (
+                    0x00000002 | 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
+                )
             try:
                 for descriptor in descriptors:
                     descriptor_path = _descriptor_path_for_open_file(descriptor)
@@ -764,18 +812,10 @@ class _StagingMutationMonitor:
             vnode_filter = select_attribute("KQ_FILTER_VNODE")
             add_flag = select_attribute("KQ_EV_ADD")
             clear_flag = select_attribute("KQ_EV_CLEAR")
-            fflags = sum(
-                getattr(select, name, 0)
-                for name in (
-                    "KQ_NOTE_WRITE",
-                    "KQ_NOTE_DELETE",
-                    "KQ_NOTE_RENAME",
-                    "KQ_NOTE_ATTRIB",
-                    "KQ_NOTE_EXTEND",
-                    "KQ_NOTE_LINK",
-                    "KQ_NOTE_REVOKE",
-                )
-            )
+            event_names = ["KQ_NOTE_DELETE", "KQ_NOTE_RENAME", "KQ_NOTE_ATTRIB", "KQ_NOTE_REVOKE"]
+            if watch_contents:
+                event_names.extend(("KQ_NOTE_WRITE", "KQ_NOTE_EXTEND", "KQ_NOTE_LINK"))
+            fflags = sum(getattr(select, name, 0) for name in event_names)
             queue = kqueue_factory()
             changes = [
                 kevent_factory(
@@ -794,15 +834,38 @@ class _StagingMutationMonitor:
             raise _ShardPinUnavailableError("private staging mutation monitoring is unavailable") from error
         return cls(kqueue=queue)
 
-    def changed(self) -> bool:
-        """Return whether any watched directory observed a mutation event."""
+    def changed(self, *, relevant_names: Collection[str] | None = None) -> bool:
+        """Return whether a watched directory or relevant child observed a mutation."""
         if self._inotify_fd is not None:
-            try:
-                return bool(os.read(self._inotify_fd, 64 * 1024))
-            except BlockingIOError:
-                return False
-            except OSError:
-                return True
+            event_header = struct.Struct("iIII")
+            normalized_names = None if relevant_names is None else {os.path.normcase(name) for name in relevant_names}
+            for _chunk in range(256):
+                try:
+                    events = os.read(self._inotify_fd, 64 * 1024)
+                except BlockingIOError:
+                    return False
+                except OSError:
+                    return True
+                if not events:
+                    return False
+                if normalized_names is None:
+                    return True
+                offset = 0
+                while offset < len(events):
+                    if len(events) - offset < event_header.size:
+                        return True
+                    _watch_descriptor, mask, _cookie, name_length = event_header.unpack_from(events, offset)
+                    offset += event_header.size
+                    if name_length > len(events) - offset:
+                        return True
+                    raw_name = events[offset : offset + name_length]
+                    offset += name_length
+                    name = os.fsdecode(raw_name.split(b"\0", 1)[0])
+                    if not name or mask & (0x00000400 | 0x00000800 | 0x00002000 | 0x00004000 | 0x00008000):
+                        return True
+                    if os.path.normcase(name) in normalized_names:
+                        return True
+            return True
         if self._kqueue is not None:
             try:
                 return bool(self._kqueue.control(None, 1024, 0))
@@ -1387,6 +1450,7 @@ def _pinned_shard_scan_path(
     source_fd = None
     staging_fd: int | None = None
     staging_parent_fd: int | None = None
+    staging_parent_path: Path | None = None
     staging_path: Path | None = None
     initial_staging_stat: os.stat_result | None = None
     staging_descriptor_root: Path | None = None
@@ -1408,6 +1472,8 @@ def _pinned_shard_scan_path(
     staging_directory_fds: dict[tuple[str, ...], int] = {}
     staging_directory_stats: dict[int, os.stat_result] = {}
     staging_mutation_monitor: _StagingMutationMonitor | None = None
+    staging_ancestor_bindings: list[tuple[Path, int]] = []
+    staging_ancestor_monitor: _StagingMutationMonitor | None = None
     linux_write_lease_guard: _LinuxWriteLeaseGuard | None = None
     created_staging_directories: set[tuple[str, ...]] = set()
     remaining_copy_bytes = copy_max_bytes
@@ -1431,6 +1497,29 @@ def _pinned_shard_scan_path(
                 return True
             if not os.path.samestat(current_entry_target, expected_entry_target):
                 return True
+        return False
+
+    def staging_path_binding_changed() -> bool:
+        if staging_ancestor_monitor is None or staging_ancestor_monitor.changed():
+            return True
+        try:
+            for ancestor_path, ancestor_fd in staging_ancestor_bindings:
+                if not os.path.samestat(
+                    os.stat(ancestor_path, follow_symlinks=False),
+                    os.fstat(ancestor_fd),
+                ):
+                    return True
+            if (
+                staging_path is None
+                or initial_staging_stat is None
+                or not os.path.samestat(
+                    os.stat(staging_path, follow_symlinks=False),
+                    initial_staging_stat,
+                )
+            ):
+                return True
+        except OSError:
+            return True
         return False
 
     try:
@@ -1464,11 +1553,19 @@ def _pinned_shard_scan_path(
         if source_descriptor_path is None:
             raise _ShardPinUnavailableError("platform cannot expose the opened shard descriptor")
 
-        staging_parent_path = Path(tempfile.gettempdir())
-        staging_parent_fd = os.open(staging_parent_path, directory_flags)
-        staging_path = Path(tempfile.mkdtemp(prefix=".modelaudit_scan_", dir=staging_parent_path))
-        initial_staging_stat = os.stat(staging_path.name, dir_fd=staging_parent_fd, follow_symlinks=False)
-        staging_fd = os.open(staging_path.name, directory_flags, dir_fd=staging_parent_fd)
+        staging_parent_path, staging_ancestor_bindings = _open_posix_directory_chain(
+            Path(tempfile.gettempdir()),
+            directory_flags,
+        )
+        staging_parent_fd = staging_ancestor_bindings[-1][1]
+        staging_ancestor_monitor = _StagingMutationMonitor.arm(
+            (descriptor for _path, descriptor in staging_ancestor_bindings),
+            watch_contents=False,
+        )
+        staging_name = _create_private_staging_directory(staging_parent_fd)
+        staging_path = staging_parent_path / staging_name
+        initial_staging_stat = os.stat(staging_name, dir_fd=staging_parent_fd, follow_symlinks=False)
+        staging_fd = os.open(staging_name, directory_flags, dir_fd=staging_parent_fd)
         staging_directory_fds[()] = staging_fd
         staging_stat = os.fstat(staging_fd)
         effective_uid = getattr(os, "geteuid", lambda: staging_stat.st_uid)()
@@ -1477,6 +1574,7 @@ def _pinned_shard_scan_path(
             or staging_stat.st_uid != effective_uid
             or stat.S_IMODE(staging_stat.st_mode) & 0o077
             or not os.path.samestat(staging_stat, initial_staging_stat)
+            or staging_path_binding_changed()
         ):
             raise _ShardPinUnavailableError("private shard staging directory changed while opening")
 
@@ -1681,6 +1779,8 @@ def _pinned_shard_scan_path(
                 raise _ShardPinUnavailableError("pinned companion content changed before scanner dispatch")
         if staging_mutation_monitor.changed():
             raise _ShardPinUnavailableError("private staging content changed before scanner dispatch")
+        if staging_path_binding_changed():
+            raise _ShardPinUnavailableError("private staging path changed before scanner dispatch")
         if staged_bindings_changed():
             raise _ShardPinUnavailableError("private staging entry changed before scanner dispatch")
         if deadline is not None and time.time() > deadline:
@@ -1690,7 +1790,11 @@ def _pinned_shard_scan_path(
         opened_scan_stat = os.stat(scan_path)
         if (
             use_regular_copy
-            and (not stat.S_ISREG(opened_scan_stat.st_mode) or opened_scan_stat.st_size != source_stat.st_size)
+            and (
+                pinned_source_copy_stat is None
+                or not stat.S_ISREG(opened_scan_stat.st_mode)
+                or not os.path.samestat(opened_scan_stat, pinned_source_copy_stat)
+            )
         ) or (not use_regular_copy and not os.path.samestat(source_stat, opened_scan_stat)):
             raise _ShardPinUnavailableError("pinned shard scan path resolved to a different file")
         pinned_scan = _PinnedShardScan(path=scan_path)
@@ -1703,6 +1807,7 @@ def _pinned_shard_scan_path(
         raise _ShardPinUnavailableError(str(error)) from error
     finally:
         if pinned_scan is not None and source_stat is not None and source_fd is not None:
+            pinned_scan.changed_during_scan = pinned_scan.changed_during_scan or staging_path_binding_changed()
             if staging_mutation_monitor is None or staging_mutation_monitor.changed():
                 pinned_scan.changed_during_scan = True
             pinned_scan.changed_during_scan = pinned_scan.changed_during_scan or _pinned_file_descriptor_changed(
@@ -1757,6 +1862,8 @@ def _pinned_shard_scan_path(
             os.close(pinned_source_copy_fd)
         if staging_mutation_monitor is not None:
             staging_mutation_monitor.close()
+        if staging_ancestor_monitor is not None:
+            staging_ancestor_monitor.close()
         for companion_fd, _companion_stat, _companion_hash in reversed(pinned_companion_copy_fds):
             os.close(companion_fd)
         for entry_parent_fd, entry_name in reversed(created_staging_entries):
@@ -1781,7 +1888,7 @@ def _pinned_shard_scan_path(
                 os.close(directory_fd)
         if staging_fd is not None:
             os.close(staging_fd)
-        if staging_path is not None and initial_staging_stat is not None and staging_parent_fd is not None:
+        if staging_path is not None and staging_parent_fd is not None and initial_staging_stat is not None:
             with suppress(OSError):
                 final_staging_stat = os.stat(staging_path.name, dir_fd=staging_parent_fd, follow_symlinks=False)
                 if os.path.samestat(initial_staging_stat, final_staging_stat):
@@ -1792,8 +1899,8 @@ def _pinned_shard_scan_path(
             os.close(companion_fd)
         for companion_parent_fd in reversed(companion_parent_fds):
             os.close(companion_parent_fd)
-        if staging_parent_fd is not None:
-            os.close(staging_parent_fd)
+        for _ancestor_path, ancestor_fd in reversed(staging_ancestor_bindings):
+            os.close(ancestor_fd)
         if parent_fd is not None:
             os.close(parent_fd)
 

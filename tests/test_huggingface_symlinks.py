@@ -306,8 +306,12 @@ class TestHuggingFaceSymlinks:
 
         monkeypatch.setattr(Path, "resolve", lexical_resolve)
 
-        def _raise(path: str) -> str:  # pragma: no cover - simulate error
-            raise OSError("dangling link")
+        real_readlink = os.readlink
+
+        def _raise(path: Any, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - simulate error
+            if os.fspath(path).endswith(broken_link.name):
+                raise OSError("dangling link")
+            return real_readlink(path, *args, **kwargs)
 
         monkeypatch.setattr(os, "readlink", _raise)
 

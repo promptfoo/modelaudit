@@ -290,6 +290,23 @@ def _make_large_text_zip_polyglot_payload() -> bytes:
     return text_prefix + archive.getvalue()
 
 
+def _make_compact_text_zip_with_inactive_gzip_decoy() -> bytes:
+    """Keep inactive gzip magic and a valid ZIP in the same post-prefix sample."""
+    archive = BytesIO()
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        zip_file.writestr("../escape.txt", b"payload")
+    text_prefix = b"#version: 0.2\n".ljust(_HF_CONTENT_SNIFF_BYTES, b" ")
+    return text_prefix + b"\x1f\x8b\x08\x00" + (b" " * 32) + archive.getvalue()
+
+
+def _with_inactive_gzip_post_prefix_decoy(payload: bytes) -> bytes:
+    """Place an inactive magic route at the first post-prefix sample."""
+    assert len(payload) >= _HF_CONTENT_SNIFF_BYTES + 4
+    decoy_payload = bytearray(payload)
+    decoy_payload[_HF_CONTENT_SNIFF_BYTES : _HF_CONTENT_SNIFF_BYTES + 4] = b"\x1f\x8b\x08\x00"
+    return bytes(decoy_payload)
+
+
 def _make_large_text_hdf5_userblock_payload(tmp_path: Path) -> bytes:
     h5py = pytest.importorskip("h5py")
     userblock_size = 2 * 1024 * 1024
@@ -5377,14 +5394,18 @@ class TestModelDownloadStreaming:
         )
 
     @pytest.mark.parametrize("selection_mode", ["standard", "source-native"])
+    @pytest.mark.parametrize("inactive_post_prefix_decoy", [False, True])
     @patch("requests.get")
     def test_large_text_prefix_does_not_hide_selected_zip_route(
         self,
         mock_requests_get: MagicMock,
         selection_mode: str,
+        inactive_post_prefix_decoy: bool,
     ) -> None:
         """A bounded tail probe must retain a prepended ZIP under exact policy."""
         payload = _make_large_text_zip_polyglot_payload()
+        if inactive_post_prefix_decoy:
+            payload = _with_inactive_gzip_post_prefix_decoy(payload)
         mock_requests_get.side_effect = _fake_range_responder(payload)
 
         if selection_mode == "standard":
@@ -5412,6 +5433,40 @@ class TestModelDownloadStreaming:
         hdf5_range = f"bytes={2 * 1024 * 1024}-{2 * 1024 * 1024 + HDF5_SUPERBLOCK_PROBE_BYTES - 1}"
         assert all(call.kwargs["headers"].get("Range") != hdf5_range for call in mock_requests_get.call_args_list)
 
+    @pytest.mark.parametrize("selection_mode", ["standard", "source-native"])
+    @patch("requests.get")
+    def test_inactive_route_does_not_shadow_zip_in_same_post_prefix_sample(
+        self,
+        mock_requests_get: MagicMock,
+        selection_mode: str,
+    ) -> None:
+        """An inactive early magic match must not short-circuit an active structural route."""
+        payload = _make_compact_text_zip_with_inactive_gzip_decoy()
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        if selection_mode == "standard":
+            selected = _select_huggingface_model_files(
+                "test/model",
+                ["known.zip", "evil.txt"],
+                _HF_TEST_REVISION,
+                {".zip"},
+                scannable_scanner_ids={"zip"},
+            )
+            selected_formats: dict[str, str] = {}
+        else:
+            selection = _select_streamable_hf_files(
+                "test/model",
+                ["known.zip", "evil.txt"],
+                _HF_TEST_REVISION,
+                {".zip"},
+                scannable_scanner_ids={"zip"},
+            )
+            selected = selection.filenames
+            selected_formats = selection.content_route_formats
+
+        assert selected == ["known.zip", "evil.txt"]
+        assert selected_formats.get("evil.txt", "zip") == "zip"
+
     def test_large_text_prefix_hdf5_route_has_local_critical_finding(self, tmp_path: Path) -> None:
         """The hidden route corresponds to an actionable local Keras H5 finding."""
         payload = _make_large_text_hdf5_userblock_payload(tmp_path)
@@ -5430,15 +5485,19 @@ class TestModelDownloadStreaming:
         )
 
     @pytest.mark.parametrize("selection_mode", ["standard", "source-native"])
+    @pytest.mark.parametrize("inactive_post_prefix_decoy", [False, True])
     @patch("requests.get")
     def test_large_text_prefix_does_not_hide_selected_hdf5_route(
         self,
         mock_requests_get: MagicMock,
         selection_mode: str,
+        inactive_post_prefix_decoy: bool,
         tmp_path: Path,
     ) -> None:
         """Sparse legal-offset probes must retain a text-prefixed HDF5 model."""
         payload = _make_large_text_hdf5_userblock_payload(tmp_path)
+        if inactive_post_prefix_decoy:
+            payload = _with_inactive_gzip_post_prefix_decoy(payload)
         mock_requests_get.side_effect = _fake_range_responder(payload)
 
         if selection_mode == "standard":

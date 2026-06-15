@@ -35,6 +35,7 @@ from modelaudit.utils.file.handlers import (
     _build_advanced_shard_family_cache_fingerprint,
     _close_windows_staging_directory_guard,
     _copy_pinned_file_descriptor,
+    _create_private_staging_directory,
     _LinuxWriteLeaseGuard,
     _open_windows_staging_directory_guard,
     _pinned_file_descriptor_changed,
@@ -66,6 +67,7 @@ def _track_created_staging_directories(monkeypatch: pytest.MonkeyPatch) -> list[
     """Track staging trees created by this worker without observing other xdist workers."""
     created_directories: list[Path] = []
     original_mkdtemp = tempfile.mkdtemp
+    original_create_private_staging_directory = _create_private_staging_directory
 
     def track_mkdtemp(*args: Any, **kwargs: Any) -> str:
         created_path = Path(original_mkdtemp(*args, **kwargs))
@@ -74,6 +76,16 @@ def _track_created_staging_directories(monkeypatch: pytest.MonkeyPatch) -> list[
         return str(created_path)
 
     monkeypatch.setattr("modelaudit.utils.file.handlers.tempfile.mkdtemp", track_mkdtemp)
+
+    def track_private_staging_directory(parent_fd: int) -> str:
+        staging_name = original_create_private_staging_directory(parent_fd)
+        created_directories.append(Path(tempfile.gettempdir()).resolve() / staging_name)
+        return staging_name
+
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._create_private_staging_directory",
+        track_private_staging_directory,
+    )
     return created_directories
 
 
@@ -539,6 +551,60 @@ def test_regular_pinned_companion_rejects_source_mutation_during_copy(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_dev_fd_fallback_rejects_staging_parent_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A public temp-parent replacement cannot redirect the portable scanner path."""
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"MALICIOUS")
+    staging_parent = tmp_path / "staging-parent"
+    replacement_parent = tmp_path / "replacement-parent"
+    held_parent = tmp_path / "held-parent"
+    staging_parent.mkdir()
+    replacement_parent.mkdir()
+    original_create = _create_private_staging_directory
+    created_name: str | None = None
+
+    def create_then_swap(parent_fd: int) -> str:
+        nonlocal created_name
+        created_name = original_create(parent_fd)
+        staging_parent.rename(held_parent)
+        replacement_parent.rename(staging_parent)
+        decoy_root = staging_parent / created_name
+        decoy_root.mkdir(mode=0o700)
+        (decoy_root / source_path.name).write_bytes(b"BENIGN!!!")
+        return created_name
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers.tempfile.gettempdir", lambda: str(staging_parent))
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._create_private_staging_directory",
+        create_then_swap,
+    )
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._descriptor_path_for_open_file",
+        lambda descriptor: f"/dev/fd/{descriptor}",
+    )
+
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="private shard staging directory changed"),
+        _pinned_shard_scan_path(
+            str(source_path),
+            _target_for_path(source_path),
+            logical_path=str(source_path),
+        ),
+    ):
+        pytest.fail("a swapped temp-parent pathname must be rejected before scanner dispatch")
+
+    assert created_name is not None
+    decoy_root = staging_parent / created_name
+    (decoy_root / source_path.name).unlink()
+    decoy_root.rmdir()
+    staging_parent.rename(replacement_parent)
+    held_parent.rename(staging_parent)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
 def test_context_only_companion_consumes_posix_staging_byte_budget(tmp_path: Path) -> None:
     """Context-only OCI companions must consume the physical staging copy budget."""
     source_path = tmp_path / "manifest.json"
@@ -674,7 +740,7 @@ def test_staging_parent_open_failure_precedes_directory_creation(
     monkeypatch.setattr("modelaudit.utils.file.handlers.tempfile.gettempdir", lambda: str(staging_parent))
 
     def fail_staging_parent_open(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> int:
-        if Path(path) == staging_parent and kwargs.get("dir_fd") is None:
+        if os.fspath(path) == staging_parent.name and kwargs.get("dir_fd") is not None:
             raise OSError(errno.EMFILE, "descriptor table exhausted")
         return original_open(path, *args, **kwargs)
 
@@ -715,6 +781,100 @@ def test_staging_root_open_failure_removes_created_directory(
 
     assert created_staging_directories
     assert all(not path.exists() for path in created_staging_directories)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_staging_root_initial_stat_failure_preserves_unverified_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup cannot name-delete a private root whose inode was never captured."""
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    original_stat = os.stat
+    created_staging_directories = _track_created_staging_directories(monkeypatch)
+    failed = False
+
+    def fail_initial_staging_stat(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal failed
+        if (
+            not failed
+            and os.fspath(path).startswith(".modelaudit_scan_")
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+        ):
+            failed = True
+            raise OSError(errno.EIO, "staging metadata unavailable")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", fail_initial_staging_stat)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, fail_initial_staging_stat})
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="staging metadata unavailable"),
+        _pinned_shard_scan_path(str(source_path), _target_for_path(source_path)),
+    ):
+        pytest.fail("staging metadata failure must stop before dispatch")
+
+    assert failed is True
+    assert created_staging_directories
+    assert all(path.is_dir() for path in created_staging_directories)
+    for created_directory in created_staging_directories:
+        created_directory.rmdir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_staging_root_initial_stat_failure_does_not_delete_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unverified cleanup preserves both a displaced root and its pathname replacement."""
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    original_create = _create_private_staging_directory
+    original_stat = os.stat
+    held_staging: Path | None = None
+    replacement_staging: Path | None = None
+    failed = False
+
+    def create_then_replace(parent_fd: int) -> str:
+        nonlocal held_staging, replacement_staging
+        staging_name = original_create(parent_fd)
+        staging_parent = Path(tempfile.gettempdir()).resolve()
+        replacement_staging = staging_parent / staging_name
+        held_staging = staging_parent / f"{staging_name}.held"
+        replacement_staging.rename(held_staging)
+        replacement_staging.mkdir()
+        return staging_name
+
+    def fail_initial_staging_stat(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal failed
+        if (
+            not failed
+            and os.fspath(path).startswith(".modelaudit_scan_")
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+        ):
+            failed = True
+            raise OSError(errno.EIO, "staging metadata unavailable")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "modelaudit.utils.file.handlers._create_private_staging_directory",
+        create_then_replace,
+    )
+    monkeypatch.setattr(os, "stat", fail_initial_staging_stat)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, fail_initial_staging_stat})
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="staging metadata unavailable"),
+        _pinned_shard_scan_path(str(source_path), _target_for_path(source_path)),
+    ):
+        pytest.fail("staging metadata failure must stop before dispatch")
+
+    assert failed is True
+    assert held_staging is not None and held_staging.is_dir()
+    assert replacement_staging is not None and replacement_staging.is_dir()
+    replacement_staging.rmdir()
+    held_staging.rmdir()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
