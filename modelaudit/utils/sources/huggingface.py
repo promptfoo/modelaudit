@@ -3200,6 +3200,21 @@ def _is_hf_safetensors_index_filename(filename: str) -> bool:
     return _hf_safetensors_index_stem(filename) is not None
 
 
+def _metadata_only_hf_candidate_requires_probe(
+    filename: str,
+    selected_files: Collection[str],
+    *,
+    allow_safetensors_index_expansion: bool,
+) -> bool:
+    """Return whether metadata alone cannot safely exclude one content-route candidate."""
+    if not _is_hf_safetensors_index_filename(filename):
+        return True
+    return allow_safetensors_index_expansion and _metadata_only_hf_index_may_govern_selected_shard(
+        filename,
+        selected_files,
+    )
+
+
 def _select_huggingface_model_files(
     repo_id: str,
     repo_files: list[str],
@@ -3270,10 +3285,10 @@ def _select_huggingface_model_files(
                 filename
                 for filename in _metadata_only_hf_content_probe_candidates(repo_files, model_files)
                 if filename not in exact_openvino_companion_candidates
-                if (
-                    not _is_hf_safetensors_index_filename(filename)
-                    or not allow_safetensors_index_expansion
-                    or _metadata_only_hf_index_may_govern_selected_shard(filename, model_files)
+                if _metadata_only_hf_candidate_requires_probe(
+                    filename,
+                    model_files,
+                    allow_safetensors_index_expansion=allow_safetensors_index_expansion,
                 )
             ]
             if content_probes_relevant
@@ -4257,6 +4272,15 @@ def _select_streamable_hf_files(
             model_files,
             exact_openvino_companion_candidates,
         )
+        candidate_files = [
+            filename
+            for filename in candidate_files
+            if _metadata_only_hf_candidate_requires_probe(
+                filename,
+                model_files,
+                allow_safetensors_index_expansion=allow_safetensors_index_expansion,
+            )
+        ]
         if candidate_files:
             _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
 

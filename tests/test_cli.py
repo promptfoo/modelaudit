@@ -981,6 +981,52 @@ def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_pat
     )
 
 
+def test_explicit_shard_family_discovery_does_not_poison_runtime_index_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Speculative broad ancestor inspection must not poison the selected explicit family."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for family_name, expected_total in (("small", 2), ("large", 3)):
+        for shard_index in range(1, expected_total + 1):
+            shard_dir = tmp_path / family_name / f"part-{shard_index}"
+            _make_trusted_shard_parent(shard_dir, parents=True)
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-{expected_total:05d}.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shard_paths.append(str(shard_path))
+
+    original_candidates = cli_module.ShardedModelDetector._safetensors_index_candidates
+    broad_ancestor = tmp_path.resolve()
+    forced_failures = 0
+
+    def fail_broad_ancestor_listing(
+        index_dir: Path,
+        inspection_context: cli_module._SafetensorsIndexInspectionContext | None = None,
+    ) -> tuple[list[Path], bool]:
+        nonlocal forced_failures
+        if index_dir.resolve() == broad_ancestor:
+            forced_failures += 1
+            return [], True
+        return original_candidates(index_dir, inspection_context)
+
+    monkeypatch.setattr(
+        cli_module.ShardedModelDetector,
+        "_safetensors_index_candidates",
+        staticmethod(fail_broad_ancestor_listing),
+    )
+    runtime_context = cli_module._SafetensorsIndexInspectionContext()
+
+    families = _explicit_local_shard_family_groups(tuple(shard_paths), runtime_context)
+
+    selected_families = {
+        families[os.path.normcase(os.path.normpath(os.path.abspath(shard_path)))] for shard_path in shard_paths
+    }
+    assert len(selected_families) == 2
+    assert forced_failures == 2
+    assert runtime_context.failure is None
+
+
 @pytest.mark.parametrize(("with_index", "expected_exit_code"), [(False, 2), (True, 0)])
 def test_scan_multiple_cross_directory_zero_based_shards_requires_index_authority(
     tmp_path: Path,

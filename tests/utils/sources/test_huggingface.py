@@ -917,6 +917,34 @@ class TestModelDownload:
         assert plan.selected_files == repo_files
         assert "evil.safetensors.index.json" in {call.args[1] for call in mock_detect.call_args_list}
 
+    @pytest.mark.parametrize("streaming", [False, True], ids=["standard", "streaming"])
+    def test_exact_onnx_policy_metadata_only_ignores_unrelated_safetensors_index(self, streaming: bool) -> None:
+        """An ONNX-only metadata plan need not inspect unrelated SafeTensors index metadata."""
+        repo_files = ["model.onnx", "adapter.safetensors.index.json"]
+        with patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect:
+            if streaming:
+                selected_files = _select_streamable_hf_files(
+                    "test/model",
+                    repo_files,
+                    _HF_TEST_REVISION,
+                    scannable_extensions={".onnx"},
+                    scannable_scanner_ids={"onnx"},
+                    allow_content_probes=False,
+                ).filenames
+            else:
+                selected_files = _select_huggingface_model_files(
+                    "test/model",
+                    repo_files,
+                    _HF_TEST_REVISION,
+                    {".onnx"},
+                    scannable_scanner_ids={"onnx"},
+                    allow_content_probes=False,
+                    allow_safetensors_index_expansion=False,
+                )
+
+        assert selected_files == ["model.onnx"]
+        mock_detect.assert_not_called()
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
     @patch(

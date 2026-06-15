@@ -2139,7 +2139,7 @@ def _terminal_safetensors_shard_boundary_failures(
             index_search_root=index_search_root,
             index_inspection_context=index_inspection_context,
             force_content_revalidation=force_content_revalidation,
-            require_declared_files=expected_proof is None,
+            require_declared_files=True,
         )
         if expected_proof is None and refreshed_proof is not None and authority_present:
             late_proof_sources.setdefault((expected_total, *refreshed_proof), []).extend(family_sources)
