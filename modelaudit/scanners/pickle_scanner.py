@@ -1535,7 +1535,11 @@ def _has_downloader_command(value: str) -> bool:
 
 
 def _literal_ast_has_downloader_url_context(tree: ast.Module) -> bool:
-    values = [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+    values = [
+        node.value if isinstance(node.value, str) else node.value.decode("utf-8", errors="ignore")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
+    ]
     return any(_PICKLE_LITERAL_URL_TEXT_RE.search(value) for value in values) and any(
         _has_downloader_command(value) for value in values
     )
