@@ -53,6 +53,7 @@ _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
 _PREVALIDATED_SHARD_INFO_CONFIG_KEY = "_trusted_prevalidated_shard_info"
 _DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY = "_trusted_defer_safetensors_index_content_revalidation"
 SAFETENSORS_SHARD_PATTERN = r".+-(\d+)-of-(\d+)\.safetensors"
+_SAFETENSORS_SHARD_FILENAME_RE = re.compile(r"(?P<stem>.+)-(?P<index>\d+)-of-(?P<total>\d+)\.safetensors")
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
@@ -876,16 +877,17 @@ class ShardedModelDetector:
     @staticmethod
     def match_safetensors_shard_filename(file_name: str) -> dict[str, int | str] | None:
         """Return SafeTensors shard metadata for an arbitrary-stem shard name."""
-        match = re.fullmatch(SAFETENSORS_SHARD_PATTERN, file_name)
-        if match is None or (match.lastindex or 0) < 2:
+        match = _SAFETENSORS_SHARD_FILENAME_RE.fullmatch(file_name)
+        if match is None:
             return None
         try:
-            shard_index = int(match.group(1))
-            expected_total = int(match.group(2))
+            shard_index = int(match.group("index"))
+            expected_total = int(match.group("total"))
         except (IndexError, ValueError):
             return None
         return {
             "pattern": SAFETENSORS_SHARD_PATTERN,
+            "family_stem": match.group("stem"),
             "current_shard_index": shard_index,
             "expected_total_shards": expected_total,
         }
@@ -1258,7 +1260,16 @@ class ShardedModelDetector:
             return file_relationship
         current_parent = os.path.dirname(normalized_current)
         expected_parents = {os.path.dirname(source_path) for source_path in inventory.expected_source_paths}
-        return current_parent in expected_parents
+        if current_parent not in expected_parents:
+            return False
+        current_details = cls.match_safetensors_shard_filename(current_file.name)
+        current_stem = current_details.get("family_stem") if current_details is not None else None
+        expected_stems = {
+            target_details.get("family_stem")
+            for source_path in inventory.expected_source_paths
+            if (target_details := cls.match_safetensors_shard_filename(Path(source_path).name)) is not None
+        }
+        return isinstance(current_stem, str) and current_stem in expected_stems
 
     @staticmethod
     def _safetensors_inventory_is_proven_unrelated(
