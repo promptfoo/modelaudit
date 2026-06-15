@@ -11821,6 +11821,15 @@ class TestZipScanner:
             b"copyright\r\nnotice\r\n",
             b"MIT License\nP\nPermission remains granted.\n",
             b"MIT License\nPermission is\ngranted to\nall users\n",
+            b"MIT License\ncopyright\nconditions\n",
+            b"MIT License\n" + (b"copyright\nconditions\n" * 4096),
+            b"MIT License\nPURPOSE\nARE DISCLAIMED. IN NO EVENT SHALL THE AUTHORS BE LIABLE.\n",
+            b"MIT License\ncopyright\ncopyright\nconditions\ninclude\n",
+            b"MIT License\nSoftware is provided.\nQuality terms apply.\n",
+            b"MIT License\nNcopyright\nconditions\ninclude\n",
+            b"MIT License\nAcopyright\nconditions\ninclude\n",
+            b"MIT License\nNPermission\nterms\n",
+            _long_context_opcode_prose(),
         }
         expected_exit_code = 2 if payload in grammar_owned else 0
         if payload in {b"copyright\nnotice\n", b"copyright\r\nnotice\r\n"}:
