@@ -2469,7 +2469,7 @@ def _build_onnx_weight_analysis_plan(
         nonlocal consumer_sample_count
         initializer = initializers[lineage.initializer_index]
         if int(initializer.data_type) not in floating_types and not (
-            quantization is not None and int(initializer.data_type) in quantized_integer_types
+            quantization is not None and int(initializer.data_type) in quantized_integer_types | float8_types
         ):
             record_exclusion(lineage.initializer_index, "non_floating_weight", node, input_index)
             return

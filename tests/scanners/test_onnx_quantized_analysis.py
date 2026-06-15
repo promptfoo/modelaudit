@@ -70,6 +70,38 @@ def _qlinear_matmul(tmp_path: Path, *, malicious: bool, scale_type: int = Tensor
     return _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 24)]), tmp_path / "q.onnx")
 
 
+def _qlinear_float8_weight(tmp_path: Path) -> Path:
+    data_type = next(
+        (int(getattr(TensorProto, name)) for name in ("FLOAT8E4M3FN", "FLOAT8E5M2") if hasattr(TensorProto, name)),
+        None,
+    )
+    if data_type is None:
+        pytest.skip("installed ONNX lacks analyzable FLOAT8 weights")
+    weights = np.zeros((100, 10), dtype=np.float32)
+    weights[:, 3] = 10.0
+    initializers = [
+        helper.make_tensor("W", data_type, [100, 10], weights.reshape(-1).tolist()),
+        _tensor("W_scale", np.asarray(1, dtype=np.float32)),
+        helper.make_tensor("W_zero", data_type, [], [0.0]),
+        _tensor("X_scale", np.asarray(1, dtype=np.float32)),
+        helper.make_tensor("X_zero", data_type, [], [0.0]),
+        _tensor("Y_scale", np.asarray(1, dtype=np.float32)),
+        helper.make_tensor("Y_zero", data_type, [], [0.0]),
+    ]
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "QLinearMatMul", ["X", "X_scale", "X_zero", "W", "W_scale", "W_zero", "Y_scale", "Y_zero"], ["Y"]
+            )
+        ],
+        "qlinear_float8",
+        [helper.make_tensor_value_info("X", data_type, [1, 100])],
+        [helper.make_tensor_value_info("Y", data_type, [1, 10])],
+        initializer=initializers,
+    )
+    return _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)]), tmp_path / "q-float8.onnx")
+
+
 def _matmul_integer_scale_path(tmp_path: Path, *, suffix: str) -> Path:
     initializers = [
         _tensor("W", _extreme_int8(True)),
@@ -154,6 +186,13 @@ def test_qlinear_matmul_quantized_weights_are_analyzed(tmp_path: Path, malicious
     assert result.success is True
     assert _coverage(result)["analyzed_initializer_count"] == 1
     assert sum(check.name == "Weight Distribution Anomaly Detection" for check in result.checks) == int(malicious)
+
+
+def test_float8_quantized_weight_is_analyzed(tmp_path: Path) -> None:
+    result = OnnxScanner().scan(str(_qlinear_float8_weight(tmp_path)))
+    assert result.success is True
+    assert _coverage(result)["analyzed_initializer_count"] == 1
+    assert any(check.name == "Weight Distribution Anomaly Detection" for check in result.checks)
 
 
 def test_float8e8m0_quantized_scale_is_accepted_when_available(tmp_path: Path) -> None:
