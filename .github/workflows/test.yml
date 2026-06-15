@@ -152,12 +152,14 @@ jobs:
       - name: Audit dependencies for vulnerabilities
         run: |
           # CVE-2026-4539 currently has no upstream Pygments fix release.
+          # GHSA-537c-gmf6-5ccf currently reports cryptography 48.0.1 as fixed,
+          # but that release is not available from PyPI for pip-audit to install.
           # pip-audit cannot audit unpublished editable path requirements, so
           # the standalone Rust-backed pickle package is audited separately.
           uv export --no-hashes --no-emit-project \
             | sed -e '/^-e \.\/packages\/modelaudit-picklescan$/d' -e '/^modelaudit-picklescan==/d' \
             > /tmp/modelaudit-audit-requirements.txt
-          uvx pip-audit --strict --desc --ignore-vuln CVE-2026-4539 -r /tmp/modelaudit-audit-requirements.txt
+          uvx pip-audit --strict --desc --ignore-vuln CVE-2026-4539 --ignore-vuln GHSA-537c-gmf6-5ccf -r /tmp/modelaudit-audit-requirements.txt
           uv export --project packages/modelaudit-picklescan --no-hashes --no-emit-project \
             > /tmp/modelaudit-picklescan-audit-requirements.txt
           if grep -Eq '^[A-Za-z0-9_.-]' /tmp/modelaudit-picklescan-audit-requirements.txt; then
