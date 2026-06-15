@@ -901,6 +901,99 @@ class TarScanner(BaseScanner):
         except OSError:
             return False
 
+    def _windows_sparse_tail_is_zero(self, file_obj: BinaryIO, *, tail_start: int, tail_end: int) -> bool | None:
+        """Check only allocated Windows sparse-tail ranges; return ``None`` if unavailable."""
+        if os.name != "nt":
+            return None
+
+        try:
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+        except ImportError:  # pragma: no cover - Windows stdlib provides these modules.
+            return None
+
+        class _FileAllocatedRangeBuffer(ctypes.Structure):
+            _fields_ = [("file_offset", ctypes.c_longlong), ("length", ctypes.c_longlong)]
+
+        fsctl_query_allocated_ranges = 0x000940CF
+        error_more_data = 234
+        output_range_count = 64
+        windows_ctypes = cast(Any, ctypes)
+        windows_msvcrt = cast(Any, msvcrt)
+        kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
+        device_io_control = kernel32.DeviceIoControl
+        device_io_control.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        ]
+        device_io_control.restype = wintypes.BOOL
+
+        try:
+            handle = wintypes.HANDLE(windows_msvcrt.get_osfhandle(file_obj.fileno()))
+        except OSError:
+            return None
+
+        checked_bytes = 0
+        query_offset = tail_start
+        while query_offset < tail_end:
+            query = _FileAllocatedRangeBuffer(query_offset, tail_end - query_offset)
+            ranges = (_FileAllocatedRangeBuffer * output_range_count)()
+            bytes_returned = wintypes.DWORD()
+            succeeded = bool(
+                device_io_control(
+                    handle,
+                    fsctl_query_allocated_ranges,
+                    ctypes.byref(query),
+                    ctypes.sizeof(query),
+                    ctypes.byref(ranges),
+                    ctypes.sizeof(ranges),
+                    ctypes.byref(bytes_returned),
+                    None,
+                )
+            )
+            error = windows_ctypes.get_last_error()
+            if not succeeded and error != error_more_data:
+                return None
+
+            range_count = bytes_returned.value // ctypes.sizeof(_FileAllocatedRangeBuffer)
+            if range_count == 0:
+                return True if succeeded else None
+
+            furthest_offset = query_offset
+            for allocated_range in ranges[:range_count]:
+                range_start = max(allocated_range.file_offset, tail_start)
+                range_end = min(allocated_range.file_offset + allocated_range.length, tail_end)
+                if range_end <= range_start:
+                    continue
+
+                checked_bytes += range_end - range_start
+                if checked_bytes > self.max_xz_padding_bytes:
+                    return False
+
+                file_obj.seek(range_start)
+                remaining = range_end - range_start
+                while remaining > 0:
+                    chunk = file_obj.read(min(ARCHIVE_MEMBER_COPY_CHUNK_BYTES, remaining))
+                    if not chunk or any(chunk):
+                        return False
+                    remaining -= len(chunk)
+                furthest_offset = max(furthest_offset, range_end)
+
+            if succeeded:
+                return True
+            if furthest_offset <= query_offset:
+                return None
+            query_offset = furthest_offset
+
+        return True
+
     def _raw_tar_has_complete_end_marker(self, tar: tarfile.TarFile) -> bool:
         """Validate raw TAR EOF and bounded zero-only record padding."""
         file_obj = cast(BinaryIO, tar.fileobj)
@@ -908,7 +1001,8 @@ class TarScanner(BaseScanner):
         if file_obj.read(2 * tarfile.BLOCKSIZE) != b"\0" * (2 * tarfile.BLOCKSIZE):
             return False
         tail_start = file_obj.tell()
-        tail_size = os.fstat(file_obj.fileno()).st_size - tail_start
+        tail_end = os.fstat(file_obj.fileno()).st_size
+        tail_size = tail_end - tail_start
         if tail_size <= self.max_xz_padding_bytes:
             return not any(file_obj.read())
         if hasattr(os, "SEEK_DATA") and hasattr(os, "SEEK_HOLE"):
@@ -929,6 +1023,13 @@ class TarScanner(BaseScanner):
                         return False
                     remaining -= len(chunk)
                 offset = hole_offset
+        windows_tail_is_zero = self._windows_sparse_tail_is_zero(
+            file_obj,
+            tail_start=tail_start,
+            tail_end=tail_end,
+        )
+        if windows_tail_is_zero is not None:
+            return windows_tail_is_zero
         tail_size = 0
         while chunk := file_obj.read(min(ARCHIVE_MEMBER_COPY_CHUNK_BYTES, self.max_xz_padding_bytes - tail_size + 1)):
             tail_size += len(chunk)

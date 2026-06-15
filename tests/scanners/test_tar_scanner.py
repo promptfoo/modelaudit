@@ -61,6 +61,46 @@ def _old_gnu_sparse_tar_bytes(*, extension_blocks: int, physical_size: int = 0) 
     return _with_tar_checksum(header) + b"".join(extensions) + (b"\0" * physical_size) + (b"\0" * 1024)
 
 
+def _mark_windows_file_sparse(file_obj: BinaryIO) -> None:
+    """Mark a Windows fixture sparse before extending it over a large zero tail."""
+    if os.name != "nt":
+        return
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    windows_ctypes = cast(Any, ctypes)
+    windows_msvcrt = cast(Any, msvcrt)
+    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
+    device_io_control = kernel32.DeviceIoControl
+    device_io_control.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    device_io_control.restype = wintypes.BOOL
+    bytes_returned = wintypes.DWORD()
+    succeeded = bool(
+        device_io_control(
+            wintypes.HANDLE(windows_msvcrt.get_osfhandle(file_obj.fileno())),
+            0x000900C4,
+            None,
+            0,
+            None,
+            0,
+            ctypes.byref(bytes_returned),
+            None,
+        )
+    )
+    assert succeeded, f"FSCTL_SET_SPARSE failed: {windows_ctypes.get_last_error()}"
+
+
 def _write_sparse_raw_tar(
     path: Path,
     *,
@@ -78,6 +118,7 @@ def _write_sparse_raw_tar(
         archive.write(b"\0" * (-len(payload) % tarfile.BLOCKSIZE))
 
     with path.open("wb") as archive:
+        _mark_windows_file_sparse(archive)
         write_member(member_name, member_payload)
         if late_invalid_header:
             archive.write(b"A" * tarfile.BLOCKSIZE)
