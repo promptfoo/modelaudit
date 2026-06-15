@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import os
 import pickletools
 import tempfile
@@ -1801,7 +1802,9 @@ def _complete_pickle_stream_payloads(payload: bytes) -> tuple[tuple[int, bytes],
     try:
         while offset < len(payload):
             stream_end: int | None = None
-            for opcode, _arg, position in pickletools.genops(payload[offset:]):
+            stream = io.BytesIO(payload)
+            stream.seek(offset)
+            for opcode, _arg, position in pickletools.genops(stream):
                 opcode_count += 1
                 if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
                     return None
@@ -1809,7 +1812,7 @@ def _complete_pickle_stream_payloads(payload: bytes) -> tuple[tuple[int, bytes],
                     continue
                 if type(position) is not int:
                     return None
-                stream_end = offset + position + 1
+                stream_end = position + 1
                 break
             if stream_end is None:
                 return None
