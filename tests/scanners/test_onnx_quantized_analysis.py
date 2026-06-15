@@ -299,6 +299,13 @@ def test_external_data_scan_does_not_reuse_primary_only_cache(tmp_path: Path) ->
         reset_cache_manager()
 
 
+def test_external_data_package_hash_matches_file_and_directory_routes(tmp_path: Path) -> None:
+    model_path, _sidecar = _external_package(tmp_path)
+    direct = scan_model_directory_or_file(str(model_path), scanners=["onnx"])
+    directory = scan_model_directory_or_file(str(tmp_path), scanners=["onnx"])
+    assert direct.content_hash == directory.content_hash
+
+
 def test_standalone_weight_distribution_clusters_identical_onnx_exports(tmp_path: Path) -> None:
     first = _qlinear_matmul(tmp_path, malicious=True)
     second = tmp_path / "copy.onnx"

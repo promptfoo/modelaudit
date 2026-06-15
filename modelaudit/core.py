@@ -5355,35 +5355,31 @@ def scan_model_directory_or_file(
                         results.bytes_scanned += file_result.bytes_scanned
                         results.files_scanned += len(scanned_file_paths)
                         processed_files += len(scanned_file_paths)
-                        for scanned_file_path in scanned_file_paths:
-                            path_content_hash = content_hashes.get(scanned_file_path)
-                            if (
-                                path_content_hash is not None
-                                and not path_content_hash.startswith("unhashable_")
-                                and path_content_hash not in recorded_content_hashes
-                            ):
-                                file_hashes.append(path_content_hash)
-                                recorded_content_hashes.add(path_content_hash)
-                        for onnx_external_data_source in onnx_external_data_sources_by_path.get(
-                            representative_file,
-                            (),
-                        ):
-                            external_data_content_hash = hashes_by_source.get(onnx_external_data_source)
-                            if (
-                                external_data_content_hash is not None
-                                and not external_data_content_hash.startswith("unhashable_")
-                                and external_data_content_hash not in recorded_content_hashes
-                            ):
-                                file_hashes.append(external_data_content_hash)
-                                recorded_content_hashes.add(external_data_content_hash)
                         package_content_hash = onnx_package_hashes_by_path.get(representative_file)
-                        if (
-                            package_content_hash is not None
-                            and onnx_external_data_sources_by_path.get(representative_file)
-                            and package_content_hash not in recorded_content_hashes
-                        ):
-                            file_hashes.append(package_content_hash)
-                            recorded_content_hashes.add(package_content_hash)
+                        package_external_sources = onnx_external_data_sources_by_path.get(representative_file, ())
+                        if package_content_hash is not None and package_external_sources:
+                            if package_content_hash not in recorded_content_hashes:
+                                file_hashes.append(package_content_hash)
+                                recorded_content_hashes.add(package_content_hash)
+                        else:
+                            for scanned_file_path in scanned_file_paths:
+                                path_content_hash = content_hashes.get(scanned_file_path)
+                                if (
+                                    path_content_hash is not None
+                                    and not path_content_hash.startswith("unhashable_")
+                                    and path_content_hash not in recorded_content_hashes
+                                ):
+                                    file_hashes.append(path_content_hash)
+                                    recorded_content_hashes.add(path_content_hash)
+                            for onnx_external_data_source in package_external_sources:
+                                external_data_content_hash = hashes_by_source.get(onnx_external_data_source)
+                                if (
+                                    external_data_content_hash is not None
+                                    and not external_data_content_hash.startswith("unhashable_")
+                                    and external_data_content_hash not in recorded_content_hashes
+                                ):
+                                    file_hashes.append(external_data_content_hash)
+                                    recorded_content_hashes.add(external_data_content_hash)
 
                         # Add scanner to tracking list (different from scanner_names)
                         scanner_name = file_result.scanner_name
