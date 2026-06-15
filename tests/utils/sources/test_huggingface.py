@@ -42,7 +42,7 @@ from modelaudit.utils.file.detection import (
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     detect_file_format_for_skip_filter,
 )
-from modelaudit.utils.file.hdf5 import HDF5_MAGIC, hdf5_metadata_checksum
+from modelaudit.utils.file.hdf5 import HDF5_MAGIC, HDF5_SUPERBLOCK_PROBE_BYTES, hdf5_metadata_checksum
 from modelaudit.utils.file.streaming import StreamedSourceByteAccounting
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
@@ -280,6 +280,40 @@ def _make_executable_zip_polyglot_payload() -> bytes:
     with zipfile.ZipFile(payload, "w") as archive:
         archive.writestr("model.pkl", b"payload")
     return b"\x7fELF" + b"\x02\x01\x01\x00" + (b"\x00" * 56) + payload.getvalue()
+
+
+def _make_large_text_zip_polyglot_payload() -> bytes:
+    archive = BytesIO()
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        zip_file.writestr("../escape.txt", b"payload")
+    text_prefix = ("#version: 0.2\n" + "e n\n" * 600_000).encode("utf-8")
+    return text_prefix + archive.getvalue()
+
+
+def _make_large_text_hdf5_userblock_payload(tmp_path: Path) -> bytes:
+    h5py = pytest.importorskip("h5py")
+    userblock_size = 2 * 1024 * 1024
+    model_path = tmp_path / "text-prefixed-model.h5"
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "text_prefixed_model",
+            "layers": [
+                {
+                    "class_name": "Lambda",
+                    "config": {"function": 'lambda x: __import__("os").system("id")'},
+                }
+            ],
+        },
+    }
+    with h5py.File(model_path, "w", userblock_size=userblock_size) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(model_config)
+
+    text_prefix = ("#version: 0.2\n" + "e n\n" * (userblock_size // 4))[:userblock_size].encode()
+    assert len(text_prefix) == userblock_size
+    with model_path.open("r+b") as handle:
+        handle.write(text_prefix)
+    return model_path.read_bytes()
 
 
 def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
@@ -5314,6 +5348,134 @@ class TestModelDownloadStreaming:
         assert routed_index in selected
         assert selected_formats.get(routed_index, "pickle") == "pickle"
         assert any(call.args[1] == routed_index for call in mock_detect.call_args_list)
+
+    def test_large_text_prefix_zip_route_has_local_critical_finding(self, tmp_path: Path) -> None:
+        """The hidden route corresponds to an actionable local ZIP finding."""
+        payload = _make_large_text_zip_polyglot_payload()
+        local_path = tmp_path / "evil.txt"
+        local_path.write_bytes(payload)
+        local_result = scan_model_directory_or_file(
+            str(local_path),
+            cache_enabled=False,
+            scanners=["zip"],
+            skip_file_types=False,
+        )
+        assert determine_exit_code(local_result) == 1
+        assert any(
+            issue.severity.value == "critical" and "path traversal" in issue.message.lower()
+            for issue in local_result.issues
+        )
+
+    @pytest.mark.parametrize("selection_mode", ["standard", "source-native"])
+    @patch("requests.get")
+    def test_large_text_prefix_does_not_hide_selected_zip_route(
+        self,
+        mock_requests_get: MagicMock,
+        selection_mode: str,
+    ) -> None:
+        """A bounded tail probe must retain a prepended ZIP under exact policy."""
+        payload = _make_large_text_zip_polyglot_payload()
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        if selection_mode == "standard":
+            selected = _select_huggingface_model_files(
+                "test/model",
+                ["known.zip", "evil.txt"],
+                _HF_TEST_REVISION,
+                {".zip"},
+                scannable_scanner_ids={"zip"},
+            )
+            selected_formats: dict[str, str] = {}
+        else:
+            selection = _select_streamable_hf_files(
+                "test/model",
+                ["known.zip", "evil.txt"],
+                _HF_TEST_REVISION,
+                {".zip"},
+                scannable_scanner_ids={"zip"},
+            )
+            selected = selection.filenames
+            selected_formats = selection.content_route_formats
+
+        assert selected == ["known.zip", "evil.txt"]
+        assert selected_formats.get("evil.txt", "zip") == "zip"
+        hdf5_range = f"bytes={2 * 1024 * 1024}-{2 * 1024 * 1024 + HDF5_SUPERBLOCK_PROBE_BYTES - 1}"
+        assert all(call.kwargs["headers"].get("Range") != hdf5_range for call in mock_requests_get.call_args_list)
+
+    def test_large_text_prefix_hdf5_route_has_local_critical_finding(self, tmp_path: Path) -> None:
+        """The hidden route corresponds to an actionable local Keras H5 finding."""
+        payload = _make_large_text_hdf5_userblock_payload(tmp_path)
+        local_path = tmp_path / "evil.txt"
+        local_path.write_bytes(payload)
+        local_result = scan_model_directory_or_file(
+            str(local_path),
+            cache_enabled=False,
+            scanners=["keras_h5"],
+            skip_file_types=False,
+        )
+        assert determine_exit_code(local_result) == 1
+        assert any(
+            issue.severity.value == "critical" and issue.message == "Lambda layer contains dangerous Python code"
+            for issue in local_result.issues
+        )
+
+    @pytest.mark.parametrize("selection_mode", ["standard", "source-native"])
+    @patch("requests.get")
+    def test_large_text_prefix_does_not_hide_selected_hdf5_route(
+        self,
+        mock_requests_get: MagicMock,
+        selection_mode: str,
+        tmp_path: Path,
+    ) -> None:
+        """Sparse legal-offset probes must retain a text-prefixed HDF5 model."""
+        payload = _make_large_text_hdf5_userblock_payload(tmp_path)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        if selection_mode == "standard":
+            selected = _select_huggingface_model_files(
+                "test/model",
+                ["known.h5", "evil.txt"],
+                _HF_TEST_REVISION,
+                {".h5"},
+                scannable_scanner_ids={"keras_h5"},
+            )
+            selected_formats: dict[str, str] = {}
+        else:
+            selection = _select_streamable_hf_files(
+                "test/model",
+                ["known.h5", "evil.txt"],
+                _HF_TEST_REVISION,
+                {".h5"},
+                scannable_scanner_ids={"keras_h5"},
+            )
+            selected = selection.filenames
+            selected_formats = selection.content_route_formats
+
+        assert selected == ["known.h5", "evil.txt"]
+        assert selected_formats.get("evil.txt", "keras_h5") == "keras_h5"
+        hdf5_range = f"bytes={2 * 1024 * 1024}-{2 * 1024 * 1024 + HDF5_SUPERBLOCK_PROBE_BYTES - 1}"
+        assert any(call.kwargs["headers"].get("Range") == hdf5_range for call in mock_requests_get.call_args_list)
+
+    @patch("requests.get")
+    def test_large_text_prefix_ignores_hdf5_magic_only_near_match(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """HDF5 magic without a plausible superblock must remain text-owned."""
+        signature_offset = 2 * 1024 * 1024
+        text_prefix = ("#version: 0.2\n" + "e n\n" * (signature_offset // 4))[:signature_offset].encode()
+        payload = text_prefix + HDF5_MAGIC + bytes(256)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected = _select_huggingface_model_files(
+            "test/model",
+            ["known.h5", "notes.txt"],
+            _HF_TEST_REVISION,
+            {".h5"},
+            scannable_scanner_ids={"keras_h5"},
+        )
+
+        assert selected == ["known.h5"]
 
     def test_remote_safetensors_validation_does_not_probe_indexes_for_unsharded_selection(self) -> None:
         """Selecting one unsharded model must not make same-parent adapter indexes authoritative."""

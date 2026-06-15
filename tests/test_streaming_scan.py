@@ -5044,7 +5044,7 @@ def test_scan_model_streaming_rejects_local_companion_stage_before_total_size_co
     def fail_copy(*_args: Any, **_kwargs: Any) -> None:
         pytest.fail("over-budget local files must not be copied into private staging")
 
-    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor_contents", fail_copy)
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
 
     result = scan_model_streaming(
         file_generator=iter([(xml_path, True)]),
@@ -5074,7 +5074,7 @@ def test_scan_model_streaming_rejects_local_stage_before_max_file_size_copy(
     def fail_copy(*_args: Any, **_kwargs: Any) -> str:
         pytest.fail("over-budget local files must not be copied into private staging")
 
-    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor_contents", fail_copy)
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
 
     result = scan_model_streaming(
         file_generator=iter([(xml_path, True)]),
@@ -5103,7 +5103,7 @@ def test_local_scan_rejects_oversized_companion_before_private_copy(
     def fail_copy(*_args: Any, **_kwargs: Any) -> str:
         pytest.fail("an oversized companion must fail before any private staging copy")
 
-    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor_contents", fail_copy)
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
     if stream:
         result = scan_model_streaming(
             iter([(xml_path, True)]),
@@ -5234,7 +5234,7 @@ def test_standard_local_scan_rejects_total_budget_before_private_copy(
     def fail_copy(*_args: Any, **_kwargs: Any) -> str:
         pytest.fail("an over-budget source must fail before any private staging copy")
 
-    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor_contents", fail_copy)
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
     result = scan_model_directory_or_file(
         str(tmp_path),
         cache_enabled=False,
@@ -5265,7 +5265,7 @@ def test_local_private_copy_rejects_post_preflight_source_growth(
     observed_limits: list[int | None] = []
     from modelaudit.utils.file import handlers
 
-    original_copy = handlers._copy_pinned_file_descriptor_contents
+    original_copy = handlers._copy_pinned_file_descriptor
 
     def grow_before_copy(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
         if os.fstat(source_fd).st_ino == source_inode:
@@ -5273,7 +5273,7 @@ def test_local_private_copy_rejects_post_preflight_source_growth(
             model_path.write_bytes(b"x" * (2 * 1024 * 1024))
         return original_copy(source_fd, destination, **kwargs)
 
-    monkeypatch.setattr(handlers, "_copy_pinned_file_descriptor_contents", grow_before_copy)
+    monkeypatch.setattr(handlers, "_copy_pinned_file_descriptor", grow_before_copy)
     if stream:
         result = scan_model_streaming(
             iter([(model_path, True)]),
@@ -6342,7 +6342,7 @@ def test_scan_model_streaming_hf_cache_rejects_onnx_stage_before_total_size_copy
     def fail_copy(*_args: Any, **_kwargs: Any) -> str:
         pytest.fail("over-budget HF files must not be copied into private staging")
 
-    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor_contents", fail_copy)
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", fail_copy)
 
     result = scan_model_streaming(
         file_generator=iter([(model_link, True)]),

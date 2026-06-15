@@ -120,6 +120,7 @@ class _HuggingFaceProbeBudget:
     file_sizes: dict[str, int] = field(default_factory=dict)
     prefixes: dict[str, bytes] = field(default_factory=dict)
     transferred_bytes: int = 0
+    active_scanner_ids: frozenset[str] | None = None
 
     def reserve(self, repo_id: str, max_bytes: int) -> None:
         """Reserve a bounded remote read or fail closed before issuing it."""
@@ -2777,6 +2778,7 @@ def _detect_huggingface_text_owner_embedded_binary_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded route for binary/model bytes embedded after a text-owned prefix."""
+    active_scanner_ids = budget.active_scanner_ids
     known_size = budget.file_sizes.get(filename)
     if known_size is None or known_size <= len(prefix):
         return None
@@ -2789,6 +2791,14 @@ def _detect_huggingface_text_owner_embedded_binary_route(
         _probe_flax_msgpack_checkpoint_stream,
         detect_format_from_magic_bytes,
     )
+
+    def route_is_active(detected_format: str) -> bool:
+        if active_scanner_ids is None:
+            return True
+        from ...scanner_selection import scanner_ids_for_detected_format
+
+        active = {str(scanner_id).lower() for scanner_id in active_scanner_ids}
+        return bool(active.intersection(scanner_ids_for_detected_format(detected_format)))
 
     def detect_sample_route(sample: bytes) -> str | None:
         if not sample:
@@ -2816,13 +2826,51 @@ def _detect_huggingface_text_owner_embedded_binary_route(
             pickle_probe_sample=sample,
             pickle_probe_is_prefix=True,
         )
-        return None if detected_format == "unknown" else detected_format
+        if detected_format != "unknown":
+            return detected_format
+
+        if not route_is_active("zip"):
+            return None
+
+        import zipfile
+
+        return "zip" if zipfile.is_zipfile(BytesIO(sample)) else None
 
     sample_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
     post_prefix = _read_huggingface_range(repo_id, filename, revision, budget, prefix, len(prefix), sample_size)
     post_prefix_route = detect_sample_route(post_prefix)
     if post_prefix_route is not None:
         return post_prefix_route
+
+    if route_is_active("keras_h5"):
+        from ..file.hdf5 import (
+            HDF5_SUPERBLOCK_PROBE_BYTES,
+            has_plausible_hdf5_superblock,
+            hdf5_signature_offsets,
+        )
+
+        post_prefix_start = len(prefix)
+        post_prefix_end = post_prefix_start + len(post_prefix)
+        for signature_offset in hdf5_signature_offsets(known_size, max_signature_scan_bytes=None):
+            probe_size = min(HDF5_SUPERBLOCK_PROBE_BYTES, known_size - signature_offset)
+            signature_end = signature_offset + probe_size
+            if signature_end <= len(prefix):
+                superblock = prefix[signature_offset:signature_end]
+            elif post_prefix_start <= signature_offset and signature_end <= post_prefix_end:
+                relative_offset = signature_offset - post_prefix_start
+                superblock = post_prefix[relative_offset : relative_offset + probe_size]
+            else:
+                superblock = _read_huggingface_range(
+                    repo_id,
+                    filename,
+                    revision,
+                    budget,
+                    prefix,
+                    signature_offset,
+                    probe_size,
+                )
+            if has_plausible_hdf5_superblock(superblock, signature_offset, known_size):
+                return "keras_h5"
 
     tail_start = max(0, known_size - min(known_size, sample_size))
     if tail_start <= len(prefix) + len(post_prefix):
@@ -3298,6 +3346,15 @@ def _select_huggingface_model_files(
         if selected_route_scanner_ids is not None
         else selected_route_formats is None or bool(selected_route_formats)
     )
+    active_content_route_scanner_ids = (
+        selected_route_scanner_ids
+        if selected_route_scanner_ids is not None
+        else (
+            None
+            if selected_route_formats is None
+            else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+        )
+    )
     exact_openvino_companion_candidates = (
         {
             companion
@@ -3331,6 +3388,9 @@ def _select_huggingface_model_files(
     probe_budget = _HuggingFaceProbeBudget(
         remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
         deadline=deadline,
+        active_scanner_ids=(
+            None if active_content_route_scanner_ids is None else frozenset(active_content_route_scanner_ids)
+        ),
     )
 
     for filename in repo_files if content_probes_relevant else ():
@@ -3403,21 +3463,6 @@ def _metadata_only_hf_content_probe_candidates(repo_files: list[str], selected_f
             if filename not in selected_file_set and not _is_huggingface_repo_bookkeeping_file(filename)
         )
     )
-
-
-def _metadata_only_hf_index_may_govern_selected_shard(
-    index_file: str,
-    selected_files: Collection[str],
-) -> bool:
-    """Return whether an unparsed index is colocated with or above a selected shard family."""
-    index_parent = PurePosixPath(index_file).parent
-    for selected_file in selected_files:
-        if _remote_safetensors_shard_parts(selected_file) is None:
-            continue
-        selected_parent = PurePosixPath(selected_file).parent
-        if index_parent == selected_parent or index_parent in selected_parent.parents:
-            return True
-    return False
 
 
 def _allows_safetensors_index_expansion(
@@ -3811,6 +3856,7 @@ def _include_huggingface_openvino_companions(
         probe_budget = _HuggingFaceProbeBudget(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
             deadline=deadline,
+            active_scanner_ids=frozenset({"openvino"}),
         )
 
     for filename in model_files:
@@ -4205,6 +4251,15 @@ def _select_streamable_hf_files(
         else selected_route_formats is None or bool(selected_route_formats)
     )
     sniff_renamed_files = allow_content_probes and sniff_renamed_files_would_be_active
+    active_content_route_scanner_ids = (
+        selected_route_scanner_ids
+        if selected_route_scanner_ids is not None
+        else (
+            None
+            if selected_route_formats is None
+            else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+        )
+    )
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
         filenames = (
@@ -4309,6 +4364,13 @@ def _select_streamable_hf_files(
             probe_budget = _HuggingFaceProbeBudget(
                 remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
                 deadline=deadline,
+                active_scanner_ids=(
+                    None if active_content_route_scanner_ids is None else frozenset(active_content_route_scanner_ids)
+                ),
+            )
+        else:
+            probe_budget.active_scanner_ids = (
+                None if active_content_route_scanner_ids is None else frozenset(active_content_route_scanner_ids)
             )
         for file_name in _streamable_hf_content_probe_candidates(
             repo_files,
@@ -6707,6 +6769,11 @@ def download_model_streaming(
                 remaining_bytes=remaining_probe_bytes,
                 deadline=deadline,
                 file_sizes={filename: selected_sizes[filename] for filename in safetensors_header_candidates},
+                active_scanner_ids=(
+                    None
+                    if scannable_scanner_ids is None
+                    else frozenset(str(scanner_id).lower() for scanner_id in scannable_scanner_ids)
+                ),
             )
             if _active_safetensors_overlap_scanner_ids(scannable_scanner_ids)
             else None

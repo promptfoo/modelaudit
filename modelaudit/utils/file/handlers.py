@@ -982,12 +982,32 @@ def _copy_pinned_file_descriptor(
     try:
         with _open_exclusive_staging_target(destination, destination_dir_fd) as target:
             destination_created = True
-            return _copy_pinned_file_descriptor_contents(
-                source_fd,
-                target,
-                max_bytes=max_bytes,
-                deadline=deadline,
-            )
+            copied_fd = os.dup(source_fd)
+            try:
+                source_size = os.fstat(copied_fd).st_size
+                if max_bytes is not None and max_bytes >= 0 and source_size > max_bytes:
+                    raise _ShardPinUnavailableError("validated source exceeds the staging byte limit")
+                if deadline is not None and time.time() > deadline:
+                    raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
+                os.lseek(copied_fd, 0, os.SEEK_SET)
+                source = os.fdopen(copied_fd, "rb", closefd=True)
+                copied_fd = -1
+                digest = hashlib.sha256()
+                with source:
+                    copied_bytes = 0
+                    while chunk := source.read(1024 * 1024):
+                        copied_bytes += len(chunk)
+                        if max_bytes is not None and max_bytes >= 0 and copied_bytes > max_bytes:
+                            raise _ShardPinUnavailableError("validated source exceeds the staging byte limit")
+                        if deadline is not None and time.time() > deadline:
+                            raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
+                        digest.update(chunk)
+                        target.write(chunk)
+                target.flush()
+                return digest.hexdigest()
+            finally:
+                if copied_fd >= 0:
+                    os.close(copied_fd)
     except BaseException:
         if destination_created:
             with suppress(OSError):
@@ -996,42 +1016,6 @@ def _copy_pinned_file_descriptor(
                 else:
                     os.unlink(str(destination), dir_fd=destination_dir_fd)
         raise
-
-
-def _copy_pinned_file_descriptor_contents(
-    source_fd: int,
-    target: Any,
-    *,
-    max_bytes: int | None = None,
-    deadline: float | None = None,
-) -> str:
-    """Copy one retained source into an already-open target and return its digest."""
-    copied_fd = os.dup(source_fd)
-    try:
-        source_size = os.fstat(copied_fd).st_size
-        if max_bytes is not None and max_bytes >= 0 and source_size > max_bytes:
-            raise _ShardPinUnavailableError("validated source exceeds the staging byte limit")
-        if deadline is not None and time.time() > deadline:
-            raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
-        os.lseek(copied_fd, 0, os.SEEK_SET)
-        source = os.fdopen(copied_fd, "rb", closefd=True)
-        copied_fd = -1
-        digest = hashlib.sha256()
-        with source:
-            copied_bytes = 0
-            while chunk := source.read(1024 * 1024):
-                copied_bytes += len(chunk)
-                if max_bytes is not None and max_bytes >= 0 and copied_bytes > max_bytes:
-                    raise _ShardPinUnavailableError("validated source exceeds the staging byte limit")
-                if deadline is not None and time.time() > deadline:
-                    raise _ShardPinUnavailableError("validated source staging exceeded the scan deadline")
-                digest.update(chunk)
-                target.write(chunk)
-        target.flush()
-        return digest.hexdigest()
-    finally:
-        if copied_fd >= 0:
-            os.close(copied_fd)
 
 
 @contextmanager
@@ -1480,10 +1464,11 @@ def _pinned_shard_scan_path(
         if source_descriptor_path is None:
             raise _ShardPinUnavailableError("platform cannot expose the opened shard descriptor")
 
-        staging_path = Path(tempfile.mkdtemp(prefix=".modelaudit_scan_"))
-        initial_staging_stat = os.stat(staging_path, follow_symlinks=False)
-        staging_parent_fd = os.open(staging_path.parent, directory_flags)
-        staging_fd = os.open(staging_path, directory_flags)
+        staging_parent_path = Path(tempfile.gettempdir())
+        staging_parent_fd = os.open(staging_parent_path, directory_flags)
+        staging_path = Path(tempfile.mkdtemp(prefix=".modelaudit_scan_", dir=staging_parent_path))
+        initial_staging_stat = os.stat(staging_path.name, dir_fd=staging_parent_fd, follow_symlinks=False)
+        staging_fd = os.open(staging_path.name, directory_flags, dir_fd=staging_parent_fd)
         staging_directory_fds[()] = staging_fd
         staging_stat = os.fstat(staging_fd)
         effective_uid = getattr(os, "geteuid", lambda: staging_stat.st_uid)()

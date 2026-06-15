@@ -5893,7 +5893,7 @@ def scan_model_directory_or_file(
                             if alias_target is not None:
                                 trusted_hf_alias_targets[target_str] = alias_target
                         is_hf_onnx_alias = route_hf_onnx_alias and target_path == scan_source
-                        if is_hf_onnx_alias and bound_local_source_path is None:
+                        if is_hf_onnx_alias:
                             hf_onnx_alias_hash_sources[target_str] = str(resolved_file)
                         dedupe_target_str = (
                             str(resolved_file)
@@ -6436,8 +6436,12 @@ def scan_model_directory_or_file(
                         else {}
                     )
                     for scanned_file_path in scanned_file_paths:
-                        hash_source = hf_onnx_alias_hash_sources.get(scanned_file_path) or str(
-                            family_targets.get(scanned_file_path, {}).get("resolved_path", scanned_file_path)
+                        trusted_hash_alias_target = trusted_hf_alias_targets.get(scanned_file_path, {})
+                        trusted_hash_alias_source = trusted_hash_alias_target.get("resolved_path")
+                        hash_source = (
+                            hf_onnx_alias_hash_sources.get(scanned_file_path)
+                            or (trusted_hash_alias_source if isinstance(trusted_hash_alias_source, str) else None)
+                            or str(family_targets.get(scanned_file_path, {}).get("resolved_path", scanned_file_path))
                         )
                         hash_source_by_path[scanned_file_path] = hash_source
                         if hash_source not in seen_hash_sources:

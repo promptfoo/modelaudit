@@ -35,7 +35,6 @@ from modelaudit.utils.file.handlers import (
     _build_advanced_shard_family_cache_fingerprint,
     _close_windows_staging_directory_guard,
     _copy_pinned_file_descriptor,
-    _copy_pinned_file_descriptor_contents,
     _LinuxWriteLeaseGuard,
     _open_windows_staging_directory_guard,
     _pinned_file_descriptor_changed,
@@ -510,7 +509,7 @@ def test_regular_pinned_companion_rejects_source_mutation_during_copy(
     source_path.write_bytes(b"source")
     companion_path.write_bytes(b"companion")
 
-    original_copy = _copy_pinned_file_descriptor_contents
+    original_copy = _copy_pinned_file_descriptor
     companion_inode = companion_path.stat().st_ino
     created_staging_directories = _track_created_staging_directories(monkeypatch)
 
@@ -520,7 +519,7 @@ def test_regular_pinned_companion_rejects_source_mutation_during_copy(
             companion_path.write_bytes(b"mutated!!")
         return copied_hash
 
-    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor_contents", copy_then_mutate)
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", copy_then_mutate)
 
     with (
         pytest.raises(_ShardPinUnavailableError, match="companion target changed while staging"),
@@ -660,6 +659,65 @@ def test_nested_companion_open_failure_removes_created_staging_tree(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_staging_parent_open_failure_precedes_directory_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staging parent descriptor failure cannot leave a newly created root behind."""
+    source_dir = tmp_path / "source"
+    staging_parent = tmp_path / "staging"
+    source_dir.mkdir()
+    staging_parent.mkdir()
+    source_path = source_dir / "model.onnx"
+    source_path.write_bytes(b"source")
+    original_open = os.open
+    monkeypatch.setattr("modelaudit.utils.file.handlers.tempfile.gettempdir", lambda: str(staging_parent))
+
+    def fail_staging_parent_open(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> int:
+        if Path(path) == staging_parent and kwargs.get("dir_fd") is None:
+            raise OSError(errno.EMFILE, "descriptor table exhausted")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_staging_parent_open)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, fail_staging_parent_open})
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="descriptor table exhausted"),
+        _pinned_shard_scan_path(str(source_path), _target_for_path(source_path)),
+    ):
+        pytest.fail("staging parent descriptor exhaustion must stop before directory creation")
+
+    assert not list(staging_parent.glob(".modelaudit_scan_*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_staging_root_open_failure_removes_created_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Descriptor exhaustion after root creation cannot leak a private staging directory."""
+    source_path = tmp_path / "model.onnx"
+    source_path.write_bytes(b"source")
+    original_open = os.open
+    created_staging_directories = _track_created_staging_directories(monkeypatch)
+
+    def fail_staging_directory_open(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> int:
+        if os.fspath(path).startswith(".modelaudit_scan_") and kwargs.get("dir_fd") is not None:
+            raise OSError(errno.EMFILE, "descriptor table exhausted")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_staging_directory_open)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, fail_staging_directory_open})
+    with (
+        pytest.raises(_ShardPinUnavailableError, match="descriptor table exhausted"),
+        _pinned_shard_scan_path(str(source_path), _target_for_path(source_path)),
+    ):
+        pytest.fail("staging descriptor exhaustion must stop before dispatch")
+
+    assert created_staging_directories
+    assert all(not path.exists() for path in created_staging_directories)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
 def test_regular_pinned_copy_uses_validated_size_as_hard_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -670,14 +728,14 @@ def test_regular_pinned_copy_uses_validated_size_as_hard_limit(
     source_stat = source_path.stat()
     target = _target_for_path(source_path)
     observed_limits: list[int | None] = []
-    original_copy = _copy_pinned_file_descriptor_contents
+    original_copy = _copy_pinned_file_descriptor
 
     def grow_before_copy(source_fd: int, destination: Any, **kwargs: Any) -> str:
         observed_limits.append(kwargs.get("max_bytes"))
         source_path.write_bytes(b"x" * (2 * 1024 * 1024))
         return original_copy(source_fd, destination, **kwargs)
 
-    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor_contents", grow_before_copy)
+    monkeypatch.setattr("modelaudit.utils.file.handlers._copy_pinned_file_descriptor", grow_before_copy)
     with (
         pytest.raises(_ShardPinUnavailableError, match="regular source scan path"),
         _pinned_shard_scan_path(
