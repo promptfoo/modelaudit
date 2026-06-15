@@ -12,7 +12,9 @@
 | **Release**                | `release-please.yml`    | Pushes to main and manual dispatch        |
 | **Docker Publish**         | `docker-publish.yml`    | Published releases and manual dispatch    |
 
-Python CI ignores documentation-only PRs, which are handled by the documentation check workflow. Code PRs run fast feedback on Python 3.12, root matrix coverage on Python 3.10 and 3.13, the NumPy compatibility lane on Python 3.10 and 3.11, Windows tests on Python 3.11, and the standalone pickle package matrix on Python 3.10-3.13. Pushes to `main` run the full root and NumPy matrices across Python 3.10-3.13.
+Python CI ignores documentation-only PRs, which are handled by the documentation check workflow. Code PRs use GitHub's default merge-ref checkout and run fail-fast root tests on Python 3.10, 3.12, and 3.13, a single Windows shard on Python 3.11, the reduced NumPy compatibility lane, and the standalone pickle package matrix on Python 3.10-3.13. Workflow-changing PRs run exhaustive sharded root tests across Python 3.10-3.13. Dependency audit runs on dependency-relevant PR merge refs and again on `merge_group` candidate SHAs, while the optional `run-slow-tests` label remains PR-only because merge-group payloads do not carry pull request label context.
+
+Pushes to `main` and `merge_group` runs validate the exact integration SHA with the full sharded fast-test matrices across Linux and Windows, the dedicated Python 3.12 slow/integration lane, 10-way coverage sharding, the full NumPy compatibility lane, and the build/package lanes. Merge-group runs intentionally fail closed: they are treated as integration events instead of depending on changed-path classification to decide whether required lanes should run, so `CI Success` cannot go green from skipped or setup-only jobs on the merge queue candidate SHA.
 
 The performance workflow compares workload-oriented benchmarks between the PR
 base and head, posts a sticky summary comment on same-repo PRs, uploads JSON and
