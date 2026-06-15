@@ -11189,7 +11189,7 @@ class TestZipScanner:
             archive.writestr(
                 "LICENSE.txt",
                 "NumPy license information\n"
-                "GNU GENERAL PUBLIC LICENSE Version 3\n"
+                "GNU GENERAL LICENSE Version 3\n"
                 "Copyright 2026 NumPy Developers\n"
                 "2. Basic Rights.\n"
                 "Rights are granted to use and redistribute this software.\n",

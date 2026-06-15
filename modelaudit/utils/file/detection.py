@@ -5813,11 +5813,23 @@ def _iter_pickle_candidate_offsets(
             and has_nontrivial_prefix
             and payload[offset - 1] in b"3456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
         )
+        if (
+            opcode_name == "PERSID"
+            and has_nontrivial_prefix
+            and payload[offset - 1] in b"3456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+        ):
+            continue
         require_continuation = offset > 0
         if opcode_name == "PERSID":
-            # pickletools has parsed the complete protocol-0 operand, so CPython
-            # can call persistent_load before any later tail is rejected.
-            require_continuation = False
+            # A complete line-leading protocol-0 operand reaches persistent_load
+            # before any later tail is rejected. Mid-word P bytes still need the
+            # existing structural candidate boundary before they own prose.
+            if line_start == offset:
+                require_continuation = False
+            elif require_continuation:
+                line_end = payload.find(b"\n", offset + 1)
+                if _has_structural_pickle_continuation(payload, line_end + 1):
+                    require_continuation = False
         if opcode_name in _PICKLE_LINE_PAIR_OPCODES:
             first_line_end = payload.find(b"\n", offset + 1)
             second_line_end = payload.find(b"\n", first_line_end + 1)
