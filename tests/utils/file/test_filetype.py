@@ -455,6 +455,19 @@ def test_detect_ambiguous_jax_json_preempts_legal_text_fallback(
     assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
 
 
+@pytest.mark.parametrize("filename", ["LICENSE.md", "NOTICE.txt"])
+def test_detect_jax_json_legal_sidecar_suffix_preempts_text_fallback(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    checkpoint_path = tmp_path / filename
+    checkpoint_path.write_text('{"license":"MIT","framework":"jax"}', encoding="utf-8")
+
+    assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+
+
 def test_detect_oversized_visible_ajax_prefix_stays_ambiguous_with_unseen_late_jax_identity(tmp_path: Path) -> None:
     visible_non_jax = tmp_path / "large-ajax.jpg"
     late_jax = tmp_path / "large-ajax-late-jax.jpg"

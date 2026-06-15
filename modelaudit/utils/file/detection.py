@@ -10050,7 +10050,7 @@ def _detect_structured_legal_sidecar_route(
         max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     ):
         return "xgboost"
-    if _could_be_content_routed_jax_json_checkpoint(file_path):
+    if _probe_jax_json_checkpoint_file(file_path) is not False:
         return "jax_checkpoint"
     if huggingface_tokenizer_json_has_template_route_evidence(file_path, allow_renamed_path=True):
         return "jinja2_template"
