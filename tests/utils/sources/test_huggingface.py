@@ -1679,16 +1679,26 @@ class TestModelDownload:
     def test_build_filtered_cache_uses_exclusive_staging(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Equivalent acquisitions receive separate non-destructive staging directories."""
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        cache_root = tmp_path / "hf-cache"
+        if huggingface_module._is_windows_platform():
+            monkeypatch.setattr(
+                huggingface_module,
+                "_get_windows_huggingface_filtered_staging_root",
+                lambda: cache_root,
+            )
         first = _build_huggingface_filtered_download_path(
-            tmp_path / "hf-cache",
+            cache_root,
             "test",
             "model",
             "test/model",
         )
         second = _build_huggingface_filtered_download_path(
-            tmp_path / "hf-cache",
+            cache_root,
             "test",
             "model",
             "test/model",
