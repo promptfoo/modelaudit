@@ -50,7 +50,7 @@ dependencies = [
     "posthog>=7.0.0",
     "protobuf>=5.29.0",
     "msgpack>=1.0.0,<2.0",
-    "modelaudit-picklescan>=0.1.4,<0.2.0",
+    "modelaudit-picklescan>=0.1.7,<0.2.0",
 ]
 
 [project.optional-dependencies]
