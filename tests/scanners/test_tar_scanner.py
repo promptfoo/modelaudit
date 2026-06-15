@@ -154,38 +154,28 @@ class TestTarScanner:
         finally:
             os.unlink(tmp_path)
 
-    def test_can_handle_compressed_tar_files(self):
-        """Test that the scanner correctly identifies compressed TAR files"""
-        # Test tar.gz
-        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-            with tarfile.open(tmp.name, "w:gz") as t:
-                info = tarfile.TarInfo("test.txt")
-                content = b"Hello World"
-                info.size = len(content)
-                t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
-            tmp_path_gz = tmp.name
+    def test_can_handle_compressed_tar_files(self, tmp_path: Path) -> None:
+        """Test that the scanner correctly identifies compressed TAR files."""
+        tmp_path_gz = tmp_path / "fixture.tar.gz"
+        with tarfile.open(tmp_path_gz, "w:gz") as t:
+            info = tarfile.TarInfo("test.txt")
+            content = b"Hello World"
+            info.size = len(content)
+            t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
 
-        # Test tar.bz2
-        with tempfile.NamedTemporaryFile(suffix=".tar.bz2", delete=False) as tmp:
-            with tarfile.open(tmp.name, "w:bz2") as t:
-                info = tarfile.TarInfo("test.txt")
-                content = b"Hello World"
-                info.size = len(content)
-                t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
-            tmp_path_bz2 = tmp.name
+        tmp_path_bz2 = tmp_path / "fixture.tar.bz2"
+        with tarfile.open(tmp_path_bz2, "w:bz2") as t:
+            info = tarfile.TarInfo("test.txt")
+            content = b"Hello World"
+            info.size = len(content)
+            t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
 
-        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-            tmp.write(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
-            tmp_path_gzip_pickle = tmp.name
+        tmp_path_gzip_pickle = tmp_path / "pickle.tar.gz"
+        tmp_path_gzip_pickle.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
 
-        try:
-            assert TarScanner.can_handle(tmp_path_gz) is True
-            assert TarScanner.can_handle(tmp_path_bz2) is True
-            assert TarScanner.can_handle(tmp_path_gzip_pickle) is False
-        finally:
-            os.unlink(tmp_path_gz)
-            os.unlink(tmp_path_bz2)
-            os.unlink(tmp_path_gzip_pickle)
+        assert TarScanner.can_handle(str(tmp_path_gz)) is True
+        assert TarScanner.can_handle(str(tmp_path_bz2)) is True
+        assert TarScanner.can_handle(str(tmp_path_gzip_pickle)) is False
 
     def test_can_handle_corrupt_gzip_returns_false(self, tmp_path: Path) -> None:
         path = tmp_path / "corrupt.tar.gz"
@@ -2515,6 +2505,20 @@ class TestTarScanner:
             tmp_path / "late-invalid-benign-cache",
         )
 
+    def test_raw_tar_nonzero_tail_fails_closed(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "raw-nonzero-tail.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("safe.txt")
+            payload = b"safe"
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+        archive_path.write_bytes(archive_path.read_bytes() + b"hidden")
+
+        result = TarScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
+
     def test_sparse_large_raw_tar_complete_end_marker_remains_successful(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "complete-end-marker.tar"
         _write_sparse_raw_tar(
@@ -3321,7 +3325,7 @@ class TestTarScanner:
                 info.pax_headers = {"comment": "A" * (40 * 1024)}
                 archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
 
-        assert file_detection._detect_tar_route(str(archive_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+        assert file_detection._detect_tar_route(str(archive_path)) == "tar"
 
         result = TarScanner(config={"max_tar_metadata_bytes": 64 * 1024}).scan(str(archive_path))
 
@@ -3336,7 +3340,7 @@ class TestTarScanner:
                 info = tarfile.TarInfo(("a" * (40 * 1024)) + f"-{index}.txt")
                 archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
 
-        assert file_detection._detect_tar_route(str(archive_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+        assert file_detection._detect_tar_route(str(archive_path)) == "tar"
 
         result = TarScanner(config={"max_tar_metadata_bytes": 64 * 1024}).scan(str(archive_path))
 

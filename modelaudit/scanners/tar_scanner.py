@@ -21,6 +21,7 @@ from typing import Any, BinaryIO, ClassVar, cast
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.file.detection import (
     _NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS,
+    _looks_like_uncompressed_tar_header,
     _NemoRouteResolutionLimitExceeded,
     _resolve_safe_tar_link_target_name,
     _resolve_safe_tar_path_through_symlinks,
@@ -174,7 +175,7 @@ class _TarBoundedStream:
 
 
 class _StrictConcatenatedDecompressionReader:
-    """Stream bzip2/xz data without silently discarding physical trailing bytes."""
+    """Stream gzip/bzip2/xz members and reject unbounded physical tails."""
 
     _RAW_READ_SIZE = 8 * 1024
 
@@ -194,14 +195,16 @@ class _StrictConcatenatedDecompressionReader:
         self._eof = False
 
     def _new_decompressor(self) -> Any:
+        if self._compression_codec == "gzip":
+            return zlib.decompressobj(wbits=31)
         if self._compression_codec == "bzip2":
             return bz2.BZ2Decompressor()
         if self._compression_codec == "xz":
             return lzma.LZMADecompressor()
         raise ValueError(f"Unsupported strict decompression codec: {self._compression_codec}")
 
-    def _read_after_xz_padding(self, initial: bytes) -> bytes | None:
-        """Skip valid four-byte XZ stream padding before a possible next stream."""
+    def _read_after_padding(self, initial: bytes) -> bytes | None:
+        """Bound permitted zero padding before a possible next compressed stream."""
         block = initial
         stream_padding_size = 0
         while True:
@@ -218,21 +221,21 @@ class _StrictConcatenatedDecompressionReader:
                     reason=TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON,
                 )
             if block:
-                if stream_padding_size % 4 != 0:
+                if self._compression_codec == "xz" and stream_padding_size % 4 != 0:
                     raise _TarCompressedPhysicalTrailingData("Invalid XZ stream padding")
                 return block
 
             padding_remaining = self._max_xz_padding_bytes - self._xz_padding_bytes_read
             block = self._fileobj.read(min(self._RAW_READ_SIZE, padding_remaining + 1))
             if not block:
-                if stream_padding_size % 4 != 0:
+                if self._compression_codec == "xz" and stream_padding_size % 4 != 0:
                     raise _TarCompressedPhysicalTrailingData("Invalid XZ stream padding")
                 return None
 
     def _next_stream_input(self) -> bytes | None:
         block = cast(bytes, self._decompressor.unused_data)
-        if self._compression_codec == "xz":
-            return self._read_after_xz_padding(block)
+        if self._compression_codec in {"gzip", "xz"}:
+            return self._read_after_padding(block)
         if not block:
             block = self._fileobj.read(self._RAW_READ_SIZE)
         return block or None
@@ -240,7 +243,7 @@ class _StrictConcatenatedDecompressionReader:
     def _decompress(self, block: bytes, max_length: int) -> bytes:
         try:
             return cast(bytes, self._decompressor.decompress(block, max_length))
-        except (OSError, lzma.LZMAError) as exc:
+        except (OSError, lzma.LZMAError, zlib.error) as exc:
             if self._completed_streams > 0:
                 raise _TarCompressedPhysicalTrailingData(
                     "Compressed wrapper contains invalid physical trailing data"
@@ -262,7 +265,7 @@ class _StrictConcatenatedDecompressionReader:
                     self._eof = True
                     break
                 self._decompressor = self._new_decompressor()
-            elif self._decompressor.needs_input:
+            elif getattr(self._decompressor, "needs_input", not getattr(self._decompressor, "unconsumed_tail", b"")):
                 block = self._fileobj.read(self._RAW_READ_SIZE)
                 if not block:
                     if self._completed_streams > 0:
@@ -271,7 +274,7 @@ class _StrictConcatenatedDecompressionReader:
                         )
                     raise EOFError("Compressed file ended before the end-of-stream marker")
             else:
-                block = b""
+                block = cast(bytes, self._decompressor.unconsumed_tail) if self._compression_codec == "gzip" else b""
 
             output.extend(self._decompress(block, size - len(output)))
 
@@ -496,8 +499,8 @@ class TarScanner(BaseScanner):
 
     @contextmanager
     def _open_tar_stream(self, path: str) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream | None, str | None]]:
-        """Open a TAR stream through a bounded decompressed-byte reader."""
-        compression_codec = self._detect_compressed_tar_wrapper(path)
+        """Open raw TAR seekably or compressed TAR through bounded r| traversal."""
+        compression_codec = None if self._raw_tar_has_valid_header(path) else self._detect_compressed_tar_wrapper(path)
         with open(path, "rb") as raw, ExitStack() as stack:
             if compression_codec is None:
                 archive = stack.enter_context(
@@ -516,18 +519,10 @@ class TarScanner(BaseScanner):
                 yield archive, None, None
                 return
 
-            if compression_codec == "gzip":
-                decompressed: Any = stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb"))
-            elif compression_codec == "bzip2":
-                decompressed = _StrictConcatenatedDecompressionReader(
+            if compression_codec in {"gzip", "bzip2", "xz"}:
+                decompressed: Any = _StrictConcatenatedDecompressionReader(
                     raw,
-                    compression_codec="bzip2",
-                    max_xz_padding_bytes=self.max_xz_padding_bytes,
-                )
-            elif compression_codec == "xz":
-                decompressed = _StrictConcatenatedDecompressionReader(
-                    raw,
-                    compression_codec="xz",
+                    compression_codec=compression_codec,
                     max_xz_padding_bytes=self.max_xz_padding_bytes,
                 )
             else:  # pragma: no cover - _detect_compressed_tar_wrapper returns only supported codecs.
@@ -818,6 +813,14 @@ class TarScanner(BaseScanner):
         return tmp_path, total_size
 
     @staticmethod
+    def _raw_tar_has_valid_header(path: str) -> bool:
+        with open(path, "rb") as file_obj:
+            prefix = file_obj.read(tarfile.BLOCKSIZE)
+            if prefix == b"\0" * tarfile.BLOCKSIZE:
+                prefix += file_obj.read(tarfile.BLOCKSIZE)
+        return TarScanner._looks_like_empty_tar_prefix(prefix) or _looks_like_uncompressed_tar_header(prefix)
+
+    @staticmethod
     def _detect_compressed_tar_wrapper(path: str) -> str | None:
         """Detect compressed TAR wrappers by content, not by filename suffix."""
         with open(path, "rb") as file_obj:
@@ -898,13 +901,40 @@ class TarScanner(BaseScanner):
         except OSError:
             return False
 
-    @staticmethod
-    def _raw_tar_has_complete_end_marker(tar: tarfile.TarFile) -> bool:
-        """Validate the two zero blocks required where raw TAR traversal stopped."""
+    def _raw_tar_has_complete_end_marker(self, tar: tarfile.TarFile) -> bool:
+        """Validate raw TAR EOF and bounded zero-only record padding."""
         file_obj = cast(BinaryIO, tar.fileobj)
         file_obj.seek(tar.offset)
-        end_marker = file_obj.read(2 * tarfile.BLOCKSIZE)
-        return end_marker == b"\0" * (2 * tarfile.BLOCKSIZE)
+        if file_obj.read(2 * tarfile.BLOCKSIZE) != b"\0" * (2 * tarfile.BLOCKSIZE):
+            return False
+        tail_start = file_obj.tell()
+        tail_size = os.fstat(file_obj.fileno()).st_size - tail_start
+        if tail_size <= self.max_xz_padding_bytes:
+            return not any(file_obj.read())
+        if hasattr(os, "SEEK_DATA") and hasattr(os, "SEEK_HOLE"):
+            offset = tail_start
+            while True:
+                try:
+                    data_offset = os.lseek(file_obj.fileno(), offset, os.SEEK_DATA)
+                except OSError as exc:
+                    return exc.errno == errno.ENXIO
+                hole_offset = os.lseek(file_obj.fileno(), data_offset, os.SEEK_HOLE)
+                file_obj.seek(data_offset)
+                remaining = hole_offset - data_offset
+                while remaining > 0:
+                    chunk = file_obj.read(min(ARCHIVE_MEMBER_COPY_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        return True
+                    if any(chunk):
+                        return False
+                    remaining -= len(chunk)
+                offset = hole_offset
+        tail_size = 0
+        while chunk := file_obj.read(min(ARCHIVE_MEMBER_COPY_CHUNK_BYTES, self.max_xz_padding_bytes - tail_size + 1)):
+            tail_size += len(chunk)
+            if tail_size > self.max_xz_padding_bytes or any(chunk):
+                return False
+        return True
 
     def _add_compressed_wrapper_limit_check(
         self,

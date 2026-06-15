@@ -1399,8 +1399,6 @@ class NemoScanner(BaseScanner):
             if preflight_reasons and preflight_reasons <= _PREFLIGHT_PREFIX_ANALYSIS_REASONS:
                 shared_budget.member_bytes_consumed = initial_member_bytes
                 shared_budget.exhausted = initial_budget_exhausted
-                tar_scanner.config["cache_enabled"] = False
-                tar_scanner.current_file_path = path
                 result.merge(tar_scanner._scan_tar_file(path, depth=archive_depth))
             else:
                 mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
