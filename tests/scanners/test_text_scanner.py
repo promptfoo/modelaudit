@@ -147,7 +147,7 @@ def test_text_scanner_routes_legal_stem_env_files_as_env_and_detects_aws_credent
 @pytest.mark.parametrize(
     ("filename", "expected_type", "content"),
     [
-        ("LICENSE", "license", "Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\nPermission is granted.\r\n"),
+        ("LICENSE", "license", "Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\nRights are granted.\r\n"),
         ("NOTICE", "notice", "NOTICE\nThis product includes third-party software.\nCopyright 2026 Example.\n"),
     ],
 )
@@ -222,7 +222,7 @@ def test_text_scanner_does_not_claim_invalid_legal_sidecar_fallback(
 def test_directory_scan_routes_legal_sidecar_to_text_before_pickle_probe(tmp_path: Path) -> None:
     license_path = tmp_path / "LICENSE"
     license_path.write_text(
-        "Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\nPermission is hereby granted.\r\n",
+        "Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\nRights are hereby granted.\r\n",
         encoding="utf-8",
     )
 
