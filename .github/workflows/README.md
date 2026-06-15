@@ -12,7 +12,7 @@
 | **Release**                | `release-please.yml`    | Pushes to main and manual dispatch        |
 | **Docker Publish**         | `docker-publish.yml`    | Published releases and manual dispatch    |
 
-Python CI ignores documentation-only PRs, which are handled by the documentation check workflow. Code PRs run fast feedback on Python 3.12, root matrix coverage on Python 3.10 and 3.13, the NumPy compatibility lane on Python 3.10 and 3.11, Windows tests on Python 3.11, and the standalone pickle package matrix on Python 3.10-3.13. Pushes to `main` run the full root and NumPy matrices across Python 3.10-3.13.
+Python CI ignores documentation-only PRs, which are handled by the documentation check workflow. Code PRs run fail-fast root tests on Python 3.10, 3.12, and 3.13, Windows tests on Python 3.11, and the standalone pickle package matrix on Python 3.10-3.13. Workflow-changing PRs run exhaustive sharded root tests across Python 3.10-3.13. Merge queue candidates and pushes to `main` also run the slow/integration suite and full NumPy compatibility matrix.
 
 The performance workflow compares workload-oriented benchmarks between the PR
 base and head, posts a sticky summary comment on same-repo PRs, uploads JSON and
