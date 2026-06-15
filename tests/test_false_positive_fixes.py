@@ -299,14 +299,15 @@ class TestFalsePositiveFixes:
         bert_file = tmp_path / "bert-base-uncased-pytorch_model.bin"
 
         # Create model weights with realistic sizes
-        np.random.seed(42)
+        generator = torch.Generator().manual_seed(42)
         bert_weights = {
-            "embeddings.word_embeddings.weight": torch.randn(30522, 768) * 0.02,  # Vocab size x hidden size
-            "embeddings.position_embeddings.weight": torch.randn(512, 768) * 0.02,
-            "embeddings.token_type_embeddings.weight": torch.randn(2, 768) * 0.02,
-            "encoder.layer.0.attention.self.query.weight": torch.randn(768, 768) * 0.02,
-            "encoder.layer.0.attention.self.key.weight": torch.randn(768, 768) * 0.02,
-            "encoder.layer.0.attention.self.value.weight": torch.randn(768, 768) * 0.02,
+            "embeddings.word_embeddings.weight": torch.randn(30522, 768, generator=generator)
+            * 0.02,  # Vocab size x hidden size
+            "embeddings.position_embeddings.weight": torch.randn(512, 768, generator=generator) * 0.02,
+            "embeddings.token_type_embeddings.weight": torch.randn(2, 768, generator=generator) * 0.02,
+            "encoder.layer.0.attention.self.query.weight": torch.randn(768, 768, generator=generator) * 0.02,
+            "encoder.layer.0.attention.self.key.weight": torch.randn(768, 768, generator=generator) * 0.02,
+            "encoder.layer.0.attention.self.value.weight": torch.randn(768, 768, generator=generator) * 0.02,
         }
 
         # Save the model
