@@ -688,8 +688,17 @@ jobs:
           path: packages/modelaudit-picklescan/dist/
 
   publish-pypi:
-    if: needs.release-please.outputs.release_created == 'true'
-    needs: [build, release-please]
+    if: >-
+      ${{
+        always() &&
+        needs.release-please.outputs.release_created == 'true' &&
+        needs.build.result == 'success' &&
+        (
+          needs.release-please.outputs.picklescan_release_created != 'true' ||
+          needs.verify-picklescan-pypi.result == 'success'
+        )
+      }}
+    needs: [build, release-please, verify-picklescan-pypi]
     runs-on: ubuntu-latest
     environment:
       name: pypi

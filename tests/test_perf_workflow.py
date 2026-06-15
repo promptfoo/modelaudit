@@ -453,29 +453,25 @@ def test_python_ci_integration_scheduling_covers_remaining_job_surface() -> None
         assert jobs[job_name]["if"] == expected_condition
 
 
-def test_python_ci_keeps_quick_feedback_pr_only() -> None:
+def test_python_ci_fast_linux_matrix_folds_quick_feedback_into_ordinary_prs() -> None:
     workflow = _load_workflow("test.yml")
-    quick_feedback_job = _jobs(workflow)["quick-feedback"]
-    assert isinstance(quick_feedback_job, dict)
-    assert quick_feedback_job["if"] == (
-        "github.event_name == 'pull_request' && "
-        "(needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true')"
-    )
+    jobs = _jobs(workflow)
+    assert "quick-feedback" not in jobs
+    assert "quick-feedback" not in jobs["ci-success"]["needs"]
 
-
-def test_python_ci_fast_linux_matrix_proves_main_shards_without_expanding_ordinary_prs() -> None:
-    workflow = _load_workflow("test.yml")
-    test_job = _jobs(workflow)["test"]
-    assert isinstance(test_job, dict)
+    test_job = jobs["test"]
     assert test_job["if"] == (
         "needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || "
         "needs.changes.outputs.workflows == 'true'"
     )
 
-    matrix_options = _matrix_options(test_job["strategy"]["matrix"]["include"])
+    matrix_expression = test_job["strategy"]["matrix"]["include"]
+    assert "needs.changes.outputs.workflows != 'true'" in matrix_expression
+    matrix_options = _matrix_options(matrix_expression)
     assert matrix_options == [
         [
             {"python-version": "3.10", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
+            {"python-version": "3.12", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
             {"python-version": "3.13", "shard-count": 1, "shard-index": 0, "shard-name": "1/1"},
         ],
         [
@@ -496,6 +492,7 @@ def test_python_ci_fast_linux_matrix_proves_main_shards_without_expanding_ordina
     assert fail_fast_step["if"] == ("github.event_name == 'pull_request' && needs.changes.outputs.workflows != 'true'")
     fail_fast_run = fail_fast_step["run"]
     assert "--maxfail=1" in fail_fast_run
+    assert '-m "not slow and not integration and not performance"' in fail_fast_run
     assert "--modelaudit-shard-count ${{ matrix.shard-count }}" in fail_fast_run
     assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in fail_fast_run
 
@@ -511,7 +508,6 @@ def test_python_ci_fast_linux_matrix_proves_main_shards_without_expanding_ordina
 def test_python_ci_windows_matrix_shards_main_and_workflow_prs() -> None:
     workflow = _load_workflow("test.yml")
     windows_job = _jobs(workflow)["windows-tests"]
-    assert isinstance(windows_job, dict)
     assert windows_job["if"] == (
         "needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || "
         "needs.changes.outputs.workflows == 'true'"
@@ -548,13 +544,11 @@ def test_python_ci_runs_slow_suite_in_a_separate_job() -> None:
     jobs = _jobs(workflow)
 
     slow_job = jobs["slow-tests"]
-    assert isinstance(slow_job, dict)
     assert slow_job["if"] == (
         "needs.changes.outputs.integration == 'true' || "
         "(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests'))"
     )
     slow_steps = slow_job["steps"]
-    assert isinstance(slow_steps, list)
     assert (
         '-m "slow or integration or performance"'
         in _step_by_name(
@@ -564,7 +558,6 @@ def test_python_ci_runs_slow_suite_in_a_separate_job() -> None:
     )
 
     fast_steps = jobs["test"]["steps"]
-    assert isinstance(fast_steps, list)
     fast_step_names = {step.get("name") for step in fast_steps}
     assert "Run slow/integration tests on PR (if labeled)" not in fast_step_names
     assert "Run slow/integration tests (main branch only)" not in fast_step_names
@@ -575,14 +568,12 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     jobs = _jobs(workflow)
 
     coverage_job = jobs["coverage"]
-    assert isinstance(coverage_job, dict)
     assert coverage_job["if"] == (
         "needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'"
     )
     assert coverage_job["permissions"] == {"contents": "read", "id-token": "write"}
     assert coverage_job["strategy"]["matrix"]["shard"] == list(range(10))
     coverage_steps = coverage_job["steps"]
-    assert isinstance(coverage_steps, list)
     coverage_run = _step_by_name(coverage_steps, "Run branch coverage shard")["run"]
     assert "--modelaudit-shard-count 10" in coverage_run
     assert "--modelaudit-shard-index ${{ matrix.shard }}" in coverage_run
@@ -595,14 +586,11 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     assert upload_step["with"]["files"] == "./coverage.xml"
 
     ci_success_job = jobs["ci-success"]
-    assert isinstance(ci_success_job, dict)
     assert "coverage" in ci_success_job["needs"]
     assert "slow-tests" in ci_success_job["needs"]
     ci_success_steps = ci_success_job["steps"]
-    assert isinstance(ci_success_steps, list)
     gate_script = _step_by_name(ci_success_steps, "Check if all jobs succeeded")["run"]
     expected_assignments = {
-        "EXPECT_QUICK_FEEDBACK": jobs["quick-feedback"]["if"],
         "EXPECT_CORE_FAST": jobs["test"]["if"],
         "EXPECT_SLOW": jobs["slow-tests"]["if"],
         "EXPECT_DEPENDENCY_AUDIT": jobs["dependency-audit"]["if"],
@@ -619,7 +607,6 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     assert 'if [[ "$expected" == "true" && "$result" != "success" ]]; then' in gate_script
     assert '[[ "$CHANGES_RESULT" == "success" ]] || FAILED=true' in gate_script
     expected_results = [
-        ("EXPECT_QUICK_FEEDBACK", "QUICK_FEEDBACK_RESULT"),
         ("EXPECT_CORE_FAST", "LINT_RESULT"),
         ("EXPECT_DEPENDENCY_AUDIT", "DEPENDENCY_AUDIT_RESULT"),
         ("EXPECT_DEPENDENCY_SURFACE", "LICENSE_RESULT"),
