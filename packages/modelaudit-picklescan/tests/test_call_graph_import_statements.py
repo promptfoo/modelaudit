@@ -571,6 +571,74 @@ def test_shared_source_sensitive_caches_fails_closed_after_mid_report_refresh(
     assert any(error.details.get("analysis") == "python_call_graph_source_stability" for error in changed_report.errors)
 
 
+def test_call_graph_report_avoids_runtime_distribution_discovery_during_benign_cache_population(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path_entry = str(tmp_path)
+    monkeypatch.syspath_prepend(path_entry)
+    monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
+    importlib.invalidate_caches()
+    payload = _global_call_payload("builtins", "print", _unicode_operand("echo benign"))
+    real_startup_findings = api_module.find_startup_hook_write_call_graphs
+    cache_populated = False
+    runtime_distribution_discovery_calls = 0
+    trusted_root = call_graph._TRUSTED_SITE_PACKAGE_PATHS[0]
+
+    def runtime_packages_distributions() -> dict[str, list[str]]:
+        nonlocal runtime_distribution_discovery_calls
+        runtime_distribution_discovery_calls += 1
+        return {}
+
+    def runtime_distribution(_name: str) -> object:
+        nonlocal runtime_distribution_discovery_calls
+        runtime_distribution_discovery_calls += 1
+        return object()
+
+    # Distribution discovery can lazily import helper modules. It must remain
+    # outside the report snapshot so benign initialization cannot churn it.
+    monkeypatch.setattr(call_graph, "packages_distributions", runtime_packages_distributions)
+    monkeypatch.setattr(call_graph, "distribution", runtime_distribution)
+    monkeypatch.setattr(
+        call_graph,
+        "_STARTUP_DISTRIBUTION_ROOTS",
+        {"probe": ((trusted_root / "probe.dist-info", tmp_path.resolve()),)},
+    )
+    _clear_call_graph_caches()
+
+    def populate_before_later_subpass(
+        import_references: object,
+        callable_invocations: object | None = None,
+        *,
+        callable_invocations_complete: bool = True,
+    ) -> tuple[call_graph.StartupHookWriteFinding, ...]:
+        nonlocal cache_populated
+        if not cache_populated:
+            monkeypatch.setitem(
+                sys.path_importer_cache,
+                path_entry,
+                FileFinder(path_entry, *call_graph._STANDARD_FILE_FINDER_LOADER_DETAILS),
+            )
+            cache_populated = True
+        assert call_graph._installed_distribution_roots("probe") == (tmp_path.resolve(),)
+        return real_startup_findings(
+            import_references,
+            callable_invocations,
+            callable_invocations_complete=callable_invocations_complete,
+        )
+
+    monkeypatch.setattr(api_module, "find_startup_hook_write_call_graphs", populate_before_later_subpass)
+    try:
+        report = scan_bytes(payload, source="benign-mid-report-importer-population.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert cache_populated is True
+    assert runtime_distribution_discovery_calls == 0
+    assert report.status == ScanStatus.COMPLETE
+    assert not any(error.details.get("analysis") == "python_call_graph_source_stability" for error in report.errors)
+
+
 def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
 

@@ -51,6 +51,7 @@ jobs:
               - 'Dockerfile.tensorflow'
               - 'requirements-tensorflow.txt'
               - 'modelaudit/**'
+              - 'packages/modelaudit-picklescan/**'
               - 'pyproject.toml'
               - '.github/workflows/docker-image-test.yml'
 

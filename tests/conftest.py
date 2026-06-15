@@ -155,6 +155,7 @@ def pytest_runtest_setup(item):
             "test_sarif_redaction.py",  # SARIF exported source credential-redaction regressions
             "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_dependency_lock.py",  # Security-sensitive uv.lock dependency guardrails
+            "test_perf_workflow.py",  # GitHub Actions workflow contract and benchmark regression tests
             "test_bug1_confidence_exploit.py",  # Security bug test
             "test_gguf_scanner.py",  # GGUF scanner tests
             "test_jax_checkpoint_scanner.py",  # JAX checkpoint scanner tests
@@ -271,7 +272,6 @@ def pytest_runtest_setup(item):
             "test_hooks_egress.py",  # progress hook egress allowlist regressions
             "test_release_workflow.py",  # release workflow regression tests
             "test_docker_workflow.py",  # Docker workflow regression tests
-            "test_perf_workflow.py",  # Performance benchmark workflow regression tests
             "test_sbom_symlink_containment.py",  # SBOM symlink containment regression tests
             "test_sbom_url_fixes.py",  # SBOM URL handling and credential-redaction regressions
         ]
