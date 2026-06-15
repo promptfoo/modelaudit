@@ -66,6 +66,7 @@ def test_intentional_incomplete_pickle_asset_preserves_security_exit() -> None:
     metadata = result.file_metadata[path].model_dump(exclude_none=True)
 
     assert result.has_errors is False
+    assert result.success is False
     assert results_have_inconclusive_outcome(result) is True
     assert metadata["scan_outcome"] == "inconclusive"
     assert metadata["scan_outcome_reasons"] == ["nested_pickle_incomplete"]
