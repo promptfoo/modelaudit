@@ -9,9 +9,8 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper
 
-import modelaudit.core as core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners import onnx_scanner as scanner
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
@@ -250,13 +249,13 @@ def test_external_data_race_is_uncached_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_path, sidecar = _external_package(tmp_path)
-    original = core.scan_file
+    original = scan_file
 
     def mutate_before_scan(path: str, config: dict[str, Any]) -> Any:
         sidecar.write_bytes(b"changed")
         return original(path, config)
 
-    monkeypatch.setattr(core, "scan_file", mutate_before_scan)
+    monkeypatch.setattr("modelaudit.core.scan_file", mutate_before_scan)
     cache_dir = tmp_path / "cache"
     reset_cache_manager()
     try:
