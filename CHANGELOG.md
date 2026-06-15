@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - validate index-driven zero- and one-based SafeTensors shard families, retain case-insensitive or prefixed index authority after remote materialization, intersect same-parent indexes with selected shard families, bind streamed or explicit scans to one index generation, stop over-limit remote indexes before range or SDK I/O, retain standard and streamed local-directory descriptor chains with Windows replacement guards, and reject recreated delete-after-scan shards without widening selected scanners to foreign shard formats, suppressing overlap-capable routes, trusting names without index authority, exposing transient descriptor paths, or accepting post-pin source changes
+- preserve native-architecture Rust installer selection for Docker builds that do not expose BuildKit's `TARGETARCH` argument
 - require and bundle `modelaudit-picklescan>=0.1.7` so root releases and source-built Docker images cannot run with the pre-hardening call-graph resolver
 - publish and verify coordinated `modelaudit-picklescan` releases before uploading a dependent root release
 - keep result-cache resolution fingerprints aligned with cached misses, symlink-sensitive lexical paths, loaded-package and namespace source-precedence contexts, bounded `FileFinder` summaries, archive-validated `zipimporter` state, and startup-frozen distribution roots so shared scans cannot reuse stale origin trust or fail on metadata-only finder removal
