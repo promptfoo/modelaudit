@@ -1481,6 +1481,51 @@ def _has_active_shell_substitution(text: str) -> bool:
     return False
 
 
+def _has_unquoted_shell_control_grammar(text: str) -> bool:
+    in_single_quote = in_double_quote = escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single_quote:
+            escaped = True
+            continue
+        if char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            continue
+        if char == "'" and not in_double_quote:
+            before, after = text[index - 1 : index], text[index + 1 : index + 2]
+            if in_single_quote or not (before.isalnum() and after.isalnum()):
+                in_single_quote = not in_single_quote
+            continue
+        if not in_single_quote and not in_double_quote and char in "|&;<>":
+            return True
+    return False
+
+
+def _is_passive_literal_ast(tree: ast.Module) -> bool:
+    passive_nodes = (
+        ast.Module,
+        ast.Expr,
+        ast.Assign,
+        ast.Name,
+        ast.Constant,
+        ast.List,
+        ast.Tuple,
+        ast.Set,
+        ast.Dict,
+        ast.JoinedStr,
+        ast.Load,
+        ast.Store,
+    )
+    return all(
+        isinstance(node, passive_nodes)
+        and (not isinstance(node, ast.Name) or isinstance(node.ctx, ast.Store))
+        and (not isinstance(node, ast.Dict) or all(key is not None for key in node.keys))
+        for node in ast.walk(tree)
+    )
+
+
 def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int) -> bool:
     if (
         max(url_start, len(text) - url_end) > _MAX_PICKLE_LITERAL_URL_CONTEXT_CHARS
@@ -1494,6 +1539,8 @@ def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int)
         + _trim_repeated_literal_padding(text[url_end:])
     )
     if len(scan_text) > _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS:
+        return False
+    if _has_unquoted_shell_control_grammar(scan_text):
         return False
     adjacent = _PICKLE_ADJACENT_SHELL_BOUNDARY_RE.match(text[url_end:]) is not None
     if not adjacent and _PICKLE_LITERAL_URL_TEXT_RE.fullmatch(scan_text.strip()) is not None:
@@ -1515,7 +1562,7 @@ def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int)
             )
             for match in _PICKLE_LITERAL_URL_RE.finditer(prose)
         )
-    return not any(isinstance(node, ast.Call) for node in ast.walk(tree))
+    return _is_passive_literal_ast(tree)
 
 
 def _inert_literal_url_stripped_scan_view(data: bytes) -> bytes:

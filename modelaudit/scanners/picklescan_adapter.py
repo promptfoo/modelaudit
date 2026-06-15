@@ -31,6 +31,11 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "callable_invocations_truncated",
         "timeout",
         "unbounded_stream_truncated",
+        "url_scan_limit_exceeded",
+        "url_context_proof_incomplete",
+        "base64_text_scan_limit_exceeded",
+        "base64_text_work_limit_exceeded",
+        "base64_text_alignment_ambiguous",
     }
 )
 _NESTED_PAYLOAD_NOTICE_CODES = frozenset({"nested_payload_detected", "encoded_nested_payload_detected"})
@@ -58,6 +63,11 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "callable_invocations_truncated": "callable_invocations_truncated",
     "timeout": "scan_timeout",
     "unbounded_stream_truncated": "unbounded_stream_truncated",
+    "url_scan_limit_exceeded": "url_scan_limit_exceeded",
+    "url_context_proof_incomplete": "url_context_proof_incomplete",
+    "base64_text_scan_limit_exceeded": "base64_text_scan_limit_exceeded",
+    "base64_text_work_limit_exceeded": "base64_text_work_limit_exceeded",
+    "base64_text_alignment_ambiguous": "base64_text_alignment_ambiguous",
 }
 _INT_TEXT_RE = re.compile(r"[+-]?\d+")
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
