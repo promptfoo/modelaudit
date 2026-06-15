@@ -3248,6 +3248,21 @@ def _is_hf_safetensors_index_filename(filename: str) -> bool:
     return _hf_safetensors_index_stem(filename) is not None
 
 
+def _metadata_only_hf_candidate_requires_probe(
+    filename: str,
+    selected_files: Collection[str],
+    *,
+    allow_safetensors_index_expansion: bool,
+) -> bool:
+    """Return whether metadata alone cannot safely exclude one content-route candidate."""
+    if not _is_hf_safetensors_index_filename(filename):
+        return True
+    return allow_safetensors_index_expansion and _metadata_only_hf_index_may_govern_selected_shard(
+        filename,
+        selected_files,
+    )
+
+
 def _select_huggingface_model_files(
     repo_id: str,
     repo_files: list[str],
@@ -3332,10 +3347,12 @@ def _select_huggingface_model_files(
                 for filename in _metadata_only_hf_content_probe_candidates(repo_files, model_files)
                 if filename not in exact_openvino_companion_candidates
                 if (
-                    not _is_hf_safetensors_index_filename(filename)
-                    or not allow_safetensors_index_expansion
-                    or _metadata_only_hf_index_may_govern_selected_shard(filename, model_files)
-                    or index_content_probe_required
+                    _metadata_only_hf_candidate_requires_probe(
+                        filename,
+                        model_files,
+                        allow_safetensors_index_expansion=allow_safetensors_index_expansion,
+                    )
+                    or (allow_safetensors_index_expansion and index_content_probe_required)
                 )
             ]
             if content_probes_relevant
@@ -4314,11 +4331,35 @@ def _select_streamable_hf_files(
     )
 
     if not allow_content_probes and sniff_renamed_files_would_be_active:
+        deferred_index_route_scanner_ids = (
+            selected_route_scanner_ids
+            if selected_route_scanner_ids is not None
+            else (
+                None
+                if selected_route_formats is None
+                else _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+            )
+        )
+        index_content_probe_required = bool(
+            allow_safetensors_index_expansion
+            and deferred_index_route_scanner_ids is not None
+            and deferred_index_route_scanner_ids.difference({"safetensors"})
+        )
         candidate_files = _streamable_hf_content_probe_candidates(
             repo_files,
             model_files,
             exact_openvino_companion_candidates,
         )
+        candidate_files = [
+            filename
+            for filename in candidate_files
+            if _metadata_only_hf_candidate_requires_probe(
+                filename,
+                model_files,
+                allow_safetensors_index_expansion=allow_safetensors_index_expansion,
+            )
+            or index_content_probe_required
+        ]
         if candidate_files:
             _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
 

@@ -27,6 +27,7 @@ from modelaudit.core import (
     _make_trusted_stream_shard_root,
     _reconcile_cross_directory_shard_coverage,
     _snapshot_validated_shard_target,
+    _terminal_safetensors_shard_boundary_failures,
     detect_file_format,
     detect_file_format_from_magic,
     determine_exit_code,
@@ -40,7 +41,11 @@ from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import PICKLE_ROUTING_INCONCLUSIVE_FORMAT, SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
-from modelaudit.utils.file.handlers import _pinned_shard_scan_path
+from modelaudit.utils.file.handlers import (
+    ShardedModelDetector,
+    _pinned_shard_scan_path,
+    _SafetensorsIndexInspectionContext,
+)
 from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
 from modelaudit.utils.file.streaming import StreamedSourceByteAccounting
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
@@ -1987,6 +1992,94 @@ def test_scan_model_streaming_rejects_swapped_index_before_program_deletion(tmp_
         and check.details.get("reason") == "shard_index_changed_after_scan"
         and check.details.get("scan_outcome_reason") == "shard_boundary_changed"
         for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("replace_declared_shard", [False, True], ids=["stable", "replaced"])
+def test_terminal_safetensors_proof_requires_selected_paths_to_remain_declared(
+    tmp_path: Path,
+    replace_declared_shard: bool,
+) -> None:
+    """A refreshed proof cannot retain an alias after its declared target is replaced."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    selected_dir = tmp_path / "selected"
+    declared_dir = tmp_path / "declared"
+    selected_dir.mkdir()
+    declared_dir.mkdir()
+    declared_first = declared_dir / "model-00001-of-00002.safetensors"
+    selected_first = selected_dir / declared_first.name
+    selected_second = selected_dir / "model-00002-of-00002.safetensors"
+    declared_first.write_bytes(struct.pack("<Q", len(header)) + header)
+    selected_second.write_bytes(struct.pack("<Q", len(header)) + header)
+    os.link(declared_first, selected_first)
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "first": declared_first.relative_to(tmp_path).as_posix(),
+                    "second": selected_second.relative_to(tmp_path).as_posix(),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    selected_paths = [str(selected_first), str(selected_second)]
+    initial_proof, authority_present = ShardedModelDetector.refresh_safetensors_index_proofs(
+        selected_paths,
+        expected_total=2,
+        index_search_root=tmp_path,
+        index_inspection_context=_SafetensorsIndexInspectionContext(),
+        force_content_revalidation=True,
+        require_declared_files=True,
+    )
+    assert initial_proof is not None
+    assert authority_present is True
+
+    if replace_declared_shard:
+        declared_first.unlink()
+        declared_first.write_bytes(struct.pack("<Q", len(header)) + header)
+
+    loose_proof, loose_authority = ShardedModelDetector.refresh_safetensors_index_proofs(
+        selected_paths,
+        expected_total=2,
+        index_search_root=tmp_path,
+        index_inspection_context=_SafetensorsIndexInspectionContext(),
+        force_content_revalidation=True,
+        require_declared_files=False,
+    )
+    strict_proof, strict_authority = ShardedModelDetector.refresh_safetensors_index_proofs(
+        selected_paths,
+        expected_total=2,
+        index_search_root=tmp_path,
+        index_inspection_context=_SafetensorsIndexInspectionContext(),
+        force_content_revalidation=True,
+        require_declared_files=True,
+    )
+    assert loose_proof == initial_proof
+    assert loose_authority is True
+    assert strict_proof == (None if replace_declared_shard else initial_proof)
+    assert strict_authority is True
+
+    validated_targets = {}
+    for selected_path in selected_paths:
+        validated_targets.update(
+            _snapshot_validated_shard_target(
+                selected_path,
+                authoritative_shard_index_base=initial_proof[0],
+                authoritative_shard_index_path=initial_proof[1],
+                authoritative_shard_index_fingerprint=initial_proof[2],
+                authoritative_shard_index_generation=initial_proof[3],
+            )
+        )
+    failures = _terminal_safetensors_shard_boundary_failures(
+        validated_targets,
+        index_search_root=tmp_path,
+        index_inspection_context=_SafetensorsIndexInspectionContext(),
+    )
+
+    assert failures == (
+        dict.fromkeys(selected_paths, "shard_index_changed_after_scan") if replace_declared_shard else {}
     )
 
 

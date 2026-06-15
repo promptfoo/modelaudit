@@ -917,6 +917,34 @@ class TestModelDownload:
         assert plan.selected_files == repo_files
         assert "evil.safetensors.index.json" in {call.args[1] for call in mock_detect.call_args_list}
 
+    @pytest.mark.parametrize("streaming", [False, True], ids=["standard", "streaming"])
+    def test_exact_onnx_policy_metadata_only_ignores_unrelated_safetensors_index(self, streaming: bool) -> None:
+        """An ONNX-only metadata plan need not inspect unrelated SafeTensors index metadata."""
+        repo_files = ["model.onnx", "adapter.safetensors.index.json"]
+        with patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect:
+            if streaming:
+                selected_files = _select_streamable_hf_files(
+                    "test/model",
+                    repo_files,
+                    _HF_TEST_REVISION,
+                    scannable_extensions={".onnx"},
+                    scannable_scanner_ids={"onnx"},
+                    allow_content_probes=False,
+                ).filenames
+            else:
+                selected_files = _select_huggingface_model_files(
+                    "test/model",
+                    repo_files,
+                    _HF_TEST_REVISION,
+                    {".onnx"},
+                    scannable_scanner_ids={"onnx"},
+                    allow_content_probes=False,
+                    allow_safetensors_index_expansion=False,
+                )
+
+        assert selected_files == ["model.onnx"]
+        mock_detect.assert_not_called()
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
     @patch(
@@ -5707,6 +5735,20 @@ class TestModelDownloadStreaming:
             )
 
         mock_requests_get.assert_not_called()
+
+    def test_streaming_metadata_only_refuses_mixed_policy_index_suffixed_candidate(self) -> None:
+        """Streaming metadata planning keeps mixed-route index candidates fail closed."""
+        repo_files = ["weights.safetensors", "evil.safetensors.index.json"]
+
+        with pytest.raises(ValueError, match="metadata-only dry-run selection incomplete"):
+            _select_streamable_hf_files(
+                "test/model",
+                repo_files,
+                _HF_TEST_REVISION,
+                scannable_extensions={".safetensors", ".pkl"},
+                scannable_scanner_ids={"safetensors", "pickle"},
+                allow_content_probes=False,
+            )
 
     def test_model_plan_metadata_only_ignores_lexically_disjoint_safetensors_index(self) -> None:
         """A sibling-directory index cannot govern the selected shard without reading its content."""

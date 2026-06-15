@@ -2782,6 +2782,7 @@ def _explicit_local_shard_family_groups(
 
     groups: dict[str, _ExplicitShardFamily] = {}
     for (_pattern, expected_total), records in grouped_paths.items():
+        discovery_context = _SafetensorsIndexInspectionContext()
         targets_by_scope: dict[str, dict[int, list[str]]] = {}
         scopes_by_source: dict[str, set[str]] = {}
         for normalized_path, resolved_path_obj, shard_index in records:
@@ -2794,27 +2795,46 @@ def _explicit_local_shard_family_groups(
         complete_scopes: dict[str, tuple[str, str, str, int] | None] = {}
         authority_scopes: set[str] = set()
         expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(expected_total)
+        zero_based_indices = ShardedModelDetector._expected_index_range(expected_total, zero_based=True)
+        candidate_scopes: list[tuple[str, tuple[str, ...], dict[int, list[str]], bool]] = []
         for scope, targets_by_index in targets_by_scope.items():
             scoped_paths = tuple(path for targets in targets_by_index.values() for path in targets)
-            if not _trusted_explicit_shard_family_scope(scope, scoped_paths):
-                continue
-            complete_by_name = (
+            complete_one_based = (
                 len(targets_by_index) == _count_expected_shard_indices(expected_indices)
                 and all(shard_index in expected_indices for shard_index in targets_by_index)
                 and all(len(targets) == 1 for targets in targets_by_index.values())
             )
+            complete_zero_based = (
+                len(targets_by_index) == _count_expected_shard_indices(zero_based_indices)
+                and all(shard_index in zero_based_indices for shard_index in targets_by_index)
+                and all(len(targets) == 1 for targets in targets_by_index.values())
+            )
+            if len(scoped_paths) != expected_total or not (complete_one_based or complete_zero_based):
+                continue
+            candidate_scopes.append((scope, scoped_paths, targets_by_index, complete_one_based))
+
+        for scope, scoped_paths, targets_by_index, complete_by_name in sorted(
+            candidate_scopes,
+            key=lambda candidate: len(Path(candidate[0]).parts),
+            reverse=True,
+        ):
+            if not _trusted_explicit_shard_family_scope(scope, scoped_paths):
+                continue
             authoritative_index_proof, authority_present = (
                 _explicit_shard_index_authority(
                     scoped_paths,
                     scope=scope,
                     expected_total=expected_total,
-                    index_inspection_context=index_inspection_context,
+                    index_inspection_context=discovery_context,
                 )
                 if _pattern == SAFETENSORS_SHARD_PATTERN
                 else (None, False)
             )
-            if authority_present:
+            inspection_failed = discovery_context.failure is not None
+            if authority_present and not inspection_failed:
                 authority_scopes.add(scope)
+            if inspection_failed:
+                continue
             if authority_present and authoritative_index_proof is None:
                 continue
             if not complete_by_name:
