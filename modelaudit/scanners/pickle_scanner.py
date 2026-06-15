@@ -10,6 +10,7 @@ import inspect
 import io
 import pickletools
 import re
+import tokenize
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -1503,27 +1504,55 @@ def _has_unquoted_shell_control_grammar(text: str) -> bool:
     return False
 
 
+_PASSIVE_LITERAL_AST_NODES = (
+    ast.Module,
+    ast.Expr,
+    ast.Assign,
+    ast.Name,
+    ast.Constant,
+    ast.List,
+    ast.Tuple,
+    ast.Set,
+    ast.Dict,
+    ast.JoinedStr,
+    ast.UnaryOp,
+    ast.UAdd,
+    ast.USub,
+    ast.Load,
+    ast.Store,
+)
+
+
 def _is_passive_literal_ast(tree: ast.Module) -> bool:
-    passive_nodes = (
-        ast.Module,
-        ast.Expr,
-        ast.Assign,
-        ast.Name,
-        ast.Constant,
-        ast.List,
-        ast.Tuple,
-        ast.Set,
-        ast.Dict,
-        ast.JoinedStr,
-        ast.Load,
-        ast.Store,
-    )
     return all(
-        isinstance(node, passive_nodes)
+        isinstance(node, _PASSIVE_LITERAL_AST_NODES)
         and (not isinstance(node, ast.Name) or isinstance(node.ctx, ast.Store))
         and (not isinstance(node, ast.Dict) or all(key is not None for key in node.keys))
+        and (
+            not isinstance(node, ast.UnaryOp)
+            or (
+                isinstance(node.op, (ast.UAdd, ast.USub))
+                and isinstance(node.operand, ast.Constant)
+                and type(node.operand.value) in (int, float, complex)
+            )
+        )
         for node in ast.walk(tree)
     )
+
+
+def _has_adjacent_python_string_tokens(text: str) -> bool:
+    previous_type: int | None = None
+    ignored_types = {tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT, tokenize.INDENT, tokenize.DEDENT}
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type in ignored_types:
+                continue
+            if token.type == tokenize.STRING and previous_type == tokenize.STRING:
+                return True
+            previous_type = token.type
+    except (IndentationError, tokenize.TokenError):
+        return True
+    return False
 
 
 def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int) -> bool:
@@ -1540,15 +1569,13 @@ def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int)
     )
     if len(scan_text) > _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS:
         return False
-    if _has_unquoted_shell_control_grammar(scan_text):
-        return False
     adjacent = _PICKLE_ADJACENT_SHELL_BOUNDARY_RE.match(text[url_end:]) is not None
     if not adjacent and _PICKLE_LITERAL_URL_TEXT_RE.fullmatch(scan_text.strip()) is not None:
         return True
     try:
         tree = ast.parse(scan_text)
     except (MemoryError, RecursionError, SyntaxError, ValueError):
-        if adjacent:
+        if adjacent or _has_unquoted_shell_control_grammar(scan_text):
             return False
         prose = b" " + scan_text.encode("utf-8")
         return all(
@@ -1562,7 +1589,7 @@ def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int)
             )
             for match in _PICKLE_LITERAL_URL_RE.finditer(prose)
         )
-    return _is_passive_literal_ast(tree)
+    return not _has_adjacent_python_string_tokens(scan_text) and _is_passive_literal_ast(tree)
 
 
 def _inert_literal_url_stripped_scan_view(data: bytes) -> bytes:

