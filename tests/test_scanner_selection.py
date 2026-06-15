@@ -950,6 +950,26 @@ def test_scan_file_fails_closed_for_inst_before_invalid_continuation(tmp_path: P
 
 
 @pytest.mark.parametrize(
+    "pickle_stream",
+    [
+        pytest.param(b"cwebbrowser\nopen \n.", id="GLOBAL-trailing-space"),
+        pytest.param(b"(iwebbrowser\nopen \n.", id="INST-trailing-space"),
+        pytest.param(b"PPermission is granted.\n.", id="PERSID-prose-operand"),
+    ],
+)
+def test_scan_file_fails_closed_for_complete_prose_shaped_pickle_callback(
+    tmp_path: Path,
+    pickle_stream: bytes,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"MIT License\n" + pickle_stream)
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    _assert_incomplete_pickle_routing(result, path)
+
+
+@pytest.mark.parametrize(
     "encoder",
     [
         pytest.param(base64.b64encode, id="base64"),

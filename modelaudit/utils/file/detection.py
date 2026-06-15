@@ -5563,9 +5563,18 @@ def _classify_bounded_pickle_candidate(
                 if _has_invalid_pickle_opcode_argument(opcode_name, argument):
                     return incomplete_route(stream_start, pre_inst, protocol, text_line_side_effects_only, events)
                 meaningful_argument = _pickle_side_effect_argument_is_meaningful(opcode_name, argument)
+                if events and (opcode_name not in _PICKLE_TEXT_LINE_SIDE_EFFECT_OPCODES or meaningful_argument):
+                    events = [
+                        (
+                            index,
+                            name,
+                            meaningful or name in _PICKLE_TEXT_LINE_SIDE_EFFECT_OPCODES,
+                        )
+                        for index, name, meaningful in events
+                    ]
                 if opcode_name == "PROTO":
                     protocol = True
-                if opcode_name == "INST" and meaningful_argument:
+                if opcode_name == "INST":
                     pre_inst = True
 
                 if not _apply_pickle_stack_effect(
@@ -5674,6 +5683,18 @@ def _has_short_terminal_persid_signal(value: bytes) -> bool:
     return 1 <= len(words) <= 2 and all(_is_compact_pickle_line(word) for word in words)
 
 
+def _has_validated_pickle_continuation(payload: bytes, offset: int) -> bool:
+    """Return whether the next bounded opcode and its argument are structurally valid."""
+    if not _has_structural_pickle_continuation(payload, offset):
+        return False
+    stream = _PickleProbeStream(payload[offset : offset + PROTO0_1_MAX_PROBE_BYTES])
+    try:
+        opcode, argument, _position = next(_gen_pickle_probe_ops(stream))
+    except (MemoryError, RecursionError, StopIteration, UnicodeError, ValueError):
+        return False
+    return not _has_invalid_pickle_opcode_argument(opcode.name, argument)
+
+
 def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
     """Cheaply reject incomplete first operands before charging structural work."""
     if offset >= len(payload):
@@ -5707,6 +5728,10 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
             cursor = line_end + 1
         if opcode.name in {"GLOBAL", "INST"}:
             operands = (lines[0], lines[1])
+            if all(line.removesuffix(b"\r") for line in operands) and _has_validated_pickle_continuation(
+                payload, cursor
+            ):
+                return True
             return all(_plausible_pickle_import_operand(line) for line in operands) and (
                 _has_structural_pickle_continuation(payload, cursor)
                 or _has_compact_malformed_pickle_tail(payload, cursor)
@@ -5720,6 +5745,8 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
                     or payload[cursor : cursor + 1] == b"."
                     or _has_compact_malformed_pickle_tail(payload, cursor)
                 )
+            if _has_validated_pickle_continuation(payload, cursor):
+                return True
             terminal_or_stop = cursor == len(payload) or payload[cursor : cursor + 1] == b"."
             if terminal_or_stop and _has_short_terminal_persid_signal(lines[0]):
                 return True

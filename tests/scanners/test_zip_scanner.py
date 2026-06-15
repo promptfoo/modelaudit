@@ -11319,6 +11319,27 @@ class TestZipScanner:
             check.name == "Pickle Routing" and check.details.get("zip_entry") == "LICENSE" for check in result.checks
         )
 
+    @pytest.mark.parametrize(
+        "pickle_stream",
+        [
+            pytest.param(b"cwebbrowser\nopen \n.", id="GLOBAL-trailing-space"),
+            pytest.param(b"(iwebbrowser\nopen \n.", id="INST-trailing-space"),
+            pytest.param(b"PPermission is granted.\n.", id="PERSID-prose-operand"),
+        ],
+    )
+    def test_scan_zip_fails_closed_for_complete_prose_shaped_pickle_callback(
+        self,
+        tmp_path: Path,
+        pickle_stream: bytes,
+    ) -> None:
+        archive_path = tmp_path / "prose_shaped_pickle_callback.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("LICENSE", b"MIT License\n" + pickle_stream)
+
+        result = self.scanner.scan(str(archive_path))
+
+        _assert_inconclusive_pickle_member(result, archive_path, "LICENSE")
+
     def test_scan_zip_fails_closed_for_backslash_legal_member_with_embedded_pickle(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "backslash_legal_member.zip"
         member_name = r"docs\LICENSE"

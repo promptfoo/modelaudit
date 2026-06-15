@@ -4553,6 +4553,18 @@ def test_legal_sidecar_structurally_decodes_short_and_line_wrapped_pickle_candid
             b"MIT License\nNPermission\nterms\n",
             id="trivial-prefix-like-persid-prose",
         ),
+        pytest.param(
+            b"MIT License\ncwebbrowser\nopen \nOrdinary prose follows\n",
+            id="GLOBAL-prose-shaped-operand-without-structural-continuation",
+        ),
+        pytest.param(
+            b"MIT License\niwebbrowser\nopen \nOrdinary prose follows\n",
+            id="INST-prose-shaped-operand-without-structural-continuation",
+        ),
+        pytest.param(
+            b"MIT License\nPPermission is granted.\nOrdinary prose follows\n",
+            id="PERSID-prose-shaped-operand-without-structural-continuation",
+        ),
         pytest.param(b"MIT License\nin to of be dead face\n", id="short-base64-and-hex-words"),
         pytest.param(b"MIT License\n" + (b"in be " * 4096), id="short-base64-word-budget"),
         pytest.param(_long_context_opcode_prose(), id="long-context-opcode-leading-prose"),
@@ -4606,6 +4618,29 @@ def test_complete_protocol0_import_named_license_retains_pickle_ownership(
     assert detect_file_format(str(path)) == "pickle"
     assert detect_file_format_from_magic(str(path)) == "pickle"
     assert detect_file_format_for_skip_filter(str(path)) == "pickle"
+
+
+@pytest.mark.parametrize(
+    "pickle_stream",
+    [
+        pytest.param(b"cwebbrowser\nopen \n.", id="GLOBAL-trailing-space"),
+        pytest.param(b"cwebbrowser\nopen \n0", id="GLOBAL-trailing-space-continuation"),
+        pytest.param(b"(iwebbrowser\nopen \n.", id="INST-trailing-space"),
+        pytest.param(b"(iwebbrowser\nopen \n0", id="INST-trailing-space-continuation"),
+        pytest.param(b"PPermission is granted.\n.", id="PERSID-prose-operand"),
+        pytest.param(b"PPermission is granted.\n0", id="PERSID-prose-operand-continuation"),
+    ],
+)
+def test_complete_embedded_protocol0_callback_with_prose_shaped_operand_fails_closed(
+    tmp_path: Path,
+    pickle_stream: bytes,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"MIT License\n" + pickle_stream)
+
+    assert detect_file_format(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 
 @pytest.mark.parametrize(
