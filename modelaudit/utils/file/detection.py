@@ -464,7 +464,7 @@ _LEGAL_TEXT_HEX_CHUNK_RE = re.compile(rb"[A-Fa-f0-9]+")
 _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE = re.compile(
     rb"(?=(?:"
     rb"[ci][^\x00-\x20\x7f-\x9f\r\n]+\r?\n[^\x00-\x20\x7f-\x9f\r\n]+\r?\n|"
-    rb"P[^\x00-\x20\x7f-\x9f\r\n]*\r?\n"
+    rb"P[^\r\n]*\r?\n"
     rb"))"
 )
 _LEGAL_TEXT_MAX_DECODED_BYTES = 1024 * 1024

@@ -1400,6 +1400,7 @@ def test_scan_file_routes_proven_leading_pickle_before_oversized_legal_fallback(
     [
         pytest.param(_long_embedded_protocol0_pickle_in_legal_text(), id="long-embedded-GLOBAL"),
         pytest.param(b"Pid\n", id="terminal-initial-PERSID"),
+        pytest.param(b"Ppermission is hereby granted.\n", id="spaced-initial-PERSID"),
         pytest.param(_long_global_operand_in_legal_text(), id="truncated-GLOBAL-operand"),
         pytest.param(
             b"MIT License\nprefix cposix\nsystem\n(S'id'\ntR.",
