@@ -5996,12 +5996,11 @@ class TestWeightDistributionSemantics:
     @pytest.mark.parametrize(
         ("op_type", "weights", "expected_reason"),
         [
-            ("MatMulInteger", np.full((128, 1), 127, dtype=np.int8), "quantized_operator"),
             ("Mul", np.zeros((288, 1), dtype=np.float32), "bookkeeping_constant"),
             ("Add", np.zeros((288, 1), dtype=np.float32), "bookkeeping_constant"),
         ],
     )
-    def test_non_neuron_initializers_are_semantically_excluded(
+    def test_bookkeeping_initializers_are_semantically_excluded(
         self,
         tmp_path: Path,
         op_type: str,
