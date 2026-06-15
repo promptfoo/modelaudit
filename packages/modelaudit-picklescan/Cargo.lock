@@ -16,7 +16,7 @@ checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
 
 [[package]]
 name = "modelaudit-picklescan-rust"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "pyo3",
 ]

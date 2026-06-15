@@ -10,9 +10,11 @@ import marshal
 import os
 import re
 import stat
+import struct
 import sys
 import sysconfig
 import threading
+import zipimport
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -51,6 +53,60 @@ from types import (
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
 
+_MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
+_MAX_STARTUP_DISTRIBUTION_NAMES = 4096
+
+
+def _capture_startup_distribution_roots() -> Mapping[str, tuple[tuple[Path, Path], ...]]:
+    try:
+        discovered = packages_distributions()
+    except Exception:
+        return MappingProxyType({})
+
+    distribution_roots: dict[str, tuple[tuple[Path, Path], ...]] = {}
+    roots_by_distribution: dict[str, tuple[Path, Path] | None] = {}
+    for top_level_name, distribution_names in discovered.items():
+        if len(distribution_roots) >= _MAX_STARTUP_DISTRIBUTION_NAMES:
+            break
+        if type(top_level_name) is not str:
+            continue
+        bounded_names: list[str] = []
+        for distribution_name in distribution_names:
+            if len(bounded_names) >= _MAX_DISTRIBUTIONS_PER_TOP_LEVEL:
+                break
+            if type(distribution_name) is str:
+                bounded_names.append(distribution_name)
+
+        roots: list[tuple[Path, Path]] = []
+        for distribution_name in bounded_names:
+            if distribution_name not in roots_by_distribution:
+                if len(roots_by_distribution) >= _MAX_STARTUP_DISTRIBUTION_NAMES:
+                    continue
+                try:
+                    installed_distribution = distribution(distribution_name)
+                    metadata_location = getattr(installed_distribution, "_path", None)
+                    candidate = (
+                        (
+                            Path(str(metadata_location)).resolve(),
+                            Path(str(installed_distribution.locate_file(""))).resolve(),
+                        )
+                        if metadata_location is not None
+                        else None
+                    )
+                except Exception:
+                    candidate = None
+                roots_by_distribution[distribution_name] = candidate
+            candidate = roots_by_distribution[distribution_name]
+            if candidate is None:
+                continue
+            if candidate not in roots:
+                roots.append(candidate)
+        distribution_roots[top_level_name] = tuple(roots)
+    return MappingProxyType(distribution_roots)
+
+
+_STARTUP_DISTRIBUTION_ROOTS = _capture_startup_distribution_roots()
+
 # Bound per-pass import/callable fan-out for untrusted inputs. The 32-reference
 # cap has kept call-graph enrichment useful while preventing pathological scan
 # growth; raising it improves completeness at a runtime cost, lowering it can
@@ -64,6 +120,15 @@ _MAX_MODULE_COMPONENTS = 32
 _MAX_SOURCE_BYTES = 1024 * 1024
 _CALL_GRAPH_REGULAR_FILE_FINGERPRINT = "regular-file"
 _MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
+_MAX_FILE_FINDER_IDENTITY_CACHE_SIZE = 128
+_MAX_FILE_FINDER_RESOLUTION_ATTEMPTS = 3
+_MAX_ZIPIMPORT_ARCHIVE_BYTES = 64 * 1024 * 1024
+_MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES = 4 * 1024 * 1024
+_MAX_ZIPIMPORT_PATH_COMPONENTS = 256
+_ZIP_END_RECORD_SIZE = 22
+_ZIP_MAX_COMMENT_BYTES = 65_535
+_ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE = 46
+_FILE_FINDER_IDENTITY_LOCK = threading.RLock()
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _SOURCE_RESOLUTION_SUFFIXES = tuple(dict.fromkeys((*SOURCE_SUFFIXES, *BYTECODE_SUFFIXES, *EXTENSION_SUFFIXES)))
 _MAX_HOOK_IDENTITY_ITEMS = 16
@@ -91,19 +156,28 @@ _STANDARD_FILE_FINDER_LOADERS = tuple(
     (suffix, loader) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_IDENTITY for suffix in suffixes
 )
 _STANDARD_FILE_FINDER_PATH_HOOK_CODE = FileFinder.path_hook(*_STANDARD_FILE_FINDER_LOADER_DETAILS).__code__
-_TRUSTED_FILE_FINDER_METHODS = tuple(
-    (name, getattr(FileFinder, name)) for name in ("__init__", "find_spec", "_get_spec", "_fill_cache")
+_TRUSTED_FILE_FINDER_METHOD_NAMES = ("__new__", "__init__", "find_spec", "_get_spec", "_fill_cache")
+_TRUSTED_ZIPIMPORTER_METHOD_NAMES = (
+    "__init__",
+    "find_spec",
+    "get_code",
+    "get_data",
+    "get_filename",
+    "get_source",
+    "is_package",
 )
-_TRUSTED_ZIPIMPORTER_METHODS = tuple(
-    (name, getattr(zipimporter, name))
-    for name in ("__init__", "find_spec", "get_code", "get_data", "get_filename", "get_source", "is_package")
-)
+
+
+class _UnsafePathResolution:
+    __slots__ = ()
+
+
+_UNSAFE_PATH_RESOLUTION = _UnsafePathResolution()
 _MAX_CLASS_INSTANCE_ALIASES = 128
 _MAX_INHERITED_CLASS_METHODS = 128
 _MAX_WILDCARD_IMPORTS = 16
 _MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
-_MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
 _MAX_TRUSTED_PTH_FILES = 64
 _MAX_TRUSTED_PTH_BYTES = 64 * 1024
 _MAX_TRUSTED_PTH_PATHS = 64
@@ -191,6 +265,27 @@ def _runtime_value_matches_snapshot(value: object, expected: _RuntimeValueSnapsh
         )
         for current_value, expected_value in zip(current[6], expected[6], strict=True)
     )
+
+
+def _type_member_without_hooks(class_: type[object], name: str) -> tuple[bool, object | None]:
+    for base in type.__getattribute__(class_, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if name in namespace:
+            return True, namespace[name]
+    return False, None
+
+
+_TRUSTED_FILE_FINDER_METHODS = tuple(
+    (name, _runtime_value_snapshot(_type_member_without_hooks(FileFinder, name)[1]))
+    for name in _TRUSTED_FILE_FINDER_METHOD_NAMES
+)
+_TRUSTED_ZIPIMPORTER_METHODS = tuple(
+    (name, _runtime_value_snapshot(_type_member_without_hooks(zipimporter, name)[1]))
+    for name in _TRUSTED_ZIPIMPORTER_METHOD_NAMES
+)
+_ZIPIMPORT_NAMESPACE = ModuleType.__getattribute__(zipimport, "__dict__")
+_ZIP_DIRECTORY_CACHE = dict.get(_ZIPIMPORT_NAMESPACE, "_zip_directory_cache")
+_ZIP_READ_DIRECTORY = dict.get(_ZIPIMPORT_NAMESPACE, "_read_directory")
 
 
 def _module_namespace_snapshot(module: ModuleType) -> Mapping[str, _RuntimeValueSnapshot]:
@@ -399,6 +494,9 @@ _IMPORT_RUNTIME_TYPES = tuple(
         )
     )
 )
+_SAFE_REMOVABLE_IMPORT_RUNTIME_TYPE_MEMBERS: Mapping[type[object], frozenset[str]] = MappingProxyType(
+    {PathFinder: frozenset({"find_distributions"})}
+)
 _IMPORT_RUNTIME_MODULE_SNAPSHOTS = (
     ("_imp", _imp, _module_namespace_snapshot(_imp)),
     (
@@ -504,15 +602,23 @@ def _namespace_matches_snapshot(
 
 
 def _type_namespace_matches_snapshot(
+    class_: type[object],
     namespace: Mapping[str, object],
     expected: Mapping[str, _RuntimeValueSnapshot],
 ) -> bool:
-    return _namespace_matches_snapshot(namespace, expected) and all(
-        name in expected or not _runtime_type_member_is_executable(value) for name, value in namespace.items()
-    )
+    safe_removals = _SAFE_REMOVABLE_IMPORT_RUNTIME_TYPE_MEMBERS.get(class_, frozenset())
+    return all(
+        (name in safe_removals and name not in namespace)
+        or (
+            name in namespace
+            and namespace[name] is expected_value[0]
+            and _runtime_value_matches_snapshot(namespace[name], expected_value)
+        )
+        for name, expected_value in expected.items()
+    ) and all(name in expected or not _runtime_type_member_is_executable(value) for name, value in namespace.items())
 
 
-def _interpreter_import_runtime_is_trusted() -> bool:
+def _interpreter_import_runtime_matches_snapshot() -> bool:
     modules = _runtime_sys_modules_without_hooks()
     if modules is None or not _runtime_import_containers_are_safe():
         return False
@@ -533,9 +639,16 @@ def _interpreter_import_runtime_is_trusted() -> bool:
             return False
     for class_, expected_namespace in _IMPORT_RUNTIME_TYPE_SNAPSHOTS:
         namespace = type.__getattribute__(class_, "__dict__")
-        if not _type_namespace_matches_snapshot(namespace, expected_namespace):
+        if not _type_namespace_matches_snapshot(class_, namespace, expected_namespace):
             return False
     return True
+
+
+def _interpreter_import_runtime_is_trusted() -> bool:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is not None:
+        return snapshot.import_runtime_trusted
+    return _interpreter_import_runtime_matches_snapshot()
 
 
 def _interpreter_target_import_lock_state_is_safe(module_name: str) -> bool:
@@ -745,14 +858,6 @@ def _executable_value_functions(value: object) -> tuple[FunctionType, ...]:
                     break
         return tuple(functions)
     return ()
-
-
-def _type_member_without_hooks(class_: type[object], name: str) -> tuple[bool, object | None]:
-    for base in type.__getattribute__(class_, "__mro__"):
-        namespace = type.__getattribute__(base, "__dict__")
-        if name in namespace:
-            return True, namespace[name]
-    return False, None
 
 
 def _runtime_attribute_path_without_hooks(
@@ -1012,6 +1117,9 @@ def _trusted_executable_value_matches_snapshot(
         ):
             return False
     return True
+
+
+_ZIP_READ_DIRECTORY_SNAPSHOT = _trusted_executable_value_snapshot(_ZIP_READ_DIRECTORY)
 
 
 def _trusted_reference_executable_matches_snapshot(
@@ -1526,10 +1634,17 @@ class _SourceReadTooLargeError(OSError):
 class _SharedSourceSnapshot:
     search_context: tuple[str, ...]
     resolution_context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+    import_runtime_trusted: bool
+    report_started: bool = False
     resolution_fingerprints: dict[str, bytes | str | None] = field(default_factory=dict)
     module_sources: dict[str, str] = field(default_factory=dict)
     loaded_module_sources: dict[str, str] = field(default_factory=dict)
     loaded_package_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    loaded_package_resolution_contexts: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    namespace_package_resolution_contexts: dict[
+        str,
+        tuple[tuple[str, ...], tuple[str, ...]],
+    ] = field(default_factory=dict)
     loaded_interpreter_modules: dict[str, _LoadedInterpreterModuleState] = field(default_factory=dict)
     loaded_interpreter_references: dict[tuple[str, str], _LoadedInterpreterReferenceState] = field(default_factory=dict)
     read_fingerprints: dict[str, tuple[int, bool, bytes | None]] = field(default_factory=dict)
@@ -1545,29 +1660,10 @@ def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunct
 
 
 @_register_source_sensitive_cache
-@lru_cache(maxsize=1)
-def _installed_package_distributions() -> Mapping[str, list[str]]:
-    try:
-        return packages_distributions()
-    except Exception:
-        return {}
-
-
-@_register_source_sensitive_cache
 @lru_cache(maxsize=256)
 def _installed_distribution_roots(top_level_name: str) -> tuple[Path, ...]:
     roots: list[Path] = []
-    distribution_names = _installed_package_distributions().get(top_level_name, ())
-    for distribution_name in distribution_names[:_MAX_DISTRIBUTIONS_PER_TOP_LEVEL]:
-        try:
-            installed_distribution = distribution(distribution_name)
-            metadata_location = getattr(installed_distribution, "_path", None)
-            if metadata_location is None:
-                continue
-            metadata_path = Path(str(metadata_location)).resolve()
-            root = Path(str(installed_distribution.locate_file(""))).resolve()
-        except Exception:
-            continue
+    for metadata_path, root in _STARTUP_DISTRIBUTION_ROOTS.get(top_level_name, ()):
         if not _path_is_in_trusted_package_environment(metadata_path):
             continue
         if root not in roots:
@@ -2901,7 +2997,6 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
     parts = _bounded_module_name_parts(module_name)
     if parts is None:
         return None
-    _track_shared_source_candidates(parts)
     interpreter_trusted = _interpreter_module_resolution_is_trusted(module_name)
     if interpreter_trusted is not None:
         return "stdlib" if interpreter_trusted else None
@@ -2910,6 +3005,10 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
     except Exception:
         return None
     loaded, _, loaded_spec = _loaded_module_state_without_hooks(module_name)
+    if isinstance(standard_spec, _UnsafePathResolution):
+        if not loaded:
+            return None
+        standard_spec = None
     spec: ModuleSpec | None
     if loaded:
         if loaded_spec is None or _module_spec_claims_builtin_or_frozen_identity(loaded_spec):
@@ -2920,16 +3019,24 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
         if standard_spec is not None:
             standard_origin, _ = _module_spec_fields_without_hooks(standard_spec)
             if type(standard_origin) is not str or loaded_origin != standard_origin:
+                _track_shared_source_candidates(parts)
                 return None
         spec = loaded_spec
     else:
-        if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
+        if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or not _path_hooks_are_trusted():
             return None
         spec = standard_spec
     if spec is None:
+        if any(_loaded_package_search_path(".".join(parts[:index]))[0] for index in range(1, len(parts))):
+            _track_shared_source_candidates(parts)
+        else:
+            # An unresolved top-level module is never trusted. Avoid suffix
+            # fan-out and prevent its conservative result crossing reports.
+            _mark_shared_source_snapshot_unreusable()
         return "unresolved"
     if type(spec) is not ModuleSpec:
         return None
+    _track_shared_source_candidates(parts)
     spec_origin, _ = _module_spec_fields_without_hooks(spec)
     if type(spec_origin) is not str:
         return None
@@ -2939,12 +3046,12 @@ def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
         return None
     if _path_is_in_trusted_package_environment(origin):
         return "site_packages"
+    if any(origin.is_relative_to(path) for path in _TRUSTED_STDLIB_PATHS):
+        return "stdlib"
     top_level_name = parts[0]
     if any(origin.is_relative_to(path) for path in _installed_distribution_roots(top_level_name)):
         _mark_shared_source_snapshot_unreusable()
         return "site_packages"
-    if any(origin.is_relative_to(path) for path in _TRUSTED_STDLIB_PATHS):
-        return "stdlib"
     return None
 
 
@@ -3010,12 +3117,14 @@ def shared_source_sensitive_caches() -> Iterator[None]:
 
     with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
         _clear_source_sensitive_caches_now()
+        import_runtime_trusted = _interpreter_import_runtime_matches_snapshot()
         resolution_context = _source_resolution_context()
         snapshot_token = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.set(
             _SharedSourceSnapshot(
                 search_context=_source_search_context(),
                 resolution_context=resolution_context,
-                reusable=_resolution_context_is_reusable(resolution_context),
+                import_runtime_trusted=import_runtime_trusted,
+                reusable=import_runtime_trusted and _resolution_context_is_reusable(resolution_context),
             )
         )
         token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(1)
@@ -3567,9 +3676,12 @@ def _resolution_context_is_reusable(
 
 def _path_importer_methods_are_trusted(
     importer_type: type[object],
-    trusted_methods: tuple[tuple[str, object], ...],
+    trusted_methods: tuple[tuple[str, _RuntimeValueSnapshot], ...],
 ) -> bool:
-    return all(getattr(importer_type, name, None) is method for name, method in trusted_methods)
+    return all(
+        _runtime_value_matches_snapshot(_type_member_without_hooks(importer_type, name)[1], snapshot)
+        for name, snapshot in trusted_methods
+    )
 
 
 def _is_standard_file_finder_path_hook(hook: object) -> bool:
@@ -3643,40 +3755,692 @@ def _meta_path_finder_resolution_identity(finder: object) -> str:
     return _pytest_assertion_rewrite_identity(finder) or _import_hook_identity(finder)
 
 
-def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
+def _zipimport_files_are_safe(files: object) -> bool:
+    if type(files) is not dict or len(files) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
+        return False
+    return all(
+        type(path) is str
+        and (
+            metadata is None
+            or (
+                type(metadata) is tuple
+                and len(metadata) == 8
+                and type(metadata[0]) is str
+                and all(type(value) is int for value in metadata[1:])
+            )
+        )
+        for path, metadata in dict.items(files)
+    )
+
+
+def _read_exact_file_descriptor(file_descriptor: int, size: int) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(file_descriptor, remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _cross_view_file_stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    # Windows path stat derives executable bits from the suffix; descriptor stat cannot.
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        stat.S_IFMT(file_stat.st_mode),
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _zipimport_bounded_central_directory_names(
+    archive: str,
+    expected_stat: os.stat_result,
+) -> frozenset[bytes] | None:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        file_descriptor = os.open(archive, flags)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(file_descriptor)
+        if (
+            _cross_view_file_stat_identity(expected_stat) != _cross_view_file_stat_identity(opened)
+            or opened.st_size < _ZIP_END_RECORD_SIZE
+        ):
+            return None
+
+        tail_size = min(opened.st_size, _ZIP_END_RECORD_SIZE + _ZIP_MAX_COMMENT_BYTES)
+        os.lseek(file_descriptor, opened.st_size - tail_size, os.SEEK_SET)
+        tail = _read_exact_file_descriptor(file_descriptor, tail_size)
+        if tail is None:
+            return None
+        end_offset = tail.rfind(b"PK\x05\x06")
+        if end_offset < 0 or end_offset + _ZIP_END_RECORD_SIZE > len(tail):
+            return None
+        (
+            disk_number,
+            central_directory_disk,
+            entries_on_disk,
+            expected_entries,
+            central_directory_size,
+            central_directory_offset,
+            comment_size,
+        ) = struct.unpack_from("<4H2LH", tail, end_offset + 4)
+        # Windows console-script launchers embed a ZIP resource inside a PE
+        # executable, so valid non-ZIP bytes may follow the end record.
+        if (
+            end_offset + _ZIP_END_RECORD_SIZE + comment_size > len(tail)
+            or disk_number != 0
+            or central_directory_disk != 0
+            or entries_on_disk != expected_entries
+            or expected_entries > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+            or expected_entries == 0xFFFF
+            or central_directory_size > _MAX_ZIPIMPORT_CENTRAL_DIRECTORY_BYTES
+            or central_directory_size == 0xFFFFFFFF
+            or central_directory_offset == 0xFFFFFFFF
+        ):
+            return None
+        absolute_end_offset = opened.st_size - tail_size + end_offset
+        central_directory_start = absolute_end_offset - central_directory_size
+        if central_directory_start < central_directory_offset or central_directory_start < 0:
+            return None
+        os.lseek(file_descriptor, central_directory_start, os.SEEK_SET)
+        central_directory = _read_exact_file_descriptor(file_descriptor, central_directory_size)
+        if central_directory is None:
+            return None
+
+        position = 0
+        entry_count = 0
+        entry_names: set[bytes] = set()
+        while position < len(central_directory):
+            signature = central_directory[position : position + 4]
+            if signature == b"PK\x01\x02":
+                if position + _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE > len(central_directory):
+                    return None
+                filename_size, extra_size, comment_size = struct.unpack_from(
+                    "<3H",
+                    central_directory,
+                    position + 28,
+                )
+                filename_start = position + _ZIP_CENTRAL_DIRECTORY_ENTRY_SIZE
+                position = filename_start + filename_size + extra_size + comment_size
+                entry_count += 1
+                if entry_count > _MAX_SOURCE_FINGERPRINT_CANDIDATES or position > len(central_directory):
+                    return None
+                entry_names.add(central_directory[filename_start : filename_start + filename_size])
+                continue
+            if signature == b"PK\x05\x05" and entry_count == expected_entries:
+                if position + 6 > len(central_directory):
+                    return None
+                signature_size = int.from_bytes(central_directory[position + 4 : position + 6], "little")
+                position += 6 + signature_size
+                break
+            return None
+        finished = os.fstat(file_descriptor)
+        path_after = os.stat(archive)
+        if (
+            position != len(central_directory)
+            or entry_count != expected_entries
+            or _stat_identity(opened) != _stat_identity(finished)
+            or _stat_identity(expected_stat) != _stat_identity(path_after)
+        ):
+            return None
+        return frozenset(entry_names)
+    except (OSError, struct.error):
+        return None
+    finally:
+        os.close(file_descriptor)
+
+
+def _zipimport_central_directory_is_bounded(archive: str, expected_stat: os.stat_result) -> bool:
+    return _zipimport_bounded_central_directory_names(archive, expected_stat) is not None
+
+
+def _zipimport_runtime_is_trusted() -> bool:
+    modules = _runtime_sys_modules_without_hooks()
+    if modules is None or dict.get(modules, "zipimport") is not zipimport:
+        return False
+    namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    return not (
+        namespace is not _ZIPIMPORT_NAMESPACE
+        or dict.get(namespace, "_zip_directory_cache") is not _ZIP_DIRECTORY_CACHE
+        or type(_ZIP_DIRECTORY_CACHE) is not dict
+        or dict.get(namespace, "_read_directory") is not _ZIP_READ_DIRECTORY
+        or not _trusted_executable_value_matches_snapshot(_ZIP_READ_DIRECTORY, _ZIP_READ_DIRECTORY_SNAPSHOT)
+    )
+
+
+def _zipimport_directory_cache_files(archive: str) -> object:
+    if not _zipimport_runtime_is_trusted():
+        return None
+    return dict.get(cast(dict[str, object], _ZIP_DIRECTORY_CACHE), archive)
+
+
+def _zipimport_expected_prefix(archive: str, entry: str) -> str | None:
+    archive_state = _zipimport_archive_state_from_entry(entry)
+    if not isinstance(archive_state, tuple):
+        return None
+    expected_archive, prefix, _cache_key = archive_state
+    try:
+        if not os.path.samefile(archive, expected_archive):
+            return None
+    except (OSError, ValueError):
+        return None
+    return prefix
+
+
+def _zipimport_names_exclude_module(
+    names: Iterable[object],
+    prefix: str,
+    module_name: str,
+) -> bool:
+    leaf_name = module_name.rsplit(".", maxsplit=1)[-1]
+    prefix = prefix.replace("\\", "/")
+    if (
+        not prefix.isascii()
+        or not leaf_name
+        or not leaf_name.isascii()
+        or "/" in leaf_name
+        or "\\" in leaf_name
+        or "\0" in leaf_name
+    ):
+        return False
+    candidate = f"{prefix}{leaf_name}".encode()
+    for name in names:
+        if type(name) is bytes:
+            raw_name = name
+        elif type(name) is str:
+            raw_name = name.encode()
+        else:
+            return False
+        normalized_name = raw_name.replace(b"\\", b"/")
+        if normalized_name in {candidate + b".py", candidate + b".pyc"} or normalized_name.startswith(candidate + b"/"):
+            return False
+    return True
+
+
+def _zipimport_absent_cache_snapshot(files: object, prefix: str, module_name: str) -> dict[str, object] | None:
+    if not _zipimport_files_are_safe(files):
+        return None
+    try:
+        snapshot = dict.copy(cast(dict[str, object], files))
+        if files != snapshot or not _zipimport_names_exclude_module(snapshot.keys(), prefix, module_name):
+            return None
+    except RuntimeError:
+        return None
+    return snapshot
+
+
+def _bounded_zip_archive_excludes_module(archive: str, prefix: str, module_name: str) -> bool:
+    try:
+        archive_stat = os.stat(archive)
+    except OSError:
+        return False
+    if not stat.S_ISREG(archive_stat.st_mode):
+        return False
+    names = _zipimport_bounded_central_directory_names(archive, archive_stat)
+    return names is not None and _zipimport_names_exclude_module(names, prefix, module_name)
+
+
+def _zipimport_archive_state_from_entry(
+    entry: str,
+) -> tuple[str, str, str] | _UnsafePathResolution | None:
+    try:
+        candidate = entry if os.path.isabs(entry) else os.path.join(os.getcwd(), entry)
+    except (OSError, ValueError):
+        return _UNSAFE_PATH_RESOLUTION
+    cache_key = entry
+    if os.path.altsep:
+        candidate = candidate.replace(os.path.altsep, os.path.sep)
+        cache_key = cache_key.replace(os.path.altsep, os.path.sep)
+    prefix_parts: list[str] = []
+    for _ in range(_MAX_ZIPIMPORT_PATH_COMPONENTS + 1):
+        try:
+            candidate_stat = os.stat(candidate)
+        except OSError:
+            pass
+        else:
+            if stat.S_ISDIR(candidate_stat.st_mode):
+                return None
+            if stat.S_ISREG(candidate_stat.st_mode):
+                prefix = os.path.join(*reversed(prefix_parts)).replace("\\", "/") if prefix_parts else ""
+                return candidate, f"{prefix}/" if prefix else "", cache_key
+            return _UNSAFE_PATH_RESOLUTION
+        parent, basename = os.path.split(candidate)
+        cache_parent = os.path.dirname(cache_key)
+        if parent == candidate or cache_parent == cache_key:
+            return _UNSAFE_PATH_RESOLUTION
+        candidate = parent
+        cache_key = cache_parent
+        if basename:
+            prefix_parts.append(basename)
+    return _UNSAFE_PATH_RESOLUTION
+
+
+def _uncached_zip_excludes_module(entry: str, module_name: str) -> bool | None:
+    if not _zipimport_runtime_is_trusted() or not _path_hooks_are_trusted():
+        return False
+    archive_state = _zipimport_archive_state_from_entry(entry)
+    if isinstance(archive_state, _UnsafePathResolution):
+        return False
+    if archive_state is None:
+        return None
+    archive, prefix, cache_key = archive_state
+    try:
+        archive_stat = os.stat(archive)
+    except OSError:
+        return False
+    if not stat.S_ISREG(archive_stat.st_mode):
+        return False
+    names = _zipimport_bounded_central_directory_names(archive, archive_stat)
+    if names is None:
+        return False
+    if archive_stat.st_size <= _MAX_ZIPIMPORT_ARCHIVE_BYTES:
+        return None
+    if not _zipimport_names_exclude_module(names, prefix, module_name):
+        return False
+    directory_cache = cast(dict[str, object], _ZIP_DIRECTORY_CACHE)
+    if not dict.__contains__(directory_cache, cache_key):
+        return True
+    files = dict.__getitem__(directory_cache, cache_key)
+    snapshot = _zipimport_absent_cache_snapshot(files, prefix, module_name)
+    return snapshot is not None and files == snapshot
+
+
+def _cached_bounded_zipimporter_excludes_module(
+    finder: object,
+    module_name: str,
+    cache_key: str,
+) -> bool:
+    if (
+        type(finder) is not zipimporter
+        or not _zipimport_runtime_is_trusted()
+        or not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS)
+    ):
+        return False
     try:
         instance_state = object.__getattribute__(finder, "__dict__")
     except (AttributeError, TypeError):
         return False
-    if not isinstance(instance_state, dict):
+    if not (
+        type(instance_state) is dict and len(instance_state) <= 5 and all(type(key) is str for key in instance_state)
+    ):
         return False
-    if type(finder) is zipimporter:
-        if not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
+    archive = dict.get(instance_state, "archive")
+    prefix = dict.get(instance_state, "prefix")
+    if (
+        type(archive) is not str
+        or type(prefix) is not str
+        or _zipimport_expected_prefix(archive, cache_key) != prefix.replace("\\", "/")
+    ):
+        return False
+    files = _zipimport_directory_cache_files(archive)
+    snapshot = _zipimport_absent_cache_snapshot(files, prefix, module_name)
+    if snapshot is None or dict.get(instance_state, "_files", files) is not files:
+        return False
+    return _bounded_zip_archive_excludes_module(archive, prefix, module_name) and files == snapshot
+
+
+def _zipimport_archive_files_match(archive: str, files: object) -> bool:
+    if not _zipimport_files_are_safe(files) or not _zipimport_runtime_is_trusted():
+        return False
+    try:
+        before = os.stat(archive)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > _MAX_ZIPIMPORT_ARCHIVE_BYTES
+            or not _zipimport_central_directory_is_bounded(archive, before)
+        ):
             return False
-        try:
-            expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
-        except (AttributeError, ImportError, OSError, TypeError):
-            return False
-        return (
-            isinstance(expected_state, dict)
-            and set(instance_state) == set(expected_state)
-            and instance_state.get("archive") == expected_state.get("archive")
-            and instance_state.get("prefix") == expected_state.get("prefix")
-            and instance_state.get("_files") is expected_state.get("_files")
-        )
-    if type(finder) is not FileFinder:
+        archive_files = cast(Callable[[str], object], _ZIP_READ_DIRECTORY)(archive)
+        after = os.stat(archive)
+    except Exception:
         return False
-    if not _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
-        return False
-    finder_path = instance_state.get("path")
-    loaders = instance_state.get("_loaders")
     return (
-        set(instance_state) <= {"_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache"}
-        and isinstance(finder_path, str)
-        and os.path.abspath(finder_path) == os.path.abspath(cache_key)
-        and isinstance(loaders, list)
-        and tuple(loaders) == _STANDARD_FILE_FINDER_LOADERS
+        _stat_identity(before) == _stat_identity(after)
+        and _zipimport_files_are_safe(archive_files)
+        and files == archive_files
     )
+
+
+def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | None:
+    if type(finder) is not zipimporter or not _path_importer_methods_are_trusted(
+        zipimporter,
+        _TRUSTED_ZIPIMPORTER_METHODS,
+    ):
+        return None
+    try:
+        instance_state = object.__getattribute__(finder, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    if not (
+        type(instance_state) is dict and len(instance_state) <= 5 and all(type(key) is str for key in instance_state)
+    ):
+        return None
+    archive = dict.get(instance_state, "archive")
+    prefix = dict.get(instance_state, "prefix")
+    files = _zipimport_directory_cache_files(archive) if type(archive) is str else None
+    if type(archive) is not str or type(prefix) is not str or not _zipimport_files_are_safe(files):
+        return None
+    try:
+        expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
+    except (AttributeError, ImportError, OSError, TypeError):
+        return None
+    if not (
+        type(expected_state) is dict
+        and len(expected_state) <= 5
+        and all(type(key) is str for key in expected_state)
+        and set(instance_state) == set(expected_state)
+        and archive == dict.get(expected_state, "archive")
+        and prefix == dict.get(expected_state, "prefix")
+        and dict.get(instance_state, "_files", files) is files
+        and dict.get(expected_state, "_files", files) is files
+        and _zipimport_archive_files_match(archive, files)
+    ):
+        return None
+    files_identity = _string_sequence_identity(
+        f"{path}\0{metadata!r}"
+        for path, metadata in sorted(dict.items(cast(dict[str, tuple[object, ...] | None], files)))
+    )
+    state_identity = _string_sequence_identity((archive, prefix, files_identity))
+    return f"trusted:zipimport.zipimporter:{state_identity}"
+
+
+def _file_finder_loaders_are_standard(loaders: object) -> bool:
+    if loaders is _STANDARD_FILE_FINDER_LOADERS:
+        return True
+    if type(loaders) is not list or len(loaders) != len(_STANDARD_FILE_FINDER_LOADERS):
+        return False
+    return all(
+        type(actual) is tuple
+        and len(actual) == 2
+        and type(actual[0]) is str
+        and actual[0] == expected[0]
+        and actual[1] is expected[1]
+        for actual, expected in zip(loaders, _STANDARD_FILE_FINDER_LOADERS, strict=True)
+    )
+
+
+def _canonical_file_finder_state(
+    finder_path: str,
+) -> tuple[int | float, frozenset[str], frozenset[str]] | None:
+    try:
+        before = os.stat(finder_path)
+    except OSError:
+        return -1, frozenset(), frozenset()
+    if not stat.S_ISDIR(before.st_mode):
+        return -1, frozenset(), frozenset()
+    try:
+        names: list[str] = []
+        with os.scandir(finder_path) as entries:
+            for index, entry in enumerate(entries):
+                if index >= _MAX_SOURCE_FINGERPRINT_CANDIDATES:
+                    return None
+                names.append(entry.name)
+        after = os.stat(finder_path)
+    except Exception:
+        return None
+    if _stat_identity(before) != _stat_identity(after):
+        return None
+    path_cache = names
+    if sys.platform.startswith("win"):
+        path_cache = []
+        for name in names:
+            stem, separator, suffix = name.partition(".")
+            path_cache.append(f"{stem}.{suffix.lower()}" if separator else stem)
+    relaxed_path_cache = (
+        (name.lower() for name in names) if sys.platform.startswith(("cygwin", "darwin", "win")) else ()
+    )
+    return after.st_mtime, frozenset(path_cache), frozenset(relaxed_path_cache)
+
+
+def _file_finder_state(
+    finder: object,
+    cache_key: str,
+) -> (
+    tuple[
+        dict[str, object],
+        str,
+        int | float,
+        set[object] | frozenset[object],
+        set[object] | frozenset[object],
+    ]
+    | None
+):
+    if type(finder) is not FileFinder or not _path_importer_methods_are_trusted(
+        FileFinder,
+        _TRUSTED_FILE_FINDER_METHODS,
+    ):
+        return None
+    try:
+        instance_state = object.__getattribute__(finder, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    if type(instance_state) is not dict:
+        return None
+    finder_path = dict.get(instance_state, "path")
+    loaders = dict.get(instance_state, "_loaders")
+    path_mtime = dict.get(instance_state, "_path_mtime")
+    path_cache = dict.get(instance_state, "_path_cache")
+    relaxed_path_cache = dict.get(instance_state, "_relaxed_path_cache")
+    if type(path_cache) not in {set, frozenset} or type(relaxed_path_cache) not in {set, frozenset}:
+        return None
+    typed_path_cache = cast(set[object] | frozenset[object], path_cache)
+    typed_relaxed_path_cache = cast(set[object] | frozenset[object], relaxed_path_cache)
+    if not (
+        len(instance_state) == 5
+        and all(
+            dict.__contains__(instance_state, name)
+            for name in ("_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache")
+        )
+        and type(finder_path) is str
+        and Path(finder_path).absolute() == Path(cache_key).absolute()
+        and _file_finder_loaders_are_standard(loaders)
+        and type(path_mtime) in {int, float}
+        and len(typed_path_cache) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        and len(typed_relaxed_path_cache) <= _MAX_SOURCE_FINGERPRINT_CANDIDATES
+    ):
+        return None
+    return (
+        cast(dict[str, object], instance_state),
+        finder_path,
+        cast(int | float, path_mtime),
+        typed_path_cache,
+        typed_relaxed_path_cache,
+    )
+
+
+@dataclass
+class _FileFinderResolutionSummary:
+    finder: object | None = None
+    finder_path: str | None = None
+    observed_path_mtime: int | float | None = None
+    observed_path_cache: object | None = None
+    observed_relaxed_path_cache: object | None = None
+    observed_path_cache_snapshot: frozenset[str] | None = None
+    observed_relaxed_path_cache_snapshot: frozenset[str] | None = None
+    path_mtime: int | float | None = None
+    path_cache: frozenset[str] | None = None
+    relaxed_path_cache: frozenset[str] | None = None
+    canonical_path_cache: frozenset[str] | None = None
+    canonical_relaxed_path_cache: frozenset[str] | None = None
+    identity: str | None = None
+
+
+@lru_cache(maxsize=_MAX_FILE_FINDER_IDENTITY_CACHE_SIZE)
+def _cached_file_finder_resolution_summary(finder_id: int) -> _FileFinderResolutionSummary:
+    del finder_id
+    return _FileFinderResolutionSummary()
+
+
+def _file_finder_cache_names_are_strings(
+    path_cache: Iterable[object],
+    relaxed_path_cache: Iterable[object],
+) -> bool:
+    return all(type(name) is str for name in path_cache) and all(type(name) is str for name in relaxed_path_cache)
+
+
+def _file_finder_cache_matches_snapshot(
+    cache: set[object] | frozenset[object],
+    snapshot: frozenset[str] | None,
+) -> bool:
+    return (
+        snapshot is not None
+        and len(cache) == len(snapshot)
+        and all(type(name) is str and name in snapshot for name in cache)
+    )
+
+
+def _file_finder_resolution_identity(
+    finder: object,
+    cache_key: str,
+    *,
+    force_refresh: bool = False,
+) -> str | None:
+    state = _file_finder_state(finder, cache_key)
+    if state is None:
+        return None
+    _, finder_path, path_mtime, path_cache, relaxed_path_cache = state
+    with _FILE_FINDER_IDENTITY_LOCK:
+        summary = _cached_file_finder_resolution_summary(id(finder))
+        if (
+            not force_refresh
+            and summary.finder is finder
+            and summary.finder_path == finder_path
+            and summary.observed_path_mtime == path_mtime
+            and path_cache is summary.observed_path_cache
+            and relaxed_path_cache is summary.observed_relaxed_path_cache
+            and _file_finder_cache_matches_snapshot(path_cache, summary.observed_path_cache_snapshot)
+            and _file_finder_cache_matches_snapshot(
+                relaxed_path_cache,
+                summary.observed_relaxed_path_cache_snapshot,
+            )
+        ):
+            return summary.identity
+        if not _file_finder_cache_names_are_strings(path_cache, relaxed_path_cache):
+            return None
+        observed_path_cache_snapshot = frozenset(cast(Iterable[str], path_cache))
+        observed_relaxed_path_cache_snapshot = frozenset(cast(Iterable[str], relaxed_path_cache))
+        canonical_state = _canonical_file_finder_state(finder_path)
+        if canonical_state is None:
+            return None
+        canonical_mtime, canonical_path_cache, canonical_relaxed_path_cache = canonical_state
+        if path_mtime == -1 or path_mtime != canonical_mtime:
+            path_mtime = canonical_mtime
+            validated_path_cache = canonical_path_cache
+            validated_relaxed_path_cache = canonical_relaxed_path_cache
+        else:
+            validated_path_cache = observed_path_cache_snapshot & canonical_path_cache
+            validated_relaxed_path_cache = observed_relaxed_path_cache_snapshot & canonical_relaxed_path_cache
+        state_identity = _string_sequence_identity(
+            (
+                finder_path,
+                repr(path_mtime),
+                _string_sequence_identity(sorted(validated_path_cache)),
+                _string_sequence_identity(sorted(validated_relaxed_path_cache)),
+            )
+        )
+        summary.finder = finder
+        summary.finder_path = finder_path
+        summary.observed_path_mtime = state[2]
+        summary.observed_path_cache = path_cache
+        summary.observed_relaxed_path_cache = relaxed_path_cache
+        summary.observed_path_cache_snapshot = observed_path_cache_snapshot
+        summary.observed_relaxed_path_cache_snapshot = observed_relaxed_path_cache_snapshot
+        summary.path_mtime = path_mtime
+        summary.path_cache = validated_path_cache
+        summary.relaxed_path_cache = validated_relaxed_path_cache
+        summary.canonical_path_cache = canonical_path_cache
+        summary.canonical_relaxed_path_cache = canonical_relaxed_path_cache
+        summary.identity = f"trusted:importlib.machinery.FileFinder:{state_identity}"
+        return summary.identity
+
+
+def _file_finder_spec_from_summary(
+    finder: object,
+    module_name: str,
+    *,
+    canonical: bool = False,
+) -> ModuleSpec | _UnsafePathResolution | None:
+    with _FILE_FINDER_IDENTITY_LOCK:
+        summary = _cached_file_finder_resolution_summary(id(finder))
+        if (
+            summary.finder is not finder
+            or summary.finder_path is None
+            or summary.path_mtime is None
+            or summary.path_cache is None
+            or summary.relaxed_path_cache is None
+            or summary.canonical_path_cache is None
+            or summary.canonical_relaxed_path_cache is None
+        ):
+            return _UNSAFE_PATH_RESOLUTION
+        finder_path = summary.finder_path
+        path_mtime = summary.path_mtime
+        path_cache = summary.canonical_path_cache if canonical else summary.path_cache
+        relaxed_path_cache = summary.canonical_relaxed_path_cache if canonical else summary.relaxed_path_cache
+
+    try:
+        resolution_finder = FileFinder(finder_path, *_STANDARD_FILE_FINDER_LOADER_DETAILS)
+        resolution_state = object.__getattribute__(resolution_finder, "__dict__")
+        if type(resolution_state) is not dict:
+            return _UNSAFE_PATH_RESOLUTION
+        resolution_state["_loaders"] = _STANDARD_FILE_FINDER_LOADERS
+        resolution_state["_path_mtime"] = path_mtime
+        resolution_state["_path_cache"] = path_cache
+        resolution_state["_relaxed_path_cache"] = relaxed_path_cache
+        spec = FileFinder.find_spec(resolution_finder, module_name)
+    except Exception:
+        return _UNSAFE_PATH_RESOLUTION
+    if not (
+        dict.get(resolution_state, "_path_mtime") == path_mtime
+        and dict.get(resolution_state, "_path_cache") is path_cache
+        and dict.get(resolution_state, "_relaxed_path_cache") is relaxed_path_cache
+    ):
+        return _UNSAFE_PATH_RESOLUTION
+    return spec if type(spec) is ModuleSpec else None
+
+
+def _file_finder_miss_matches_canonical_state(finder: object, module_name: str) -> bool:
+    with _FILE_FINDER_IDENTITY_LOCK:
+        summary = _cached_file_finder_resolution_summary(id(finder))
+        if (
+            summary.finder is not finder
+            or summary.finder_path is None
+            or summary.path_mtime is None
+            or summary.path_cache is None
+            or summary.relaxed_path_cache is None
+            or summary.canonical_path_cache is None
+            or summary.canonical_relaxed_path_cache is None
+        ):
+            return False
+        if (
+            summary.path_cache == summary.canonical_path_cache
+            and summary.relaxed_path_cache == summary.canonical_relaxed_path_cache
+        ):
+            return True
+    return _file_finder_spec_from_summary(finder, module_name, canonical=True) is None
+
+
+def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
+    if type(finder) is FileFinder:
+        return _file_finder_resolution_identity(finder, cache_key) is not None
+    return _zipimporter_resolution_identity(finder, cache_key) is not None
 
 
 def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
@@ -3691,6 +4455,36 @@ def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
     return False
 
 
+def _path_importer_resolution_context(search_path: Iterable[str]) -> tuple[str, ...]:
+    path_importer_cache = _runtime_path_importer_cache_without_hooks()
+    if path_importer_cache is None or type(search_path) not in {list, tuple}:
+        return (_UNREUSABLE_HOOK_STATE_IDENTITY,)
+    path_importers = []
+    for entry in search_path:
+        if type(entry) is not str:
+            return (_UNREUSABLE_HOOK_STATE_IDENTITY,)
+        cache_key = entry or os.getcwd()
+        if not dict.__contains__(path_importer_cache, cache_key):
+            continue
+        finder = dict.__getitem__(path_importer_cache, cache_key)
+        absolute_cache_key = str(Path(cache_key).absolute())
+        if finder is None:
+            path_importers.append(f"{absolute_cache_key}=cached-none")
+            continue
+        if type(finder) is FileFinder:
+            file_finder_identity = _file_finder_resolution_identity(finder, cache_key)
+            identity = file_finder_identity or _import_hook_identity(finder)
+            path_importers.append(f"{absolute_cache_key}={identity}")
+            continue
+        if type(finder) is zipimporter:
+            zipimporter_identity = _zipimporter_resolution_identity(finder, cache_key)
+            identity = zipimporter_identity or _import_hook_identity(finder)
+            path_importers.append(f"{absolute_cache_key}={identity}")
+            continue
+        path_importers.append(f"{absolute_cache_key}={_import_hook_identity(finder)}")
+    return tuple(path_importers)
+
+
 def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     search_path = _runtime_search_path_without_hooks()
     meta_path = _runtime_meta_path_without_hooks()
@@ -3699,17 +4493,10 @@ def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tupl
     if search_path is None or meta_path is None or path_hooks is None or path_importer_cache is None:
         unavailable = (_UNREUSABLE_HOOK_STATE_IDENTITY,)
         return unavailable, unavailable, unavailable
-    nonstandard_importers = []
-    for entry in search_path:
-        cache_key = entry or os.getcwd()
-        finder = dict.get(path_importer_cache, cache_key)
-        if finder is None or _is_trusted_standard_path_importer(finder, cache_key):
-            continue
-        nonstandard_importers.append(f"{Path(cache_key).absolute()}={_import_hook_identity(finder)}")
     return (
         tuple(_meta_path_finder_resolution_identity(finder) for finder in meta_path),
         tuple(_path_hook_resolution_identity(hook) for hook in path_hooks),
-        tuple(nonstandard_importers),
+        _path_importer_resolution_context(search_path),
     )
 
 
@@ -3733,35 +4520,11 @@ def _read_bounded_regular_file(path: Path, max_bytes: int | None) -> tuple[bytes
             remaining -= len(chunk)
         content = b"".join(chunks)
         after = os.fstat(file_descriptor)
-        before_identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        after_identity = (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
         try:
             path_stat = path.stat()
         except OSError as error:
             raise OSError(f"source candidate path changed while being read: {path}") from error
-        path_identity = (
-            path_stat.st_dev,
-            path_stat.st_ino,
-            path_stat.st_mode,
-            path_stat.st_size,
-            path_stat.st_mtime_ns,
-            path_stat.st_ctime_ns,
-        )
-        if before_identity != after_identity or after_identity != path_identity:
+        if len({_stat_identity(before), _stat_identity(after), _stat_identity(path_stat)}) != 1:
             raise OSError(f"source candidate changed while being read: {path}")
         if max_bytes is not None and len(content) > max_bytes:
             raise _SourceReadTooLargeError(f"source candidate exceeds {max_bytes} bytes: {path}")
@@ -3776,17 +4539,7 @@ def _read_bounded_source_text(path: Path) -> str:
 
 
 def _regular_file_identity_fingerprint(file_stat: os.stat_result) -> str:
-    identity = "\0".join(
-        str(value)
-        for value in (
-            file_stat.st_dev,
-            file_stat.st_ino,
-            file_stat.st_mode,
-            file_stat.st_size,
-            file_stat.st_mtime_ns,
-            file_stat.st_ctime_ns,
-        )
-    )
+    identity = "\0".join(str(value) for value in _stat_identity(file_stat))
     digest = hashlib.sha256(identity.encode()).hexdigest()
     return f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:{digest}"
 
@@ -3833,23 +4586,7 @@ def _read_candidate_fingerprint(
             after = path.stat()
         except OSError:
             return False, None
-        before_identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        after_identity = (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        if before_identity != after_identity:
+        if _stat_identity(before) != _stat_identity(after):
             return False, None
         return True, hashlib.sha256(b"directory\0" + b"\0".join(sorted(entries))).digest()
     if not stat.S_ISREG(before.st_mode):
@@ -3880,39 +4617,7 @@ def _read_candidate_fingerprint(
     finally:
         os.close(file_descriptor)
 
-    before_identity = (
-        before.st_dev,
-        before.st_ino,
-        before.st_mode,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    )
-    opened_identity = (
-        opened.st_dev,
-        opened.st_ino,
-        opened.st_mode,
-        opened.st_size,
-        opened.st_mtime_ns,
-        opened.st_ctime_ns,
-    )
-    after_identity = (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    )
-    path_identity = (
-        path_after.st_dev,
-        path_after.st_ino,
-        path_after.st_mode,
-        path_after.st_size,
-        path_after.st_mtime_ns,
-        path_after.st_ctime_ns,
-    )
-    if len({before_identity, opened_identity, after_identity, path_identity}) != 1:
+    if len({_stat_identity(value) for value in (before, opened, after, path_after)}) != 1:
         return False, None
     if require_complete and len(source) > read_limit:
         return False, None
@@ -3920,6 +4625,7 @@ def _read_candidate_fingerprint(
 
 
 def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
+    snapshot.import_runtime_trusted = _interpreter_import_runtime_matches_snapshot()
     snapshot.search_context = _source_search_context()
     snapshot.resolution_context = _source_resolution_context()
     snapshot.resolution_fingerprints.clear()
@@ -3927,18 +4633,76 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.module_sources.clear()
     snapshot.loaded_module_sources.clear()
     snapshot.loaded_package_paths.clear()
+    snapshot.loaded_package_resolution_contexts.clear()
+    snapshot.namespace_package_resolution_contexts.clear()
     snapshot.loaded_interpreter_modules.clear()
     snapshot.loaded_interpreter_references.clear()
     snapshot.generation += 1
     snapshot.stable = True
-    snapshot.reusable = _resolution_context_is_reusable(snapshot.resolution_context)
+    snapshot.reusable = snapshot.import_runtime_trusted and _resolution_context_is_reusable(snapshot.resolution_context)
+
+
+def _path_importer_context_allows_trusted_cache_population(
+    before: tuple[str, ...],
+    after: tuple[str, ...],
+) -> bool:
+    before_index = 0
+    for identity in after:
+        if before_index < len(before) and identity == before[before_index]:
+            before_index += 1
+            continue
+        path, separator, state = identity.rpartition("=")
+        if not separator or not path or not state:
+            return False
+        if state.startswith(("trusted:importlib.machinery.FileFinder:", "trusted:zipimport.zipimporter:")):
+            continue
+        if state != "cached-none" or _zipimport_archive_state_from_entry(path) is not None:
+            return False
+        try:
+            os.stat(path)
+        except OSError:
+            continue
+        return False
+    return before_index == len(before)
+
+
+def _resolution_context_allows_trusted_cache_population(
+    before: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    after: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> bool:
+    return before[:2] == after[:2] and _path_importer_context_allows_trusted_cache_population(before[2], after[2])
+
+
+def _current_trusted_path_importer_context(
+    search_path: Iterable[str],
+    expected: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    if _search_path_has_untrusted_importer(search_path):
+        return None
+    current = _path_importer_resolution_context(search_path)
+    if current == expected or _path_importer_context_allows_trusted_cache_population(expected, current):
+        return current
+    return None
+
+
+def _snapshot_resolution_context_is_current(snapshot: _SharedSourceSnapshot) -> bool:
+    current = _source_resolution_context()
+    if snapshot.resolution_context == current:
+        return True
+    if not _resolution_context_allows_trusted_cache_population(snapshot.resolution_context, current):
+        return False
+    snapshot.resolution_context = current
+    snapshot.reusable = snapshot.reusable and _resolution_context_is_reusable(current)
+    return True
 
 
 def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
     if (
         not snapshot.stable
+        or not snapshot.import_runtime_trusted
+        or not _interpreter_import_runtime_matches_snapshot()
         or snapshot.search_context != _source_search_context()
-        or snapshot.resolution_context != _source_resolution_context()
+        or not _snapshot_resolution_context_is_current(snapshot)
     ):
         return False
     for path, (read_limit, require_complete, expected_read_fingerprint) in snapshot.read_fingerprints.items():
@@ -3963,8 +4727,33 @@ def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
         is_loaded, current_search_path = _loaded_package_search_path(module_name)
         if not is_loaded or current_search_path is None or tuple(current_search_path) != expected_search_path:
             return False
-        if _search_path_has_untrusted_importer(current_search_path):
+        expected_resolution_context = snapshot.loaded_package_resolution_contexts.get(module_name)
+        if expected_resolution_context is None:
             return False
+        current_resolution_context = _current_trusted_path_importer_context(
+            current_search_path,
+            expected_resolution_context,
+        )
+        if current_resolution_context is None:
+            return False
+        snapshot.loaded_package_resolution_contexts[module_name] = current_resolution_context
+    for module_name, (
+        expected_search_path,
+        expected_resolution_context,
+    ) in snapshot.namespace_package_resolution_contexts.items():
+        is_loaded, _loaded_search_path = _loaded_package_search_path(module_name)
+        if is_loaded:
+            return False
+        current_resolution_context = _current_trusted_path_importer_context(
+            expected_search_path,
+            expected_resolution_context,
+        )
+        if current_resolution_context is None:
+            return False
+        snapshot.namespace_package_resolution_contexts[module_name] = (
+            expected_search_path,
+            current_resolution_context,
+        )
     for module_name, expected_module_state in snapshot.loaded_interpreter_modules.items():
         if not _loaded_interpreter_module_state_matches(module_name, expected_module_state):
             return False
@@ -3981,9 +4770,11 @@ def _begin_shared_source_report() -> int | None:
     if snapshot is None:
         return None
     with snapshot.lock:
-        if not _shared_source_snapshot_is_current(snapshot):
+        # Context creation already validated the runtime immediately before the first report.
+        if snapshot.report_started and (not snapshot.reusable or not _shared_source_snapshot_is_current(snapshot)):
             _clear_source_sensitive_caches_now()
             _reset_shared_source_snapshot(snapshot)
+        snapshot.report_started = True
         return snapshot.generation
 
 
@@ -4018,6 +4809,8 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
                 "module_sources": {},
                 "loaded_module_sources": {},
                 "loaded_package_paths": {},
+                "loaded_package_resolution_contexts": {},
+                "namespace_package_resolution_contexts": {},
                 "fingerprints": {},
                 "read_fingerprints": {},
             }
@@ -4034,6 +4827,19 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
             "loaded_package_paths": {
                 module_name: list(search_path)
                 for module_name, search_path in sorted(snapshot.loaded_package_paths.items())
+            },
+            "loaded_package_resolution_contexts": {
+                module_name: list(resolution_context)
+                for module_name, resolution_context in sorted(snapshot.loaded_package_resolution_contexts.items())
+            },
+            "namespace_package_resolution_contexts": {
+                module_name: {
+                    "search_path": list(search_path),
+                    "path_importers": list(resolution_context),
+                }
+                for module_name, (search_path, resolution_context) in sorted(
+                    snapshot.namespace_package_resolution_contexts.items()
+                )
             },
             "fingerprints": {
                 path: fingerprint.hex() if isinstance(fingerprint, bytes) else fingerprint
@@ -4081,10 +4887,7 @@ def _track_resolution_candidate_paths(candidates: Iterable[Path]) -> bool:
         return True
     candidate_paths = {str(candidate): candidate for candidate in candidates}
     with snapshot.lock:
-        if (
-            snapshot.search_context != _source_search_context()
-            or snapshot.resolution_context != _source_resolution_context()
-        ):
+        if snapshot.search_context != _source_search_context() or not _snapshot_resolution_context_is_current(snapshot):
             snapshot.stable = False
             snapshot.reusable = False
             return False
@@ -4126,6 +4929,7 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
                 if _search_path_has_untrusted_importer(loaded_search_path):
                     _mark_shared_source_snapshot_unreusable()
                     return
+                loaded_resolution_context = _path_importer_resolution_context(loaded_search_path)
                 with snapshot.lock:
                     expected_search_path = tuple(loaded_search_path)
                     existing_search_path = snapshot.loaded_package_paths.get(qualified_name)
@@ -4133,7 +4937,20 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
                         snapshot.stable = False
                         snapshot.reusable = False
                         return
+                    existing_resolution_context = snapshot.loaded_package_resolution_contexts.get(qualified_name)
+                    if (
+                        existing_resolution_context is not None
+                        and existing_resolution_context != loaded_resolution_context
+                        and not _path_importer_context_allows_trusted_cache_population(
+                            existing_resolution_context,
+                            loaded_resolution_context,
+                        )
+                    ):
+                        snapshot.stable = False
+                        snapshot.reusable = False
+                        return
                     snapshot.loaded_package_paths[qualified_name] = expected_search_path
+                    snapshot.loaded_package_resolution_contexts[qualified_name] = loaded_resolution_context
                 search_path = loaded_search_path
                 continue
 
@@ -4143,6 +4960,9 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
         for entry in search_path:
             considered_entries.append(entry)
             entry_spec = _find_standard_path_spec(qualified_name, [entry])
+            if isinstance(entry_spec, _UnsafePathResolution):
+                _mark_shared_source_snapshot_unreusable()
+                return
             if entry_spec is None:
                 continue
             if entry_spec.loader is not None:
@@ -4153,6 +4973,36 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
         if resolved_spec is None and namespace_locations:
             resolved_spec = ModuleSpec(qualified_name, loader=None, is_package=True)
             resolved_spec.submodule_search_locations = namespace_locations
+        if (
+            resolved_spec is not None
+            and resolved_spec.submodule_search_locations
+            and (resolved_spec.loader is None or index < len(parts) - 1)
+        ):
+            namespace_search_path = tuple(
+                str(Path(entry or os.getcwd()).absolute()) for entry in resolved_spec.submodule_search_locations
+            )
+            if len(namespace_search_path) > _MAX_SOURCE_FINGERPRINT_CANDIDATES or _search_path_has_untrusted_importer(
+                namespace_search_path
+            ):
+                _mark_shared_source_snapshot_unreusable()
+                return
+            namespace_resolution_context = _path_importer_resolution_context(namespace_search_path)
+            with snapshot.lock:
+                namespace_context = namespace_search_path, namespace_resolution_context
+                existing_namespace_context = snapshot.namespace_package_resolution_contexts.get(qualified_name)
+                if existing_namespace_context is not None and existing_namespace_context != namespace_context:
+                    existing_search_path, existing_resolution_context = existing_namespace_context
+                    if (
+                        existing_search_path != namespace_search_path
+                        or not _path_importer_context_allows_trusted_cache_population(
+                            existing_resolution_context,
+                            namespace_resolution_context,
+                        )
+                    ):
+                        snapshot.stable = False
+                        snapshot.reusable = False
+                        return
+                snapshot.namespace_package_resolution_contexts[qualified_name] = namespace_context
 
         resolution_candidates: set[Path] = set()
         for entry in considered_entries:
@@ -4170,9 +5020,8 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
                     resolution_candidates.add(cache_candidate)
 
         with snapshot.lock:
-            if (
-                snapshot.search_context != _source_search_context()
-                or snapshot.resolution_context != _source_resolution_context()
+            if snapshot.search_context != _source_search_context() or not _snapshot_resolution_context_is_current(
+                snapshot
             ):
                 snapshot.stable = False
                 snapshot.reusable = False
@@ -4251,7 +5100,7 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
             snapshot.stable = False
             snapshot.reusable = False
             return
-        if snapshot.resolution_context != _source_resolution_context():
+        if not _snapshot_resolution_context_is_current(snapshot):
             snapshot.stable = False
             snapshot.reusable = False
             return
@@ -4346,10 +5195,11 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
     if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
         return None
 
-    return _find_standard_filesystem_spec(module_name)
+    spec = _find_standard_filesystem_spec(module_name)
+    return spec if type(spec) is ModuleSpec else None
 
 
-def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
+def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | _UnsafePathResolution | None:
     if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         return None
     parts = module_name.split(".")
@@ -4370,7 +5220,10 @@ def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
                     return None
                 search_path = loaded_search_path
                 continue
-        spec = _find_standard_path_spec(qualified_name, search_path)
+        path_spec = _find_standard_path_spec(qualified_name, search_path)
+        if isinstance(path_spec, _UnsafePathResolution):
+            return path_spec
+        spec = path_spec
         if spec is None:
             return None
         if index == len(parts) - 1:
@@ -4454,17 +5307,29 @@ def _current_module_source_path(module_name: str) -> str | None:
     if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         return None
     spec = _find_standard_filesystem_spec(module_name)
-    if spec is None or not isinstance(spec.origin, str) or not spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+    if (
+        type(spec) is not ModuleSpec
+        or not isinstance(spec.origin, str)
+        or not spec.origin.endswith(tuple(SOURCE_SUFFIXES))
+    ):
         return None
     return str(Path(spec.origin).absolute())
 
 
 def _zipimport_archive_path(entry: str) -> Path | None:
-    try:
-        archive = zipimporter(entry).archive
-    except (ImportError, OSError):
+    if not _zipimport_runtime_is_trusted():
         return None
-    return Path(archive).absolute()
+    archive_state = _zipimport_archive_state_from_entry(entry)
+    if not isinstance(archive_state, tuple):
+        return None
+    archive, _prefix, _cache_key = archive_state
+    try:
+        archive_stat = os.stat(archive)
+    except OSError:
+        return None
+    if _zipimport_bounded_central_directory_names(archive, archive_stat) is None:
+        return None
+    return Path(archive)
 
 
 def _loaded_module_source_path(module_name: str) -> str | None:
@@ -4591,27 +5456,104 @@ def _has_untrusted_path_hook() -> bool:
     return _search_path_has_untrusted_importer(search_path)
 
 
-def _find_standard_path_spec(module_name: str, search_path: list[str]) -> ModuleSpec | None:
-    if not _interpreter_import_runtime_is_trusted() or _search_path_has_untrusted_importer(search_path):
+def _path_hooks_are_trusted() -> bool:
+    path_hooks = _runtime_path_hooks_without_hooks()
+    return path_hooks is not None and all(_is_standard_path_hook(hook) for hook in path_hooks)
+
+
+def _fresh_standard_path_importer(entry: str) -> FileFinder | zipimporter | _UnsafePathResolution | None:
+    path_hooks = _runtime_path_hooks_without_hooks()
+    if path_hooks is None:
+        return _UNSAFE_PATH_RESOLUTION
+    for hook in path_hooks:
+        if not _is_standard_path_hook(hook):
+            return _UNSAFE_PATH_RESOLUTION
+        if hook is zipimporter and not _zipimport_runtime_is_trusted():
+            return _UNSAFE_PATH_RESOLUTION
+        try:
+            finder = zipimporter(entry) if hook is zipimporter else cast(Callable[[str], FileFinder], hook)(entry)
+        except ImportError:
+            continue
+        except Exception:
+            return _UNSAFE_PATH_RESOLUTION
+        if not _is_trusted_standard_path_importer(finder, entry or os.getcwd()):
+            return _UNSAFE_PATH_RESOLUTION
+        return finder
+    return None
+
+
+def _trusted_path_importer_spec(
+    finder: FileFinder | zipimporter,
+    module_name: str,
+    cache_key: str,
+) -> ModuleSpec | _UnsafePathResolution | None:
+    if type(finder) is FileFinder:
+        for attempt in range(_MAX_FILE_FINDER_RESOLUTION_ATTEMPTS):
+            if _file_finder_resolution_identity(finder, cache_key, force_refresh=attempt > 0) is None:
+                return _UNSAFE_PATH_RESOLUTION
+            spec = _file_finder_spec_from_summary(finder, module_name)
+            if isinstance(spec, _UnsafePathResolution):
+                continue
+            if spec is None and not _file_finder_miss_matches_canonical_state(finder, module_name):
+                continue
+            return spec
+        return _UNSAFE_PATH_RESOLUTION
+    try:
+        spec = zipimporter.find_spec(cast(zipimporter, finder), module_name)
+    except Exception:
+        return _UNSAFE_PATH_RESOLUTION
+    if spec is None:
+        return None
+    if type(spec) is ModuleSpec:
+        return spec
+    return _UNSAFE_PATH_RESOLUTION
+
+
+def _find_standard_path_spec(
+    module_name: str,
+    search_path: list[str],
+) -> ModuleSpec | _UnsafePathResolution | None:
+    if not _interpreter_import_runtime_is_trusted():
         _mark_shared_source_snapshot_unreusable()
         return None
 
-    namespace_locations: list[str] = []
-    loader_details = (
-        (ExtensionFileLoader, EXTENSION_SUFFIXES),
-        (SourceFileLoader, SOURCE_SUFFIXES),
-        (SourcelessFileLoader, BYTECODE_SUFFIXES),
-    )
-    for entry in search_path:
-        try:
-            zip_spec = zipimporter(entry).find_spec(module_name)
-        except ImportError:
-            zip_spec = None
-        if zip_spec is not None:
-            return zip_spec
+    path_importer_cache = _runtime_path_importer_cache_without_hooks()
+    if path_importer_cache is None:
+        _mark_shared_source_snapshot_unreusable()
+        return _UNSAFE_PATH_RESOLUTION
 
-        finder = FileFinder(entry, *loader_details)
-        spec = finder.find_spec(module_name)
+    namespace_locations: list[str] = []
+    for entry in search_path:
+        cache_key = entry or os.getcwd()
+        if dict.__contains__(path_importer_cache, cache_key):
+            cached_finder = dict.__getitem__(path_importer_cache, cache_key)
+            if cached_finder is None:
+                continue
+            if not _is_trusted_standard_path_importer(cached_finder, cache_key):
+                if _cached_bounded_zipimporter_excludes_module(cached_finder, module_name, cache_key):
+                    continue
+                _mark_shared_source_snapshot_unreusable()
+                return _UNSAFE_PATH_RESOLUTION
+            finder = cast(FileFinder | zipimporter, cached_finder)
+        else:
+            uncached_zip_excludes_module = _uncached_zip_excludes_module(cache_key, module_name)
+            if uncached_zip_excludes_module is not None:
+                if uncached_zip_excludes_module:
+                    continue
+                _mark_shared_source_snapshot_unreusable()
+                return _UNSAFE_PATH_RESOLUTION
+            fresh_finder = _fresh_standard_path_importer(cache_key)
+            if isinstance(fresh_finder, _UnsafePathResolution):
+                _mark_shared_source_snapshot_unreusable()
+                return fresh_finder
+            if fresh_finder is None:
+                continue
+            finder = fresh_finder
+
+        spec = _trusted_path_importer_spec(finder, module_name, cache_key)
+        if isinstance(spec, _UnsafePathResolution):
+            _mark_shared_source_snapshot_unreusable()
+            return spec
         if spec is None:
             continue
         if spec.loader is not None:
@@ -7625,9 +8567,13 @@ def _resolve_module_source(module_name: str) -> Path | None:
     if parts is None or len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         _mark_shared_source_snapshot_unreusable()
         return None
-    _track_shared_source_candidates(parts)
     spec = _find_standard_filesystem_spec(module_name)
     loaded, _, loaded_spec = _loaded_module_state_without_hooks(module_name)
+    if type(spec) is not ModuleSpec:
+        if not loaded:
+            _mark_shared_source_snapshot_unreusable()
+        return None
+    _track_shared_source_candidates(parts)
     if loaded:
         if loaded_spec is None:
             return None
@@ -7651,7 +8597,7 @@ def _resolve_module_source(module_name: str) -> Path | None:
                 return loaded_source_path
         elif loaded_origin not in {"built-in", "frozen"}:
             return None
-    elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
+    elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or not _path_hooks_are_trusted():
         return None
 
     spec_origin = None
