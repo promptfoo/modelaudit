@@ -418,6 +418,40 @@ def test_python_ci_triggers_merge_group_and_cancels_superseded_main_runs() -> No
         "${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}"
     )
 
+    changes_job = _jobs(workflow)["changes"]
+    assert isinstance(changes_job, dict)
+    assert changes_job["outputs"]["integration"] == "${{ steps.classify.outputs.integration }}"
+    changes_steps = changes_job["steps"]
+    assert isinstance(changes_steps, list)
+    classify_run = _step_by_name(changes_steps, "Classify CI event")["run"]
+    assert '[[ "$GITHUB_REF" == "refs/heads/main" || "$GITHUB_EVENT_NAME" == "merge_group" ]]' in classify_run
+    assert 'echo "integration=true" >> "$GITHUB_OUTPUT"' in classify_run
+    assert 'echo "integration=false" >> "$GITHUB_OUTPUT"' in classify_run
+
+
+def test_python_ci_integration_scheduling_covers_remaining_job_surface() -> None:
+    jobs = _jobs(_load_workflow("test.yml"))
+    integration = "needs.changes.outputs.integration == 'true'"
+    python = "needs.changes.outputs.python == 'true'"
+    dependencies = "needs.changes.outputs.dependencies == 'true'"
+    workflows = "needs.changes.outputs.workflows == 'true'"
+    picklescan = "needs.changes.outputs.picklescan == 'true'"
+    expected_conditions = {
+        "lint": f"{integration} || {python} || {workflows}",
+        "license-check": f"{integration} || {dependencies} || {workflows}",
+        "uv-lock-check": f"{integration} || {dependencies} || {workflows}",
+        "type-check": f"{integration} || {python} || {workflows}",
+        "test-numpy-compatibility": f"{integration} || {dependencies}",
+        "test-vendored-protos": f"{integration} || {python} || {dependencies}",
+        "test-proto-reproducibility": f"{integration} || {python} || {dependencies}",
+        "test-extras-smoke": f"{integration} || {dependencies}",
+        "build": f"{integration} || {python} || {dependencies} || {workflows}",
+        "picklescan-package": f"{integration} || {picklescan} || {workflows}",
+    }
+
+    for job_name, expected_condition in expected_conditions.items():
+        assert jobs[job_name]["if"] == expected_condition
+
 
 def test_python_ci_fast_linux_matrix_folds_quick_feedback_into_ordinary_prs() -> None:
     workflow = _load_workflow("test.yml")
@@ -427,8 +461,8 @@ def test_python_ci_fast_linux_matrix_folds_quick_feedback_into_ordinary_prs() ->
 
     test_job = jobs["test"]
     assert test_job["if"] == (
-        "github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || "
-        "needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'"
+        "needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || "
+        "needs.changes.outputs.workflows == 'true'"
     )
 
     matrix_expression = test_job["strategy"]["matrix"]["include"]
@@ -475,8 +509,8 @@ def test_python_ci_windows_matrix_shards_main_and_workflow_prs() -> None:
     workflow = _load_workflow("test.yml")
     windows_job = _jobs(workflow)["windows-tests"]
     assert windows_job["if"] == (
-        "github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || "
-        "needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'"
+        "needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || "
+        "needs.changes.outputs.workflows == 'true'"
     )
 
     matrix_options = _matrix_options(windows_job["strategy"]["matrix"]["include"])
@@ -511,9 +545,8 @@ def test_python_ci_runs_slow_suite_in_a_separate_job() -> None:
 
     slow_job = jobs["slow-tests"]
     assert slow_job["if"] == (
-        "github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || "
-        "(github.event_name == 'pull_request' && "
-        "contains(github.event.pull_request.labels.*.name, 'run-slow-tests'))"
+        "needs.changes.outputs.integration == 'true' || "
+        "(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests'))"
     )
     slow_steps = slow_job["steps"]
     assert (
@@ -536,8 +569,7 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
 
     coverage_job = jobs["coverage"]
     assert coverage_job["if"] == (
-        "github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || "
-        "needs.changes.outputs.workflows == 'true'"
+        "needs.changes.outputs.integration == 'true' || needs.changes.outputs.workflows == 'true'"
     )
     assert coverage_job["permissions"] == {"contents": "read", "id-token": "write"}
     assert coverage_job["strategy"]["matrix"]["shard"] == list(range(10))
@@ -558,24 +590,38 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     assert "slow-tests" in ci_success_job["needs"]
     ci_success_steps = ci_success_job["steps"]
     gate_script = _step_by_name(ci_success_steps, "Check if all jobs succeeded")["run"]
-    assert (
-        'if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then'
-        in gate_script
-    )
-    assert (
-        'if [[ "$ON_MERGE_GROUP" == "true" || ( "$ON_PULL_REQUEST" == "true" && '
-        '( "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" || '
-        '"$PYTHON_CHANGED" == "true" || "$PICKLESCAN_CHANGED" == "true" ) ) ]]; then' in gate_script
-    )
-    assert (
-        'if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then'
-        in gate_script
-    )
-    assert '[[ "$COVERAGE_RESULT" != "success" ]] && FAILED=true' in gate_script
-    assert '[[ "$TEST_RESULT" != "success" ]] && FAILED=true' in gate_script
-    assert '[[ "$WINDOWS_RESULT" != "success" ]] && FAILED=true' in gate_script
-    assert (
-        'if [[ "$ON_MERGE_GROUP" == "true" || "$ON_MAIN_BRANCH" == "true" || "$RUN_SLOW_LABEL" == "true" ]]; then'
-        in gate_script
-    )
-    assert '[[ "$SLOW_RESULT" != "success" ]] && FAILED=true' in gate_script
+    expected_assignments = {
+        "EXPECT_CORE_FAST": jobs["test"]["if"],
+        "EXPECT_SLOW": jobs["slow-tests"]["if"],
+        "EXPECT_DEPENDENCY_AUDIT": jobs["dependency-audit"]["if"],
+        "EXPECT_DEPENDENCY_SURFACE": jobs["license-check"]["if"],
+        "EXPECT_OPTIONAL_DEPENDENCY_LANES": jobs["test-numpy-compatibility"]["if"],
+        "EXPECT_VENDORED_PROTOS": jobs["test-vendored-protos"]["if"],
+        "EXPECT_BUILD": jobs["build"]["if"],
+        "EXPECT_PICKLESCAN": jobs["picklescan-package"]["if"],
+        "EXPECT_COVERAGE": jobs["coverage"]["if"],
+    }
+    for expectation, condition in expected_assignments.items():
+        assert f'{expectation}="${{{{ {condition} }}}}"' in gate_script
+
+    assert 'if [[ "$expected" == "true" && "$result" != "success" ]]; then' in gate_script
+    assert '[[ "$CHANGES_RESULT" == "success" ]] || FAILED=true' in gate_script
+    expected_results = [
+        ("EXPECT_CORE_FAST", "LINT_RESULT"),
+        ("EXPECT_DEPENDENCY_AUDIT", "DEPENDENCY_AUDIT_RESULT"),
+        ("EXPECT_DEPENDENCY_SURFACE", "LICENSE_RESULT"),
+        ("EXPECT_DEPENDENCY_SURFACE", "UV_LOCK_RESULT"),
+        ("EXPECT_CORE_FAST", "TYPE_CHECK_RESULT"),
+        ("EXPECT_CORE_FAST", "WINDOWS_RESULT"),
+        ("EXPECT_CORE_FAST", "TEST_RESULT"),
+        ("EXPECT_SLOW", "SLOW_RESULT"),
+        ("EXPECT_COVERAGE", "COVERAGE_RESULT"),
+        ("EXPECT_OPTIONAL_DEPENDENCY_LANES", "NUMPY_RESULT"),
+        ("EXPECT_VENDORED_PROTOS", "PROTOS_RESULT"),
+        ("EXPECT_VENDORED_PROTOS", "PROTO_REPRO_RESULT"),
+        ("EXPECT_OPTIONAL_DEPENDENCY_LANES", "EXTRAS_RESULT"),
+        ("EXPECT_BUILD", "BUILD_RESULT"),
+        ("EXPECT_PICKLESCAN", "PICKLESCAN_RESULT"),
+    ]
+    for expectation, result in expected_results:
+        assert f'require_success "${expectation}" "${result}"' in gate_script
