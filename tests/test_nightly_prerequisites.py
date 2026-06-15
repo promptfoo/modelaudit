@@ -5,6 +5,7 @@ import pickle
 from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
 import modelaudit_picklescan._rust as picklescan_rust
 import pytest
@@ -12,7 +13,12 @@ from modelaudit_picklescan import SafetyVerdict, scan_bytes
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import results_have_inconclusive_outcome
-from modelaudit.scanners.pickle_scanner import _is_legitimate_serialization_file
+from modelaudit.scanners.pickle_scanner import (
+    _JOBLIB_NUMPY_ARRAY_WRAPPER_PICKLE_MARKER,
+    _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE,
+    _is_legitimate_serialization_file,
+    _joblib_numpy_array_validated_raw_span_control_references,
+)
 from tests.helpers.file_creators import create_malicious_pickle, create_safe_pickle
 
 
@@ -53,12 +59,18 @@ def test_real_joblib_fixture_has_trusted_numpy_serialization_proof(tmp_path: Pat
     joblib = pytest.importorskip("joblib")
     numpy = pytest.importorskip("numpy")
     joblib_file = tmp_path / "real.joblib"
-    joblib.dump({"weights": numpy.arange(32, dtype=numpy.float32)}, joblib_file)
+    joblib.dump({"weights": numpy.arange(32, dtype=numpy.float32)}, joblib_file, protocol=2)
 
     contents = joblib_file.read_bytes()
-    assert b"joblib.numpy_pickle" in contents
-    assert b"NumpyArrayWrapper" in contents
-    assert _is_legitimate_serialization_file(str(joblib_file)) is True
+    assert _JOBLIB_NUMPY_ARRAY_WRAPPER_PICKLE_MARKER in contents
+    validated_references = _joblib_numpy_array_validated_raw_span_control_references(joblib_file)
+    assert _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE in validated_references
+    with patch(
+        "modelaudit.scanners.pickle_scanner._joblib_numpy_array_validated_raw_span_control_references",
+        return_value=validated_references,
+    ) as validator:
+        assert _is_legitimate_serialization_file(str(joblib_file)) is True
+    validator.assert_called_once_with(joblib_file)
 
 
 def test_compiled_picklescan_path_classifies_nightly_inputs() -> None:
