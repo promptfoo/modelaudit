@@ -463,7 +463,7 @@ _LEGAL_TEXT_BASE64_CHUNK_RE = re.compile(rb"[A-Za-z0-9+/_-]+={0,2}")
 _LEGAL_TEXT_HEX_CHUNK_RE = re.compile(rb"[A-Fa-f0-9]+")
 _LEGAL_TEXT_PICKLE_LINE_SIDE_EFFECT_RE = re.compile(
     rb"(?=(?:"
-    rb"[ci][^\x00-\x20\x7f-\x9f\r\n]+\r?\n[^\x00-\x20\x7f-\x9f\r\n]+\r?\n|"
+    rb"[ci][^\r\n]*\r?\n[^\r\n]*\r?\n|"
     rb"P[^\r\n]*\r?\n"
     rb"))"
 )
@@ -5815,18 +5815,9 @@ def _iter_pickle_candidate_offsets(
         )
         require_continuation = offset > 0
         if opcode_name == "PERSID":
-            line_end = payload.find(b"\n", offset + 1)
-            trailing = payload[line_end + 1 :] if line_end >= 0 else b""
-            require_continuation = require_continuation and bool(trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES))
-            if (
-                require_continuation
-                and line_start == offset
-                and (
-                    _has_structural_pickle_continuation(payload, line_end + 1)
-                    or _has_compact_malformed_pickle_tail(payload, line_end + 1)
-                )
-            ):
-                require_continuation = False
+            # pickletools has parsed the complete protocol-0 operand, so CPython
+            # can call persistent_load before any later tail is rejected.
+            require_continuation = False
         if opcode_name in _PICKLE_LINE_PAIR_OPCODES:
             first_line_end = payload.find(b"\n", offset + 1)
             second_line_end = payload.find(b"\n", first_line_end + 1)
@@ -5858,9 +5849,13 @@ def _iter_pickle_candidate_offsets(
                     )
                 )
             )
-            if require_continuation and not (has_structural_continuation or has_nonstructural_import_signal):
+            if line_start == offset:
+                # A complete line-leading GLOBAL/INST operand reaches find_class
+                # before a later malformed tail or INST MARK failure is rejected.
+                require_continuation = False
+            elif require_continuation and not (has_structural_continuation or has_nonstructural_import_signal):
                 continue
-            if require_continuation:
+            elif require_continuation:
                 require_continuation = False
         if (opcode_name in {"GLOBAL", "INST"} and line_start < offset) or (
             opcode_name == "PERSID" and has_trivial_prefix
@@ -5882,7 +5877,7 @@ def _iter_pickle_candidate_offsets(
             )
         yield from maybe_add(
             offset,
-            prevalidated=_is_plausible_pickle_candidate(payload, offset),
+            prevalidated=True,
             require_continuation=require_continuation,
             require_strong_continuation=has_nontrivial_prefix,
         )
