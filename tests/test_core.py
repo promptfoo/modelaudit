@@ -373,6 +373,22 @@ def _write_ordered_hf_tokenizer_json(
     return path
 
 
+def _write_streamed_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"padding":"'
+        )
+        chunk = "x" * (1024 * 1024)
+        remaining = padding_size
+        while remaining:
+            current = min(remaining, len(chunk))
+            handle.write(chunk[:current])
+            remaining -= current
+        handle.write('"}')
+    return path
+
+
 def _write_truncated_ordered_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
     path.write_text(
         (
@@ -12594,6 +12610,21 @@ def test_scan_file_large_hf_tokenizer_json_does_not_run_binary_json_scanners(
     assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
     assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
     assert not any(check.name == "JSON Content Analysis" for check in result.checks)
+
+
+def test_scan_file_valid_over_64m_hf_tokenizer_json_does_not_fail_closed_as_mxnet(tmp_path: Path) -> None:
+    tokenizer_path = _write_streamed_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES + 1,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert result.success is True
+    assert result.scanner_name not in {"manifest", "jinja2_template", "mxnet", "xgboost"}
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
 def test_scan_file_oversized_hf_tokenizer_json_does_not_fail_closed_as_mxnet(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ import lzma
 import pickle
 import struct
 import tarfile
+import tracemalloc
 import zipfile
 import zlib
 from collections.abc import Callable
@@ -2076,7 +2077,7 @@ def test_hf_tokenizer_json_key_text_inside_padding_string_does_not_route_jinja(
     )
 
     assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
-    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
     assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
 
 
@@ -4926,3 +4927,125 @@ def test_openvino_vs_pmml_detection(tmp_path):
     # Validation should pass for both
     assert validate_file_type(str(openvino_path)) is True
     assert validate_file_type(str(pmml_path)) is True
+
+
+def _write_streamed_hf_tokenizer_json(path: Path, *, padding_size: int, late_fields: str = "") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"padding":"'
+        )
+        chunk = "x" * (1024 * 1024)
+        remaining = padding_size
+        while remaining:
+            current = min(remaining, len(chunk))
+            handle.write(chunk[:current])
+            remaining -= current
+        handle.write(f'"{late_fields}}}')
+    return path
+
+
+def test_hf_tokenizer_json_eof_proof_claims_valid_over_64m_tokenizer(tmp_path: Path) -> None:
+    tokenizer_path = _write_streamed_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES + 1,
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_eof_proof_budget_boundary_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert file_detection.TOKENIZER_JSON_EOF_PROOF_READ_BYTES == 512 * 1024 * 1024
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=256)
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_EOF_PROOF_READ_BYTES
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_hf_tokenizer_json_eof_proof_keeps_large_vocab_token_memory_bounded(tmp_path: Path) -> None:
+    long_token = "x" * (file_detection._HF_TOKENIZER_STREAM_MAX_KEY_BYTES + 1)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"' + long_token + '":0},"merges":[]}}',
+        encoding="utf-8",
+    )
+
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_eof_proof_keeps_large_padding_memory_bounded(tmp_path: Path) -> None:
+    tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=4 * 1024 * 1024)
+
+    tracemalloc.start()
+    try:
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 2 * 1024 * 1024
+
+
+def test_hf_tokenizer_json_eof_proof_rejects_late_conflict_after_old_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    tokenizer_path = _write_streamed_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=256,
+        late_fields=',"chat_template":"{{ dangerous }}"',
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_eof_proof_rejects_flat_deep_duplicate_and_invalid_utf8(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", 4096)
+    flat_root = ",".join(f'"field_{index}":0' for index in range(file_detection._HF_TOKENIZER_STREAM_MAX_TRACKED_KEYS))
+    payloads = [
+        '{"version":"1.0","version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}',
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","type":"BPE","vocab":{"hello":0},"merges":[]}}',
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"deep":'
+        + ("[" * 65)
+        + "0"
+        + ("]" * 65)
+        + "}",
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},' + flat_root + "}",
+    ]
+    for index, payload in enumerate(payloads):
+        tokenizer_path = tmp_path / f"case-{index}" / "tokenizer.json"
+        tokenizer_path.parent.mkdir()
+        tokenizer_path.write_text(payload, encoding="utf-8")
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+
+    late_duplicate = _write_streamed_hf_tokenizer_json(
+        tmp_path / "late-duplicate" / "tokenizer.json",
+        padding_size=256,
+        late_fields=',"version":"1.0"',
+    )
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(late_duplicate) is False
+
+    invalid_utf8_path = tmp_path / "invalid" / "tokenizer.json"
+    invalid_utf8_path.parent.mkdir()
+    invalid_utf8_path.write_bytes(
+        b'{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"\xff":0},"merges":[]}}'
+    )
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(invalid_utf8_path) is False
