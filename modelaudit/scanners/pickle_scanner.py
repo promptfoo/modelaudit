@@ -1523,8 +1523,22 @@ _PASSIVE_LITERAL_AST_NODES = (
 )
 
 
+def _has_downloader_command(value: str) -> bool:
+    return (
+        re.search(r"""(?:^|[\s'"=;|&])(?:[^\s'";|&]*/)?(?:curl|wget|open)(?:\.exe)?(?:\s|$)""", value, re.IGNORECASE)
+        is not None
+    )
+
+
 def _literal_ast_has_downloader_argv(tree: ast.Module) -> bool:
     for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and _PICKLE_LITERAL_URL_TEXT_RE.search(node.value)
+            and _has_downloader_command(node.value)
+        ):
+            return True
         if not isinstance(node, (ast.List, ast.Tuple)):
             continue
         values = [
@@ -1534,7 +1548,7 @@ def _literal_ast_has_downloader_argv(tree: ast.Module) -> bool:
         ]
         if not any(_PICKLE_LITERAL_URL_TEXT_RE.search(value) for value in values):
             continue
-        if any(re.search(r"(?:^|/)(?:curl|wget|open)(?:\.exe)?$", value, re.IGNORECASE) for value in values):
+        if any(_has_downloader_command(value) for value in values):
             return True
     return False
 
