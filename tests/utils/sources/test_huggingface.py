@@ -11317,24 +11317,24 @@ class TestModelDownloadStreaming:
 
     @pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
     @pytest.mark.parametrize(
-        ("malformed_index_count", "expected_budget_scope"),
+        ("malformed_index_count", "expected_limit_scope"),
         [
-            (_MAX_HF_SAFETENSORS_RETAINED_RESULTS - 2, None),
-            (_MAX_HF_SAFETENSORS_RETAINED_RESULTS - 1, "header"),
-            (600, "index"),
+            (_HF_SAFETENSORS_INDEX_MAX_FILES - 2, None),
+            (_HF_SAFETENSORS_INDEX_MAX_FILES + 1, "index-cap"),
+            (600, "index-cap"),
         ],
         ids=[
-            "below-budget-indexes-plus-header",
-            "index-results-exhaust-budget-on-header",
+            "below-index-cap-plus-header",
+            "index-cap-exceeded-plus-header",
             "six-hundred-indexes-plus-header",
         ],
     )
     def test_unscoped_index_result_retention_is_bounded_before_header_scan(
         self,
         malformed_index_count: int,
-        expected_budget_scope: str | None,
+        expected_limit_scope: str | None,
     ) -> None:
-        """Index reconciliation must share the source-native result budget with headers."""
+        """Index count and source-native result retention stay bounded before headers."""
         repo_root = Path(__file__).resolve().parents[3]
         script = textwrap.dedent(
             """
@@ -11473,6 +11473,13 @@ class TestModelDownloadStreaming:
                             result.metadata.get("analysis_scope") == "safetensors_index_reconciliation"
                             for result in source_results
                         ),
+                        "index_incomplete_reasons": [
+                            result.metadata.get("remote_index_reconciliation", {}).get(
+                                "index_incomplete_reason"
+                            )
+                            for result in source_results
+                            if result.metadata.get("analysis_scope") == "safetensors_index_reconciliation"
+                        ],
                         "header_scope_results": sum(
                             result.metadata.get("analysis_scope") == "safetensors_header_and_metadata"
                             for result in source_results
@@ -11531,14 +11538,9 @@ class TestModelDownloadStreaming:
         assert completed.returncode == 0, completed.stderr
         metrics = json.loads(completed.stdout.strip().splitlines()[-1])
 
-        expected_results = min(malformed_index_count + 1, _MAX_HF_SAFETENSORS_RETAINED_RESULTS)
-        expected_range_requests = (
-            _MAX_HF_SAFETENSORS_RETAINED_RESULTS
-            if expected_budget_scope == "index"
-            else malformed_index_count
-            if expected_budget_scope == "header"
-            else malformed_index_count + 2
-        )
+        index_cap_exceeded = expected_limit_scope == "index-cap"
+        expected_results = 2 if index_cap_exceeded else malformed_index_count + 1
+        expected_range_requests = 2 if index_cap_exceeded else malformed_index_count + 2
         assert metrics["streamed_results"] == expected_results
         assert metrics["files_scanned"] == expected_results
         assert metrics["range_requests"] == expected_range_requests
@@ -11556,39 +11558,17 @@ class TestModelDownloadStreaming:
         assert metrics["last_is_last"] is True
         assert metrics["last_marker_count"] == 1
 
-        if expected_budget_scope is not None:
-            assert metrics["budget_results"] == 1
-            assert metrics["budget_checks"] == 1
-            assert metrics["last_result_success"] is False
-            assert metrics["budget_filename"] == metrics["last_path"]
-            assert metrics["budget_details"]["exceeded"] == ["result_count"]
-            assert metrics["budget_details"]["retained_results"] == expected_results - 1
-            assert metrics["budget_details"]["projected_results"] == expected_results
-            if expected_budget_scope == "index":
-                assert metrics["index_scope_results"] == expected_results
-                assert metrics["header_scope_results"] == 0
-                assert metrics["last_path"] == "broken-0511.safetensors.index.json"
-                assert metrics["budget_is_index_only"] is True
-                assert metrics["budget_has_header_only"] is False
-                assert metrics["budget_index_reason"] == "index_read_or_parse_failed"
-            else:
-                assert metrics["index_scope_results"] == malformed_index_count
-                assert metrics["header_scope_results"] == 1
-                assert metrics["last_path"] == "weights.safetensors"
-                assert metrics["budget_is_index_only"] is None
-                assert metrics["budget_has_header_only"] is True
-                assert metrics["budget_index_reason"] is None
-                assert metrics["budget_details"]["candidate_scan_preflighted"] is True
-                assert metrics["huge_header_bytes"] > 6_000_000
-                assert metrics["huge_name_retained"] is False
+        assert metrics["budget_results"] == 0
+        assert metrics["budget_checks"] == 0
+        assert metrics["index_scope_results"] == (1 if index_cap_exceeded else malformed_index_count)
+        assert metrics["header_scope_results"] == 1
+        assert metrics["last_path"] == "weights.safetensors"
+        assert metrics["last_result_success"] is True
+        assert metrics["budget_details"] is None
+        if index_cap_exceeded:
+            assert metrics["index_incomplete_reasons"] == ["index_inspection_limit_exceeded"]
         else:
-            assert metrics["budget_results"] == 0
-            assert metrics["budget_checks"] == 0
-            assert metrics["index_scope_results"] == malformed_index_count
-            assert metrics["header_scope_results"] == 1
-            assert metrics["last_path"] == "weights.safetensors"
-            assert metrics["last_result_success"] is True
-            assert metrics["budget_details"] is None
+            assert metrics["index_incomplete_reasons"] == ["index_read_or_parse_failed"] * malformed_index_count
 
     @pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
     def test_remote_safetensors_max_cardinality_repository_retention_is_measured_and_bounded(self) -> None:
@@ -12711,6 +12691,44 @@ class TestModelDownloadStreaming:
         assert unscoped_failures[index_name]["index_complete"] is False
         assert unscoped_failures[index_name]["index_incomplete_reason"] == expected_reason
         assert read_range.call_count == int(failure_mode in {"unreadable", "malformed"})
+
+    def test_deferred_index_reconciliation_enforces_count_cap_before_range_io(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Source-native reconciliation rejects index count overflow before network reads."""
+        index_names = [f"family-{index}.safetensors.index.json" for index in range(3)]
+        retained_failures: dict[str, dict[str, Any]] = {}
+        read_range = MagicMock(side_effect=AssertionError("index overflow must fail before range I/O"))
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._HF_SAFETENSORS_INDEX_MAX_FILES", 2)
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._read_huggingface_strict_range",
+            read_range,
+        )
+
+        def retain_failure(filename: str, failure: dict[str, Any]) -> bool:
+            retained_failures[filename] = dict(failure)
+            return True
+
+        details, transferred, acquired_indexes, unscoped_failures = _remote_safetensors_index_details_by_file(
+            "test/model",
+            [],
+            index_names,
+            _HF_TEST_REVISION,
+            dict.fromkeys(index_names, 2),
+            deadline=None,
+            max_transferred_bytes=None,
+            retain_unscoped_failure=retain_failure,
+        )
+
+        assert details == {}
+        assert transferred == 0
+        assert acquired_indexes == {}
+        assert unscoped_failures == {}
+        assert retained_failures[index_names[-1]]["index_incomplete_reason"] == "index_inspection_limit_exceeded"
+        assert retained_failures[index_names[-1]]["index_file_count"] == 3
+        assert retained_failures[index_names[-1]]["index_file_limit"] == 2
+        read_range.assert_not_called()
 
     def test_unparsed_index_without_named_scope_fails_closed_for_same_parent_shard(self) -> None:
         """An unreadable index cannot leave an otherwise unscoped peer falsely clean."""

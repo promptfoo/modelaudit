@@ -1969,6 +1969,49 @@ def test_scan_shard_shaped_directory_does_not_require_file_receipt(tmp_path: Pat
     )
 
 
+def test_scan_shard_shaped_directory_rejects_file_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory-to-file swap after dispatch cannot produce a clean singleton scan."""
+    shard_directory = tmp_path / "model-00001-of-00001.safetensors"
+    shard_directory.mkdir()
+    malicious_child = shard_directory / "malicious.pkl"
+    malicious_child.write_bytes(b"cos\nsystem\n(S'echo unsafe'\ntR.")
+    held_directory = tmp_path / "held-model-directory"
+    original_scan = cli_module.scan_model_directory_or_file
+
+    def scan_substitute(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
+        shard_directory.rename(held_directory)
+        shard_directory.write_bytes(_minimal_safetensors_bytes())
+        try:
+            return original_scan(path, *args, **kwargs)
+        finally:
+            shard_directory.unlink()
+            held_directory.rename(shard_directory)
+
+    monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_substitute)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(shard_directory), "--scanners", "safetensors", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert output_payload["has_errors"] is True
+    assert output_payload["files_scanned"] == 0
+    assert output_payload.get("content_hash") is None
+    assert malicious_child.is_file()
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "source_boundary_changed"
+        and check.get("details", {}).get("reason") == "local_source_changed_during_scan"
+        for check in output_payload["checks"]
+    )
+
+
 def test_scan_path_state_requires_unindexed_shard_completion_receipt(tmp_path: Path) -> None:
     """A clean shard result must still account for its pre-scan identity."""
     shard = tmp_path / "model-00001-of-00001.safetensors"
@@ -1997,6 +2040,30 @@ def test_scan_path_state_requires_unindexed_shard_completion_receipt(tmp_path: P
     )
     assert boundary_check.location == str(shard.absolute())
     assert boundary_check.details["reason"] == "shard_target_changed_during_scan"
+
+
+def test_scan_path_state_normalizes_platform_spelling_in_shard_receipts() -> None:
+    """Case-only resolved-path changes do not invalidate the same platform target."""
+    expected: dict[str, int | str] = {
+        "resolved_path": "C:/Users/Runner/AppData/Local/Temp/model.safetensors",
+        "device": 1,
+        "inode": 2,
+        "size": 3,
+        "mtime_ns": 4,
+        "ctime_ns": 5,
+        "nlink": 1,
+    }
+    current: dict[str, int | str] = {
+        **expected,
+        "resolved_path": "c:/users/runner/appdata/local/temp/model.safetensors",
+    }
+
+    with patch("modelaudit.cli.os.path.normcase", side_effect=lambda path: path.lower()):
+        assert _ScanPathState.shard_target_receipts_match(expected, current) is True
+
+    current["inode"] = 7
+    with patch("modelaudit.cli.os.path.normcase", side_effect=lambda path: path.lower()):
+        assert _ScanPathState.shard_target_receipts_match(expected, current) is False
 
 
 def test_scan_path_state_revalidates_index_authority_for_cached_results(tmp_path: Path) -> None:

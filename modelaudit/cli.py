@@ -39,10 +39,12 @@ from .cache.trusted_config_store import TrustedConfigStore
 from .config import ModelAuditConfig, set_config
 from .config.local_config import find_local_config_for_paths
 from .core import (
+    _LOCAL_SOURCE_RECEIPT_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY,
     _make_trusted_stream_shard_root,
     _reconcile_cross_directory_shard_coverage,
+    _snapshot_local_source_receipt,
     _snapshot_validated_shard_target,
     determine_exit_code,
     scan_model_directory_or_file,
@@ -1701,6 +1703,7 @@ class _SourceDispatchResult:
     repository_current_file: str | None = None
     safetensors_index_proofs: tuple[HuggingFaceSafetensorsIndexProof, ...] = ()
     initial_shard_target: ValidatedShardTargets | None = None
+    initial_local_source_receipt: dict[str, int | str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1780,6 +1783,25 @@ class _ScanPathState:
         """Preserve errors from results that cannot join final CLI shard reconciliation."""
         if scan_result.has_errors:
             self.has_errors_outside_reconciled_shards = True
+
+    @staticmethod
+    def shard_target_receipts_match(
+        expected_target: dict[str, int | str],
+        current_target: dict[str, int | str],
+    ) -> bool:
+        """Compare shard receipts while normalizing platform path spelling."""
+        if expected_target.keys() != current_target.keys():
+            return False
+        for receipt_field, expected_value in expected_target.items():
+            current_value = current_target.get(receipt_field)
+            if receipt_field == "resolved_path" and isinstance(expected_value, str) and isinstance(current_value, str):
+                if os.path.normcase(os.path.normpath(expected_value)) != os.path.normcase(
+                    os.path.normpath(current_value)
+                ):
+                    return False
+            elif expected_value != current_value:
+                return False
+        return True
 
     def explicit_shard_family_for(self, path: str) -> _ExplicitShardFamily | None:
         """Return trusted family metadata only for an exact explicit file argument."""
@@ -1905,7 +1927,10 @@ class _ScanPathState:
                     ),
                     None,
                 )
-                if current_target is None or pre_scan_target[expected_source] != current_target:
+                if current_target is None or not self.shard_target_receipts_match(
+                    pre_scan_target[expected_source],
+                    current_target,
+                ):
                     _record_shard_boundary_failure(scan_result, asset.path)
                     continue
             self.validated_shard_targets.update(post_scan_target)
@@ -3691,6 +3716,11 @@ def _scan_local_or_downloaded_path(
             _SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY: path_state.safetensors_index_context,
             **_scanner_selection_overrides(runtime),
         }
+        if (
+            source_result.initial_local_source_receipt is not None
+            and source_result.initial_local_source_receipt.get("mode_type") == stat.S_IFDIR
+        ):
+            config_overrides[_LOCAL_SOURCE_RECEIPT_CONFIG_KEY] = source_result.initial_local_source_receipt
         if explicit_family is not None:
             config_overrides[_DEFER_SAFETENSORS_INDEX_CONTENT_REVALIDATION_CONFIG_KEY] = True
         is_dvc_pointer = actual_path.lower().endswith(".dvc")
@@ -4645,9 +4675,15 @@ def _resolve_scan_source_for_path(
         path_state.mark_non_shard_error(audit_result)
         return None
 
+    initial_local_source_receipt = _snapshot_local_source_receipt(path)
+    if initial_local_source_receipt is None:
+        click.echo(f"Error: Path changed during source dispatch: {_display_path(path)}", err=True)
+        path_state.mark_non_shard_error(audit_result)
+        return None
     return _SourceDispatchResult(
         actual_path=path,
         initial_shard_target=path_state.capture_initial_shard_target(path),
+        initial_local_source_receipt=initial_local_source_receipt,
     )
 
 

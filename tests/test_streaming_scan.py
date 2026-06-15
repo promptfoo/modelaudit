@@ -2917,11 +2917,52 @@ def test_scan_model_streaming_rejects_recreated_program_deleted_shard(tmp_path: 
     )
 
     assert result.success is False
+    assert result.has_errors is True
     assert determine_exit_code(result) == 2
+    assert result.content_hash is None
     assert shard.read_bytes() == b"MALICIOUS REPLACEMENT"
     assert any(
         check.location == str(shard)
-        and check.details.get("reason") == "shard_target_changed_after_scan"
+        and check.details.get("reason") == "shard_target_recreated_after_scan"
+        and check.details.get("scan_outcome_reason") == "shard_boundary_changed"
+        for check in result.checks
+    )
+
+
+def test_scan_model_streaming_rejects_relinked_program_deleted_shard(tmp_path: Path) -> None:
+    """A retained hard link cannot restore a program-deleted shard as trusted."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    original_bytes = struct.pack("<Q", len(header)) + header
+    shard.write_bytes(original_bytes)
+    hidden_link = tmp_path / "retained-shard.bin"
+    try:
+        os.link(shard, hidden_link)
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+
+    def shard_stream() -> Iterator[tuple[Path, bool]]:
+        yield shard, True
+        hidden_link.write_bytes(b"X" * len(original_bytes))
+        os.link(hidden_link, shard)
+
+    result = scan_model_streaming(
+        file_generator=shard_stream(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert result.content_hash is None
+    assert shard.read_bytes() == b"X" * len(original_bytes)
+    assert any(
+        check.location == str(shard)
+        and check.details.get("reason") == "shard_target_recreated_after_scan"
         and check.details.get("scan_outcome_reason") == "shard_boundary_changed"
         for check in result.checks
     )

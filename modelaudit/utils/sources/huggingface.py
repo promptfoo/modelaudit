@@ -1490,18 +1490,31 @@ def _remote_safetensors_index_details_by_file(
 
     total_index_bytes = 0
     acquired_index_bytes: dict[str, bytes] = {}
+    relevant_index_files: list[tuple[str, set[str]]] = []
     for index_filename in sorted(filename for filename in repo_files if _is_safetensors_index_file(filename)):
         filename_family = _remote_safetensors_index_filename_family(index_filename, selected_files)
         if deadline is not None and time.monotonic() >= deadline:
             failure = _index_failure_details(index_filename, "index_reconciliation_timed_out")
             record_failure(index_filename, failure, filename_family)
-            break
+            return details_by_file, total_index_bytes, acquired_index_bytes, unscoped_failures
         parent_prefix = _remote_index_parent_prefix(index_filename)
         if selected_files and not any(
             not parent_prefix or filename.startswith(parent_prefix) for filename in selected_files
         ):
             continue
+        relevant_index_files.append((index_filename, filename_family))
+        if len(relevant_index_files) > _HF_SAFETENSORS_INDEX_MAX_FILES:
+            failure = _index_failure_details(index_filename, "index_inspection_limit_exceeded")
+            failure["index_file_count"] = len(relevant_index_files)
+            failure["index_file_limit"] = _HF_SAFETENSORS_INDEX_MAX_FILES
+            record_failure(index_filename, failure, filename_family)
+            return details_by_file, total_index_bytes, acquired_index_bytes, unscoped_failures
 
+    for index_filename, filename_family in relevant_index_files:
+        if deadline is not None and time.monotonic() >= deadline:
+            failure = _index_failure_details(index_filename, "index_reconciliation_timed_out")
+            record_failure(index_filename, failure, filename_family)
+            break
         index_size = path_sizes.get(index_filename)
         if index_size is None:
             failure = _index_failure_details(index_filename, "missing_index_size")

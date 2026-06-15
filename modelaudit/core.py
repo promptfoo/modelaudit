@@ -422,6 +422,7 @@ _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
 DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
 DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
+_LOCAL_SOURCE_RECEIPT_CONFIG_KEY = "_local_source_receipt"
 _INCOMPLETE_SHARD_CHECK_NAMES = frozenset(
     {
         "Shard Scan",
@@ -596,6 +597,10 @@ class _DirectoryOwnerSnapshotEntry:
 
 class _DirectoryOwnerSnapshotLimitError(RuntimeError):
     """Raised when a logical-owner namespace exceeds its bounded inventory."""
+
+
+class _LocalSourceBoundaryError(RuntimeError):
+    """Raised when a local source no longer matches its dispatch receipt."""
 
 
 def _directory_owner_stat_mode(entry_stat: os.stat_result) -> int:
@@ -1274,6 +1279,42 @@ def _snapshot_validated_shard_target(
         target["authoritative_shard_index_fingerprint"] = authoritative_shard_index_fingerprint
         target["authoritative_shard_index_generation"] = authoritative_shard_index_generation
     return {str(source.absolute()): target}
+
+
+def _snapshot_local_source_receipt(source_path: str | os.PathLike[str]) -> dict[str, int | str] | None:
+    """Capture the filesystem object selected by a local source path."""
+    try:
+        resolved_source = Path(source_path).resolve(strict=True)
+        source_stat = os.stat(resolved_source, follow_symlinks=False)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return {
+        "resolved_path": str(resolved_source),
+        "device": source_stat.st_dev,
+        "inode": source_stat.st_ino,
+        "mode_type": stat.S_IFMT(source_stat.st_mode),
+        "size": source_stat.st_size,
+        "mtime_ns": source_stat.st_mtime_ns,
+        "ctime_ns": source_stat.st_ctime_ns,
+        "nlink": source_stat.st_nlink,
+    }
+
+
+def _local_source_receipts_match(
+    expected: dict[str, int | str],
+    current: dict[str, int | str] | None,
+) -> bool:
+    """Return whether a source still names the object captured at dispatch."""
+    if current is None or expected.keys() != current.keys():
+        return False
+    for field, expected_value in expected.items():
+        current_value = current.get(field)
+        if field == "resolved_path" and isinstance(expected_value, str) and isinstance(current_value, str):
+            if os.path.normcase(os.path.normpath(expected_value)) != os.path.normcase(os.path.normpath(current_value)):
+                return False
+        elif current_value != expected_value:
+            return False
+    return True
 
 
 _WindowsShardGuards = list[tuple[int, str, dict[str, int | str]]]
@@ -2184,7 +2225,10 @@ def _terminal_safetensors_shard_boundary_failures(
         if source_path in failures:
             continue
         normalized_source = os.path.normcase(os.path.normpath(os.path.abspath(source_path)))
-        if normalized_source in normalized_deleted_paths and not os.path.lexists(source_path):
+        if normalized_source in normalized_deleted_paths:
+            if not os.path.lexists(source_path):
+                continue
+            failures[source_path] = "shard_target_recreated_after_scan"
             continue
         resolved_path = expected_target.get("resolved_path")
         current_target = _snapshot_validated_shard_target(
@@ -3837,6 +3881,15 @@ def scan_model_directory_or_file(
     """
     # Start timer for timeout
     start_time = time.time()
+    local_source_receipt_value = kwargs.pop(_LOCAL_SOURCE_RECEIPT_CONFIG_KEY, None)
+    expected_local_source_receipt = (
+        local_source_receipt_value
+        if isinstance(local_source_receipt_value, dict)
+        and all(
+            isinstance(key, str) and isinstance(value, (int, str)) for key, value in local_source_receipt_value.items()
+        )
+        else None
+    )
     dvc_parent_file = kwargs.pop(_DVC_PARENT_FILE_CONFIG_KEY, None)
     dvc_remaining_total_size = kwargs.pop(_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY, None)
     dvc_total_size_limit = kwargs.pop(_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY, None)
@@ -3932,6 +3985,11 @@ def scan_model_directory_or_file(
     config[_SAFETENSORS_INDEX_CONTEXT_CONFIG_KEY] = index_inspection_context
 
     try:
+        if expected_local_source_receipt is not None and not _local_source_receipts_match(
+            expected_local_source_receipt,
+            _snapshot_local_source_receipt(path),
+        ):
+            raise _LocalSourceBoundaryError("local source changed after dispatch")
         # Handle streaming paths
         if is_stream_url(path):
             # Extract the actual URL
@@ -6248,6 +6306,12 @@ def scan_model_directory_or_file(
                     aggregate_hash_complete = False
                     _record_dvc_output_limit_incomplete(results, scan_metadata, path, single_dvc_resolution)
 
+        if expected_local_source_receipt is not None and not _local_source_receipts_match(
+            expected_local_source_receipt,
+            _snapshot_local_source_receipt(path),
+        ):
+            raise _LocalSourceBoundaryError("local source changed during scanning")
+
     except KeyboardInterrupt:
         logger.debug("Scan interrupted by user")
         scan_metadata["success"] = False
@@ -6257,20 +6321,44 @@ def scan_model_directory_or_file(
         )
     except Exception as e:
         report_path = _redacted_scan_path_for_reporting(path)
-        report_error = _redacted_scan_error_for_reporting(e, path)
-        if is_stream_url(path):
-            logger.error(f"Error during scan: {report_error}")
+        if isinstance(e, _LocalSourceBoundaryError):
+            from .scanner_results import Check as ScanCheck
+
+            scan_metadata["success"] = False
+            scan_metadata["has_operational_errors"] = True
+            results.checks.append(
+                ScanCheck(
+                    name="Local Source Boundary Check",
+                    status=CheckStatus.FAILED,
+                    message="Validated local source changed during scan dispatch; scan coverage is incomplete.",
+                    severity=IssueSeverity.INFO,
+                    location=report_path,
+                    details={
+                        "path": report_path,
+                        "reason": "local_source_changed_during_scan",
+                        "analysis_incomplete": True,
+                        "operational_error": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "source_boundary_changed",
+                    },
+                )
+            )
+            aggregate_hash_complete = False
         else:
-            logger.exception(f"Error during scan: {report_error}")
-        scan_metadata["success"] = False
-        scan_metadata["has_operational_errors"] = True
-        _add_issue_to_model(
-            results,
-            f"Error during scan: {report_error}",
-            severity=IssueSeverity.INFO.value,
-            details={"exception_type": type(e).__name__},
-        )
-        _add_error_asset_to_results(results, report_path)
+            report_error = _redacted_scan_error_for_reporting(e, path)
+            if is_stream_url(path):
+                logger.error(f"Error during scan: {report_error}")
+            else:
+                logger.exception(f"Error during scan: {report_error}")
+            scan_metadata["success"] = False
+            scan_metadata["has_operational_errors"] = True
+            _add_issue_to_model(
+                results,
+                f"Error during scan: {report_error}",
+                severity=IssueSeverity.INFO.value,
+                details={"exception_type": type(e).__name__},
+            )
+            _add_error_asset_to_results(results, report_path)
     finally:
         _close_windows_shard_guards(windows_shard_guards)
         pickle_source_snapshot_stack.close()
