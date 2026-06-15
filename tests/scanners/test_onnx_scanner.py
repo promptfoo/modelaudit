@@ -6405,7 +6405,7 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible"][0]["consumer_op"] == "Einsum"
         assert semantics["eligible"][0]["output_axes"] == [1]
 
-    def test_qdq_weight_path_remains_a_clean_quantized_exclusion(self, tmp_path: Path) -> None:
+    def test_qdq_weight_path_is_analyzed_cleanly(self, tmp_path: Path) -> None:
         model_path = create_qdq_weight_model(tmp_path)
 
         result = OnnxScanner().scan(str(model_path))
@@ -6413,8 +6413,9 @@ class TestWeightDistributionSemantics:
         assert result.success is True
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["eligible_initializer_count"] == 0
-        assert semantics["exclusion_counts"]["quantized_operator"] == 3
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
+        assert semantics["eligible"][0]["quantization_kind"] == "DequantizeLinear"
 
     def test_sparse_weight_lineage_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_sparse_weight_model(tmp_path)
