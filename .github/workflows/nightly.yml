@@ -10,14 +10,20 @@ permissions:
   contents: read
 
 jobs:
-  full-matrix:
-    name: Full Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+  correctness:
+    name: Correctness (${{ matrix.os }}, Python ${{ matrix.python-version }}, Shard ${{ matrix.shard }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        shard: [0, 1]
+        exclude:
+          - { os: windows-latest, python-version: "3.10" }
+          - { os: windows-latest, python-version: "3.12" }
+          - { os: windows-latest, python-version: "3.13" }
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -38,19 +44,15 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          uv sync --extra all-ci
+          uv sync --extra ${{ matrix.os == 'windows-latest' && 'all-ci-windows' || 'all-ci' }}
 
-      - name: Run standalone picklescan Rust tests
+      - name: Run correctness shard (fast + slow + integration)
         run: |
-          cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+          uv run pytest -n auto -m "not performance" --modelaudit-shard-count 2 --modelaudit-shard-index ${{ matrix.shard }} --tb=short --durations=20
 
-      - name: Run all tests (fast + slow + integration + performance)
-        run: |
-          uv run pytest -n auto --tb=short --durations=20
-
-  windows-full:
-    name: Windows Full Tests (Python 3.11)
-    runs-on: windows-latest
+  performance:
+    name: Performance Tests (Python 3.11, single process)
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Checkout repo
@@ -58,6 +60,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
 
       - name: Pin Python version
         run: |
@@ -70,12 +74,45 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          uv sync --extra all-ci-windows
+          uv sync --extra all-ci
 
-      - name: Run standalone picklescan Rust tests
+      - name: Run performance tests once without xdist
+        run: |
+          uv run pytest -n 0 -m performance --tb=short --durations=20
+
+  picklescan-rust:
+    name: Standalone Picklescan Rust Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run standalone picklescan Rust tests once
         run: |
           cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
 
-      - name: Run all Windows tests except performance benchmarks
+  nightly-success:
+    name: Nightly Success
+    needs: [correctness, performance, picklescan-rust]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every Nightly lane to succeed
+        env:
+          CORRECTNESS_RESULT: ${{ needs.correctness.result }}
+          PERFORMANCE_RESULT: ${{ needs.performance.result }}
+          PICKLESCAN_RUST_RESULT: ${{ needs.picklescan-rust.result }}
         run: |
-          uv run pytest -n auto -m "not performance" --tb=short --durations=20
+          for result in "$CORRECTNESS_RESULT" "$PERFORMANCE_RESULT" "$PICKLESCAN_RUST_RESULT"; do
+            if [[ "$result" != "success" ]]; then
+              echo "Required Nightly lane did not succeed: $result"
+              exit 1
+            fi
+          done
