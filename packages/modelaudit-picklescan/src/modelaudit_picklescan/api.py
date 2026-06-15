@@ -1799,10 +1799,10 @@ def _complete_pickle_stream_payloads(payload: bytes) -> tuple[tuple[int, bytes],
     streams: list[tuple[int, bytes]] = []
     offset = 0
     opcode_count = 0
+    stream = io.BytesIO(payload)
     try:
         while offset < len(payload):
             stream_end: int | None = None
-            stream = io.BytesIO(payload)
             stream.seek(offset)
             for opcode, _arg, position in pickletools.genops(stream):
                 opcode_count += 1
