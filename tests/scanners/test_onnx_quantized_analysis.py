@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -32,7 +32,7 @@ def _extreme_int8(malicious: bool) -> np.ndarray:
 
 
 def _coverage(result: Any) -> dict[str, Any]:
-    return result.metadata["onnx_weight_distribution_semantics"]
+    return cast(dict[str, Any], result.metadata["onnx_weight_distribution_semantics"])
 
 
 def _failed_coverage(result: Any) -> None:
