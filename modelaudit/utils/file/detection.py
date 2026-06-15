@@ -3467,8 +3467,13 @@ def _classify_sentencepiece_model_proto_file(path: str | Path) -> _SentencePiece
         if stat.st_size < 32:
             return "unknown"
         fingerprint_head, fingerprint_tail = _sentencepiece_model_proto_cache_fingerprint(file_path, stat.st_size)
+        cache_path = (
+            str(file_path.absolute())
+            if _is_private_descriptor_bound_regular_file(file_path)
+            else str(file_path.resolve())
+        )
         return _classify_sentencepiece_model_proto_file_cached(
-            str(file_path.resolve()),
+            cache_path,
             stat.st_size,
             stat.st_mtime_ns,
             stat.st_ctime_ns,

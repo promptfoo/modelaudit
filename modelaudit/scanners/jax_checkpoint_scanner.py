@@ -17,10 +17,12 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from ..utils._path_hardening import _is_private_descriptor_bound_regular_file
 from ..utils.file.detection import (
     _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE,
     _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY,
     _probe_jax_json_checkpoint_file_state,
     _read_jax_json_checkpoint_prefix,
     has_jax_json_checkpoint_structure,
@@ -800,6 +802,7 @@ class JaxCheckpointScanner(BaseScanner):
         # Handle file-based checkpoints
         if os.path.isfile(path):
             path_obj = Path(path)
+            follow_validated_symlink = _is_private_descriptor_bound_regular_file(path_obj)
             filename = path_obj.name.lower()
             if filename == "_checkpoint":
                 return True
@@ -816,8 +819,14 @@ class JaxCheckpointScanner(BaseScanner):
                 if filename == "metadata.json":
                     if cls._has_regular_orbax_sibling_marker(path_obj):
                         return True
-                    return tokenizer_jax_evidence or is_jax_json_checkpoint_file(path)
-                return tokenizer_jax_evidence or is_confirmed_jax_json_checkpoint_file(path)
+                    return tokenizer_jax_evidence or is_jax_json_checkpoint_file(
+                        path,
+                        follow_validated_symlink=follow_validated_symlink,
+                    )
+                return tokenizer_jax_evidence or is_confirmed_jax_json_checkpoint_file(
+                    path,
+                    follow_validated_symlink=follow_validated_symlink,
+                )
             if not ext and cls._is_orbax_checkpoint_entry_name(filename):
                 with suppress(OSError):
                     path_stat = path_obj.lstat()
@@ -825,8 +834,11 @@ class JaxCheckpointScanner(BaseScanner):
                         return cls._probe_numbered_checkpoint_file(path_obj, path_stat) is not False
                 return True
             if ext in cls.supported_extensions:
-                return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
-            return is_jax_json_checkpoint_file(path)
+                return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(
+                    path,
+                    follow_validated_symlink=follow_validated_symlink,
+                )
+            return is_jax_json_checkpoint_file(path, follow_validated_symlink=follow_validated_symlink)
 
         return False
 
@@ -1653,7 +1665,13 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)
-            elif self._header_looks_like_json(header) or is_jax_json_checkpoint_file(path):  # JSON format
+            elif self._header_looks_like_json(header) or is_jax_json_checkpoint_file(
+                path,
+                follow_validated_symlink=(
+                    self.config.get(VALIDATED_DESCRIPTOR_BOUND_SOURCE_CONFIG_KEY) is True
+                    and _is_private_descriptor_bound_regular_file(path)
+                ),
+            ):  # JSON format
                 self._scan_json_checkpoint(path, result)
             else:
                 result.add_check(

@@ -1761,7 +1761,7 @@ class TestOnnxExternalDataContentHash:
             _skip_path_during_directory_prefilter(monkeypatch, layer)
         layer_stat = layer.stat()
         copied_layer = False
-        original_copy = handlers._copy_pinned_file_descriptor
+        original_copy = handlers._copy_pinned_file_descriptor_contents
 
         def track_copy(source_fd: int, *args: Any, **kwargs: Any) -> str:
             nonlocal copied_layer
@@ -1770,7 +1770,7 @@ class TestOnnxExternalDataContentHash:
                 copied_layer = True
             return original_copy(source_fd, *args, **kwargs)
 
-        monkeypatch.setattr(handlers, "_copy_pinned_file_descriptor", track_copy)
+        monkeypatch.setattr(handlers, "_copy_pinned_file_descriptor_contents", track_copy)
         max_file_size = manifest.stat().st_size + 1 if limit_kind == "max_file_size" else 0
         max_total_size = manifest.stat().st_size + layer.stat().st_size - 1 if limit_kind == "max_total_size" else 0
         if mode == "streaming":
