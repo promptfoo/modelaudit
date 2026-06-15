@@ -175,6 +175,7 @@ dev = [
 packages = ["modelaudit"]
 
 [tool.uv]
+constraint-dependencies = ["aiohttp>=3.14.1", "cryptography>=48.0.1"]
 # Exclude platform-specific extras from universal lock file resolution
 # tensorrt only supports Linux and Windows
 default-groups = ["dev"]
