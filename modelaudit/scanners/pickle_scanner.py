@@ -1523,7 +1523,25 @@ _PASSIVE_LITERAL_AST_NODES = (
 )
 
 
+def _literal_ast_has_downloader_argv(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        values = [
+            element.value
+            for element in node.elts
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        ]
+        if not any(_PICKLE_LITERAL_URL_TEXT_RE.search(value) for value in values):
+            continue
+        if any(re.search(r"(?:^|/)(?:curl|wget|open)(?:\.exe)?$", value, re.IGNORECASE) for value in values):
+            return True
+    return False
+
+
 def _is_passive_literal_ast(tree: ast.Module) -> bool:
+    if _literal_ast_has_downloader_argv(tree):
+        return False
     return all(
         isinstance(node, _PASSIVE_LITERAL_AST_NODES)
         and (not isinstance(node, ast.Name) or isinstance(node.ctx, ast.Store))
@@ -4037,8 +4055,8 @@ class PickleScanner(BaseScanner):
             position_offset == 0
             and self._rust_scan_completed_cleanly(result)
             and isinstance(coverage, Mapping)
-            and coverage.get("bytes_scanned") == len(data)
-            and coverage.get("bytes_total") == len(data)
+            and isinstance(coverage.get("bytes_scanned"), int)
+            and coverage["bytes_scanned"] >= len(data)
             and coverage.get("raw_scan_complete") is True
             and coverage.get("opcode_scan_complete") is True
         )

