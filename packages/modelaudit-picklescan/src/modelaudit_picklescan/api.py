@@ -1840,6 +1840,7 @@ def _merge_pytorch_storage_reference_parses(
         referenced_keys=referenced_keys,
         storage_refs_by_key=storage_refs_by_key,
         storage_global_positions=storage_global_positions,
+        # Rebuild context is stream-local; only storage PID structure composes safely.
         canonical_tensor_rebuild_invocations=set(),
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all(parsed.all_persistent_ids_are_pytorch_storage for parsed in parses),

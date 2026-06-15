@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- refresh vulnerable aiohttp, cryptography, and required MLflow lock entries detected by dependency audit
 - isolate canonical legacy PyTorch storage globals across concatenated control pickle streams before source-sensitive call-graph enrichment while malformed tails still fail closed
 - preserve native-architecture Rust installer selection for Docker builds that do not expose BuildKit's `TARGETARCH` argument
 - require and bundle `modelaudit-picklescan>=0.1.7` so root releases and source-built Docker images cannot run with the pre-hardening call-graph resolver
