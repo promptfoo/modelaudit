@@ -4,6 +4,7 @@ import importlib
 import io
 import json
 import lzma
+import os
 import pickle
 import struct
 import tarfile
@@ -2145,7 +2146,7 @@ def test_hf_tokenizer_json_escaped_jinja_string_between_probe_and_suffix_routes_
     assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
 
 
-def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed_across_gap(
+def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_eof_claimed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2162,8 +2163,8 @@ def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed_acro
     )
 
     assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
-    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
-    assert detect_file_format(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
 def test_hf_tokenizer_json_route_key_after_value_ending_at_probe_boundary_routes_jinja(
@@ -5012,6 +5013,58 @@ def test_hf_tokenizer_json_eof_proof_rejects_late_conflict_after_old_budget(
     assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
     assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_eof_proof_rechecks_same_inode_restored_mtime_conflict(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"clean":[{"op":"null","name":"data","inputs":[]}],"safe_keys":[0],"quiet":[[0,0,0]]',
+    )
+    clean_stat = tokenizer_path.stat()
+
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+
+    _write_ordered_hf_tokenizer_json(
+        tokenizer_path,
+        late_fields=',"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]',
+    )
+    os.utime(tokenizer_path, ns=(clean_stat.st_atime_ns, clean_stat.st_mtime_ns))
+
+    rewritten_stat = tokenizer_path.stat()
+    assert rewritten_stat.st_ino == clean_stat.st_ino
+    assert rewritten_stat.st_size == clean_stat.st_size
+    assert rewritten_stat.st_mtime_ns == clean_stat.st_mtime_ns
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "mxnet"
+
+
+@pytest.mark.parametrize(
+    "model_fields, added_tokens",
+    [
+        ('"type":"BPE","vocab":{"hello":0},"merges":[]', '[{"id":1,"content":"hello","special":false}]'),
+        ('"type":"Unigram","vocab":[["hello",-1.0]],"unk_id":0', '[{"id":1,"content":"hello","special":false}]'),
+    ],
+)
+def test_hf_tokenizer_json_eof_proof_accepts_array_elements_after_old_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_fields: str,
+    added_tokens: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", 4096)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        f'{{"version":"1.0","added_tokens":{added_tokens},"model":{{{model_fields}}},"padding":"{"x" * 256}"}}',
+        encoding="utf-8",
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
 def test_hf_tokenizer_json_eof_proof_rejects_flat_deep_duplicate_and_invalid_utf8(

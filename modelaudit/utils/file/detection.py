@@ -1767,7 +1767,7 @@ def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
         expected_stat = file_path.stat()
     except OSError:
         return False
-    return _hf_tokenizer_json_eof_proves_ownership_cached(
+    return _hf_tokenizer_json_eof_proves_ownership_for_identity(
         str(file_path),
         expected_stat.st_size,
         expected_stat.st_mtime_ns,
@@ -1777,8 +1777,7 @@ def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
     )
 
 
-@lru_cache(maxsize=64)
-def _hf_tokenizer_json_eof_proves_ownership_cached(
+def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     file_path_str: str,
     file_size: int,
     mtime_ns: int,
@@ -1830,7 +1829,7 @@ def _hf_tokenizer_json_eof_proves_ownership_cached(
         context = stack[-1]
         if context.kind == "object" and context.mode == "value" and context.pending_key is not None:
             return (*context.path, context.pending_key)
-        return context.path
+        return (*context.path, "[]")
 
     def tracked_keys(path: tuple[str, ...]) -> set[str] | None:
         if path == ():
