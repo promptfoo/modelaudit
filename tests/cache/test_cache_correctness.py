@@ -26,6 +26,9 @@ from typing import Any
 from zipimport import zipimporter
 
 import pytest
+from modelaudit_picklescan.call_graph import (
+    _cached_bounded_zipimporter_excludes_module as _picklescan_cached_bounded_zipimporter_excludes_module,
+)
 from modelaudit_picklescan.call_graph import _import_hook_identity as _picklescan_import_hook_identity
 from modelaudit_picklescan.call_graph import _path_hook_resolution_identity as _picklescan_path_hook_resolution_identity
 from modelaudit_picklescan.call_graph import (
@@ -45,8 +48,8 @@ from modelaudit.cache.scan_results_cache import (
     _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
     AncestorIdentity,
     ScanResultsCache,
-    _import_hook_identity,
-    _path_hook_resolution_identity,
+    _current_module_source_path,
+    _path_importer_resolution_context,
     _source_resolution_context,
 )
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
@@ -84,20 +87,26 @@ def _call_graph_fingerprint_metadata(
     loaded_package_paths: dict[str, list[str]] | None = None,
     read_fingerprints: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    package_paths = loaded_package_paths or {}
     return {
         "reusable": True,
         "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
         "resolution_context": _source_resolution_context(),
         "module_sources": module_sources or {},
         "loaded_module_sources": loaded_module_sources or {},
-        "loaded_package_paths": loaded_package_paths or {},
+        "loaded_package_paths": package_paths,
+        "loaded_package_resolution_contexts": {
+            module_name: list(_path_importer_resolution_context(search_path))
+            for module_name, search_path in package_paths.items()
+        },
+        "namespace_package_resolution_contexts": {},
         "fingerprints": fingerprints or {},
         "read_fingerprints": read_fingerprints or {},
     }
 
 
-def _source_independent_call_graph_fingerprint_metadata() -> dict[str, Any]:
-    return {
+def _source_independent_call_graph_fingerprint_metadata(*, critical_references: bool = False) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
         "reusable": True,
         "source_independent": True,
         "fingerprints": {},
@@ -106,6 +115,9 @@ def _source_independent_call_graph_fingerprint_metadata() -> dict[str, Any]:
         "loaded_module_sources": {},
         "loaded_package_paths": {},
     }
+    if critical_references:
+        metadata["critical_references_covered"] = True
+    return metadata
 
 
 def _identity_kwargs(cache: ScanResultsCache, file_path: str) -> dict[str, Any]:
@@ -1353,6 +1365,61 @@ def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX symlink parent-traversal semantics")
+def test_scan_cache_invalidates_symlink_sensitive_parent_search_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "base"
+    clean_parent = tmp_path / "other"
+    clean_root = clean_parent / "pkgroot"
+    poisoned_root = base / "pkgroot"
+    clean_root.mkdir(parents=True)
+    poisoned_root.mkdir(parents=True)
+    symlink_target = clean_parent / "inner"
+    symlink_target.mkdir()
+    link = base / "link"
+    try:
+        link.symlink_to(symlink_target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    clean_entry = link / ".." / "pkgroot"
+    poisoned_entry = poisoned_root
+    assert clean_entry.resolve() == clean_root.resolve()
+    assert os.path.abspath(clean_entry) == os.path.abspath(poisoned_entry)
+    clean_source = clean_root / "cache_switch_module.py"
+    poisoned_source = poisoned_root / "cache_switch_module.py"
+    clean_source.write_text("def entrypoint():\n    return 1\n")
+    poisoned_source.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    original_search_path = list(sys.path)
+    monkeypatch.setattr(sys, "path", [str(clean_entry), *original_search_path])
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    clean_source_path = str(clean_source.absolute())
+    fingerprint_metadata = _call_graph_fingerprint_metadata(
+        {clean_source_path: hashlib.sha256(clean_source.read_bytes()).hexdigest()},
+        module_sources={"cache_switch_module": clean_source_path},
+    )
+    fingerprint_metadata["search_context"] = cache._source_search_context()
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    monkeypatch.setattr(sys, "path", [str(poisoned_entry), *original_search_path])
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
 def test_scan_cache_invalidates_when_loaded_module_override_appears(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1480,6 +1547,63 @@ def test_scan_cache_reuses_matching_loaded_parent_package_path(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+@pytest.mark.parametrize("transition", ["finder-to-none", "none-to-finder"])
+def test_scan_cache_invalidates_loaded_package_importer_semantics_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transition: str,
+) -> None:
+    source_path = tmp_path / "runtime" / "cache_pkg" / "child.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("def entrypoint():\n    return 1\n")
+    package_path = str(source_path.parent.absolute())
+    loaded_parent = ModuleType("cache_pkg")
+    loaded_parent.__path__ = [package_path]
+    loaded_parent.__spec__ = ModuleSpec("cache_pkg", loader=None, is_package=True)
+    monkeypatch.setitem(sys.modules, "cache_pkg", loaded_parent)
+    standard_finder = FileFinder(
+        package_path,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    assert standard_finder.find_spec("cache_pkg.child") is not None
+    monkeypatch.setitem(
+        sys.path_importer_cache,
+        package_path,
+        standard_finder if transition == "finder-to-none" else None,
+    )
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    source = str(source_path.absolute())
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
+                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+                module_sources={"cache_pkg.child": source},
+                loaded_package_paths={"cache_pkg": [package_path]},
+            )
+        },
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    monkeypatch.setitem(
+        sys.path_importer_cache,
+        package_path,
+        None if transition == "finder-to-none" else standard_finder,
+    )
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
 def test_scan_cache_rejects_custom_importer_on_matching_loaded_parent_package_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1565,31 +1689,25 @@ def test_import_hook_identity_distinguishes_same_qualname_closures() -> None:
     bytecode_hook = FileFinder.path_hook((SourcelessFileLoader, BYTECODE_SUFFIXES))
 
     assert source_hook.__qualname__ == bytecode_hook.__qualname__
-    assert _import_hook_identity(source_hook) == _import_hook_identity(equivalent_source_hook)
-    assert _import_hook_identity(source_hook) != _import_hook_identity(bytecode_hook)
+    assert _picklescan_import_hook_identity(source_hook) == _picklescan_import_hook_identity(equivalent_source_hook)
+    assert _picklescan_import_hook_identity(source_hook) != _picklescan_import_hook_identity(bytecode_hook)
 
 
 def test_import_hook_identity_tracks_function_defaults_and_keyword_defaults() -> None:
     def hook(_path: str, target: str = "safe", *, mode: str = "source") -> tuple[str, str]:
         return target, mode
 
-    identity_functions = (_import_hook_identity, _picklescan_import_hook_identity)
-    initial_identities = tuple(identity(hook) for identity in identity_functions)
+    initial_identity = _picklescan_import_hook_identity(hook)
 
     hook.__defaults__ = ("malicious",)
 
-    assert all(
-        identity(hook) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(hook) != initial_identity
 
     hook.__defaults__ = ("safe",)
-    default_restored_identities = tuple(identity(hook) for identity in identity_functions)
+    default_restored_identity = _picklescan_import_hook_identity(hook)
     hook.__kwdefaults__ = {"mode": "bytecode"}
 
-    assert all(
-        identity(hook) != initial
-        for identity, initial in zip(identity_functions, default_restored_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(hook) != default_restored_identity
 
 
 def test_import_hook_identity_tracks_referenced_global_state() -> None:
@@ -1597,14 +1715,11 @@ def test_import_hook_identity_tracks_referenced_global_state() -> None:
     exec("def hook(_path):\n    return target\n", namespace)
     hook = namespace["hook"]
     assert isinstance(hook, FunctionType)
-    identity_functions = (_import_hook_identity, _picklescan_import_hook_identity)
-    initial_identities = tuple(identity(hook) for identity in identity_functions)
+    initial_identity = _picklescan_import_hook_identity(hook)
 
     namespace["target"] = "malicious"
 
-    assert all(
-        identity(hook) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(hook) != initial_identity
 
 
 def test_import_hook_identity_tracks_class_method_state() -> None:
@@ -1618,32 +1733,23 @@ def test_import_hook_identity_tracks_class_method_state() -> None:
     )
     finder_type: Any = namespace["Finder"]
     finder = finder_type()
-    identity_functions = (_import_hook_identity, _picklescan_import_hook_identity)
-
-    initial_identities = tuple(identity(finder) for identity in identity_functions)
+    initial_identity = _picklescan_import_hook_identity(finder)
     finder_type.root = "malicious"
-    assert all(
-        identity(finder) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(finder) != initial_identity
 
     finder_type.root = "safe"
-    restored_identities = tuple(identity(finder) for identity in identity_functions)
+    restored_identity = _picklescan_import_hook_identity(finder)
     finder_type.find_spec.__defaults__ = ("bytecode",)
-    assert all(
-        identity(finder) != restored for identity, restored in zip(identity_functions, restored_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(finder) != restored_identity
 
     finder_type.find_spec.__defaults__ = ("source",)
-    defaults_restored_identities = tuple(identity(finder) for identity in identity_functions)
+    defaults_restored_identity = _picklescan_import_hook_identity(finder)
     namespace["target"] = "malicious"
-    assert all(
-        identity(finder) != restored
-        for identity, restored in zip(identity_functions, defaults_restored_identities, strict=True)
-    )
+    assert _picklescan_import_hook_identity(finder) != defaults_restored_identity
 
     finder_type.__module__ = PathFinder.__module__
     finder_type.__qualname__ = PathFinder.__qualname__
-    assert all(":unreusable:" in identity(finder_type) for identity in identity_functions)
+    assert ":unreusable:" in _picklescan_import_hook_identity(finder_type)
 
 
 def test_standard_file_finder_hook_identity_invalidates_when_methods_change(
@@ -1654,20 +1760,16 @@ def test_standard_file_finder_hook_identity_invalidates_when_methods_change(
         for hook in sys.path_hooks
         if _picklescan_path_hook_resolution_identity(hook) == "trusted:importlib.machinery.FileFinder.path_hook"
     )
-    initial_cache_identity = _path_hook_resolution_identity(standard_hook)
-    initial_picklescan_identity = _picklescan_path_hook_resolution_identity(standard_hook)
+    initial_identity = _picklescan_path_hook_resolution_identity(standard_hook)
 
     def changed_find_spec(self: FileFinder, _fullname: str, _target: object = None) -> None:
         return None
 
     monkeypatch.setattr(FileFinder, "find_spec", changed_find_spec)
 
-    changed_cache_identity = _path_hook_resolution_identity(standard_hook)
-    changed_picklescan_identity = _picklescan_path_hook_resolution_identity(standard_hook)
-    assert changed_cache_identity != initial_cache_identity
-    assert changed_picklescan_identity != initial_picklescan_identity
-    assert ":unreusable:" in changed_cache_identity
-    assert ":unreusable:" in changed_picklescan_identity
+    changed_identity = _picklescan_path_hook_resolution_identity(standard_hook)
+    assert changed_identity != initial_identity
+    assert ":unreusable:" in changed_identity
 
 
 def test_arbitrary_startup_path_hook_is_never_trusted() -> None:
@@ -1677,9 +1779,9 @@ def test_arbitrary_startup_path_hook_is_never_trusted() -> None:
 
     hook = StartupPathHook()
 
-    for identity in (_path_hook_resolution_identity(hook), _picklescan_path_hook_resolution_identity(hook)):
-        assert not identity.startswith("trusted:")
-        assert ":unreusable:" in identity
+    identity = _picklescan_path_hook_resolution_identity(hook)
+    assert not identity.startswith("trusted:")
+    assert ":unreusable:" in identity
 
 
 def test_import_hook_identity_tracks_bound_method_state() -> None:
@@ -1691,13 +1793,11 @@ def test_import_hook_identity_tracks_bound_method_state() -> None:
             return self.target
 
     hook = StatefulHook("safe")
-    cache_identity = _import_hook_identity(hook.find_spec)
-    picklescan_identity = _picklescan_import_hook_identity(hook.find_spec)
+    initial_identity = _picklescan_import_hook_identity(hook.find_spec)
 
     hook.target = "malicious"
 
-    assert _import_hook_identity(hook.find_spec) != cache_identity
-    assert _picklescan_import_hook_identity(hook.find_spec) != picklescan_identity
+    assert _picklescan_import_hook_identity(hook.find_spec) != initial_identity
 
 
 def test_scan_cache_rejects_file_finder_subclass_importer(
@@ -1786,8 +1886,6 @@ def test_import_hook_identity_includes_descriptor_method_code(descriptor_kind: s
     equivalent_hook = type("DescriptorFinder", (), {"find_spec": descriptor(original_find_spec)})
     changed_hook = type("DescriptorFinder", (), {"find_spec": descriptor(changed_find_spec)})
 
-    assert _import_hook_identity(original_hook) == _import_hook_identity(equivalent_hook)
-    assert _import_hook_identity(original_hook) != _import_hook_identity(changed_hook)
     assert _picklescan_import_hook_identity(original_hook) == _picklescan_import_hook_identity(equivalent_hook)
     assert _picklescan_import_hook_identity(original_hook) != _picklescan_import_hook_identity(changed_hook)
 
@@ -1800,6 +1898,173 @@ def test_cache_resolution_context_matches_picklescan_metadata() -> None:
         "path_hooks": list(path_hooks),
         "path_importers": list(path_importers),
     }
+
+
+def test_scan_cache_rejects_resolution_metadata_without_current_picklescan_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": _call_graph_fingerprint_metadata()},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    monkeypatch.setattr(
+        "modelaudit.cache.scan_results_cache._PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE",
+        False,
+    )
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_revalidates_sources_after_standard_importer_cache_population(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = "cache_population_source"
+    source_path = tmp_path / f"{module}.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+    path_entry = str(tmp_path)
+    monkeypatch.syspath_prepend(path_entry)
+    monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    source = str(source_path.absolute())
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
+                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+                module_sources={module: source},
+            )
+        },
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    finder = FileFinder(
+        path_entry,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    assert finder.find_spec(module) is not None
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+    calls: list[str] = []
+
+    def missing_current_source(module_name: str) -> str | None:
+        calls.append(module_name)
+        return None
+
+    monkeypatch.setattr(
+        "modelaudit.cache.scan_results_cache._current_module_source_path",
+        missing_current_source,
+        raising=False,
+    )
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+    assert calls == [module]
+
+
+@pytest.mark.parametrize("context_kind", ["loaded", "namespace"])
+@pytest.mark.parametrize("source_matches", [True, False], ids=["benign", "changed"])
+def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    context_kind: str,
+    source_matches: bool,
+) -> None:
+    parent_module = f"{context_kind}_cache_population"
+    module = f"{parent_module}.child"
+    package_path = tmp_path / parent_module
+    package_path.mkdir()
+    source_path = package_path / "child.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+    path_entry = str(package_path)
+    file_path = _make_cacheable_file(tmp_path, "nested-population.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
+    if context_kind == "loaded":
+        loaded_parent = ModuleType(parent_module)
+        loaded_parent.__path__ = [path_entry]
+        loaded_parent.__spec__ = ModuleSpec(parent_module, loader=None, is_package=True)
+        monkeypatch.setitem(sys.modules, parent_module, loaded_parent)
+    else:
+        monkeypatch.delitem(sys.modules, parent_module, raising=False)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        root_finder = FileFinder(
+            str(tmp_path),
+            (ExtensionFileLoader, EXTENSION_SUFFIXES),
+            (SourceFileLoader, SOURCE_SUFFIXES),
+            (SourcelessFileLoader, BYTECODE_SUFFIXES),
+        )
+        assert root_finder.find_spec(parent_module) is not None
+        monkeypatch.setitem(sys.path_importer_cache, str(tmp_path), root_finder)
+
+    source = str(source_path.absolute())
+    fingerprint_metadata = _call_graph_fingerprint_metadata(
+        {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+        module_sources={module: source},
+        loaded_package_paths={parent_module: [path_entry]} if context_kind == "loaded" else None,
+    )
+    if context_kind == "namespace":
+        fingerprint_metadata["namespace_package_resolution_contexts"] = {
+            parent_module: {"search_path": [path_entry], "path_importers": []}
+        }
+
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    finder = FileFinder(
+        path_entry,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    if source_matches:
+        assert finder.find_spec(module) is not None
+    else:
+        finder_state = object.__getattribute__(finder, "__dict__")
+        finder_state.update(
+            _path_mtime=os.stat(path_entry).st_mtime,
+            _path_cache=set(),
+            _relaxed_path_cache=set(),
+        )
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+    calls: list[str] = []
+
+    def current_source(module_name: str) -> str | None:
+        calls.append(module_name)
+        return source if source_matches else None
+
+    monkeypatch.setattr("modelaudit.cache.scan_results_cache._current_module_source_path", current_source)
+
+    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+    assert (cached_result is not None) is source_matches
+    assert calls == [module]
 
 
 def test_resolution_context_rejects_mutated_zipimporter_state(
@@ -1815,13 +2080,134 @@ def test_resolution_context_rejects_mutated_zipimporter_state(
     monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
     monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
 
-    assert not _source_resolution_context()["path_importers"]
-    assert not _picklescan_source_resolution_context()[2]
+    trusted_context = _source_resolution_context()
+    assert trusted_context["path_importers"] == list(_picklescan_source_resolution_context()[2])
+    assert any(
+        path_entry in identity and "trusted:zipimport.zipimporter" in identity
+        for identity in trusted_context["path_importers"]
+    )
 
     object.__getattribute__(finder, "__dict__")["archive"] = str(tmp_path / "other.zip")
 
-    assert any(path_entry in identity for identity in _source_resolution_context()["path_importers"])
-    assert any(path_entry in identity for identity in _picklescan_source_resolution_context()[2])
+    mutated_context = _source_resolution_context()
+    assert mutated_context["path_importers"] == list(_picklescan_source_resolution_context()[2])
+    assert mutated_context != trusted_context
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a Windows console-script launcher")
+def test_windows_console_launcher_zipimporter_cache_can_exclude_stdlib() -> None:
+    launcher_entries = [
+        (key, finder)
+        for key, finder in dict.items(sys.path_importer_cache)
+        if type(key) is str and key.lower().endswith("pytest.exe") and type(finder) is zipimporter
+    ]
+    if not launcher_entries:
+        pytest.skip("pytest.exe is not cached as a zipimporter")
+
+    cache_key, finder = launcher_entries[0]
+    assert _picklescan_cached_bounded_zipimporter_excludes_module(finder, "linecache", cache_key)
+
+
+def test_scan_cache_rejects_changed_unloaded_namespace_importer_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "cached_namespace_package"
+    package_path = tmp_path / module_name
+    package_path.mkdir()
+    path_entry = str(package_path)
+    finder = FileFinder(
+        path_entry,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+    fingerprint_metadata = _call_graph_fingerprint_metadata()
+    fingerprint_metadata["namespace_package_resolution_contexts"] = {
+        module_name: {
+            "search_path": [path_entry],
+            "path_importers": list(_path_importer_resolution_context([path_entry])),
+        }
+    }
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, None)
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+@pytest.mark.parametrize("shadowing_source", [False, True], ids=["benign", "shadowing"])
+def test_scan_cache_revalidates_sources_when_namespace_precedence_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shadowing_source: bool,
+) -> None:
+    parent_module = "cached_namespace_precedence"
+    module_name = f"{parent_module}.child"
+    earlier_root = tmp_path / "earlier"
+    later_root = tmp_path / "later"
+    earlier_root.mkdir()
+    later_package = later_root / parent_module
+    later_package.mkdir(parents=True)
+    later_source = later_package / "child.py"
+    later_source.write_text("value = 'later'\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "path", [str(earlier_root), str(later_root), *sys.path])
+    monkeypatch.delitem(sys.modules, parent_module, raising=False)
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.delitem(sys.path_importer_cache, str(earlier_root), raising=False)
+    monkeypatch.delitem(sys.path_importer_cache, str(later_root), raising=False)
+    monkeypatch.delitem(sys.path_importer_cache, str(later_package), raising=False)
+
+    expected_source = str(later_source.absolute())
+    assert _current_module_source_path(module_name) == expected_source
+    fingerprint_metadata = _call_graph_fingerprint_metadata(
+        {expected_source: hashlib.sha256(later_source.read_bytes()).hexdigest()},
+        module_sources={module_name: expected_source},
+    )
+    fingerprint_metadata["namespace_package_resolution_contexts"] = {
+        parent_module: {
+            "search_path": [str(later_package)],
+            "path_importers": list(_path_importer_resolution_context([str(later_package)])),
+        }
+    }
+    file_path = _make_cacheable_file(tmp_path, "namespace-precedence.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    earlier_package = earlier_root / parent_module
+    earlier_package.mkdir()
+    if shadowing_source:
+        (earlier_package / "child.py").write_text("value = 'earlier'\n", encoding="utf-8")
+    else:
+        (earlier_package / "other.py").write_text("value = 1\n", encoding="utf-8")
+
+    current_source = str((earlier_package / "child.py").absolute()) if shadowing_source else expected_source
+    assert _current_module_source_path(module_name) == current_source
+    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+    assert (cached_result is not None) is not shadowing_source
 
 
 def test_cache_module_validation_does_not_execute_custom_path_hooks(
@@ -2327,6 +2713,52 @@ def test_scan_cache_rejects_source_independent_marker_with_source_inputs(
     )
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+@pytest.mark.parametrize(
+    ("check_module", "check_name", "expected_hit"),
+    (("posix", "system", True), ("builtins", "eval", False)),
+)
+def test_scan_cache_requires_all_critical_source_inputs_to_be_covered(
+    tmp_path: Path,
+    check_module: str,
+    check_name: str,
+    expected_hit: bool,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [
+            {
+                "status": "failed",
+                "severity": "critical",
+                "details": {
+                    "pickle_rule_code": "DANGEROUS_CALL",
+                    "module": check_module,
+                    "name": check_name,
+                },
+            }
+        ],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "malicious",
+            "import_references": [{"module": "posix", "name": "system"}],
+            "callable_invocations": [],
+        },
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _source_independent_call_graph_fingerprint_metadata(
+                critical_references=True
+            )
+        },
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+    assert (cached_result is not None) is expected_hit
 
 
 def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returning_them(

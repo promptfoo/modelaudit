@@ -200,7 +200,7 @@ def test_numpy_read_failure_ignores_s902_severity_override(
 class TestCVE20196446ObjectDtype:
     """Tests for CVE-2019-6446: NumPy allow_pickle RCE via object dtype."""
 
-    def test_object_dtype_triggers_cve(self, tmp_path):
+    def test_object_dtype_triggers_cve(self, tmp_path: Path) -> None:
         """Object dtype array should trigger informational CVE-2019-6446 attribution."""
         arr = np.array(["hello", "world"], dtype=object)
         path = tmp_path / "object_array.npy"
@@ -209,7 +209,12 @@ class TestCVE20196446ObjectDtype:
         scanner = NumPyScanner()
         result = scanner.scan(str(path))
 
-        assert result.success is True
+        failed_checks = [
+            (check.name, check.message, check.details) for check in result.checks if check.status != CheckStatus.PASSED
+        ]
+        assert result.success is True, (
+            f"Benign object-dtype scan was incomplete: metadata={result.metadata!r}; failed_checks={failed_checks!r}"
+        )
         cve_checks = [c for c in result.checks if "CVE-2019-6446" in c.name or "CVE-2019-6446" in c.message]
         assert len(cve_checks) > 0, f"Should detect CVE-2019-6446. Checks: {[c.message for c in result.checks]}"
         assert cve_checks[0].severity == IssueSeverity.INFO
