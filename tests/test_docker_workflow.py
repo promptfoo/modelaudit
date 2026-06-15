@@ -283,6 +283,20 @@ def test_dockerfiles_verify_pinned_rustup_init_instead_of_streaming_shell() -> N
         )
 
 
+@pytest.mark.parametrize("dockerfile", ("Dockerfile", "Dockerfile.full", "Dockerfile.tensorflow"))
+def test_dockerfiles_fallback_to_native_architecture_without_buildkit(dockerfile: str) -> None:
+    lines = _dockerfile_lines(dockerfile)
+    content = "\n".join(lines)
+    architecture_case = 'case "${TARGETARCH:=$(dpkg --print-architecture)}" in'
+
+    assert lines.count("ARG TARGETARCH") == 1
+    assert not any(line.startswith("ARG TARGETARCH=") for line in lines)
+    assert architecture_case in content
+    assert 'amd64) rustup_target="x86_64-unknown-linux-gnu"' in content
+    assert 'arm64) rustup_target="aarch64-unknown-linux-gnu"' in content
+    assert '*) echo "Unsupported Docker build architecture: ${TARGETARCH}" >&2; exit 1 ;;' in content
+
+
 def test_tensorflow_dockerfile_builds_coordinated_picklescan_wheel() -> None:
     content = (_REPO_ROOT / "Dockerfile.tensorflow").read_text(encoding="utf-8")
 
