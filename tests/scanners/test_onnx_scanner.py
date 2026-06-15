@@ -19,7 +19,12 @@ from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import (
+    _onnx_external_data_role,
+    _onnx_package_content_hash,
+    determine_exit_code,
+    scan_model_directory_or_file,
+)
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.integrations.sarif_formatter import format_sarif_output
@@ -51,6 +56,14 @@ def _make_external_tensor(name: str, data_type: int, dims: list[int], external_p
     entry.value = external_path
     tensor.external_data.append(entry)
     return tensor
+
+
+def _onnx_external_package_aggregate_hash(model_path: Path, sidecar_path: Path) -> str:
+    package_hash = _onnx_package_content_hash(
+        compute_sha256_hash(model_path),
+        [(_onnx_external_data_role(model_path, sidecar_path), compute_sha256_hash(sidecar_path))],
+    )
+    return compute_aggregate_hash([package_hash])
 
 
 def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
@@ -2415,12 +2428,7 @@ def test_directory_scan_hashes_external_data_for_content_routed_onnx_bin(tmp_pat
 
     assert_only_onnx_external_schema_validation_skipped(result)
     assert result.bytes_scanned == routed_model_path.stat().st_size + sidecar_path.stat().st_size
-    assert result.content_hash == compute_aggregate_hash(
-        [
-            compute_sha256_hash(routed_model_path),
-            compute_sha256_hash(sidecar_path),
-        ]
-    )
+    assert result.content_hash == _onnx_external_package_aggregate_hash(routed_model_path, sidecar_path)
     assert not any(check.name == "Format Validation" for check in result.checks)
 
 
@@ -4827,12 +4835,7 @@ class TestCVE202634447SymlinkTraversal:
         assert len(resolved_checks) == 1
         assert_only_onnx_external_schema_validation_skipped(result)
         assert result.bytes_scanned == model_path.stat().st_size + sidecar_path.stat().st_size
-        assert result.content_hash == compute_aggregate_hash(
-            [
-                compute_sha256_hash(model_path),
-                compute_sha256_hash(sidecar_path),
-            ]
-        )
+        assert result.content_hash == _onnx_external_package_aggregate_hash(model_path, sidecar_path)
         assert not any(check.name == "Format Validation" for check in result.checks)
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
 
