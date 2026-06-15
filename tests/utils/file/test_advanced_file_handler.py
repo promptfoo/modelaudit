@@ -3477,6 +3477,19 @@ class TestShardedModelDetector:
         assert shard_info["shards"] == [str(shard_one)]
         assert shard_info["total_shards"] == 1
 
+    def test_detect_shards_accepts_arbitrary_safetensors_stems(self, tmp_path: Path) -> None:
+        """Local SafeTensors routing must match remote arbitrary-stem shard names."""
+        shard_one = tmp_path / "diffusion_pytorch_model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "diffusion_pytorch_model-00002-of-00002.safetensors"
+        shard_one.write_bytes(b"test")
+        shard_two.write_bytes(b"test")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one), str(shard_two)]
+        assert shard_info.get("missing_shard_count", 0) == 0
+
     def test_detect_shards_respects_allowed_paths(self, tmp_path: Path) -> None:
         """Directory scans should be able to constrain shard expansion to validated paths."""
         shard_one = tmp_path / "model-00001-of-00002.safetensors"

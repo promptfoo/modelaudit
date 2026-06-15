@@ -2497,7 +2497,16 @@ class ShardedModelDetector:
             return file_relationship
         current_parent = os.path.dirname(normalized_current)
         expected_parents = {os.path.dirname(source_path) for source_path in inventory.expected_source_paths}
-        return current_parent in expected_parents
+        if current_parent not in expected_parents:
+            return False
+        current_details = cls.match_safetensors_shard_filename(current_file.name)
+        current_stem = current_details.get("normalized_shard_stem") if current_details is not None else None
+        expected_stems = {
+            target_details.get("normalized_shard_stem")
+            for source_path in inventory.expected_source_paths
+            if (target_details := cls.match_safetensors_shard_filename(Path(source_path).name)) is not None
+        }
+        return isinstance(current_stem, str) and current_stem in expected_stems
 
     @staticmethod
     def _safetensors_inventory_is_proven_unrelated(
