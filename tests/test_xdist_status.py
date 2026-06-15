@@ -8,6 +8,7 @@ from types import ModuleType
 from typing import Any, cast
 
 import pytest
+import yaml
 
 from tests.xdist_status import (
     REPORT_INTERVAL_ENV,
@@ -30,6 +31,21 @@ def _load_root_conftest() -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_nightly_workflow() -> dict[str, Any]:
+    workflow_path = Path(__file__).parents[1] / ".github" / "workflows" / "nightly.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    assert isinstance(workflow, dict)
+    return workflow
+
+
+def _step_by_name(job: dict[str, Any], name: str) -> dict[str, Any]:
+    steps = cast(list[dict[str, Any]], job["steps"])
+    for step in steps:
+        if step.get("name") == name:
+            return step
+    raise AssertionError(f"Step {name!r} not found")
 
 
 def test_collect_long_running_worker_statuses_sorts_by_elapsed_desc(
@@ -234,6 +250,78 @@ def test_nodeid_sharding_is_stable_disjoint_and_exhaustive() -> None:
     assert set(first_assignment) == set(range(5))
     for nodeid in nodeids:
         assert sum(root_conftest._nodeid_shard(nodeid, 5) == index for index in range(5)) == 1
+
+
+def test_nightly_correctness_matrix_uses_exhaustive_two_way_shards() -> None:
+    jobs = _load_nightly_workflow()["jobs"]
+    correctness = jobs["correctness"]
+
+    assert correctness["timeout-minutes"] == 45
+    assert correctness["runs-on"] == "${{ matrix.os }}"
+    assert correctness["strategy"]["fail-fast"] is False
+    matrix = correctness["strategy"]["matrix"]
+    assert matrix == {
+        "os": ["ubuntu-latest", "windows-latest"],
+        "python-version": ["3.10", "3.11", "3.12", "3.13"],
+        "shard": [0, 1],
+        "exclude": [
+            {"os": "windows-latest", "python-version": "3.10"},
+            {"os": "windows-latest", "python-version": "3.12"},
+            {"os": "windows-latest", "python-version": "3.13"},
+        ],
+    }
+    assert "3.11" in matrix["python-version"]
+    assert "uv python pin ${{ matrix.python-version }}" in _step_by_name(correctness, "Pin Python version")["run"]
+
+    sync_run = _step_by_name(correctness, "Sync dependencies")["run"]
+    assert "matrix.os == 'windows-latest'" in sync_run
+    assert "'all-ci-windows' || 'all-ci'" in sync_run
+
+    run = _step_by_name(correctness, "Run correctness shard (fast + slow + integration)")["run"]
+    assert run.count('-m "not performance"') == 1
+    assert "-m performance" not in run
+    assert "pytest -n auto" in run
+    assert "--modelaudit-shard-count 2" in run
+    assert "--modelaudit-shard-index ${{ matrix.shard }}" in run
+    assert "tests" not in run.split()
+    for fail_fast_option in (" -x", "--maxfail", "--ignore", "--deselect"):
+        assert fail_fast_option not in run
+
+
+def test_nightly_runs_unsharded_performance_and_rust_once_and_fails_closed() -> None:
+    jobs = _load_nightly_workflow()["jobs"]
+
+    performance = jobs["performance"]
+    assert performance["timeout-minutes"] == 45
+    assert performance["runs-on"] == "ubuntu-latest"
+    assert "strategy" not in performance
+    assert _step_by_name(performance, "Pin Python version")["run"].strip() == "uv python pin 3.11"
+    performance_run = _step_by_name(performance, "Run performance tests once without xdist")["run"]
+    assert performance_run.count("pytest -n 0 -m performance") == 1
+    assert '-m "not performance"' not in performance_run
+    assert "--modelaudit-shard" not in performance_run
+    assert "tests" not in performance_run.split()
+    for fail_fast_option in (" -x", "--maxfail", "--ignore", "--deselect"):
+        assert fail_fast_option not in performance_run
+
+    assert "strategy" not in jobs["picklescan-rust"]
+    rust_run = _step_by_name(jobs["picklescan-rust"], "Run standalone picklescan Rust tests once")["run"]
+    assert "cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml" in rust_run
+
+    gate = jobs["nightly-success"]
+    assert gate["if"] == "always()"
+    assert gate["needs"] == ["correctness", "performance", "picklescan-rust"]
+    check_step = _step_by_name(gate, "Require every Nightly lane to succeed")
+    assert check_step["env"] == {
+        "CORRECTNESS_RESULT": "${{ needs.correctness.result }}",
+        "PERFORMANCE_RESULT": "${{ needs.performance.result }}",
+        "PICKLESCAN_RUST_RESULT": "${{ needs.picklescan-rust.result }}",
+    }
+    assert 'if [[ "$result" != "success" ]]' in check_step["run"]
+    assert max(job["timeout-minutes"] for job in jobs.values()) == 45
+    for job in jobs.values():
+        assert "continue-on-error" not in job
+        assert all("continue-on-error" not in step for step in job["steps"])
 
 
 def test_nodeid_sharding_rejects_non_positive_count() -> None:

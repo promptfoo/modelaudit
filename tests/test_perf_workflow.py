@@ -186,21 +186,6 @@ def test_perf_workflow_runs_retained_memory_guard_as_blocking_step() -> None:
     assert "tests/test_performance_benchmarks.py::TestPerformanceBenchmarks::test_memory_usage_stability" in run
 
 
-def test_nightly_windows_lane_defers_performance_benchmarks_to_linux() -> None:
-    workflow = _load_workflow("nightly.yml")
-    jobs = _jobs(workflow)
-
-    linux_steps = jobs["full-matrix"]["steps"]
-    assert isinstance(linux_steps, list)
-    linux_run = _step_by_name(linux_steps, "Run all tests (fast + slow + integration + performance)")["run"]
-    assert '-m "not performance"' not in linux_run
-
-    windows_steps = jobs["windows-full"]["steps"]
-    assert isinstance(windows_steps, list)
-    windows_run = _step_by_name(windows_steps, "Run all Windows tests except performance benchmarks")["run"]
-    assert '-m "not performance"' in windows_run
-
-
 def test_docs_workflow_passes_changed_files_to_prettier_as_json() -> None:
     workflow = _load_workflow("docs-check.yml")
     raw_workflow = cast(dict[Any, Any], workflow)
