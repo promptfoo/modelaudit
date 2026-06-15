@@ -9607,6 +9607,12 @@ def detect_file_format(path: str) -> str:
         tar_route = _detect_tar_route(path)
         if tar_route is not None:
             return tar_route
+        expected_codec = _COMPRESSED_EXTENSION_CODECS[ext]
+        if compression_format == expected_codec and _has_structurally_valid_compression_header(
+            header,
+            expected_codec,
+        ):
+            return "compressed"
         torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
         if _is_torch7_signature(torch7_prefix):
             return "torch7"
