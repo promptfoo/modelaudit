@@ -3741,15 +3741,15 @@ def test_detect_file_format_keeps_global_shaped_non_pickle_prose_on_text_route(t
     assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
-def test_detect_file_format_keeps_unreachable_inst_prose_on_text_route(tmp_path: Path) -> None:
+def test_detect_file_format_fails_closed_for_terminal_inst_callback(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     path.write_bytes(
         b"Apache License\nThe documentation includes these literal lines:\nimystery_module\nThing\nApache License\n"
     )
 
-    assert detect_file_format(str(path)) == "text"
-    assert detect_file_format_from_magic(str(path)) == "text"
-    assert detect_file_format_for_skip_filter(str(path)) == "text"
+    assert detect_file_format(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_legal_text_global_collision_is_a_valid_pickle(monkeypatch: pytest.MonkeyPatch) -> None:
