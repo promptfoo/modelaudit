@@ -299,6 +299,22 @@ def test_external_data_scan_does_not_reuse_primary_only_cache(tmp_path: Path) ->
         reset_cache_manager()
 
 
+def test_inline_onnx_scan_keeps_primary_file_cache(tmp_path: Path) -> None:
+    model_path = _qlinear_matmul(tmp_path, malicious=False)
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        scan_model_directory_or_file(
+            str(model_path),
+            scanners=["onnx"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+        )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+    finally:
+        reset_cache_manager()
+
+
 def test_external_data_package_hash_matches_file_and_directory_routes(tmp_path: Path) -> None:
     model_path, _sidecar = _external_package(tmp_path)
     direct = scan_model_directory_or_file(str(model_path), scanners=["onnx"])

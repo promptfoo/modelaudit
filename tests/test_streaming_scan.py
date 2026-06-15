@@ -23,6 +23,8 @@ import pytest
 
 from modelaudit.core import (
     _complete_validated_shard_family_sources,
+    _onnx_external_data_role,
+    _onnx_package_content_hash,
     _reconcile_cross_directory_shard_coverage,
     _snapshot_validated_shard_target,
     determine_exit_code,
@@ -129,6 +131,14 @@ def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
     assert len(schema_issues) == 1
     assert result.issues == schema_issues
     assert determine_exit_code(result) == 2
+
+
+def _onnx_external_package_aggregate_hash(model_path: Path, sidecar_path: Path) -> str:
+    package_hash = _onnx_package_content_hash(
+        compute_sha256_hash(model_path),
+        [(_onnx_external_data_role(model_path, sidecar_path), compute_sha256_hash(sidecar_path))],
+    )
+    return compute_aggregate_hash([package_hash])
 
 
 def write_hf_download_metadata(path: Path) -> None:
@@ -2220,7 +2230,7 @@ def test_scan_model_streaming_onnx_external_data_contributes_content_hash(
     sidecar_path = tmp_path / "model.onnx_data"
     model_path.write_bytes(create_external_onnx_payload(tmp_path))
     sidecar_path.write_bytes(struct.pack("f", 1.0))
-    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+    expected_hash = _onnx_external_package_aggregate_hash(model_path, sidecar_path)
     onnx = pytest.importorskip("onnx")
     monkeypatch.setattr(
         onnx,
@@ -2241,7 +2251,7 @@ def test_scan_model_streaming_onnx_external_data_contributes_content_hash(
     assert result.content_hash == expected_hash
 
     sidecar_path.write_bytes(struct.pack("f", 2.0))
-    changed_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+    changed_hash = _onnx_external_package_aggregate_hash(model_path, sidecar_path)
     changed_result = scan_model_streaming(
         file_generator=iter([(model_path, True)]),
         timeout=30,
@@ -2439,7 +2449,7 @@ def test_scan_model_streaming_onnx_external_data_refetch_does_not_duplicate_cont
 
     model_path.write_bytes(model_payload)
     sidecar_path.write_bytes(sidecar_payload)
-    expected_hash = compute_aggregate_hash([compute_sha256_hash(sidecar_path), compute_sha256_hash(model_path)])
+    expected_hash = _onnx_external_package_aggregate_hash(model_path, sidecar_path)
     model_path.unlink()
     sidecar_path.unlink()
 
