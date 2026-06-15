@@ -4572,6 +4572,17 @@ def test_pytorch_zip_keeps_implicit_execution_urls_actionable(
     assert _has_network_evidence_for_url(result, "https://attacker.example/payload")
 
 
+def test_pytorch_zip_keeps_split_downloader_pickle_url_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "split-downloader.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps({"argv": [b"curl"], "url": "https://attacker.example/payload"}, protocol=4)
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _has_network_evidence_for_url(result, "https://attacker.example/payload")
+
+
 def test_pytorch_zip_filters_inert_url_past_pickle_expensive_window(
     tmp_path: Path,
 ) -> None:

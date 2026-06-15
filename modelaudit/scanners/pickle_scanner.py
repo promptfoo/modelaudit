@@ -1535,10 +1535,11 @@ def _has_downloader_command(value: str) -> bool:
 
 
 def _literal_ast_has_downloader_url_context(tree: ast.Module) -> bool:
+    dict_key_ids = {id(key) for node in ast.walk(tree) if isinstance(node, ast.Dict) for key in node.keys if key}
     values = [
         node.value if isinstance(node.value, str) else node.value.decode("utf-8", errors="ignore")
         for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and id(node) not in dict_key_ids
     ]
     return any(_PICKLE_LITERAL_URL_TEXT_RE.search(value) for value in values) and any(
         _has_downloader_command(value) for value in values
@@ -1648,6 +1649,13 @@ def _pickle_literal_url_stripped_scan_view(data: bytes, *, allow_filtering: bool
         if not operations or len(operations) > budget or operations[-1][0].name != "STOP":
             return data
         budget -= len(operations)
+        literal_values = [
+            _literal_arg_text(arg) for opcode, arg, _ in operations if opcode.name in _PICKLE_LITERAL_OPCODE_NAMES
+        ]
+        if any(_PICKLE_LITERAL_URL_TEXT_RE.search(value) for value in literal_values) and any(
+            _has_downloader_command(value) for value in literal_values
+        ):
+            return data
         for (opcode, arg, position), (_, _, next_position) in pairwise(operations):
             if opcode.name in _PICKLE_LITERAL_OPCODE_NAMES:
                 if not isinstance(position, int) or not isinstance(next_position, int):
