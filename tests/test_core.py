@@ -515,8 +515,7 @@ def _core_legacy_pytorch_object_stream(
         object_stream += pickle.dumps(storage_size, protocol=2)[2:-1]
         object_stream += b"NtQa"
     if malicious_object:
-        malicious_pickle = _build_malicious_pickle(protocol=2)
-        object_stream += malicious_pickle[2:-1] + b"a"
+        object_stream += b"cos\nsystem\n" + _core_binunicode(b"echo core-dispatch-test") + b"\x85Ra"
     object_stream += b"."
     return bytes(object_stream)
 
