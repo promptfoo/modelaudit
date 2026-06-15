@@ -3610,26 +3610,31 @@ def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    ("filename", "content"),
+    ("filename", "content", "expected_format"),
     [
-        ("LICENSE", "MIT License\n\nCopyright (c) 2026 Example\nPermission is hereby granted.\n"),
-        ("NOTICE", "NOTICE\n\nThis product includes third-party software.\nCopyright (c) 2026 Example.\n"),
-        ("NOTICE", "NOTICE."),
-        ("LICENSE.txt", "Apache License\n\nCopyright 2026 Example\nLicensed under the Apache License.\n"),
-        ("NOTICE.md", "# Notice\n\nThird-party notices and copyright statements.\n"),
+        (
+            "LICENSE",
+            "MIT License\n\nCopyright (c) 2026 Example\nPermission is hereby granted.\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        ),
+        ("NOTICE", "NOTICE\n\nThis product includes third-party software.\nCopyright (c) 2026 Example.\n", "text"),
+        ("NOTICE", "NOTICE.", "text"),
+        ("LICENSE.txt", "Apache License\n\nCopyright 2026 Example\nLicensed under the Apache License.\n", "text"),
+        ("NOTICE.md", "# Notice\n\nThird-party notices and copyright statements.\n", "text"),
     ],
 )
 def test_detect_file_format_routes_complete_legal_text_sidecars_to_text(
     tmp_path: Path,
     filename: str,
     content: str,
+    expected_format: str,
 ) -> None:
     payload = tmp_path / filename
     payload.write_text(content, encoding="utf-8")
 
-    assert detect_file_format(str(payload)) == "text"
-    assert detect_file_format_from_magic(str(payload)) == "text"
-    assert detect_file_format_for_skip_filter(str(payload)) == "text"
+    assert detect_file_format(str(payload)) == expected_format
+    assert detect_file_format_from_magic(str(payload)) == expected_format
+    assert detect_file_format_for_skip_filter(str(payload)) == expected_format
 
 
 def test_detect_file_format_does_not_treat_license_prose_as_encoded_payload_budget(tmp_path: Path) -> None:
@@ -3684,9 +3689,9 @@ def test_detect_file_format_accepts_legal_text_at_exact_route_size_limit(tmp_pat
     prefix = b"NOTICE\nCopyright (c) Example\nPermission is hereby granted.\n"
     path.write_bytes(prefix + (b"A" * (file_detection._LEGAL_TEXT_ROUTE_MAX_BYTES - len(prefix))))
 
-    assert detect_file_format(str(path)) == "text"
-    assert detect_file_format_from_magic(str(path)) == "text"
-    assert detect_file_format_for_skip_filter(str(path)) == "text"
+    assert detect_file_format(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 
 @pytest.mark.parametrize(
@@ -4029,9 +4034,9 @@ def test_next_buffer_callback_precedes_invalid_continuation() -> None:
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-GLOBAL-punctuation",
         ),
-        pytest.param(b"Pid\nApache License\n", "pickle", id="whole-PERSID"),
-        pytest.param(b"PMIT License\n.", "pickle", id="spaced-PERSID-before-STOP"),
-        pytest.param(b"PMIT License\n", "pickle", id="spaced-PERSID-before-EOF"),
+        pytest.param(b"Pid\nApache License\n", PICKLE_ROUTING_INCONCLUSIVE_FORMAT, id="whole-PERSID"),
+        pytest.param(b"PMIT License\n.", PICKLE_ROUTING_INCONCLUSIVE_FORMAT, id="spaced-PERSID-before-STOP"),
+        pytest.param(b"PMIT License\n", PICKLE_ROUTING_INCONCLUSIVE_FORMAT, id="spaced-PERSID-before-EOF"),
         pytest.param(
             b"MIT License\nPMIT License\n",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -4091,13 +4096,13 @@ def test_next_buffer_callback_precedes_invalid_continuation() -> None:
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-CRLF-PERSID",
         ),
-        pytest.param(b"P\n.MIT License\n", "pickle", id="initial-empty-PERSID"),
+        pytest.param(b"P\n.MIT License\n", PICKLE_ROUTING_INCONCLUSIVE_FORMAT, id="initial-empty-PERSID"),
         pytest.param(
             b"MIT License\nP\n.",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="embedded-empty-PERSID",
         ),
-        pytest.param(b"Pmit license\n.", "pickle", id="initial-lowercase-spaced-PERSID"),
+        pytest.param(b"Pmit license\n.", PICKLE_ROUTING_INCONCLUSIVE_FORMAT, id="initial-lowercase-spaced-PERSID"),
         pytest.param(
             b"MIT License\nPmit license\n",
             PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -4344,28 +4349,28 @@ def test_xgboost_json_legal_name_without_route_evidence_remains_unknown(tmp_path
         ),
         pytest.param(
             b"MIT License\n" + base64.b64encode(b"Pid\nA"),
-            "pickle",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="base64-PERSID-before-invalid-tail",
         ),
         pytest.param(b"MIT License\nVQFhUQ\n", "pickle", id="alphabetic-base64-BINPERSID"),
         pytest.param(
             b"MIT License\n" + base64.b64encode(b"Pid\r\n."),
-            "pickle",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="base64-CRLF-PERSID",
         ),
         pytest.param(
             b"MIT License\n" + base64.b64encode(b"P\n."),
-            "pickle",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="base64-empty-PERSID",
         ),
         pytest.param(
             b"MIT License\n" + base64.b64encode(b"Pmit license\n."),
-            "pickle",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="base64-lowercase-spaced-PERSID",
         ),
         pytest.param(
             b"MIT License\n" + binascii.hexlify(b"Pid\nAB"),
-            "pickle",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             id="hex-PERSID-before-multibyte-invalid-tail",
         ),
         pytest.param(
@@ -4578,9 +4583,24 @@ def test_legal_sidecar_structural_candidate_routing_preserves_benign_near_matche
     path = tmp_path / "LICENSE.txt"
     path.write_bytes(payload)
 
-    assert detect_file_format(str(path)) == "text"
-    assert detect_file_format_from_magic(str(path)) == "text"
-    assert detect_file_format_for_skip_filter(str(path)) == "text"
+    grammar_owned = {
+        b"MIT License\nPermission is granted to groups of users.\n",
+        b"Permission is granted to users.\nPermission remains granted.\n",
+        b"Permission is hereby granted.\n",
+        b"Permission is hereby granted\n",
+        b"copyright\nnotice\n",
+        b"copyright\r\nnotice\r\n",
+        b"MIT License\nP\nPermission remains granted.\n",
+        b"MIT License\nPermission is\ngranted to\nall users\n",
+        b"MIT License\ncwebbrowser\nopen \nOrdinary prose follows\n",
+        b"MIT License\niwebbrowser\nopen \nOrdinary prose follows\n",
+    }
+    expected_format = PICKLE_ROUTING_INCONCLUSIVE_FORMAT if payload in grammar_owned else "text"
+    if payload in {b"copyright\nnotice\n", b"copyright\r\nnotice\r\n"}:
+        expected_format = "pickle"
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(path)) == expected_format
 
 
 def test_legal_sidecar_encoded_budget_ignores_benign_license_reference_tokens(tmp_path: Path) -> None:
@@ -4960,7 +4980,7 @@ def test_legal_named_pickle_with_post_stop_persid_fails_closed(tmp_path: Path) -
     [
         pytest.param(b"0", "pickle", id="POP"),
         pytest.param(b"2", "pickle", id="DUP"),
-        pytest.param(b"Pid\n", "pickle", id="PERSID"),
+        pytest.param(b"Pid\n", PICKLE_ROUTING_INCONCLUSIVE_FORMAT, id="PERSID"),
         pytest.param(b"a", "pickle", id="APPEND"),
         pytest.param(b"s", "pickle", id="SETITEM"),
         pytest.param(b"t", "pickle", id="TUPLE"),

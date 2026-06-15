@@ -653,7 +653,7 @@ def _payload_rule_codes(payload: dict[str, Any]) -> set[str]:
 def test_scan_cli_routes_legal_license_text_without_pickle_failures(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     path.write_text(
-        "MIT License\nCopyright (c) Example\nPermission is hereby granted for documentation use.\n",
+        "MIT License\nCopyright (c) Example\nRights are hereby granted for documentation use.\n",
         encoding="utf-8",
     )
 

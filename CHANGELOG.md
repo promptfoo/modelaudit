@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- route complete UTF-8 license and notice sidecars to text scanning before generic pickle probing while preserving fail-closed pickle controls, including structurally complete protocol-0 import and persistent-ID callbacks with prose-shaped operands
+- route verified UTF-8 license and notice sidecars through one bounded pickle tokenization path before text scanning, preserving malformed GLOBAL/NEXT_BUFFER side effects and failing closed on protocol-0 persistent-ID callbacks
 - preserve native-architecture Rust installer selection for Docker builds that do not expose BuildKit's `TARGETARCH` argument
 - require and bundle `modelaudit-picklescan>=0.1.7` so root releases and source-built Docker images cannot run with the pre-hardening call-graph resolver
 - publish and verify coordinated `modelaudit-picklescan` releases before uploading a dependent root release

@@ -5366,36 +5366,13 @@ def _classify_pickle_security_payload(payload: bytes) -> str | None:
     return None
 
 
-def _plausible_pickle_import_operand(value: str | bytes) -> bool:
-    if isinstance(value, bytes):
-        try:
-            value = value.decode("utf-8")
-        except UnicodeDecodeError:
-            return False
-    value = value.removesuffix("\r")
-    return bool(value) and not any(
-        character.isspace() or ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in value
-    )
-
-
 def _pickle_side_effect_argument_is_meaningful(opcode_name: str, argument: Any) -> bool:
+    """Return whether pickletools proved an eager side-effect operand."""
     if opcode_name in {"GLOBAL", "INST"}:
-        if not _is_valid_pickle_global_argument(argument):
-            return False
-        return all(_plausible_pickle_import_operand(value) for value in argument[1:])
-    elif opcode_name == "PERSID":
-        if not isinstance(argument, str):
-            return False
-        values = (argument.removesuffix("\r"),)
-    else:
-        return True
-    return all(
-        value
-        and not any(
-            character.isspace() or ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in value
-        )
-        for value in values
-    )
+        return _is_valid_pickle_global_argument(argument)
+    if opcode_name == "PERSID":
+        return isinstance(argument, str)
+    return True
 
 
 def _pickle_candidate_route(*, embedded: bool) -> str:
@@ -5482,7 +5459,7 @@ def _incomplete_pickle_security_route(
         parsed_opcodes=parsed_opcodes,
     ):
         return None
-    if any(name == "INST" for _index, name, _meaningful in meaningful_events):
+    if any(name in {"INST", "PERSID"} for _index, name, _meaningful in meaningful_events):
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     if any(
         name in _PICKLE_CONTEXT_FREE_SIDE_EFFECT_OPCODES
@@ -5611,6 +5588,8 @@ def _classify_bounded_pickle_candidate(
                         parsed_opcodes=parsed_opcodes,
                     )
                 ):
+                    if any(name == "PERSID" for _index, name, _meaningful in meaningful_events):
+                        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
                     return _pickle_candidate_route(embedded=embedded)
                 if has_nontrivial_opcode and not embedded and not decoded:
                     return "pickle"
@@ -5660,41 +5639,6 @@ def _is_compact_pickle_line(value: bytes) -> bool:
     return bool(value) and not any(byte <= 0x20 or 0x7F <= byte <= 0x9F for byte in value)
 
 
-def _has_terminal_persid_signal(value: bytes) -> bool:
-    """Distinguish a terminal identifier-like operand from a prose sentence."""
-    value = value.removesuffix(b"\r")
-    if not value or value[-1:] in b".,;:!?":
-        return False
-    words = value.split()
-    cased_words = [
-        word for word in words if any(byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" for byte in word)
-    ]
-    return bool(cased_words) and (
-        any(word.isupper() for word in cased_words) or all(word[:1].isupper() for word in cased_words)
-    )
-
-
-def _has_short_terminal_persid_signal(value: bytes) -> bool:
-    """Accept a short operand at STOP/EOF without admitting sentence-like prose."""
-    value = value.removesuffix(b"\r")
-    if not value or value[-1:] in b".,;:!?":
-        return False
-    words = value.split()
-    return 1 <= len(words) <= 2 and all(_is_compact_pickle_line(word) for word in words)
-
-
-def _has_validated_pickle_continuation(payload: bytes, offset: int) -> bool:
-    """Return whether the next bounded opcode and its argument are structurally valid."""
-    if not _has_structural_pickle_continuation(payload, offset):
-        return False
-    stream = _PickleProbeStream(payload[offset : offset + PROTO0_1_MAX_PROBE_BYTES])
-    try:
-        opcode, argument, _position = next(_gen_pickle_probe_ops(stream))
-    except (MemoryError, RecursionError, StopIteration, UnicodeError, ValueError):
-        return False
-    return not _has_invalid_pickle_opcode_argument(opcode.name, argument)
-
-
 def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
     """Cheaply reject incomplete first operands before charging structural work."""
     if offset >= len(payload):
@@ -5728,36 +5672,14 @@ def _is_plausible_pickle_candidate(payload: bytes, offset: int = 0) -> bool:
             cursor = line_end + 1
         if opcode.name in {"GLOBAL", "INST"}:
             operands = (lines[0], lines[1])
-            if all(line.removesuffix(b"\r") for line in operands) and _has_validated_pickle_continuation(
-                payload, cursor
-            ):
-                return True
-            return all(_plausible_pickle_import_operand(line) for line in operands) and (
-                _has_structural_pickle_continuation(payload, cursor)
+            return all(line.removesuffix(b"\r") for line in operands) and (
+                cursor == len(payload)
+                or _has_structural_pickle_continuation(payload, cursor)
                 or _has_compact_malformed_pickle_tail(payload, cursor)
                 or _has_pickle_import_signal(operands)
             )
         if opcode.name == "PERSID":
-            normalized_operand = lines[0].removesuffix(b"\r")
-            if not normalized_operand:
-                return (
-                    cursor == len(payload)
-                    or payload[cursor : cursor + 1] == b"."
-                    or _has_compact_malformed_pickle_tail(payload, cursor)
-                )
-            if _has_validated_pickle_continuation(payload, cursor):
-                return True
-            terminal_or_stop = cursor == len(payload) or payload[cursor : cursor + 1] == b"."
-            if terminal_or_stop and _has_short_terminal_persid_signal(lines[0]):
-                return True
-            return _is_compact_pickle_line(lines[0]) or (
-                _has_terminal_persid_signal(lines[0])
-                and (
-                    terminal_or_stop
-                    or _has_structural_pickle_continuation(payload, cursor)
-                    or _has_compact_malformed_pickle_tail(payload, cursor)
-                )
-            )
+            return True
         if opcode.name == "STRING":
             value = lines[0]
             if len(value) < 2 or value[:1] not in {b"'", b'"'} or value[-1:] != value[:1]:
@@ -6258,6 +6180,8 @@ def _iter_encoded_route_tokens(
     for raw_line in payload.splitlines():
         line = raw_line.strip(b" \t")
         compact_line = line.translate(None, b" \t")
+        if not compact_line and block:
+            continue
         encoded_line = compact_line if compact_line and token_re.fullmatch(compact_line) is not None else None
         if encoded_line is not None:
             normalized_alphabetic_prose = (
@@ -6392,7 +6316,8 @@ def _encoded_pickle_route(
             if len(token) < general_minimum_length and not _decoded_base64_has_structural_pickle_signal(decoded):
                 opcode = _PICKLE_OPCODE_BY_BYTE.get(decoded[0])
                 if opcode is None or (
-                    _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.get(opcode.name) != len(decoded)
+                    not _decoded_base64_has_exact_weak_pickle_signal(decoded)
+                    and _PICKLE_WEAK_DECODED_ENTRY_SUFFIX_OFFSETS.get(opcode.name) != len(decoded)
                     and not _decoded_weak_pickle_side_effect_has_nonstop_suffix(decoded)
                 ):
                     continue

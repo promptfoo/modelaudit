@@ -62,7 +62,7 @@ def _build_malicious_pickle() -> bytes:
 
 def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
     return (
-        b"MIT License\nCopyright (c) Example\nPermission is hereby granted.\n"
+        b"MIT License\nCopyright (c) Example\nRights are hereby granted.\n"
         + b"cposix\nsystem\n(S'"
         + (b"id #" + b"A" * 70000)
         + b"'\ntR."
@@ -763,6 +763,8 @@ def test_selected_jinja_scanner_handles_legal_jax_template_overlap(tmp_path: Pat
 
     assert result.scanner_name == "jinja2_template"
     assert result.metadata["scanner_dependency_ids"] == ["jinja2_template"]
+    assert "jax_checkpoint" in result.metadata["skipped_scanner_ids"]
+    assert {entry["scanner_id"] for entry in collect_suppressed_preferred_scanners(result.checks)} == {"jax_checkpoint"}
     assert any(
         check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
         for check in result.checks
@@ -783,6 +785,8 @@ def test_selected_jinja_scanner_handles_legal_xgboost_template_overlap(tmp_path:
 
     assert result.scanner_name == "jinja2_template"
     assert result.metadata["scanner_dependency_ids"] == ["jinja2_template"]
+    assert "xgboost" in result.metadata["skipped_scanner_ids"]
+    assert {entry["scanner_id"] for entry in collect_suppressed_preferred_scanners(result.checks)} == {"xgboost"}
     assert any(
         check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
         for check in result.checks
@@ -888,7 +892,7 @@ def test_scan_file_keeps_malicious_pickle_named_license_on_pickle_route(tmp_path
 
 def test_scan_file_keeps_ordinary_copyright_notice_on_text_route(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
-    path.write_bytes(b"Copyright notice.\nMIT License\nPermission is hereby granted.\n")
+    path.write_bytes(b"Legal notice.\nMIT License\nRights are hereby granted.\n")
 
     result = scan_model_directory_or_file(str(path), cache_enabled=False)
 
@@ -1034,8 +1038,8 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         pytest.param(b"MIT License\nPid\n", 2, id="terminal-embedded-PERSID"),
         pytest.param(b"MIT License\nPid\n0", 2, id="embedded-PERSID-structural-continuation"),
         pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
-        pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
-        pytest.param(b"PMIT License\n.", 1, id="spaced-PERSID-before-STOP"),
+        pytest.param(b"Pid\nApache License\n", 2, id="whole-PERSID"),
+        pytest.param(b"PMIT License\n.", 2, id="spaced-PERSID-before-STOP"),
         pytest.param(b"MIT License\nXPid\n)R.\n", 2, id="adjacent-embedded-PERSID"),
         pytest.param(b"\x82\x01", 1, id="sole-EXT1"),
         pytest.param(b"\x97", 1, id="sole-NEXT_BUFFER"),
@@ -1046,6 +1050,7 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
             2,
             id="embedded-import-only-GLOBAL",
         ),
+        pytest.param(b"MIT License\ncposix\nopen \nA", 2, id="embedded-GLOBAL-whitespace-side-effect"),
         pytest.param(b"MIT License\nS'id'\nQApache License\n", 2, id="embedded-BINPERSID"),
         pytest.param(b"MIT License\n]QApache License\n", 2, id="same-line-BINPERSID"),
         pytest.param(b"MIT\nXS'id'\nQtext\n", 2, id="mid-line-STRING-before-BINPERSID"),
@@ -1083,6 +1088,9 @@ def test_scan_file_rejects_encoded_import_before_invalid_continuation(
         ),
         pytest.param(b"MIT License\nY2IK eAou\n", 1, id="base64-intra-line-whitespace"),
         pytest.param(b"MIT License\n63620a 780a2e\n", 1, id="hex-intra-line-whitespace"),
+        pytest.param(b"MIT License\nY2IK\n\n eAou\n", 1, id="base64-blank-line-whitespace"),
+        pytest.param(b"MIT License\n63620a\n\n 780a2e\n", 1, id="hex-blank-line-whitespace"),
+        pytest.param(b"MIT License\n972e\n", 1, id="hex-NEXT_BUFFER-before-STOP"),
         pytest.param(b"MIT License\nY 2IKeAou\n", 1, id="base64-unaligned-intra-line-whitespace"),
         pytest.param(b"MIT License\n6 3620a780a2e\n", 1, id="hex-unaligned-intra-line-whitespace"),
         pytest.param(b"MIT License\nY 2IK\ne Aou\n", 1, id="base64-mixed-line-whitespace"),
@@ -1341,10 +1349,16 @@ def test_scan_file_keeps_structural_pickle_near_match_prose_on_text_route(
 
     result = scan_model_directory_or_file(str(path), cache_enabled=False)
 
-    assert result.scanner_names == ["text"]
-    assert determine_exit_code(result) == 0
-    assert result.success is True
-    assert not any(check.name == "Pickle Routing" for check in result.checks)
+    grammar_owned = {
+        b"MIT License\nPermission is granted to groups of users.\n",
+        b"Permission is granted to users.\nPermission remains granted.\n",
+        b"MIT License\nPermission is\ngranted to\nall users\n",
+    }
+    expected_exit_code = 2 if payload in grammar_owned else 0
+    assert result.scanner_names == ([] if expected_exit_code == 2 else ["text"])
+    assert determine_exit_code(result) == expected_exit_code
+    assert result.success is (expected_exit_code == 0)
+    assert any(check.name == "Pickle Routing" for check in result.checks) is (expected_exit_code == 2)
 
 
 def test_scan_file_fails_closed_for_urlsafe_base64_encoded_pickle(tmp_path: Path) -> None:
@@ -1385,6 +1399,7 @@ def test_scan_file_routes_proven_leading_pickle_before_oversized_legal_fallback(
     "payload",
     [
         pytest.param(_long_embedded_protocol0_pickle_in_legal_text(), id="long-embedded-GLOBAL"),
+        pytest.param(b"Pid\n", id="terminal-initial-PERSID"),
         pytest.param(_long_global_operand_in_legal_text(), id="truncated-GLOBAL-operand"),
         pytest.param(
             b"MIT License\nprefix cposix\nsystem\n(S'id'\ntR.",

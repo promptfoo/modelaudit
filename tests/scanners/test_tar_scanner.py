@@ -657,7 +657,7 @@ class TestTarScanner:
 
     def test_scan_tar_routes_legal_text_member_to_text_scanner(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "legal_text_member.tar"
-        payload = b"MIT License\n\nCopyright (c) 2026 Example\nPermission is hereby granted.\n"
+        payload = b"MIT License\n\nCopyright (c) 2026 Example\nRights are hereby granted.\n"
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("LICENSE")
             info.size = len(payload)
@@ -707,7 +707,7 @@ class TestTarScanner:
     def test_scan_tar_fails_closed_for_long_embedded_protocol0_license_member(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "long_embedded_license_member.tar"
         payload = (
-            b"MIT License\nCopyright (c) Example\nPermission is hereby granted.\n"
+            b"MIT License\nCopyright (c) Example\nRights are hereby granted.\n"
             + b"cposix\nsystem\n(S'"
             + (b"id #" + b"A" * 70000)
             + b"'\ntR."

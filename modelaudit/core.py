@@ -6569,7 +6569,17 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             safetensors_overlap_scanner_ids,
         )
         return exc.result
-    skipped_preferred_scanner_id: str | None = None
+    selected_template_overlap_owner_id = (
+        _registry.get_scanner_id_for_header_format(magic_format)
+        if selected_overlap_replaces_excluded_owner(
+            scanner_selection,
+            _registry.get_scanner_id_for_header_format(magic_format),
+            "jinja2_template",
+        )
+        and huggingface_tokenizer_json_has_template_route_evidence(path, allow_renamed_path=True)
+        else None
+    )
+    skipped_preferred_scanner_id: str | None = selected_template_overlap_owner_id
     unavailable_preferred_scanner_id: str | None = None
     trusted_flax_overlap_scanner_id: str | None = None
     if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
@@ -6835,6 +6845,16 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             else:
                 sr = _make_unavailable_recognized_format_result(path, magic_format, scanner_id)
             result = sr
+
+    if selected_template_overlap_owner_id:
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            selected_template_overlap_owner_id,
+            scanner_selection,
+            context="preferred scanner",
+            kind=SCANNER_SELECTION_PREFERRED_KIND,
+        )
 
     if skipped_overlap_scanner_id:
         add_scanner_selection_skip_check(
