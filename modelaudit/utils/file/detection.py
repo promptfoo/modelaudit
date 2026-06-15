@@ -5814,7 +5814,8 @@ def _iter_pickle_candidate_offsets(
             and payload[offset - 1] in b"3456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
         )
         if (
-            opcode_name == "PERSID"
+            is_plain_text
+            and opcode_name == "PERSID"
             and has_nontrivial_prefix
             and payload[offset - 1] in b"3456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
         ):
@@ -5959,7 +5960,7 @@ def _bounded_pickle_candidate_route(
     if budget is None:
         budget = _LegalTextPickleCandidateBudget()
     if is_plain_text is None:
-        is_plain_text = _decode_complete_utf8_plain_text(payload) is not None
+        is_plain_text = not decoded and _decode_complete_utf8_plain_text(payload) is not None
     last_security_offset = (
         max((offset for offset, value in enumerate(payload) if value in _PICKLE_SECURITY_OPCODE_BYTES), default=-1)
         if decoded
