@@ -3732,7 +3732,7 @@ def test_detect_file_format_keeps_global_shaped_non_pickle_prose_on_text_route(t
     path = tmp_path / "LICENSE"
     path.write_bytes(
         b"Copyright notice.\n"
-        b"MIT License\nPermission is hereby granted.\n"
+        b"MIT License\nRights are hereby granted.\n"
         b"The documentation may mention cwebbrowser\nopen\nas prose without containing a complete pickle stream.\n"
     )
 
