@@ -55,6 +55,21 @@ def _target_for_path(path: Path) -> dict[str, int | str]:
     }
 
 
+def _track_created_staging_directories(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Track staging trees created by this worker without observing other xdist workers."""
+    created_directories: list[Path] = []
+    original_mkdtemp = tempfile.mkdtemp
+
+    def track_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        created_path = Path(original_mkdtemp(*args, **kwargs))
+        if created_path.name.startswith(".modelaudit_scan_"):
+            created_directories.append(created_path)
+        return str(created_path)
+
+    monkeypatch.setattr("modelaudit.utils.file.handlers.tempfile.mkdtemp", track_mkdtemp)
+    return created_directories
+
+
 def test_pinned_file_descriptor_change_fails_closed_on_fstat_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -256,7 +271,7 @@ def test_regular_pinned_companion_rejects_source_mutation_during_copy(
 
     original_copy = _copy_pinned_file_descriptor
     companion_inode = companion_path.stat().st_ino
-    staging_directories_before = set(Path(tempfile.gettempdir()).glob(".modelaudit_scan_*"))
+    created_staging_directories = _track_created_staging_directories(monkeypatch)
 
     def copy_then_mutate(source_fd: int, destination: Path | str, **kwargs: Any) -> str:
         copied_hash = original_copy(source_fd, destination, **kwargs)
@@ -279,7 +294,8 @@ def test_regular_pinned_companion_rejects_source_mutation_during_copy(
         ),
     ):
         pytest.fail("mutated companion must be rejected before scanner dispatch")
-    assert set(Path(tempfile.gettempdir()).glob(".modelaudit_scan_*")) == staging_directories_before
+    assert created_staging_directories
+    assert all(not path.exists() for path in created_staging_directories)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
@@ -351,7 +367,7 @@ def test_nested_companion_open_failure_removes_created_staging_tree(
     source_target = _target_for_path(source_path)
     companion_target = _target_for_path(companion_path)
     original_open = os.open
-    staging_directories_before = set(Path(tempfile.gettempdir()).glob(".modelaudit_scan_*"))
+    created_staging_directories = _track_created_staging_directories(monkeypatch)
 
     def fail_nested_directory_open(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> int:
         if os.fspath(path) == "nested" and kwargs.get("dir_fd") is not None:
@@ -372,7 +388,8 @@ def test_nested_companion_open_failure_removes_created_staging_tree(
     ):
         pytest.fail("descriptor exhaustion must stop before dispatch")
 
-    assert set(Path(tempfile.gettempdir()).glob(".modelaudit_scan_*")) == staging_directories_before
+    assert created_staging_directories
+    assert all(not path.exists() for path in created_staging_directories)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
