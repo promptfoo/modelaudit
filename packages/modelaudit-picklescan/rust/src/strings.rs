@@ -33,11 +33,18 @@ enum StringLexFrame {
     Comment(bool),
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Base64ScanContinuation {
+    alignment_prefix: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StringScanContinuation {
     lex_stack: Vec<StringLexFrame>,
     inside_url: bool,
     reviewed_prefix_bytes: usize,
+    lexical_lookbehind: Vec<u8>,
+    base64: Base64ScanContinuation,
 }
 
 fn getattr_target_bit(target: &str) -> u8 {
@@ -62,9 +69,26 @@ pub(crate) fn suspicious_string_matches_window(
     continuation: Option<StringScanContinuation>,
     next_window_start: usize,
 ) -> (Vec<String>, Option<StringScanContinuation>) {
+    let base64_alignment_prefix = continuation
+        .as_ref()
+        .filter(|continuation| !continuation.inside_url && continuation.reviewed_prefix_bytes == 0)
+        .map_or_else(Vec::new, |continuation| {
+            continuation.base64.alignment_prefix.clone()
+        });
     let (plain_value, url_limit_exceeded, url_context_incomplete, next_continuation) =
         strip_url_spans_with_context(value, continuation, next_window_start);
-    let mut matches = suspicious_string_matches_impl(plain_value.as_ref(), true);
+    let aligned_value = if !base64_alignment_prefix.is_empty()
+        && plain_value.as_bytes().first().is_some_and(|byte| {
+            base64_value(*byte).is_some() || is_base64_ignored_whitespace(*byte)
+        }) {
+        let mut aligned = String::with_capacity(base64_alignment_prefix.len() + plain_value.len());
+        aligned.extend(base64_alignment_prefix.iter().map(|byte| char::from(*byte)));
+        aligned.push_str(plain_value.as_ref());
+        Cow::Owned(aligned)
+    } else {
+        plain_value
+    };
+    let mut matches = suspicious_string_matches_impl(aligned_value.as_ref(), true);
     if url_limit_exceeded {
         push_unique(&mut matches, URL_SCAN_LIMIT_SENTINEL);
     }
@@ -217,6 +241,16 @@ fn strip_url_spans_with_context(
     let mut lex_stack = continuation
         .as_ref()
         .map_or_else(Vec::new, |continuation| continuation.lex_stack.clone());
+    let lexical_lookbehind = continuation.as_ref().map_or_else(Vec::new, |continuation| {
+        continuation.lexical_lookbehind.clone()
+    });
+    let next_base64 = base64_continuation_at(
+        bytes,
+        next_window_start,
+        continuation
+            .as_ref()
+            .map(|continuation| &continuation.base64),
+    );
     let mut next_continuation = None;
     let reviewed_prefix_bytes = continuation
         .as_ref()
@@ -241,7 +275,13 @@ fn strip_url_spans_with_context(
             copied_through = end;
             cursor = end;
             if next_window_start < end {
-                next_continuation = Some(continuation);
+                next_continuation = Some(StringScanContinuation {
+                    lex_stack: continuation.lex_stack,
+                    inside_url: true,
+                    reviewed_prefix_bytes: 0,
+                    lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
+                    base64: Base64ScanContinuation::default(),
+                });
             }
         }
     }
@@ -252,6 +292,8 @@ fn strip_url_spans_with_context(
                 lex_stack: lex_stack.clone(),
                 inside_url: false,
                 reviewed_prefix_bytes: 0,
+                lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
+                base64: next_base64.clone(),
             });
         }
         if url_scheme_starts(bytes, cursor) {
@@ -261,6 +303,8 @@ fn strip_url_spans_with_context(
                 lex_stack: lex_stack.clone(),
                 inside_url: true,
                 reviewed_prefix_bytes: 0,
+                lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
+                base64: Base64ScanContinuation::default(),
             };
             let (end, uncertain) = url_end(bytes, cursor, continuation.lex_stack.last().copied());
             context_incomplete |= uncertain;
@@ -318,7 +362,7 @@ fn strip_url_spans_with_context(
                 }
                 b'\'' | b'"' => {
                     if let Some((frame, width)) =
-                        string_lex_frame_at_boundary(bytes, cursor, next_window_start)
+                        string_lex_frame_with_lookbehind(bytes, cursor, &lexical_lookbehind)
                     {
                         context_incomplete |= !push_lex_frame(&mut lex_stack, frame);
                         cursor += width - 1;
@@ -368,7 +412,7 @@ fn strip_url_spans_with_context(
                         context_incomplete = true;
                         cursor += quote_run - 1;
                     } else if let Some((frame, width)) =
-                        string_lex_frame_at_boundary(bytes, cursor, next_window_start)
+                        string_lex_frame_with_lookbehind(bytes, cursor, &lexical_lookbehind)
                     {
                         lex_stack.push(frame);
                         cursor += width - 1;
@@ -380,14 +424,21 @@ fn strip_url_spans_with_context(
             .as_ref()
             .is_some_and(|before| lex_stack != *before);
         let step_consumed_multiple_bytes = cursor > step_start;
+        let boundary_quote_was_reviewed = step_start == next_window_start
+            && matches!(byte, b'\'' | b'"')
+            && lex_stack_before_step.is_some();
         if (step_start < next_window_start && next_window_start <= cursor)
             || (step_start == next_window_start
-                && (step_changed_lexer || step_consumed_multiple_bytes))
+                && (step_changed_lexer
+                    || step_consumed_multiple_bytes
+                    || boundary_quote_was_reviewed))
         {
             next_continuation = Some(StringScanContinuation {
                 lex_stack: lex_stack.clone(),
                 inside_url: false,
                 reviewed_prefix_bytes: cursor + 1 - next_window_start,
+                lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
+                base64: next_base64.clone(),
             });
         }
         cursor += 1;
@@ -398,6 +449,8 @@ fn strip_url_spans_with_context(
             lex_stack,
             inside_url: false,
             reviewed_prefix_bytes: 0,
+            lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
+            base64: next_base64,
         });
     }
 
@@ -444,42 +497,42 @@ fn string_lex_frame(bytes: &[u8], quote: usize) -> Option<(StringLexFrame, usize
     Some((StringLexFrame::String(delimiter, width, formatted), width))
 }
 
-fn string_lex_frame_at_boundary(
+fn string_lex_frame_with_lookbehind(
     bytes: &[u8],
     quote: usize,
-    next_window_start: usize,
+    lookbehind: &[u8],
 ) -> Option<(StringLexFrame, usize)> {
-    string_lex_frame(bytes, quote).or_else(|| {
-        let delimiter = bytes[quote];
-        let width = if bytes.get(quote..quote + 3) == Some([delimiter; 3].as_slice()) {
-            3
-        } else {
-            1
-        };
-        if !(quote..quote + width).contains(&next_window_start) || quote_is_escaped(bytes, quote) {
-            return None;
+    if quote >= 3 || lookbehind.is_empty() {
+        return string_lex_frame(bytes, quote);
+    }
+    let suffix_end = (quote + 3).min(bytes.len());
+    let mut contextual = Vec::with_capacity(lookbehind.len() + suffix_end);
+    contextual.extend_from_slice(lookbehind);
+    contextual.extend_from_slice(&bytes[..suffix_end]);
+    string_lex_frame(&contextual, lookbehind.len() + quote)
+}
+
+fn lexical_lookbehind_at(bytes: &[u8], boundary: usize) -> Vec<u8> {
+    bytes[boundary.saturating_sub(3)..boundary].to_vec()
+}
+
+fn base64_continuation_at(
+    bytes: &[u8],
+    boundary: usize,
+    previous: Option<&Base64ScanContinuation>,
+) -> Base64ScanContinuation {
+    let mut continuation = previous.cloned().unwrap_or_default();
+    for byte in &bytes[..boundary] {
+        if base64_value(*byte).is_some() {
+            continuation.alignment_prefix.push(*byte);
+            if continuation.alignment_prefix.len() == 4 {
+                continuation.alignment_prefix.clear();
+            }
+        } else if !is_base64_ignored_whitespace(*byte) {
+            continuation = Base64ScanContinuation::default();
         }
-        // The preceding window can see a prefix that the next window loses
-        // when its overlap begins at or inside the opening quote.
-        let prefix_start = quote.saturating_sub(2);
-        let prefix = &bytes[prefix_start..quote];
-        let suffix = [prefix, prefix.get(1..).unwrap_or_default()]
-            .into_iter()
-            .find(|candidate| {
-                matches!(
-                    candidate.to_ascii_lowercase().as_slice(),
-                    b"r" | b"u" | b"b" | b"f" | b"br" | b"rb" | b"fr" | b"rf"
-                )
-            })?;
-        Some((
-            StringLexFrame::String(
-                delimiter,
-                width,
-                suffix.iter().any(|byte| byte.eq_ignore_ascii_case(&b'f')),
-            ),
-            width,
-        ))
-    })
+    }
+    continuation
 }
 
 fn url_scheme_starts(bytes: &[u8], start: usize) -> bool {
@@ -1959,7 +2012,7 @@ mod tests {
         const BOUNDARY: usize = 64;
         for prefix in ["f", "F", "fr", "Fr", "fR", "rf", "rF", "RF"] {
             for quote in ["'", "\"", "'''", "\"\"\""] {
-                let before_quote = format!("{}{}", "A".repeat(BOUNDARY - prefix.len()), prefix);
+                let before_quote = format!("{} {prefix}", "A".repeat(BOUNDARY - prefix.len() - 1));
                 let literal = format!(
                     "{before_quote}{quote}{}https://example.invalid/x{{os.system(cmd)}}{quote}",
                     "B".repeat(128),
@@ -1984,7 +2037,7 @@ mod tests {
             "r", "R", "b", "B", "u", "U", "br", "Br", "bR", "rb", "rB", "RB",
         ] {
             for quote in ["'", "\"", "'''", "\"\"\""] {
-                let before_quote = format!("{}{}", "A".repeat(BOUNDARY - prefix.len()), prefix);
+                let before_quote = format!("{} {prefix}", "A".repeat(BOUNDARY - prefix.len() - 1));
                 let literal = format!(
                     "{before_quote}{quote}{}https://example.invalid/x{{os.system(cmd)}}{quote}",
                     "B".repeat(128),
@@ -2003,6 +2056,89 @@ mod tests {
     }
 
     #[test]
+    fn window_continuation_rejects_embedded_string_prefix_suffixes() {
+        const BOUNDARY: usize = 64;
+        for prefix in [
+            "r", "R", "u", "U", "b", "B", "f", "F", "br", "bR", "Br", "BR", "rb", "rB", "Rb", "RB",
+            "fr", "fR", "Fr", "FR", "rf", "rF", "Rf", "RF",
+        ] {
+            for marker in ["x", "é"] {
+                for quote in ["'", "\"", "'''", "\"\"\""] {
+                    let before_quote = format!(
+                        "{}{marker}{prefix}",
+                        "A".repeat(BOUNDARY - prefix.len() - marker.len())
+                    );
+                    let literal = format!(
+                        "{before_quote}{quote}https://example.invalid/path;os.system(cmd){quote}"
+                    );
+                    for boundary in BOUNDARY..BOUNDARY + quote.len() {
+                        let matches = scan_windows_split_inside_lexical_unit(
+                            &literal,
+                            boundary,
+                            BOUNDARY + 32,
+                        );
+
+                        assert!(
+                            matches.contains(&"os.system".to_string()),
+                            "marker={marker:?} prefix={prefix:?} quote={quote:?} boundary={boundary} matches={matches:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn window_continuation_preserves_split_string_prefixes() {
+        const BOUNDARY: usize = 64;
+        for prefix in [
+            "r", "R", "u", "U", "b", "B", "f", "F", "br", "bR", "Br", "BR", "rb", "rB", "Rb", "RB",
+            "fr", "fR", "Fr", "FR", "rf", "rF", "Rf", "RF",
+        ] {
+            let formatted = prefix.bytes().any(|byte| byte.eq_ignore_ascii_case(&b'f'));
+            for split in 1..=prefix.len() {
+                for quote in ["'", "\"", "'''", "\"\"\""] {
+                    let prefix_start = BOUNDARY - split;
+                    let quote_start = prefix_start + prefix.len();
+                    let before_prefix = "A".repeat(prefix_start - 1);
+                    let expression = if formatted {
+                        "https://example.invalid/path{os.system(cmd)}"
+                    } else {
+                        "https://example.invalid/path;os.system(cmd)"
+                    };
+                    let literal = format!("{before_prefix} {prefix}{quote}{expression}{quote}");
+                    let matches = scan_windows_split_inside_lexical_unit(
+                        &literal,
+                        BOUNDARY,
+                        quote_start + 32,
+                    );
+
+                    assert_eq!(
+                        matches.contains(&"os.system".to_string()),
+                        formatted,
+                        "prefix={prefix:?} split={split} quote={quote:?} matches={matches:?}",
+                    );
+
+                    let invalid_before_prefix =
+                        format!("{}x{prefix}", "A".repeat(prefix_start.saturating_sub(1)));
+                    let invalid_literal = format!(
+                        "{invalid_before_prefix}{quote}https://example.invalid/path;os.system(cmd){quote}"
+                    );
+                    let invalid_matches = scan_windows_split_inside_lexical_unit(
+                        &invalid_literal,
+                        BOUNDARY,
+                        quote_start + 32,
+                    );
+                    assert!(
+                        invalid_matches.contains(&"os.system".to_string()),
+                        "invalid prefix={prefix:?} split={split} quote={quote:?} matches={invalid_matches:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn window_continuation_does_not_skip_ordinary_boundary_base64_token() {
         const BOUNDARY: usize = 64;
         let encoded = "b3Muc3lzdGVtKCdpZCcp";
@@ -2010,6 +2146,58 @@ mod tests {
         let matches = scan_windows_split_inside_lexical_unit(&literal, BOUNDARY, BOUNDARY + 4);
 
         assert!(matches.contains(&"base64 os.system".to_string()));
+    }
+
+    #[test]
+    fn window_continuation_preserves_base64_alignment_around_overlap() {
+        const BOUNDARY: usize = 64;
+        let encoded = format!("{}b3Muc3lzdGVtKCdpZCcp", "QUFB".repeat(64));
+        for shift in -3isize..=3 {
+            let token_start = BOUNDARY.checked_add_signed(shift).unwrap();
+            let literal = format!("{}!{encoded}!", ".".repeat(token_start - 1));
+            let matches = scan_windows_split_inside_lexical_unit(&literal, BOUNDARY, BOUNDARY + 32);
+
+            assert!(
+                matches.contains(&"base64 os.system".to_string()),
+                "shift={shift} matches={matches:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn window_continuation_preserves_mime_base64_alignment() {
+        const BOUNDARY: usize = 64;
+        let encoded = format!("{}b3Muc3lzdGVtKCdpZCcp", "QUFB \r\n".repeat(64));
+        let literal = format!("{}!{encoded}!", ".".repeat(BOUNDARY - 3));
+        let matches = scan_windows_split_inside_lexical_unit(&literal, BOUNDARY, BOUNDARY + 32);
+
+        assert!(matches.contains(&"base64 os.system".to_string()));
+    }
+
+    #[test]
+    fn window_continuation_keeps_shifted_base64_url_inert() {
+        const BOUNDARY: usize = 64;
+        let encoded = format!("{}b3Muc3lzdGVtKCdpZCcp", "QUFB".repeat(64));
+        let literal = format!(
+            "{}https://example.invalid/{encoded}",
+            ".".repeat(BOUNDARY - 2)
+        );
+        let matches = scan_windows_split_inside_lexical_unit(&literal, BOUNDARY, BOUNDARY + 32);
+
+        assert!(!matches.contains(&"base64 os.system".to_string()));
+    }
+
+    #[test]
+    fn window_continuation_keeps_shifted_benign_base64_clean() {
+        const BOUNDARY: usize = 64;
+        let encoded = format!("{}c2FmZSB0ZXh0", "QUFB".repeat(64));
+        for shift in -3isize..=3 {
+            let token_start = BOUNDARY.checked_add_signed(shift).unwrap();
+            let literal = format!("{}!{encoded}!", ".".repeat(token_start - 1));
+            let matches = scan_windows_split_inside_lexical_unit(&literal, BOUNDARY, BOUNDARY + 32);
+
+            assert!(matches.is_empty(), "shift={shift} matches={matches:?}");
+        }
     }
 
     #[test]

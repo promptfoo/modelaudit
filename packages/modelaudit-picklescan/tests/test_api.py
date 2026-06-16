@@ -13381,7 +13381,7 @@ def test_scan_bytes_keeps_url_after_overlap_split_escaped_quote_inert(protocol: 
 
 @pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
 def test_scan_bytes_detects_formatted_url_expression_when_quote_starts_overlap(protocol: int) -> None:
-    literal = ("A" * 4095) + "f'" + ("B" * 5000) + "https://example.invalid/x{os.system(cmd)}'"
+    literal = ("A" * 4094) + " f'" + ("B" * 5000) + "https://example.invalid/x{os.system(cmd)}'"
 
     report = scan_bytes(
         pickle.dumps({"metadata": literal}, protocol=protocol),
@@ -13396,6 +13396,78 @@ def test_scan_bytes_detects_formatted_url_expression_when_quote_starts_overlap(p
         for finding in report.findings
     )
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    ("max_chars", "expected_status"),
+    [(8192, ScanStatus.INCONCLUSIVE), (20000, ScanStatus.COMPLETE)],
+)
+def test_scan_bytes_rejects_embedded_prefix_at_overlap(max_chars: int, expected_status: ScanStatus) -> None:
+    literal = ("A" * (4096 - len("xf"))) + "xf'https://example.invalid/path;os.system(cmd)'" + ("B" * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"embedded-prefix-overlap-{max_chars}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=max_chars),
+    )
+
+    assert report.status == expected_status
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("prefix", ["fr", "fR", "Fr", "FR", "rf", "rF", "Rf", "RF"])
+def test_scan_bytes_preserves_formatted_prefix_split_at_overlap(prefix: str) -> None:
+    literal = (
+        ("A" * 4094)
+        + " "
+        + prefix[0]
+        + prefix[1:]
+        + "'https://example.invalid/"
+        + ("x" * 5000)
+        + "{os.system(cmd)}'"
+        + ("B" * 200)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"split-{prefix}-prefix-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("prefix", ["br", "bR", "Br", "BR", "rb", "rB", "Rb", "RB"])
+def test_scan_bytes_preserves_nonformatted_prefix_split_at_overlap(prefix: str) -> None:
+    literal = (
+        ("A" * 4094)
+        + " "
+        + prefix[0]
+        + prefix[1:]
+        + "'https://example.invalid/"
+        + ("x" * 5000)
+        + ";os.system(cmd)'"
+        + ("B" * 200)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"split-{prefix}-prefix-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
 
 
 def test_scan_bytes_does_not_skip_base64_token_starting_at_overlap() -> None:
@@ -13423,6 +13495,111 @@ def test_scan_bytes_keeps_base64_payload_in_url_starting_at_overlap_inert() -> N
     report = scan_bytes(
         pickle.dumps({"metadata": literal}, protocol=pickle.HIGHEST_PROTOCOL),
         source="base64-url-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+@pytest.mark.parametrize("shift", [-2, -1, 0, 1, 2])
+def test_scan_bytes_preserves_shifted_base64_alignment(protocol: int, shift: int) -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    token_start = 4096 + shift
+    literal = ("." * (token_start - 1)) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"shifted-base64-{shift}-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_preserves_shifted_mime_base64_alignment() -> None:
+    encoded = base64.encodebytes((b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4093) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="shifted-mime-base64.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_preserves_shifted_urlsafe_base64_alignment() -> None:
+    encoded = base64.urlsafe_b64encode(b"\xf8" + (b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4093) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="shifted-urlsafe-base64.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_detects_shifted_base64_without_windowing() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4093) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="unbounded-shifted-base64.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=30000),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_keeps_shifted_base64_url_inert() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4094) + "https://example.invalid/" + encoded + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="shifted-base64-url.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+def test_scan_bytes_keeps_shifted_benign_base64_clean() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"safe metadata" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4093) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="shifted-benign-base64.pkl",
         options=ScanOptions(max_string_literal_scan_chars=8192),
     )
 
