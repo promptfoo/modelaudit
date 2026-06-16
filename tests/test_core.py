@@ -375,14 +375,17 @@ def test_local_source_lexical_identity_ignores_ordinary_directory_content_metada
     replaced_parent = fake_stat(inode=11, mode=stat.S_IFDIR | 0o700, size=9, mtime_ns=8, ctime_ns=7)
 
     initial_identity = core_module._local_source_lexical_identity(
-        [(parent_path, initial_parent), (source_path, source_stat)]
+        [(parent_path, initial_parent), (source_path, source_stat)],
+        windows=False,
     )
 
     assert initial_identity == core_module._local_source_lexical_identity(
-        [(parent_path, changed_parent_contents), (source_path, source_stat)]
+        [(parent_path, changed_parent_contents), (source_path, source_stat)],
+        windows=False,
     )
     assert initial_identity != core_module._local_source_lexical_identity(
-        [(parent_path, replaced_parent), (source_path, source_stat)]
+        [(parent_path, replaced_parent), (source_path, source_stat)],
+        windows=False,
     )
 
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
@@ -405,13 +408,15 @@ def test_local_source_lexical_identity_ignores_ordinary_directory_content_metada
         reparse_tag=0xA000000C,
     )
     assert core_module._local_source_lexical_identity(
-        [(parent_path, initial_reparse), (source_path, source_stat)]
-    ) != core_module._local_source_lexical_identity([(parent_path, changed_reparse), (source_path, source_stat)])
+        [(parent_path, initial_reparse), (source_path, source_stat)],
+        windows=False,
+    ) != core_module._local_source_lexical_identity(
+        [(parent_path, changed_reparse), (source_path, source_stat)],
+        windows=False,
+    )
 
 
-def test_windows_local_source_lexical_identity_uses_stable_reparse_fields(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_windows_local_source_lexical_identity_uses_stable_reparse_fields() -> None:
     """Windows reparse timestamps may drift, but object identity and tag may not."""
 
     def fake_reparse_stat(*, inode: int, mtime_ns: int, ctime_ns: int, reparse_tag: int) -> os.stat_result:
@@ -430,18 +435,19 @@ def test_windows_local_source_lexical_identity_uses_stable_reparse_fields(
             ),
         )
 
-    monkeypatch.setattr(core_module.os, "name", "nt")
     reparse_path = Path("alias")
     initial = fake_reparse_stat(inode=30, mtime_ns=2, ctime_ns=3, reparse_tag=0xA000000C)
     metadata_changed = fake_reparse_stat(inode=30, mtime_ns=4, ctime_ns=5, reparse_tag=0xA000000C)
     replaced = fake_reparse_stat(inode=31, mtime_ns=4, ctime_ns=5, reparse_tag=0xA000000C)
     retagged = fake_reparse_stat(inode=30, mtime_ns=4, ctime_ns=5, reparse_tag=0x9000001A)
 
-    initial_identity = core_module._local_source_lexical_identity([(reparse_path, initial)])
+    initial_identity = core_module._local_source_lexical_identity([(reparse_path, initial)], windows=True)
 
-    assert initial_identity == core_module._local_source_lexical_identity([(reparse_path, metadata_changed)])
-    assert initial_identity != core_module._local_source_lexical_identity([(reparse_path, replaced)])
-    assert initial_identity != core_module._local_source_lexical_identity([(reparse_path, retagged)])
+    assert initial_identity == core_module._local_source_lexical_identity(
+        [(reparse_path, metadata_changed)], windows=True
+    )
+    assert initial_identity != core_module._local_source_lexical_identity([(reparse_path, replaced)], windows=True)
+    assert initial_identity != core_module._local_source_lexical_identity([(reparse_path, retagged)], windows=True)
 
 
 def test_windows_local_source_guard_paths_allow_ordinary_directory_writers(
@@ -532,6 +538,26 @@ def test_local_source_directory_receipts_ignore_content_metadata() -> None:
     assert core_module._local_source_receipts_match(expected, current)
     current["inode"] = 7
     assert not core_module._local_source_receipts_match(expected, current)
+
+
+def test_windows_local_source_receipts_bind_resolved_target_across_lexical_drift() -> None:
+    """Windows handle retention, not volatile pre-open metadata, binds the path chain."""
+    expected: dict[str, int | str] = {
+        "resolved_path": r"C:\model",
+        "lexical_identity": "first",
+        "device": 1,
+        "inode": 2,
+        "mode_type": stat.S_IFDIR,
+        "size": 3,
+        "mtime_ns": 4,
+        "ctime_ns": 5,
+        "nlink": 6,
+    }
+    current = {**expected, "lexical_identity": "second"}
+
+    assert core_module._local_source_receipts_match(expected, current, windows=True)
+    current["inode"] = 7
+    assert not core_module._local_source_receipts_match(expected, current, windows=True)
 
 
 @pytest.mark.usefixtures("requires_symlinks")

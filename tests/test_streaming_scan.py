@@ -14,7 +14,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -8333,29 +8333,28 @@ def test_scan_model_streaming_cleanup_rejects_pre_unlink_generation_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cleanup cannot mark a replacement deletion as the scanned generation."""
+    """Cleanup quarantines and preserves a replacement instead of deleting it."""
+    import modelaudit.core as core_module
+
     source_root = tmp_path / "source"
     source_root.mkdir()
     streamed_file = source_root / "streamed.pkl"
     streamed_file.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
     held_original = tmp_path / "held-original.pkl"
     replacement_payload = pickle.dumps({"weights": [4, 5, 6]})
-    original_unlink = Path.unlink
+    original_rename = core_module.os.rename
     swapped = False
 
-    def swap_before_unlink(path: Path, missing_ok: bool = False) -> None:
+    def swap_before_quarantine(*args: Any, **kwargs: Any) -> None:
         nonlocal swapped
-        same_source = False
-        if not swapped:
-            with suppress(OSError):
-                same_source = os.path.samefile(path, streamed_file)
-        if same_source:
-            streamed_file.rename(held_original)
+        source_name = os.fspath(args[0]) if args else ""
+        if not swapped and source_name == streamed_file.name and kwargs.get("src_dir_fd") is not None:
+            original_rename(streamed_file, held_original)
             streamed_file.write_bytes(replacement_payload)
             swapped = True
-        original_unlink(path, missing_ok=missing_ok)
+        original_rename(*args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", swap_before_unlink)
+    monkeypatch.setattr(core_module.os, "rename", swap_before_quarantine)
 
     result = scan_model_streaming(
         file_generator=iterate_files_streaming(str(source_root)),
@@ -8370,6 +8369,9 @@ def test_scan_model_streaming_cleanup_rejects_pre_unlink_generation_swap(
     assert swapped is True
     assert held_original.exists()
     assert not streamed_file.exists()
+    preserved_replacements = list(source_root.glob(".modelaudit-delete-*/source"))
+    assert len(preserved_replacements) == 1
+    assert preserved_replacements[0].read_bytes() == replacement_payload
     assert result.success is False
     assert determine_exit_code(result) == 2
     assert any(check.name == "Local Source Boundary Check" for check in result.checks)

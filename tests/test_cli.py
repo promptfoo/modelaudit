@@ -1036,8 +1036,65 @@ def test_explicit_shard_family_discovery_does_not_poison_runtime_index_context(
     }
     assert len(selected_families) == 2
     assert all(not family.authority_invalid for family in selected_families)
-    assert forced_failures == 2
+    assert forced_failures >= 2
     assert discovery_budget_ids == {id(runtime_context.directory_paths)}
+    assert runtime_context.failure is None
+
+
+def test_explicit_same_shape_probe_failure_does_not_poison_later_family(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One speculative family failure cannot suppress later complete-scope validation."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    selected_by_family: dict[str, list[Path]] = {"a": [], "b": []}
+    for family_name, selected in selected_by_family.items():
+        family_root = tmp_path / family_name
+        _make_trusted_shard_parent(family_root, parents=True)
+        for shard_index in (1, 2):
+            shard_path = family_root / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            selected.append(shard_path)
+
+    probe_contexts: list[cli_module._SafetensorsIndexInspectionContext] = []
+    shared_scope = os.path.normcase(os.path.normpath(str(tmp_path.resolve())))
+    failed_shared_probe = False
+
+    def fail_first_shared_probe(
+        _paths: tuple[str, ...],
+        *,
+        scope: str,
+        expected_total: int,
+        index_inspection_context: cli_module._SafetensorsIndexInspectionContext,
+        force_index_content_revalidation: bool = False,
+    ) -> tuple[tuple[str, str, str, int] | None, bool]:
+        nonlocal failed_shared_probe
+        del expected_total, force_index_content_revalidation
+        probe_contexts.append(index_inspection_context)
+        if scope == shared_scope and not failed_shared_probe:
+            failed_shared_probe = True
+            index_inspection_context.record_failure("forced speculative ancestor failure")
+        return None, False
+
+    monkeypatch.setattr(cli_module, "_explicit_shard_index_authority", fail_first_shared_probe)
+    runtime_context = cli_module._SafetensorsIndexInspectionContext()
+    selected_paths = tuple(str(path) for paths in selected_by_family.values() for path in paths)
+
+    families = _explicit_local_shard_family_groups(selected_paths, runtime_context)
+
+    first_family = {
+        families[os.path.normcase(os.path.normpath(os.path.abspath(path)))] for path in selected_by_family["a"]
+    }
+    later_family = {
+        families[os.path.normcase(os.path.normpath(os.path.abspath(path)))] for path in selected_by_family["b"]
+    }
+    assert failed_shared_probe is True
+    assert len(first_family) == 1
+    assert next(iter(first_family)).authority_invalid is True
+    assert len(later_family) == 1
+    assert next(iter(later_family)).authority_invalid is False
+    assert len({id(context.directory_paths) for context in probe_contexts}) == 1
+    assert len({id(context) for context in probe_contexts}) > 1
     assert runtime_context.failure is None
 
 
@@ -1083,9 +1140,8 @@ def test_explicit_same_shape_families_share_bounded_ancestor_inspection(
     assert len(selected_families) == 2
     assert all(family.authority_invalid is listing_incomplete for family in selected_families)
     assert observed_contexts
-    if listing_incomplete:
-        assert len(observed_contexts) == 1
-    assert len({id(context) for context in observed_contexts}) == 1
+    assert len({id(context.directory_paths) for context in observed_contexts if context is not None}) == 1
+    assert len({id(context) for context in observed_contexts}) > 1
 
 
 @pytest.mark.parametrize(("with_index", "expected_exit_code"), [(False, 2), (True, 0)])

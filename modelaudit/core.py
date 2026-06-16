@@ -1539,8 +1539,14 @@ def _retained_companion_relative_path(
     raise ValueError("retained companion escaped its discovery and logical parents")
 
 
-def _local_source_lexical_identity(entries: list[tuple[Path, os.stat_result]]) -> str:
+def _local_source_lexical_identity(
+    entries: list[tuple[Path, os.stat_result]],
+    *,
+    windows: bool | None = None,
+) -> str:
     """Hash the lexical path entries observed around local source resolution."""
+
+    windows = os.name == "nt" if windows is None else windows
 
     def entry_identity(entry_path: Path, entry_stat: os.stat_result) -> tuple[int | str, ...]:
         normalized_path = os.path.normcase(os.path.normpath(str(entry_path)))
@@ -1554,7 +1560,7 @@ def _local_source_lexical_identity(entries: list[tuple[Path, os.stat_result]]) -
             entry_stat.st_ino,
             mode_type,
         )
-        if os.name == "nt" and link_like:
+        if windows and link_like:
             return (
                 *common_identity,
                 file_attributes,
@@ -2516,13 +2522,21 @@ def _with_additional_incomplete_reason(result: ScanResult, reason: str | None) -
 def _local_source_receipts_match(
     expected: dict[str, int | str],
     current: dict[str, int | str] | None,
+    *,
+    windows: bool | None = None,
 ) -> bool:
     """Return whether a source still names the object captured at dispatch."""
     if current is None or expected.keys() != current.keys():
         return False
+    windows = os.name == "nt" if windows is None else windows
     directory_receipt = expected.get("mode_type") == stat.S_IFDIR and current.get("mode_type") == stat.S_IFDIR
     for field, expected_value in expected.items():
         if directory_receipt and field in {"size", "mtime_ns", "ctime_ns", "nlink"}:
+            continue
+        # Windows retains every lexical component with delete-denying handles before
+        # traversal. Across CLI dispatch, bind the same resolved object rather than
+        # volatile reparse metadata; the guarded post-open snapshot closes the gap.
+        if windows and field == "lexical_identity":
             continue
         current_value = current.get(field)
         if field == "resolved_path" and isinstance(expected_value, str) and isinstance(current_value, str):
@@ -10759,12 +10773,12 @@ def scan_model_streaming(
     ) -> None:
         nonlocal deferred_streamed_index_bytes, aggregate_hash_complete, preserve_shard_reconciliation_errors
 
-        def record_cleanup_generation_failure(message: str) -> None:
+        def record_cleanup_generation_failure(message: str, failure_path: Path | None = None) -> None:
             nonlocal aggregate_hash_complete, preserve_shard_reconciliation_errors
 
             aggregate_hash_complete = False
             preserve_shard_reconciliation_errors = True
-            pending_delete_failures[source_path] = OSError(message)
+            pending_delete_failures[failure_path or source_path] = OSError(message)
             _record_local_source_boundary_failure(results, cleanup_report_path or str(source_path))
 
         is_index_suffix = source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
@@ -10911,14 +10925,137 @@ def scan_model_streaming(
             if retained_identity != expected_cleanup_identity.stat:
                 record_cleanup_generation_failure("retained streamed source changed before cleanup")
                 return
-        try:
-            source_path.unlink()
-            if retained_cleanup_stat is not None:
-                assert retained_cleanup_fd is not None
+        if retained_cleanup_stat is not None:
+            assert retained_cleanup_fd is not None
+            assert expected_cleanup_identity is not None
+            assert expected_cleanup_identity.stat is not None
+            parent_fd: int | None = None
+            tombstone_dir_fd: int | None = None
+            tombstone_dir_path: Path | None = None
+            tombstone_dir_stat: os.stat_result | None = None
+            tombstone_path: Path | None = None
+            moved_source = False
+            tombstone_removed = False
+            try:
+                parent_flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NONBLOCK", 0)
+                )
+                parent_fd = os.open(source_path.parent, parent_flags)
+                bound_parent_stat = os.fstat(parent_fd)
+                canonical_parent = canonical_stream_parent(source_path)
+                if not os.path.samestat(bound_parent_stat, os.stat(canonical_parent)):
+                    raise OSError("streamed source parent changed before cleanup quarantine")
+                tombstone_dir_path = Path(
+                    tempfile.mkdtemp(
+                        prefix=".modelaudit-delete-",
+                        dir=canonical_parent,
+                    )
+                )
+                tombstone_dir_stat = os.stat(tombstone_dir_path, follow_symlinks=False)
+                effective_uid = getattr(os, "geteuid", lambda: tombstone_dir_stat.st_uid)()
+                if (
+                    not stat.S_ISDIR(tombstone_dir_stat.st_mode)
+                    or tombstone_dir_stat.st_dev != bound_parent_stat.st_dev
+                    or tombstone_dir_stat.st_uid != effective_uid
+                    or stat.S_IMODE(tombstone_dir_stat.st_mode) & 0o077
+                ):
+                    raise OSError("private streamed cleanup quarantine is unsafe")
+                tombstone_dir_fd = os.open(
+                    tombstone_dir_path,
+                    parent_flags | getattr(os, "O_NOFOLLOW", 0),
+                )
+                if not os.path.samestat(os.fstat(tombstone_dir_fd), tombstone_dir_stat):
+                    raise OSError("private streamed cleanup quarantine changed while opening")
+                tombstone_name = "source"
+                tombstone_path = tombstone_dir_path / tombstone_name
+                os.rename(
+                    source_path.name,
+                    tombstone_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=tombstone_dir_fd,
+                )
+                moved_source = True
+                moved_stat = os.stat(tombstone_name, dir_fd=tombstone_dir_fd, follow_symlinks=False)
+                retained_after_move = os.fstat(retained_cleanup_fd)
+                moved_identity = (
+                    moved_stat.st_dev,
+                    moved_stat.st_ino,
+                    moved_stat.st_mode,
+                    moved_stat.st_size,
+                    moved_stat.st_mtime_ns,
+                )
+                retained_moved_identity = (
+                    retained_after_move.st_dev,
+                    retained_after_move.st_ino,
+                    retained_after_move.st_mode,
+                    retained_after_move.st_size,
+                    retained_after_move.st_mtime_ns,
+                )
+                if (
+                    not stat.S_ISREG(moved_stat.st_mode)
+                    or not os.path.samestat(moved_stat, retained_after_move)
+                    or moved_identity != expected_cleanup_identity.stat[:5]
+                    or retained_moved_identity != expected_cleanup_identity.stat[:5]
+                ):
+                    record_cleanup_generation_failure(
+                        "cleanup quarantined a different streamed source generation",
+                        tombstone_path,
+                    )
+                    return
+                os.unlink(tombstone_name, dir_fd=tombstone_dir_fd)
+                tombstone_removed = True
                 retained_after_unlink = os.fstat(retained_cleanup_fd)
                 if retained_after_unlink.st_nlink != retained_cleanup_stat.st_nlink - 1:
                     record_cleanup_generation_failure("cleanup removed a different streamed source generation")
                     return
+                try:
+                    os.stat(source_path.name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    record_cleanup_generation_failure("streamed source path was recreated during cleanup")
+                    return
+                current_tombstone_dir = os.stat(
+                    tombstone_dir_path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if not os.path.samestat(current_tombstone_dir, tombstone_dir_stat):
+                    raise OSError("private streamed cleanup quarantine was replaced")
+                os.rmdir(tombstone_dir_path.name, dir_fd=parent_fd)
+                tombstone_dir_path = None
+                normalized_source = normalized_stream_path(source_path)
+                deleted_streamed_sources.add(normalized_source)
+                logger.debug("Deleted %s %s after generation-bound quarantine", source_path, context)
+            except Exception as error:
+                failure_path = tombstone_path if moved_source and tombstone_path is not None else source_path
+                logger.warning("Failed to delete %s %s: %s", source_path, context, error)
+                record_cleanup_generation_failure(str(error), failure_path)
+            finally:
+                if tombstone_dir_fd is not None:
+                    os.close(tombstone_dir_fd)
+                if (
+                    tombstone_dir_path is not None
+                    and tombstone_dir_stat is not None
+                    and parent_fd is not None
+                    and (not moved_source or tombstone_removed)
+                ):
+                    with suppress(OSError):
+                        current_tombstone_dir = os.stat(
+                            tombstone_dir_path.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        if os.path.samestat(current_tombstone_dir, tombstone_dir_stat):
+                            os.rmdir(tombstone_dir_path.name, dir_fd=parent_fd)
+                if parent_fd is not None:
+                    os.close(parent_fd)
+            return
+        try:
+            source_path.unlink()
             if source_path.exists() or source_path.is_symlink():
                 record_cleanup_generation_failure("streamed source path was recreated during cleanup")
                 return

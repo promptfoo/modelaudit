@@ -2785,7 +2785,6 @@ def _explicit_local_shard_family_groups(
     if index_inspection_context is None:
         index_inspection_context = _SafetensorsIndexInspectionContext()
     for (_pattern, expected_total), records in grouped_paths.items():
-        discovery_context = index_inspection_context.isolated_failure_context()
         try:
             external_scope_boundary = os.path.normcase(
                 os.path.normpath(os.path.commonpath([str(resolved_path.parent) for _, resolved_path, _ in records]))
@@ -2864,13 +2863,14 @@ def _explicit_local_shard_family_groups(
                         except ValueError:
                             continue
                         paths_under_scope.append(selected_path)
+                    probe_context = index_inspection_context.isolated_failure_context()
                     external_proof, authority_present = _explicit_shard_index_authority(
                         tuple(paths_under_scope),
                         scope=scope,
                         expected_total=expected_total,
-                        index_inspection_context=discovery_context,
+                        index_inspection_context=probe_context,
                     )
-                    if discovery_context.failure is not None:
+                    if probe_context.failure is not None:
                         authority_invalid = True
                         authority_scope = scope
                         break
@@ -2897,17 +2897,18 @@ def _explicit_local_shard_family_groups(
         ):
             if not _trusted_explicit_shard_family_scope(scope, scoped_paths):
                 continue
+            probe_context = index_inspection_context.isolated_failure_context()
             authoritative_index_proof, authority_present = (
                 _explicit_shard_index_authority(
                     scoped_paths,
                     scope=scope,
                     expected_total=expected_total,
-                    index_inspection_context=discovery_context,
+                    index_inspection_context=probe_context,
                 )
                 if is_safetensors_family_pattern(_pattern)
                 else (None, False)
             )
-            inspection_failed = discovery_context.failure is not None
+            inspection_failed = probe_context.failure is not None
             if authority_present and not inspection_failed:
                 authority_scopes.add(scope)
             if inspection_failed:
