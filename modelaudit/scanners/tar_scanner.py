@@ -498,10 +498,29 @@ class TarScanner(BaseScanner):
         )
 
     @contextmanager
-    def _open_tar_stream(self, path: str) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream | None, str | None]]:
+    def _open_tar_stream(
+        self,
+        path: str,
+        *,
+        raw_file: BinaryIO | None = None,
+    ) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream | None, str | None]]:
         """Open raw TAR seekably or compressed TAR through bounded r| traversal."""
-        compression_codec = None if self._raw_tar_has_valid_header(path) else self._detect_compressed_tar_wrapper(path)
-        with open(path, "rb") as raw, ExitStack() as stack:
+        with ExitStack() as stack:
+            raw = raw_file if raw_file is not None else stack.enter_context(open(path, "rb"))
+            raw.seek(0)
+            prefix = raw.read(tarfile.BLOCKSIZE)
+            if prefix == b"\0" * tarfile.BLOCKSIZE:
+                prefix += raw.read(tarfile.BLOCKSIZE)
+            raw.seek(0)
+            compression_codec = None
+            if not (self._looks_like_empty_tar_prefix(prefix) or _looks_like_uncompressed_tar_header(prefix)):
+                if prefix.startswith(_GZIP_MAGIC):
+                    compression_codec = "gzip"
+                elif prefix.startswith(_BZIP2_MAGIC):
+                    compression_codec = "bzip2"
+                elif prefix.startswith(_XZ_MAGIC):
+                    compression_codec = "xz"
+
             if compression_codec is None:
                 archive = stack.enter_context(
                     tarfile.open(
@@ -1007,12 +1026,16 @@ class TarScanner(BaseScanner):
             return not any(file_obj.read())
         if hasattr(os, "SEEK_DATA") and hasattr(os, "SEEK_HOLE"):
             offset = tail_start
+            checked_bytes = 0
             while True:
                 try:
                     data_offset = os.lseek(file_obj.fileno(), offset, os.SEEK_DATA)
                 except OSError as exc:
                     return exc.errno == errno.ENXIO
-                hole_offset = os.lseek(file_obj.fileno(), data_offset, os.SEEK_HOLE)
+                hole_offset = min(os.lseek(file_obj.fileno(), data_offset, os.SEEK_HOLE), tail_end)
+                checked_bytes += hole_offset - data_offset
+                if checked_bytes > self.max_xz_padding_bytes:
+                    return False
                 file_obj.seek(data_offset)
                 remaining = hole_offset - data_offset
                 while remaining > 0:
@@ -1325,10 +1348,11 @@ class TarScanner(BaseScanner):
         result: ScanResult,
         *,
         retain_member_budget: bool = True,
+        raw_file: BinaryIO | None = None,
     ) -> bool:
         """Stream TAR headers once to enforce wrapper and optional aggregate limits."""
         entry_count = 0
-        compressed_size = os.path.getsize(path)
+        compressed_size = os.fstat(raw_file.fileno()).st_size if raw_file is not None else os.path.getsize(path)
         compression_codec: str | None = None
         consumed_size = 0
         archive_uncompressed_size = 0
@@ -1336,7 +1360,7 @@ class TarScanner(BaseScanner):
         initial_member_bytes = shared_budget.member_bytes_consumed
 
         try:
-            with self._open_tar_stream(path) as (tar, bounded_stream, compression_codec):
+            with self._open_tar_stream(path, raw_file=raw_file) as (tar, bounded_stream, compression_codec):
                 while True:
                     try:
                         member = tar.next()

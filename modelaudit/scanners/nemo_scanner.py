@@ -12,7 +12,7 @@ import re
 import tarfile
 import tempfile
 from collections.abc import Iterator
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar
 
 from ..core_results import (
     OPERATIONAL_ERROR_REASON_METADATA_KEY,
@@ -1357,6 +1357,31 @@ class NemoScanner(BaseScanner):
             return TarScanner.can_handle(path)
         return is_nemo_archive(path)
 
+    @staticmethod
+    def _archive_identity(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+
+    @classmethod
+    def _archive_source_changed(
+        cls,
+        path: str,
+        archive_file: BinaryIO,
+        expected_identity: tuple[int, int, int, int, int],
+    ) -> bool:
+        """Return whether the open archive or its pathname changed during analysis."""
+        try:
+            descriptor_identity = cls._archive_identity(os.fstat(archive_file.fileno()))
+            path_identity = cls._archive_identity(os.stat(path))
+        except OSError:
+            return True
+        return descriptor_identity != expected_identity or path_identity != expected_identity
+
     def scan(self, path: str) -> ScanResult:
         budget_scanner = TarScanner(config=dict(self.config))
         with _tar_shared_scan_budget_scope(
@@ -1390,11 +1415,20 @@ class NemoScanner(BaseScanner):
         shared_budget = tar_scanner._get_or_create_shared_budget()
         initial_member_bytes = shared_budget.member_bytes_consumed
         initial_budget_exhausted = shared_budget.exhausted
-        if not tar_scanner._preflight_tar_archive(
-            path,
-            preflight_result,
-            retain_member_budget=is_declared_nemo,
-        ):
+        archive_file = open(path, "rb")  # noqa: SIM115 - descriptor spans preflight and analysis.
+        try:
+            initial_archive_identity = self._archive_identity(os.fstat(archive_file.fileno()))
+            preflight_succeeded = tar_scanner._preflight_tar_archive(
+                path,
+                preflight_result,
+                retain_member_budget=is_declared_nemo,
+                raw_file=archive_file,
+            )
+        except Exception:
+            archive_file.close()
+            raise
+        if not preflight_succeeded:
+            archive_file.close()
             preflight_reasons = set(preflight_result.metadata.get("scan_outcome_reasons", []))
             if preflight_reasons and preflight_reasons <= _PREFLIGHT_PREFIX_ANALYSIS_REASONS:
                 shared_budget.member_bytes_consumed = initial_member_bytes
@@ -1413,31 +1447,54 @@ class NemoScanner(BaseScanner):
             result.merge(preflight_result)
 
         nemo_owned_entries: set[str] = set()
-        if not HAS_YAML:
-            result.add_check(
-                name="YAML Parser Availability",
-                passed=False,
-                message="PyYAML not available; cannot analyze NeMo config for Hydra _target_ injection",
-                severity=IssueSeverity.WARNING,
-                location=path,
-            )
-        else:
-            try:
-                self._scan_nemo_archive(
-                    path,
-                    result,
-                    nemo_owned_entries,
-                    inspect_embedded_members=is_declared_nemo,
-                )
-            except tarfile.TarError as e:
+        archive_source_changed = self._archive_source_changed(path, archive_file, initial_archive_identity)
+        try:
+            if not HAS_YAML:
                 result.add_check(
-                    name="NeMo Archive Integrity",
+                    name="YAML Parser Availability",
                     passed=False,
-                    message=f"Failed to open NeMo archive: {e}",
+                    message="PyYAML not available; cannot analyze NeMo config for Hydra _target_ injection",
                     severity=IssueSeverity.WARNING,
                     location=path,
                 )
-                result.success = False
+            else:
+                try:
+                    self._scan_nemo_archive(
+                        path,
+                        result,
+                        nemo_owned_entries,
+                        archive_file=archive_file,
+                        inspect_embedded_members=is_declared_nemo,
+                    )
+                except tarfile.TarError as e:
+                    result.add_check(
+                        name="NeMo Archive Integrity",
+                        passed=False,
+                        message=f"Failed to open NeMo archive: {e}",
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                    )
+                    result.success = False
+        finally:
+            archive_source_changed = archive_source_changed or self._archive_source_changed(
+                path,
+                archive_file,
+                initial_archive_identity,
+            )
+            archive_file.close()
+        if archive_source_changed:
+            mark_archive_scan_incomplete(result, "nemo_archive_identity_changed")
+            result.add_check(
+                name="NeMo Archive Identity",
+                passed=False,
+                message="NeMo archive changed while it was being scanned",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "nemo_archive_identity_changed",
+                },
+            )
 
         if not is_declared_nemo:
             tar_config = dict(self.config)
@@ -1500,6 +1557,7 @@ class NemoScanner(BaseScanner):
         result: ScanResult,
         nemo_owned_entries: set[str],
         *,
+        archive_file: BinaryIO,
         inspect_embedded_members: bool,
     ) -> None:
         """Extract and scan YAML configs from a NeMo tar archive."""
@@ -1513,7 +1571,8 @@ class NemoScanner(BaseScanner):
         link_resolution_budget_reported = False
         linked_loaded_path_reported = False
 
-        with tarfile.open(path, "r:*") as tar:
+        archive_file.seek(0)
+        with tarfile.open(fileobj=archive_file, mode="r:*") as tar:
             archive_members = tar.getmembers()
             members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
             linked_loaded_paths: set[str] = set()

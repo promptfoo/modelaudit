@@ -4,6 +4,7 @@ import bz2
 import gzip
 import io
 import lzma
+import os
 import pickle
 import random
 import tarfile
@@ -8016,6 +8017,73 @@ class TestCVE202523304HydraTarget:
         assert result.success is False
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23304"]
         assert "tar_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize("mode", ["w", "w:gz"])
+    def test_nemo_analysis_uses_preflighted_descriptor_when_path_is_replaced(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mode: Literal["w", "w:gz"],
+    ) -> None:
+        nemo_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "os.system", "command": "echo pwned"}},
+            filename="replace-after-preflight.nemo",
+            mode=mode,
+        )
+        replacement_path = tmp_path / "replacement.nemo"
+        with tarfile.open(replacement_path, "w") as archive:
+            for index in range(129):
+                _add_tar_bytes(archive, f"weights-{index}.bin", b"safe")
+
+        original_preflight = tar_scanner_module.TarScanner._preflight_tar_archive
+        replacement_performed = False
+
+        def replace_after_preflight(
+            scanner: tar_scanner_module.TarScanner,
+            path: str,
+            result: ScanResult,
+            **kwargs: Any,
+        ) -> bool:
+            nonlocal replacement_performed
+            succeeded = original_preflight(scanner, path, result, **kwargs)
+            if succeeded and not replacement_performed:
+                os.replace(replacement_path, nemo_path)
+                replacement_performed = True
+            return succeeded
+
+        monkeypatch.setattr(tar_scanner_module.TarScanner, "_preflight_tar_archive", replace_after_preflight)
+        original_getmembers = tarfile.TarFile.getmembers
+        materialized_member_counts: list[int] = []
+
+        def tracked_getmembers(archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
+            members = original_getmembers(archive)
+            materialized_member_counts.append(len(members))
+            return members
+
+        monkeypatch.setattr(tarfile.TarFile, "getmembers", tracked_getmembers)
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_entries=1,
+            )
+
+            metadata = aggregate.file_metadata[str(nemo_path)]
+            assert replacement_performed is True
+            assert materialized_member_counts == [1]
+            assert aggregate.success is False
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_content_routed_nemo_preflight_does_not_double_charge_shared_budget(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "within-budget.tar.gz"

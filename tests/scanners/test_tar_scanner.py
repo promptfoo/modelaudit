@@ -2560,6 +2560,55 @@ class TestTarScanner:
         assert result.success is False
         assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
 
+    def test_dense_raw_tar_zero_tail_is_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if not hasattr(os, "SEEK_DATA") or not hasattr(os, "SEEK_HOLE"):
+            pytest.skip("allocated-range traversal is unavailable")
+
+        archive_path = tmp_path / "dense-zero-tail.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("safe.txt")
+            payload = b"safe"
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        with tarfile.open(archive_path, "r:") as archive:
+            while archive.next() is not None:
+                pass
+
+            class CountingReader:
+                def __init__(self, fileobj: BinaryIO) -> None:
+                    self.fileobj = fileobj
+                    self.bytes_read = 0
+
+                def read(self, size: int = -1) -> bytes:
+                    data = self.fileobj.read(size)
+                    self.bytes_read += len(data)
+                    return data
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self.fileobj, name)
+
+            fileobj = CountingReader(cast(BinaryIO, archive.fileobj))
+            archive.fileobj = cast(Any, fileobj)
+            tail_end = archive_path.stat().st_size
+
+            def dense_lseek(_fd: int, offset: int, whence: int) -> int:
+                if whence == os.SEEK_DATA:
+                    return offset
+                assert whence == os.SEEK_HOLE
+                return tail_end
+
+            monkeypatch.setattr(os, "lseek", dense_lseek)
+
+            scanner = TarScanner(config={"compressed_max_xz_padding_bytes": 64})
+
+            assert scanner._raw_tar_has_complete_end_marker(archive) is False
+            assert fileobj.bytes_read == 2 * tarfile.BLOCKSIZE
+
     def test_sparse_large_raw_tar_complete_end_marker_remains_successful(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "complete-end-marker.tar"
         _write_sparse_raw_tar(
