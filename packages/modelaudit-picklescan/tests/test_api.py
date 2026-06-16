@@ -13326,6 +13326,59 @@ def test_scan_bytes_carries_quote_context_to_later_overlap_url(protocol: int) ->
     assert any(notice.code == expected_notice for notice in report.notices)
 
 
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_detects_code_after_triple_quote_crossing_overlap_start(protocol: int) -> None:
+    window_chars = 8 * 1024 * 1024
+    step_chars = window_chars - 4096
+    quote = '"""'
+    prefix = "metadata=" + quote
+    literal = (
+        prefix
+        + ("A" * (step_chars - 2 - len(prefix)))
+        + quote
+        + (" " * 5000)
+        + "url = 'https://example.invalid/x';os.system(cmd)"
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"triple-quote-overlap-protocol-{protocol}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    if protocol == 0:
+        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+        assert any(notice.code == "parse_incomplete" for notice in report.notices)
+    else:
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert any(
+            finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+            for finding in report.findings
+        )
+        assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_keeps_url_after_overlap_split_escaped_quote_inert(protocol: int) -> None:
+    window_chars = 8192
+    step_chars = window_chars - 4096
+    prefix = "metadata='"
+    literal = (
+        prefix + ("A" * (step_chars - 1 - len(prefix))) + "\\'https://example.invalid/x;os.system(cmd)'" + (" " * 5000)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"escaped-quote-overlap-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=window_chars),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
 def test_scan_bytes_preserves_call_after_cross_window_quoted_url() -> None:
     literal = "metadata='https://example.invalid/" + ("a" * (8 * 1024 * 1024)) + "';os.system(cmd)"
 

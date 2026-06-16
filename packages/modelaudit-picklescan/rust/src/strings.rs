@@ -37,6 +37,7 @@ enum StringLexFrame {
 pub(crate) struct StringScanContinuation {
     lex_stack: Vec<StringLexFrame>,
     inside_url: bool,
+    reviewed_prefix_bytes: usize,
 }
 
 fn getattr_target_bit(target: &str) -> u8 {
@@ -217,6 +218,19 @@ fn strip_url_spans_with_context(
         .as_ref()
         .map_or_else(Vec::new, |continuation| continuation.lex_stack.clone());
     let mut next_continuation = None;
+    let reviewed_prefix_bytes = continuation
+        .as_ref()
+        .map_or(0, |continuation| continuation.reviewed_prefix_bytes)
+        .min(bytes.len());
+
+    if reviewed_prefix_bytes > 0 {
+        let stripped = output.get_or_insert_with(|| String::with_capacity(value.len()));
+        // A prior overlapping window completed the lexical unit that contains
+        // these bytes. Do not reinterpret its tail against the post-unit state.
+        stripped.push('\0');
+        copied_through = reviewed_prefix_bytes;
+        cursor = reviewed_prefix_bytes;
+    }
 
     if let Some(continuation) = continuation.filter(|continuation| continuation.inside_url) {
         let (end, uncertain) = url_end(bytes, 0, continuation.lex_stack.last().copied());
@@ -237,6 +251,7 @@ fn strip_url_spans_with_context(
             next_continuation = Some(StringScanContinuation {
                 lex_stack: lex_stack.clone(),
                 inside_url: false,
+                reviewed_prefix_bytes: 0,
             });
         }
         if url_scheme_starts(bytes, cursor) {
@@ -245,6 +260,7 @@ fn strip_url_spans_with_context(
             let continuation = StringScanContinuation {
                 lex_stack: lex_stack.clone(),
                 inside_url: true,
+                reviewed_prefix_bytes: 0,
             };
             let (end, uncertain) = url_end(bytes, cursor, continuation.lex_stack.last().copied());
             context_incomplete |= uncertain;
@@ -359,6 +375,7 @@ fn strip_url_spans_with_context(
             next_continuation = Some(StringScanContinuation {
                 lex_stack: lex_stack.clone(),
                 inside_url: false,
+                reviewed_prefix_bytes: cursor + 1 - next_window_start,
             });
         }
         cursor += 1;
@@ -368,6 +385,7 @@ fn strip_url_spans_with_context(
         next_continuation = Some(StringScanContinuation {
             lex_stack,
             inside_url: false,
+            reviewed_prefix_bytes: 0,
         });
     }
 
@@ -1802,6 +1820,142 @@ mod tests {
         );
         matches.extend(next_matches);
         matches
+    }
+
+    fn scan_windows_split_inside_lexical_unit(
+        value: &str,
+        next_window_start: usize,
+        first_window_end: usize,
+    ) -> Vec<String> {
+        let (mut matches, continuation) =
+            suspicious_string_matches_window(&value[..first_window_end], None, next_window_start);
+        let (next_matches, _) = suspicious_string_matches_window(
+            &value[next_window_start..],
+            continuation,
+            value.len() - next_window_start,
+        );
+        matches.extend(next_matches);
+        matches
+    }
+
+    fn scan_all_overlapping_windows(
+        value: &str,
+        window_chars: usize,
+        overlap_chars: usize,
+    ) -> Vec<String> {
+        let step_chars = window_chars - overlap_chars;
+        let mut matches = Vec::new();
+        let mut continuation = None;
+        let mut window_start = 0;
+        loop {
+            let window_end = (window_start + window_chars).min(value.len());
+            let next_window_start = (window_start + step_chars).min(value.len());
+            let (window_matches, next_continuation) = suspicious_string_matches_window(
+                &value[window_start..window_end],
+                continuation,
+                next_window_start - window_start,
+            );
+            matches.extend(window_matches);
+            if window_end == value.len() {
+                break;
+            }
+            window_start = next_window_start;
+            continuation = next_continuation;
+        }
+        matches
+    }
+
+    #[test]
+    fn window_continuation_aligns_state_after_multibyte_lexical_units() {
+        let cases = [
+            (
+                "metadata='safe\\'https://example.invalid/x;os.system(cmd)'",
+                "\\'",
+            ),
+            (
+                "metadata='safe\\\r\nhttps://example.invalid/x;os.system(cmd)'",
+                "\\\r\n",
+            ),
+            (
+                "metadata=f'{{https://example.invalid/x;os.system(cmd)}}'",
+                "{{",
+            ),
+            (
+                "metadata=f'{value:{{https://example.invalid/x;os.system(cmd)}}}'",
+                "{{",
+            ),
+            (
+                "metadata=\"\"\"https://example.invalid/x;os.system(cmd)\"\"\"",
+                "\"\"\"",
+            ),
+        ];
+
+        for (literal, unit) in cases {
+            let unit_start = literal.find(unit).unwrap();
+            let unit_end = unit_start + unit.len();
+            for boundary in unit_start..=unit_end {
+                let matches = scan_windows_split_inside_lexical_unit(literal, boundary, unit_end);
+                assert!(
+                    !matches.contains(&"os.system".to_string()),
+                    "unit={unit:?} boundary_offset={} matches={matches:?}",
+                    boundary - unit_start,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn window_continuation_detects_code_after_split_triple_quote() {
+        let literal = "metadata=\"\"\"Résumé—safe\"\"\" os.system(cmd)";
+        let close_start = literal.rfind("\"\"\"").unwrap();
+        let close_end = close_start + 3;
+
+        for boundary in close_start..=close_end {
+            let matches = scan_windows_split_inside_lexical_unit(literal, boundary, close_end);
+            assert!(
+                matches.contains(&"os.system".to_string()),
+                "boundary_offset={} matches={matches:?}",
+                boundary - close_start,
+            );
+        }
+    }
+
+    #[test]
+    fn window_continuation_propagates_post_unit_state_across_multiple_windows() {
+        const WINDOW_CHARS: usize = 64;
+        const STEP_CHARS: usize = 48;
+        let prefix = "metadata='";
+        let literal = format!(
+            "{}{}\\'{}https://example.invalid/{};os.system(cmd)'",
+            prefix,
+            "A".repeat(STEP_CHARS - 1 - prefix.len()),
+            "B".repeat(WINDOW_CHARS),
+            "x".repeat(WINDOW_CHARS),
+        );
+
+        let matches =
+            scan_all_overlapping_windows(&literal, WINDOW_CHARS, WINDOW_CHARS - STEP_CHARS);
+        assert!(
+            !matches.contains(&"os.system".to_string()),
+            "matches={matches:?}"
+        );
+    }
+
+    #[test]
+    fn window_continuation_preserves_utf8_url_context_at_every_char_boundary() {
+        let literal = "metadata='αéhttps://example.invalid/x;os.system(cmd)'—safe";
+        let boundaries = literal
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(literal.len()));
+
+        for boundary in boundaries {
+            let matches = scan_windows_split_inside_lexical_unit(literal, boundary, literal.len());
+            assert!(
+                !matches.contains(&"os.system".to_string()),
+                "boundary={boundary} matches={matches:?}",
+            );
+        }
     }
 
     #[test]
