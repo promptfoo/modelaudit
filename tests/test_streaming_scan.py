@@ -3524,6 +3524,48 @@ def test_scan_model_streaming_rebinds_family_members_to_retained_directory(
     assert retained_descriptors == {shard.name: True, index_path.name: True}
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+def test_scan_model_streaming_rejects_replaced_retained_symlink_target(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A restored symlink target cannot hide a pre-open replacement generation."""
+    del requires_symlinks
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    target_dir = tmp_path / "targets"
+    target_dir.mkdir()
+    shard_target = target_dir / shard.name
+    original_payload = struct.pack("<Q", len(header)) + header
+    shard_target.write_bytes(original_payload)
+    shard.symlink_to(shard_target.relative_to(tmp_path))
+    original_generation = target_dir / "original-generation"
+
+    def replace_then_restore_target() -> Iterator[tuple[Path, bool]]:
+        shard_target.rename(original_generation)
+        shard_target.write_bytes(original_payload)
+        yield shard, False
+        shard_target.unlink()
+        original_generation.rename(shard_target)
+        yield shard_target, True
+
+    result = scan_model_streaming(
+        file_generator=replace_then_restore_target(),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        skip_file_types=True,
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("reason") == "local_source_changed_during_scan" for check in result.checks)
+    assert shard_target.read_bytes() == original_payload
+
+
 def test_scan_model_streaming_fails_if_deleted_index_suffix_precedes_created_shard(tmp_path: Path) -> None:
     """A later shard cannot silently benefit from an already-cleaned index candidate."""
     index_path = tmp_path / "model.safetensors.index.json"

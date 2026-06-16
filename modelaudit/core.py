@@ -11766,6 +11766,32 @@ def scan_model_streaming(
                                 scan_path.stat(),
                             ):
                                 raise OSError("retained streaming link target changed while opening")
+                            if not is_hf_cache_symlink:
+                                if resolved_local_source_path is None:
+                                    raise OSError("retained streaming link target omitted its source root")
+                                try:
+                                    target_relative_parts = (
+                                        Path(os.path.abspath(scan_path))
+                                        .relative_to(Path(os.path.abspath(resolved_local_source_path)))
+                                        .parts
+                                    )
+                                except ValueError as error:
+                                    raise OSError("retained streaming link target escaped its source root") from error
+                                expected_target_entry = initial_local_source_entries.get(target_relative_parts)
+                                retained_target_entry = _directory_owner_snapshot_entry(
+                                    scan_path,
+                                    target_relative_parts,
+                                    entry_stat=retained_stream_stat,
+                                )
+                                if (
+                                    expected_target_entry is None
+                                    or expected_target_entry.entry_type != "file"
+                                    or not _directory_owner_snapshot_entries_match(
+                                        expected_target_entry,
+                                        retained_target_entry,
+                                    )
+                                ):
+                                    raise OSError("retained streaming link target changed before opening")
                         except OSError as error:
                             if stream_source_fd >= 0:
                                 os.close(stream_source_fd)
