@@ -7586,6 +7586,7 @@ def scan_model_streaming(
     file_hashes: list[str] = []
     hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     hashed_stream_file_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
+    recorded_stream_file_paths: set[Path] = set()
     recorded_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     recorded_stream_file_targets: set[_FileTargetIdentityKey] = set()
     hashed_stream_source_hashes_by_path: dict[Path, tuple[_FileIdentitySnapshot, str]] = {}
@@ -7846,6 +7847,7 @@ def scan_model_streaming(
             return file_hash
         if record_hash:
             file_hashes.append(file_hash)
+            recorded_stream_file_paths.add(scan_path_key)
             if scan_path_identity is not None:
                 recorded_stream_file_instances.add((scan_path_key, scan_path_identity))
             if scan_target_key is not None:
@@ -8371,9 +8373,13 @@ def scan_model_streaming(
                                     external_data_hash,
                                 )
                             )
-                            if external_data_instance in recorded_stream_file_instances or (
-                                external_data_target_key is not None
-                                and external_data_target_key in recorded_stream_file_targets
+                            if (
+                                external_data_key in recorded_stream_file_paths
+                                or (external_data_instance in recorded_stream_file_instances)
+                                or (
+                                    external_data_target_key is not None
+                                    and external_data_target_key in recorded_stream_file_targets
+                                )
                             ):
                                 recorded_onnx_external_data_hashes.append(external_data_hash)
                         if external_data_target_key is not None and (

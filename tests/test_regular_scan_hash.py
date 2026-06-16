@@ -1704,7 +1704,7 @@ class TestOnnxExternalDataContentHash:
         monkeypatch: pytest.MonkeyPatch,
         defer_owner_hash: bool,
     ) -> None:
-        """Sidecar bytes should participate in max_total_size accounting."""
+        """Sidecars skipped before hashing must not inflate scanned-byte accounting."""
         from modelaudit import core
 
         model_path = tmp_path / "renamed"
@@ -1729,6 +1729,6 @@ class TestOnnxExternalDataContentHash:
             onnx_raw_detector_max_bytes=1 if defer_owner_hash else 512 * 1024 * 1024,
         )
 
-        assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
+        assert result.bytes_scanned == model_path.stat().st_size
         assert result.content_hash is None
         assert determine_exit_code(result) == 2
