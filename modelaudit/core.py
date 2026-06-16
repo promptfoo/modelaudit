@@ -1602,6 +1602,12 @@ def _local_source_stat_matches_receipt(
     expected: dict[str, int | str],
 ) -> bool:
     """Return whether an opened directory is the target captured at dispatch."""
+    if stat.S_IFMT(current.st_mode) == stat.S_IFDIR and expected.get("mode_type") == stat.S_IFDIR:
+        return (
+            current.st_dev == expected.get("device")
+            and current.st_ino == expected.get("inode")
+            and stat.S_IFMT(current.st_mode) == expected.get("mode_type")
+        )
     expected_fields = {
         "device": current.st_dev,
         "inode": current.st_ino,
@@ -2339,11 +2345,11 @@ def _retain_windows_local_source_guards(
     handles: list[int] = []
     invalid_handle_value = ctypes.c_void_p(-1).value
     try:
-        for guard_path, open_reparse_point, share_mode in guard_paths:
+        for guard_path, open_reparse_point, desired_access, share_mode in guard_paths:
             flags = 0x02000000 | (0x00200000 if open_reparse_point else 0)
             handle = create_file(
                 str(guard_path),
-                0,
+                desired_access,
                 share_mode,
                 None,
                 3,
@@ -2364,20 +2370,24 @@ def _retain_windows_local_source_guards(
 def _windows_local_source_guard_paths(
     source_path: str | os.PathLike[str],
     expected_receipt: dict[str, int | str],
-) -> list[tuple[Path, bool, int]]:
+) -> list[tuple[Path, bool, int, int]]:
     """Return Windows source guards with directory-content-compatible sharing."""
-    guard_paths: list[tuple[Path, bool, int]] = []
+    guard_paths: list[tuple[Path, bool, int, int]] = []
+    absolute_source = Path(os.path.abspath(os.fspath(source_path)))
+    delete_access = 0x00010000
     for entry_path, entry_stat in _local_source_lexical_identity_entries(source_path):
         is_reparse_point = stat.S_ISLNK(entry_stat.st_mode) or _stat_is_windows_reparse_point(entry_stat)
         is_ordinary_directory = stat.S_ISDIR(entry_stat.st_mode) and not is_reparse_point
         share_mode = 0x00000001 | (0x00000002 if is_ordinary_directory else 0)
-        guard_paths.append((entry_path, is_reparse_point, share_mode))
+        desired_access = delete_access if is_ordinary_directory and entry_path == absolute_source else 0
+        guard_paths.append((entry_path, is_reparse_point, desired_access, share_mode))
     resolved_path = expected_receipt.get("resolved_path")
     if not isinstance(resolved_path, str):
         raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
     resolved_is_directory = expected_receipt.get("mode_type") == stat.S_IFDIR
     resolved_share_mode = 0x00000001 | (0x00000002 if resolved_is_directory else 0)
-    guard_paths.append((Path(resolved_path), False, resolved_share_mode))
+    resolved_access = delete_access if resolved_is_directory else 0
+    guard_paths.append((Path(resolved_path), False, resolved_access, resolved_share_mode))
     return list(dict.fromkeys(guard_paths))
 
 
@@ -2496,7 +2506,10 @@ def _local_source_receipts_match(
     """Return whether a source still names the object captured at dispatch."""
     if current is None or expected.keys() != current.keys():
         return False
+    directory_receipt = expected.get("mode_type") == stat.S_IFDIR and current.get("mode_type") == stat.S_IFDIR
     for field, expected_value in expected.items():
+        if directory_receipt and field in {"size", "mtime_ns", "ctime_ns", "nlink"}:
+            continue
         current_value = current.get(field)
         if field == "resolved_path" and isinstance(expected_value, str) and isinstance(current_value, str):
             if os.path.normcase(os.path.normpath(expected_value)) != os.path.normcase(os.path.normpath(current_value)):

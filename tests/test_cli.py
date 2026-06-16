@@ -1188,6 +1188,67 @@ def test_explicit_shard_family_does_not_ignore_governing_ancestor_index(tmp_path
     assert parse_click_json_output(result.output)["success"] is False
 
 
+@pytest.mark.parametrize(
+    "index_target",
+    ["selected", "omitted"],
+    ids=["exact-family", "conflicting-family"],
+)
+def test_explicit_same_shape_families_retain_governing_ancestor_index(
+    tmp_path: Path,
+    index_target: str,
+) -> None:
+    """Another complete family cannot suppress authority above both families."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    scope = tmp_path / "scope"
+    family_a = scope / "a"
+    family_b = scope / "b"
+    omitted_dir = scope / "omitted"
+    for directory in (family_a, family_b, omitted_dir):
+        _make_trusted_shard_parent(directory, parents=True)
+
+    selected_families: list[list[Path]] = []
+    for family_dir in (family_a, family_b):
+        family = [family_dir / f"model-{index:05d}-of-00002.safetensors" for index in (1, 2)]
+        for shard in family:
+            shard.write_bytes(struct.pack("<Q", len(header)) + header)
+        selected_families.append(family)
+
+    omitted = omitted_dir / "model-00002-of-00002.safetensors"
+    omitted.write_bytes(struct.pack("<Q", len(header)) + header)
+    second_target = selected_families[0][1] if index_target == "selected" else omitted
+    (scope / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "first": selected_families[0][0].relative_to(scope).as_posix(),
+                    "second": second_target.relative_to(scope).as_posix(),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    selected = [*selected_families[0], *selected_families[1]]
+    inspection_context = cli_module._SafetensorsIndexInspectionContext()
+    explicit_families = _explicit_local_shard_family_groups(
+        tuple(str(shard) for shard in selected),
+        inspection_context,
+    )
+    family_a_metadata = explicit_families[os.path.normcase(os.path.normpath(os.path.abspath(selected_families[0][0])))]
+    assert family_a_metadata.scope == os.path.normcase(os.path.normpath(str(scope)))
+    assert family_a_metadata.authority_invalid is True
+    result = _invoke_assumed_shard_family(selected, scanners="safetensors")
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert output_payload.get("content_hash") is None
+    assert any(
+        record.get("details", {}).get("scan_outcome_reason") == "shard_boundary_changed"
+        for record in [*output_payload["checks"], *output_payload["issues"]]
+    )
+
+
 def test_explicit_shard_family_rejects_overlapping_duplicate_ancestor_index(tmp_path: Path) -> None:
     """Overwritten index occurrences cannot hide selected shards from authority checks."""
     header = b'{"__metadata__":{"format":"pt"}}'

@@ -454,10 +454,46 @@ def test_windows_local_source_guard_paths_allow_ordinary_directory_writers(
     )
 
     assert guard_paths == [
-        (parent_path, False, 0x00000001 | 0x00000002),
-        (reparse_path, True, 0x00000001),
-        (source_path, False, 0x00000001),
+        (parent_path, False, 0, 0x00000001 | 0x00000002),
+        (reparse_path, True, 0, 0x00000001),
+        (source_path, False, 0, 0x00000001),
     ]
+
+    monkeypatch.setattr(
+        core_module,
+        "_local_source_lexical_identity_entries",
+        lambda _path: [(parent_path, fake_stat(inode=10, mode=stat.S_IFDIR | 0o700))],
+    )
+    assert core_module._windows_local_source_guard_paths(
+        parent_path,
+        {"resolved_path": str(parent_path), "mode_type": stat.S_IFDIR},
+    ) == [(parent_path, False, 0x00010000, 0x00000001 | 0x00000002)]
+
+
+def test_local_source_directory_receipts_ignore_content_metadata() -> None:
+    """Directory identity remains stable when only its child namespace changes."""
+    expected: dict[str, int | str] = {
+        "resolved_path": "/model",
+        "lexical_identity": "identity",
+        "device": 1,
+        "inode": 2,
+        "mode_type": stat.S_IFDIR,
+        "size": 3,
+        "mtime_ns": 4,
+        "ctime_ns": 5,
+        "nlink": 6,
+    }
+    current: dict[str, int | str] = {
+        **expected,
+        "size": 30,
+        "mtime_ns": 40,
+        "ctime_ns": 50,
+        "nlink": 60,
+    }
+
+    assert core_module._local_source_receipts_match(expected, current)
+    current["inode"] = 7
+    assert not core_module._local_source_receipts_match(expected, current)
 
 
 @pytest.mark.usefixtures("requires_symlinks")
@@ -2753,7 +2789,8 @@ def test_directory_scan_ordinary_probe_cap_does_not_route_jax_owner(
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
     assert "jax_checkpoint" not in result.scanner_names
-    assert str(model_dir) not in result.file_metadata
+    owner_metadata = result.file_metadata.get(str(model_dir))
+    assert owner_metadata is None or owner_metadata.get("directory_owner_scan") is not True
     assert determine_exit_code(result) == 0
 
 
