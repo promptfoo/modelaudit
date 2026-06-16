@@ -13307,6 +13307,25 @@ def test_scan_bytes_keeps_cross_window_url_continuation_inert(protocol: int) -> 
     assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
 
 
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_carries_quote_context_to_later_overlap_url(protocol: int) -> None:
+    window_chars = 8 * 1024 * 1024
+    literal = (
+        "metadata='" + ("A" * (window_chars - 2000)) + "https://example.invalid/" + ("x" * 4000) + ";os.system(cmd)'"
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"later-overlap-url-protocol-{protocol}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+    expected_notice = "parse_incomplete" if protocol == 0 else "literal_scan_truncated"
+    assert any(notice.code == expected_notice for notice in report.notices)
+
+
 def test_scan_bytes_preserves_call_after_cross_window_quoted_url() -> None:
     literal = "metadata='https://example.invalid/" + ("a" * (8 * 1024 * 1024)) + "';os.system(cmd)"
 
