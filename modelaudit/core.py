@@ -48,6 +48,7 @@ from modelaudit.scanner_results import (
     SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
     VALIDATED_FORMAT_METADATA_KEY,
     Check,
+    CheckStatus,
     Issue,
     IssueSeverity,
     ScanResult,
@@ -1439,6 +1440,18 @@ def _discard_recorded_hash(file_hashes: list[str], content_hash: str) -> None:
         file_hashes.remove(content_hash)
 
 
+def _hash_is_needed_outside_onnx_package(
+    hashes_by_source: dict[str, str],
+    package_sources: set[str],
+    content_hash: str,
+) -> bool:
+    """Keep one bare digest when an unrelated source shares package bytes."""
+    return any(
+        source not in package_sources and source_hash == content_hash
+        for source, source_hash in hashes_by_source.items()
+    )
+
+
 def _openvino_xml_companion_key(path: Path) -> str:
     """Return a stable lexical key for one scheduled OpenVINO XML scan."""
     return os.path.normcase(os.path.normpath(str(Path(os.path.abspath(path)))))
@@ -1977,11 +1990,14 @@ _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT = 20
 
 
 def _onnx_weight_anomaly_cluster_key(
-    issue: Issue,
+    issue: Check | Issue,
     *,
     content_hash: str | None = None,
 ) -> tuple[Any, ...] | None:
-    if getattr(issue, "type", None) not in {"onnx_check", "weight_distribution_check"}:
+    if isinstance(issue, Check):
+        if issue.name != "Weight Distribution Anomaly Detection" or issue.status != CheckStatus.FAILED:
+            return None
+    elif getattr(issue, "type", None) not in {"onnx_check", "weight_distribution_check"}:
         return None
     if not content_hash:
         return None
@@ -2055,6 +2071,7 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
         return
 
     emitted: set[tuple[Any, ...]] = set()
+    clustered_issues_by_key: dict[tuple[Any, ...], Issue] = {}
     retained_issues: list[Issue] = []
     for issue, key in zip(results.issues, issue_keys, strict=True):
         if key is None:
@@ -2106,22 +2123,49 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
                 "byte_identical_export_groups_truncated": False,
             }
         )
-        retained_issues.append(
-            Issue(
-                message=(
-                    f"{representative.message.split(' (clustered across ', 1)[0]} "
-                    f"(clustered across {unique_export_count} byte-identical ONNX exports)"
-                ),
-                severity=representative.severity,
-                location=representative.location,
-                details=details,
-                timestamp=representative.timestamp,
-                why=representative.why,
-                type=getattr(representative, "type", None),
-                rule_code=getattr(representative, "rule_code", None),
+        clustered_issue = Issue(
+            message=(
+                f"{representative.message.split(' (clustered across ', 1)[0]} "
+                f"(clustered across {unique_export_count} byte-identical ONNX exports)"
+            ),
+            severity=representative.severity,
+            location=representative.location,
+            details=details,
+            timestamp=representative.timestamp,
+            why=representative.why,
+            type=getattr(representative, "type", None),
+            rule_code=getattr(representative, "rule_code", None),
+        )
+        retained_issues.append(clustered_issue)
+        clustered_issues_by_key[key] = clustered_issue
+    retained_checks: list[Check] = []
+    retained_cluster_check_keys: set[tuple[Any, ...]] = set()
+    for check in results.checks:
+        key = _onnx_weight_anomaly_cluster_key(check, content_hash=_file_content_hash(results, check.location))
+        if key is None:
+            retained_checks.append(check)
+            continue
+        clustered_check_issue = clustered_issues_by_key.get(key)
+        if clustered_check_issue is None:
+            retained_checks.append(check)
+            continue
+        if key in retained_cluster_check_keys:
+            continue
+        retained_cluster_check_keys.add(key)
+        retained_checks.append(
+            check.model_copy(
+                update={
+                    "message": clustered_check_issue.message,
+                    "details": clustered_check_issue.details,
+                    "location": clustered_check_issue.location,
+                    "severity": clustered_check_issue.severity,
+                    "why": clustered_check_issue.why,
+                    "rule_code": clustered_check_issue.rule_code,
+                }
             )
         )
     results.issues = retained_issues
+    results.checks = retained_checks
 
 
 def _build_shard_family_cache_fingerprint(
@@ -5256,6 +5300,16 @@ def scan_model_directory_or_file(
                             cluster_content_hashes[scanned_file_path] = onnx_package_hashes_by_path[representative_file]
                         else:
                             cluster_content_hashes.pop(scanned_file_path, None)
+                onnx_package_sources = {
+                    source
+                    for representative_file, scanned_file_paths, _shard_family_key, _repository_member in scan_entries
+                    if representative_file in onnx_package_hashes_by_path
+                    for source in (
+                        *(hash_source_by_path.get(scanned_file_path) for scanned_file_path in scanned_file_paths),
+                        *onnx_external_data_sources_by_path.get(representative_file, ()),
+                    )
+                    if source is not None
+                }
                 duplicate_paths_by_hash: dict[str, list[str]] = {}
                 for file_path, content_hash in cluster_content_hashes.items():
                     if not content_hash.startswith("unhashable_"):
@@ -5373,7 +5427,15 @@ def scan_model_directory_or_file(
                             ):
                                 if consumed_content_hash is None or consumed_content_hash.startswith("unhashable_"):
                                     continue
-                                _discard_recorded_hash(file_hashes, consumed_content_hash)
+                                if _hash_is_needed_outside_onnx_package(
+                                    hashes_by_source,
+                                    onnx_package_sources,
+                                    consumed_content_hash,
+                                ):
+                                    if consumed_content_hash not in recorded_content_hashes:
+                                        file_hashes.append(consumed_content_hash)
+                                else:
+                                    _discard_recorded_hash(file_hashes, consumed_content_hash)
                                 recorded_content_hashes.add(consumed_content_hash)
                             if package_content_hash not in recorded_content_hashes:
                                 file_hashes.append(package_content_hash)
@@ -5871,7 +5933,6 @@ def scan_model_directory_or_file(
                     for external_data_path, external_data_identity in discovered_external_data_paths or ():
                         onnx_external_data_pre_scan_identities.append((external_data_path, external_data_identity))
                         external_data_size = _snapshot_file_size(external_data_identity)
-                        onnx_external_data_bytes_scanned += external_data_size
                         if _should_defer_hash_for_max_file_size(str(external_data_path), config) or (
                             max_total_size > 0 and top_level_hashed_bytes + external_data_size > max_total_size
                         ):
@@ -5883,6 +5944,7 @@ def scan_model_directory_or_file(
                             aggregate_hash_complete = False
                             onnx_package_hash_complete = False
                             continue
+                        onnx_external_data_bytes_scanned += external_data_size
                         top_level_hashed_bytes += external_data_size
                         onnx_external_data_hashes.append(
                             (_onnx_external_data_role(Path(target), external_data_path), external_data_hash)

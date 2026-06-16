@@ -361,11 +361,34 @@ def test_external_data_package_hash_matches_file_and_directory_routes(tmp_path: 
     assert direct.content_hash == directory.content_hash
 
 
+def test_external_data_package_keeps_unrelated_duplicate_sidecar_hash(tmp_path: Path) -> None:
+    model_path, sidecar = _external_package(tmp_path)
+    package_only = scan_model_directory_or_file(str(tmp_path), scanners=["onnx"])
+    (tmp_path / "standalone.bin").write_bytes(sidecar.read_bytes())
+    with_standalone = scan_model_directory_or_file(str(tmp_path), scanners=["onnx"])
+    assert model_path in {Path(path) for path in with_standalone.file_metadata}
+    assert with_standalone.content_hash != package_only.content_hash
+
+
+def test_external_data_max_file_size_does_not_count_skipped_sidecar(tmp_path: Path) -> None:
+    model_path, sidecar = _external_package(tmp_path)
+    result = scan_model_directory_or_file(
+        str(model_path),
+        scanners=["onnx"],
+        max_file_size=sidecar.stat().st_size - 1,
+    )
+    assert result.bytes_scanned < model_path.stat().st_size + sidecar.stat().st_size
+    assert result.content_hash is None
+
+
 def test_standalone_weight_distribution_clusters_identical_onnx_exports(tmp_path: Path) -> None:
     first = _qlinear_matmul(tmp_path, malicious=True)
     second = tmp_path / "copy.onnx"
     second.write_bytes(first.read_bytes())
     result = scan_model_directory_or_file(str(tmp_path), scanners=["weight_distribution"])
     anomalies = [issue for issue in result.issues if issue.type == "weight_distribution_check"]
+    anomaly_checks = [check for check in result.checks if check.name == "Weight Distribution Anomaly Detection"]
     assert len(anomalies) == 1
+    assert len(anomaly_checks) == 1
     assert anomalies[0].details["cluster_size"] == 2
+    assert result.failed_checks == 1

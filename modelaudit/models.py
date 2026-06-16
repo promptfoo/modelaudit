@@ -626,8 +626,11 @@ def _stable_onnx_weight_context_value(value: Any) -> Any:
     return value
 
 
-def _onnx_weight_issue_context_key(issue: Issue) -> tuple[Any, ...] | None:
-    if getattr(issue, "type", None) not in {"onnx_check", "weight_distribution_check"}:
+def _onnx_weight_issue_context_key(issue: Check | Issue) -> tuple[Any, ...] | None:
+    if isinstance(issue, Check):
+        if issue.name != "Weight Distribution Anomaly Detection" or issue.status != CheckStatus.FAILED:
+            return None
+    elif getattr(issue, "type", None) not in {"onnx_check", "weight_distribution_check"}:
         return None
     details = issue.details if isinstance(issue.details, dict) else {}
     anomaly_neurons = details.get("affected_neurons", details.get("outlier_neurons"))
