@@ -902,21 +902,27 @@ class TarScanner(BaseScanner):
         return ((total_size + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE) * tarfile.RECORDSIZE
 
     @staticmethod
-    def _is_empty_tar_archive(path: str) -> bool:
+    def _is_empty_tar_archive(path: str, *, raw_file: BinaryIO | None = None) -> bool:
         """Detect standard empty TAR archives that some Python 3.10 builds reject on ``next()``."""
         max_read_size = 10 * 1024 * 1024
         try:
-            file_size = os.path.getsize(path)
+            file_size = os.fstat(raw_file.fileno()).st_size if raw_file is not None else os.path.getsize(path)
             if file_size < 2 * tarfile.BLOCKSIZE or file_size % tarfile.BLOCKSIZE != 0:
                 return False
             if file_size > max_read_size:
                 return False
 
-            with open(path, "rb") as file_obj:
-                first_block = file_obj.read(tarfile.BLOCKSIZE)
-                if first_block != b"\0" * tarfile.BLOCKSIZE:
-                    return False
-                return all(not any(chunk) for chunk in iter(lambda: file_obj.read(64 * 1024), b""))
+            with ExitStack() as stack:
+                file_obj = raw_file if raw_file is not None else stack.enter_context(open(path, "rb"))
+                original_offset = file_obj.tell()
+                try:
+                    file_obj.seek(0)
+                    first_block = file_obj.read(tarfile.BLOCKSIZE)
+                    if first_block != b"\0" * tarfile.BLOCKSIZE:
+                        return False
+                    return all(not any(chunk) for chunk in iter(lambda: file_obj.read(64 * 1024), b""))
+                finally:
+                    file_obj.seek(original_offset)
         except OSError:
             return False
 
@@ -1571,7 +1577,7 @@ class TarScanner(BaseScanner):
             },
         )
 
-    def _scan_tar_file(self, path: str, depth: int = 0) -> ScanResult:
+    def _scan_tar_file(self, path: str, depth: int = 0, *, raw_file: BinaryIO | None = None) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
         scan_complete = True
@@ -1604,7 +1610,7 @@ class TarScanner(BaseScanner):
             rule_code=None,
         )
 
-        if self._is_empty_tar_archive(path):
+        if self._is_empty_tar_archive(path, raw_file=raw_file):
             result.add_check(
                 name="Entry Count Limit Check",
                 passed=True,
@@ -1627,7 +1633,7 @@ class TarScanner(BaseScanner):
         archive_uncompressed_size = 0
         entry_count_check_recorded = False
         aggregate_size_check_recorded = False
-        compressed_size = os.path.getsize(path)
+        compressed_size = os.fstat(raw_file.fileno()).st_size if raw_file is not None else os.path.getsize(path)
         compression_codec: str | None = None
         bounded_stream: _TarBoundedStream | None = None
         shared_budget = self._get_or_create_shared_budget()
@@ -1639,7 +1645,7 @@ class TarScanner(BaseScanner):
         link_resolution_budget = [_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS]
 
         try:
-            with self._open_tar_stream(path) as (tar, bounded_stream, compression_codec):
+            with self._open_tar_stream(path, raw_file=raw_file) as (tar, bounded_stream, compression_codec):
                 security_only_nested_entries = self.config.get(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY)
                 if not isinstance(security_only_nested_entries, set):
                     security_only_nested_entries = set()
@@ -1648,7 +1654,14 @@ class TarScanner(BaseScanner):
                     try:
                         member = tar.next()
                     except OSError as exc:
-                        if not contents and exc.errno == errno.EINVAL and self._is_empty_tar_archive(path):
+                        if (
+                            not contents
+                            and exc.errno == errno.EINVAL
+                            and self._is_empty_tar_archive(
+                                path,
+                                raw_file=raw_file,
+                            )
+                        ):
                             break
                         scan_complete = False
                         self._record_incomplete_tar_scan(result, path, exc)

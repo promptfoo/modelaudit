@@ -8085,6 +8085,136 @@ class TestCVE202523304HydraTarget:
         finally:
             reset_cache_manager()
 
+    def test_nemo_prefix_fallback_preserves_preflight_failure_when_path_is_replaced(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = tmp_path / "replace-after-failed-preflight.nemo"
+        with tarfile.open(nemo_path, "w") as archive:
+            _add_tar_bytes(archive, "oversized.bin", b"x" * 128)
+        replacement_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "torch.nn.Linear"}},
+            filename="replacement.nemo",
+        )
+
+        original_preflight = tar_scanner_module.TarScanner._preflight_tar_archive
+        replacement_performed = False
+
+        def replace_after_failed_preflight(
+            scanner: tar_scanner_module.TarScanner,
+            path: str,
+            result: ScanResult,
+            **kwargs: Any,
+        ) -> bool:
+            nonlocal replacement_performed
+            succeeded = original_preflight(scanner, path, result, **kwargs)
+            if not succeeded and not replacement_performed:
+                os.replace(replacement_path, nemo_path)
+                replacement_performed = True
+            return succeeded
+
+        monkeypatch.setattr(
+            tar_scanner_module.TarScanner,
+            "_preflight_tar_archive",
+            replace_after_failed_preflight,
+        )
+
+        cache_dir = tmp_path / "prefix-fallback-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_total_uncompressed_size=100,
+            )
+
+            metadata = aggregate.file_metadata[str(nemo_path)]
+            assert replacement_performed is True
+            assert aggregate.success is False
+            assert "tar_total_size_limit_exceeded" in metadata["scan_outcome_reasons"]
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            assert not any(issue.details.get("cve_id") for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_content_routed_nemo_tar_followup_uses_bound_descriptor_after_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "replace-before-tar-followup.tar.gz"
+        with tarfile.open(model_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+            _add_tar_bytes(archive, "payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+        replacement_path = tmp_path / "replacement.tar.gz"
+        with tarfile.open(replacement_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "safe.txt", b"safe")
+
+        original_nemo_scan = NemoScanner._scan_nemo_archive
+        replacement_performed = False
+
+        def replace_after_nemo_analysis(scanner: NemoScanner, path: str, *args: Any, **kwargs: Any) -> None:
+            nonlocal replacement_performed
+            original_nemo_scan(scanner, path, *args, **kwargs)
+            os.replace(replacement_path, model_path)
+            replacement_performed = True
+
+        monkeypatch.setattr(NemoScanner, "_scan_nemo_archive", replace_after_nemo_analysis)
+
+        cache_dir = tmp_path / "tar-followup-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            metadata = aggregate.file_metadata[str(model_path)]
+            assert replacement_performed is True
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            assert any("os.system" in issue.message.lower() for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_nemo_preflight_interrupt_closes_bound_descriptor(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "torch.nn.Linear"}},
+            filename="interrupted-preflight.nemo",
+        )
+        captured_files: list[Any] = []
+
+        def interrupt_preflight(
+            _scanner: tar_scanner_module.TarScanner,
+            _path: str,
+            _result: ScanResult,
+            **kwargs: Any,
+        ) -> bool:
+            captured_files.append(kwargs["raw_file"])
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(tar_scanner_module.TarScanner, "_preflight_tar_archive", interrupt_preflight)
+
+        with pytest.raises(KeyboardInterrupt):
+            NemoScanner().scan(str(nemo_path))
+
+        assert len(captured_files) == 1
+        assert captured_files[0].closed is True
+
     def test_content_routed_nemo_preflight_does_not_double_charge_shared_budget(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "within-budget.tar.gz"
         config_payload = b"model:\n  _target_: torch.nn.Linear\n"

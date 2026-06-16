@@ -1382,6 +1382,21 @@ class NemoScanner(BaseScanner):
             return True
         return descriptor_identity != expected_identity or path_identity != expected_identity
 
+    @staticmethod
+    def _record_archive_identity_change(result: ScanResult, path: str) -> None:
+        mark_archive_scan_incomplete(result, "nemo_archive_identity_changed")
+        result.add_check(
+            name="NeMo Archive Identity",
+            passed=False,
+            message="NeMo archive changed while it was being scanned",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "nemo_archive_identity_changed",
+            },
+        )
+
     def scan(self, path: str) -> ScanResult:
         budget_scanner = TarScanner(config=dict(self.config))
         with _tar_shared_scan_budget_scope(
@@ -1424,20 +1439,41 @@ class NemoScanner(BaseScanner):
                 retain_member_budget=is_declared_nemo,
                 raw_file=archive_file,
             )
-        except Exception:
+        except BaseException:
             archive_file.close()
             raise
         if not preflight_succeeded:
-            archive_file.close()
-            preflight_reasons = set(preflight_result.metadata.get("scan_outcome_reasons", []))
-            if preflight_reasons and preflight_reasons <= _PREFLIGHT_PREFIX_ANALYSIS_REASONS:
-                shared_budget.member_bytes_consumed = initial_member_bytes
-                shared_budget.exhausted = initial_budget_exhausted
-                result.merge(tar_scanner._scan_tar_file(path, depth=archive_depth))
-            else:
+            archive_source_changed = self._archive_source_changed(path, archive_file, initial_archive_identity)
+            try:
+                preflight_reasons = set(preflight_result.metadata.get("scan_outcome_reasons", []))
                 mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
                 preflight_result.finish(success=False)
                 result.merge(preflight_result)
+                if preflight_reasons and preflight_reasons <= _PREFLIGHT_PREFIX_ANALYSIS_REASONS:
+                    shared_budget.member_bytes_consumed = initial_member_bytes
+                    shared_budget.exhausted = initial_budget_exhausted
+                    result.merge(
+                        tar_scanner._scan_tar_file(
+                            path,
+                            depth=archive_depth,
+                            raw_file=archive_file,
+                        )
+                    )
+            finally:
+                archive_source_changed = archive_source_changed or self._archive_source_changed(
+                    path,
+                    archive_file,
+                    initial_archive_identity,
+                )
+                archive_file.close()
+            if archive_source_changed:
+                for check in result.checks:
+                    if check.details.get("scan_outcome_reason") in preflight_reasons:
+                        check.severity = IssueSeverity.INFO
+                for issue in result.issues:
+                    if issue.details.get("scan_outcome_reason") in preflight_reasons:
+                        issue.severity = IssueSeverity.INFO
+                self._record_archive_identity_change(result, path)
             result.bytes_scanned = file_size
             self._finish_scan_result(result)
             return result
@@ -1475,6 +1511,20 @@ class NemoScanner(BaseScanner):
                         location=path,
                     )
                     result.success = False
+            if not is_declared_nemo:
+                tar_config = dict(self.config)
+                tar_config[TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY] = nemo_owned_entries
+                tar_config[TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY] = True
+                # The enclosing NeMo result controls whether this artifact is
+                # complete enough to cache; nested TAR dispatch must not persist partial results.
+                tar_config["cache_enabled"] = False
+                result.merge(
+                    TarScanner(config=tar_config)._scan_tar_file(
+                        path,
+                        depth=archive_depth,
+                        raw_file=archive_file,
+                    )
+                )
         finally:
             archive_source_changed = archive_source_changed or self._archive_source_changed(
                 path,
@@ -1483,27 +1533,7 @@ class NemoScanner(BaseScanner):
             )
             archive_file.close()
         if archive_source_changed:
-            mark_archive_scan_incomplete(result, "nemo_archive_identity_changed")
-            result.add_check(
-                name="NeMo Archive Identity",
-                passed=False,
-                message="NeMo archive changed while it was being scanned",
-                severity=IssueSeverity.WARNING,
-                location=path,
-                details={
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "nemo_archive_identity_changed",
-                },
-            )
-
-        if not is_declared_nemo:
-            tar_config = dict(self.config)
-            tar_config[TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY] = nemo_owned_entries
-            tar_config[TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY] = True
-            # The enclosing NeMo result controls whether this artifact is
-            # complete enough to cache; nested TAR dispatch must not persist partial results.
-            tar_config["cache_enabled"] = False
-            result.merge(TarScanner(config=tar_config).scan(path))
+            self._record_archive_identity_change(result, path)
 
         result.bytes_scanned = file_size
         self._finish_scan_result(result)
