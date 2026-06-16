@@ -13379,6 +13379,58 @@ def test_scan_bytes_keeps_url_after_overlap_split_escaped_quote_inert(protocol: 
     assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
 
 
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_detects_formatted_url_expression_when_quote_starts_overlap(protocol: int) -> None:
+    literal = ("A" * 4095) + "f'" + ("B" * 5000) + "https://example.invalid/x{os.system(cmd)}'"
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"formatted-quote-overlap-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+def test_scan_bytes_does_not_skip_base64_token_starting_at_overlap() -> None:
+    encoded = base64.b64encode((b"A" * 3069) + b"os.system('id')").decode("ascii")
+    literal = ("!" * 4096) + encoded + (" " * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="base64-token-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_keeps_base64_payload_in_url_starting_at_overlap_inert() -> None:
+    encoded = base64.b64encode((b"A" * 3069) + b"os.system('id')").decode("ascii")
+    literal = ("!" * 4096) + "https://example.invalid/" + encoded + (" " * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="base64-url-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
 def test_scan_bytes_preserves_call_after_cross_window_quoted_url() -> None:
     literal = "metadata='https://example.invalid/" + ("a" * (8 * 1024 * 1024)) + "';os.system(cmd)"
 
