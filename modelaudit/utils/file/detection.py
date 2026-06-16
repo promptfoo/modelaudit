@@ -434,7 +434,7 @@ _HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(_JAX_JSON_CHECKPOINT_IDENTITY_KEYS | _J
 _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS = (
     _HF_TOKENIZER_TEMPLATE_KEYS | _MXNET_SYMBOL_ROOT_KEYS | {"learner"} | _JAX_JSON_CHECKPOINT_MARKER_KEYS
 )
-_HFTokenizerEOFProofKey = tuple[str, int, int, int, int, int, int]
+_HFTokenizerEOFProofKey = tuple[str, int, int, int, int, int, int, int]
 
 
 @dataclass
@@ -1796,7 +1796,7 @@ def huggingface_tokenizer_json_eof_proof_scope() -> Iterator[_HFTokenizerEOFProo
 
 
 def _hf_tokenizer_stat_matches_identity(stat_result: os.stat_result, key: _HFTokenizerEOFProofKey) -> bool:
-    _, file_size, mtime_ns, ctime_ns, device, inode, _ = key
+    _, file_size, mtime_ns, ctime_ns, device, inode, _, _ = key
     return (
         stat_result.st_size == file_size
         and stat_result.st_mtime_ns == mtime_ns
@@ -1806,20 +1806,46 @@ def _hf_tokenizer_stat_matches_identity(stat_result: os.stat_result, key: _HFTok
     )
 
 
+def _hf_tokenizer_file_change_token(file_path: str, file_stat: os.stat_result) -> int:
+    from ...cache.scan_results_cache import ScanResultsCache
+
+    return ScanResultsCache._get_file_change_token(file_path, file_stat)
+
+
+def _hf_tokenizer_path_matches_identity(file_path: Path, key: _HFTokenizerEOFProofKey) -> bool:
+    try:
+        file_stat = file_path.stat()
+        return (
+            _hf_tokenizer_stat_matches_identity(file_stat, key)
+            and _hf_tokenizer_file_change_token(str(file_path), file_stat) == key[6]
+        )
+    except OSError:
+        return False
+
+
 def _hf_tokenizer_json_digest_matches_identity(key: _HFTokenizerEOFProofKey, expected_digest: bytes) -> bool:
     file_path = Path(key[0])
+    file_size = key[1]
+    proof_budget = key[7]
     hasher = hashlib.sha256()
+    bytes_read = 0
     try:
-        if not file_path.is_file() or not _hf_tokenizer_stat_matches_identity(file_path.stat(), key):
+        if not file_path.is_file() or not _hf_tokenizer_path_matches_identity(file_path, key):
             return False
         with file_path.open("rb") as stream:
             if not _hf_tokenizer_stat_matches_identity(os.fstat(stream.fileno()), key):
                 return False
-            while chunk := stream.read(_HF_TOKENIZER_STREAM_CHUNK_BYTES):
+            while bytes_read <= proof_budget:
+                chunk = stream.read(min(_HF_TOKENIZER_STREAM_CHUNK_BYTES, proof_budget + 1 - bytes_read))
+                if not chunk:
+                    break
                 hasher.update(chunk)
+                bytes_read += len(chunk)
+            if bytes_read != file_size or bytes_read > proof_budget:
+                return False
             if not _hf_tokenizer_stat_matches_identity(os.fstat(stream.fileno()), key):
                 return False
-        if not _hf_tokenizer_stat_matches_identity(file_path.stat(), key):
+        if not _hf_tokenizer_path_matches_identity(file_path, key):
             return False
     except OSError:
         return False
@@ -1830,6 +1856,7 @@ def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
     """Return whether bounded streaming JSON proves exact tokenizer ownership."""
     try:
         expected_stat = file_path.stat()
+        change_token = _hf_tokenizer_file_change_token(str(file_path), expected_stat)
     except OSError:
         return False
     key: _HFTokenizerEOFProofKey = (
@@ -1839,16 +1866,14 @@ def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
         expected_stat.st_ctime_ns,
         expected_stat.st_dev,
         expected_stat.st_ino,
+        change_token,
         TOKENIZER_JSON_EOF_PROOF_READ_BYTES,
     )
     scope = _HF_TOKENIZER_EOF_PROOF_SCOPE.get()
     if scope is not None and key in scope.memo:
         result = scope.memo[key]
         if result:
-            try:
-                return _hf_tokenizer_stat_matches_identity(file_path.stat(), key)
-            except OSError:
-                return False
+            return _hf_tokenizer_path_matches_identity(file_path, key)
         return False
     result = _hf_tokenizer_json_eof_proves_ownership_for_identity(*key)
     if scope is not None:
@@ -1863,6 +1888,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     ctime_ns: int,
     device: int,
     inode: int,
+    change_token: int,
     proof_budget: int,
 ) -> bool:
     file_path = Path(file_path_str)
@@ -1875,6 +1901,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
             or expected_stat.st_ctime_ns != ctime_ns
             or expected_stat.st_dev != device
             or expected_stat.st_ino != inode
+            or _hf_tokenizer_file_change_token(file_path_str, expected_stat) != change_token
             or expected_stat.st_size < 4
             or expected_stat.st_size > proof_budget
         ):
@@ -2092,6 +2119,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
                 or opened_stat.st_ctime_ns != ctime_ns
                 or opened_stat.st_dev != device
                 or opened_stat.st_ino != inode
+                or _hf_tokenizer_file_change_token(file_path_str, opened_stat) != change_token
             ):
                 return False
             first_chunk = True
@@ -2220,6 +2248,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
                 return False
             opened_after_stat = os.fstat(stream.fileno())
             current_stat = file_path.stat()
+            current_change_token = _hf_tokenizer_file_change_token(file_path_str, current_stat)
     except (OSError, UnicodeDecodeError, _JSONProbeInvalid):
         return False
 
@@ -2234,12 +2263,22 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         and current_stat.st_ctime_ns == expected_stat.st_ctime_ns
         and current_stat.st_dev == expected_stat.st_dev
         and current_stat.st_ino == expected_stat.st_ino
+        and current_change_token == change_token
         and root_keys >= _HF_TOKENIZER_ROOT_KEYS | {"model"}
         and saw_model_schema
     )
     if not owns_tokenizer:
         return False
-    key: _HFTokenizerEOFProofKey = (file_path_str, file_size, mtime_ns, ctime_ns, device, inode, proof_budget)
+    key: _HFTokenizerEOFProofKey = (
+        file_path_str,
+        file_size,
+        mtime_ns,
+        ctime_ns,
+        device,
+        inode,
+        change_token,
+        proof_budget,
+    )
     digest = content_hasher.digest()
     scope = _HF_TOKENIZER_EOF_PROOF_SCOPE.get()
     if scope is not None:

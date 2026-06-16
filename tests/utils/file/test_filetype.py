@@ -1,5 +1,6 @@
 import bz2
 import gzip
+import hashlib
 import importlib
 import io
 import json
@@ -5190,6 +5191,120 @@ def test_hf_tokenizer_json_eof_proof_rejects_post_eof_same_inode_rewrite(
     if os.name != "nt":
         assert rewritten_stat.st_ctime_ns != clean_stat.st_ctime_ns
     assert file_detection.huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_digest_verifier_bounds_concurrent_growth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 256
+    tokenizer_path = _write_ordered_hf_tokenizer_json(tmp_path / "tokenizer.json")
+    file_stat = tokenizer_path.stat()
+    key: file_detection._HFTokenizerEOFProofKey = (
+        str(tokenizer_path),
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_detection._hf_tokenizer_file_change_token(str(tokenizer_path), file_stat),
+        proof_budget,
+    )
+    original_open = Path.open
+    bytes_returned = 0
+
+    class GrowingReader:
+        def __init__(self, wrapped: IO[bytes]) -> None:
+            self.wrapped = wrapped
+
+        def __enter__(self) -> "GrowingReader":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.wrapped.close()
+
+        def fileno(self) -> int:
+            return self.wrapped.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal bytes_returned
+            chunk = b"x" * size
+            bytes_returned += len(chunk)
+            return chunk
+
+    def growing_open(self: Path, mode: str = "r", *args: object, **kwargs: object) -> IO[Any]:
+        del args, kwargs
+        return cast(IO[Any], GrowingReader(cast(IO[bytes], original_open(self, mode))))
+
+    monkeypatch.setattr(Path, "open", growing_open)
+
+    assert file_detection._hf_tokenizer_json_digest_matches_identity(key, b"not-the-digest") is False
+    assert bytes_returned == proof_budget + 1
+
+
+def test_hf_tokenizer_json_digest_verifier_rejects_windows_like_eof_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"clean":[{"op":"null","name":"data","inputs":[]}],"safe_keys":[0],"quiet":[[0,0,0]]',
+    )
+    conflict_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "conflict.json",
+        late_fields=',"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]',
+    )
+    clean_bytes = tokenizer_path.read_bytes()
+    conflict_bytes = conflict_path.read_bytes()
+    clean_stat = tokenizer_path.stat()
+    assert len(conflict_bytes) == len(clean_bytes)
+    generation = 1
+    key: file_detection._HFTokenizerEOFProofKey = (
+        str(tokenizer_path),
+        clean_stat.st_size,
+        clean_stat.st_mtime_ns,
+        clean_stat.st_ctime_ns,
+        clean_stat.st_dev,
+        clean_stat.st_ino,
+        generation,
+        4096,
+    )
+    original_open = Path.open
+
+    class EOFRewriteReader:
+        def __init__(self, wrapped: IO[bytes]) -> None:
+            self.wrapped = wrapped
+            self.rewritten = False
+
+        def __enter__(self) -> "EOFRewriteReader":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.wrapped.close()
+
+        def fileno(self) -> int:
+            return self.wrapped.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal generation
+            chunk = self.wrapped.read(size)
+            if not chunk and not self.rewritten:
+                self.rewritten = True
+                with original_open(tokenizer_path, "wb") as rewrite_stream:
+                    rewrite_stream.write(conflict_bytes)
+                os.utime(tokenizer_path, ns=(clean_stat.st_atime_ns, clean_stat.st_mtime_ns))
+                generation += 1
+            return chunk
+
+    def tracking_open(self: Path, mode: str = "r", *args: object, **kwargs: object) -> IO[Any]:
+        del args, kwargs
+        return cast(IO[Any], EOFRewriteReader(cast(IO[bytes], original_open(self, mode))))
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_stat_matches_identity", lambda *args: True)
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_file_change_token", lambda *args: generation)
+
+    assert file_detection._hf_tokenizer_json_digest_matches_identity(key, hashlib.sha256(clean_bytes).digest()) is False
 
 
 @pytest.mark.parametrize(
