@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - require executable pickle context before reporting URL-only S310 network findings while preserving reducer and loader detections
+- refresh vulnerable aiohttp, cryptography, and required MLflow lock entries detected by dependency audit
 - preserve native-architecture Rust installer selection for Docker builds that do not expose BuildKit's `TARGETARCH` argument
 - require and bundle `modelaudit-picklescan>=0.1.7` so root releases and source-built Docker images cannot run with the pre-hardening call-graph resolver
 - publish and verify coordinated `modelaudit-picklescan` releases before uploading a dependent root release
