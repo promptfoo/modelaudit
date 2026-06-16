@@ -33,6 +33,7 @@ from modelaudit.utils.file.detection import (
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+    TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_for_skip_filter,
@@ -4972,7 +4973,31 @@ def test_hf_tokenizer_json_eof_proof_budget_boundary_fails_closed(
     assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_EOF_PROOF_READ_BYTES
     assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
-    assert detect_file_format(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_hf_tokenizer_json_over_eof_cap_with_hidden_late_conflict_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 256
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", proof_budget)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    benign_tokenizer = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}'
+    hidden_conflict = ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}]'
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(benign_tokenizer + (" " * 320) + hidden_conflict + (" " * 128), encoding="utf-8")
+
+    assert tokenizer_path.stat().st_size > proof_budget
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_hf_tokenizer_json_eof_proof_keeps_large_vocab_token_memory_bounded(tmp_path: Path) -> None:

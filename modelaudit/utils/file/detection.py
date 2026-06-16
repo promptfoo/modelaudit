@@ -392,6 +392,7 @@ TOKENIZER_JSON_ROUTING_READ_BYTES = 16 * 1024 * 1024
 TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES = 64 * 1024 * 1024
 TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES = 64 * 1024 * 1024
 TOKENIZER_JSON_EOF_PROOF_READ_BYTES = 512 * 1024 * 1024
+TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT = "tokenizer_json_routing_inconclusive"
 _HF_TOKENIZER_STREAM_CHUNK_BYTES = 1024 * 1024
 _HF_TOKENIZER_STREAM_MAX_KEY_BYTES = 4096
 _HF_TOKENIZER_STREAM_MAX_TRACKED_KEYS = 4096
@@ -1662,7 +1663,11 @@ def _is_hf_tokenizer_json_route_candidate_path(file_path: Path) -> bool:
     return file_path.name.lower() in _HF_TOKENIZER_JSON_ROUTE_FILENAMES
 
 
-def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
+def _malformed_hf_tokenizer_json_has_schema_evidence(
+    path: str | Path,
+    *,
+    accept_complete_prefix: bool = False,
+) -> bool:
     """Return whether exact tokenizer.json has tokenizer evidence but malformed JSON."""
     file_path = Path(path)
     if not _is_hf_tokenizer_json_schema_path(file_path):
@@ -1698,7 +1703,10 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
         if offset >= len(probe):
             return sample_is_prefix and has_tokenizer_root_evidence()
         if probe[offset] == ord("}"):
-            return has_tokenizer_root_evidence() and not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
+            return has_tokenizer_root_evidence() and (
+                not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
+                or (accept_complete_prefix and sample_is_prefix)
+            )
         if probe[offset] != ord('"'):
             return has_tokenizer_root_evidence()
 
@@ -1747,10 +1755,26 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
             offset += 1
             continue
         if probe[offset] == ord("}"):
-            return has_tokenizer_root_evidence() and not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
+            return has_tokenizer_root_evidence() and (
+                not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
+                or (accept_complete_prefix and sample_is_prefix)
+            )
         return has_tokenizer_root_evidence()
 
     return sample_is_prefix and has_tokenizer_root_evidence()
+
+
+def _hf_tokenizer_json_eof_proof_exceeds_budget(path: str | Path) -> bool:
+    """Return whether exact tokenizer evidence extends beyond the EOF proof cap."""
+    file_path = Path(path)
+    if not _is_hf_tokenizer_json_schema_path(file_path):
+        return False
+    try:
+        if not file_path.is_file() or file_path.stat().st_size <= TOKENIZER_JSON_EOF_PROOF_READ_BYTES:
+            return False
+    except OSError:
+        return False
+    return _malformed_hf_tokenizer_json_has_schema_evidence(file_path, accept_complete_prefix=True)
 
 
 def huggingface_tokenizer_json_has_template_route_evidence(path: str | Path) -> bool:
@@ -2720,6 +2744,8 @@ def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str |
         or huggingface_tokenizer_json_has_jax_route_evidence(file_path)
     ):
         return None
+    if not tokenizer_has_mxnet_or_xgboost and _hf_tokenizer_json_eof_proof_exceeds_budget(file_path):
+        return TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
     if not tokenizer_has_mxnet_or_xgboost and _malformed_hf_tokenizer_json_has_schema_evidence(file_path):
         return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
     if file_path.name.lower().endswith("-symbol.json"):

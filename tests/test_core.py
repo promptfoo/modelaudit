@@ -12627,6 +12627,32 @@ def test_scan_file_valid_over_64m_hf_tokenizer_json_does_not_fail_closed_as_mxne
     assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
+def test_scan_file_tokenizer_over_eof_cap_with_hidden_late_conflict_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 256
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", proof_budget)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    benign_tokenizer = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}'
+    hidden_conflict = ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}]'
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(benign_tokenizer + (" " * 320) + hidden_conflict + (" " * 128), encoding="utf-8")
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert tokenizer_path.stat().st_size > proof_budget
+    assert result.success is False
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == ["tokenizer_json_ownership_incomplete"]
+    assert any(check.name == "Tokenizer JSON Routing" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata["scan_outcome_reasons"]
+
+
 @pytest.mark.parametrize(
     "model_fields, added_tokens",
     [
