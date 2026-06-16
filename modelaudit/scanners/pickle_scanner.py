@@ -326,6 +326,26 @@ _PICKLE_LITERAL_OPCODE_NAMES = frozenset(
 )
 _PICKLE_MEMO_READ_OPCODE_NAMES = frozenset({"GET", "BINGET", "LONG_BINGET"})
 _PICKLE_MEMO_WRITE_OPCODE_NAMES = frozenset({"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"})
+_PICKLE_INERT_DIRECT_VALUE_OPCODE_NAMES = _PICKLE_LITERAL_OPCODE_NAMES | frozenset(
+    {
+        "INT",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "LONG",
+        "LONG1",
+        "LONG4",
+        "FLOAT",
+        "BINFLOAT",
+        "NONE",
+        "NEWTRUE",
+        "NEWFALSE",
+        "EMPTY_LIST",
+        "EMPTY_TUPLE",
+        "EMPTY_DICT",
+        "EMPTY_SET",
+    }
+)
 _PICKLE_STRING_OPCODE_NAMES = frozenset(
     {
         "STRING",
@@ -1549,7 +1569,7 @@ def _direct_pickle_dict_key_literal_positions(
         if index < 0:
             return None
         opcode = operations[index][0]
-        if opcode.name == "MARK" or opcode.stack_before or len(opcode.stack_after) != 1:
+        if opcode.name not in _PICKLE_INERT_DIRECT_VALUE_OPCODE_NAMES:
             return None
         return index
 
@@ -1579,11 +1599,7 @@ def _direct_pickle_dict_key_literal_positions(
             candidate_opcode = operations[candidate][0]
             if candidate_opcode.name in _PICKLE_MEMO_WRITE_OPCODE_NAMES:
                 continue
-            if (
-                candidate_opcode.name == "MARK"
-                or candidate_opcode.stack_before
-                or len(candidate_opcode.stack_after) != 1
-            ):
+            if candidate_opcode.name not in _PICKLE_INERT_DIRECT_VALUE_OPCODE_NAMES:
                 item_indexes = []
                 break
             item_indexes.append(candidate)

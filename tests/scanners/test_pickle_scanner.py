@@ -1134,6 +1134,39 @@ def test_scan_stream_ignores_passive_downloader_dict_keys(protocol: int) -> None
     )
 
 
+@pytest.mark.parametrize(
+    ("protocol", "executable_value"),
+    [
+        pytest.param(b"\x80\x02", b"cdecimal\nDecimal\n", id="global"),
+        pytest.param(b"\x80\x04", b"\x8c\x07decimal\x8c\x07Decimal\x93", id="stack-global"),
+        pytest.param(b"\x80\x02", b"\x82\x01", id="ext1"),
+        pytest.param(b"\x80\x02", b"\x83\x01\x00", id="ext2"),
+        pytest.param(b"\x80\x02", b"\x84\x01\x00\x00\x00", id="ext4"),
+        pytest.param(b"\x80\x02", b"Pexternal-storage-key\n", id="persid"),
+        pytest.param(b"\x80\x02", b"Vexternal-storage-key\nQ", id="binpersid"),
+        pytest.param(b"\x80\x05", b"\x97", id="next-buffer"),
+        pytest.param(b"\x80\x05", b"\x97\x98", id="readonly-buffer"),
+        pytest.param(b"\x80\x02", b"cbuiltins\nstr\n)R", id="reduce"),
+        pytest.param(b"\x80\x02", b"cbuiltins\nobject\n)\x81}b", id="build"),
+    ],
+)
+def test_pickle_url_filter_fails_closed_for_executable_direct_dict_values(
+    protocol: bytes, executable_value: bytes
+) -> None:
+    payload = protocol + b"(dVcurl\n" + executable_value + b"sVurl\nVhttps://attacker.example/os.system(cmd)\ns."
+
+    assert pickle_scanner._pickle_literal_url_stripped_scan_view(payload, allow_filtering=True) == payload
+
+    result = PickleScanner(config={"enable_cache": False}).scan_stream(
+        io.BytesIO(payload), len(payload), source="executable-direct-dict-value.pkl"
+    )
+
+    assert any(
+        issue.rule_code in {"S309", "S310"} and issue.details.get("url") == "https://attacker.example/os.system(cmd)"
+        for issue in result.issues
+    )
+
+
 def test_scan_stream_fails_closed_for_undecodable_literal_before_inert_url() -> None:
     payload = pickle.dumps(
         {"blob": b"\xff", "url": "https://docs.example.invalid/reference/os.system(command)"},

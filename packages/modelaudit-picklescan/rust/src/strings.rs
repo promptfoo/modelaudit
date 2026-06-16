@@ -33,6 +33,11 @@ enum StringLexFrame {
     Comment(bool),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UrlContinuation {
+    lex_stack: Vec<StringLexFrame>,
+}
+
 fn getattr_target_bit(target: &str) -> u8 {
     match target {
         "system" => 1,
@@ -52,11 +57,11 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
 
 pub(crate) fn suspicious_string_matches_window(
     value: &str,
-    starts_in_url: bool,
+    url_continuation: Option<UrlContinuation>,
     next_window_start: usize,
-) -> (Vec<String>, bool) {
-    let (plain_value, url_limit_exceeded, url_context_incomplete, next_starts_in_url) =
-        strip_url_spans_with_context(value, starts_in_url, next_window_start);
+) -> (Vec<String>, Option<UrlContinuation>) {
+    let (plain_value, url_limit_exceeded, url_context_incomplete, next_url_continuation) =
+        strip_url_spans_with_context(value, url_continuation, next_window_start);
     let mut matches = suspicious_string_matches_impl(plain_value.as_ref(), true);
     if url_limit_exceeded {
         push_unique(&mut matches, URL_SCAN_LIMIT_SENTINEL);
@@ -64,7 +69,7 @@ pub(crate) fn suspicious_string_matches_window(
     if url_context_incomplete {
         push_unique(&mut matches, URL_CONTEXT_INCOMPLETE_SENTINEL);
     }
-    (matches, next_starts_in_url)
+    (matches, next_url_continuation)
 }
 
 fn suspicious_string_matches_impl(value: &str, scan_base64: bool) -> Vec<String> {
@@ -191,15 +196,15 @@ const URL_CODE_PADDING_BYTES: &[u8] = b" \t\r\n'\"!+-/%*|&;@=<>^~:,.[]{}()";
 
 fn strip_url_spans(value: &str) -> (Cow<'_, str>, bool, bool) {
     let (plain, span_limit_exceeded, context_incomplete, _) =
-        strip_url_spans_with_context(value, false, value.len());
+        strip_url_spans_with_context(value, None, value.len());
     (plain, span_limit_exceeded, context_incomplete)
 }
 
 fn strip_url_spans_with_context(
     value: &str,
-    starts_in_url: bool,
+    url_continuation: Option<UrlContinuation>,
     next_window_start: usize,
-) -> (Cow<'_, str>, bool, bool, bool) {
+) -> (Cow<'_, str>, bool, bool, Option<UrlContinuation>) {
     let bytes = value.as_bytes();
     let mut output: Option<String> = None;
     let mut copied_through = 0usize;
@@ -207,18 +212,22 @@ fn strip_url_spans_with_context(
     let mut url_count = 0usize;
     let mut span_limit_exceeded = false;
     let mut context_incomplete = false;
-    let mut lex_stack: Vec<StringLexFrame> = Vec::new();
-    let mut next_starts_in_url = false;
+    let mut lex_stack = url_continuation
+        .as_ref()
+        .map_or_else(Vec::new, |continuation| continuation.lex_stack.clone());
+    let mut next_url_continuation = None;
 
-    if starts_in_url {
-        let (end, uncertain) = url_end(bytes, 0, None);
+    if let Some(url_continuation) = url_continuation {
+        let (end, uncertain) = url_end(bytes, 0, url_continuation.lex_stack.last().copied());
         context_incomplete |= uncertain;
         if end > 0 {
             let stripped = output.get_or_insert_with(|| String::with_capacity(value.len()));
             stripped.push('\0');
             copied_through = end;
             cursor = end;
-            next_starts_in_url = next_window_start < end;
+            if next_window_start < end {
+                next_url_continuation = Some(url_continuation);
+            }
         }
     }
 
@@ -226,14 +235,19 @@ fn strip_url_spans_with_context(
         if url_scheme_starts(bytes, cursor) {
             url_count += 1;
             span_limit_exceeded |= url_count > MAX_STRIPPED_URL_SPANS;
-            let (end, uncertain) = url_end(bytes, cursor, lex_stack.last().copied());
+            let continuation = UrlContinuation {
+                lex_stack: lex_stack.clone(),
+            };
+            let (end, uncertain) = url_end(bytes, cursor, continuation.lex_stack.last().copied());
             context_incomplete |= uncertain;
             let stripped = output.get_or_insert_with(|| String::with_capacity(value.len()));
             stripped.push_str(&value[copied_through..cursor]);
             // Keep bytes on opposite sides of a removed URL in separate
             // lexical tokens. MIME-Base64 whitespace must not stitch them.
             stripped.push('\0');
-            next_starts_in_url |= cursor <= next_window_start && next_window_start < end;
+            if cursor <= next_window_start && next_window_start < end {
+                next_url_continuation = Some(continuation);
+            }
             copied_through = end;
             cursor = end;
             continue;
@@ -342,14 +356,14 @@ fn strip_url_spans_with_context(
                 Cow::Owned(stripped),
                 span_limit_exceeded,
                 context_incomplete,
-                next_starts_in_url,
+                next_url_continuation,
             )
         }
         None => (
             Cow::Borrowed(value),
             span_limit_exceeded,
             context_incomplete,
-            next_starts_in_url,
+            next_url_continuation,
         ),
     }
 }
@@ -1751,6 +1765,51 @@ mod tests {
             "'".repeat(MAX_URL_LOCAL_PREFIX_BYTES + 1)
         );
         assert!(suspicious_string_matches(&bounded_quote_run).contains(&"os.system".to_string()));
+    }
+
+    fn scan_two_overlapping_windows(value: &str) -> Vec<String> {
+        const WINDOW_CHARS: usize = 8192;
+        const NEXT_WINDOW_START: usize = WINDOW_CHARS - 256;
+
+        let (mut matches, continuation) =
+            suspicious_string_matches_window(&value[..WINDOW_CHARS], None, NEXT_WINDOW_START);
+        let (next_matches, _) = suspicious_string_matches_window(
+            &value[NEXT_WINDOW_START..],
+            continuation,
+            value.len() - NEXT_WINDOW_START,
+        );
+        matches.extend(next_matches);
+        matches
+    }
+
+    #[test]
+    fn url_window_continuation_preserves_bounded_lexical_context() {
+        for literal in [
+            format!(
+                "metadata='https://example.invalid/{} space os.system(cmd)'",
+                "a".repeat(9000)
+            ),
+            format!(
+                "metadata=f'https://example.invalid/{};os.system(cmd)'",
+                "a".repeat(9000)
+            ),
+            format!(
+                "# https://example.invalid/{} space os.system(cmd)\nmetadata = 1",
+                "a".repeat(9000)
+            ),
+        ] {
+            assert!(!scan_two_overlapping_windows(&literal).contains(&"os.system".to_string()));
+        }
+    }
+
+    #[test]
+    fn url_window_continuation_preserves_code_after_closing_quote() {
+        let literal = format!(
+            "metadata='https://example.invalid/{} space';os.system(cmd)",
+            "a".repeat(9000)
+        );
+
+        assert!(scan_two_overlapping_windows(&literal).contains(&"os.system".to_string()));
     }
 
     #[test]

@@ -13338,6 +13338,40 @@ def test_scan_bytes_keeps_url_crossing_overlap_start_inert() -> None:
     assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
 
 
+@pytest.mark.parametrize("url_separator", [" space ", ";"])
+def test_scan_bytes_keeps_cross_window_quoted_url_content_inert(url_separator: str) -> None:
+    literal = "metadata='https://example.invalid/" + ("a" * 9000) + url_separator + "os.system(cmd)'"
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="cross-window-quoted-url.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+def test_scan_bytes_preserves_call_after_bounded_cross_window_quoted_url() -> None:
+    literal = "metadata='https://example.invalid/" + ("a" * 9000) + " space';os.system(cmd)"
+
+    report = scan_bytes(
+        pickle.dumps({"code": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="bounded-cross-window-url-call.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
 def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_literals() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     padded_encoded_payload = base64.b64encode(nested_payload).decode("ascii") + ("A" * 128)

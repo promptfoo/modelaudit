@@ -6171,14 +6171,14 @@ impl<'a> ScanState<'a> {
             .min(SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS);
         let step_chars = suspicious_window_chars.saturating_sub(overlap_chars).max(1);
         let mut window_start = 0usize;
-        let mut starts_in_url = false;
+        let mut url_continuation = None;
         loop {
             let window_end = advance_chars_from(value, window_start, suspicious_window_chars);
             let next_window_start = advance_chars_from(value, window_start, step_chars);
             let next_window_offset = next_window_start.saturating_sub(window_start);
-            let (matches, next_starts_in_url) = suspicious_string_matches_window(
+            let (matches, next_url_continuation) = suspicious_string_matches_window(
                 &value[window_start..window_end],
-                starts_in_url,
+                url_continuation,
                 next_window_offset,
             );
             self.record_string_literal_matches(matches, op_name, position, suppress_hex_escape);
@@ -6189,7 +6189,7 @@ impl<'a> ScanState<'a> {
                 break;
             }
             window_start = next_window_start;
-            starts_in_url = next_starts_in_url;
+            url_continuation = next_url_continuation;
         }
     }
 
