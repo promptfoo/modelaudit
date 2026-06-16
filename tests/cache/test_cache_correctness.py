@@ -54,7 +54,12 @@ from modelaudit.cache.scan_results_cache import (
 )
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult
-from modelaudit.utils.helpers.cache_decorator import cached_scan
+from modelaudit.utils.helpers.cache_decorator import (
+    BOUND_CACHE_IDENTITY_CONFIG_KEY,
+    CacheIdentityBinding,
+    cached_scan,
+    should_bypass_cache_for_sharded_model,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -579,6 +584,40 @@ def test_cached_scan_persists_miss_and_hits_on_second_call(tmp_path: Path) -> No
 
     cache_manager = get_cache_manager(str(cache_dir), enabled=True)
     assert cache_manager.get_stats()["total_entries"] == 1
+
+
+def test_descriptor_bound_shard_uses_logical_path_cache_bypass(tmp_path: Path) -> None:
+    descriptor_path = _make_cacheable_file(tmp_path, name="17")
+    logical_path = tmp_path / "checkpoint_1.pt"
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        BOUND_CACHE_IDENTITY_CONFIG_KEY: CacheIdentityBinding(
+            scan_path=str(descriptor_path),
+            identity_path=str(logical_path),
+        ),
+    }
+    calls = 0
+
+    assert should_bypass_cache_for_sharded_model(str(logical_path)) is True
+    assert should_bypass_cache_for_sharded_model(str(descriptor_path)) is False
+
+    @cached_scan(cache_identity_config_key=BOUND_CACHE_IDENTITY_CONFIG_KEY)
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        nonlocal calls
+        assert path == str(descriptor_path)
+        assert config is not None
+        calls += 1
+        return {"call_count": calls}
+
+    first = scan(str(descriptor_path), config)
+    second = scan(str(descriptor_path), config)
+
+    assert first == {"call_count": 1}
+    assert second == {"call_count": 2}
+    assert calls == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
 def test_cached_scan_restores_private_metadata_for_internal_scan_results(tmp_path: Path) -> None:

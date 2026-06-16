@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -3901,23 +3902,38 @@ def test_scan_model_streaming_rejects_index_recreated_during_cleanup(
         encoding="utf-8",
     )
     original_unlink = core_module.os.unlink
-    tombstone_unlinks = 0
+    original_mkdtemp = core_module.tempfile.mkdtemp
+    index_tombstone_stats: list[os.stat_result] = []
     recreated = False
 
-    def recreate_after_tombstone_unlink(*args: Any, **kwargs: Any) -> None:
-        nonlocal recreated, tombstone_unlinks
-        target_name = Path(os.fspath(args[0])).name if args else ""
-        original_unlink(*args, **kwargs)
-        if target_name.startswith(".modelaudit-index-delete-"):
-            tombstone_unlinks += 1
-            final_unlink_count = 1 if os.name == "nt" else 2
-            if tombstone_unlinks == final_unlink_count:
-                index_path.write_text(
-                    json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
-                    encoding="utf-8",
-                )
-                recreated = True
+    def record_index_tombstone(*args: Any, **kwargs: Any) -> str:
+        tombstone_dir = str(original_mkdtemp(*args, **kwargs))
+        if str(kwargs.get("prefix", "")).startswith(".modelaudit-index-delete-"):
+            index_tombstone_stats.append(os.stat(tombstone_dir, follow_symlinks=False))
+        return tombstone_dir
 
+    def recreate_after_tombstone_unlink(*args: Any, **kwargs: Any) -> None:
+        nonlocal recreated
+        target = Path(os.fspath(args[0])) if args else Path()
+        target_name = target.name
+        target_parent_name = target.parent.name
+        target_dir_fd = kwargs.get("dir_fd")
+        bound_index_tombstone = bool(
+            isinstance(target_dir_fd, int)
+            and any(os.path.samestat(os.fstat(target_dir_fd), expected) for expected in index_tombstone_stats)
+        )
+        original_unlink(*args, **kwargs)
+        is_private_index_tombstone = target_name == "source" and (
+            bound_index_tombstone or target_parent_name.startswith(".modelaudit-index-delete-")
+        )
+        if is_private_index_tombstone and not recreated:
+            index_path.write_text(
+                json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}),
+                encoding="utf-8",
+            )
+            recreated = True
+
+    monkeypatch.setattr(core_module.tempfile, "mkdtemp", record_index_tombstone)
     monkeypatch.setattr(core_module.os, "unlink", recreate_after_tombstone_unlink)
 
     result = scan_model_streaming(
@@ -3930,13 +3946,14 @@ def test_scan_model_streaming_rejects_index_recreated_during_cleanup(
     )
 
     assert recreated is True
+    assert len(index_tombstone_stats) == 1
+    if os.name != "nt":
+        assert stat.S_IMODE(index_tombstone_stats[0].st_mode) & 0o077 == 0
     assert index_path.exists()
     assert result.success is False
     assert determine_exit_code(result) == 2
-    assert any(
-        issue.details.get("scan_outcome_reason") == "safetensors_index_recreated_during_cleanup"
-        for issue in result.issues
-    )
+    cleanup_reasons = [issue.details.get("scan_outcome_reason") for issue in result.issues]
+    assert "safetensors_index_recreated_during_cleanup" in cleanup_reasons, cleanup_reasons
 
 
 def test_scan_model_streaming_quarantine_rename_failure_is_durable(

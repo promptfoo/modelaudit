@@ -463,41 +463,42 @@ def cached_scan(
                 ) == os.path.normcase(os.path.abspath(file_path)):
                     cache_key_path = binding.identity_path
                     trusted_descriptor_path = True
+            cache_policy_path = cache_key_path if trusted_descriptor_path else file_path
 
             # Check if file should be cached based on characteristics
             try:
                 file_stat = os.stat(file_path)
-                file_ext = os.path.splitext(file_path)[1]
+                file_ext = os.path.splitext(cache_policy_path)[1]
 
                 if not os.access(file_path, os.R_OK):
                     logger.debug(f"Bypassing cache for unreadable file: {file_path}")
                     return func(*args, **kwargs)
 
-                if should_bypass_cache_for_read_failure_aware_file(file_path):
+                if should_bypass_cache_for_read_failure_aware_file(cache_policy_path):
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
                     return func(*args, **kwargs)
 
-                if should_bypass_cache_for_sharded_model(file_path):
+                if should_bypass_cache_for_sharded_model(cache_policy_path):
                     logger.debug(f"Bypassing cache for sharded model family: {file_path}")
                     return func(*args, **kwargs)
 
-                if should_bypass_cache_for_openvino_sidecar(file_path):
+                if should_bypass_cache_for_openvino_sidecar(cache_policy_path):
                     logger.debug(f"Bypassing cache for OpenVINO sidecar-dependent scan: {file_path}")
                     return func(*args, **kwargs)
 
-                if should_bypass_cache_for_zip_entry_preflight(file_path, raw_config or {}):
+                if should_bypass_cache_for_zip_entry_preflight(cache_policy_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded ZIP entry preflight: {file_path}")
                     return func(*args, **kwargs)
 
-                if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
+                if should_bypass_cache_for_unavailable_hdf5_analysis(cache_policy_path):
                     logger.debug(f"Bypassing cache because HDF5 analysis is unavailable: {file_path}")
                     return func(*args, **kwargs)
 
-                if should_bypass_cache_for_file_backed_hdf5(file_path):
+                if should_bypass_cache_for_file_backed_hdf5(cache_policy_path):
                     logger.debug(f"Bypassing cache for file-backed HDF5 inspection: {file_path}")
                     return func(*args, **kwargs)
 
-                if should_defer_hash_for_file_backed_onnx(file_path, raw_config or {}, file_stat.st_size):
+                if should_defer_hash_for_file_backed_onnx(cache_policy_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for file-backed ONNX inspection: {file_path}")
                     return func(*args, **kwargs)
 
@@ -505,13 +506,13 @@ def cached_scan(
                     logger.debug(f"File {file_path} not suitable for caching, calling function directly")
                     return func(*args, **kwargs)
 
-                if should_bypass_cache_for_safetensors_header_limit(file_path, raw_config or {}):
+                if should_bypass_cache_for_safetensors_header_limit(cache_policy_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded SafeTensors header failure: {file_path}")
                     return func(*args, **kwargs)
-                if should_bypass_cache_for_max_file_size(file_path, raw_config or {}, file_stat.st_size):
+                if should_bypass_cache_for_max_file_size(cache_policy_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for max_file_size rejection: {file_path}")
                     return func(*args, **kwargs)
-                if should_defer_hash_for_pytorch_read_limit(file_path, raw_config or {}, file_stat.st_size):
+                if should_defer_hash_for_pytorch_read_limit(cache_policy_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for bounded PyTorch read-limit scan: {file_path}")
                     return func(*args, **kwargs)
 

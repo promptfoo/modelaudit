@@ -150,10 +150,12 @@ from modelaudit.utils.file.handlers import (
     ShardedModelDetector,
     ValidatedShardTargets,
     _activate_safetensors_index_inspection_context,
+    _close_windows_staging_directory_guard,
     _count_expected_shard_indices,
     _deactivate_safetensors_index_inspection_context,
     _load_safetensors_index_json,
     _open_windows_shard_guard_fd,
+    _open_windows_staging_directory_guard,
     _pinned_shard_scan_path,
     _preserve_findings_with_shard_boundary_failure,
     _rebase_pinned_shard_result,
@@ -161,6 +163,8 @@ from modelaudit.utils.file.handlers import (
     _ShardPinUnavailableError,
     _StagingMutationMonitor,
     _validated_stat_matches_target,
+    _windows_staging_directory_guard_matches,
+    _WindowsStagingDirectoryGuard,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -10642,29 +10646,36 @@ def scan_model_streaming(
         nonlocal deleted_streamed_index_tracking_incomplete, streamed_index_cleanup_verification_bytes
 
         parent_fd: int | None = None
-        tombstone_fd: int | None = None
+        tombstone_dir_fd: int | None = None
+        tombstone_dir_path: Path | None = None
+        tombstone_dir_stat: os.stat_result | None = None
+        windows_tombstone_guard: _WindowsStagingDirectoryGuard | None = None
         tombstone_path: Path | None = None
         moved_source = False
+        tombstone_removed = False
 
         def restore_quarantined_index() -> bool:
             """Restore a moved replacement without overwriting a recreated source path."""
+            nonlocal tombstone_removed
+
             if not moved_source or tombstone_path is None:
                 return False
             try:
-                if parent_fd is not None:
+                if parent_fd is not None and tombstone_dir_fd is not None:
                     os.link(
-                        tombstone_path.name,
+                        "source",
                         source_path.name,
-                        src_dir_fd=parent_fd,
+                        src_dir_fd=tombstone_dir_fd,
                         dst_dir_fd=parent_fd,
                         follow_symlinks=False,
                     )
-                    os.unlink(tombstone_path.name, dir_fd=parent_fd)
+                    os.unlink("source", dir_fd=tombstone_dir_fd)
                 else:
                     os.link(tombstone_path, source_path, follow_symlinks=False)
                     os.unlink(tombstone_path)
             except OSError:
                 return False
+            tombstone_removed = True
             return True
 
         def preserve_unverified_index(message: str, reason: str) -> None:
@@ -10675,9 +10686,39 @@ def scan_model_streaming(
                     "Unverified SafeTensors index generation was preserved in cleanup quarantine"
                 )
 
+        def quarantined_index_identity_and_content_path() -> tuple[_FileIdentitySnapshot | None, Path]:
+            """Preserve an index symlink's original relative-target resolution after quarantine."""
+            assert tombstone_path is not None
+            moved_identity = _snapshot_file_identity(tombstone_path)
+            if moved_identity is None or not stat.S_ISLNK(moved_identity.lstat[2]):
+                return moved_identity, tombstone_path
+            try:
+                raw_target = Path(os.readlink(tombstone_path))
+                target_path = raw_target if raw_target.is_absolute() else source_path.parent / raw_target
+                target_stat = os.stat(target_path)
+                resolved_target = str(target_path.resolve(strict=True))
+            except OSError:
+                return moved_identity, tombstone_path
+            return (
+                _FileIdentitySnapshot(
+                    lstat=moved_identity.lstat,
+                    stat=(
+                        target_stat.st_dev,
+                        target_stat.st_ino,
+                        target_stat.st_mode,
+                        target_stat.st_size,
+                        target_stat.st_mtime_ns,
+                        target_stat.st_ctime_ns,
+                    ),
+                    resolved_path=resolved_target,
+                ),
+                target_path,
+            )
+
         try:
             canonical_parent = canonical_stream_parent(source_path)
             use_directory_fd = os.name != "nt"
+            bound_parent_stat = os.stat(canonical_parent, follow_symlinks=False)
             if use_directory_fd:
                 parent_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_DIRECTORY", 0)
                 parent_fd = os.open(source_path.parent, parent_flags)
@@ -10685,29 +10726,50 @@ def scan_model_streaming(
                 canonical_parent = canonical_stream_parent(source_path)
                 if not os.path.samestat(bound_parent_stat, os.stat(canonical_parent)):
                     raise OSError("SafeTensors index parent changed before cleanup")
-            tombstone_fd, raw_tombstone_path = tempfile.mkstemp(
-                prefix=".modelaudit-index-delete-",
-                dir=canonical_parent,
+            tombstone_dir_path = Path(
+                tempfile.mkdtemp(
+                    prefix=".modelaudit-index-delete-",
+                    dir=canonical_parent,
+                )
             )
-            tombstone_path = Path(raw_tombstone_path)
-            os.close(tombstone_fd)
-            tombstone_fd = None
+            tombstone_dir_stat = os.stat(tombstone_dir_path, follow_symlinks=False)
+            effective_uid = getattr(os, "geteuid", lambda: tombstone_dir_stat.st_uid)()
+            if (
+                not stat.S_ISDIR(tombstone_dir_stat.st_mode)
+                or tombstone_dir_stat.st_dev != bound_parent_stat.st_dev
+                or tombstone_dir_stat.st_uid != effective_uid
+                or (os.name != "nt" and stat.S_IMODE(tombstone_dir_stat.st_mode) & 0o077)
+            ):
+                raise OSError("private SafeTensors index cleanup quarantine is unsafe")
             if parent_fd is not None:
-                os.unlink(tombstone_path.name, dir_fd=parent_fd)
+                tombstone_dir_fd = os.open(
+                    tombstone_dir_path.name,
+                    parent_flags | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+                if not os.path.samestat(os.fstat(tombstone_dir_fd), tombstone_dir_stat):
+                    raise OSError("private SafeTensors index cleanup quarantine changed while opening")
+                tombstone_path = tombstone_dir_path / "source"
                 os.rename(
                     source_path.name,
-                    tombstone_path.name,
+                    "source",
                     src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
+                    dst_dir_fd=tombstone_dir_fd,
                 )
             else:
+                windows_tombstone_guard = _open_windows_staging_directory_guard(
+                    tombstone_dir_path,
+                    tombstone_dir_stat,
+                )
+                tombstone_dir_path = windows_tombstone_guard.bound_path
+                tombstone_path = tombstone_dir_path / "source"
                 os.replace(source_path, tombstone_path)
             moved_source = True
-            moved_identity = _snapshot_file_identity(tombstone_path)
+            moved_identity, moved_content_path = quarantined_index_identity_and_content_path()
             moved_classification: bool | None = None
             if require_proven_non_index:
                 moved_classification, _moved_receipt = classify_structural_safetensors_index(
-                    tombstone_path,
+                    moved_content_path,
                     charge_budget=False,
                 )
             moved_generation_matches = bool(
@@ -10741,7 +10803,7 @@ def scan_model_streaming(
                     streamed_index_cleanup_verification_bytes + moved_size <= MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES
                 ):
                     streamed_index_cleanup_verification_bytes += moved_size
-                    moved_content_hash = compute_sha256_hash(tombstone_path)
+                    moved_content_hash = compute_sha256_hash(moved_content_path)
                     content_hash_changed = expected_content_hash is None or moved_content_hash != expected_content_hash
                 else:
                     content_hash_changed = require_proven_non_index is False
@@ -10761,10 +10823,15 @@ def scan_model_streaming(
                     deleted_streamed_index_candidates.add(candidate_receipt)
                 else:
                     deleted_streamed_index_tracking_incomplete = True
-            if parent_fd is not None:
-                os.unlink(tombstone_path.name, dir_fd=parent_fd)
+            if parent_fd is not None and tombstone_dir_fd is not None:
+                os.unlink("source", dir_fd=tombstone_dir_fd)
             else:
+                if windows_tombstone_guard is None or not _windows_staging_directory_guard_matches(
+                    windows_tombstone_guard
+                ):
+                    raise OSError("private SafeTensors index cleanup quarantine changed before deletion")
                 os.unlink(tombstone_path)
+            tombstone_removed = True
             try:
                 if parent_fd is not None:
                     os.stat(source_path.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -10796,13 +10863,30 @@ def scan_model_streaming(
                 reason="safetensors_index_cleanup_failed",
             )
         finally:
-            if tombstone_fd is not None:
-                os.close(tombstone_fd)
+            if tombstone_dir_fd is not None:
+                os.close(tombstone_dir_fd)
+            if windows_tombstone_guard is not None:
+                _close_windows_staging_directory_guard(windows_tombstone_guard)
+            if (
+                tombstone_dir_path is not None
+                and tombstone_dir_stat is not None
+                and (not moved_source or tombstone_removed)
+            ):
+                with suppress(OSError):
+                    if parent_fd is not None:
+                        current_tombstone_dir = os.stat(
+                            tombstone_dir_path.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        if os.path.samestat(current_tombstone_dir, tombstone_dir_stat):
+                            os.rmdir(tombstone_dir_path.name, dir_fd=parent_fd)
+                    else:
+                        current_tombstone_dir = os.stat(tombstone_dir_path, follow_symlinks=False)
+                        if os.path.samestat(current_tombstone_dir, tombstone_dir_stat):
+                            os.rmdir(tombstone_dir_path)
             if parent_fd is not None:
                 os.close(parent_fd)
-            if not moved_source and tombstone_path is not None:
-                with suppress(OSError):
-                    os.unlink(tombstone_path)
 
     def delete_streamed_source(
         source_path: Path,
