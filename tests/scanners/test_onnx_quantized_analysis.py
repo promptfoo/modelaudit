@@ -303,8 +303,8 @@ def test_quantized_identifiers_are_bounded(tmp_path: Path) -> None:
     assert context["quantization_scale_truncated"] is True
 
 
-def _external_package(tmp_path: Path) -> tuple[Path, Path]:
-    sidecar = tmp_path / "weights.bin"
+def _external_package(tmp_path: Path, *, sidecar_name: str = "weights.bin") -> tuple[Path, Path]:
+    sidecar = tmp_path / sidecar_name
     sidecar.write_bytes(np.ones((100, 10), dtype=np.float32).tobytes())
     weight = onnx.TensorProto()
     weight.name = "W"
@@ -423,12 +423,13 @@ def test_external_data_max_file_size_does_not_count_skipped_sidecar(tmp_path: Pa
 
 
 def test_external_data_max_total_size_does_not_count_skipped_sidecar(tmp_path: Path) -> None:
-    model_path, sidecar = _external_package(tmp_path)
+    model_path, sidecar = _external_package(tmp_path, sidecar_name="weights.external_data")
     result = scan_model_directory_or_file(
         str(tmp_path),
         scanners=["onnx"],
         max_total_size=model_path.stat().st_size + sidecar.stat().st_size - 1,
     )
+    assert str(sidecar) not in result.file_metadata
     assert result.bytes_scanned < model_path.stat().st_size + sidecar.stat().st_size
     assert result.content_hash is None
 
