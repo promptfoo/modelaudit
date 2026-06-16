@@ -770,7 +770,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             scan_result.checks,
             allow_skipped_check_exemption=True,
         )
-        if (
+        incoming_invalidates_content_hash = (
             bool(metadata.get("operational_error"))
             or _metadata_has_incomplete_coverage(metadata)
             or issues_have_incomplete_coverage
@@ -780,8 +780,10 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                 and _checks_have_failed_security_findings(scan_result.checks)
                 and not scan_result.has_errors
             )
-        ):
+        )
+        if incoming_invalidates_content_hash:
             self.success = False
+            self.content_hash = None
 
         if metadata:
             scanner_selection = metadata.get("scanner_selection")

@@ -6240,6 +6240,37 @@ class TestModelDownloadStreaming:
         assert plan.selected_sizes == {filename: len(frame)}
         mock_requests_get.assert_not_called()
 
+    def test_runtime_plan_does_not_double_count_complete_small_safetensors_probe(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A complete routing probe is not also reserved as a second full-file download."""
+        filename = "model.safetensors"
+        frame, _header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}},
+            b"\x00",
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: len(frame)}, _HF_TEST_REVISION),
+        )
+
+        with patch("requests.get", side_effect=_fake_range_responder(frame)):
+            plan = plan_huggingface_streaming_download(
+                "hf://test/model",
+                max_size=len(frame) + 8,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"pickle", "safetensors"},
+                _stream_safetensors_headers=True,
+            )
+
+        assert plan.selected_files == [filename]
+        assert plan.probe_bytes_transferred == 0
+
     def test_runtime_planning_keeps_large_declared_safetensors_header_native(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -6972,6 +7003,7 @@ class TestModelDownloadStreaming:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
+    @pytest.mark.parametrize("cache_dir_owned", [False, True], ids=["caller-owned", "invocation-owned"])
     def test_download_model_streaming_preserves_onnx_external_data_before_parent_yield(
         self,
         mock_hf_hub_download: MagicMock,
@@ -6980,8 +7012,9 @@ class TestModelDownloadStreaming:
         _mock_get_extensions: MagicMock,
         _mock_detect_content: MagicMock,
         tmp_path: Path,
+        cache_dir_owned: bool,
     ) -> None:
-        """Referenced ONNX sidecars should be present while the parent ONNX is yielded."""
+        """Only explicitly invocation-owned context sidecars are removed after the parent yield."""
         payload = _make_external_onnx_payload(tmp_path)
         sidecar_bytes = struct.pack("f", 1.0)
 
@@ -7004,6 +7037,7 @@ class TestModelDownloadStreaming:
             max_size=len(payload) + len(sidecar_bytes),
             scannable_extensions={".onnx"},
             scannable_scanner_ids={"onnx"},
+            _cache_dir_owned=cache_dir_owned,
         )
         model_path, is_last = next(generator)
         sidecar_path = model_path.with_name("model.onnx_data")
@@ -7022,7 +7056,7 @@ class TestModelDownloadStreaming:
 
         with pytest.raises(StopIteration):
             next(generator)
-        assert not sidecar_path.exists()
+        assert sidecar_path.exists() is (not cache_dir_owned)
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
@@ -9962,7 +9996,7 @@ class TestModelDownloadStreaming:
         filename = "model.safetensors"
         payload = b"ordinary unknown model bytes"
         model_path = tmp_path / filename
-        max_size = (2 * len(payload)) + 8 + budget_adjustment
+        max_size = (2 * len(payload)) + budget_adjustment
         monkeypatch.setattr(
             "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
             lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
@@ -9995,7 +10029,7 @@ class TestModelDownloadStreaming:
                     )
                 )
             else:
-                with pytest.raises(Exception, match="minimum remote SafeTensors routing reads"):
+                with pytest.raises(Exception, match="downloaded bytes plus selected file"):
                     list(
                         download_model_streaming(
                             f"hf://test/model?revision={_HF_TEST_REVISION}",
@@ -10010,7 +10044,7 @@ class TestModelDownloadStreaming:
         assert [(item[0], item[1]) for item in map(_unpack_internal_stream_item, results)] == (
             [(model_path, True)] if expected_success else []
         )
-        assert mock_requests_get.call_count == int(expected_success)
+        assert mock_requests_get.call_count == 1
         assert mock_download.call_count == int(expected_success)
         mock_header_scan.assert_not_called()
 
@@ -10153,7 +10187,7 @@ class TestModelDownloadStreaming:
 
     @pytest.mark.parametrize(
         ("budget_adjustment", "expected_success", "expected_request_count"),
-        [(0, True, 4), (-1, False, 0)],
+        [(0, True, 4), (-1, False, 3)],
         ids=["exact-budget", "one-byte-under"],
     )
     def test_download_model_streaming_accounts_content_probe_before_header_ranges(
@@ -10193,34 +10227,18 @@ class TestModelDownloadStreaming:
             patch("requests.get", side_effect=range_response) as mock_requests_get,
             patch("huggingface_hub.hf_hub_download") as mock_download,
         ):
-            if expected_success:
-                results = list(
-                    download_model_streaming(
-                        f"hf://test/model?revision={_HF_TEST_REVISION}",
-                        max_size=max_size,
-                        scannable_extensions={".safetensors"},
-                        scannable_scanner_ids={"pickle", "safetensors"},
-                        _include_scan_results=True,
-                    )
+            results = list(
+                download_model_streaming(
+                    f"hf://test/model?revision={_HF_TEST_REVISION}",
+                    max_size=max_size,
+                    scannable_extensions={".safetensors"},
+                    scannable_scanner_ids={"pickle", "safetensors"},
+                    _include_scan_results=True,
                 )
-            else:
-                with pytest.raises(Exception, match=f"require at least {(2 * len(frame)) + 8} bytes"):
-                    list(
-                        download_model_streaming(
-                            f"hf://test/model?revision={_HF_TEST_REVISION}",
-                            max_size=max_size,
-                            scannable_extensions={".safetensors"},
-                            scannable_scanner_ids={"pickle", "safetensors"},
-                            _include_scan_results=True,
-                        )
-                    )
-                results = []
+            )
 
-        if expected_success:
-            _path, _is_last, scan_result, _accounting = _unpack_internal_stream_item(results[0])
-            assert scan_result.success is True
-        else:
-            assert results == []
+        _path, _is_last, scan_result, _accounting = _unpack_internal_stream_item(results[0])
+        assert scan_result.success is expected_success
         assert mock_requests_get.call_count == expected_request_count
         mock_download.assert_not_called()
 

@@ -321,6 +321,7 @@ def should_skip_file(
     skip_hidden: bool = True,
     metadata_scanner_available: bool = True,
     scanner_selection_extensions: Collection[str] | None = None,
+    content_path: str | None = None,
 ) -> bool:
     """
     Check if a file should be skipped based on its extension or name.
@@ -375,10 +376,11 @@ def should_skip_file(
     ):
         return False
 
-    if use_default_skip_extensions and ext in skip_extensions and _has_scannable_content(path):
+    inspected_path = content_path or path
+    if use_default_skip_extensions and ext in skip_extensions and _has_scannable_content(inspected_path):
         return False
 
-    if use_default_skip_extensions and ext in skip_extensions and _has_complete_declared_text_content(path):
+    if use_default_skip_extensions and ext in skip_extensions and _has_complete_declared_text_content(inspected_path):
         return scanner_selection_extensions is not None
 
     # Skip based on extension

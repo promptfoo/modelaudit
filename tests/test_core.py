@@ -951,14 +951,21 @@ def test_local_member_rewrite_after_pin_fails_terminal_namespace(
     payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
     original_pin = core_module._pinned_shard_scan_path
     rewrote = False
+    rewrite_denied = False
 
     @contextmanager
     def rewrite_after_pin(*args: Any, **kwargs: Any) -> Iterator[Any]:
-        nonlocal rewrote
+        nonlocal rewrite_denied, rewrote
         with original_pin(*args, **kwargs) as pinned_scan:
             yield pinned_scan
-        payload.write_bytes(_build_malicious_pickle())
-        rewrote = True
+        try:
+            payload.write_bytes(_build_malicious_pickle())
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            rewrite_denied = True
+        else:
+            rewrote = True
 
     monkeypatch.setattr(core_module, "_pinned_shard_scan_path", rewrite_after_pin)
     if stream:
@@ -980,6 +987,14 @@ def test_local_member_rewrite_after_pin_fails_terminal_namespace(
             skip_file_types=False,
         )
 
+    if rewrite_denied:
+        assert os.name == "nt"
+        assert rewrote is False
+        assert determine_exit_code(result) == 0
+        assert result.success is True
+        payload.write_bytes(_build_malicious_pickle())
+        assert payload.read_bytes() == _build_malicious_pickle()
+        return
     assert rewrote is True
     assert payload.read_bytes() == _build_malicious_pickle()
     assert determine_exit_code(result) == 2
@@ -5926,6 +5941,42 @@ def test_scan_file_hf_bookkeeping_skip_precedes_zip_preflight(
     assert result.scanner_name == "skipped"
     assert result.success is True
     assert any(check.name == "HuggingFace Cache File Skip" for check in result.checks)
+
+
+def test_hf_bookkeeping_classification_binds_the_initial_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A temporary benign metadata replacement cannot hide the selected generation."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    metadata_path = hf_home / "download" / "model.metadata"
+    metadata_path.parent.mkdir(parents=True)
+    malicious = pickle.dumps({"payload": "malicious"})
+    metadata_path.write_bytes(malicious)
+    held_path = tmp_path / "held.metadata"
+    original_read = core_module._read_regular_bookkeeping_text
+    swapped = False
+
+    def read_during_swap(path_obj: Path, max_bytes: int) -> str | None:
+        nonlocal swapped
+        metadata_path.replace(held_path)
+        metadata_path.write_text(
+            "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+            encoding="utf-8",
+        )
+        try:
+            swapped = True
+            return original_read(path_obj, max_bytes)
+        finally:
+            metadata_path.unlink()
+            held_path.replace(metadata_path)
+
+    monkeypatch.setattr(core_module, "_read_regular_bookkeeping_text", read_during_swap)
+
+    assert core_module._is_huggingface_cache_file(str(metadata_path)) is False
+    assert swapped is True
+    assert metadata_path.read_bytes() == malicious
 
 
 def test_scan_file_size_limit_precedes_zip_preflight(

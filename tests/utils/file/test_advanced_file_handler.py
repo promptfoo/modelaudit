@@ -13,8 +13,10 @@ import tempfile
 import time
 import types
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from pathlib import Path
+from threading import Event, Lock, Thread
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -422,14 +424,68 @@ def test_pinned_scan_uses_borrowed_source_and_companion_descriptors(
         os.close(source_fd)
 
 
-def test_pinned_scan_rejects_borrowed_descriptors_on_windows(
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor staging")
+def test_pinned_scan_closes_duplicated_companion_when_fstat_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The borrowed-descriptor interface is intentionally POSIX-only."""
+    """A duplicated companion descriptor is cleanup-owned before identity inspection."""
     source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "model.onnx_data"
     source_path.write_bytes(b"source")
-    source_fd = os.open(source_path, os.O_RDONLY)
+    companion_path.write_bytes(b"companion")
+    companion_fd = os.open(companion_path, os.O_RDONLY)
+    duplicated_companion_fds: list[int] = []
+    original_dup = os.dup
+    original_fstat = os.fstat
+
+    def track_dup(file_fd: int) -> int:
+        duplicated_fd = original_dup(file_fd)
+        if file_fd == companion_fd:
+            duplicated_companion_fds.append(duplicated_fd)
+        return duplicated_fd
+
+    def fail_duplicated_companion_fstat(file_fd: int) -> os.stat_result:
+        if duplicated_companion_fds and file_fd == duplicated_companion_fds[-1]:
+            raise OSError(errno.EIO, "simulated companion identity failure")
+        return original_fstat(file_fd)
+
+    monkeypatch.setattr(os, "dup", track_dup)
+    monkeypatch.setattr(os, "fstat", fail_duplicated_companion_fstat)
+    try:
+        with (
+            pytest.raises(_ShardPinUnavailableError, match="simulated companion identity failure"),
+            _pinned_shard_scan_path(
+                str(source_path),
+                _target_for_path(source_path),
+                logical_path=str(source_path),
+                companion_targets={
+                    companion_path.name: (str(companion_path), _target_for_path(companion_path)),
+                },
+                companion_fds={companion_path.name: companion_fd},
+                require_regular_path=True,
+            ),
+        ):
+            pytest.fail("companion identity failure must prevent scanner dispatch")
+
+        assert len(duplicated_companion_fds) == 1
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            original_fstat(duplicated_companion_fds[0])
+        original_fstat(companion_fd)
+    finally:
+        os.close(companion_fd)
+
+
+def test_pinned_scan_rejects_borrowed_companion_descriptors_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows accepts a retained source handle but not unbound companion descriptors."""
+    source_path = tmp_path / "model.onnx"
+    companion_path = tmp_path / "model.onnx_data"
+    source_path.write_bytes(b"source")
+    companion_path.write_bytes(b"companion")
+    companion_fd = os.open(companion_path, os.O_RDONLY)
     monkeypatch.setattr("modelaudit.utils.file.handlers.os.name", "nt")
     try:
         with (
@@ -437,13 +493,16 @@ def test_pinned_scan_rejects_borrowed_descriptors_on_windows(
             _pinned_shard_scan_path(
                 str(source_path),
                 _target_for_path(source_path),
-                source_fd=source_fd,
+                companion_targets={
+                    companion_path.name: (str(companion_path), _target_for_path(companion_path)),
+                },
+                companion_fds={companion_path.name: companion_fd},
             ),
         ):
-            pytest.fail("Windows must reject borrowed source descriptors")
-        os.fstat(source_fd)
+            pytest.fail("Windows must reject borrowed companion descriptors")
+        os.fstat(companion_fd)
     finally:
-        os.close(source_fd)
+        os.close(companion_fd)
 
 
 @pytest.mark.skipif(
@@ -2744,6 +2803,87 @@ class TestShardedModelDetector:
         assert shard_info["safetensors_index_error"] == "safetensors index directory enumeration incomplete"
         assert result.success is False
         assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_shard_family_limit_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """High-cardinality shard families stop before building unbounded target maps."""
+        shards = [tmp_path / f"model-{index:05d}-of-00003.safetensors" for index in range(1, 4)]
+        for shard in shards:
+            shard.write_bytes(b"model")
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_SCANNABLE_SHARDS", 2)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shards[0]), index_search_root=tmp_path)
+        result = AdvancedFileHandler(
+            str(shards[0]),
+            CompletingShardScanner(),
+            index_search_root=tmp_path,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"] == "shard family member limit exceeded"
+        assert shard_info["shard_family_member_limit_exceeded"] is True
+        assert shard_info["maximum_scannable_shards"] == 2
+        assert shard_info["total_shards"] == 2
+        assert shard_info["unvalidated_shard_count"] == 1
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_retained_target_limit_fails_closed_before_binding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A retained-input inventory is family-filtered and capped before target binding."""
+        shards = [tmp_path / str(index) / f"model-{index:05d}-of-00003.safetensors" for index in range(1, 4)]
+        for shard in shards:
+            shard.parent.mkdir()
+            shard.write_bytes(b"model")
+        allowed_targets = {str(shard): _target_for_path(shard) for shard in shards}
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_SCANNABLE_SHARDS", 2)
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shards[0]),
+            allowed_targets=allowed_targets,
+            index_search_root=tmp_path,
+        )
+
+        assert shard_info is not None
+        assert shard_info["shard_family_member_limit_exceeded"] is True
+        assert shard_info["maximum_scannable_shards"] == 2
+        assert shard_info["total_shards"] == 2
+        assert shard_info["unvalidated_shards"] == [str(shards[2])]
+
+    def test_detect_safetensors_retained_target_cap_reserves_requested_shard(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Stale peers ordered first cannot evict the requested shard from the bounded inventory."""
+        shards = [tmp_path / str(index) / f"model-{index:05d}-of-00003.safetensors" for index in range(1, 4)]
+        for shard in shards:
+            shard.parent.mkdir()
+            shard.write_bytes(b"model")
+        stale_targets = {str(shard): _target_for_path(shard) for shard in shards[:2]}
+        requested_target = _target_for_path(shards[2])
+        for shard in shards[:2]:
+            shard.write_bytes(b"stale-peer")
+        allowed_targets = {**stale_targets, str(shards[2]): requested_target}
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_SCANNABLE_SHARDS", 2)
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shards[2]),
+            allowed_targets=allowed_targets,
+            index_search_root=tmp_path,
+        )
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shards[2])]
+        assert shard_info["shard_family_member_limit_exceeded"] is True
+        assert shard_info["maximum_scannable_shards"] == 2
+        assert shard_info["unvalidated_shard_count"] >= 1
 
     def test_safetensors_index_context_enforces_aggregate_directory_entry_budget(
         self,
@@ -5825,6 +5965,122 @@ class TestAdvancedFileHandler:
         assert shard_checks[0].severity == IssueSeverity.INFO
         assert shard_checks[0].details["error"] == "<redacted>"
         assert leaked_secret not in result.to_json()
+
+    def test_parallel_shard_submission_is_bounded_by_worker_count(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only one pending shard scan per worker is retained at a time."""
+        shard_paths = [tmp_path / f"model-{index:05d}-of-00008.safetensors" for index in range(1, 9)]
+        for shard_path in shard_paths:
+            shard_path.write_bytes(b"model")
+        handler = ParallelShardHandler(
+            {
+                "shards": [str(shard_path) for shard_path in shard_paths],
+                "total_shards": len(shard_paths),
+                "total_size": sum(shard_path.stat().st_size for shard_path in shard_paths),
+            },
+            CompletingShardScanner,
+        )
+        release_workers = Event()
+        initial_workers_started = Event()
+        submit_lock = Lock()
+        submitted = 0
+        started = 0
+        original_submit = ThreadPoolExecutor.submit
+
+        def tracking_submit(executor: ThreadPoolExecutor, *args: Any, **kwargs: Any) -> Any:
+            nonlocal submitted
+            with submit_lock:
+                submitted += 1
+            return original_submit(executor, *args, **kwargs)
+
+        def blocking_scan(_shard_path: str) -> ScanResult:
+            nonlocal started
+            with submit_lock:
+                started += 1
+                if started == 2:
+                    initial_workers_started.set()
+            assert release_workers.wait(timeout=5)
+            shard_result = ScanResult(scanner_name="bounded_submission_test")
+            shard_result.finish(success=True)
+            return shard_result
+
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_PARALLEL_WORKERS", 2)
+        monkeypatch.setattr(ThreadPoolExecutor, "submit", tracking_submit)
+        monkeypatch.setattr(handler, "_scan_single_shard", blocking_scan)
+        scan_results: list[ScanResult] = []
+        scan_thread = Thread(target=lambda: scan_results.append(handler.scan_shards()))
+
+        scan_thread.start()
+        try:
+            assert initial_workers_started.wait(timeout=5)
+            time.sleep(0.05)
+            with submit_lock:
+                assert submitted == 2
+        finally:
+            release_workers.set()
+            scan_thread.join(timeout=5)
+
+        assert not scan_thread.is_alive()
+        assert len(scan_results) == 1
+        assert scan_results[0].success is True
+        assert submitted == len(shard_paths)
+
+    def test_parallel_shard_limit_fails_closed_before_submission(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Caller-provided shard inventories cannot bypass the detector's family cap."""
+        shard_paths = [tmp_path / f"model-{index:05d}-of-00003.safetensors" for index in range(1, 4)]
+        for shard_path in shard_paths:
+            shard_path.write_bytes(b"model")
+        handler = ParallelShardHandler(
+            {
+                "shards": [str(shard_path) for shard_path in shard_paths],
+                "total_shards": len(shard_paths),
+                "total_size": sum(shard_path.stat().st_size for shard_path in shard_paths),
+            },
+            CompletingShardScanner,
+        )
+        scanned_paths: list[str] = []
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_SCANNABLE_SHARDS", 2)
+        monkeypatch.setattr(handler, "_scan_single_shard", lambda shard: scanned_paths.append(shard))
+
+        result = handler.scan_shards()
+
+        assert result.success is False
+        assert scanned_paths == []
+        assert "shard_count_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        coverage_check = next(check for check in result.checks if check.name == "Sharded Model Coverage Check")
+        assert coverage_check.details["total_shards"] == 3
+        assert coverage_check.details["maximum_scannable_shards"] == 2
+
+    def test_parallel_shard_membership_enumeration_limit_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pre-scan family revalidation bounds unrelated directory-entry work."""
+        shard_path = tmp_path / "model-00001-of-00001.safetensors"
+        shard_path.write_bytes(b"model")
+        shard_info = ShardedModelDetector.detect_shards(str(shard_path), index_search_root=tmp_path)
+        assert shard_info is not None
+        (tmp_path / "unrelated-a.txt").write_text("a", encoding="utf-8")
+        (tmp_path / "unrelated-b.txt").write_text("b", encoding="utf-8")
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers.MAX_SAFETENSORS_SHARD_INDEX_DIRECTORY_ENTRIES",
+            2,
+        )
+
+        result = ParallelShardHandler(shard_info, CompletingShardScanner).scan_shards()
+
+        assert result.success is False
+        assert "shard_family_changed" in result.metadata["scan_outcome_reasons"]
+        membership_check = next(check for check in result.checks if check.name == "Sharded Model Membership Check")
+        assert membership_check.details["error"] == "shard family membership inspection limit exceeded"
 
     def test_parallel_shards_preserve_raw_detector_failures_and_remove_clean_checks(
         self,

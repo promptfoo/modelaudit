@@ -7108,6 +7108,55 @@ def test_scan_huggingface_direct_file_binds_downloaded_generation(
     assert any(check.get("name") == "Local Source Boundary Check" for check in output["checks"])
 
 
+@patch("modelaudit.cli.download_model")
+def test_scan_huggingface_repository_binds_downloaded_generation(
+    mock_download_model: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A downloaded HF repository root cannot be replaced before local scan dispatch."""
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.safetensors").write_bytes(_minimal_safetensors_bytes())
+    replacement_dir = tmp_path / "replacement"
+    replacement_dir.mkdir()
+    (replacement_dir / "model.safetensors").write_bytes(_minimal_safetensors_bytes().replace(b'"pt"', b'"tf"'))
+    held_dir = tmp_path / "held"
+    mock_download_model.return_value = downloaded_dir
+    original_scan = cli_module.scan_model_directory_or_file
+    swapped = False
+
+    def swap_before_scan(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
+        nonlocal swapped
+        downloaded_dir.rename(held_dir)
+        replacement_dir.rename(downloaded_dir)
+        swapped = True
+        return original_scan(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "scan_model_directory_or_file", swap_before_scan)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--quiet",
+            "--no-cache",
+            "--format",
+            "json",
+            "--scanners",
+            "safetensors",
+            "hf://test/model",
+        ],
+        catch_exceptions=False,
+    )
+
+    output = parse_click_json_output(result.output)
+    assert swapped is True
+    assert result.exit_code == 2, result.output
+    assert output["success"] is False
+    assert any(check.get("name") == "Local Source Boundary Check" for check in output["checks"])
+
+
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")

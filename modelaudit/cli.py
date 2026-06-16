@@ -4240,6 +4240,7 @@ def _resolve_scan_source_for_path(
 
         temp_dir = None
         owned_filtered_temp_path: str | None = None
+        downloaded_model_source_guard: _BoundLocalSourceGuard | None = None
         try:
             source_model_id, source_model_source = extract_model_id_from_path(path)
             if runtime.cache_enabled and runtime.cache_dir:
@@ -4286,6 +4287,7 @@ def _resolve_scan_source_for_path(
                         timeout_seconds=runtime.timeout,
                         repository_file_inventory=stream_repository_file_inventory,
                         scanner_config=runtime.config,
+                        _cache_dir_owned=temp_dir is not None,
                         _include_scan_results=True,
                         **hf_stream_kwargs,
                     )
@@ -4369,6 +4371,14 @@ def _resolve_scan_source_for_path(
                 scannable_filenames=runtime.scannable_filenames,
                 scannable_scanner_ids=runtime.scannable_scanner_ids,
             )
+            downloaded_model_source_guard = _open_bound_local_source(download_path) if os.name == "posix" else None
+            initial_local_source_receipt = (
+                downloaded_model_source_guard.receipt
+                if downloaded_model_source_guard is not None
+                else _snapshot_local_source_receipt(download_path)
+            )
+            if initial_local_source_receipt is None:
+                raise OSError("Downloaded Hugging Face model changed before source binding")
             owned_filtered_temp_path = str(temporary_download_paths[0]) if temporary_download_paths else None
             if temp_dir is not None and owned_filtered_temp_path is not None:
                 try:
@@ -4407,8 +4417,12 @@ def _resolve_scan_source_for_path(
                 repository_file_inventory=tuple(download_repository_file_inventory),
                 safetensors_index_proofs=tuple(download_safetensors_index_proofs),
                 initial_shard_target=path_state.capture_initial_shard_target(str(download_path)),
+                initial_local_source_receipt=initial_local_source_receipt,
+                initial_local_source_guard=downloaded_model_source_guard,
             )
         except _HuggingFaceStreamInterruptedError as exc:
+            if downloaded_model_source_guard is not None:
+                downloaded_model_source_guard.close()
             if runtime.show_styled_output:
                 click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
 
@@ -4424,6 +4438,8 @@ def _resolve_scan_source_for_path(
             )
             return None
         except Exception as exc:
+            if downloaded_model_source_guard is not None:
+                downloaded_model_source_guard.close()
             if runtime.show_styled_output:
                 click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
 

@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1641,6 +1642,20 @@ def _local_source_stat_matches_receipt(
     return all(expected.get(field) == value for field, value in expected_fields.items())
 
 
+def _local_source_uses_trusted_directory_alias(
+    source_path: str | os.PathLike[str],
+    expected_receipt: Mapping[str, int | str] | None,
+) -> bool:
+    """Return whether a retained Windows source is a directory reparse alias."""
+    if os.name != "nt" or expected_receipt is None or expected_receipt.get("mode_type") != stat.S_IFDIR:
+        return False
+    try:
+        source_stat = os.lstat(source_path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(source_stat.st_mode) or _stat_is_windows_reparse_point(source_stat)
+
+
 def _local_source_lexical_entry_matches_receipt(
     current: os.stat_result,
     expected: dict[str, int | str],
@@ -2391,11 +2406,13 @@ def _retain_windows_local_source_guards(
             after_open = os.stat(guard_path, follow_symlinks=False)
             before_attributes = getattr(before_open, "st_file_attributes", 0) or 0
             after_attributes = getattr(after_open, "st_file_attributes", 0) or 0
-            if (
-                not os.path.samestat(before_open, after_open)
-                or stat.S_IFMT(before_open.st_mode) != stat.S_IFMT(after_open.st_mode)
-                or before_attributes != after_attributes
-                or (getattr(before_open, "st_reparse_tag", 0) or 0) != (getattr(after_open, "st_reparse_tag", 0) or 0)
+            stable_reparse_shape = (
+                stat.S_IFMT(before_open.st_mode) == stat.S_IFMT(after_open.st_mode)
+                and before_attributes == after_attributes
+                and (getattr(before_open, "st_reparse_tag", 0) or 0) == (getattr(after_open, "st_reparse_tag", 0) or 0)
+            )
+            if (open_reparse_point and not stable_reparse_shape) or (
+                not open_reparse_point and not os.path.samestat(before_open, after_open)
             ):
                 raise _LocalSourceBoundaryError("local source entry changed while retaining its boundary")
         resolved_path = expected_receipt.get("resolved_path")
@@ -5644,7 +5661,13 @@ def scan_model_directory_or_file(
                     None,
                     deadline=start_time + timeout,
                     max_entries=local_source_namespace_max_entries,
-                    trusted_root_symlink=bound_local_source_path is not None,
+                    trusted_root_symlink=(
+                        bound_local_source_path is not None
+                        or _local_source_uses_trusted_directory_alias(
+                            local_source_report_path,
+                            expected_local_source_receipt,
+                        )
+                    ),
                 )
             except (OSError, RuntimeError, TimeoutError) as error:
                 local_source_initial_namespace_error = error
@@ -8810,7 +8833,13 @@ def scan_model_directory_or_file(
                     None,
                     deadline=start_time + timeout,
                     max_entries=local_source_namespace_max_entries,
-                    trusted_root_symlink=bound_local_source_path is not None,
+                    trusted_root_symlink=(
+                        bound_local_source_path is not None
+                        or _local_source_uses_trusted_directory_alias(
+                            local_source_report_path,
+                            expected_local_source_receipt,
+                        )
+                    ),
                 )
             except (OSError, RuntimeError, TimeoutError) as error:
                 raise _LocalSourceBoundaryError("local source namespace changed after scanning") from error
@@ -8959,20 +8988,54 @@ def _same_bookkeeping_identity(left: os.stat_result, right: os.stat_result) -> b
     )
 
 
+_BOUND_BOOKKEEPING_IDENTITY: ContextVar[tuple[str, _FileIdentitySnapshot] | None] = ContextVar(
+    "bound_bookkeeping_identity",
+    default=None,
+)
+
+
+def _bookkeeping_matches_bound_identity(path_obj: Path, path_stat: os.stat_result, *, opened: bool) -> bool:
+    bound = _BOUND_BOOKKEEPING_IDENTITY.get()
+    if bound is None:
+        return True
+    bound_path, expected = bound
+    if os.path.normcase(os.path.normpath(os.path.abspath(path_obj))) != bound_path:
+        return True
+    expected_tuple = expected.stat if opened else expected.lstat
+    if expected_tuple is None:
+        return False
+    observed = (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        path_stat.st_mode,
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
+        path_stat.st_ctime_ns,
+    )
+    return observed == expected_tuple
+
+
 def _read_regular_bookkeeping_text(path_obj: Path, max_bytes: int) -> str | None:
     """Read a bounded regular bookkeeping file without following symlinks."""
     try:
         before_stat = path_obj.lstat()
     except OSError:
         return None
-    if _bookkeeping_stat_size(before_stat, max_bytes) is None:
+    if (
+        not _bookkeeping_matches_bound_identity(path_obj, before_stat, opened=False)
+        or _bookkeeping_stat_size(before_stat, max_bytes) is None
+    ):
         return None
 
     fd: int | None = None
     try:
         fd = os.open(path_obj, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         opened_stat = os.fstat(fd)
-        if not _same_bookkeeping_identity(before_stat, opened_stat):
+        if not _same_bookkeeping_identity(before_stat, opened_stat) or not _bookkeeping_matches_bound_identity(
+            path_obj,
+            opened_stat,
+            opened=True,
+        ):
             return None
         if _bookkeeping_stat_size(opened_stat, max_bytes) is None:
             return None
@@ -9002,10 +9065,14 @@ def _read_regular_bookkeeping_text(path_obj: Path, max_bytes: int) -> str | None
 
 
 def _has_scannable_bookkeeping_format(path_obj: Path) -> bool:
+    expected = _BOUND_BOOKKEEPING_IDENTITY.get()
     try:
-        return detect_file_format_for_skip_filter(str(path_obj)) != "unknown"
+        detected = detect_file_format_for_skip_filter(str(path_obj)) != "unknown"
     except (OSError, ValueError, RecursionError):
         return True
+    if expected is not None and _snapshot_file_identity(path_obj) != expected[1]:
+        return True
+    return detected
 
 
 def _hf_cache_relative_parts(path_obj: Path) -> tuple[Path, tuple[str, ...]] | None:
@@ -9172,6 +9239,8 @@ def _regular_bookkeeping_file_size(path_obj: Path, max_bytes: int) -> int | None
         stat_result = path_obj.lstat()
     except OSError:
         return None
+    if not _bookkeeping_matches_bound_identity(path_obj, stat_result, opened=False):
+        return None
     return _bookkeeping_stat_size(stat_result, max_bytes)
 
 
@@ -9213,6 +9282,20 @@ def _is_benign_local_hf_download_bookkeeping_file(
 
 
 def _is_huggingface_cache_file(path: str) -> bool:
+    """Classify one immutable Hugging Face bookkeeping generation."""
+    path_obj = Path(path)
+    expected_identity = _snapshot_file_identity(path_obj)
+    if expected_identity is None:
+        return False
+    normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path_obj)))
+    token = _BOUND_BOOKKEEPING_IDENTITY.set((normalized_path, expected_identity))
+    try:
+        return _classify_huggingface_cache_file(path)
+    finally:
+        _BOUND_BOOKKEEPING_IDENTITY.reset(token)
+
+
+def _classify_huggingface_cache_file(path: str) -> bool:
     """
     Check if a file is a HuggingFace cache/metadata file that should be skipped.
 
@@ -10444,6 +10527,7 @@ def scan_model_streaming(
     preserved_openvino_companion_snapshots: dict[Path, _FileIdentitySnapshot] = {}
     deferred_openvino_sidecars: dict[Path, Path] = {}
     consumed_openvino_companions: set[Path] = set()
+    consumed_openvino_companion_receipts: dict[Path, tuple[_FileTargetIdentityKey, str]] = {}
     preserve_shard_reconciliation_errors = False
     deleted_streamed_index_tracking_incomplete = False
     streamed_safetensors_scope_tracking_incomplete = False
@@ -10640,7 +10724,7 @@ def scan_model_streaming(
         expected_identity: _FileIdentitySnapshot | None,
         expected_content_hash: str | None,
         require_proven_non_index: bool,
-        require_content_hash: bool,
+        generation_failure: Callable[[str, Path | None], None] | None = None,
     ) -> None:
         """Move one bound index generation aside before validating and unlinking it."""
         nonlocal deleted_streamed_index_tracking_incomplete, streamed_index_cleanup_verification_bytes
@@ -10680,10 +10764,13 @@ def scan_model_streaming(
 
         def preserve_unverified_index(message: str, reason: str) -> None:
             restored = restore_quarantined_index()
-            record_streamed_index_retention_failure(source_path, message, reason=reason)
+            if generation_failure is None:
+                record_streamed_index_retention_failure(source_path, message, reason=reason)
+            else:
+                generation_failure(message, source_path if restored else tombstone_path)
             if not restored and tombstone_path is not None:
                 pending_delete_failures[tombstone_path] = OSError(
-                    "Unverified SafeTensors index generation was preserved in cleanup quarantine"
+                    "Unverified streamed source generation was preserved in cleanup quarantine"
                 )
 
         def quarantined_index_identity_and_content_path() -> tuple[_FileIdentitySnapshot | None, Path]:
@@ -10741,6 +10828,18 @@ def scan_model_streaming(
                 or (os.name != "nt" and stat.S_IMODE(tombstone_dir_stat.st_mode) & 0o077)
             ):
                 raise OSError("private SafeTensors index cleanup quarantine is unsafe")
+            if expected_identity is not None and _snapshot_file_identity(source_path) != expected_identity:
+                preserve_unverified_index(
+                    "SafeTensors index candidate changed before cleanup.",
+                    "safetensors_index_changed_before_cleanup",
+                )
+                return
+            if expected_content_hash is None:
+                preserve_unverified_index(
+                    "Streamed source cleanup omitted a content proof for the selected generation.",
+                    "safetensors_index_cleanup_failed",
+                )
+                return
             if parent_fd is not None:
                 tombstone_dir_fd = os.open(
                     tombstone_dir_path.name,
@@ -10775,6 +10874,9 @@ def scan_model_streaming(
             moved_generation_matches = bool(
                 expected_identity is not None
                 and moved_identity is not None
+                # A same-filesystem rename updates ctime. The full pre-rename
+                # identity above binds ctime; the content proof below closes
+                # the remaining snapshot-to-rename window.
                 and moved_identity.lstat[:5] == expected_identity.lstat[:5]
                 and (
                     (moved_identity.stat is None and expected_identity.stat is None)
@@ -10797,22 +10899,24 @@ def scan_model_streaming(
                     "safetensors_index_changed_before_cleanup",
                 )
                 return
-            if require_content_hash:
-                moved_size = _snapshot_file_size(moved_identity)
-                if moved_size <= MAX_SAFETENSORS_SHARD_INDEX_BYTES and (
-                    streamed_index_cleanup_verification_bytes + moved_size <= MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES
-                ):
-                    streamed_index_cleanup_verification_bytes += moved_size
-                    moved_content_hash = compute_sha256_hash(moved_content_path)
-                    content_hash_changed = expected_content_hash is None or moved_content_hash != expected_content_hash
-                else:
-                    content_hash_changed = require_proven_non_index is False
-                if content_hash_changed:
-                    preserve_unverified_index(
-                        "Content-routed index candidate changed after scanning.",
-                        "safetensors_index_changed_before_cleanup",
-                    )
-                    return
+            moved_size = _snapshot_file_size(moved_identity)
+            if moved_size <= MAX_SAFETENSORS_SHARD_INDEX_BYTES and (
+                streamed_index_cleanup_verification_bytes + moved_size <= MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES
+            ):
+                streamed_index_cleanup_verification_bytes += moved_size
+                moved_content_hash = compute_sha256_hash(moved_content_path)
+                content_hash_changed = moved_content_hash != expected_content_hash
+            else:
+                # Structural classification proves only that this is not index
+                # authority; it does not prove that the quarantined bytes are
+                # the generation selected before the rename.
+                content_hash_changed = True
+            if content_hash_changed:
+                preserve_unverified_index(
+                    "Content-routed index candidate changed after scanning.",
+                    "safetensors_index_changed_before_cleanup",
+                )
+                return
             if track_candidate:
                 normalized_source = normalized_stream_path(source_path)
                 candidate_receipt = (normalized_source, canonical_parent)
@@ -10844,11 +10948,14 @@ def scan_model_streaming(
                 recreated_path = Path(canonical_parent) / source_path.name
                 error = OSError("SafeTensors index path was recreated during cleanup")
                 pending_delete_failures[recreated_path] = error
-                record_streamed_index_retention_failure(
-                    source_path,
-                    "SafeTensors index path was recreated during cleanup.",
-                    reason="safetensors_index_recreated_during_cleanup",
-                )
+                if generation_failure is None:
+                    record_streamed_index_retention_failure(
+                        source_path,
+                        "SafeTensors index path was recreated during cleanup.",
+                        reason="safetensors_index_recreated_during_cleanup",
+                    )
+                else:
+                    generation_failure("streamed source path was recreated during cleanup", recreated_path)
             else:
                 deleted_streamed_sources.add(normalized_stream_path(source_path))
             logger.debug("Deleted %s %s after identity-bound quarantine", source_path, context)
@@ -10857,11 +10964,14 @@ def scan_model_streaming(
             pending_delete_failures[tombstone_path if moved_source and tombstone_path is not None else source_path] = (
                 error
             )
-            record_streamed_index_retention_failure(
-                source_path,
-                "SafeTensors index cleanup could not bind and remove the selected generation.",
-                reason="safetensors_index_cleanup_failed",
-            )
+            if generation_failure is None:
+                record_streamed_index_retention_failure(
+                    source_path,
+                    "SafeTensors index cleanup could not bind and remove the selected generation.",
+                    reason="safetensors_index_cleanup_failed",
+                )
+            else:
+                generation_failure(str(error), tombstone_path if moved_source else source_path)
         finally:
             if tombstone_dir_fd is not None:
                 os.close(tombstone_dir_fd)
@@ -10899,7 +11009,6 @@ def scan_model_streaming(
         expected_content_hash: str | None = None,
         structural_index_classification_complete: bool = False,
         quarantine_proven_non_index: bool = False,
-        require_content_hash: bool = False,
         expected_cleanup_identity: _FileIdentitySnapshot | None = None,
         retained_cleanup_fd: int | None = None,
         cleanup_report_path: str | None = None,
@@ -10912,7 +11021,6 @@ def scan_model_streaming(
             aggregate_hash_complete = False
             preserve_shard_reconciliation_errors = True
             pending_delete_failures[failure_path or source_path] = OSError(message)
-            _record_local_source_boundary_failure(results, cleanup_report_path or str(source_path))
 
         is_index_suffix = source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
         if not (source_path.exists() or source_path.is_symlink()):
@@ -10994,6 +11102,7 @@ def scan_model_streaming(
                     defer_safetensors_index=False,
                     track_safetensors_index_candidate=False,
                     structural_index_identity=source_identity,
+                    expected_content_hash=expected_content_hash,
                 )
                 return
             retained_content_hash = expected_content_hash or compute_sha256_hash(retained_source_path)
@@ -11031,7 +11140,6 @@ def scan_model_streaming(
                 expected_identity=expected_cleanup_identity or structural_index_identity,
                 expected_content_hash=expected_content_hash,
                 require_proven_non_index=quarantine_proven_non_index,
-                require_content_hash=require_content_hash or quarantine_proven_non_index,
             )
             return
         retained_cleanup_stat: os.stat_result | None = None
@@ -11143,6 +11251,7 @@ def scan_model_streaming(
                     moved_stat.st_mode,
                     moved_stat.st_size,
                     moved_stat.st_mtime_ns,
+                    moved_stat.st_ctime_ns,
                 )
                 retained_moved_identity = (
                     retained_after_move.st_dev,
@@ -11150,13 +11259,21 @@ def scan_model_streaming(
                     retained_after_move.st_mode,
                     retained_after_move.st_size,
                     retained_after_move.st_mtime_ns,
+                    retained_after_move.st_ctime_ns,
                 )
                 if (
                     not stat.S_ISREG(moved_stat.st_mode)
                     or not os.path.samestat(moved_stat, retained_after_move)
-                    or moved_identity != expected_cleanup_identity.stat[:5]
-                    or retained_moved_identity != expected_cleanup_identity.stat[:5]
+                    or moved_identity != retained_moved_identity
+                    or moved_identity[:5] != expected_cleanup_identity.stat[:5]
                 ):
+                    restored = restore_quarantined_source()
+                    record_cleanup_generation_failure(
+                        "cleanup quarantined a different streamed source generation",
+                        source_path if restored else tombstone_path,
+                    )
+                    return
+                if expected_content_hash is None or compute_sha256_hash(tombstone_path) != expected_content_hash:
                     restored = restore_quarantined_source()
                     record_cleanup_generation_failure(
                         "cleanup quarantined a different streamed source generation",
@@ -11212,17 +11329,21 @@ def scan_model_streaming(
                 if parent_fd is not None:
                     os.close(parent_fd)
             return
-        try:
-            source_path.unlink()
-            if source_path.exists() or source_path.is_symlink():
-                record_cleanup_generation_failure("streamed source path was recreated during cleanup")
-                return
-            normalized_source = normalized_stream_path(source_path)
-            deleted_streamed_sources.add(normalized_source)
-            logger.debug(f"Deleted {source_path} {context}")
-        except Exception as e:
-            logger.warning(f"Failed to delete {source_path} {context}: {e}")
-            pending_delete_failures[source_path] = e
+        if expected_cleanup_identity is None:
+            record_cleanup_generation_failure("streamed source cleanup omitted its selected generation")
+            return
+        if stat.S_ISREG(expected_cleanup_identity.lstat[2]) and expected_content_hash is None:
+            record_cleanup_generation_failure("streamed source cleanup omitted its selected content hash")
+            return
+        delete_streamed_index_candidate(
+            source_path,
+            context,
+            track_candidate=False,
+            expected_identity=expected_cleanup_identity,
+            expected_content_hash=expected_content_hash,
+            require_proven_non_index=False,
+            generation_failure=record_cleanup_generation_failure,
+        )
 
     def delete_deferred_streamed_indexes(context: str) -> None:
         """Delete only the exact index generations retained through terminal validation."""
@@ -11274,7 +11395,6 @@ def scan_model_streaming(
                 track_safetensors_index_candidate=False,
                 structural_index_identity=expected_identity,
                 expected_content_hash=expected_content_hash,
-                require_content_hash=True,
             )
             if not (source_path.exists() or source_path.is_symlink()):
                 deleted_streamed_sources.update(deferred_streamed_index_logical_paths.get(source_path, set()))
@@ -11518,6 +11638,39 @@ def scan_model_streaming(
             if scan_target_key is not None:
                 hashed_stream_source_hashes_by_target.setdefault(scan_target_key, file_hash)
         return file_hash
+
+    def retained_stream_descriptor_hash(file_fd: int) -> str | None:
+        """Hash exactly one retained regular-file generation without reopening its pathname."""
+        duplicate_fd: int | None = None
+        try:
+            initial_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(initial_stat.st_mode):
+                return None
+            duplicate_fd = os.dup(file_fd)
+            os.lseek(duplicate_fd, 0, os.SEEK_SET)
+            remaining = initial_stat.st_size + 1
+            digest = hashlib.sha256()
+            bytes_read = 0
+            while remaining > 0:
+                chunk = os.read(duplicate_fd, min(remaining, 64 * 1024))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                bytes_read += len(chunk)
+                remaining -= len(chunk)
+            final_stat = os.fstat(file_fd)
+            if bytes_read != initial_stat.st_size or any(
+                getattr(initial_stat, field) != getattr(final_stat, field)
+                for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+            ):
+                return None
+            return digest.hexdigest()
+        except OSError:
+            return None
+        finally:
+            if duplicate_fd is not None:
+                with suppress(OSError):
+                    os.close(duplicate_fd)
 
     def append_streamed_openvino_companion_hash(
         xml_path: Path,
@@ -11962,8 +12115,6 @@ def scan_model_streaming(
             ):
                 delete_streamed_source(source_path, "after streaming size limit")
                 break
-            if not is_precomputed_streamed_result and source_key in consumed_openvino_companions:
-                continue
             scan_path = bound_stream_source_path or source_path
             pinned_scan_context: Any | None = None
             pinned_scan: Any | None = None
@@ -11975,6 +12126,7 @@ def scan_model_streaming(
             retained_stream_parent_fd: int | None = None
             retained_stream_source_fd: int | None = None
             retained_stream_source_fd_owned = False
+            retained_stream_source_target: dict[str, int | str] | None = None
             retained_stream_discovery_path: Path | None = None
             if (
                 os.name == "posix"
@@ -11997,6 +12149,61 @@ def scan_model_streaming(
                     retained_stream_parent_fd = candidate_parent_fd
                     retained_stream_source_fd = candidate_source_fd
                     retained_stream_discovery_path = retained_parent_path / retained_source_name
+                    retained_stream_source_target = _snapshot_regular_file_descriptor(candidate_source_fd)
+            if not is_precomputed_streamed_result and base_dir is None:
+                stream_source_fd = -1
+                try:
+                    if os.name == "nt":
+                        stream_source_fd = _open_windows_shard_guard_fd(str(source_path))
+                    else:
+                        stream_source_fd = os.open(
+                            source_path,
+                            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0),
+                        )
+                    stream_source_stat = os.fstat(stream_source_fd)
+                    source_identity = _snapshot_file_identity(source_path)
+                    if (
+                        source_identity is None
+                        or source_identity.stat is None
+                        or not stat.S_ISREG(stream_source_stat.st_mode)
+                        or source_identity.stat
+                        != (
+                            stream_source_stat.st_dev,
+                            stream_source_stat.st_ino,
+                            stream_source_stat.st_mode,
+                            stream_source_stat.st_size,
+                            stream_source_stat.st_mtime_ns,
+                            stream_source_stat.st_ctime_ns,
+                        )
+                    ):
+                        raise OSError("streamed source changed while binding its initial generation")
+                    retained_stream_source_target = {
+                        "resolved_path": str(Path(os.path.abspath(source_path))),
+                        "device": stream_source_stat.st_dev,
+                        "inode": stream_source_stat.st_ino,
+                        "mode": stream_source_stat.st_mode,
+                        "size": stream_source_stat.st_size,
+                        "mtime_ns": stream_source_stat.st_mtime_ns,
+                        "ctime_ns": stream_source_stat.st_ctime_ns,
+                        "nlink": stream_source_stat.st_nlink,
+                    }
+                    descriptor_target = _snapshot_regular_file_descriptor(stream_source_fd)
+                    if descriptor_target is not None:
+                        retained_stream_source_target = descriptor_target
+                        scan_path = Path(str(descriptor_target["resolved_path"]))
+                except OSError as error:
+                    if stream_source_fd >= 0:
+                        with suppress(OSError):
+                            os.close(stream_source_fd)
+                    if (
+                        isinstance(error, FileNotFoundError)
+                        and source_key in consumed_openvino_companions
+                        and _snapshot_file_identity(source_path) is None
+                    ):
+                        continue
+                    raise _LocalSourceBoundaryError("streamed source could not bind its initial generation") from error
+                retained_stream_source_fd = stream_source_fd
+                retained_stream_source_fd_owned = True
             is_hf_cache_symlink = False
             trusted_hf_alias_target: dict[str, int | str] | None = None
             trusted_hf_alias_logical_path: str | None = None
@@ -12014,6 +12221,7 @@ def scan_model_streaming(
             independent_openvino_sidecar_result: ScanResult | None = None
             independent_openvino_sidecar_path: Path | None = None
             escaped_openvino_cleanup_path: Path | None = None
+            escaped_openvino_cleanup_identity: _FileIdentitySnapshot | None = None
             preflight_scan_result: ScanResult | None = None
             file_hash: str | None = None
             structural_index_classification: bool | None = None
@@ -12024,6 +12232,9 @@ def scan_model_streaming(
             try:
                 check_interrupted()
             except KeyboardInterrupt:
+                if retained_stream_source_fd_owned and retained_stream_source_fd is not None:
+                    with suppress(OSError):
+                        os.close(retained_stream_source_fd)
                 if not is_precomputed_streamed_result:
                     delete_streamed_source(source_path, "after streaming interruption")
                 raise
@@ -12036,6 +12247,9 @@ def scan_model_streaming(
                 logger.error(f"Streaming scan timeout after {timeout}s")
                 if not is_precomputed_streamed_result:
                     delete_streamed_source(source_path, "after streaming timeout")
+                if retained_stream_source_fd_owned and retained_stream_source_fd is not None:
+                    with suppress(OSError):
+                        os.close(retained_stream_source_fd)
                 break
 
             try:
@@ -12077,6 +12291,7 @@ def scan_model_streaming(
                             ) from error
                         retained_stream_source_fd = stream_source_fd
                         retained_stream_source_fd_owned = True
+                        retained_stream_source_target = _snapshot_regular_file_descriptor(stream_source_fd)
                 if retained_stream_source_fd is not None and source_path.name.lower().endswith(
                     SAFETENSORS_INDEX_SUFFIX
                 ):
@@ -12085,6 +12300,23 @@ def scan_model_streaming(
                         source_fd=retained_stream_source_fd,
                     )
                     structural_index_classification_complete = True
+                consumed_openvino_receipt = consumed_openvino_companion_receipts.get(source_key)
+                if consumed_openvino_receipt is not None and retained_stream_source_fd is not None:
+                    expected_target_key, expected_content_hash = consumed_openvino_receipt
+                    current_target = retained_stream_source_target or _snapshot_regular_file_descriptor(
+                        retained_stream_source_fd
+                    )
+                    if (
+                        current_target is not None
+                        and _regular_file_target_identity_key(current_target) == expected_target_key
+                        and retained_stream_descriptor_hash(retained_stream_source_fd) == expected_content_hash
+                    ):
+                        if retained_stream_source_fd_owned:
+                            with suppress(OSError):
+                                os.close(retained_stream_source_fd)
+                            retained_stream_source_fd = None
+                            retained_stream_source_fd_owned = False
+                        continue
                 if precomputed_result is not None:
                     _normalize_unclassified_scan_failure(precomputed_result)
                     metadata_dict = dict(precomputed_result.metadata or {})
@@ -12252,6 +12484,7 @@ def scan_model_streaming(
                             ) from error
                         retained_stream_source_fd = stream_source_fd
                         retained_stream_source_fd_owned = True
+                        retained_stream_source_target = _snapshot_regular_file_descriptor(stream_source_fd)
                         if source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX):
                             structural_index_classification, structural_index_identity = (
                                 classify_structural_safetensors_index(
@@ -12323,6 +12556,7 @@ def scan_model_streaming(
                         str(source_path),
                         metadata_scanner_available=metadata_scanner_available,
                         scanner_selection_extensions=scanner_selection_skip_extensions,
+                        content_path=str(scan_path),
                     )
                     and not _preserve_hf_download_sidecar_asset(str(source_path), scanner_selection_skip_extensions)
                 ):
@@ -12366,6 +12600,9 @@ def scan_model_streaming(
                             )
                             if escaped_companion is not None:
                                 escaped_openvino_cleanup_path = logical_source_path.with_suffix(".bin")
+                                escaped_openvino_cleanup_identity = _snapshot_file_identity(
+                                    escaped_openvino_cleanup_path
+                                )
                                 preflight_scan_result = _openvino_weights_symlink_escape_result(
                                     logical_source_path,
                                     escaped_openvino_cleanup_path,
@@ -12812,11 +13049,25 @@ def scan_model_streaming(
                         else logical_source_path
                     )
                     pin_is_alias = True
-                elif bound_local_source_path is not None and not initial_shard_target:
+                elif not initial_shard_target:
                     if retained_stream_source_fd is not None:
-                        pin_target = _snapshot_regular_file_descriptor(retained_stream_source_fd)
+                        current_retained_target = _snapshot_regular_file_descriptor(retained_stream_source_fd)
+                        if current_retained_target is None and retained_stream_source_target is not None:
+                            with suppress(OSError):
+                                current_retained_stat = os.fstat(retained_stream_source_fd)
+                                current_retained_target = {
+                                    **retained_stream_source_target,
+                                    "device": current_retained_stat.st_dev,
+                                    "inode": current_retained_stat.st_ino,
+                                    "mode": current_retained_stat.st_mode,
+                                    "size": current_retained_stat.st_size,
+                                    "mtime_ns": current_retained_stat.st_mtime_ns,
+                                    "ctime_ns": current_retained_stat.st_ctime_ns,
+                                    "nlink": current_retained_stat.st_nlink,
+                                }
+                        pin_target = current_retained_target
                         if pin_target is not None:
-                            pin_target["resolved_path"] = str(scan_path)
+                            pin_target = {**pin_target, "resolved_path": str(scan_path)}
                     else:
                         pin_target = initial_stream_target(scan_path)
                     candidate_pin_resolved_path = pin_target.get("resolved_path") if pin_target is not None else None
@@ -12944,7 +13195,8 @@ def scan_model_streaming(
                                     context_only_companion_bytes_scanned += companion_size
                             selected_resolved_path = pin_resolved_path
                             scan_config["cache_enabled"] = False
-                        except _ShardPinUnavailableError:
+                        except _ShardPinUnavailableError as error:
+                            logger.error("Failed to pin streamed source %s: %s", report_path, error)
                             for retained_companion_fd in retained_stream_companion_fds.values():
                                 with suppress(OSError):
                                     os.close(retained_companion_fd)
@@ -13408,7 +13660,9 @@ def scan_model_streaming(
                             quarantine_proven_non_index=content_routed_safetensors_index_payload,
                             expected_cleanup_identity=cleanup_source_identity,
                             retained_cleanup_fd=(
-                                retained_stream_source_fd if retained_stream_source_fd_owned else None
+                                retained_stream_source_fd
+                                if retained_stream_source_fd_owned and os.name != "nt"
+                                else None
                             ),
                             cleanup_report_path=report_path,
                         )
@@ -13417,7 +13671,31 @@ def scan_model_streaming(
                         with suppress(OSError):
                             os.close(retained_stream_source_fd)
                 if openvino_scan_companion_path is not None and openvino_scan_companion_key is not None:
-                    delete_streamed_source(openvino_scan_companion_path, "after OpenVINO XML scan")
+                    preserved_companion_identity = (
+                        preserved_openvino_companion_snapshots.get(openvino_scan_companion_key)
+                        or openvino_companion_pre_scan_identity
+                    )
+                    preserved_companion_target = _file_target_identity_key(
+                        openvino_scan_companion_path,
+                        preserved_companion_identity,
+                    )
+                    preserved_companion_content_hash = (
+                        hashed_stream_file_hashes_by_target.get(preserved_companion_target)
+                        if preserved_companion_target is not None
+                        else None
+                    )
+                    if preserved_companion_target is not None and preserved_companion_content_hash is not None:
+                        consumed_openvino_companion_receipts[openvino_scan_companion_key] = (
+                            preserved_companion_target,
+                            preserved_companion_content_hash,
+                        )
+                    delete_streamed_source(
+                        openvino_scan_companion_path,
+                        "after OpenVINO XML scan",
+                        expected_cleanup_identity=preserved_companion_identity,
+                        expected_content_hash=preserved_companion_content_hash,
+                        cleanup_report_path=str(openvino_scan_companion_path),
+                    )
                     consumed_openvino_companions.add(openvino_scan_companion_key)
                     deferred_openvino_sidecars.pop(openvino_scan_companion_key, None)
                     preserved_openvino_companion_snapshots.pop(openvino_scan_companion_key, None)
@@ -13425,6 +13703,8 @@ def scan_model_streaming(
                     delete_streamed_source(
                         escaped_openvino_cleanup_path,
                         "after escaped OpenVINO XML scan",
+                        expected_cleanup_identity=escaped_openvino_cleanup_identity,
+                        cleanup_report_path=str(escaped_openvino_cleanup_path),
                     )
 
         # Source-owned cleanup may mutate retained artifacts. Run it before the

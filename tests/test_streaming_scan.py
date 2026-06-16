@@ -2834,13 +2834,11 @@ def test_scan_model_streaming_rejects_swapped_index_before_program_deletion(tmp_
         json.dumps({"weight_map": {"initial": shard.name}}),
         encoding="utf-8",
     )
+    replacement_index = json.dumps({"weight_map": {"replacement": shard.name}})
 
     def shard_stream() -> Iterator[tuple[Path, bool]]:
         yield shard, False
-        index_path.write_text(
-            json.dumps({"weight_map": {"replacement": shard.name}}),
-            encoding="utf-8",
-        )
+        index_path.write_text(replacement_index, encoding="utf-8")
         yield index_path, True
 
     result = scan_model_streaming(
@@ -2855,7 +2853,7 @@ def test_scan_model_streaming_rejects_swapped_index_before_program_deletion(tmp_
     assert result.success is False
     assert result.has_errors is True
     assert determine_exit_code(result) == 2
-    assert not index_path.exists()
+    assert index_path.read_text(encoding="utf-8") == replacement_index
     assert any(
         check.name == "Sharded Model Boundary Check"
         and check.location == str(shard)
@@ -3091,6 +3089,51 @@ def test_scan_model_streaming_rejects_index_swap_at_content_routed_cleanup(
     )
 
 
+def test_scan_model_streaming_content_routed_cleanup_budget_exhaustion_preserves_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exhausted cleanup hashing cannot delete a structurally non-index replacement."""
+    import modelaudit.core as core_module
+
+    payload = pickle.dumps({"weights": [1, 2, 3]}).ljust(90, b"\0")
+    replacement = pickle.dumps({"weights": [4, 5, 6]}).ljust(90, b"\0")
+    assert len(payload) == len(replacement) == 90
+    paths = [tmp_path / f"payload-{index}.safetensors.index.json" for index in range(2)]
+    for path in paths:
+        path.write_bytes(payload)
+    second_stat = paths[1].stat()
+    original_rename = core_module.os.rename
+    rewritten = False
+
+    def rewrite_second_before_quarantine(*args: Any, **kwargs: Any) -> None:
+        nonlocal rewritten
+        source_name = os.fspath(args[0]) if args else ""
+        if not rewritten and source_name == paths[1].name and kwargs.get("src_dir_fd") is not None:
+            paths[1].write_bytes(replacement)
+            os.utime(paths[1], ns=(second_stat.st_atime_ns, second_stat.st_mtime_ns))
+            rewritten = True
+        original_rename(*args, **kwargs)
+
+    monkeypatch.setattr(core_module, "MAX_SAFETENSORS_SHARD_INDEX_TOTAL_BYTES", len(payload))
+    monkeypatch.setattr(core_module.os, "rename", rewrite_second_before_quarantine)
+
+    result = scan_model_streaming(
+        file_generator=iter((path, index == len(paths) - 1) for index, path in enumerate(paths)),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["pickle"],
+        skip_file_types=False,
+    )
+
+    assert rewritten is True
+    assert not paths[0].exists()
+    assert paths[1].read_bytes() == replacement
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+
+
 def test_scan_model_streaming_tracks_present_invalid_weight_map_before_shard(tmp_path: Path) -> None:
     """A present malformed weight_map is not proven unrelated content."""
     index_path = tmp_path / "model.safetensors.index.json"
@@ -3205,6 +3248,50 @@ def test_scan_model_streaming_index_retention_overflow_is_durable(
     )
 
 
+def test_scan_model_streaming_retention_overflow_cleanup_rejects_pre_rename_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overflow cleanup preserves a same-size rewrite raced between identity check and rename."""
+    import modelaudit.core as core_module
+
+    monkeypatch.setattr(core_module, "MAX_SAFETENSORS_SHARD_INDEX_FILES", 1)
+    indexes = [tmp_path / f"model-{index}.safetensors.index.json" for index in range(2)]
+    payload = json.dumps({"weight_map": {"tensor": "model-00001-of-00001.safetensors"}}).encode()
+    replacement = payload.replace(b"tensor", b"attack")
+    assert len(replacement) == len(payload)
+    for index_path in indexes:
+        index_path.write_bytes(payload)
+    overflow_stat = indexes[1].stat()
+    original_rename = core_module.os.rename
+    raced = False
+
+    def rewrite_before_quarantine(*args: Any, **kwargs: Any) -> None:
+        nonlocal raced
+        source_name = os.fspath(args[0]) if args else ""
+        if not raced and source_name == indexes[1].name and kwargs.get("src_dir_fd") is not None:
+            indexes[1].write_bytes(replacement)
+            os.utime(indexes[1], ns=(overflow_stat.st_atime_ns, overflow_stat.st_mtime_ns))
+            raced = True
+        original_rename(*args, **kwargs)
+
+    monkeypatch.setattr(core_module.os, "rename", rewrite_before_quarantine)
+
+    result = scan_model_streaming(
+        file_generator=iter((path, index == len(indexes) - 1) for index, path in enumerate(indexes)),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+        scanners=["metadata"],
+    )
+
+    assert raced is True
+    assert indexes[1].read_bytes() == replacement
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+
+
 def test_scan_model_streaming_rejects_index_disappearing_before_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3303,9 +3390,14 @@ def test_scan_model_streaming_rejects_index_disappearing_while_binding_retention
     assert result.has_errors is True
     assert determine_exit_code(result) == 2
     assert any(
-        issue.details.get("scan_outcome_reason") == "safetensors_index_disappeared_before_retention"
+        issue.details.get("scan_outcome_reason")
+        in {
+            "safetensors_index_disappeared_before_retention",
+            "safetensors_index_disappeared_before_cleanup",
+            "source_boundary_changed",
+        }
         for issue in result.issues
-    )
+    ), [issue.details for issue in result.issues]
 
 
 def test_scan_model_streaming_preserved_index_cannot_disappear_before_later_shard(tmp_path: Path) -> None:
@@ -3342,11 +3434,11 @@ def test_scan_model_streaming_preserved_index_cannot_disappear_before_later_shar
     )
 
 
-def test_scan_model_streaming_large_non_json_index_suffix_deletes_cleanly(
+def test_scan_model_streaming_large_non_json_index_suffix_preserves_without_cleanup_hash_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A bounded prefix can prove large non-JSON content is not index authority."""
+    """Structural non-index proof cannot substitute for cleanup content equality."""
     from modelaudit import core as core_module
 
     monkeypatch.setattr(core_module, "MAX_SAFETENSORS_SHARD_INDEX_BYTES", 8)
@@ -3362,9 +3454,9 @@ def test_scan_model_streaming_large_non_json_index_suffix_deletes_cleanly(
         scanners=["metadata"],
     )
 
-    assert not payload.exists()
-    assert result.success is True
-    assert determine_exit_code(result) == 0
+    assert payload.exists()
+    assert result.success is False
+    assert determine_exit_code(result) == 2
 
 
 def test_scan_model_streaming_indeterminate_index_probe_budget_fails_closed(
@@ -3428,7 +3520,8 @@ def test_scan_model_streaming_index_suffix_fifo_fails_promptly(tmp_path: Path) -
     )
 
     assert time.monotonic() - started < 2
-    assert not fifo_path.exists()
+    # Special files have no content-bound regular generation to delete safely.
+    assert fifo_path.exists()
     assert result.success is False
     assert determine_exit_code(result) == 2
 
@@ -5422,6 +5515,33 @@ def test_scan_model_streaming_preserves_openvino_companion_when_bin_arrives_firs
     assert not any(check.rule_code == "S901" for check in result.checks)
 
 
+def test_scan_model_streaming_recreated_consumed_openvino_companion_is_scanned(tmp_path: Path) -> None:
+    """A malicious generation recreated at a consumed sidecar path cannot inherit its skip receipt."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    recreated = False
+
+    def recreate_companion() -> Iterator[tuple[Path, bool]]:
+        nonlocal recreated
+        yield xml_path, False
+        assert not bin_path.exists()
+        create_malicious_pickle(bin_path)
+        recreated = True
+        yield bin_path, True
+
+    result = scan_model_streaming(
+        file_generator=recreate_companion(),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["openvino", "pickle"],
+        skip_file_types=False,
+    )
+
+    assert recreated is True
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
 def test_scan_model_streaming_preserves_executable_openvino_bin_sidecar_route(tmp_path: Path) -> None:
     """Executable same-stem .bin content must not be consumed only by OpenVINO XML scanning."""
     xml_path, bin_path = _write_openvino_pair(tmp_path)
@@ -5963,9 +6083,12 @@ def test_scan_model_streaming_openvino_prefetched_companion_counts_toward_max_to
     )
 
     assert determine_exit_code(result) == 2
-    assert result.bytes_scanned > 32
+    assert result.bytes_scanned == 0
     assert result.content_hash is None
-    assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+    assert any(
+        "Total scan size limit exceeded" in issue.message and issue.details.get("projected_total_size", 0) > 32
+        for issue in result.issues
+    )
 
 
 def test_scan_model_streaming_rejects_local_companion_stage_before_total_size_copy(
@@ -6299,10 +6422,12 @@ def test_scan_model_streaming_openvino_symlink_escape_fails_closed(
         cache_enabled=False,
     )
 
-    assert determine_exit_code(result) == 1
+    # The critical escape finding is preserved, and cleanup fails closed rather
+    # than deleting an unproven symlink generation.
+    assert determine_exit_code(result) == 2
     assert result.content_hash is None
     assert not xml_path.exists()
-    assert not bin_path.exists()
+    assert bin_path.is_symlink()
     assert escaped_weights.exists()
     assert any(
         check.name == "OpenVINO Weights Symlink Boundary Check"
@@ -6318,7 +6443,7 @@ def test_scan_model_streaming_openvino_companion_swap_fails_closed(tmp_path: Pat
     real_scan_file = scan_file
 
     def swap_companion(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        if Path(path) == xml_path:
+        if Path(path).name == xml_path.name:
             bin_path.write_bytes(b"changed")
         return real_scan_file(path, config=config)
 
@@ -6559,7 +6684,9 @@ def test_scan_model_streaming_skips_non_model_files(tmp_path: Path) -> None:
         )
 
     mock_scan.assert_called_once()
-    assert mock_scan.call_args.args[0] == str(model_file)
+    scanned_path = Path(mock_scan.call_args.args[0])
+    assert scanned_path.name == model_file.name
+    assert scanned_path != model_file
     assert mock_scan.call_args.kwargs["config"]["skip_file_types"] is True
     assert result.files_scanned == 1
 
@@ -6631,7 +6758,9 @@ def test_scan_model_streaming_skip_file_types_preserves_malicious_findings(tmp_p
         )
 
     mock_scan.assert_called_once()
-    assert mock_scan.call_args.args[0] == str(model_file)
+    scanned_path = Path(mock_scan.call_args.args[0])
+    assert scanned_path.name == model_file.name
+    assert scanned_path != model_file
     assert result.files_scanned == 1
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert determine_exit_code(result) == 1
@@ -6655,8 +6784,56 @@ def test_scan_model_streaming_keeps_non_model_files_when_skip_disabled(tmp_path:
             skip_file_types=False,
         )
 
-    assert [call.args[0] for call in mock_scan.call_args_list] == [str(ignored_file), str(model_file)]
+    scanned_paths = [Path(call.args[0]) for call in mock_scan.call_args_list]
+    assert [path.name for path in scanned_paths] == [ignored_file.name, model_file.name]
+    assert all(path not in {ignored_file, model_file} for path in scanned_paths)
+    assert set(result.file_metadata) == {str(ignored_file), str(model_file)}
     assert result.files_scanned == 2
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor binding")
+def test_scan_model_streaming_binds_unrooted_source_before_skip_filter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malicious yielded generation cannot be hidden by a pre-filter pathname swap."""
+    import modelaudit.core as core_module
+
+    source = create_malicious_pickle(tmp_path / "model.pkl")
+    retained_malicious = tmp_path / "retained-malicious.pkl"
+    benign_payload = pickle.dumps({"safe": True})
+    original_should_skip_file = core_module.should_skip_file
+    swapped = False
+
+    def swap_before_filter(path: str, *args: Any, **kwargs: Any) -> bool:
+        nonlocal swapped
+        if not swapped and Path(path) == source:
+            source.rename(retained_malicious)
+            source.write_bytes(benign_payload)
+            swapped = True
+        return original_should_skip_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(core_module, "should_skip_file", swap_before_filter)
+    try:
+        result = scan_model_streaming(
+            file_generator=iter([(source, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["pickle"],
+            skip_file_types=True,
+        )
+    finally:
+        if swapped:
+            source.unlink()
+            retained_malicious.rename(source)
+
+    assert swapped is True
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues), (
+        [(issue.severity, issue.message, issue.details) for issue in result.issues],
+        [(check.name, check.message, check.details) for check in result.checks],
+    )
+    assert determine_exit_code(result) == 1
 
 
 def test_scan_model_streaming_skips_huggingface_cache_metadata(
@@ -7106,7 +7283,9 @@ def test_scan_model_streaming_hf_cache_alias_rejects_pre_open_blob_aba(
     assert result.success is False
     assert any(check.name == "Local Source Boundary Check" for check in result.checks)
     assert blob_path.exists()
-    assert not model_link.exists()
+    # The alias generation changed before it could be cleanup-bound, so it is
+    # preserved alongside the terminal boundary failure.
+    assert model_link.is_symlink()
 
 
 def test_scan_model_streaming_hf_home_cache_symlink_allowed(
@@ -8084,8 +8263,10 @@ def test_scan_model_streaming_fails_closed_after_max_total_size(
         cache_enabled=False,
     )
 
-    assert hashed_paths == [payload]
-    assert result.files_scanned == 1
+    # The retained descriptor exposes the complete size before hashing, so the
+    # oversized source is rejected without spending any of the hash budget.
+    assert hashed_paths == []
+    assert result.files_scanned == 0
     assert result.success is False
     assert determine_exit_code(result) == 2
     assert any(issue.message.startswith("Total scan size limit exceeded") for issue in result.issues)
@@ -8120,7 +8301,9 @@ def test_scan_model_streaming_stops_hashing_at_max_total_size(
         cache_enabled=False,
     )
 
-    assert hashed_paths == [first, second]
+    assert [path.name for path in hashed_paths] == [first.name, second.name]
+    assert all(path not in {first, second} for path in hashed_paths)
+    assert set(result.file_metadata) == {str(first), str(second), str(third)}
     assert result.files_scanned == 3
     assert result.content_hash is None
     assert result.success is True
@@ -8220,7 +8403,7 @@ def test_scan_model_streaming_empty_generator():
     assert result.content_hash is None or result.content_hash == compute_aggregate_hash([])
 
 
-def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(tmp_path: Path) -> None:
+def test_scan_model_streaming_timeout_closes_generator_and_preserves_unbound_yielded_file(tmp_path: Path) -> None:
     streamed_file = tmp_path / "streamed.pkl"
     streamed_file.write_bytes(b"payload")
     generator_closed = False
@@ -8252,7 +8435,13 @@ def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(
     assert result.has_errors is True
     assert result.success is False
     assert generator_closed is True
-    assert not streamed_file.exists()
+    # Timeout is observed before this generation can be content-bound. Preserve
+    # it instead of risking deletion of a replacement selected during a race.
+    assert streamed_file.exists()
+    assert any(
+        issue.details.get("operational_error") is True and "omitted its selected generation" in issue.message
+        for issue in result.issues
+    )
     mock_scan.assert_not_called()
 
 
@@ -8287,8 +8476,8 @@ def test_scan_model_streaming_timeout_omits_successful_prefix_hash(
     assert result.content_hash is None
 
 
-def test_scan_model_streaming_interruption_closes_generator_and_deletes_yielded_file(tmp_path: Path) -> None:
-    streamed_file = tmp_path / "streamed.pkl"
+def test_scan_model_streaming_interruption_closes_generator_and_preserves_unbound_yielded_file(tmp_path: Path) -> None:
+    streamed_file = tmp_path / "streamed.json"
     streamed_file.write_bytes(b"payload")
     generator_closed = False
 
@@ -8310,39 +8499,45 @@ def test_scan_model_streaming_interruption_closes_generator_and_deletes_yielded_
         )
 
     assert generator_closed is True
-    assert not streamed_file.exists()
+    # Interruption is observed before this generation can be content-bound.
+    assert streamed_file.exists()
 
 
 def test_scan_model_streaming_delete_failure_is_operational_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    streamed_file = tmp_path / "streamed.pkl"
+    streamed_file = tmp_path / "streamed.json"
     streamed_file.write_bytes(b"payload")
-    original_unlink = Path.unlink
+    import modelaudit.core as core_module
 
-    def fail_streamed_unlink(path: Path, missing_ok: bool = False) -> None:
-        if path == streamed_file:
+    original_rename = core_module.os.rename
+
+    def fail_quarantine_rename(*args: Any, **kwargs: Any) -> None:
+        source_name = os.fspath(args[0]) if args else ""
+        if source_name == streamed_file.name and kwargs.get("src_dir_fd") is not None:
             raise PermissionError("delete denied")
-        original_unlink(path, missing_ok=missing_ok)
+        original_rename(*args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", fail_streamed_unlink)
+    monkeypatch.setattr(core_module.os, "rename", fail_quarantine_rename)
     monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: create_mock_scan_result())
 
     result = scan_model_streaming(
         file_generator=iter([(streamed_file, True)]),
         delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["metadata"],
+        max_total_size=4096,
     )
 
+    # A quarantine move failure preserves the exact retained generation.
     assert streamed_file.exists()
+    assert list(tmp_path.glob(".modelaudit-delete-*/source")) == []
     assert result.has_errors is True
     assert result.success is False
     assert determine_exit_code(result) == 2
     assert any(
-        issue.location == str(streamed_file)
-        and issue.details.get("operational_error") is True
-        and "delete denied" in issue.message
-        for issue in result.issues
+        issue.details.get("operational_error") is True and "delete denied" in issue.message for issue in result.issues
     )
 
 
@@ -8397,9 +8592,12 @@ def test_scan_model_streaming_accepts_generator_fallback_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    streamed_file = tmp_path / "streamed.pkl"
+    streamed_file = tmp_path / "streamed.json"
     streamed_file.write_bytes(b"payload")
+    import modelaudit.core as core_module
+
     original_unlink = Path.unlink
+    original_rename = core_module.os.rename
 
     def file_generator() -> Iterator[tuple[Path, bool]]:
         try:
@@ -8407,17 +8605,21 @@ def test_scan_model_streaming_accepts_generator_fallback_cleanup(
         finally:
             original_unlink(streamed_file)
 
-    def fail_streamed_unlink(path: Path, missing_ok: bool = False) -> None:
-        if path == streamed_file:
+    def fail_quarantine_rename(*args: Any, **kwargs: Any) -> None:
+        source_name = os.fspath(args[0]) if args else ""
+        if source_name == streamed_file.name and kwargs.get("src_dir_fd") is not None:
             raise PermissionError("delete denied")
-        original_unlink(path, missing_ok=missing_ok)
+        original_rename(*args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", fail_streamed_unlink)
+    monkeypatch.setattr(core_module.os, "rename", fail_quarantine_rename)
     monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: create_mock_scan_result())
 
     result = scan_model_streaming(
         file_generator=file_generator(),
         delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["metadata"],
+        max_total_size=4096,
     )
 
     assert not streamed_file.exists()

@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
@@ -57,6 +57,7 @@ MMAP_MAX_WINDOW = 500 * 1024 * 1024  # 500MB max window size
 
 # Parallel scanning parameters
 MAX_PARALLEL_WORKERS = 4
+MAX_SCANNABLE_SHARDS = 256
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
@@ -467,6 +468,16 @@ def _validated_stat_matches_target(opened_stat: os.stat_result, target: dict[str
     return stat.S_ISREG(opened_stat.st_mode) and all(
         not isinstance(target.get(key), int) or target[key] == current_value for key, current_value in expected_values
     )
+
+
+def _fstat_or_close_owned_descriptor(file_fd: int) -> os.stat_result:
+    """Read a newly owned descriptor's identity without leaking it on failure."""
+    try:
+        return os.fstat(file_fd)
+    except BaseException:
+        with suppress(OSError):
+            os.close(file_fd)
+        raise
 
 
 def _descriptor_path_for_open_file(file_fd: int) -> str | None:
@@ -1143,11 +1154,13 @@ def _pinned_windows_logical_scan_path(
     pinned_name: str,
     companion_targets: Mapping[str, tuple[str, dict[str, int | str]]] | None,
     *,
+    borrowed_source_fd: int | None = None,
     copy_max_bytes: int | None = None,
     deadline: float | None = None,
 ) -> Iterator[_PinnedShardScan]:
     """Stage descriptor-read bytes under logical filenames while retaining Windows guards."""
-    source_fd: int | None = None
+    source_fd: int | None = borrowed_source_fd
+    source_fd_owned = borrowed_source_fd is None
     source_stat: os.stat_result | None = None
     source_hash: str | None = None
     staged_source_fd: int | None = None
@@ -1174,7 +1187,8 @@ def _pinned_windows_logical_scan_path(
             remaining_copy_bytes -= copied_size
 
     try:
-        source_fd = _open_windows_shard_guard_fd(resolved_path)
+        if source_fd is None:
+            source_fd = _open_windows_shard_guard_fd(resolved_path)
         source_stat = os.fstat(source_fd)
         if not _validated_stat_matches_target(source_stat, target):
             raise _ShardPinUnavailableError("validated shard target changed before pinning")
@@ -1239,7 +1253,7 @@ def _pinned_windows_logical_scan_path(
             ):
                 raise _ShardPinUnavailableError("validated companion path escaped its scan directory")
             companion_fd = _open_windows_shard_guard_fd(companion_path)
-            companion_stat = os.fstat(companion_fd)
+            companion_stat = _fstat_or_close_owned_descriptor(companion_fd)
             if not _validated_stat_matches_target(companion_stat, companion_target):
                 os.close(companion_fd)
                 raise _ShardPinUnavailableError("validated companion target changed before pinning")
@@ -1294,7 +1308,7 @@ def _pinned_windows_logical_scan_path(
                 str(staged_companion),
                 open_reparse_point=True,
             )
-            staged_companion_stat = os.fstat(staged_companion_fd)
+            staged_companion_stat = _fstat_or_close_owned_descriptor(staged_companion_fd)
             staged_companion_fd_attributes = getattr(staged_companion_stat, "st_file_attributes", 0) or 0
             if (
                 not os.path.samestat(staged_companion_path_stat, staged_companion_stat)
@@ -1379,7 +1393,7 @@ def _pinned_windows_logical_scan_path(
             os.close(staged_source_fd)
         for companion_fd, _source_stat, _source_hash in reversed(companion_fds):
             os.close(companion_fd)
-        if source_fd is not None:
+        if source_fd_owned and source_fd is not None:
             os.close(source_fd)
         try:
             cleanup_root_guard: _WindowsStagingDirectoryGuard | None = staging_directory_guards.get(())
@@ -1468,8 +1482,8 @@ def _pinned_shard_scan_path(
 ) -> Iterator[_PinnedShardScan]:
     """Expose a validated shard through a directory descriptor immune to pathname ABA swaps."""
     if os.name == "nt":
-        if source_fd is not None or companion_fds:
-            raise _ShardPinUnavailableError("borrowed source descriptors are unsupported on Windows")
+        if companion_fds:
+            raise _ShardPinUnavailableError("borrowed companion descriptors are unsupported on Windows")
         if logical_path is not None or companion_targets:
             pinned_name = Path(logical_path).name if logical_path is not None else Path(resolved_path).name
             if not pinned_name or pinned_name in {".", ".."}:
@@ -1479,6 +1493,7 @@ def _pinned_shard_scan_path(
                 target,
                 pinned_name,
                 companion_targets,
+                borrowed_source_fd=source_fd,
                 copy_max_bytes=copy_max_bytes,
                 deadline=deadline,
             ) as windows_pinned_scan:
@@ -1704,7 +1719,7 @@ def _pinned_shard_scan_path(
                     os.O_RDONLY | nofollow | nonblock | cloexec,
                     dir_fd=companion_parent_fd,
                 )
-            companion_stat = os.fstat(companion_fd)
+            companion_stat = _fstat_or_close_owned_descriptor(companion_fd)
             if not _validated_stat_matches_target(companion_stat, companion_target):
                 os.close(companion_fd)
                 raise _ShardPinUnavailableError("validated companion target changed before pinning")
@@ -1723,7 +1738,7 @@ def _pinned_shard_scan_path(
                     raise _ShardPinUnavailableError("validated companion staging directory changed") from error
                 created_staging_directories.add(parent_parts)
                 created_parent_fd = os.open(parent_part, directory_flags, dir_fd=companion_staging_parent_fd)
-                created_parent_stat = os.fstat(created_parent_fd)
+                created_parent_stat = _fstat_or_close_owned_descriptor(created_parent_fd)
                 if (
                     not stat.S_ISDIR(created_parent_stat.st_mode)
                     or created_parent_stat.st_uid != effective_uid
@@ -1780,7 +1795,7 @@ def _pinned_shard_scan_path(
                     os.O_RDONLY | nofollow | nonblock | cloexec,
                     dir_fd=companion_staging_parent_fd,
                 )
-                pinned_companion_copy_stat = os.fstat(pinned_companion_copy_fd)
+                pinned_companion_copy_stat = _fstat_or_close_owned_descriptor(pinned_companion_copy_fd)
                 pinned_companion_copy_fds.append(
                     (pinned_companion_copy_fd, pinned_companion_copy_stat, companion_copy_hash)
                 )
@@ -2238,6 +2253,35 @@ class ShardedModelDetector:
         if expected_total is not None and current_total != expected_total:
             return None
         return current_index, current_total
+
+    @classmethod
+    def _add_bounded_family_candidate(
+        cls,
+        candidate: Path,
+        candidate_paths: dict[str, Path],
+        pattern: str,
+        *,
+        expected_total: int | None,
+        normalized_safetensors_stem: str | None,
+    ) -> bool:
+        """Retain one unique family candidate, returning False at the family cap."""
+        if (
+            cls._match_family_filename(
+                candidate.name,
+                pattern,
+                expected_total=expected_total,
+                normalized_safetensors_stem=normalized_safetensors_stem,
+            )
+            is None
+        ):
+            return True
+        normalized_candidate = os.path.normcase(os.path.normpath(os.path.abspath(candidate)))
+        if normalized_candidate in candidate_paths:
+            return True
+        if len(candidate_paths) >= MAX_SCANNABLE_SHARDS:
+            return False
+        candidate_paths[normalized_candidate] = candidate
+        return True
 
     @classmethod
     def match_shard_filename(cls, file_name: str) -> dict[str, int | str | None] | None:
@@ -3116,24 +3160,10 @@ class ShardedModelDetector:
             index_inspection_context or _CURRENT_SAFETENSORS_INDEX_CONTEXT.get() or _SafetensorsIndexInspectionContext()
         )
         requested_path = str(Path(file_path).absolute())
-        normalized_allowed_targets = (
-            {
-                os.path.normcase(os.path.normpath(os.path.abspath(source_path))): target
-                for source_path, target in allowed_targets.items()
-                if isinstance(source_path, str) and isinstance(target, dict)
-            }
-            if allowed_targets is not None
-            else None
-        )
-        validated_peer_paths = (
-            [Path(source_path) for source_path in allowed_targets if isinstance(source_path, str)]
-            if allowed_targets is not None
-            else []
-        )
         allowed_path_set: set[str] | None = None
         if allowed_paths is not None:
             allowed_path_set = {os.path.normcase(os.path.normpath(os.path.abspath(path))) for path in allowed_paths}
-        elif normalized_allowed_targets is None:
+        elif allowed_targets is None:
             allowed_path_set = cls._direct_hf_shard_allowed_paths(Path(file_path))
 
         safetensors_match = cls.match_safetensors_shard_filename(file_name)
@@ -3166,6 +3196,7 @@ class ShardedModelDetector:
                 shard_targets: dict[str, dict[str, int | str]] = {}
                 seen_target_identities: set[tuple[int | str, ...]] = set()
                 total_size = 0
+                family_member_limit_exceeded = False
                 requested_expected_total: int | None = None
                 if safetensors_match is not None:
                     raw_expected_total = safetensors_match["expected_total_shards"]
@@ -3176,6 +3207,56 @@ class ShardedModelDetector:
                     with suppress(IndexError, ValueError):
                         requested_expected_total = int(match.group(2))
                         expected_totals.add(requested_expected_total)
+                normalized_allowed_targets: ValidatedShardTargets | None = None
+                validated_peer_paths: list[Path] = []
+                if allowed_targets is not None:
+                    normalized_allowed_targets = {}
+                    untyped_allowed_targets: Mapping[Any, Any] = allowed_targets
+                    normalized_requested_path = os.path.normcase(os.path.normpath(os.path.abspath(file_path)))
+                    # The requested shard is the dispatch authority. Reserve its
+                    # slot before bounded peers so mapping order cannot evict it.
+                    for source_path, target in untyped_allowed_targets.items():
+                        if not isinstance(source_path, str) or not isinstance(target, dict):
+                            continue
+                        normalized_source = os.path.normcase(os.path.normpath(os.path.abspath(source_path)))
+                        if normalized_source != normalized_requested_path:
+                            continue
+                        peer_path = Path(source_path)
+                        if (
+                            cls._match_family_filename(
+                                peer_path.name,
+                                pattern,
+                                expected_total=requested_expected_total,
+                                normalized_safetensors_stem=normalized_safetensors_stem,
+                            )
+                            is not None
+                        ):
+                            normalized_allowed_targets[normalized_source] = target
+                            validated_peer_paths.append(peer_path)
+                        break
+                    for source_path, target in untyped_allowed_targets.items():
+                        if not isinstance(source_path, str) or not isinstance(target, dict):
+                            continue
+                        peer_path = Path(source_path)
+                        if (
+                            cls._match_family_filename(
+                                peer_path.name,
+                                pattern,
+                                expected_total=requested_expected_total,
+                                normalized_safetensors_stem=normalized_safetensors_stem,
+                            )
+                            is None
+                        ):
+                            continue
+                        normalized_source = os.path.normcase(os.path.normpath(os.path.abspath(source_path)))
+                        if normalized_source in normalized_allowed_targets:
+                            continue
+                        if len(normalized_allowed_targets) >= MAX_SCANNABLE_SHARDS:
+                            family_member_limit_exceeded = True
+                            unvalidated_shards.append(source_path)
+                            break
+                        normalized_allowed_targets[normalized_source] = target
+                        validated_peer_paths.append(peer_path)
                 index_inventory = cls._load_safetensors_index_inventory(
                     dir_path,
                     pattern,
@@ -3199,11 +3280,55 @@ class ShardedModelDetector:
                             cls._safetensors_inventory_file_relationship(index_inventory, Path(file_path)) is True
                         )
 
-                # Collect local siblings and caller-snapshotted peers; validated index targets are added below.
+                # Collect bounded family candidates from local siblings and caller-snapshotted peers;
+                # validated index targets are added below.
                 candidate_paths: dict[str, Path] = {}
-                for candidate in (Path(file_path), *dir_path.glob("*"), *validated_peer_paths):
-                    normalized_candidate = os.path.normcase(os.path.normpath(os.path.abspath(candidate)))
-                    candidate_paths.setdefault(normalized_candidate, candidate)
+                current_path = Path(file_path)
+
+                cls._add_bounded_family_candidate(
+                    current_path,
+                    candidate_paths,
+                    pattern,
+                    expected_total=requested_expected_total,
+                    normalized_safetensors_stem=normalized_safetensors_stem,
+                )
+                try:
+                    for entry_count, candidate in enumerate(dir_path.iterdir(), start=1):
+                        if entry_count > MAX_SAFETENSORS_SHARD_INDEX_DIRECTORY_ENTRIES:
+                            shard_info.setdefault(
+                                "safetensors_index_error", "safetensors shard sibling inspection limit exceeded"
+                            )
+                            unvalidated_shards.append(str(dir_path))
+                            break
+                        if not cls._add_bounded_family_candidate(
+                            candidate,
+                            candidate_paths,
+                            pattern,
+                            expected_total=requested_expected_total,
+                            normalized_safetensors_stem=normalized_safetensors_stem,
+                        ):
+                            family_member_limit_exceeded = True
+                            if str(candidate) not in unvalidated_shards:
+                                unvalidated_shards.append(str(candidate))
+                            break
+                except OSError:
+                    shard_info.setdefault(
+                        "safetensors_index_error",
+                        "safetensors shard sibling inspection failed",
+                    )
+                    unvalidated_shards.append(str(dir_path))
+                for candidate in validated_peer_paths:
+                    if not cls._add_bounded_family_candidate(
+                        candidate,
+                        candidate_paths,
+                        pattern,
+                        expected_total=requested_expected_total,
+                        normalized_safetensors_stem=normalized_safetensors_stem,
+                    ):
+                        family_member_limit_exceeded = True
+                        if str(candidate) not in unvalidated_shards:
+                            unvalidated_shards.append(str(candidate))
+                        break
                 if index_inventory is not None and index_inventory.error is None:
                     candidate_aliases_by_name: dict[str, list[Path]] = {}
                     for candidate in candidate_paths.values():
@@ -3250,10 +3375,23 @@ class ShardedModelDetector:
                                 if matches_existing_alias:
                                     continue
                             normalized_expected = os.path.normcase(os.path.normpath(os.path.abspath(expected_path)))
-                            candidate_paths.setdefault(normalized_expected, expected_path)
+                            if normalized_expected not in candidate_paths and not cls._add_bounded_family_candidate(
+                                expected_path,
+                                candidate_paths,
+                                pattern,
+                                expected_total=requested_expected_total,
+                                normalized_safetensors_stem=normalized_safetensors_stem,
+                            ):
+                                family_member_limit_exceeded = True
+                                if str(expected_path) not in unvalidated_shards:
+                                    unvalidated_shards.append(str(expected_path))
+                                break
 
                 shard_indices: dict[str, int] = {}
-                for file in sorted(candidate_paths.values(), key=str):
+                for file in sorted(
+                    candidate_paths.values(),
+                    key=lambda candidate: (candidate != current_path, str(candidate)),
+                ):
                     family_match = cls._match_family_filename(
                         file.name,
                         pattern,
@@ -3362,8 +3500,10 @@ class ShardedModelDetector:
                             present_indices.add(candidate_shard_index)
                             shard_indices[str(file)] = candidate_shard_index
 
-                if not shard_info["shards"]:
-                    return None
+                if family_member_limit_exceeded:
+                    shard_info["shard_family_member_limit_exceeded"] = True
+                    shard_info["maximum_scannable_shards"] = MAX_SCANNABLE_SHARDS
+                    shard_info.setdefault("safetensors_index_error", "shard family member limit exceeded")
 
                 if requested_expected_total is not None:
                     authoritative_indices = (
@@ -3931,6 +4071,24 @@ class ParallelShardHandler:
         completed_shards = 0
         success = True
 
+        if total_shards > MAX_SCANNABLE_SHARDS:
+            _mark_inconclusive_scan_outcome(result, "shard_count_limit_exceeded")
+            result.add_check(
+                name="Sharded Model Coverage Check",
+                passed=False,
+                message="Shard family exceeds the bounded parallel scan limit; scan coverage is incomplete.",
+                severity=IssueSeverity.INFO,
+                details={
+                    "total_shards": total_shards,
+                    "maximum_scannable_shards": MAX_SCANNABLE_SHARDS,
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_count_limit_exceeded",
+                },
+            )
+            result.finish(success=False)
+            return result
+
         # Add info about sharded model
         result.add_check(
             name="Sharded Model Detection",
@@ -3988,52 +4146,65 @@ class ParallelShardHandler:
                 result.finish(success=False)
                 return result
 
-        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_WORKERS, total_shards)) as executor:
-            # Submit all shard scans
-            future_to_shard = {
-                executor.submit(copy_context().run, self._scan_single_shard, shard): shard for shard in shards
-            }
+        max_workers = min(MAX_PARALLEL_WORKERS, total_shards)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            shard_iterator = iter(shards)
+            pending: dict[Future[Any], str] = {}
 
-            # Process results as they complete
-            for future in as_completed(future_to_shard):
-                shard = future_to_shard[future]
-                completed_shards += 1
-
+            def submit_next_shard() -> bool:
                 try:
-                    shard_result = future.result(timeout=SHARD_SCAN_TIMEOUT)
-                    result.merge(shard_result)
-                    success = success and bool(shard_result.success)
+                    shard = next(shard_iterator)
+                except StopIteration:
+                    return False
+                pending[executor.submit(copy_context().run, self._scan_single_shard, shard)] = shard
+                return True
 
-                    if progress_callback:
-                        percentage = (completed_shards / total_shards) * 100
-                        progress_callback(f"Scanned shard {completed_shards}/{total_shards}", percentage)
+            for _ in range(max_workers):
+                submit_next_shard()
 
-                except Exception as e:
-                    from ...scanners._evidence_redaction import (
-                        redact_evidence_string,
-                        redact_untrusted_error_message,
-                    )
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    shard = pending.pop(future)
+                    completed_shards += 1
 
-                    safe_shard = redact_evidence_string(shard, max_chars=500)
-                    safe_shard_name = redact_evidence_string(Path(shard).name, max_chars=500)
-                    safe_error = redact_untrusted_error_message(e)
-                    logger.error("Error scanning shard %s: %s", safe_shard, safe_error)
-                    success = False
-                    _mark_inconclusive_scan_outcome(result, "shard_scan_error")
-                    result.add_check(
-                        name="Shard Scan",
-                        passed=False,
-                        message=f"Error scanning shard: {safe_shard_name}",
-                        severity=IssueSeverity.INFO,
-                        location=safe_shard,
-                        details={
-                            "error": safe_error,
-                            "exception_type": type(e).__name__,
-                            "analysis_incomplete": True,
-                            "scan_outcome": "inconclusive",
-                            "scan_outcome_reason": "shard_scan_error",
-                        },
-                    )
+                    try:
+                        shard_result = future.result(timeout=SHARD_SCAN_TIMEOUT)
+                        result.merge(shard_result)
+                        success = success and bool(shard_result.success)
+
+                        if progress_callback:
+                            percentage = (completed_shards / total_shards) * 100
+                            progress_callback(f"Scanned shard {completed_shards}/{total_shards}", percentage)
+
+                    except Exception as e:
+                        from ...scanners._evidence_redaction import (
+                            redact_evidence_string,
+                            redact_untrusted_error_message,
+                        )
+
+                        safe_shard = redact_evidence_string(shard, max_chars=500)
+                        safe_shard_name = redact_evidence_string(Path(shard).name, max_chars=500)
+                        safe_error = redact_untrusted_error_message(e)
+                        logger.error("Error scanning shard %s: %s", safe_shard, safe_error)
+                        success = False
+                        _mark_inconclusive_scan_outcome(result, "shard_scan_error")
+                        result.add_check(
+                            name="Shard Scan",
+                            passed=False,
+                            message=f"Error scanning shard: {safe_shard_name}",
+                            severity=IssueSeverity.INFO,
+                            location=safe_shard,
+                            details={
+                                "error": safe_error,
+                                "exception_type": type(e).__name__,
+                                "analysis_incomplete": True,
+                                "scan_outcome": "inconclusive",
+                                "scan_outcome_reason": "shard_scan_error",
+                            },
+                        )
+
+                    submit_next_shard()
 
         if expected_members is not None and family_dir is not None:
             membership_error: str | None
@@ -4116,8 +4287,15 @@ class ParallelShardHandler:
             family_directories.update(
                 Path(source_path).parent for source_path in shard_targets if isinstance(source_path, str)
             )
+        total_entries_inspected = 0
         for family_directory in family_directories:
-            for candidate in family_directory.glob("*"):
+            for directory_entries_inspected, candidate in enumerate(family_directory.iterdir(), start=1):
+                total_entries_inspected += 1
+                if (
+                    directory_entries_inspected > MAX_SAFETENSORS_SHARD_INDEX_DIRECTORY_ENTRIES
+                    or total_entries_inspected > MAX_SAFETENSORS_SHARD_INDEX_TOTAL_DIRECTORY_ENTRIES
+                ):
+                    raise OSError("shard family membership inspection limit exceeded")
                 if (
                     ShardedModelDetector._match_family_filename(
                         candidate.name,
@@ -4131,6 +4309,8 @@ class ParallelShardHandler:
                 ):
                     continue
                 members.add(str(candidate.absolute()))
+                if len(members) > MAX_SCANNABLE_SHARDS:
+                    raise OSError("shard family member limit exceeded")
         return members
 
     def _scan_single_shard(self, shard_path: str) -> "ScanResult":

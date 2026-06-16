@@ -870,6 +870,8 @@ class TestModelAuditResultModel:
     def test_aggregate_scan_result_direct_check_only_incomplete_coverage_fails_closed(self) -> None:
         """Direct aggregation should honor incomplete coverage retained only in check details."""
         result = create_initial_audit_result()
+        result.aggregate_scan_result({"content_hash": "a" * 64, "success": True})
+        assert result.content_hash == "a" * 64
         scan_result = ScanResult(scanner_name="dvc")
         scan_result.add_check(
             name="DVC Output Resolution",
@@ -887,6 +889,7 @@ class TestModelAuditResultModel:
         assert result.success is False
         assert result.checks[0].details["scan_outcome_reason"] == "dvc_analysis_incomplete"
         assert determine_exit_code(result) == 2
+        assert result.content_hash is None
 
     def test_aggregate_scan_result_direct_runtime_version_skip_does_not_fail_coverage_success(self) -> None:
         """Direct aggregation should also exempt expected runtime-version skips."""
