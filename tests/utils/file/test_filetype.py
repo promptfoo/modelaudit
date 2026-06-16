@@ -4221,6 +4221,33 @@ def test_detect_file_format_fails_closed_when_nemo_route_probe_limit_is_reached(
     assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
+def test_nested_sparse_metadata_uses_sparse_probe_exception_factory() -> None:
+    tar_info_class = file_detection.bounded_tar_info_class(1)
+    tar_info = tar_info_class("sparse.bin")
+    budget = tar_info_class._modelaudit_metadata_budget
+    general_factory = tar_info_class._modelaudit_exception_factory
+    sparse_factory = tar_info_class._modelaudit_sparse_exception_factory
+    wrapped = file_detection._TarMetadataBoundedFile(io.BytesIO(b"xx"), budget, general_factory)
+
+    class FakeTarFile:
+        fileobj: Any = wrapped
+
+    fake_tar = FakeTarFile()
+
+    def process_sparse_metadata() -> tarfile.TarInfo:
+        fake_tar.fileobj.read(2)
+        return tar_info
+
+    with pytest.raises(file_detection._NemoRouteSparseProbeBudgetExceeded):
+        tar_info._process_metadata(
+            cast(Any, fake_tar),
+            process_sparse_metadata,
+            exception_factory=sparse_factory,
+        )
+
+    assert wrapped._exception_factory is general_factory
+
+
 def test_detect_file_format_fails_closed_when_nemo_link_resolution_budget_is_reached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

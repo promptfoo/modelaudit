@@ -5805,6 +5805,10 @@ class _NemoRouteProbeBudgetExceeded(Exception):
     """Raised when bounded NeMo TAR routing would need too much stream data."""
 
 
+class _NemoRouteSparseProbeBudgetExceeded(_NemoRouteProbeBudgetExceeded):
+    """Raised when a GNU sparse extension chain exceeds the routing budget."""
+
+
 _TarMetadataExceptionFactory = Callable[[str, int, int], Exception]
 
 
@@ -5849,6 +5853,7 @@ class _BoundedTarInfo(tarfile.TarInfo):
 
     _modelaudit_metadata_budget: ClassVar[_TarMetadataBudget]
     _modelaudit_exception_factory: ClassVar[_TarMetadataExceptionFactory]
+    _modelaudit_sparse_exception_factory: ClassVar[_TarMetadataExceptionFactory]
 
     def _check_extension_header_size(self, header_kind: str) -> None:
         padded_size = ((max(self.size, 0) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
@@ -5860,16 +5865,29 @@ class _BoundedTarInfo(tarfile.TarInfo):
                 budget.max_bytes,
             )
 
-    def _process_metadata(self, tar_file: tarfile.TarFile, processor: Callable[[], tarfile.TarInfo]) -> tarfile.TarInfo:
+    def _process_metadata(
+        self,
+        tar_file: tarfile.TarFile,
+        processor: Callable[[], tarfile.TarInfo],
+        *,
+        exception_factory: _TarMetadataExceptionFactory | None = None,
+    ) -> tarfile.TarInfo:
         budget = type(self)._modelaudit_metadata_budget
         current_fileobj = tar_file.fileobj
         if isinstance(current_fileobj, _TarMetadataBoundedFile) and current_fileobj.budget is budget:
-            return processor()
+            if exception_factory is None:
+                return processor()
+            original_exception_factory = current_fileobj._exception_factory
+            current_fileobj._exception_factory = exception_factory
+            try:
+                return processor()
+            finally:
+                current_fileobj._exception_factory = original_exception_factory
 
         tar_file.fileobj = _TarMetadataBoundedFile(
             current_fileobj,
             budget,
-            type(self)._modelaudit_exception_factory,
+            exception_factory or type(self)._modelaudit_exception_factory,
         )
         try:
             return processor()
@@ -5888,13 +5906,18 @@ class _BoundedTarInfo(tarfile.TarInfo):
 
     def _proc_sparse(self, tar_file: tarfile.TarFile) -> tarfile.TarInfo:
         parent = cast(Any, super())
-        return self._process_metadata(tar_file, lambda: cast(tarfile.TarInfo, parent._proc_sparse(tar_file)))
+        return self._process_metadata(
+            tar_file,
+            lambda: cast(tarfile.TarInfo, parent._proc_sparse(tar_file)),
+            exception_factory=type(self)._modelaudit_sparse_exception_factory,
+        )
 
 
 def bounded_tar_info_class(
     max_metadata_bytes: int,
     *,
     exception_factory: _TarMetadataExceptionFactory | None = None,
+    sparse_exception_factory: _TarMetadataExceptionFactory | None = None,
 ) -> type[_BoundedTarInfo]:
     """Create an archive-local TarInfo class with one cumulative metadata budget."""
     normalized_limit = max(1, max_metadata_bytes)
@@ -5902,12 +5925,21 @@ def bounded_tar_info_class(
     def default_exception_factory(message: str, _bytes_read: int, _max_bytes: int) -> Exception:
         return _NemoRouteProbeBudgetExceeded(message)
 
+    def default_sparse_exception_factory(message: str, _bytes_read: int, _max_bytes: int) -> Exception:
+        return _NemoRouteSparseProbeBudgetExceeded(message)
+
+    resolved_exception_factory = exception_factory or default_exception_factory
+    resolved_sparse_exception_factory = (
+        sparse_exception_factory or exception_factory or default_sparse_exception_factory
+    )
+
     return type(
         "_ArchiveBoundedTarInfo",
         (_BoundedTarInfo,),
         {
             "_modelaudit_metadata_budget": _TarMetadataBudget(normalized_limit),
-            "_modelaudit_exception_factory": exception_factory or default_exception_factory,
+            "_modelaudit_exception_factory": resolved_exception_factory,
+            "_modelaudit_sparse_exception_factory": resolved_sparse_exception_factory,
         },
     )
 
@@ -6111,6 +6143,7 @@ def _gzip_tar_trailing_data_status(
     *,
     max_decompressed_bytes: int | None = None,
     max_decompression_ratio: float | None = None,
+    max_entries: int | None = None,
 ) -> _GzipTarTrailingStatus | None:
     """Return proven gzip TAR stream-tail status after the TAR EOF padding."""
     decompressed_limit = _normalize_positive_int(
@@ -6121,6 +6154,7 @@ def _gzip_tar_trailing_data_status(
         max_decompression_ratio,
         _TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSION_RATIO,
     )
+    entry_limit = _normalize_positive_int(max_entries, _NEMO_ROUTE_MAX_ENTRIES)
     try:
         compressed_size = path.stat().st_size
         with path.open("rb") as raw:
@@ -6153,7 +6187,7 @@ def _gzip_tar_trailing_data_status(
                     except (EOFError, OSError, tarfile.TarError, zlib.error):
                         return None
                     for entry_count, _member in enumerate(archive, start=1):
-                        if entry_count > _NEMO_ROUTE_MAX_ENTRIES:
+                        if entry_count > entry_limit:
                             return "invalid"
                     cast(Any, archive.fileobj).bufsize = _TAR_GZIP_POST_EOF_TRAILING_READ_BYTES
                     while True:
@@ -6171,12 +6205,14 @@ def gzip_tar_trailing_data_status(
     *,
     max_decompressed_bytes: int | None = None,
     max_decompression_ratio: float | None = None,
+    max_entries: int | None = None,
 ) -> _GzipTarTrailingStatus | None:
     """Return proven gzip TAR stream-tail status after archive EOF."""
     return _gzip_tar_trailing_data_status(
         Path(path),
         max_decompressed_bytes=max_decompressed_bytes,
         max_decompression_ratio=max_decompression_ratio,
+        max_entries=max_entries,
     )
 
 
@@ -6336,12 +6372,10 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
                         root_config_links.append(member)
     except _NemoRouteResolutionLimitExceeded:
         return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    except _NemoRouteSparseProbeBudgetExceeded:
+        return NEMO_ROUTING_INCONCLUSIVE_FORMAT
     except _NemoRouteProbeBudgetExceeded:
-        return (
-            "tar"
-            if _has_supported_tar_compression_wrapper(file_path) and find_hdf5_signature_offset(path) is None
-            else NEMO_ROUTING_INCONCLUSIVE_FORMAT
-        )
+        return "tar" if find_hdf5_signature_offset(path) is None else NEMO_ROUTING_INCONCLUSIVE_FORMAT
     except (EOFError, OSError, tarfile.TarError):
         return None
 

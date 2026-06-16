@@ -2199,6 +2199,7 @@ def _gzip_tar_trailing_status_for_config(path: str, config: dict[str, Any] | Non
         path,
         max_decompressed_bytes=config.get("compressed_max_decompressed_bytes") if config is not None else None,
         max_decompression_ratio=config.get("compressed_max_decompression_ratio") if config is not None else None,
+        max_entries=config.get("max_tar_entries") if config is not None else None,
     )
 
 

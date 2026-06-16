@@ -345,6 +345,36 @@ class TestNemoScannerBasic:
         assert result.scanner_name == "nemo"
         assert calls == 1
 
+    def test_gzip_nemo_tail_validation_uses_configured_entry_limit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 2)
+        path = tmp_path / "configured-entry-limit.nemo"
+        with tarfile.open(path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+            _add_tar_bytes(archive, "weights-1.bin", b"safe")
+            _add_tar_bytes(archive, "weights-2.bin", b"safe")
+
+        configured = scan_file(
+            str(path),
+            config={"cache_enabled": False, "max_tar_entries": 4},
+        )
+        scanner_limited = scan_file(
+            str(path),
+            config={"cache_enabled": False, "max_tar_entries": 2},
+        )
+
+        assert configured.scanner_name == "nemo"
+        assert configured.success is True
+        assert not [check for check in configured.checks if check.name == "Compressed TAR Stream Integrity"]
+        assert scanner_limited.success is False
+        assert any(
+            check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+            for check in scanner_limited.checks
+        )
+
     def test_gzip_nemo_tail_validation_uses_chunked_tar_reads(
         self,
         tmp_path: Path,
@@ -4060,6 +4090,64 @@ class TestCVE202523304HydraTarget:
             and check.details["target"] == "os.system"
             for check in result.checks
         )
+
+    @pytest.mark.parametrize(
+        ("target", "expected_success", "expected_exit_code"),
+        [("torch.nn.Linear", True, 0), ("os.system", False, 1)],
+    )
+    def test_raw_tar_metadata_route_overflow_hands_off_to_tar_scanner(
+        self,
+        tmp_path: Path,
+        target: str,
+        expected_success: bool,
+        expected_exit_code: int,
+    ) -> None:
+        path = tmp_path / f"raw-large-pax-{'safe' if expected_success else 'malicious'}.jpg"
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as archive:
+            metadata = tarfile.TarInfo("metadata.bin")
+            metadata.pax_headers = {"comment": "x" * (file_detection._NEMO_ROUTE_MAX_METADATA_BYTES + 1)}
+            archive.addfile(metadata, io.BytesIO())
+            _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
+
+        assert file_detection.detect_file_format(str(path)) == "tar"
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        assert direct.scanner_name == "tar"
+        assert direct.success is expected_success
+        assert "nemo_routing_incomplete" not in direct.metadata.get("scan_outcome_reasons", [])
+        assert any(check.details.get("cve_id") == "CVE-2025-23304" for check in direct.checks) is (not expected_success)
+        assert determine_exit_code(aggregate) == expected_exit_code
+
+    def test_raw_tar_metadata_route_overflow_remains_uncacheable_when_tar_limit_is_lower(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "raw-large-pax-incomplete.jpg"
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as archive:
+            metadata = tarfile.TarInfo("metadata.bin")
+            metadata.pax_headers = {"comment": "x" * (file_detection._NEMO_ROUTE_MAX_METADATA_BYTES + 1)}
+            archive.addfile(metadata, io.BytesIO())
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+
+        cache_dir = tmp_path / "raw-pax-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_metadata_bytes=32 * 1024,
+            )
+
+            file_metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is False
+            assert "tar_metadata_read_limit_exceeded" in file_metadata["scan_outcome_reasons"]
+            assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     @pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
     def test_renamed_compressed_nemo_after_route_budget_scans_benign_config(
