@@ -5039,20 +5039,52 @@ def test_hf_tokenizer_json_eof_proof_uses_configured_chunk_size(
     assert set(read_sizes) == {chunk_size}
 
 
-def test_hf_tokenizer_json_eof_proof_bypasses_cache_without_reliable_change_time(
+def test_hf_tokenizer_json_eof_proof_reuses_only_within_scan_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=8192)
-    proof_cache = file_detection._hf_tokenizer_json_eof_proves_ownership_cached
-    proof_cache.cache_clear()
-    monkeypatch.setattr(file_detection, "_supports_reliable_hf_tokenizer_eof_cache_identity", lambda: False)
+    original_proof = file_detection._hf_tokenizer_json_eof_proves_ownership_for_identity
+    proof_calls = 0
 
+    def counting_proof(*args: Any, **kwargs: Any) -> bool:
+        nonlocal proof_calls
+        proof_calls += 1
+        return original_proof(*args, **kwargs)
+
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_json_eof_proves_ownership_for_identity", counting_proof)
+
+    with file_detection.huggingface_tokenizer_json_eof_proof_scope() as proof_scope:
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+        assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+
+    assert proof_scope.stable is True
+    assert proof_calls == 1
     assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
-    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
-    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
-    assert proof_cache.cache_info().hits == 0
-    assert proof_cache.cache_info().misses == 0
+    assert proof_calls == 2
+
+
+def test_hf_tokenizer_json_eof_proof_scope_digest_rejects_restored_metadata_rewrite(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"clean":[{"op":"null","name":"data","inputs":[]}],"safe_keys":[0],"quiet":[[0,0,0]]',
+    )
+    conflict_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "conflict.json",
+        late_fields=',"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]',
+    )
+    conflict_bytes = conflict_path.read_bytes()
+    clean_stat = tokenizer_path.stat()
+    assert len(conflict_bytes) == clean_stat.st_size
+
+    with file_detection.huggingface_tokenizer_json_eof_proof_scope() as proof_scope:
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+        time.sleep(0.01)
+        tokenizer_path.write_bytes(conflict_bytes)
+        os.utime(tokenizer_path, ns=(clean_stat.st_atime_ns, clean_stat.st_mtime_ns))
+
+    assert proof_scope.stable is False
 
 
 def test_hf_tokenizer_json_eof_proof_rejects_late_conflict_after_old_budget(
@@ -5073,8 +5105,6 @@ def test_hf_tokenizer_json_eof_proof_rejects_late_conflict_after_old_budget(
 
 
 def test_hf_tokenizer_json_eof_proof_rechecks_same_inode_restored_mtime_conflict(tmp_path: Path) -> None:
-    proof_cache = file_detection._hf_tokenizer_json_eof_proves_ownership_cached
-    proof_cache.cache_clear()
     tokenizer_path = _write_ordered_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
         late_fields=',"clean":[{"op":"null","name":"data","inputs":[]}],"safe_keys":[0],"quiet":[[0,0,0]]',
@@ -5100,14 +5130,8 @@ def test_hf_tokenizer_json_eof_proof_rechecks_same_inode_restored_mtime_conflict
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
     assert file_detection.huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(tokenizer_path) is True
     assert detect_file_format(str(tokenizer_path)) == "mxnet"
-    cache_info = proof_cache.cache_info()
-    if os.name == "nt":
-        assert cache_info.misses == 0
-    else:
-        assert cache_info.misses == 2
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Windows st_ctime_ns is creation time, not reliable change time")
 def test_hf_tokenizer_json_eof_proof_rejects_post_eof_same_inode_rewrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5163,7 +5187,8 @@ def test_hf_tokenizer_json_eof_proof_rejects_post_eof_same_inode_rewrite(
     assert rewritten_stat.st_ino == clean_stat.st_ino
     assert rewritten_stat.st_size == clean_stat.st_size
     assert rewritten_stat.st_mtime_ns == clean_stat.st_mtime_ns
-    assert rewritten_stat.st_ctime_ns != clean_stat.st_ctime_ns
+    if os.name != "nt":
+        assert rewritten_stat.st_ctime_ns != clean_stat.st_ctime_ns
     assert file_detection.huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(tokenizer_path) is True
 
 

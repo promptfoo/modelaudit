@@ -12662,20 +12662,38 @@ def test_scan_file_eof_tokenizer_ownership_proof_is_cached_per_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
-    monkeypatch.setattr(file_detection, "_supports_reliable_hf_tokenizer_eof_cache_identity", lambda: True)
     tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=4096)
-    proof = file_detection._hf_tokenizer_json_eof_proves_ownership_cached
-    proof.cache_clear()
+    original_proof = file_detection._hf_tokenizer_json_eof_proves_ownership_for_identity
+    proof_calls = 0
 
-    try:
-        result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
-        cache_info = proof.cache_info()
-    finally:
-        proof.cache_clear()
+    def counting_proof(*args: Any, **kwargs: Any) -> bool:
+        nonlocal proof_calls
+        proof_calls += 1
+        return original_proof(*args, **kwargs)
+
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_json_eof_proves_ownership_for_identity", counting_proof)
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
 
     assert result.success is True
-    assert cache_info.misses == 1
-    assert cache_info.hits >= 1
+    assert proof_calls == 1
+
+
+def test_scan_file_fails_closed_when_tokenizer_proof_scope_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=4096)
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_json_digest_matches_identity", lambda *args: False)
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert "tokenizer_json_changed_during_scan" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Tokenizer JSON Identity Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
 
 
 def test_scan_file_oversized_hf_tokenizer_json_does_not_fail_closed_as_mxnet(tmp_path: Path) -> None:

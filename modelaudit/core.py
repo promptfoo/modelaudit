@@ -110,6 +110,7 @@ from modelaudit.utils.file.detection import (
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     gzip_tar_trailing_data_status,
+    huggingface_tokenizer_json_eof_proof_scope,
     huggingface_tokenizer_json_has_jax_route_evidence,
     huggingface_tokenizer_json_has_template_route_evidence,
     is_confirmed_jax_json_checkpoint_file,
@@ -6082,8 +6083,23 @@ def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     config.setdefault(NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_file)
     validate_scan_config(config)
 
-    # Delegate to internal implementation - cache decorator handles caching
-    return _scan_file_internal(path, config)
+    # Delegate to internal implementation - cache decorator handles caching.
+    with huggingface_tokenizer_json_eof_proof_scope() as tokenizer_proof_scope:
+        result = _scan_file_internal(path, config)
+    if not tokenizer_proof_scope.stable:
+        reason = "tokenizer_json_changed_during_scan"
+        result.add_check(
+            name="Tokenizer JSON Identity Check",
+            passed=False,
+            message="Tokenizer JSON changed while its ownership proof was in use; scan coverage is incomplete.",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={"analysis_incomplete": True, "scan_outcome": "inconclusive", "scan_outcome_reason": reason},
+        )
+        _mark_operational_scan_error(result, reason)
+        _mark_inconclusive_scan_outcome(result, reason)
+        result.finish(success=False)
+    return result
 
 
 def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> ScanResult:
