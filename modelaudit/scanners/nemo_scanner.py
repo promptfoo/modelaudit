@@ -1397,6 +1397,15 @@ class NemoScanner(BaseScanner):
             },
         )
 
+    @staticmethod
+    def _downgrade_identity_attributable_integrity_failure(result: ScanResult) -> None:
+        for check in result.checks:
+            if check.name == "NeMo Archive Integrity":
+                check.severity = IssueSeverity.INFO
+        for issue in result.issues:
+            if issue.details.get("scan_outcome_reason") == "nemo_archive_integrity_incomplete":
+                issue.severity = IssueSeverity.INFO
+
     def scan(self, path: str) -> ScanResult:
         budget_scanner = TarScanner(config=dict(self.config))
         with _tar_shared_scan_budget_scope(
@@ -1509,6 +1518,10 @@ class NemoScanner(BaseScanner):
                         message=f"Failed to open NeMo archive: {e}",
                         severity=IssueSeverity.WARNING,
                         location=path,
+                        details={
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "nemo_archive_integrity_incomplete",
+                        },
                     )
                     result.success = False
             if not is_declared_nemo:
@@ -1533,6 +1546,7 @@ class NemoScanner(BaseScanner):
             )
             archive_file.close()
         if archive_source_changed:
+            self._downgrade_identity_attributable_integrity_failure(result)
             self._record_archive_identity_change(result, path)
 
         result.bytes_scanned = file_size

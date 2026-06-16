@@ -8186,6 +8186,145 @@ class TestCVE202523304HydraTarget:
         finally:
             reset_cache_manager()
 
+    @pytest.mark.parametrize("mutation", ["truncate", "unlink"])
+    def test_content_routed_nemo_tar_followup_preserves_findings_after_source_mutation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mutation: Literal["truncate", "unlink"],
+    ) -> None:
+        model_path = tmp_path / f"mutated-before-tar-followup-{mutation}.tar.gz"
+        with tarfile.open(model_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
+            _add_tar_bytes(archive, "payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        original_nemo_scan = NemoScanner._scan_nemo_archive
+
+        def mutate_after_nemo_analysis(scanner: NemoScanner, path: str, *args: Any, **kwargs: Any) -> None:
+            original_nemo_scan(scanner, path, *args, **kwargs)
+            if mutation == "truncate":
+                with model_path.open("r+b") as archive_file:
+                    archive_file.truncate(0)
+            else:
+                model_path.unlink()
+
+        monkeypatch.setattr(NemoScanner, "_scan_nemo_archive", mutate_after_nemo_analysis)
+
+        cache_dir = tmp_path / f"tar-followup-{mutation}-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            metadata = aggregate.file_metadata[str(model_path)]
+            assert aggregate.success is False
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            if mutation == "truncate":
+                assert "tar_scan_incomplete" in metadata["scan_outcome_reasons"]
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_identity_caused_nemo_integrity_failure_is_operational(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "torch.nn.Linear"}},
+            filename="identity-corruption.nemo",
+        )
+        original_preflight = tar_scanner_module.TarScanner._preflight_tar_archive
+
+        def truncate_after_preflight(
+            scanner: tar_scanner_module.TarScanner,
+            path: str,
+            result: ScanResult,
+            **kwargs: Any,
+        ) -> bool:
+            succeeded = original_preflight(scanner, path, result, **kwargs)
+            if succeeded:
+                with nemo_path.open("r+b") as archive_file:
+                    archive_file.truncate(0)
+            return succeeded
+
+        monkeypatch.setattr(tar_scanner_module.TarScanner, "_preflight_tar_archive", truncate_after_preflight)
+
+        cache_dir = tmp_path / "identity-corruption-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            metadata = aggregate.file_metadata[str(nemo_path)]
+            integrity_issues = [
+                issue
+                for issue in aggregate.issues
+                if issue.details.get("scan_outcome_reason") == "nemo_archive_integrity_incomplete"
+            ]
+            assert aggregate.success is False
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            assert len(integrity_issues) == 1
+            assert integrity_issues[0].severity == IssueSeverity.INFO
+            assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_identity_caused_nemo_integrity_failure_preserves_prior_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "os.system", "command": "echo pwned"}},
+            filename="identity-corruption-after-finding.nemo",
+        )
+        original_nemo_scan = NemoScanner._scan_nemo_archive
+
+        def fail_after_nemo_finding(scanner: NemoScanner, path: str, *args: Any, **kwargs: Any) -> None:
+            original_nemo_scan(scanner, path, *args, **kwargs)
+            with nemo_path.open("r+b") as archive_file:
+                archive_file.truncate(0)
+            raise tarfile.ReadError("archive changed after NeMo analysis")
+
+        monkeypatch.setattr(NemoScanner, "_scan_nemo_archive", fail_after_nemo_finding)
+
+        cache_dir = tmp_path / "identity-corruption-finding-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            integrity_issues = [
+                issue
+                for issue in aggregate.issues
+                if issue.details.get("scan_outcome_reason") == "nemo_archive_integrity_incomplete"
+            ]
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+            assert len(integrity_issues) == 1
+            assert integrity_issues[0].severity == IssueSeverity.INFO
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_nemo_preflight_interrupt_closes_bound_descriptor(
         self,
         tmp_path: Path,

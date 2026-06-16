@@ -2234,6 +2234,11 @@ class TarScanner(BaseScanner):
                 compression_codec=compression_codec,
                 compressed_size=compressed_size,
             )
+        except Exception as exc:
+            if raw_file is None:
+                raise
+            scan_complete = False
+            self._record_incomplete_tar_scan(result, path, exc)
 
         if reached_eof and not entry_count_check_recorded:
             result.add_check(
@@ -2272,7 +2277,9 @@ class TarScanner(BaseScanner):
                 scan_complete = False
 
         result.metadata["contents"] = contents
-        result.metadata["file_size"] = os.path.getsize(path)
+        result.metadata["file_size"] = (
+            os.fstat(raw_file.fileno()).st_size if raw_file is not None else os.path.getsize(path)
+        )
         result.metadata["archive_uncompressed_size"] = archive_uncompressed_size
         result.metadata["max_tar_total_uncompressed_size"] = self._get_max_total_uncompressed_size()
         if not scan_complete:
