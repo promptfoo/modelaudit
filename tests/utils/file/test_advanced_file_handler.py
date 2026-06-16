@@ -13,10 +13,9 @@ import tempfile
 import time
 import types
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -5966,6 +5965,32 @@ class TestAdvancedFileHandler:
         assert shard_checks[0].details["error"] == "<redacted>"
         assert leaked_secret not in result.to_json()
 
+    def test_parallel_shard_base_exceptions_propagate(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Control-flow exceptions raised by workers must reach the caller."""
+        shard_path = tmp_path / "model-00001-of-00001.safetensors"
+        shard_path.write_bytes(b"model")
+        handler = ParallelShardHandler(
+            {"shards": [str(shard_path)], "total_shards": 1, "total_size": 5},
+            CompletingShardScanner,
+        )
+
+        def interrupt_scan(_shard_path: str) -> ScanResult:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_PARALLEL_WORKERS", 1)
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._PARALLEL_SHARD_WORKER_SLOTS",
+            BoundedSemaphore(1),
+        )
+        monkeypatch.setattr(handler, "_scan_single_shard", interrupt_scan)
+
+        with pytest.raises(KeyboardInterrupt):
+            handler.scan_shards()
+
     def test_parallel_shard_submission_is_bounded_by_worker_count(
         self,
         tmp_path: Path,
@@ -5985,30 +6010,33 @@ class TestAdvancedFileHandler:
         )
         release_workers = Event()
         initial_workers_started = Event()
-        submit_lock = Lock()
-        submitted = 0
+        worker_lock = Lock()
         started = 0
-        original_submit = ThreadPoolExecutor.submit
-
-        def tracking_submit(executor: ThreadPoolExecutor, *args: Any, **kwargs: Any) -> Any:
-            nonlocal submitted
-            with submit_lock:
-                submitted += 1
-            return original_submit(executor, *args, **kwargs)
+        active = 0
+        maximum_active = 0
 
         def blocking_scan(_shard_path: str) -> ScanResult:
-            nonlocal started
-            with submit_lock:
+            nonlocal active, maximum_active, started
+            with worker_lock:
                 started += 1
-                if started == 2:
+                active += 1
+                maximum_active = max(maximum_active, active)
+                if active == 2:
                     initial_workers_started.set()
-            assert release_workers.wait(timeout=5)
-            shard_result = ScanResult(scanner_name="bounded_submission_test")
-            shard_result.finish(success=True)
-            return shard_result
+            try:
+                assert release_workers.wait(timeout=5)
+                shard_result = ScanResult(scanner_name="bounded_submission_test")
+                shard_result.finish(success=True)
+                return shard_result
+            finally:
+                with worker_lock:
+                    active -= 1
 
         monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_PARALLEL_WORKERS", 2)
-        monkeypatch.setattr(ThreadPoolExecutor, "submit", tracking_submit)
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._PARALLEL_SHARD_WORKER_SLOTS",
+            BoundedSemaphore(2),
+        )
         monkeypatch.setattr(handler, "_scan_single_shard", blocking_scan)
         scan_results: list[ScanResult] = []
         scan_thread = Thread(target=lambda: scan_results.append(handler.scan_shards()))
@@ -6017,8 +6045,9 @@ class TestAdvancedFileHandler:
         try:
             assert initial_workers_started.wait(timeout=5)
             time.sleep(0.05)
-            with submit_lock:
-                assert submitted == 2
+            with worker_lock:
+                assert started == 2
+                assert maximum_active == 2
         finally:
             release_workers.set()
             scan_thread.join(timeout=5)
@@ -6026,7 +6055,157 @@ class TestAdvancedFileHandler:
         assert not scan_thread.is_alive()
         assert len(scan_results) == 1
         assert scan_results[0].success is True
-        assert submitted == len(shard_paths)
+        assert started == len(shard_paths)
+        assert maximum_active == 2
+
+    def test_parallel_shard_timeout_returns_fail_closed_without_waiting_for_worker(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A wedged shard must not keep the main scan blocked past its deadline."""
+        shard_paths = [tmp_path / f"model-{index:05d}-of-00003.safetensors" for index in range(1, 4)]
+        for shard_path in shard_paths:
+            shard_path.write_bytes(b"model")
+        handler = ParallelShardHandler(
+            {
+                "shards": [str(shard_path) for shard_path in shard_paths],
+                "total_shards": len(shard_paths),
+                "total_size": sum(shard_path.stat().st_size for shard_path in shard_paths),
+            },
+            CompletingShardScanner,
+        )
+        release_worker = Event()
+        worker_started = Event()
+        worker_finished = Event()
+        started_paths: list[str] = []
+
+        def blocking_scan(shard_path: str) -> ScanResult:
+            started_paths.append(shard_path)
+            worker_started.set()
+            try:
+                assert release_worker.wait(timeout=2)
+                shard_result = ScanResult(scanner_name="timeout_test")
+                shard_result.finish(success=True)
+                return shard_result
+            finally:
+                worker_finished.set()
+
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_PARALLEL_WORKERS", 1)
+        monkeypatch.setattr("modelaudit.utils.file.handlers.SHARD_SCAN_TIMEOUT", 0.05)
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._PARALLEL_SHARD_WORKER_SLOTS",
+            BoundedSemaphore(1),
+        )
+        monkeypatch.setattr(handler, "_scan_single_shard", blocking_scan)
+
+        started_at = time.monotonic()
+        try:
+            result = handler.scan_shards()
+            elapsed = time.monotonic() - started_at
+
+            assert worker_started.is_set()
+            assert elapsed < 0.5
+            assert result.success is False
+            assert result.metadata["analysis_incomplete"] is True
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
+            timeout_check = next(check for check in result.checks if check.name == "Shard Scan")
+            assert timeout_check.details["exception_type"] == "TimeoutError"
+            assert timeout_check.details["scan_outcome_reason"] == "shard_scan_error"
+            assert started_paths == [str(shard_paths[0])]
+        finally:
+            release_worker.set()
+            assert worker_finished.wait(timeout=2)
+
+    def test_parallel_shard_permanently_blocked_worker_does_not_block_process_exit(self) -> None:
+        """Timed-out daemon workers must not be joined during interpreter shutdown."""
+        script = """
+from threading import BoundedSemaphore, Event
+
+from modelaudit.utils.file import handlers
+from modelaudit.utils.file.handlers import ParallelShardHandler
+
+handlers.MAX_PARALLEL_WORKERS = 1
+handlers.SHARD_SCAN_TIMEOUT = 0.05
+handlers._PARALLEL_SHARD_WORKER_SLOTS = BoundedSemaphore(1)
+handler = ParallelShardHandler(
+    {"shards": ["blocked.safetensors"], "total_shards": 1, "total_size": 1},
+    object,
+)
+handler._scan_single_shard = lambda _shard: Event().wait()
+result = handler.scan_shards()
+assert result.success is False
+assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
+print("scan-returned")
+"""
+
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[3],
+            env={**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"},
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.strip() == "scan-returned"
+
+    def test_repeated_parallel_shard_timeouts_remain_globally_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated calls cannot create workers after the process-wide slots are occupied."""
+        release_workers = Event()
+        all_workers_finished = Event()
+        worker_lock = Lock()
+        started = 0
+        finished = 0
+
+        def blocking_scan(_shard_path: str) -> ScanResult:
+            nonlocal finished, started
+            with worker_lock:
+                started += 1
+            try:
+                assert release_workers.wait(timeout=5)
+                shard_result = ScanResult(scanner_name="repeated_timeout_test")
+                shard_result.finish(success=True)
+                return shard_result
+            finally:
+                with worker_lock:
+                    finished += 1
+                    if finished == 2:
+                        all_workers_finished.set()
+
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MAX_PARALLEL_WORKERS", 2)
+        monkeypatch.setattr("modelaudit.utils.file.handlers.SHARD_SCAN_TIMEOUT", 0.03)
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._PARALLEL_SHARD_WORKER_SLOTS",
+            BoundedSemaphore(2),
+        )
+        results: list[ScanResult] = []
+        started_at = time.monotonic()
+        try:
+            for index in range(5):
+                shard_path = tmp_path / f"blocked-{index}.safetensors"
+                shard_path.write_bytes(b"model")
+                handler = ParallelShardHandler(
+                    {"shards": [str(shard_path)], "total_shards": 1, "total_size": 5},
+                    CompletingShardScanner,
+                )
+                monkeypatch.setattr(handler, "_scan_single_shard", blocking_scan)
+                results.append(handler.scan_shards())
+
+            assert time.monotonic() - started_at < 0.5
+            assert started == 2
+            assert all(result.success is False for result in results)
+            assert all("shard_scan_error" in result.metadata["scan_outcome_reasons"] for result in results)
+        finally:
+            release_workers.set()
+            assert all_workers_finished.wait(timeout=2)
 
     def test_parallel_shard_limit_fails_closed_before_submission(
         self,

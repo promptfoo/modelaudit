@@ -18,12 +18,12 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, suppress
-from contextvars import ContextVar, copy_context
+from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from threading import RLock
+from queue import Empty, Queue
+from threading import BoundedSemaphore, RLock, Thread
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..._safetensors_shards import (
@@ -59,6 +59,7 @@ MMAP_MAX_WINDOW = 500 * 1024 * 1024  # 500MB max window size
 MAX_PARALLEL_WORKERS = 4
 MAX_SCANNABLE_SHARDS = 256
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
+_PARALLEL_SHARD_WORKER_SLOTS = BoundedSemaphore(MAX_PARALLEL_WORKERS)
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
 _PREVALIDATED_SHARD_INFO_CONFIG_KEY = "_trusted_prevalidated_shard_info"
@@ -4146,65 +4147,126 @@ class ParallelShardHandler:
                 result.finish(success=False)
                 return result
 
+        from ...scanners._evidence_redaction import (
+            redact_evidence_string,
+            redact_untrusted_error_message,
+        )
+
         max_workers = min(MAX_PARALLEL_WORKERS, total_shards)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            shard_iterator = iter(shards)
-            pending: dict[Future[Any], str] = {}
+        worker_slots = _PARALLEL_SHARD_WORKER_SLOTS
+        worker_results: Queue[tuple[int, ScanResult | None, BaseException | None]] = Queue()
+        active_workers: dict[int, tuple[str, float]] = {}
+        next_shard_index = 0
+        next_worker_id = 0
 
-            def submit_next_shard() -> bool:
-                try:
-                    shard = next(shard_iterator)
-                except StopIteration:
-                    return False
-                pending[executor.submit(copy_context().run, self._scan_single_shard, shard)] = shard
-                return True
+        def add_shard_error(shard: str, error: BaseException | str, exception_type: str) -> None:
+            nonlocal success
+            safe_shard = redact_evidence_string(shard, max_chars=500)
+            safe_shard_name = redact_evidence_string(Path(shard).name, max_chars=500)
+            safe_error = redact_untrusted_error_message(error)
+            logger.error("Error scanning shard %s: %s", safe_shard, safe_error)
+            success = False
+            _mark_inconclusive_scan_outcome(result, "shard_scan_error")
+            result.add_check(
+                name="Shard Scan",
+                passed=False,
+                message=f"Error scanning shard: {safe_shard_name}",
+                severity=IssueSeverity.INFO,
+                location=safe_shard,
+                details={
+                    "error": safe_error,
+                    "exception_type": exception_type,
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_scan_error",
+                },
+            )
 
-            for _ in range(max_workers):
-                submit_next_shard()
+        def run_shard(worker_id: int, shard: str, context: Context) -> None:
+            shard_result: ScanResult | None = None
+            error: BaseException | None = None
+            try:
+                shard_result = context.run(self._scan_single_shard, shard)
+            except BaseException as exc:
+                error = exc
+            finally:
+                worker_results.put((worker_id, shard_result, error))
+                worker_slots.release()
 
-            while pending:
-                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    shard = pending.pop(future)
-                    completed_shards += 1
+        def start_worker_with_acquired_slot() -> None:
+            nonlocal next_shard_index, next_worker_id
+            shard = shards[next_shard_index]
+            next_shard_index += 1
+            worker_id = next_worker_id
+            next_worker_id += 1
+            worker = Thread(
+                target=run_shard,
+                args=(worker_id, shard, copy_context()),
+                name="modelaudit-shard-scan",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except BaseException:
+                worker_slots.release()
+                raise
+            active_workers[worker_id] = (shard, time.monotonic() + SHARD_SCAN_TIMEOUT)
 
-                    try:
-                        shard_result = future.result(timeout=SHARD_SCAN_TIMEOUT)
-                        result.merge(shard_result)
-                        success = success and bool(shard_result.success)
+        def start_available_workers() -> None:
+            while next_shard_index < total_shards and len(active_workers) < max_workers:
+                if not worker_slots.acquire(blocking=False):
+                    return
+                start_worker_with_acquired_slot()
 
-                        if progress_callback:
-                            percentage = (completed_shards / total_shards) * 100
-                            progress_callback(f"Scanned shard {completed_shards}/{total_shards}", percentage)
+        start_available_workers()
+        while active_workers or next_shard_index < total_shards:
+            if not active_workers:
+                acquired = worker_slots.acquire(timeout=SHARD_SCAN_TIMEOUT)
+                if not acquired:
+                    add_shard_error(
+                        shards[next_shard_index],
+                        f"Shard scan could not start within the {SHARD_SCAN_TIMEOUT}-second timeout.",
+                        "TimeoutError",
+                    )
+                    break
+                start_worker_with_acquired_slot()
+                start_available_workers()
+                continue
 
-                    except Exception as e:
-                        from ...scanners._evidence_redaction import (
-                            redact_evidence_string,
-                            redact_untrusted_error_message,
-                        )
+            next_deadline = min(deadline for _, deadline in active_workers.values())
+            try:
+                worker_id, shard_result, error = worker_results.get(timeout=max(0.0, next_deadline - time.monotonic()))
+            except Empty:
+                now = time.monotonic()
+                overdue = [
+                    (worker_id, shard) for worker_id, (shard, deadline) in active_workers.items() if deadline <= now
+                ]
+                if not overdue:
+                    continue
+                for _, shard in overdue:
+                    add_shard_error(
+                        shard,
+                        f"Shard scan exceeded the {SHARD_SCAN_TIMEOUT}-second timeout.",
+                        "TimeoutError",
+                    )
+                break
 
-                        safe_shard = redact_evidence_string(shard, max_chars=500)
-                        safe_shard_name = redact_evidence_string(Path(shard).name, max_chars=500)
-                        safe_error = redact_untrusted_error_message(e)
-                        logger.error("Error scanning shard %s: %s", safe_shard, safe_error)
-                        success = False
-                        _mark_inconclusive_scan_outcome(result, "shard_scan_error")
-                        result.add_check(
-                            name="Shard Scan",
-                            passed=False,
-                            message=f"Error scanning shard: {safe_shard_name}",
-                            severity=IssueSeverity.INFO,
-                            location=safe_shard,
-                            details={
-                                "error": safe_error,
-                                "exception_type": type(e).__name__,
-                                "analysis_incomplete": True,
-                                "scan_outcome": "inconclusive",
-                                "scan_outcome_reason": "shard_scan_error",
-                            },
-                        )
+            shard, _ = active_workers.pop(worker_id)
+            completed_shards += 1
+            if error is not None:
+                if not isinstance(error, Exception):
+                    raise error
+                add_shard_error(shard, error, type(error).__name__)
+            else:
+                assert shard_result is not None
+                result.merge(shard_result)
+                success = success and bool(shard_result.success)
 
-                    submit_next_shard()
+                if progress_callback:
+                    percentage = (completed_shards / total_shards) * 100
+                    progress_callback(f"Scanned shard {completed_shards}/{total_shards}", percentage)
+
+            start_available_workers()
 
         if expected_members is not None and family_dir is not None:
             membership_error: str | None
