@@ -2782,8 +2782,10 @@ def _explicit_local_shard_family_groups(
         )
 
     groups: dict[str, _ExplicitShardFamily] = {}
+    if index_inspection_context is None:
+        index_inspection_context = _SafetensorsIndexInspectionContext()
     for (_pattern, expected_total), records in grouped_paths.items():
-        discovery_context = _SafetensorsIndexInspectionContext()
+        discovery_context = index_inspection_context.isolated_failure_context()
         try:
             external_scope_boundary = os.path.normcase(
                 os.path.normpath(os.path.commonpath([str(resolved_path.parent) for _, resolved_path, _ in records]))
@@ -2843,12 +2845,11 @@ def _explicit_local_shard_family_groups(
                 authority_scope: str | None = None
                 authority_invalid = False
                 for scope in sorted(extra_scopes, key=lambda candidate: len(Path(candidate).parts), reverse=True):
-                    if external_scope_boundary is None:
-                        break
-                    try:
-                        Path(scope).relative_to(Path(external_scope_boundary))
-                    except ValueError:
-                        continue
+                    if external_scope_boundary is not None:
+                        try:
+                            Path(scope).relative_to(Path(external_scope_boundary))
+                        except ValueError:
+                            continue
                     if not _trusted_explicit_shard_family_scope(scope, scoped_paths):
                         continue
                     if agreed_external_proof is not None and not _trusted_explicit_shard_index_authority(
@@ -4059,6 +4060,7 @@ def _resolve_scan_source_for_path(
 
         download_spinner = None
         temp_dir = None
+        downloaded_source_guard: _BoundLocalSourceGuard | None = None
         if runtime.show_styled_output and should_show_spinner():
             download_spinner = yaspin(
                 Spinners.dots, text=f"Downloading file from {style_text(display_path, fg='cyan')}"
@@ -4087,6 +4089,14 @@ def _resolve_scan_source_for_path(
                 repository_file_inventory=direct_repository_file_inventory,
                 timeout_seconds=runtime.timeout,
             )
+            downloaded_source_guard = _open_bound_local_source(download_path) if os.name == "posix" else None
+            initial_local_source_receipt = (
+                downloaded_source_guard.receipt
+                if downloaded_source_guard is not None
+                else _snapshot_local_source_receipt(download_path)
+            )
+            if initial_local_source_receipt is None:
+                raise OSError("Downloaded Hugging Face file changed before source binding")
             source_model_id, source_model_source = extract_model_id_from_path(path)
 
             if not runtime.cache_enabled and temp_dir is None:
@@ -4104,9 +4114,21 @@ def _resolve_scan_source_for_path(
                 source_model_source=source_model_source,
                 repository_file_inventory=tuple(direct_repository_file_inventory),
                 repository_current_file=repository_current_file,
-                initial_shard_target=path_state.capture_initial_shard_target(str(download_path)),
+                initial_shard_target=path_state.capture_initial_shard_target(
+                    str(download_path),
+                    expected_target=(
+                        initial_local_source_receipt
+                        if downloaded_source_guard is not None
+                        and initial_local_source_receipt.get("mode_type") == stat.S_IFREG
+                        else None
+                    ),
+                ),
+                initial_local_source_receipt=initial_local_source_receipt,
+                initial_local_source_guard=downloaded_source_guard,
             )
         except Exception as exc:
+            if downloaded_source_guard is not None:
+                downloaded_source_guard.close()
             if download_spinner:
                 download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
             elif runtime.show_styled_output:

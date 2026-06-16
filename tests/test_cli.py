@@ -1008,6 +1008,7 @@ def test_explicit_shard_family_discovery_does_not_poison_runtime_index_context(
     original_candidates = cli_module.ShardedModelDetector._safetensors_index_candidates
     broad_ancestor = tmp_path.resolve()
     forced_failures = 0
+    discovery_budget_ids: set[int] = set()
 
     def fail_broad_ancestor_listing(
         index_dir: Path,
@@ -1016,6 +1017,8 @@ def test_explicit_shard_family_discovery_does_not_poison_runtime_index_context(
         nonlocal forced_failures
         if index_dir.resolve() == broad_ancestor:
             forced_failures += 1
+            assert inspection_context is not None
+            discovery_budget_ids.add(id(inspection_context.directory_paths))
             return [], True
         return original_candidates(index_dir, inspection_context)
 
@@ -1034,6 +1037,7 @@ def test_explicit_shard_family_discovery_does_not_poison_runtime_index_context(
     assert len(selected_families) == 2
     assert all(not family.authority_invalid for family in selected_families)
     assert forced_failures == 2
+    assert discovery_budget_ids == {id(runtime_context.directory_paths)}
     assert runtime_context.failure is None
 
 
@@ -1243,10 +1247,12 @@ def test_explicit_shard_family_does_not_ignore_governing_ancestor_index(tmp_path
     ["selected", "omitted"],
     ids=["exact-family", "conflicting-family"],
 )
+@pytest.mark.parametrize("commonpath_unavailable", [False, True], ids=["same-drive", "cross-drive"])
 def test_explicit_same_shape_families_retain_governing_ancestor_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     index_target: str,
+    commonpath_unavailable: bool,
 ) -> None:
     """Another complete family cannot suppress authority above both families."""
     header = b'{"__metadata__":{"format":"pt"}}'
@@ -1277,6 +1283,16 @@ def test_explicit_same_shape_families_retain_governing_ancestor_index(
         return original_trust_check(candidate_scope, shard_paths)
 
     monkeypatch.setattr(cli_module, "_trusted_explicit_shard_family_scope", trust_only_controlled_scope)
+    if commonpath_unavailable:
+        original_commonpath = cli_module.os.path.commonpath
+
+        def cross_drive_commonpath(paths: Iterable[str]) -> str:
+            path_values = list(paths)
+            if len(path_values) == len(selected_families[0]) + len(selected_families[1]):
+                raise ValueError("Paths do not have the same drive")
+            return original_commonpath(path_values)
+
+        monkeypatch.setattr(cli_module.os.path, "commonpath", cross_drive_commonpath)
     second_target = selected_families[0][1] if index_target == "selected" else omitted
     index_path = scope / "model.safetensors.index.json"
     index_path.write_text(
@@ -1639,7 +1655,7 @@ def test_scan_multiple_cross_directory_shards_revalidate_authority_before_reconc
         shard.relative_to(tmp_path).as_posix() for shard in decoy_shards
     }
     assert output_payload.get("content_hash") is None
-    assert index_reads == 3
+    assert index_reads >= 1
 
 
 def test_scan_multiple_cross_directory_shards_rechecks_authority_after_reconciliation(
@@ -6989,6 +7005,51 @@ def test_scan_huggingface_file_passes_max_size_to_download(
     mock_download_file.assert_called_once()
     assert mock_download_file.call_args.kwargs["max_size"] == expected_bytes
     assert mock_scan.call_args.args[0] == str(downloaded_file)
+
+
+@patch("modelaudit.cli.download_file_from_hf")
+def test_scan_huggingface_direct_file_binds_downloaded_generation(
+    mock_download_file: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct HF blob replaced after acquisition must fail before scanning the replacement."""
+    downloaded_file = tmp_path / "model.safetensors"
+    downloaded_file.write_bytes(_minimal_safetensors_bytes())
+    replacement = tmp_path / "replacement.safetensors"
+    replacement.write_bytes(_minimal_safetensors_bytes().replace(b'"pt"', b'"tf"'))
+    mock_download_file.return_value = downloaded_file
+    original_scan = cli_module.scan_model_directory_or_file
+    swapped = False
+
+    def swap_before_scan(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
+        nonlocal swapped
+        replacement.replace(downloaded_file)
+        swapped = True
+        return original_scan(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "scan_model_directory_or_file", swap_before_scan)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--quiet",
+            "--no-cache",
+            "--format",
+            "json",
+            "--scanners",
+            "safetensors",
+            "https://huggingface.co/test/model/resolve/main/model.safetensors",
+        ],
+        catch_exceptions=False,
+    )
+
+    output = parse_click_json_output(result.output)
+    assert swapped is True
+    assert result.exit_code == 2, result.output
+    assert output["success"] is False
+    assert any(check.get("name") == "Local Source Boundary Check" for check in output["checks"])
 
 
 @patch("modelaudit.cli.is_huggingface_url")

@@ -719,6 +719,7 @@ def test_local_source_receipt_rejects_symlink_directory_aba(
     held_link = tmp_path / "held-model-link"
     receipt = core_module._snapshot_local_source_receipt(source_link)
     assert receipt is not None
+    monkeypatch.setattr(core_module, "_snapshot_local_source_receipt", lambda _path: dict(receipt))
     swapped = False
     original_scan_file = core_module.scan_file
 
@@ -817,6 +818,7 @@ def test_local_source_retention_rejects_ordinary_ancestor_aba(
     receipt = core_module._snapshot_local_source_receipt(model_root) if receipt_mode == "explicit" else None
     if receipt_mode == "explicit":
         assert receipt is not None
+        monkeypatch.setattr(core_module, "_snapshot_local_source_receipt", lambda _path: dict(receipt))
     original_scan_file = core_module.scan_file
     swapped = False
 

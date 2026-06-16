@@ -1643,6 +1643,7 @@ class _BoundLocalSourceGuard:
 
     bound_path: str
     receipt: dict[str, int | str]
+    acquired_lexical_identity: str
     guarded_descriptors: tuple[tuple[int, dict[str, int | str]], ...]
     guarded_entries: tuple[tuple[int, str, int, dict[str, int | str]], ...]
     staging_path: Path | None = None
@@ -1982,6 +1983,7 @@ def _open_bound_local_source(source_path: str | os.PathLike[str]) -> _BoundLocal
     opened: list[tuple[int, dict[str, int | str]]] = []
     opened_entries: list[tuple[int, str, int, dict[str, int | str]]] = []
     identity_entries: list[tuple[Path, os.stat_result]] = []
+    lexical_identity_entries: list[tuple[Path, os.stat_result]] = []
     guard: _BoundLocalSourceGuard | None = None
     current_path = Path(parts[0])
     try:
@@ -1994,6 +1996,8 @@ def _open_bound_local_source(source_path: str | os.PathLike[str]) -> _BoundLocal
         current_receipt = _local_source_receipt_from_stat(str(current_path), "", current_stat)
         opened.append((current_fd, current_receipt))
         identity_entries.append((current_path, current_stat))
+        if len(parts) == 1:
+            lexical_identity_entries.append((current_path, current_stat))
 
         for index, part in enumerate(parts[1:], start=1):
             child_fd = os.open(
@@ -2032,6 +2036,8 @@ def _open_bound_local_source(source_path: str | os.PathLike[str]) -> _BoundLocal
             current_receipt = _local_source_receipt_from_stat(str(current_path), "", child_stat)
             opened.append((child_fd, current_receipt))
             identity_entries.append((current_path, child_stat))
+            if index == len(parts) - 1 or stat.S_ISLNK(lexical_entry_stat.st_mode):
+                lexical_identity_entries.append((current_path, lexical_entry_stat))
             current_fd = child_fd
 
         final_stat = os.fstat(current_fd)
@@ -2058,6 +2064,7 @@ def _open_bound_local_source(source_path: str | os.PathLike[str]) -> _BoundLocal
         guard = _BoundLocalSourceGuard(
             bound_path=descriptor_path,
             receipt=receipt,
+            acquired_lexical_identity=_local_source_lexical_identity(lexical_identity_entries),
             guarded_descriptors=tuple(opened),
             guarded_entries=tuple(opened_entries),
         )
@@ -2524,6 +2531,18 @@ def _local_source_receipts_match(
         elif current_value != expected_value:
             return False
     return True
+
+
+def _bound_local_source_guard_matches_receipt(
+    expected: dict[str, int | str],
+    guard: _BoundLocalSourceGuard,
+) -> bool:
+    """Compare a dispatch receipt with the lexical chain captured by a retained guard."""
+    if _local_source_receipts_match(expected, guard.receipt):
+        return True
+    acquired_receipt = dict(guard.receipt)
+    acquired_receipt["lexical_identity"] = guard.acquired_lexical_identity
+    return _local_source_receipts_match(expected, acquired_receipt)
 
 
 _WindowsShardGuards = list[tuple[int, str, dict[str, int | str]]]
@@ -5453,10 +5472,25 @@ def scan_model_directory_or_file(
             )
         ):
             raise _LocalSourceBoundaryError("local source changed after dispatch")
+        if (
+            local_source_bound_guard is None
+            and expected_local_source_receipt is not None
+            and os.name == "posix"
+            and not is_stream_url(local_source_report_path)
+        ):
+            try:
+                owned_local_source_guard = _open_bound_local_source(local_source_report_path)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise _LocalSourceBoundaryError("local source could not be retained") from error
+            local_source_bound_guard = owned_local_source_guard
+            local_source_boundary_stack.callback(owned_local_source_guard.close)
         if local_source_bound_guard is not None:
             if (
                 expected_local_source_receipt is None
-                or not _local_source_receipts_match(expected_local_source_receipt, local_source_bound_guard.receipt)
+                or not _bound_local_source_guard_matches_receipt(
+                    expected_local_source_receipt,
+                    local_source_bound_guard,
+                )
                 or local_source_bound_guard.changed()
             ):
                 raise _LocalSourceBoundaryError("retained local source changed after dispatch")
@@ -5497,15 +5531,6 @@ def scan_model_directory_or_file(
                         expected_local_source_receipt,
                     )
                 )
-                if expected_local_source_receipt.get("mode_type") == stat.S_IFDIR and os.name == "posix":
-                    bound_local_source_path = local_source_boundary_stack.enter_context(
-                        _bound_local_source_directory(local_source_report_path, expected_local_source_receipt)
-                    )
-                    resolved_path_value = expected_local_source_receipt.get("resolved_path")
-                    if not isinstance(resolved_path_value, str):
-                        raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
-                    resolved_local_source_path = resolved_path_value
-                    path = bound_local_source_path
             except Exception as error:
                 raise _LocalSourceBoundaryError("local source boundary could not be retained") from error
         # Handle streaming paths
@@ -10304,6 +10329,7 @@ def scan_model_streaming(
         kwargs.pop(_PREVALIDATED_LOCAL_TARGETS_CONFIG_KEY, None)
     )
     owned_local_source_guard: _BoundLocalSourceGuard | None = None
+    receipt_only_local_source_guard = False
     bound_local_source_is_lexical_link = False
     local_source_initial_namespace: tuple[_DirectoryOwnerSnapshotEntry, ...] | None = None
     initial_local_source_entries: dict[tuple[str, ...], _DirectoryOwnerSnapshotEntry] = {}
@@ -10727,17 +10753,33 @@ def scan_model_streaming(
         structural_index_classification_complete: bool = False,
         quarantine_proven_non_index: bool = False,
         require_content_hash: bool = False,
+        expected_cleanup_identity: _FileIdentitySnapshot | None = None,
+        retained_cleanup_fd: int | None = None,
+        cleanup_report_path: str | None = None,
     ) -> None:
-        nonlocal deferred_streamed_index_bytes
+        nonlocal deferred_streamed_index_bytes, aggregate_hash_complete, preserve_shard_reconciliation_errors
+
+        def record_cleanup_generation_failure(message: str) -> None:
+            nonlocal aggregate_hash_complete, preserve_shard_reconciliation_errors
+
+            aggregate_hash_complete = False
+            preserve_shard_reconciliation_errors = True
+            pending_delete_failures[source_path] = OSError(message)
+            _record_local_source_boundary_failure(results, cleanup_report_path or str(source_path))
 
         is_index_suffix = source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
         if not (source_path.exists() or source_path.is_symlink()):
+            if expected_cleanup_identity is not None:
+                record_cleanup_generation_failure("streamed source disappeared before generation-bound cleanup")
             if is_index_suffix and structural_index_classification_complete:
                 record_streamed_index_retention_failure(
                     source_path,
                     "SafeTensors index candidate disappeared before cleanup.",
                     reason="safetensors_index_disappeared_before_cleanup",
                 )
+            return
+        if expected_cleanup_identity is not None and _snapshot_file_identity(source_path) != expected_cleanup_identity:
+            record_cleanup_generation_failure("streamed source changed before generation-bound cleanup")
             return
         if not delete_after_scan and not is_index_suffix:
             return
@@ -10839,14 +10881,47 @@ def scan_model_streaming(
                 source_path,
                 context,
                 track_candidate=track_safetensors_index_candidate,
-                expected_identity=structural_index_identity,
+                expected_identity=expected_cleanup_identity or structural_index_identity,
                 expected_content_hash=expected_content_hash,
                 require_proven_non_index=quarantine_proven_non_index,
                 require_content_hash=require_content_hash or quarantine_proven_non_index,
             )
             return
+        retained_cleanup_stat: os.stat_result | None = None
+        if (
+            retained_cleanup_fd is not None
+            and expected_cleanup_identity is not None
+            and expected_cleanup_identity.stat is not None
+            and expected_cleanup_identity.lstat[:3] == expected_cleanup_identity.stat[:3]
+            and stat.S_ISREG(expected_cleanup_identity.lstat[2])
+        ):
+            try:
+                retained_cleanup_stat = os.fstat(retained_cleanup_fd)
+            except OSError:
+                record_cleanup_generation_failure("retained streamed source closed before cleanup")
+                return
+            retained_identity = (
+                retained_cleanup_stat.st_dev,
+                retained_cleanup_stat.st_ino,
+                retained_cleanup_stat.st_mode,
+                retained_cleanup_stat.st_size,
+                retained_cleanup_stat.st_mtime_ns,
+                retained_cleanup_stat.st_ctime_ns,
+            )
+            if retained_identity != expected_cleanup_identity.stat:
+                record_cleanup_generation_failure("retained streamed source changed before cleanup")
+                return
         try:
             source_path.unlink()
+            if retained_cleanup_stat is not None:
+                assert retained_cleanup_fd is not None
+                retained_after_unlink = os.fstat(retained_cleanup_fd)
+                if retained_after_unlink.st_nlink != retained_cleanup_stat.st_nlink - 1:
+                    record_cleanup_generation_failure("cleanup removed a different streamed source generation")
+                    return
+            if source_path.exists() or source_path.is_symlink():
+                record_cleanup_generation_failure("streamed source path was recreated during cleanup")
+                return
             normalized_source = normalized_stream_path(source_path)
             deleted_streamed_sources.add(normalized_source)
             logger.debug(f"Deleted {source_path} {context}")
@@ -11196,10 +11271,27 @@ def scan_model_streaming(
                 expected_local_source_receipt = _snapshot_local_source_receipt(local_source_report_root)
                 if expected_local_source_receipt is None:
                     raise _LocalSourceBoundaryError("local streaming source could not be retained")
+        if (
+            local_source_bound_guard is None
+            and expected_local_source_receipt is not None
+            and local_source_report_root is not None
+            and os.name == "posix"
+            and not is_stream_url(local_source_report_root)
+        ):
+            try:
+                owned_local_source_guard = _open_bound_local_source(local_source_report_root)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise _LocalSourceBoundaryError("local streaming source could not be retained") from error
+            local_source_bound_guard = owned_local_source_guard
+            receipt_only_local_source_guard = True
+            local_source_boundary_stack.callback(owned_local_source_guard.close)
         if local_source_bound_guard is not None:
             if (
                 expected_local_source_receipt is None
-                or not _local_source_receipts_match(expected_local_source_receipt, local_source_bound_guard.receipt)
+                or not _bound_local_source_guard_matches_receipt(
+                    expected_local_source_receipt,
+                    local_source_bound_guard,
+                )
                 or local_source_bound_guard.changed()
             ):
                 raise _LocalSourceBoundaryError("retained local source changed before streaming traversal")
@@ -11213,6 +11305,13 @@ def scan_model_streaming(
                 and local_source_bound_guard.guarded_entries[-1][3].get("mode_type") == stat.S_IFLNK
             )
             scan_root = bound_local_source_path
+            if receipt_only_local_source_guard and expected_local_source_receipt.get("mode_type") == stat.S_IFDIR:
+                original_close = getattr(file_generator, "close", None)
+                if callable(original_close):
+                    original_close()
+                from .utils.helpers.file_iterator import iterate_files_streaming
+
+                file_generator = iterate_files_streaming(bound_local_source_path)
         elif expected_local_source_receipt is not None:
             current_receipt = (
                 _snapshot_local_source_receipt(local_source_report_root)
@@ -11227,23 +11326,6 @@ def scan_model_streaming(
                     expected_local_source_receipt,
                 )
             )
-            if expected_local_source_receipt.get("mode_type") == stat.S_IFDIR and os.name == "posix":
-                bound_local_source_path = local_source_boundary_stack.enter_context(
-                    _bound_local_source_directory(
-                        local_source_report_root or "<local-stream>", expected_local_source_receipt
-                    )
-                )
-                resolved_path_value = expected_local_source_receipt.get("resolved_path")
-                if not isinstance(resolved_path_value, str):
-                    raise _LocalSourceBoundaryError("local source receipt omitted its resolved path")
-                resolved_local_source_path = resolved_path_value
-                original_close = getattr(file_generator, "close", None)
-                if callable(original_close):
-                    original_close()
-                from .utils.helpers.file_iterator import iterate_files_streaming
-
-                file_generator = iterate_files_streaming(bound_local_source_path)
-                scan_root = bound_local_source_path
     except Exception:
         local_source_boundary_stack.close()
         _record_local_source_boundary_failure(results, local_source_report_root or "<local-stream>")
@@ -11563,6 +11645,13 @@ def scan_model_streaming(
                     parent_entry = initial_local_source_entries.get(parent_parts)
                     if parent_entry is not None and parent_entry.entry_type == "link":
                         observed_local_source_artifacts.add(parent_parts)
+            cleanup_source_identity = (
+                _snapshot_file_identity(source_path)
+                if delete_after_scan
+                and not is_precomputed_streamed_result
+                and not source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
+                else None
+            )
             source_key = Path(os.path.abspath(source_path))
             if pretransferred_bytes:
                 if received_pretransferred_bytes or streamed_item_count != 1:
@@ -13009,22 +13098,29 @@ def scan_model_streaming(
             finally:
                 if pinned_scan_context is not None:
                     pinned_scan_context.__exit__(None, None, None)
-                if retained_stream_source_fd_owned and retained_stream_source_fd is not None:
-                    with suppress(OSError):
-                        os.close(retained_stream_source_fd)
-                # Delete file after scanning if requested
-                if not preserve_source_after_scan:
-                    delete_streamed_source(
-                        source_path,
-                        "after scanning",
-                        defer_safetensors_index=not content_routed_safetensors_index_payload,
-                        track_safetensors_index_candidate=not content_routed_safetensors_index_payload,
-                        structural_index_classification=structural_index_classification,
-                        structural_index_identity=structural_index_identity,
-                        expected_content_hash=file_hash,
-                        structural_index_classification_complete=structural_index_classification_complete,
-                        quarantine_proven_non_index=content_routed_safetensors_index_payload,
-                    )
+                try:
+                    # Delete only the exact generation selected for the pinned scan.
+                    if not preserve_source_after_scan:
+                        delete_streamed_source(
+                            source_path,
+                            "after scanning",
+                            defer_safetensors_index=not content_routed_safetensors_index_payload,
+                            track_safetensors_index_candidate=not content_routed_safetensors_index_payload,
+                            structural_index_classification=structural_index_classification,
+                            structural_index_identity=structural_index_identity,
+                            expected_content_hash=file_hash,
+                            structural_index_classification_complete=structural_index_classification_complete,
+                            quarantine_proven_non_index=content_routed_safetensors_index_payload,
+                            expected_cleanup_identity=cleanup_source_identity,
+                            retained_cleanup_fd=(
+                                retained_stream_source_fd if retained_stream_source_fd_owned else None
+                            ),
+                            cleanup_report_path=report_path,
+                        )
+                finally:
+                    if retained_stream_source_fd_owned and retained_stream_source_fd is not None:
+                        with suppress(OSError):
+                            os.close(retained_stream_source_fd)
                 if openvino_scan_companion_path is not None and openvino_scan_companion_key is not None:
                     delete_streamed_source(openvino_scan_companion_path, "after OpenVINO XML scan")
                     consumed_openvino_companions.add(openvino_scan_companion_key)

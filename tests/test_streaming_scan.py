@@ -14,7 +14,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -8326,6 +8326,53 @@ def test_scan_model_streaming_delete_failure_is_operational_error(
         and "delete denied" in issue.message
         for issue in result.issues
     )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor cleanup semantics")
+def test_scan_model_streaming_cleanup_rejects_pre_unlink_generation_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup cannot mark a replacement deletion as the scanned generation."""
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    streamed_file = source_root / "streamed.pkl"
+    streamed_file.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    held_original = tmp_path / "held-original.pkl"
+    replacement_payload = pickle.dumps({"weights": [4, 5, 6]})
+    original_unlink = Path.unlink
+    swapped = False
+
+    def swap_before_unlink(path: Path, missing_ok: bool = False) -> None:
+        nonlocal swapped
+        same_source = False
+        if not swapped:
+            with suppress(OSError):
+                same_source = os.path.samefile(path, streamed_file)
+        if same_source:
+            streamed_file.rename(held_original)
+            streamed_file.write_bytes(replacement_payload)
+            swapped = True
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", swap_before_unlink)
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(str(source_root)),
+        scan_root=str(source_root),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["pickle"],
+        skip_file_types=False,
+    )
+
+    assert swapped is True
+    assert held_original.exists()
+    assert not streamed_file.exists()
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.name == "Local Source Boundary Check" for check in result.checks)
 
 
 def test_scan_model_streaming_accepts_generator_fallback_cleanup(

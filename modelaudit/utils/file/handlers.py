@@ -169,8 +169,8 @@ class _SafetensorsShardIndexInventory:
 
 
 @dataclass
-class _SafetensorsIndexInspectionContext:
-    """Bound and memoize local SafeTensors index inspection for one top-level scan."""
+class _SafetensorsIndexInspectionBudget:
+    """Mutable aggregate caps and caches shared by related inspection scopes."""
 
     lock: RLock = field(default_factory=RLock)
     candidate_paths: set[str] = field(default_factory=set)
@@ -181,7 +181,62 @@ class _SafetensorsIndexInspectionContext:
     generations: dict[str, int] = field(default_factory=dict)
     bytes_read: int = 0
     directory_entries_inspected: int = 0
+
+
+@dataclass
+class _SafetensorsIndexInspectionContext:
+    """Bound and memoize local SafeTensors index inspection for one top-level scan."""
+
+    _budget: _SafetensorsIndexInspectionBudget = field(default_factory=_SafetensorsIndexInspectionBudget)
     failure: str | None = None
+
+    @property
+    def lock(self) -> RLock:
+        return self._budget.lock
+
+    @property
+    def candidate_paths(self) -> set[str]:
+        return self._budget.candidate_paths
+
+    @property
+    def directory_paths(self) -> set[str]:
+        return self._budget.directory_paths
+
+    @property
+    def charged_observations(self) -> set[tuple[Any, ...]]:
+        return self._budget.charged_observations
+
+    @property
+    def parsed_inventories(self) -> dict[tuple[Any, ...], _SafetensorsShardIndexInventory]:
+        return self._budget.parsed_inventories
+
+    @property
+    def last_observations(self) -> dict[str, tuple[Any, ...]]:
+        return self._budget.last_observations
+
+    @property
+    def generations(self) -> dict[str, int]:
+        return self._budget.generations
+
+    @property
+    def bytes_read(self) -> int:
+        return self._budget.bytes_read
+
+    @bytes_read.setter
+    def bytes_read(self, value: int) -> None:
+        self._budget.bytes_read = value
+
+    @property
+    def directory_entries_inspected(self) -> int:
+        return self._budget.directory_entries_inspected
+
+    @directory_entries_inspected.setter
+    def directory_entries_inspected(self, value: int) -> None:
+        self._budget.directory_entries_inspected = value
+
+    def isolated_failure_context(self) -> "_SafetensorsIndexInspectionContext":
+        """Share aggregate budgets while isolating one speculative probe's failure."""
+        return _SafetensorsIndexInspectionContext(_budget=self._budget)
 
     def record_failure(self, message: str) -> str:
         """Retain the first aggregate inspection failure for the full scan."""
