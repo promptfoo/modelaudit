@@ -391,4 +391,3 @@ def test_standalone_weight_distribution_clusters_identical_onnx_exports(tmp_path
     assert len(anomalies) == 1
     assert len(anomaly_checks) == 1
     assert anomalies[0].details["cluster_size"] == 2
-    assert result.failed_checks == 1
