@@ -2,7 +2,6 @@ import base64
 import binascii
 import bz2
 import codecs
-import importlib.util
 import json
 import lzma
 import math
@@ -5749,32 +5748,23 @@ def _has_compact_malformed_pickle_tail(payload: bytes, offset: int) -> bool:
     )
 
 
-@lru_cache(maxsize=128)
-def _is_importable_top_level_module(module: str) -> bool:
-    if module in sys.builtin_module_names or module in sys.stdlib_module_names:
-        return True
-    try:
-        return importlib.util.find_spec(module) is not None
-    except Exception:
-        return False
-
-
 def _has_pickle_import_signal(operands: tuple[bytes, bytes]) -> bool:
     """Reject lowercase prose pairs while retaining import-shaped operands."""
     normalized_operands = (operands[0].removesuffix(b"\r"), operands[1].removesuffix(b"\r"))
     if not all(operand.isalpha() and operand.islower() for operand in normalized_operands):
         return True
-    return _has_importable_pickle_module(normalized_operands)
+    return _has_stdlib_pickle_module_signal(normalized_operands)
 
 
-def _has_importable_pickle_module(operands: tuple[bytes, bytes]) -> bool:
+def _has_stdlib_pickle_module_signal(operands: tuple[bytes, bytes]) -> bool:
+    """Use immutable interpreter metadata without consulting import hooks."""
     module, _name = operands
     module = module.removesuffix(b"\r")
     try:
         top_level_module = module.decode("utf-8").partition(".")[0]
     except UnicodeDecodeError:
         return False
-    return _is_importable_top_level_module(top_level_module)
+    return top_level_module in sys.builtin_module_names or top_level_module in sys.stdlib_module_names
 
 
 def _iter_pickle_candidate_offsets(
@@ -5857,7 +5847,7 @@ def _iter_pickle_candidate_offsets(
                     and (
                         opcode_name == "GLOBAL"
                         or continuation_offset == len(payload)
-                        or _has_importable_pickle_module(operands)
+                        or _has_stdlib_pickle_module_signal(operands)
                         or (has_trivial_prefix and ord("(") in payload[line_start:offset])
                     )
                 )

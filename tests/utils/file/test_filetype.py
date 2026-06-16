@@ -3741,6 +3741,74 @@ def test_detect_file_format_keeps_global_shaped_non_pickle_prose_on_text_route(t
     assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
+def test_legal_text_pickle_probe_does_not_invoke_import_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probed_modules: list[str] = []
+
+    class RecordingFinder:
+        def find_spec(
+            self,
+            fullname: str,
+            _path: object = None,
+            _target: object = None,
+        ) -> None:
+            probed_modules.append(fullname)
+
+    def alpha_suffix(index: int) -> str:
+        letters = []
+        value = index
+        for _ in range(3):
+            letters.append(chr(ord("a") + (value % 26)))
+            value //= 26
+        return "".join(letters)
+
+    path = tmp_path / "LICENSE"
+    attacker_modules = [f"attacker{alpha_suffix(index)}" for index in range(300)]
+    candidate_lines = [f"Legal prose c{module}\npayload\nordinary words.\n" for module in attacker_modules]
+    path.write_text("MIT License\nCopyright Example\n" + "".join(candidate_lines), encoding="utf-8")
+    monkeypatch.setattr(sys, "meta_path", [RecordingFinder(), *sys.meta_path])
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
+    assert set(probed_modules).isdisjoint(attacker_modules)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"carbitrarybundle\npayload\n.", id="GLOBAL"),
+        pytest.param(b"(iarbitrarybundle\nPayload\n.", id="INST"),
+    ],
+)
+def test_legal_text_pickle_probe_routes_arbitrary_modules_without_import_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    probed_modules: list[str] = []
+
+    class RecordingFinder:
+        def find_spec(
+            self,
+            fullname: str,
+            _path: object = None,
+            _target: object = None,
+        ) -> None:
+            probed_modules.append(fullname)
+
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+    monkeypatch.setattr(sys, "meta_path", [RecordingFinder(), *sys.meta_path])
+
+    assert detect_file_format(str(path)) == "pickle"
+    assert detect_file_format_from_magic(str(path)) == "pickle"
+    assert detect_file_format_for_skip_filter(str(path)) == "pickle"
+    assert "arbitrarybundle" not in probed_modules
+
+
 def test_detect_file_format_fails_closed_for_terminal_inst_callback(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     path.write_bytes(
