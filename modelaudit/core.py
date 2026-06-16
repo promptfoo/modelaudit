@@ -2055,7 +2055,11 @@ def _onnx_weight_anomaly_provenance(results: ModelAuditResultModel, issue: Issue
     }
 
 
-def _onnx_weight_check_cluster_keys(results: ModelAuditResultModel, check: Check) -> tuple[tuple[Any, ...], ...]:
+def _onnx_weight_check_cluster_keys(
+    results: ModelAuditResultModel,
+    check: Check,
+    cluster_keys: Iterable[tuple[Any, ...]],
+) -> tuple[tuple[Any, ...], ...]:
     """Return raw or consolidated ONNX anomaly contexts carried by one check."""
     content_hash = _file_content_hash(results, check.location)
     key = _onnx_weight_anomaly_cluster_key(check, content_hash=content_hash)
@@ -2068,13 +2072,15 @@ def _onnx_weight_check_cluster_keys(results: ModelAuditResultModel, check: Check
     for finding in findings:
         if not isinstance(finding, dict):
             return ()
-        key = _onnx_weight_anomaly_cluster_key(
-            check.model_copy(update={"details": finding}),
-            content_hash=content_hash,
-        )
-        if key is None:
+        finding_context = _onnx_weight_issue_context_key(check.model_copy(update={"details": finding}))
+        matching_keys = [
+            key
+            for key in cluster_keys
+            if len(key) >= 3 and key[1] == check.severity and key[2] == content_hash and key[3:] == finding_context
+        ]
+        if finding_context is None or len(matching_keys) != 1:
             return ()
-        keys.append(key)
+        keys.append(matching_keys[0])
     return tuple(keys)
 
 
@@ -2164,7 +2170,7 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
     retained_checks: list[Check] = []
     retained_cluster_check_keys: set[tuple[tuple[Any, ...], ...]] = set()
     for check in results.checks:
-        keys = _onnx_weight_check_cluster_keys(results, check)
+        keys = _onnx_weight_check_cluster_keys(results, check, clustered_issues_by_key)
         clustered_check_issues = [clustered_issues_by_key[key] for key in keys if key in clustered_issues_by_key]
         if not keys or len(clustered_check_issues) != len(keys):
             retained_checks.append(check)
