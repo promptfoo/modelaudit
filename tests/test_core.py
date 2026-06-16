@@ -12642,6 +12642,14 @@ def test_scan_file_tokenizer_over_eof_cap_with_hidden_late_conflict_fails_closed
     hidden_conflict = ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}]'
     tokenizer_path = tmp_path / "tokenizer.json"
     tokenizer_path.write_text(benign_tokenizer + (" " * 320) + hidden_conflict + (" " * 128), encoding="utf-8")
+    magic_probe_calls = 0
+
+    def counting_magic_probe(path: str) -> str:
+        nonlocal magic_probe_calls
+        magic_probe_calls += 1
+        return file_detection.detect_file_format_from_magic(path)
+
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", counting_magic_probe)
 
     result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
 
@@ -12651,6 +12659,7 @@ def test_scan_file_tokenizer_over_eof_cap_with_hidden_late_conflict_fails_closed
     assert result.metadata["scan_outcome_reasons"] == ["tokenizer_json_ownership_incomplete"]
     assert any(check.name == "Tokenizer JSON Routing" and check.status == CheckStatus.FAILED for check in result.checks)
     assert "mxnet_symbol_routing_incomplete" not in result.metadata["scan_outcome_reasons"]
+    assert magic_probe_calls == 0
 
 
 @pytest.mark.parametrize(

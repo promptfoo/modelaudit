@@ -6338,7 +6338,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         magic_format = "unknown"
     elif header_format == "zip":
         magic_format = "zip"
-    elif header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}:
+    elif header_format in {
+        "mxnet",
+        MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+        TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
+    }:
         magic_format = header_format
     else:
         try:
