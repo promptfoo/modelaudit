@@ -12657,6 +12657,26 @@ def test_scan_file_eof_owned_tokenizer_array_elements_do_not_fail_closed_as_mxne
     assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
+def test_scan_file_eof_tokenizer_ownership_proof_is_cached_per_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=4096)
+    proof = file_detection._hf_tokenizer_json_eof_proves_ownership_for_identity
+    proof.cache_clear()
+
+    try:
+        result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+        cache_info = proof.cache_info()
+    finally:
+        proof.cache_clear()
+
+    assert result.success is True
+    assert cache_info.misses == 1
+    assert cache_info.hits >= 1
+
+
 def test_scan_file_oversized_hf_tokenizer_json_does_not_fail_closed_as_mxnet(tmp_path: Path) -> None:
     tokenizer_path = _write_hf_tokenizer_json(
         tmp_path / "tokenizer.json",

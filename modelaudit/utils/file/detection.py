@@ -1771,16 +1771,19 @@ def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
         str(file_path),
         expected_stat.st_size,
         expected_stat.st_mtime_ns,
+        expected_stat.st_ctime_ns,
         expected_stat.st_dev,
         expected_stat.st_ino,
         TOKENIZER_JSON_EOF_PROOF_READ_BYTES,
     )
 
 
+@lru_cache(maxsize=64)
 def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     file_path_str: str,
     file_size: int,
     mtime_ns: int,
+    ctime_ns: int,
     device: int,
     inode: int,
     proof_budget: int,
@@ -1792,6 +1795,7 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
             not file_path.is_file()
             or expected_stat.st_size != file_size
             or expected_stat.st_mtime_ns != mtime_ns
+            or expected_stat.st_ctime_ns != ctime_ns
             or expected_stat.st_dev != device
             or expected_stat.st_ino != inode
             or expected_stat.st_size < 4
@@ -1995,18 +1999,24 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
             raise _JSONProbeInvalid
         finish_value()
 
+    def proof_chunks(stream: BinaryIO) -> Iterator[bytes]:
+        while read_chunk := stream.read(_HF_TOKENIZER_STREAM_CHUNK_BYTES):
+            for offset in range(0, len(read_chunk), 4096):
+                yield read_chunk[offset : offset + 4096]
+
     try:
         with file_path.open("rb") as stream:
             opened_stat = os.fstat(stream.fileno())
             if (
                 opened_stat.st_size != file_size
                 or opened_stat.st_mtime_ns != mtime_ns
+                or opened_stat.st_ctime_ns != ctime_ns
                 or opened_stat.st_dev != device
                 or opened_stat.st_ino != inode
             ):
                 return False
             first_chunk = True
-            while chunk := stream.read(min(_HF_TOKENIZER_STREAM_CHUNK_BYTES, 4096)):
+            for chunk in proof_chunks(stream):
                 bytes_read += len(chunk)
                 if bytes_read > proof_budget:
                     return False
@@ -2016,14 +2026,17 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
                     if chunk.startswith(_UTF8_BOM):
                         chunk = chunk[len(_UTF8_BOM) :]
                 if in_string and not capture_string and not escaped and unicode_escape_remaining == 0:
-                    combined = string_tail + chunk
-                    if b'"' not in chunk and b"\\" not in chunk and not any(byte < 0x20 for byte in chunk):
+                    boundary = string_tail + chunk[:16]
+                    if b'"' not in chunk and b"\\" not in chunk and min(chunk) >= 0x20:
                         if string_scans_templates(string_path) and (
-                            any(indicator.encode() in combined for indicator in _JSON_PROBE_TEMPLATE_INDICATORS)
-                            or _JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE.search(combined) is not None
+                            any(
+                                indicator.encode() in chunk or indicator.encode() in boundary
+                                for indicator in _JSON_PROBE_TEMPLATE_INDICATORS
+                            )
+                            or _JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE.search(boundary) is not None
                         ):
                             raise _JSONProbeInvalid
-                        string_tail = combined[-16:]
+                        string_tail = chunk[-16:] if len(chunk) >= 16 else boundary[-16:]
                         continue
                 for byte in chunk:
                     if in_string:
@@ -2134,10 +2147,12 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     return (
         opened_after_stat.st_size == expected_stat.st_size
         and opened_after_stat.st_mtime_ns == expected_stat.st_mtime_ns
+        and opened_after_stat.st_ctime_ns == expected_stat.st_ctime_ns
         and opened_after_stat.st_dev == expected_stat.st_dev
         and opened_after_stat.st_ino == expected_stat.st_ino
         and current_stat.st_size == expected_stat.st_size
         and current_stat.st_mtime_ns == expected_stat.st_mtime_ns
+        and current_stat.st_ctime_ns == expected_stat.st_ctime_ns
         and current_stat.st_dev == expected_stat.st_dev
         and current_stat.st_ino == expected_stat.st_ino
         and root_keys >= _HF_TOKENIZER_ROOT_KEYS | {"model"}
