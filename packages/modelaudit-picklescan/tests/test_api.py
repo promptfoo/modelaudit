@@ -2873,6 +2873,34 @@ def test_scan_bytes_flags_canonical_pytorch_storage_persistent_ids() -> None:
     assert report.notices == ()
 
 
+def test_scan_bytes_marks_pytorch_storage_persistent_id_in_follow_on_control_stream() -> None:
+    payload = pickle.dumps({"protocol_version": 1001}, protocol=5) + _pytorch_storage_persistent_id_payload(
+        "k", storage_name="ByteStorage"
+    )
+
+    report = scan_bytes(payload, source="legacy-control-streams.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    import_references = cast(tuple[dict[str, object], ...], report.metadata.get("import_references", ()))
+    assert any(
+        reference.get("import_reference") == "torch.ByteStorage"
+        and reference.get("pytorch_storage_persistent_id") is True
+        for reference in import_references
+    )
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+def test_pytorch_storage_parser_rejects_malformed_bytes_after_control_streams() -> None:
+    payload = pickle.dumps({"protocol_version": 1001}, protocol=5) + _pytorch_storage_persistent_id_payload(
+        "k", storage_name="ByteStorage"
+    )
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload + b"\xff")
+
+    assert parsed.parse_complete is False
+    assert parsed.all_persistent_ids_are_pytorch_storage is False
+
+
 def test_scan_bytes_marks_global_pytorch_storage_persistent_id_import_reference() -> None:
     payload = (
         b"\x80\x02("
