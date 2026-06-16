@@ -389,6 +389,16 @@ class TestDvcIntegration:
             issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON for issue in results.issues
         )
 
+    def test_single_dvc_directory_hash_matches_direct_directory(self, tmp_path: Path) -> None:
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        (output_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+        direct = scan_model_directory_or_file(str(output_dir))
+        via_dvc = scan_model_directory_or_file(str(dvc_file))
+        assert via_dvc.content_hash == direct.content_hash
+
     @pytest.mark.parametrize("scan_directory", [False, True])
     def test_unreadable_dvc_directory_subtree_marks_scan_incomplete(
         self,

@@ -3716,6 +3716,7 @@ def scan_model_directory_or_file(
     }
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
+    single_dvc_directory_content_hash: str | None = None
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     nearby_license_cache: dict[str, list[str]] = {}
@@ -5824,7 +5825,9 @@ def scan_model_directory_or_file(
                         nested_result.files_scanned > 0 and nested_result.content_hash is None
                     ):
                         aggregate_hash_complete = False
-                    if nested_result.content_hash and nested_result.content_hash not in file_hashes:
+                    if is_dvc_pointer and len(target_files) == 1:
+                        single_dvc_directory_content_hash = nested_result.content_hash
+                    elif nested_result.content_hash and nested_result.content_hash not in file_hashes:
                         file_hashes.append(nested_result.content_hash)
                     if nested_result.has_errors:
                         scan_metadata["has_operational_errors"] = True
@@ -6222,6 +6225,8 @@ def scan_model_directory_or_file(
     # Compute aggregate content hash only when every declared artifact was covered.
     if not aggregate_hash_complete:
         results.content_hash = None
+    elif single_dvc_directory_content_hash is not None:
+        results.content_hash = single_dvc_directory_content_hash
     elif file_hashes:
         from .utils.helpers.secure_hasher import compute_aggregate_hash
 
@@ -7581,6 +7586,8 @@ def scan_model_streaming(
     file_hashes: list[str] = []
     hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     hashed_stream_file_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
+    recorded_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
+    recorded_stream_file_targets: set[_FileTargetIdentityKey] = set()
     hashed_stream_source_hashes_by_path: dict[Path, tuple[_FileIdentitySnapshot, str]] = {}
     hashed_stream_source_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
     unstable_stream_hash_paths: set[Path] = set()
@@ -7839,6 +7846,10 @@ def scan_model_streaming(
             return file_hash
         if record_hash:
             file_hashes.append(file_hash)
+            if scan_path_identity is not None:
+                recorded_stream_file_instances.add((scan_path_key, scan_path_identity))
+            if scan_target_key is not None:
+                recorded_stream_file_targets.add(scan_target_key)
         if scan_path_identity is not None:
             hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
         if scan_target_key is not None:
@@ -7991,6 +8002,7 @@ def scan_model_streaming(
             onnx_external_data_hash_unstable: set[Path] = set()
             onnx_external_data_bytes_scanned = 0
             onnx_external_data_hashes: list[tuple[str, str]] = []
+            recorded_onnx_external_data_hashes: list[str] = []
             onnx_package_hash_complete: bool | None = None
             suppress_consumed_onnx_external_data_accounting = False
             openvino_sidecar_needs_independent_scan = False
@@ -8359,6 +8371,11 @@ def scan_model_streaming(
                                     external_data_hash,
                                 )
                             )
+                            if external_data_instance in recorded_stream_file_instances or (
+                                external_data_target_key is not None
+                                and external_data_target_key in recorded_stream_file_targets
+                            ):
+                                recorded_onnx_external_data_hashes.append(external_data_hash)
                         if external_data_target_key is not None and (
                             defer_hash_for_file_backed_onnx or external_data_hash is not None
                         ):
@@ -8442,7 +8459,7 @@ def scan_model_streaming(
                                 else file_hash
                             )
                             metadata_dict["content_hash"] = package_content_hash
-                            for _external_data_role, external_data_hash in onnx_external_data_hashes:
+                            for external_data_hash in recorded_onnx_external_data_hashes:
                                 _discard_recorded_hash(file_hashes, external_data_hash)
                             if package_content_hash not in file_hashes:
                                 file_hashes.append(package_content_hash)

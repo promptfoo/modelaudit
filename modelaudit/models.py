@@ -633,7 +633,7 @@ def _onnx_weight_issue_context_key(issue: Check | Issue) -> tuple[Any, ...] | No
     elif getattr(issue, "type", None) not in {"onnx_check", "weight_distribution_check"}:
         return None
     details = issue.details if isinstance(issue.details, dict) else {}
-    anomaly_neurons = details.get("affected_neurons", details.get("outlier_neurons"))
+    anomaly_neurons = details.get("affected_neurons", details.get("outlier_neurons", details.get("neuron_index")))
     if anomaly_neurons is None or "initializer" not in details:
         return None
     fields = (

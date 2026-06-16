@@ -2435,6 +2435,28 @@ def test_scan_model_streaming_defers_file_backed_onnx_hash(
     )
 
 
+def test_scan_model_streaming_onnx_external_data_keeps_unrelated_duplicate_hash(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    unrelated_path = tmp_path / "unrelated.bin"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(struct.pack("f", 1.0))
+    unrelated_path.write_bytes(sidecar_path.read_bytes())
+    package_hash = _onnx_package_content_hash(
+        compute_sha256_hash(model_path),
+        [(_onnx_external_data_role(model_path, sidecar_path), compute_sha256_hash(sidecar_path))],
+    )
+    result = scan_model_streaming(
+        file_generator=iter([(unrelated_path, True), (model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+    assert result.content_hash == compute_aggregate_hash([compute_sha256_hash(unrelated_path), package_hash])
+
+
 def test_scan_model_streaming_onnx_external_data_refetch_does_not_duplicate_content_hash(
     tmp_path: Path,
 ) -> None:

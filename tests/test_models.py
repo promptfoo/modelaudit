@@ -25,6 +25,7 @@ from modelaudit.models import (
     ScannerPerformanceMetrics,
     SecretsFinding,
     WeightAnalysisModel,
+    _onnx_weight_issue_context_key,
     convert_assets_to_models,
     convert_checks_to_models,
     convert_issues_to_models,
@@ -753,6 +754,16 @@ class TestModelAuditResultModel:
         result.issues = [issue, issue, issue]
         result.deduplicate_issues()
         assert len(result.issues) == 1
+
+    def test_onnx_weight_context_accepts_single_neuron_index(self) -> None:
+        issue = Issue(
+            message="dissimilar",
+            severity=IssueSeverity.WARNING,
+            timestamp=time.time(),
+            type="weight_distribution_check",
+            details={"initializer": "W", "neuron_index": 3},
+        )
+        assert _onnx_weight_issue_context_key(issue) is not None
 
     def test_dict_compat(self):
         """Test dictionary-like access."""
