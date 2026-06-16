@@ -13608,6 +13608,168 @@ def test_scan_bytes_keeps_shifted_benign_base64_clean() -> None:
     assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
 
 
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_resets_base64_alignment_when_url_ends_at_overlap(protocol: int) -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system('id')" + (b"Z" * 50)).decode("ascii")
+    url = "https://example.invalid/a"
+    literal = ("." * (4096 - len(url))) + url + "\n" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"url-end-base64-overlap-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("url_end_delta", [-1, 0, 1])
+@pytest.mark.parametrize("encoding", ["standard", "mime", "urlsafe"])
+def test_scan_bytes_resets_encoded_alignment_around_removed_url(
+    url_end_delta: int,
+    encoding: str,
+) -> None:
+    payload = (b"Q" * 5000) + b"os.system('id')" + (b"Z" * 50)
+    if encoding == "mime":
+        encoded = base64.encodebytes(payload).decode("ascii")
+    elif encoding == "urlsafe":
+        encoded = base64.urlsafe_b64encode(b"\xf8" + payload).decode("ascii")
+    else:
+        encoded = base64.b64encode(payload).decode("ascii")
+    url = "https://example.invalid/a"
+    url_end = 4096 + url_end_delta
+    literal = ("." * (url_end - len(url))) + url + "\n" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"url-{url_end_delta}-{encoding}-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_keeps_benign_base64_after_removed_url_clean() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"safe metadata" + (b"Z" * 50)).decode("ascii")
+    url = "https://example.invalid/a"
+    literal = ("." * (4096 - len(url))) + url + "\n" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="benign-url-end-base64-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+def test_scan_bytes_detects_base64_after_removed_url_without_windowing() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system('id')" + (b"Z" * 50)).decode("ascii")
+    url = "https://example.invalid/a"
+    literal = ("." * (4096 - len(url))) + url + "\n" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="unbounded-url-end-base64-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=30000),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+@pytest.mark.parametrize("slash_count", [5, 7, 9])
+def test_scan_bytes_preserves_odd_backslash_parity_at_overlap(protocol: int, slash_count: int) -> None:
+    quote_position = 4097
+    literal = (
+        ("A" * (quote_position - slash_count))
+        + ("\\" * slash_count)
+        + "'https://example.invalid/"
+        + ("x" * 4200)
+        + ";os.system(cmd)'"
+        + ("B" * 5000)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"odd-backslash-{slash_count}-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("slash_count", [4, 6, 8])
+@pytest.mark.parametrize("quote_shift", [0, 1, 2])
+def test_scan_bytes_preserves_even_backslash_parity_at_overlap(slash_count: int, quote_shift: int) -> None:
+    quote_position = 4096 + quote_shift
+    literal = (
+        ("A" * (quote_position - slash_count))
+        + ("\\" * slash_count)
+        + "'https://example.invalid/"
+        + ("x" * 4200)
+        + ";os.system(cmd)'"
+        + ("B" * 5000)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"even-backslash-{slash_count}-shift-{quote_shift}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+def test_scan_bytes_detects_odd_backslash_payload_without_windowing() -> None:
+    quote_position = 4097
+    literal = (
+        ("A" * (quote_position - 5))
+        + ("\\" * 5)
+        + "'https://example.invalid/"
+        + ("x" * 4200)
+        + ";os.system(cmd)'"
+        + ("B" * 5000)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="unbounded-odd-backslash.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=30000),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_preserves_call_after_cross_window_quoted_url() -> None:
     literal = "metadata='https://example.invalid/" + ("a" * (8 * 1024 * 1024)) + "';os.system(cmd)"
 

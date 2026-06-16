@@ -44,6 +44,7 @@ pub(crate) struct StringScanContinuation {
     inside_url: bool,
     reviewed_prefix_bytes: usize,
     lexical_lookbehind: Vec<u8>,
+    trailing_backslash_odd: bool,
     base64: Base64ScanContinuation,
 }
 
@@ -244,12 +245,20 @@ fn strip_url_spans_with_context(
     let lexical_lookbehind = continuation.as_ref().map_or_else(Vec::new, |continuation| {
         continuation.lexical_lookbehind.clone()
     });
-    let next_base64 = base64_continuation_at(
+    let continuation_trailing_backslash_odd = continuation
+        .as_ref()
+        .is_some_and(|continuation| continuation.trailing_backslash_odd);
+    let mut base64 = continuation
+        .as_ref()
+        .map_or_else(Base64ScanContinuation::default, |continuation| {
+            continuation.base64.clone()
+        });
+    let next_trailing_backslash_odd = trailing_backslash_odd_at(
         bytes,
         next_window_start,
         continuation
             .as_ref()
-            .map(|continuation| &continuation.base64),
+            .is_some_and(|continuation| continuation.trailing_backslash_odd),
     );
     let mut next_continuation = None;
     let reviewed_prefix_bytes = continuation
@@ -264,6 +273,7 @@ fn strip_url_spans_with_context(
         stripped.push('\0');
         copied_through = reviewed_prefix_bytes;
         cursor = reviewed_prefix_bytes;
+        base64 = Base64ScanContinuation::default();
     }
 
     if let Some(continuation) = continuation.filter(|continuation| continuation.inside_url) {
@@ -274,12 +284,14 @@ fn strip_url_spans_with_context(
             stripped.push('\0');
             copied_through = end;
             cursor = end;
+            base64 = Base64ScanContinuation::default();
             if next_window_start < end {
                 next_continuation = Some(StringScanContinuation {
                     lex_stack: continuation.lex_stack,
                     inside_url: true,
                     reviewed_prefix_bytes: 0,
                     lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
+                    trailing_backslash_odd: next_trailing_backslash_odd,
                     base64: Base64ScanContinuation::default(),
                 });
             }
@@ -293,7 +305,8 @@ fn strip_url_spans_with_context(
                 inside_url: false,
                 reviewed_prefix_bytes: 0,
                 lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
-                base64: next_base64.clone(),
+                trailing_backslash_odd: next_trailing_backslash_odd,
+                base64: base64.clone(),
             });
         }
         if url_scheme_starts(bytes, cursor) {
@@ -304,6 +317,7 @@ fn strip_url_spans_with_context(
                 inside_url: true,
                 reviewed_prefix_bytes: 0,
                 lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
+                trailing_backslash_odd: next_trailing_backslash_odd,
                 base64: Base64ScanContinuation::default(),
             };
             let (end, uncertain) = url_end(bytes, cursor, continuation.lex_stack.last().copied());
@@ -315,6 +329,9 @@ fn strip_url_spans_with_context(
             stripped.push('\0');
             if cursor <= next_window_start && next_window_start < end {
                 next_continuation = Some(continuation);
+            }
+            if cursor < next_window_start {
+                base64 = Base64ScanContinuation::default();
             }
             copied_through = end;
             cursor = end;
@@ -361,9 +378,12 @@ fn strip_url_spans_with_context(
                         !push_lex_frame(&mut lex_stack, StringLexFrame::Comment(false));
                 }
                 b'\'' | b'"' => {
-                    if let Some((frame, width)) =
-                        string_lex_frame_with_lookbehind(bytes, cursor, &lexical_lookbehind)
-                    {
+                    if let Some((frame, width)) = string_lex_frame_with_lookbehind(
+                        bytes,
+                        cursor,
+                        &lexical_lookbehind,
+                        continuation_trailing_backslash_odd,
+                    ) {
                         context_incomplete |= !push_lex_frame(&mut lex_stack, frame);
                         cursor += width - 1;
                     }
@@ -411,9 +431,12 @@ fn strip_url_spans_with_context(
                     if quote_run > 6 {
                         context_incomplete = true;
                         cursor += quote_run - 1;
-                    } else if let Some((frame, width)) =
-                        string_lex_frame_with_lookbehind(bytes, cursor, &lexical_lookbehind)
-                    {
+                    } else if let Some((frame, width)) = string_lex_frame_with_lookbehind(
+                        bytes,
+                        cursor,
+                        &lexical_lookbehind,
+                        continuation_trailing_backslash_odd,
+                    ) {
                         lex_stack.push(frame);
                         cursor += width - 1;
                     }
@@ -427,6 +450,10 @@ fn strip_url_spans_with_context(
         let boundary_quote_was_reviewed = step_start == next_window_start
             && matches!(byte, b'\'' | b'"')
             && lex_stack_before_step.is_some();
+        let base64_feed_end = (cursor + 1).min(next_window_start);
+        if step_start < base64_feed_end {
+            advance_base64_continuation(&mut base64, &bytes[step_start..base64_feed_end]);
+        }
         if (step_start < next_window_start && next_window_start <= cursor)
             || (step_start == next_window_start
                 && (step_changed_lexer
@@ -438,7 +465,8 @@ fn strip_url_spans_with_context(
                 inside_url: false,
                 reviewed_prefix_bytes: cursor + 1 - next_window_start,
                 lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
-                base64: next_base64.clone(),
+                trailing_backslash_odd: next_trailing_backslash_odd,
+                base64: base64.clone(),
             });
         }
         cursor += 1;
@@ -450,7 +478,8 @@ fn strip_url_spans_with_context(
             inside_url: false,
             reviewed_prefix_bytes: 0,
             lexical_lookbehind: lexical_lookbehind_at(bytes, next_window_start),
-            base64: next_base64,
+            trailing_backslash_odd: next_trailing_backslash_odd,
+            base64,
         });
     }
 
@@ -501,38 +530,63 @@ fn string_lex_frame_with_lookbehind(
     bytes: &[u8],
     quote: usize,
     lookbehind: &[u8],
+    preceding_backslash_odd: bool,
 ) -> Option<(StringLexFrame, usize)> {
-    if quote >= 3 || lookbehind.is_empty() {
-        return string_lex_frame(bytes, quote);
+    let current_backslashes = bytes[..quote]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    let (context, contextual_quote) = if quote >= 3 || lookbehind.is_empty() {
+        (Cow::Borrowed(bytes), quote)
+    } else {
+        let suffix_end = (quote + 3).min(bytes.len());
+        let mut contextual = Vec::with_capacity(lookbehind.len() + suffix_end);
+        contextual.extend_from_slice(lookbehind);
+        contextual.extend_from_slice(&bytes[..suffix_end]);
+        let contextual_quote = lookbehind.len() + quote;
+        (Cow::Owned(contextual), contextual_quote)
+    };
+    if current_backslashes != quote {
+        return string_lex_frame(context.as_ref(), contextual_quote);
     }
-    let suffix_end = (quote + 3).min(bytes.len());
-    let mut contextual = Vec::with_capacity(lookbehind.len() + suffix_end);
-    contextual.extend_from_slice(lookbehind);
-    contextual.extend_from_slice(&bytes[..suffix_end]);
-    string_lex_frame(&contextual, lookbehind.len() + quote)
+    if (current_backslashes % 2 == 1) ^ preceding_backslash_odd {
+        return None;
+    }
+    let formatted = string_quote_prefix_unescaped(context.as_ref(), contextual_quote)?;
+    let delimiter = bytes[quote];
+    let width = if bytes.get(quote..quote + 3) == Some([delimiter; 3].as_slice()) {
+        3
+    } else {
+        1
+    };
+    Some((StringLexFrame::String(delimiter, width, formatted), width))
 }
 
 fn lexical_lookbehind_at(bytes: &[u8], boundary: usize) -> Vec<u8> {
     bytes[boundary.saturating_sub(3)..boundary].to_vec()
 }
 
-fn base64_continuation_at(
-    bytes: &[u8],
-    boundary: usize,
-    previous: Option<&Base64ScanContinuation>,
-) -> Base64ScanContinuation {
-    let mut continuation = previous.cloned().unwrap_or_default();
-    for byte in &bytes[..boundary] {
+fn advance_base64_continuation(continuation: &mut Base64ScanContinuation, bytes: &[u8]) {
+    for byte in bytes {
         if base64_value(*byte).is_some() {
             continuation.alignment_prefix.push(*byte);
             if continuation.alignment_prefix.len() == 4 {
                 continuation.alignment_prefix.clear();
             }
         } else if !is_base64_ignored_whitespace(*byte) {
-            continuation = Base64ScanContinuation::default();
+            *continuation = Base64ScanContinuation::default();
         }
     }
-    continuation
+}
+
+fn trailing_backslash_odd_at(bytes: &[u8], boundary: usize, preceding_odd: bool) -> bool {
+    let trailing = bytes[..boundary]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    (trailing % 2 == 1) ^ (trailing == boundary && preceding_odd)
 }
 
 fn url_scheme_starts(bytes: &[u8], start: usize) -> bool {
@@ -636,6 +690,10 @@ fn string_quote_prefix(bytes: &[u8], quote: usize) -> Option<bool> {
     if quote_is_escaped(bytes, quote) {
         return None;
     }
+    string_quote_prefix_unescaped(bytes, quote)
+}
+
+fn string_quote_prefix_unescaped(bytes: &[u8], quote: usize) -> Option<bool> {
     let mut prefix_start = quote;
     while prefix_start > 0
         && quote - prefix_start < 2
@@ -2197,6 +2255,49 @@ mod tests {
             let matches = scan_windows_split_inside_lexical_unit(&literal, BOUNDARY, BOUNDARY + 32);
 
             assert!(matches.is_empty(), "shift={shift} matches={matches:?}");
+        }
+    }
+
+    #[test]
+    fn window_continuation_resets_base64_alignment_at_removed_url_boundary() {
+        const BOUNDARY: usize = 64;
+        let url = "https://example.invalid/a";
+        let encoded = format!("{}b3Muc3lzdGVtKCdpZCcp", "QUFB".repeat(64));
+        for url_end_delta in -1isize..=1 {
+            let url_end = BOUNDARY.checked_add_signed(url_end_delta).unwrap();
+            let literal = format!("{}{}\n{encoded}!", ".".repeat(url_end - url.len()), url);
+            let matches = scan_windows_split_inside_lexical_unit(&literal, BOUNDARY, BOUNDARY + 32);
+
+            assert!(
+                matches.contains(&"base64 os.system".to_string()),
+                "url_end_delta={url_end_delta} matches={matches:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn window_continuation_preserves_trailing_backslash_parity() {
+        const BOUNDARY: usize = 64;
+        for delimiter in ["'", "\""] {
+            for slash_count in 4usize..=9 {
+                for quote_shift in 0usize..=2 {
+                    let quote = BOUNDARY + quote_shift;
+                    let literal = format!(
+                        "{}{}{delimiter}https://example.invalid/{};os.system(cmd){delimiter}",
+                        "A".repeat(quote - slash_count),
+                        "\\".repeat(slash_count),
+                        "x".repeat(128),
+                    );
+                    let matches =
+                        scan_windows_split_inside_lexical_unit(&literal, BOUNDARY, BOUNDARY + 32);
+
+                    assert_eq!(
+                        matches.contains(&"os.system".to_string()),
+                        slash_count % 2 == 1,
+                        "delimiter={delimiter:?} slash_count={slash_count} quote_shift={quote_shift} matches={matches:?}",
+                    );
+                }
+            }
         }
     }
 
