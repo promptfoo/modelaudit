@@ -70,6 +70,47 @@ def _qlinear_matmul(tmp_path: Path, *, malicious: bool, scale_type: int = Tensor
     return _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 24)]), tmp_path / "q.onnx")
 
 
+def _qlinear_two_weights(tmp_path: Path) -> Path:
+    initializers = [
+        _tensor("W", _extreme_int8(True)),
+        _tensor("V", _extreme_int8(True)),
+    ]
+    nodes = []
+    for weight, output in (("W", "Y"), ("V", "Z")):
+        initializers.extend(
+            [
+                _tensor(f"{weight}_scale", np.asarray(1, dtype=np.float32)),
+                _tensor(f"{weight}_zero", np.asarray(0, dtype=np.int8)),
+            ]
+        )
+        nodes.append(
+            helper.make_node(
+                "QLinearMatMul",
+                ["X", "X_scale", "X_zero", weight, f"{weight}_scale", f"{weight}_zero", "Y_scale", "Y_zero"],
+                [output],
+            )
+        )
+    initializers.extend(
+        [
+            _tensor("X_scale", np.asarray(1, dtype=np.float32)),
+            _tensor("X_zero", np.asarray(0, dtype=np.int8)),
+            _tensor("Y_scale", np.asarray(1, dtype=np.float32)),
+            _tensor("Y_zero", np.asarray(0, dtype=np.int8)),
+        ]
+    )
+    graph = helper.make_graph(
+        nodes,
+        "qlinear_two",
+        [helper.make_tensor_value_info("X", TensorProto.INT8, [1, 100])],
+        [
+            helper.make_tensor_value_info("Y", TensorProto.INT8, [1, 10]),
+            helper.make_tensor_value_info("Z", TensorProto.INT8, [1, 10]),
+        ],
+        initializer=initializers,
+    )
+    return _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 24)]), tmp_path / "q-two.onnx")
+
+
 def _qlinear_float8_weight(tmp_path: Path) -> Path:
     data_type = next(
         (int(getattr(TensorProto, name)) for name in ("FLOAT8E4M3FN", "FLOAT8E5M2") if hasattr(TensorProto, name)),
@@ -381,6 +422,17 @@ def test_external_data_max_file_size_does_not_count_skipped_sidecar(tmp_path: Pa
     assert result.content_hash is None
 
 
+def test_external_data_max_total_size_does_not_count_skipped_sidecar(tmp_path: Path) -> None:
+    model_path, sidecar = _external_package(tmp_path)
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        scanners=["onnx"],
+        max_total_size=model_path.stat().st_size + sidecar.stat().st_size - 1,
+    )
+    assert result.bytes_scanned < model_path.stat().st_size + sidecar.stat().st_size
+    assert result.content_hash is None
+
+
 def test_standalone_weight_distribution_clusters_identical_onnx_exports(tmp_path: Path) -> None:
     first = _qlinear_matmul(tmp_path, malicious=True)
     second = tmp_path / "copy.onnx"
@@ -391,3 +443,14 @@ def test_standalone_weight_distribution_clusters_identical_onnx_exports(tmp_path
     assert len(anomalies) == 1
     assert len(anomaly_checks) == 1
     assert anomalies[0].details["cluster_size"] == 2
+
+
+def test_standalone_weight_distribution_clusters_consolidated_onnx_checks(tmp_path: Path) -> None:
+    first = _qlinear_two_weights(tmp_path)
+    (tmp_path / "copy.onnx").write_bytes(first.read_bytes())
+    result = scan_model_directory_or_file(str(tmp_path), scanners=["weight_distribution"])
+    anomaly_checks = [check for check in result.checks if check.name == "Weight Distribution Anomaly Detection"]
+    assert len(anomaly_checks) == 1
+    findings = anomaly_checks[0].details["findings"]
+    assert len(findings) == 2
+    assert all(finding["cluster_size"] == 2 for finding in findings)

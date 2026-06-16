@@ -2055,6 +2055,29 @@ def _onnx_weight_anomaly_provenance(results: ModelAuditResultModel, issue: Issue
     }
 
 
+def _onnx_weight_check_cluster_keys(results: ModelAuditResultModel, check: Check) -> tuple[tuple[Any, ...], ...]:
+    """Return raw or consolidated ONNX anomaly contexts carried by one check."""
+    content_hash = _file_content_hash(results, check.location)
+    key = _onnx_weight_anomaly_cluster_key(check, content_hash=content_hash)
+    if key is not None:
+        return (key,)
+    findings = check.details.get("findings") if isinstance(check.details, dict) else None
+    if check.name != "Weight Distribution Anomaly Detection" or not isinstance(findings, list):
+        return ()
+    keys: list[tuple[Any, ...]] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            return ()
+        key = _onnx_weight_anomaly_cluster_key(
+            check.model_copy(update={"details": finding}),
+            content_hash=content_hash,
+        )
+        if key is None:
+            return ()
+        keys.append(key)
+    return tuple(keys)
+
+
 def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
     clusters: dict[tuple[Any, ...], list[Issue]] = {}
     issue_keys: list[tuple[Any, ...] | None] = []
@@ -2139,28 +2162,39 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
         retained_issues.append(clustered_issue)
         clustered_issues_by_key[key] = clustered_issue
     retained_checks: list[Check] = []
-    retained_cluster_check_keys: set[tuple[Any, ...]] = set()
+    retained_cluster_check_keys: set[tuple[tuple[Any, ...], ...]] = set()
     for check in results.checks:
-        key = _onnx_weight_anomaly_cluster_key(check, content_hash=_file_content_hash(results, check.location))
-        if key is None:
+        keys = _onnx_weight_check_cluster_keys(results, check)
+        clustered_check_issues = [clustered_issues_by_key[key] for key in keys if key in clustered_issues_by_key]
+        if not keys or len(clustered_check_issues) != len(keys):
             retained_checks.append(check)
             continue
-        clustered_check_issue = clustered_issues_by_key.get(key)
-        if clustered_check_issue is None:
-            retained_checks.append(check)
+        if keys in retained_cluster_check_keys:
             continue
-        if key in retained_cluster_check_keys:
-            continue
-        retained_cluster_check_keys.add(key)
+        retained_cluster_check_keys.add(keys)
+        representative_check_issue = clustered_check_issues[0]
+        clustered_check_details = (
+            representative_check_issue.details
+            if len(clustered_check_issues) == 1
+            else {
+                "component_count": len(clustered_check_issues),
+                "findings": [issue.details for issue in clustered_check_issues],
+            }
+        )
+        clustered_check_message = (
+            representative_check_issue.message
+            if len(clustered_check_issues) == 1
+            else f"{check.name} found {len(clustered_check_issues)} issues"
+        )
         retained_checks.append(
             check.model_copy(
                 update={
-                    "message": clustered_check_issue.message,
-                    "details": clustered_check_issue.details,
-                    "location": clustered_check_issue.location,
-                    "severity": clustered_check_issue.severity,
-                    "why": clustered_check_issue.why,
-                    "rule_code": clustered_check_issue.rule_code,
+                    "message": clustered_check_message,
+                    "details": clustered_check_details,
+                    "location": representative_check_issue.location,
+                    "severity": representative_check_issue.severity,
+                    "why": representative_check_issue.why,
+                    "rule_code": representative_check_issue.rule_code,
                 }
             )
         )
@@ -4834,11 +4868,11 @@ def scan_model_directory_or_file(
                                 continue
                             external_data_size = _snapshot_file_size(external_data_identity)
                             representative_external_identities.append((external_data_path, external_data_identity))
-                            representative_external_bytes += external_data_size
                             if max_total_size > 0 and hash_budget_bytes + external_data_size > max_total_size:
                                 aggregate_hash_complete = False
                                 onnx_package_hash_complete_by_path[representative_file] = False
                                 continue
+                            representative_external_bytes += external_data_size
                             external_data_source = str(
                                 Path(external_data_identity.resolved_path)
                                 if external_data_identity.resolved_path is not None
