@@ -7048,6 +7048,49 @@ def test_scan_model_streaming_hf_cache_alias_rejects_post_scan_blob_replacement(
     assert any(check.name == "Local Source Boundary Check" for check in result.checks)
 
 
+def test_scan_model_streaming_hf_cache_alias_rejects_pre_open_blob_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Deleting an alias cannot hide a blob generation swapped before its retained open."""
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--test-model"
+    snapshots_dir = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshots_dir.mkdir(parents=True)
+    blobs_dir.mkdir(parents=True)
+    blob_path = blobs_dir / "blob123"
+    create_malicious_pickle(blob_path)
+    original_generation = blobs_dir / "original-generation"
+    model_link = snapshots_dir / "model.pkl"
+    model_link.symlink_to(os.path.relpath(blob_path, model_link.parent))
+
+    def replace_then_restore_blob() -> Iterator[tuple[Path, bool]]:
+        blob_path.rename(original_generation)
+        blob_path.write_bytes(pickle.dumps({"data": "safe"}))
+        try:
+            yield model_link, True
+        finally:
+            blob_path.unlink(missing_ok=True)
+            original_generation.rename(blob_path)
+
+    result = scan_model_streaming(
+        file_generator=replace_then_restore_blob(),
+        timeout=30,
+        delete_after_scan=True,
+        scan_root=str(snapshots_dir),
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert any(check.name == "Local Source Boundary Check" for check in result.checks)
+    assert blob_path.exists()
+    assert not model_link.exists()
+
+
 def test_scan_model_streaming_hf_home_cache_symlink_allowed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

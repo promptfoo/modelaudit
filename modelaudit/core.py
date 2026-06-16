@@ -10324,6 +10324,7 @@ def scan_model_streaming(
     counted_onnx_external_data_targets: set[_FileTargetIdentityKey] = set()
     consumed_onnx_external_data_aliases: dict[Path, _FileTargetIdentityKey] = {}
     accounted_context_only_targets: set[_FileTargetIdentityKey] = set()
+    initial_hf_alias_targets: dict[tuple[str, ...], dict[str, int | str]] = {}
     terminal_hf_alias_targets: dict[Path, dict[str, int | str]] = {}
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
@@ -11282,6 +11283,48 @@ def scan_model_streaming(
             else None
         )
         is_hf_cache = base_dir is not None and hf_cache_root is not None
+        if is_hf_cache and local_source_initial_namespace is not None:
+            assert base_dir is not None
+            assert hf_cache_root is not None
+            trusted_blobs_root = _trusted_hf_blobs_root(hf_cache_root)
+            logical_source_root = (
+                Path(resolved_local_source_path) if resolved_local_source_path is not None else base_dir
+            )
+            if trusted_blobs_root is not None:
+                for initial_entry in local_source_initial_namespace:
+                    if time.time() - start_time > timeout:
+                        raise _LocalSourceBoundaryError("Hugging Face alias target retention timed out")
+                    if initial_entry.entry_type != "link":
+                        continue
+                    retained_alias_path = base_dir.joinpath(*initial_entry.relative_parts)
+                    logical_alias_path = logical_source_root.joinpath(*initial_entry.relative_parts)
+                    if not _is_hf_cache_snapshot_alias(logical_alias_path, hf_cache_root):
+                        continue
+                    try:
+                        current_entry = _directory_owner_snapshot_entry(
+                            retained_alias_path,
+                            initial_entry.relative_parts,
+                        )
+                        resolved_alias = retained_alias_path.resolve(strict=True)
+                        alias_target = _snapshot_regular_file_target(resolved_alias)
+                        verified_entry = _directory_owner_snapshot_entry(
+                            retained_alias_path,
+                            initial_entry.relative_parts,
+                        )
+                        verified_resolved_alias = retained_alias_path.resolve(strict=True)
+                        verified_alias_stat = verified_resolved_alias.stat()
+                    except (OSError, RuntimeError):
+                        continue
+                    if (
+                        alias_target is not None
+                        and is_within_directory(str(trusted_blobs_root), str(resolved_alias))
+                        and _directory_owner_snapshot_entries_match(initial_entry, current_entry)
+                        and _directory_owner_snapshot_entries_match(initial_entry, verified_entry)
+                        and os.path.normcase(os.path.normpath(str(resolved_alias)))
+                        == os.path.normcase(os.path.normpath(str(verified_resolved_alias)))
+                        and _validated_stat_matches_target(verified_alias_stat, alias_target)
+                    ):
+                        initial_hf_alias_targets[initial_entry.relative_parts] = alias_target
         scanner_selection_skip_extensions = (
             None if is_hf_cache and scanner_selection.active else scanner_selection_extensions
         )
@@ -11408,9 +11451,8 @@ def scan_model_streaming(
                     pass
                 else:
                     rebound_source_path = Path(bound_local_source_path).joinpath(*relative_source.parts)
-                    if preserve_stream_family_path:
-                        bound_stream_source_path = rebound_source_path
-                    else:
+                    bound_stream_source_path = rebound_source_path
+                    if not preserve_stream_family_path:
                         source_path = rebound_source_path
             local_source_relative_parts: tuple[str, ...] | None = None
             if initial_local_source_entries and not is_precomputed_streamed_result:
@@ -11766,7 +11808,26 @@ def scan_model_streaming(
                                 scan_path.stat(),
                             ):
                                 raise OSError("retained streaming link target changed while opening")
-                            if not is_hf_cache_symlink:
+                            if is_hf_cache_symlink:
+                                initial_alias_target = (
+                                    initial_hf_alias_targets.get(local_source_relative_parts)
+                                    if local_source_relative_parts is not None
+                                    else None
+                                )
+                                if (
+                                    initial_alias_target is None
+                                    or trusted_hf_alias_target is None
+                                    or not _local_target_receipts_match(
+                                        initial_alias_target,
+                                        trusted_hf_alias_target,
+                                    )
+                                    or not _validated_stat_matches_target(
+                                        retained_stream_stat,
+                                        initial_alias_target,
+                                    )
+                                ):
+                                    raise OSError("retained Hugging Face alias target changed before opening")
+                            else:
                                 if resolved_local_source_path is None:
                                     raise OSError("retained streaming link target omitted its source root")
                                 try:
@@ -12361,11 +12422,12 @@ def scan_model_streaming(
                     )
                     pin_is_alias = True
                 elif bound_local_source_path is not None and not initial_shard_target:
-                    pin_target = (
-                        _snapshot_regular_file_descriptor(retained_stream_source_fd)
-                        if retained_stream_source_fd is not None
-                        else initial_stream_target(scan_path)
-                    )
+                    if retained_stream_source_fd is not None:
+                        pin_target = _snapshot_regular_file_descriptor(retained_stream_source_fd)
+                        if pin_target is not None:
+                            pin_target["resolved_path"] = str(scan_path)
+                    else:
+                        pin_target = initial_stream_target(scan_path)
                     candidate_pin_resolved_path = pin_target.get("resolved_path") if pin_target is not None else None
                     pin_resolved_path = (
                         candidate_pin_resolved_path if isinstance(candidate_pin_resolved_path, str) else None
