@@ -3809,6 +3809,83 @@ def test_legal_text_pickle_probe_routes_arbitrary_modules_without_import_hooks(
     assert "arbitrarybundle" not in probed_modules
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_format"),
+    [
+        pytest.param(b"carbitrarybundle\npayload\nApache License\n", "pickle", id="raw-GLOBAL"),
+        pytest.param(
+            base64.b64encode(b"carbitrarybundle\npayload\nApache License\n"),
+            "pickle",
+            id="base64-GLOBAL",
+        ),
+        pytest.param(
+            binascii.hexlify(b"carbitrarybundle\npayload\nApache License\n"),
+            "pickle",
+            id="hex-GLOBAL",
+        ),
+        pytest.param(
+            b"MIT License\n" + base64.b64encode(b"carbitrarybundle\npayload\nApache License\n"),
+            "pickle",
+            id="legal-prefix-base64-GLOBAL",
+        ),
+        pytest.param(
+            b"MIT License\n" + binascii.hexlify(b"carbitrarybundle\npayload\nApache License\n"),
+            "pickle",
+            id="legal-prefix-hex-GLOBAL",
+        ),
+        pytest.param(
+            b"iarbitrarybundle\npayload\nApache License\n",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="raw-INST",
+        ),
+        pytest.param(
+            base64.b64encode(b"iarbitrarybundle\npayload\nApache License\n"),
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="base64-INST",
+        ),
+        pytest.param(
+            binascii.hexlify(b"iarbitrarybundle\npayload\nApache License\n"),
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            id="hex-INST",
+        ),
+    ],
+)
+def test_legal_text_pickle_probe_fails_closed_for_arbitrary_import_before_prose_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    probed_modules: list[str] = []
+
+    class RecordingFinder:
+        def find_spec(
+            self,
+            fullname: str,
+            _path: object = None,
+            _target: object = None,
+        ) -> None:
+            probed_modules.append(fullname)
+
+    path = tmp_path / "LICENSE"
+    path.write_bytes(payload)
+    monkeypatch.setattr(sys, "meta_path", [RecordingFinder(), *sys.meta_path])
+
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(path)) == expected_format
+    assert "arbitrarybundle" not in probed_modules
+
+
+def test_legal_text_pickle_probe_preserves_invalid_global_prose_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"carbitrarybundle payload\nApache License")
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
+
+
 def test_detect_file_format_fails_closed_for_terminal_inst_callback(tmp_path: Path) -> None:
     path = tmp_path / "LICENSE"
     path.write_bytes(

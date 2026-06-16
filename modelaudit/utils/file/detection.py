@@ -5773,7 +5773,7 @@ def _iter_pickle_candidate_offsets(
     scan_embedded: bool,
     is_plain_text: bool,
 ) -> Iterator[tuple[int, bool, bool, bool, bool]]:
-    seen: set[int] = set()
+    seen_prevalidated: dict[int, bool] = {}
 
     def maybe_add(
         offset: int,
@@ -5782,9 +5782,13 @@ def _iter_pickle_candidate_offsets(
         require_continuation: bool = False,
         require_strong_continuation: bool = False,
     ) -> Iterator[tuple[int, bool, bool, bool, bool]]:
-        if offset not in seen and offset < len(payload) and payload[offset] in _PICKLE_OPCODE_BY_BYTE:
-            seen.add(offset)
-            yield offset, prevalidated, require_continuation, require_strong_continuation, False
+        if offset >= len(payload) or payload[offset] not in _PICKLE_OPCODE_BY_BYTE:
+            return
+        prior_prevalidated = seen_prevalidated.get(offset)
+        if prior_prevalidated is not None and (prior_prevalidated or not prevalidated):
+            return
+        seen_prevalidated[offset] = prevalidated
+        yield offset, prevalidated, require_continuation, require_strong_continuation, False
 
     yield from maybe_add(0, prevalidated=_is_plausible_pickle_candidate(payload))
     if not scan_embedded:
