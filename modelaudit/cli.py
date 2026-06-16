@@ -2839,15 +2839,24 @@ def _explicit_local_shard_family_groups(
                         scope,
                     ):
                         break
+                    paths_under_scope: list[str] = []
+                    for selected_path, _resolved_path, _shard_index in records:
+                        try:
+                            Path(selected_path).relative_to(Path(scope))
+                        except ValueError:
+                            continue
+                        paths_under_scope.append(selected_path)
+                    external_context = _SafetensorsIndexInspectionContext()
                     external_proof, authority_present = _explicit_shard_index_authority(
-                        scoped_paths,
+                        tuple(paths_under_scope),
                         scope=scope,
                         expected_total=expected_total,
-                        index_inspection_context=discovery_context,
+                        index_inspection_context=external_context,
                     )
-                    if discovery_context.failure is not None:
-                        authority_invalid = True
-                        authority_scope = scope
+                    if external_context.failure is not None:
+                        if external_context.candidate_paths:
+                            authority_invalid = True
+                            authority_scope = scope
                         break
                     if not authority_present:
                         continue

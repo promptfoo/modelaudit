@@ -1032,6 +1032,7 @@ def test_explicit_shard_family_discovery_does_not_poison_runtime_index_context(
         families[os.path.normcase(os.path.normpath(os.path.abspath(shard_path)))] for shard_path in shard_paths
     }
     assert len(selected_families) == 2
+    assert all(not family.authority_invalid for family in selected_families)
     assert forced_failures == 2
     assert runtime_context.failure is None
 
@@ -1170,7 +1171,8 @@ def test_explicit_shard_family_does_not_ignore_governing_ancestor_index(tmp_path
     for shard in (*selected, decoy):
         shard.write_bytes(struct.pack("<Q", len(header)) + header)
     scope = selected_dir.parent
-    (scope / "model.safetensors.index.json").write_text(
+    index_path = scope / "model.safetensors.index.json"
+    index_path.write_text(
         json.dumps(
             {
                 "weight_map": {
@@ -1181,6 +1183,7 @@ def test_explicit_shard_family_does_not_ignore_governing_ancestor_index(tmp_path
         ),
         encoding="utf-8",
     )
+    index_path.chmod(0o644)
 
     result = _invoke_assumed_shard_family(selected, scanners="safetensors")
 
@@ -1228,7 +1231,8 @@ def test_explicit_same_shape_families_retain_governing_ancestor_index(
 
     monkeypatch.setattr(cli_module, "_trusted_explicit_shard_family_scope", trust_only_controlled_scope)
     second_target = selected_families[0][1] if index_target == "selected" else omitted
-    (scope / "model.safetensors.index.json").write_text(
+    index_path = scope / "model.safetensors.index.json"
+    index_path.write_text(
         json.dumps(
             {
                 "weight_map": {
@@ -1239,6 +1243,7 @@ def test_explicit_same_shape_families_retain_governing_ancestor_index(
         ),
         encoding="utf-8",
     )
+    index_path.chmod(0o644)
 
     selected = [*selected_families[0], *selected_families[1]]
     inspection_context = cli_module._SafetensorsIndexInspectionContext()
@@ -1247,8 +1252,11 @@ def test_explicit_same_shape_families_retain_governing_ancestor_index(
         inspection_context,
     )
     family_a_metadata = explicit_families[os.path.normcase(os.path.normpath(os.path.abspath(selected_families[0][0])))]
+    family_b_metadata = explicit_families[os.path.normcase(os.path.normpath(os.path.abspath(selected_families[1][0])))]
     assert family_a_metadata.scope == os.path.normcase(os.path.normpath(str(scope)))
     assert family_a_metadata.authority_invalid is True
+    assert family_b_metadata.scope == os.path.normcase(os.path.normpath(str(scope)))
+    assert family_b_metadata.authority_invalid is True
     result = _invoke_assumed_shard_family(selected, scanners="safetensors")
 
     assert result.exit_code == 2, result.output

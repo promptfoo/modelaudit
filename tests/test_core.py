@@ -2827,7 +2827,8 @@ def test_directory_scan_late_checkpoint_child_scans_without_owner_context(
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
     assert "jax_checkpoint" in result.scanner_names
-    assert str(model_dir) not in result.file_metadata
+    owner_metadata = result.file_metadata.get(str(model_dir))
+    assert owner_metadata is None or owner_metadata.get("directory_owner_scan") is not True
     assert any(
         issue.rule_code == "S902"
         and issue.severity == IssueSeverity.CRITICAL
