@@ -340,7 +340,7 @@ def test_windows_missing_reparse_attributes_and_mode_are_treated_as_absent() -> 
 
 
 def test_local_source_lexical_identity_ignores_ordinary_directory_content_metadata() -> None:
-    """Unrelated sibling changes cannot invalidate an ordinary ancestor identity."""
+    """Ordinary directory metadata is ignored while POSIX link metadata stays bound."""
 
     def fake_stat(
         *,
@@ -350,6 +350,7 @@ def test_local_source_lexical_identity_ignores_ordinary_directory_content_metada
         mtime_ns: int,
         ctime_ns: int,
         file_attributes: int = 0,
+        reparse_tag: int = 0,
     ) -> os.stat_result:
         return cast(
             os.stat_result,
@@ -362,6 +363,7 @@ def test_local_source_lexical_identity_ignores_ordinary_directory_content_metada
                 st_ctime_ns=ctime_ns,
                 st_nlink=1,
                 st_file_attributes=file_attributes,
+                st_reparse_tag=reparse_tag,
             ),
         )
 
@@ -391,6 +393,7 @@ def test_local_source_lexical_identity_ignores_ordinary_directory_content_metada
         mtime_ns=2,
         ctime_ns=3,
         file_attributes=reparse_flag,
+        reparse_tag=0xA000000C,
     )
     changed_reparse = fake_stat(
         inode=30,
@@ -399,11 +402,46 @@ def test_local_source_lexical_identity_ignores_ordinary_directory_content_metada
         mtime_ns=4,
         ctime_ns=5,
         file_attributes=reparse_flag,
+        reparse_tag=0xA000000C,
     )
-
     assert core_module._local_source_lexical_identity(
         [(parent_path, initial_reparse), (source_path, source_stat)]
     ) != core_module._local_source_lexical_identity([(parent_path, changed_reparse), (source_path, source_stat)])
+
+
+def test_windows_local_source_lexical_identity_uses_stable_reparse_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows reparse timestamps may drift, but object identity and tag may not."""
+
+    def fake_reparse_stat(*, inode: int, mtime_ns: int, ctime_ns: int, reparse_tag: int) -> os.stat_result:
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=1,
+                st_ino=inode,
+                st_mode=stat.S_IFDIR | 0o700,
+                st_size=1,
+                st_mtime_ns=mtime_ns,
+                st_ctime_ns=ctime_ns,
+                st_nlink=1,
+                st_file_attributes=getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400),
+                st_reparse_tag=reparse_tag,
+            ),
+        )
+
+    monkeypatch.setattr(core_module.os, "name", "nt")
+    reparse_path = Path("alias")
+    initial = fake_reparse_stat(inode=30, mtime_ns=2, ctime_ns=3, reparse_tag=0xA000000C)
+    metadata_changed = fake_reparse_stat(inode=30, mtime_ns=4, ctime_ns=5, reparse_tag=0xA000000C)
+    replaced = fake_reparse_stat(inode=31, mtime_ns=4, ctime_ns=5, reparse_tag=0xA000000C)
+    retagged = fake_reparse_stat(inode=30, mtime_ns=4, ctime_ns=5, reparse_tag=0x9000001A)
+
+    initial_identity = core_module._local_source_lexical_identity([(reparse_path, initial)])
+
+    assert initial_identity == core_module._local_source_lexical_identity([(reparse_path, metadata_changed)])
+    assert initial_identity != core_module._local_source_lexical_identity([(reparse_path, replaced)])
+    assert initial_identity != core_module._local_source_lexical_identity([(reparse_path, retagged)])
 
 
 def test_windows_local_source_guard_paths_allow_ordinary_directory_writers(
@@ -2809,15 +2847,20 @@ def test_directory_scan_late_checkpoint_child_scans_without_owner_context(
     original_iterdir = Path.iterdir
 
     def synthetic_entries(path: Path) -> Iterator[Path]:
-        if path != model_dir:
-            yield from original_iterdir(path)
-            return
-        if not path.is_dir():
+        is_test_directory = path == model_dir or (
+            path.is_dir()
+            and (path / checkpoint_path.name).is_file()
+            and all(
+                (path / f"unrelated_{index}.txt").is_file()
+                for index in range(JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES)
+            )
+        )
+        if not is_test_directory:
             yield from original_iterdir(path)
             return
         for index in range(JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES):
             yield path / f"unrelated_{index}.txt"
-        yield checkpoint_path
+        yield path / checkpoint_path.name
 
     monkeypatch.setattr(Path, "iterdir", synthetic_entries)
 

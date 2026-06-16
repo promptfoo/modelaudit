@@ -1547,12 +1547,19 @@ def _local_source_lexical_identity(entries: list[tuple[Path, os.stat_result]]) -
         mode_type = stat.S_IFMT(entry_stat.st_mode)
         file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+        link_like = stat.S_ISLNK(entry_stat.st_mode) or bool(file_attributes & reparse_flag)
         common_identity: tuple[int | str, ...] = (
             normalized_path,
             entry_stat.st_dev,
             entry_stat.st_ino,
             mode_type,
         )
+        if os.name == "nt" and link_like:
+            return (
+                *common_identity,
+                file_attributes,
+                getattr(entry_stat, "st_reparse_tag", 0) or 0,
+            )
         if mode_type == stat.S_IFDIR and not (file_attributes & reparse_flag):
             return (*common_identity, file_attributes)
         return (
