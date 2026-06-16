@@ -1554,18 +1554,22 @@ def _local_source_lexical_identity(
         file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
         link_like = stat.S_ISLNK(entry_stat.st_mode) or bool(file_attributes & reparse_flag)
+        if windows and link_like:
+            # Windows reparse-point file indexes can drift across equivalent path
+            # observations. The resolved target receipt and retained handle bind
+            # object identity; this hash binds only stable lexical structure.
+            return (
+                normalized_path,
+                mode_type,
+                int(bool(file_attributes & reparse_flag)),
+                getattr(entry_stat, "st_reparse_tag", 0) or 0,
+            )
         common_identity: tuple[int | str, ...] = (
             normalized_path,
             entry_stat.st_dev,
             entry_stat.st_ino,
             mode_type,
         )
-        if windows and link_like:
-            return (
-                *common_identity,
-                file_attributes,
-                getattr(entry_stat, "st_reparse_tag", 0) or 0,
-            )
         if mode_type == stat.S_IFDIR and not (file_attributes & reparse_flag):
             return (*common_identity, file_attributes)
         return (
@@ -2366,6 +2370,7 @@ def _retain_windows_local_source_guards(
     invalid_handle_value = ctypes.c_void_p(-1).value
     try:
         for guard_path, open_reparse_point, desired_access, share_mode in guard_paths:
+            before_open = os.stat(guard_path, follow_symlinks=False)
             flags = 0x02000000 | (0x00200000 if open_reparse_point else 0)
             handle = create_file(
                 str(guard_path),
@@ -2379,7 +2384,21 @@ def _retain_windows_local_source_guards(
             if handle in (None, invalid_handle_value):
                 raise ctypes_windows.WinError(ctypes_windows.get_last_error())
             handles.append(handle if isinstance(handle, int) else int(handle.value))
-        if not _local_source_receipts_match(expected_receipt, _snapshot_local_source_receipt(source_path)):
+            after_open = os.stat(guard_path, follow_symlinks=False)
+            before_attributes = getattr(before_open, "st_file_attributes", 0) or 0
+            after_attributes = getattr(after_open, "st_file_attributes", 0) or 0
+            if (
+                not os.path.samestat(before_open, after_open)
+                or stat.S_IFMT(before_open.st_mode) != stat.S_IFMT(after_open.st_mode)
+                or before_attributes != after_attributes
+                or (getattr(before_open, "st_reparse_tag", 0) or 0) != (getattr(after_open, "st_reparse_tag", 0) or 0)
+            ):
+                raise _LocalSourceBoundaryError("local source entry changed while retaining its boundary")
+        resolved_path = expected_receipt.get("resolved_path")
+        if not isinstance(resolved_path, str) or not _local_source_stat_matches_receipt(
+            os.stat(resolved_path, follow_symlinks=False),
+            expected_receipt,
+        ):
             raise _LocalSourceBoundaryError("local source changed while retaining its boundary")
         yield
     finally:

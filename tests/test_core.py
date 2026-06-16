@@ -416,8 +416,8 @@ def test_local_source_lexical_identity_ignores_ordinary_directory_content_metada
     )
 
 
-def test_windows_local_source_lexical_identity_uses_stable_reparse_fields() -> None:
-    """Windows reparse timestamps may drift, but object identity and tag may not."""
+def test_windows_local_source_lexical_identity_uses_stable_reparse_shape() -> None:
+    """Windows reparse metadata drift is left to target receipts and retained handles."""
 
     def fake_reparse_stat(*, inode: int, mtime_ns: int, ctime_ns: int, reparse_tag: int) -> os.stat_result:
         return cast(
@@ -438,7 +438,7 @@ def test_windows_local_source_lexical_identity_uses_stable_reparse_fields() -> N
     reparse_path = Path("alias")
     initial = fake_reparse_stat(inode=30, mtime_ns=2, ctime_ns=3, reparse_tag=0xA000000C)
     metadata_changed = fake_reparse_stat(inode=30, mtime_ns=4, ctime_ns=5, reparse_tag=0xA000000C)
-    replaced = fake_reparse_stat(inode=31, mtime_ns=4, ctime_ns=5, reparse_tag=0xA000000C)
+    inode_changed = fake_reparse_stat(inode=31, mtime_ns=4, ctime_ns=5, reparse_tag=0xA000000C)
     retagged = fake_reparse_stat(inode=30, mtime_ns=4, ctime_ns=5, reparse_tag=0x9000001A)
 
     initial_identity = core_module._local_source_lexical_identity([(reparse_path, initial)], windows=True)
@@ -446,7 +446,7 @@ def test_windows_local_source_lexical_identity_uses_stable_reparse_fields() -> N
     assert initial_identity == core_module._local_source_lexical_identity(
         [(reparse_path, metadata_changed)], windows=True
     )
-    assert initial_identity != core_module._local_source_lexical_identity([(reparse_path, replaced)], windows=True)
+    assert initial_identity == core_module._local_source_lexical_identity([(reparse_path, inode_changed)], windows=True)
     assert initial_identity != core_module._local_source_lexical_identity([(reparse_path, retagged)], windows=True)
 
 
@@ -824,6 +824,22 @@ def test_windows_local_source_guard_denies_directory_rename_restore_aba(tmp_path
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows reparse sharing semantics")
+@pytest.mark.usefixtures("requires_symlinks")
+def test_windows_local_source_guard_retains_stable_directory_symlink(tmp_path: Path) -> None:
+    """A stable directory alias and resolved target can be guarded together."""
+    model_root = tmp_path / "model"
+    model_root.mkdir()
+    source_link = tmp_path / "model-link"
+    source_link.symlink_to(model_root, target_is_directory=True)
+    receipt = core_module._snapshot_local_source_receipt(source_link)
+    assert receipt is not None
+
+    with core_module._retain_windows_local_source_guards(source_link, receipt):
+        current = core_module._snapshot_local_source_receipt(source_link)
+        assert core_module._local_source_receipts_match(receipt, current)
+
+
 @pytest.mark.parametrize("receipt_mode", ["explicit", "auto"], ids=["explicit-receipt", "auto-retention"])
 @pytest.mark.parametrize("stream", [False, True], ids=["standard", "local-stream"])
 def test_local_source_retention_rejects_ordinary_ancestor_aba(
@@ -847,10 +863,17 @@ def test_local_source_retention_rejects_ordinary_ancestor_aba(
         monkeypatch.setattr(core_module, "_snapshot_local_source_receipt", lambda _path: dict(receipt))
     original_scan_file = core_module.scan_file
     swapped = False
+    rename_denied = False
 
     def swap_ancestor() -> None:
-        nonlocal swapped
-        staging_root.rename(held_root)
+        nonlocal rename_denied, swapped
+        try:
+            staging_root.rename(held_root)
+        except OSError:
+            if os.name != "nt":
+                raise
+            rename_denied = True
+            return
         replacement_model = staging_root / "model"
         replacement_model.mkdir(parents=True)
         (replacement_model / "benign.pkl").write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
@@ -900,6 +923,11 @@ def test_local_source_retention_rejects_ordinary_ancestor_aba(
         shutil.rmtree(staging_root)
         held_root.rename(staging_root)
         swapped = False
+    if rename_denied:
+        assert os.name == "nt"
+        assert determine_exit_code(result) == 1
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        return
     assert determine_exit_code(result) in {1, 2}
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) or any(
         check.name == "Local Source Boundary Check" for check in result.checks
