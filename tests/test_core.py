@@ -12662,8 +12662,9 @@ def test_scan_file_eof_tokenizer_ownership_proof_is_cached_per_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_supports_reliable_hf_tokenizer_eof_cache_identity", lambda: True)
     tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=4096)
-    proof = file_detection._hf_tokenizer_json_eof_proves_ownership_for_identity
+    proof = file_detection._hf_tokenizer_json_eof_proves_ownership_cached
     proof.cache_clear()
 
     try:

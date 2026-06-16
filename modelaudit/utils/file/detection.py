@@ -1767,7 +1767,12 @@ def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
         expected_stat = file_path.stat()
     except OSError:
         return False
-    return _hf_tokenizer_json_eof_proves_ownership_for_identity(
+    proof = (
+        _hf_tokenizer_json_eof_proves_ownership_cached
+        if _supports_reliable_hf_tokenizer_eof_cache_identity()
+        else _hf_tokenizer_json_eof_proves_ownership_for_identity
+    )
+    return proof(
         str(file_path),
         expected_stat.st_size,
         expected_stat.st_mtime_ns,
@@ -1778,7 +1783,13 @@ def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
     )
 
 
-@lru_cache(maxsize=64)
+def _supports_reliable_hf_tokenizer_eof_cache_identity() -> bool:
+    """Return whether metadata changes reliably invalidate tokenizer proofs."""
+    # On supported Windows Python versions, st_ctime_ns is the file creation
+    # time, so same-size in-place rewrites can preserve every cached identity field.
+    return os.name != "nt"
+
+
 def _hf_tokenizer_json_eof_proves_ownership_for_identity(
     file_path_str: str,
     file_size: int,
@@ -2158,6 +2169,11 @@ def _hf_tokenizer_json_eof_proves_ownership_for_identity(
         and root_keys >= _HF_TOKENIZER_ROOT_KEYS | {"model"}
         and saw_model_schema
     )
+
+
+_hf_tokenizer_json_eof_proves_ownership_cached = lru_cache(maxsize=64)(
+    _hf_tokenizer_json_eof_proves_ownership_for_identity
+)
 
 
 def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
