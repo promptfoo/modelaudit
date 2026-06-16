@@ -922,12 +922,15 @@ def test_regular_pinned_validation_hash_honors_dispatch_deadline(
     source_path.write_bytes(b"source")
     target = _target_for_path(source_path)
     original_hash = handlers._hash_pinned_file_descriptor
+    dispatch_deadline = time.time() + 60
+    observed_deadlines: list[float | None] = []
 
-    def delayed_hash(source_fd: int, **kwargs: Any) -> str:
-        time.sleep(0.02)
+    def expired_hash(source_fd: int, **kwargs: Any) -> str:
+        observed_deadlines.append(kwargs.get("deadline"))
+        kwargs["deadline"] = time.time() - 1
         return original_hash(source_fd, **kwargs)
 
-    monkeypatch.setattr(handlers, "_hash_pinned_file_descriptor", delayed_hash)
+    monkeypatch.setattr(handlers, "_hash_pinned_file_descriptor", expired_hash)
     with (
         pytest.raises(_ShardPinUnavailableError, match="changed while staging"),
         _pinned_shard_scan_path(
@@ -935,10 +938,12 @@ def test_regular_pinned_validation_hash_honors_dispatch_deadline(
             target,
             logical_path=str(source_path),
             require_regular_path=True,
-            deadline=time.time() + 0.01,
+            deadline=dispatch_deadline,
         ),
     ):
         pytest.fail("an expired validation deadline must stop before dispatch")
+
+    assert observed_deadlines == [dispatch_deadline]
 
 
 def test_windows_staging_directory_guard_uses_no_follow_delete_denying_handle(

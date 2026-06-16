@@ -10645,6 +10645,36 @@ def scan_model_streaming(
         tombstone_fd: int | None = None
         tombstone_path: Path | None = None
         moved_source = False
+
+        def restore_quarantined_index() -> bool:
+            """Restore a moved replacement without overwriting a recreated source path."""
+            if not moved_source or tombstone_path is None:
+                return False
+            try:
+                if parent_fd is not None:
+                    os.link(
+                        tombstone_path.name,
+                        source_path.name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    os.unlink(tombstone_path.name, dir_fd=parent_fd)
+                else:
+                    os.link(tombstone_path, source_path, follow_symlinks=False)
+                    os.unlink(tombstone_path)
+            except OSError:
+                return False
+            return True
+
+        def preserve_unverified_index(message: str, reason: str) -> None:
+            restored = restore_quarantined_index()
+            record_streamed_index_retention_failure(source_path, message, reason=reason)
+            if not restored and tombstone_path is not None:
+                pending_delete_failures[tombstone_path] = OSError(
+                    "Unverified SafeTensors index generation was preserved in cleanup quarantine"
+                )
+
         try:
             canonical_parent = canonical_stream_parent(source_path)
             use_directory_fd = os.name != "nt"
@@ -10694,17 +10724,17 @@ def scan_model_streaming(
                 )
             )
             if expected_identity is not None and not moved_generation_matches:
-                record_streamed_index_retention_failure(
-                    source_path,
+                preserve_unverified_index(
                     "SafeTensors index candidate changed before cleanup.",
-                    reason="safetensors_index_changed_before_cleanup",
+                    "safetensors_index_changed_before_cleanup",
                 )
+                return
             if require_proven_non_index and moved_classification is not False:
-                record_streamed_index_retention_failure(
-                    source_path,
+                preserve_unverified_index(
                     "SafeTensors index candidate changed before content-routed cleanup.",
-                    reason="safetensors_index_changed_before_cleanup",
+                    "safetensors_index_changed_before_cleanup",
                 )
+                return
             if require_content_hash:
                 moved_size = _snapshot_file_size(moved_identity)
                 if moved_size <= MAX_SAFETENSORS_SHARD_INDEX_BYTES and (
@@ -10716,11 +10746,11 @@ def scan_model_streaming(
                 else:
                     content_hash_changed = require_proven_non_index is False
                 if content_hash_changed:
-                    record_streamed_index_retention_failure(
-                        source_path,
+                    preserve_unverified_index(
                         "Content-routed index candidate changed after scanning.",
-                        reason="safetensors_index_changed_before_cleanup",
+                        "safetensors_index_changed_before_cleanup",
                     )
+                    return
             if track_candidate:
                 normalized_source = normalized_stream_path(source_path)
                 candidate_receipt = (normalized_source, canonical_parent)
@@ -10955,6 +10985,30 @@ def scan_model_streaming(
             tombstone_path: Path | None = None
             moved_source = False
             tombstone_removed = False
+
+            def restore_quarantined_source() -> bool:
+                """Restore a moved replacement without overwriting a recreated source path."""
+                nonlocal tombstone_removed
+
+                if tombstone_dir_fd is None or parent_fd is None:
+                    return False
+                try:
+                    os.link(
+                        "source",
+                        source_path.name,
+                        src_dir_fd=tombstone_dir_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    return False
+                try:
+                    os.unlink("source", dir_fd=tombstone_dir_fd)
+                    tombstone_removed = True
+                except OSError:
+                    pass
+                return True
+
             try:
                 parent_flags = (
                     os.O_RDONLY
@@ -11019,9 +11073,10 @@ def scan_model_streaming(
                     or moved_identity != expected_cleanup_identity.stat[:5]
                     or retained_moved_identity != expected_cleanup_identity.stat[:5]
                 ):
+                    restored = restore_quarantined_source()
                     record_cleanup_generation_failure(
                         "cleanup quarantined a different streamed source generation",
-                        tombstone_path,
+                        source_path if restored else tombstone_path,
                     )
                     return
                 os.unlink(tombstone_name, dir_fd=tombstone_dir_fd)

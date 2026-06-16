@@ -3876,6 +3876,7 @@ def test_scan_model_streaming_rejects_retained_index_rewrite_at_cleanup(
     )
 
     assert rewritten is True
+    assert index_path.read_text(encoding="utf-8") == replacement_payload
     assert result.success is False
     assert determine_exit_code(result) == 2
     assert any(
@@ -8333,7 +8334,7 @@ def test_scan_model_streaming_cleanup_rejects_pre_unlink_generation_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cleanup quarantines and preserves a replacement instead of deleting it."""
+    """Cleanup restores a quarantined replacement instead of deleting or hiding it."""
     import modelaudit.core as core_module
 
     source_root = tmp_path / "source"
@@ -8368,10 +8369,8 @@ def test_scan_model_streaming_cleanup_rejects_pre_unlink_generation_swap(
 
     assert swapped is True
     assert held_original.exists()
-    assert not streamed_file.exists()
-    preserved_replacements = list(source_root.glob(".modelaudit-delete-*/source"))
-    assert len(preserved_replacements) == 1
-    assert preserved_replacements[0].read_bytes() == replacement_payload
+    assert streamed_file.read_bytes() == replacement_payload
+    assert list(source_root.glob(".modelaudit-delete-*")) == []
     assert result.success is False
     assert determine_exit_code(result) == 2
     assert any(check.name == "Local Source Boundary Check" for check in result.checks)

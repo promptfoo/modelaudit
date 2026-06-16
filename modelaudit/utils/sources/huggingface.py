@@ -5950,7 +5950,6 @@ def download_model(
     )
     download_path = None
     disk_check_path = None
-    download_path_preexisting = False
     filtered_cache_root: Path | None = None
     filtered_staging_handed_off = False
     windows_filtered_staging_root = (
@@ -5962,8 +5961,6 @@ def download_model(
     if cache_dir is not None and not selection_is_filtered:
         # Create a structured, containment-checked cache directory.
         download_path = _build_huggingface_download_path(cache_dir, namespace, repo_name)
-        download_path_preexisting = download_path.exists()
-        download_path.mkdir(parents=True, exist_ok=True)
         disk_check_path = download_path
     else:
         disk_check_path = windows_filtered_staging_root or (
@@ -6015,7 +6012,6 @@ def download_model(
             )
             # Each filtered view is exclusive to this invocation and must be
             # retained only until its caller finishes scanning it.
-            download_path_preexisting = False
             disk_check_path = download_path
 
         if selection_is_filtered:
@@ -6037,6 +6033,10 @@ def download_model(
             }
             if selected_model_sizes and len(selected_model_sizes) == len(model_files):
                 model_size = sum(selected_model_sizes.values(), start=0)
+
+        if cache_dir is not None and not selection_is_filtered:
+            assert download_path is not None
+            download_path.mkdir(parents=True, exist_ok=True)
 
         if model_size and disk_check_path is not None:
             has_space, message = check_disk_space(disk_check_path, model_size)
@@ -6224,13 +6224,6 @@ def download_model(
                 and download_path is not None
                 and download_path.exists()
                 and _is_trusted_huggingface_filtered_download_path(filtered_cache_root, download_path)
-            ) or (
-                not selection_is_filtered
-                and cache_dir is not None
-                and download_path is not None
-                and not download_path_preexisting
-                and download_path.exists()
-                and _is_within_directory(cache_dir / "huggingface", download_path)
             )
             if failed_staging_is_owned:
                 assert download_path is not None
