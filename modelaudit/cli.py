@@ -2784,6 +2784,12 @@ def _explicit_local_shard_family_groups(
     groups: dict[str, _ExplicitShardFamily] = {}
     for (_pattern, expected_total), records in grouped_paths.items():
         discovery_context = _SafetensorsIndexInspectionContext()
+        try:
+            external_scope_boundary = os.path.normcase(
+                os.path.normpath(os.path.commonpath([str(resolved_path.parent) for _, resolved_path, _ in records]))
+            )
+        except ValueError:
+            external_scope_boundary = None
         targets_by_scope: dict[str, dict[int, list[str]]] = {}
         scopes_by_source: dict[str, set[str]] = {}
         for normalized_path, resolved_path_obj, shard_index in records:
@@ -2816,12 +2822,17 @@ def _explicit_local_shard_family_groups(
 
         candidate_scopes_by_paths: dict[tuple[str, ...], set[str]] = {}
         deepest_candidate_scope_by_paths: dict[tuple[str, ...], str] = {}
+        deepest_candidate_scope_by_source: dict[str, str] = {}
         for scope, scoped_paths, _targets_by_index, _complete_by_name in candidate_scopes:
             path_key = tuple(sorted(scoped_paths))
             candidate_scopes_by_paths.setdefault(path_key, set()).add(scope)
             current_scope = deepest_candidate_scope_by_paths.get(path_key)
             if current_scope is None or len(Path(scope).parts) > len(Path(current_scope).parts):
                 deepest_candidate_scope_by_paths[path_key] = scope
+            for scoped_path in scoped_paths:
+                current_source_scope = deepest_candidate_scope_by_source.get(scoped_path)
+                if current_source_scope is None or len(Path(scope).parts) > len(Path(current_source_scope).parts):
+                    deepest_candidate_scope_by_source[scoped_path] = scope
 
         external_authority_by_scope: dict[str, tuple[str, tuple[str, str, str, int] | None]] = {}
         if is_safetensors_family_pattern(_pattern):
@@ -2832,6 +2843,12 @@ def _explicit_local_shard_family_groups(
                 authority_scope: str | None = None
                 authority_invalid = False
                 for scope in sorted(extra_scopes, key=lambda candidate: len(Path(candidate).parts), reverse=True):
+                    if external_scope_boundary is None:
+                        break
+                    try:
+                        Path(scope).relative_to(Path(external_scope_boundary))
+                    except ValueError:
+                        continue
                     if not _trusted_explicit_shard_family_scope(scope, scoped_paths):
                         continue
                     if agreed_external_proof is not None and not _trusted_explicit_shard_index_authority(
@@ -2846,17 +2863,15 @@ def _explicit_local_shard_family_groups(
                         except ValueError:
                             continue
                         paths_under_scope.append(selected_path)
-                    external_context = _SafetensorsIndexInspectionContext()
                     external_proof, authority_present = _explicit_shard_index_authority(
                         tuple(paths_under_scope),
                         scope=scope,
                         expected_total=expected_total,
-                        index_inspection_context=external_context,
+                        index_inspection_context=discovery_context,
                     )
-                    if external_context.failure is not None:
-                        if external_context.candidate_paths:
-                            authority_invalid = True
-                            authority_scope = scope
+                    if discovery_context.failure is not None:
+                        authority_invalid = True
+                        authority_scope = scope
                         break
                     if not authority_present:
                         continue
@@ -2913,24 +2928,24 @@ def _explicit_local_shard_family_groups(
                     continue
             complete_scopes[scope] = authoritative_index_proof
         for normalized_path, _resolved_path, _shard_index in records:
+            name_scope = deepest_candidate_scope_by_source.get(normalized_path)
+            external_authority = external_authority_by_scope.get(name_scope) if name_scope is not None else None
+            if external_authority is not None:
+                assert name_scope is not None
+                external_scope, external_proof = external_authority
+                family_paths = tuple(path for targets in targets_by_scope[name_scope].values() for path in targets)
+                groups[normalized_path] = _ExplicitShardFamily(
+                    group=f"explicit-cli:{external_scope}",
+                    scope=external_scope,
+                    pattern=_pattern,
+                    expected_total=expected_total,
+                    paths=family_paths,
+                    supports_index_authority=True,
+                    initial_index_proof=external_proof,
+                    authority_invalid=external_proof is None,
+                )
+                continue
             matching_scopes = scopes_by_source[normalized_path] & complete_scopes.keys()
-            if matching_scopes:
-                name_scope = max(matching_scopes, key=lambda scope: len(Path(scope).parts))
-                external_authority = external_authority_by_scope.get(name_scope)
-                if external_authority is not None:
-                    external_scope, external_proof = external_authority
-                    family_paths = tuple(path for targets in targets_by_scope[name_scope].values() for path in targets)
-                    groups[normalized_path] = _ExplicitShardFamily(
-                        group=f"explicit-cli:{external_scope}",
-                        scope=external_scope,
-                        pattern=_pattern,
-                        expected_total=expected_total,
-                        paths=family_paths,
-                        supports_index_authority=True,
-                        initial_index_proof=external_proof,
-                        authority_invalid=external_proof is None,
-                    )
-                    continue
             matching_authority_scopes = scopes_by_source[normalized_path] & authority_scopes
             if matching_authority_scopes:
                 matching_scopes = {scope for scope in matching_scopes if complete_scopes[scope] is not None}

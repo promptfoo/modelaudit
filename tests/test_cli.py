@@ -1037,6 +1037,53 @@ def test_explicit_shard_family_discovery_does_not_poison_runtime_index_context(
     assert runtime_context.failure is None
 
 
+@pytest.mark.parametrize("listing_incomplete", [False, True], ids=["complete", "capped"])
+def test_explicit_same_shape_families_share_bounded_ancestor_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    listing_incomplete: bool,
+) -> None:
+    """Common-ancestor probes share one cap and fail closed when that cap is reached."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    scope = tmp_path / "scope"
+    selected: list[Path] = []
+    for family_name in ("a", "b"):
+        shard_dir = scope / family_name
+        _make_trusted_shard_parent(shard_dir, parents=True)
+        for shard_index in (1, 2):
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            selected.append(shard_path)
+
+    original_candidates = cli_module.ShardedModelDetector._safetensors_index_candidates
+    observed_contexts: list[cli_module._SafetensorsIndexInspectionContext | None] = []
+
+    def inspect_common_scope(
+        index_dir: Path,
+        inspection_context: cli_module._SafetensorsIndexInspectionContext | None = None,
+    ) -> tuple[list[Path], bool]:
+        if index_dir.resolve() == scope.resolve():
+            observed_contexts.append(inspection_context)
+            return [], listing_incomplete
+        return original_candidates(index_dir, inspection_context)
+
+    monkeypatch.setattr(
+        cli_module.ShardedModelDetector,
+        "_safetensors_index_candidates",
+        staticmethod(inspect_common_scope),
+    )
+
+    families = _explicit_local_shard_family_groups(tuple(str(path) for path in selected))
+    selected_families = {families[os.path.normcase(os.path.normpath(os.path.abspath(path)))] for path in selected}
+
+    assert len(selected_families) == 2
+    assert all(family.authority_invalid is listing_incomplete for family in selected_families)
+    assert observed_contexts
+    if listing_incomplete:
+        assert len(observed_contexts) == 1
+    assert len({id(context) for context in observed_contexts}) == 1
+
+
 @pytest.mark.parametrize(("with_index", "expected_exit_code"), [(False, 2), (True, 0)])
 def test_scan_multiple_cross_directory_zero_based_shards_requires_index_authority(
     tmp_path: Path,
