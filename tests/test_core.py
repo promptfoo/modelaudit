@@ -8934,11 +8934,21 @@ def test_explicit_compressed_tar_hdf5_overlap_preserves_top_level_and_nested_tar
 ) -> None:
     model_path = tmp_path / f"explicit-overlap-{'malicious' if malicious else 'benign'}.tar.gz"
     pickle_payload = _build_malicious_pickle(protocol=0) if malicious else pickle.dumps({"weights": [1]}, protocol=0)
+    nested_tar = io.BytesIO()
+    with tarfile.open(fileobj=nested_tar, mode="w") as archive:
+        filler = b"A" * (1024 * 1024 + tarfile.BLOCKSIZE)
+        filler_info = tarfile.TarInfo("large-nested-weights.bin")
+        filler_info.size = len(filler)
+        archive.addfile(filler_info, io.BytesIO(filler))
+        payload_info = tarfile.TarInfo("late-payload.pkl")
+        payload_info.size = len(pickle_payload)
+        archive.addfile(payload_info, io.BytesIO(pickle_payload))
+    assert nested_tar.tell() > 1024 * 1024
     userblock_size = _write_tar_hdf5_userblock(
         model_path,
         [
             ("large-weights.bin", b"A" * (128 * 1024)),
-            ("payload.pkl", pickle_payload),
+            ("nested.tar", nested_tar.getvalue()),
         ],
         compressed=True,
     )
@@ -8956,6 +8966,8 @@ def test_explicit_compressed_tar_hdf5_overlap_preserves_top_level_and_nested_tar
     assert top_level.scanner_name == "keras_h5"
     assert "tar" in top_level.metadata["supplemental_scanners"]
     assert bool(top_level_pickle_checks) is malicious
+    assert "tar_compressed_trailing_data" not in top_level.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Compressed TAR Trailing Data" for check in top_level.checks)
 
     outer_path = tmp_path / f"explicit-overlap-{'malicious' if malicious else 'benign'}.zip"
     with zipfile.ZipFile(outer_path, "w") as archive:
@@ -8967,11 +8979,38 @@ def test_explicit_compressed_tar_hdf5_overlap_preserves_top_level_and_nested_tar
     ]
     assert nested.scanner_name == "zip"
     assert bool(nested_pickle_checks) is malicious
+    assert "tar_compressed_trailing_data" not in nested.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Compressed TAR Trailing Data" for check in nested.checks)
 
 
-def test_scan_file_preserves_large_zeroed_hdf5_userblock_above_16_mib(
+def test_aligned_nonzero_hdf5_userblock_routes_to_validated_hdf5_owner(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "nonzero-userblock.h5"
+    userblock_size = 1024 * 1024
+    with h5py.File(model_path, "w", userblock_size=userblock_size) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense", "config": {}}]}},
+        )
+    with model_path.open("r+b") as handle:
+        handle.seek(4096)
+        handle.write(b"nonzero HDF5 userblock metadata")
+    with model_path.open("ab") as handle:
+        aligned_size = ((handle.tell() + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+        handle.truncate(aligned_size)
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == "hdf5"
+    assert file_detection.detect_file_format_from_magic(str(model_path)) == "hdf5"
+    assert file_detection.detect_file_format_for_skip_filter(str(model_path)) == "hdf5"
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert "nemo_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_file_preserves_large_valid_hdf5_userblock_without_zero_prefix_proof(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_path = tmp_path / "large-zeroed-userblock.h5"
     userblock_size = _write_large_valid_userblock_keras_hdf5(model_path, userblock_size=32 * 1024 * 1024)
@@ -8980,20 +9019,9 @@ def test_scan_file_preserves_large_zeroed_hdf5_userblock_above_16_mib(
     assert file_detection.detect_file_format(str(model_path)) == "hdf5"
     assert file_detection.detect_file_format_from_magic(str(model_path)) == "hdf5"
 
-    zero_userblock_checks = 0
-    original_check = file_detection._has_zero_filled_hdf5_userblock
-
-    def count_zero_userblock_checks(path: Path, signature_offset: int) -> bool:
-        nonlocal zero_userblock_checks
-        zero_userblock_checks += 1
-        return original_check(path, signature_offset)
-
-    monkeypatch.setattr(file_detection, "_has_zero_filled_hdf5_userblock", count_zero_userblock_checks)
-
     result = scan_file(str(model_path), config={"cache_enabled": False})
 
     assert result.scanner_name == "keras_h5"
-    assert zero_userblock_checks == 1
 
 
 def test_directory_scan_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_probe(

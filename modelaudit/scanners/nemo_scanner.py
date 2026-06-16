@@ -34,6 +34,7 @@ from .archive_member_security import (
 )
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .tar_scanner import (
+    TAR_ENTRY_COUNT_INCOMPLETE_REASON,
     TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY,
     TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY,
     TarScanner,
@@ -55,6 +56,7 @@ _PREFLIGHT_PREFIX_ANALYSIS_REASONS = frozenset(
     {
         "tar_metadata_read_limit_exceeded",
         "tar_total_size_limit_exceeded",
+        TAR_ENTRY_COUNT_INCOMPLETE_REASON,
     }
 )
 

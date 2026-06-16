@@ -101,6 +101,7 @@ from modelaudit.utils.file.detection import (
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     _detect_tar_route,
+    _has_supported_tar_compression_wrapper,
     _is_malformed_sentencepiece_model_proto_candidate_file,
     detect_file_format,
     detect_file_format_for_skip_filter,
@@ -6499,7 +6500,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     path,
                     magic_format,
                     ext_format,
-                    gzip_tar_trailing_status=gzip_tar_trailing_status,
+                    gzip_tar_trailing_status=(
+                        None if gzip_tar_trailing_status == "entry_limit" else gzip_tar_trailing_status
+                    ),
                 )
             else:
                 file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
@@ -6854,19 +6857,24 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             integrity_message = (
                 "Compressed TAR stream contains non-zero trailing data after archive EOF"
                 if gzip_tar_trailing_status == "nonzero"
-                else "Compressed TAR stream could not be fully validated after archive EOF"
+                else (
+                    "Compressed TAR stream exceeded the configured entry limit before archive EOF validation"
+                    if gzip_tar_trailing_status == "entry_limit"
+                    else "Compressed TAR stream could not be fully validated after archive EOF"
+                )
             )
             result.add_check(
                 name="Compressed TAR Stream Integrity",
                 passed=False,
                 message=integrity_message,
-                severity=IssueSeverity.WARNING,
+                severity=(IssueSeverity.INFO if gzip_tar_trailing_status == "entry_limit" else IssueSeverity.WARNING),
                 location=path,
                 details={"compression": "gzip", "stream_tail_status": gzip_tar_trailing_status},
                 rule_code="S902",
             )
             _mark_inconclusive_scan_outcome(result, _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON)
-            _mark_operational_scan_error(result, _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON)
+            if gzip_tar_trailing_status != "entry_limit":
+                _mark_operational_scan_error(result, _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON)
             result.success = False
 
     if (
@@ -6930,10 +6938,16 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         and result.scanner_name != hdf5_userblock_supplemental_scanner_id
         and hdf5_userblock_supplemental_scanner_id not in safetensors_overlap_scanner_ids
     ):
+        supplemental_config = config
+        if hdf5_userblock_supplemental_scanner_id == "tar" and _has_supported_tar_compression_wrapper(Path(path)):
+            from modelaudit.scanners.tar_scanner import TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY
+
+            supplemental_config = dict(config)
+            supplemental_config[TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY] = hdf5_signature_offset
         _merge_supplemental_scanner_analysis(
             path,
             result,
-            config,
+            supplemental_config,
             scanner_selection,
             hdf5_userblock_supplemental_scanner_id,
             context="HDF5 user-block content analysis",

@@ -61,8 +61,10 @@ MAX_TAR_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY = "_tar_security_only_nested_member_entries"
 TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY = "_tar_skip_reachable_nemo_config_scan"
 TAR_SHARED_SCAN_BUDGET_CONFIG_KEY = "_tar_shared_scan_budget"
+TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY = "_tar_source_size_limit"
 TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON = "tar_entry_extraction_incomplete"
 TAR_TOTAL_SIZE_INCOMPLETE_REASON = "tar_total_size_limit_exceeded"
+TAR_ENTRY_COUNT_INCOMPLETE_REASON = "tar_entry_count_limit_exceeded"
 TAR_SPECIAL_MEMBER_INCOMPLETE_REASON = "tar_special_member_unsupported"
 TAR_SPARSE_MEMBER_INCOMPLETE_REASON = "tar_sparse_member_unsupported"
 TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON = "tar_compressed_trailing_data"
@@ -172,6 +174,42 @@ class _TarBoundedStream:
                 reason="tar_decompressed_size_limit_exceeded",
             )
         return data
+
+
+class _TarSourcePrefixFile:
+    """Expose only the physical source prefix owned by a supplemental TAR scan."""
+
+    def __init__(self, fileobj: BinaryIO, limit: int) -> None:
+        self._fileobj = fileobj
+        self.limit = limit
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = max(self.limit - self.tell(), 0)
+        if size is None or size < 0 or size > remaining:
+            size = remaining
+        return self._fileobj.read(size)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            target = offset
+        elif whence == os.SEEK_CUR:
+            target = self.tell() + offset
+        elif whence == os.SEEK_END:
+            target = self.limit + offset
+        else:
+            raise ValueError(f"Unsupported seek mode: {whence}")
+        if target < 0 or target > self.limit:
+            raise OSError("TAR source prefix seek exceeds owner boundary")
+        return self._fileobj.seek(target, os.SEEK_SET)
+
+    def tell(self) -> int:
+        return self._fileobj.tell()
+
+    def fileno(self) -> int:
+        return self._fileobj.fileno()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._fileobj, name)
 
 
 class _StrictConcatenatedDecompressionReader:
@@ -321,6 +359,18 @@ class TarScanner(BaseScanner):
             self.config.get("max_tar_metadata_bytes"),
             DEFAULT_MAX_TAR_METADATA_BYTES,
         )
+        configured_source_limit = self.config.get(TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY)
+        self.source_size_limit = (
+            configured_source_limit
+            if isinstance(configured_source_limit, int)
+            and not isinstance(configured_source_limit, bool)
+            and configured_source_limit > 0
+            else None
+        )
+
+    def _effective_source_size(self, path: str, raw_file: BinaryIO | None = None) -> int:
+        size = os.fstat(raw_file.fileno()).st_size if raw_file is not None else os.path.getsize(path)
+        return min(size, self.source_size_limit) if self.source_size_limit is not None else size
 
     @staticmethod
     def _normalize_positive_float_config(value: Any, default: float) -> float:
@@ -507,6 +557,8 @@ class TarScanner(BaseScanner):
         """Open raw TAR seekably or compressed TAR through bounded r| traversal."""
         with ExitStack() as stack:
             raw = raw_file if raw_file is not None else stack.enter_context(open(path, "rb"))
+            if self.source_size_limit is not None:
+                raw = cast(BinaryIO, _TarSourcePrefixFile(raw, self._effective_source_size(path, raw)))
             raw.seek(0)
             prefix = raw.read(tarfile.BLOCKSIZE)
             if prefix == b"\0" * tarfile.BLOCKSIZE:
@@ -1027,6 +1079,8 @@ class TarScanner(BaseScanner):
             return False
         tail_start = file_obj.tell()
         tail_end = os.fstat(file_obj.fileno()).st_size
+        if self.source_size_limit is not None:
+            tail_end = min(tail_end, self.source_size_limit)
         tail_size = tail_end - tail_start
         if tail_size <= self.max_xz_padding_bytes:
             return not any(file_obj.read())
@@ -1358,7 +1412,7 @@ class TarScanner(BaseScanner):
     ) -> bool:
         """Stream TAR headers once to enforce wrapper and optional aggregate limits."""
         entry_count = 0
-        compressed_size = os.fstat(raw_file.fileno()).st_size if raw_file is not None else os.path.getsize(path)
+        compressed_size = self._effective_source_size(path, raw_file)
         compression_codec: str | None = None
         consumed_size = 0
         archive_uncompressed_size = 0
@@ -1403,14 +1457,20 @@ class TarScanner(BaseScanner):
 
                     entry_count += 1
                     if entry_count > self.max_entries:
+                        mark_archive_scan_incomplete(result, TAR_ENTRY_COUNT_INCOMPLETE_REASON)
                         result.add_check(
                             name="Entry Count Limit Check",
                             passed=False,
                             message=f"TAR file contains too many entries ({entry_count} > {self.max_entries})",
                             rule_code="S902",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=path,
-                            details={"entries": entry_count, "max_entries": self.max_entries},
+                            details={
+                                "entries": entry_count,
+                                "max_entries": self.max_entries,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": TAR_ENTRY_COUNT_INCOMPLETE_REASON,
+                            },
                         )
                         return False
 
@@ -1633,7 +1693,7 @@ class TarScanner(BaseScanner):
         archive_uncompressed_size = 0
         entry_count_check_recorded = False
         aggregate_size_check_recorded = False
-        compressed_size = os.fstat(raw_file.fileno()).st_size if raw_file is not None else os.path.getsize(path)
+        compressed_size = self._effective_source_size(path, raw_file)
         compression_codec: str | None = None
         bounded_stream: _TarBoundedStream | None = None
         shared_budget = self._get_or_create_shared_budget()
@@ -1734,11 +1794,16 @@ class TarScanner(BaseScanner):
                             passed=False,
                             message=f"TAR file contains too many entries ({entry_count} > {self.max_entries})",
                             rule_code="S902",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=path,
-                            details={"entries": entry_count, "max_entries": self.max_entries},
+                            details={
+                                "entries": entry_count,
+                                "max_entries": self.max_entries,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": TAR_ENTRY_COUNT_INCOMPLETE_REASON,
+                            },
                         )
-                        mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
+                        mark_archive_scan_incomplete(result, TAR_ENTRY_COUNT_INCOMPLETE_REASON)
                         break
 
                     name = member.name
@@ -2109,6 +2174,7 @@ class TarScanner(BaseScanner):
                                 nested_config = dict(self.config)
                                 nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
                                 nested_config.pop(TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY, None)
+                                nested_config.pop(TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY, None)
                                 nested_config["cache_enabled"] = False
                                 nested_config["_archive_depth"] = depth + 1
                                 nested_result = self._scan_nested_archive_entry(tmp_path, nested_config)
@@ -2147,6 +2213,7 @@ class TarScanner(BaseScanner):
                                     nested_config = dict(self.config)
                                     nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
                                     nested_config.pop(TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY, None)
+                                    nested_config.pop(TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY, None)
                                     nested_config["cache_enabled"] = False
                                     nested_config["_archive_depth"] = depth + 1
                                     file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
@@ -2277,9 +2344,7 @@ class TarScanner(BaseScanner):
                 scan_complete = False
 
         result.metadata["contents"] = contents
-        result.metadata["file_size"] = (
-            os.fstat(raw_file.fileno()).st_size if raw_file is not None else os.path.getsize(path)
-        )
+        result.metadata["file_size"] = self._effective_source_size(path, raw_file)
         result.metadata["archive_uncompressed_size"] = archive_uncompressed_size
         result.metadata["max_tar_total_uncompressed_size"] = self._get_max_total_uncompressed_size()
         if not scan_complete:

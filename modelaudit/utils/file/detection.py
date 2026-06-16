@@ -1,6 +1,5 @@
 import bz2
 import codecs
-import errno
 import gzip
 import json
 import lzma
@@ -88,7 +87,7 @@ _TensorFlowProtoRoute = Literal[
 ]
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
 _SentencePieceModelProtoRoute = Literal["unknown", "strong", "malformed_candidate"]
-_GzipTarTrailingStatus = Literal["invalid", "nonzero"]
+_GzipTarTrailingStatus = Literal["entry_limit", "invalid", "nonzero"]
 _GZIP_TAR_STATUS_UNSET = object()
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _TORCH7_ASCII_HEADER_MAX_LINE_BYTES = 4096
@@ -254,7 +253,6 @@ _ZIP_MAGIC_SIGNATURES = (
 _TAR_BLOCK_SIZE = 512
 _TAR_EMPTY_ARCHIVE_PROBE_BYTES = 2 * _TAR_BLOCK_SIZE
 _TAR_EMPTY_ARCHIVE_MAX_VERIFY_BYTES = 10 * 1024 * 1024
-_HDF5_ZERO_USERBLOCK_MAX_DENSE_VERIFY_BYTES = 64 * 1024 * 1024
 _TAR_FORMAT_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 _TAR_USTAR_OFFSET = 257
 _TAR_USTAR_MAGIC_SIZE = 5
@@ -6188,7 +6186,7 @@ def _gzip_tar_trailing_data_status(
                         return None
                     for entry_count, _member in enumerate(archive, start=1):
                         if entry_count > entry_limit:
-                            return "invalid"
+                            return "entry_limit"
                     cast(Any, archive.fileobj).bufsize = _TAR_GZIP_POST_EOF_TRAILING_READ_BYTES
                     while True:
                         trailing = archive.fileobj.read(_TAR_GZIP_POST_EOF_TRAILING_READ_BYTES)
@@ -6375,7 +6373,7 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
     except _NemoRouteSparseProbeBudgetExceeded:
         return NEMO_ROUTING_INCONCLUSIVE_FORMAT
     except _NemoRouteProbeBudgetExceeded:
-        return "tar" if find_hdf5_signature_offset(path) is None else NEMO_ROUTING_INCONCLUSIVE_FORMAT
+        return "tar"
     except (EOFError, OSError, tarfile.TarError):
         return None
 
@@ -6455,33 +6453,6 @@ def _looks_like_uncompressed_tar_header(header: bytes) -> bool:
     return _has_tar_ustar_signature(header) or _has_valid_tar_checksum_header(header)
 
 
-def _has_zero_filled_hdf5_userblock(file_path: Path, signature_offset: int) -> bool:
-    """Verify a zero userblock with bounded dense reads or a sparse-hole proof."""
-    try:
-        with file_path.open("rb") as stream:
-            if hasattr(os, "SEEK_DATA"):
-                try:
-                    next_data_offset = os.lseek(stream.fileno(), 0, os.SEEK_DATA)
-                    if next_data_offset >= signature_offset:
-                        return True
-                except OSError as exc:
-                    if exc.errno == errno.ENXIO:
-                        return True
-
-            if signature_offset > _HDF5_ZERO_USERBLOCK_MAX_DENSE_VERIFY_BYTES:
-                return False
-            stream.seek(0)
-            remaining = signature_offset
-            while remaining > 0:
-                chunk = stream.read(min(64 * 1024, remaining))
-                if not chunk or any(chunk):
-                    return False
-                remaining -= len(chunk)
-            return True
-    except OSError:
-        return False
-
-
 def _classify_empty_tar_prefix(file_path: Path, header: bytes, file_size: int) -> str | None:
     """Classify an apparent empty TAR without trusting its zero prefix alone."""
     has_zero_prefix = (
@@ -6493,7 +6464,7 @@ def _classify_empty_tar_prefix(file_path: Path, header: bytes, file_size: int) -
         return None
 
     hdf5_signature_offset = find_hdf5_signature_offset(str(file_path))
-    if hdf5_signature_offset is not None and _has_zero_filled_hdf5_userblock(file_path, hdf5_signature_offset):
+    if hdf5_signature_offset is not None:
         return "hdf5"
     if zipfile.is_zipfile(file_path):
         return "zip"

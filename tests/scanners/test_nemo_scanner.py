@@ -4119,6 +4119,49 @@ class TestCVE202523304HydraTarget:
         assert any(check.details.get("cve_id") == "CVE-2025-23304" for check in direct.checks) is (not expected_success)
         assert determine_exit_code(aggregate) == expected_exit_code
 
+    @pytest.mark.parametrize(
+        ("target", "expected_success"),
+        [("torch.nn.Linear", True), ("os.system", False)],
+    )
+    def test_raw_tar_metadata_route_overflow_ignores_embedded_hdf5_owner(
+        self,
+        tmp_path: Path,
+        target: str,
+        expected_success: bool,
+    ) -> None:
+        h5py = pytest.importorskip("h5py")
+        embedded_path = tmp_path / "embedded.h5"
+        with h5py.File(embedded_path, "w") as h5_file:
+            h5_file.create_dataset("weights", data=[1])
+        embedded_hdf5 = embedded_path.read_bytes()
+
+        path = tmp_path / f"pax-embedded-hdf5-{'safe' if expected_success else 'malicious'}.tar"
+        archive_bytes = io.BytesIO()
+        with tarfile.open(fileobj=archive_bytes, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            metadata = tarfile.TarInfo("metadata.bin")
+            metadata.pax_headers = {"comment": "x" * (file_detection._NEMO_ROUTE_MAX_METADATA_BYTES + 1)}
+            archive.addfile(metadata, io.BytesIO())
+
+            member_data_offset = archive_bytes.tell() + tarfile.BLOCKSIZE
+            hdf5_signature_offset = tarfile.BLOCKSIZE
+            while hdf5_signature_offset < member_data_offset:
+                hdf5_signature_offset *= 2
+            embedded_payload = bytes(hdf5_signature_offset - member_data_offset) + embedded_hdf5
+            _add_tar_bytes(archive, "assets/embedded.h5", embedded_payload)
+            _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
+        path.write_bytes(archive_bytes.getvalue())
+
+        assert file_detection.find_hdf5_signature_offset(str(path)) == hdf5_signature_offset
+        assert file_detection.detect_file_format(str(path)) == "tar"
+
+        result = scan_file(str(path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "keras_h5"
+        assert "tar" in result.metadata["supplemental_scanners"]
+        assert result.success is False
+        assert "nemo_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+        assert any(check.details.get("cve_id") == "CVE-2025-23304" for check in result.checks) is (not expected_success)
+
     def test_raw_tar_metadata_route_overflow_remains_uncacheable_when_tar_limit_is_lower(
         self,
         tmp_path: Path,
@@ -8079,7 +8122,7 @@ class TestCVE202523304HydraTarget:
         finally:
             reset_cache_manager()
 
-    @pytest.mark.parametrize("boundary", ["entry_count", "decompressed_size"])
+    @pytest.mark.parametrize("boundary", ["decompressed_size"])
     def test_inherited_preflight_limits_remain_terminal_before_nemo_analysis(
         self,
         tmp_path: Path,
@@ -8105,6 +8148,44 @@ class TestCVE202523304HydraTarget:
         assert result.success is False
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23304"]
         assert "tar_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("target", "expected_exit_code"),
+        [("torch.nn.Linear", 2), ("os.system", 1)],
+    )
+    def test_nemo_entry_limit_replays_only_bounded_prefix(
+        self,
+        tmp_path: Path,
+        target: str,
+        expected_exit_code: int,
+    ) -> None:
+        nemo_path = tmp_path / f"entry-prefix-{target.replace('.', '-')}.nemo"
+        with tarfile.open(nemo_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
+            _add_tar_bytes(archive, "safe.bin", b"safe")
+            _add_tar_bytes(archive, "late.pkl", b'cos\nsystem\n(S"echo late"\ntR.')
+
+        cache_dir = tmp_path / f"entry-prefix-{target.replace('.', '-')}-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_entries=2,
+            )
+
+            metadata = aggregate.file_metadata[str(nemo_path)]
+            hydra_findings = [issue for issue in aggregate.issues if issue.details.get("cve_id") == "CVE-2025-23304"]
+            assert aggregate.success is False
+            assert "tar_entry_count_limit_exceeded" in metadata["scan_outcome_reasons"]
+            assert bool(hydra_findings) is (target == "os.system")
+            assert not any("late.pkl" in str(issue.location) for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == expected_exit_code
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     @pytest.mark.parametrize("mode", ["w", "w:gz"])
     def test_nemo_analysis_uses_preflighted_descriptor_when_path_is_replaced(
