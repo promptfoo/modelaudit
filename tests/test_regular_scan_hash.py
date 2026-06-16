@@ -1545,6 +1545,37 @@ class TestHashGenerationEdgeCases:
         assert sensitive_path_fragment not in caplog.text
         assert sensitive_error_fragment not in caplog.text
 
+    def test_single_file_hash_failure_log_omits_sensitive_values(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Top-level hash failures must not disclose paths or exception text."""
+        from modelaudit import core
+
+        sensitive_path_fragment = "top-level-secret-token"
+        sensitive_error_fragment = "top-level-secret-error"
+        model_path = tmp_path / f"{sensitive_path_fragment}.pkl"
+        model_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+        def fail_hash(_path: str, *, deadline: float | None = None) -> str:
+            del deadline
+            raise OSError(sensitive_error_fragment)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+        with caplog.at_level(logging.DEBUG, logger="modelaudit.core"):
+            result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+
+        assert result.content_hash is None
+        hash_failure_logs = [
+            record.getMessage() for record in caplog.records if record.getMessage().startswith("Failed to hash")
+        ]
+        assert hash_failure_logs == ["Failed to hash a top-level scan target."]
+        assert sensitive_path_fragment not in "".join(hash_failure_logs)
+        assert sensitive_error_fragment not in "".join(hash_failure_logs)
+
     def test_hash_generation_performance(self, tmp_path):
         """Test that hash generation doesn't significantly impact performance."""
         import time
@@ -1809,3 +1840,47 @@ class TestOnnxExternalDataContentHash:
         assert copied_layer is False
         assert determine_exit_code(result) == 2
         assert result.content_hash is None
+
+    @pytest.mark.parametrize("mode", ["single", "directory"])
+    def test_companion_hash_failure_logs_omit_sensitive_values(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        mode: str,
+    ) -> None:
+        """Retained companion hash failures log neither path nor exception data."""
+        from modelaudit import core
+
+        sensitive_path_fragment = "companion-secret-token"
+        sensitive_error_fragment = "companion-secret-error"
+        layer = tmp_path / f"{sensitive_path_fragment}.tar.gz"
+        layer.write_bytes(b"not a tar archive")
+        manifest = tmp_path / "model.manifest"
+        manifest.write_text(json.dumps({"layers": [layer.name]}), encoding="utf-8")
+        if mode == "directory":
+            _skip_path_during_directory_prefilter(monkeypatch, layer)
+        original_hash = core._calculate_file_hash
+
+        def fail_companion_hash(file_path: str, *, deadline: float | None = None) -> str:
+            if Path(file_path).name == layer.name:
+                raise OSError(sensitive_error_fragment)
+            return original_hash(file_path, deadline=deadline)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_companion_hash)
+
+        with caplog.at_level(logging.DEBUG, logger="modelaudit.core"):
+            result = scan_model_directory_or_file(
+                str(manifest if mode == "single" else tmp_path),
+                skip_file_types=mode == "directory",
+                cache_enabled=False,
+                scanners=["oci_layer"],
+            )
+
+        assert result.content_hash is None
+        hash_failure_logs = [
+            record.getMessage() for record in caplog.records if record.getMessage().startswith("Failed to hash")
+        ]
+        assert hash_failure_logs
+        assert sensitive_path_fragment not in "".join(hash_failure_logs)
+        assert sensitive_error_fragment not in "".join(hash_failure_logs)

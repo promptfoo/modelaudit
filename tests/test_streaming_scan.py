@@ -3139,29 +3139,22 @@ def test_scan_model_streaming_bounds_structural_index_probe_after_growth(
         encoding="utf-8",
     )
     initial_size = index_path.stat().st_size
-    original_scan_file = core_module.scan_file
-    original_os_read = os.read
-    classification_armed = False
+    original_os_pread = os.pread
+    index_stat = index_path.stat()
     grew = False
     read_sizes: list[int] = []
 
-    def arm_after_scan(*args: Any, **kwargs: Any) -> ScanResult:
-        nonlocal classification_armed
-        result = original_scan_file(*args, **kwargs)
-        classification_armed = True
-        return result
-
-    def grow_before_classification_read(file_descriptor: int, size: int) -> bytes:
+    def grow_before_classification_read(file_descriptor: int, size: int, offset: int) -> bytes:
         nonlocal grew
-        if classification_armed and not grew:
+        descriptor_stat = os.fstat(file_descriptor)
+        if not grew and (descriptor_stat.st_dev, descriptor_stat.st_ino) == (index_stat.st_dev, index_stat.st_ino):
             with index_path.open("ab") as handle:
                 handle.write(b"x" * (1024 * 1024))
             grew = True
             read_sizes.append(size)
-        return original_os_read(file_descriptor, size)
+        return original_os_pread(file_descriptor, size, offset)
 
-    monkeypatch.setattr(core_module, "scan_file", arm_after_scan)
-    monkeypatch.setattr(core_module.os, "read", grow_before_classification_read)
+    monkeypatch.setattr(core_module.os, "pread", grow_before_classification_read)
 
     scan_model_streaming(
         file_generator=iter([(index_path, True)]),
@@ -3283,7 +3276,7 @@ def test_scan_model_streaming_rejects_index_disappearing_while_binding_retention
         nonlocal index_snapshot_calls, removed
         if Path(path) == index_path:
             index_snapshot_calls += 1
-            if index_snapshot_calls == 4:
+            if index_snapshot_calls == 3:
                 index_path.unlink()
                 removed = True
         return original_snapshot(path)
@@ -3304,7 +3297,7 @@ def test_scan_model_streaming_rejects_index_disappearing_while_binding_retention
     )
 
     assert removed is True
-    assert index_snapshot_calls >= 4
+    assert index_snapshot_calls >= 3
     assert result.success is False
     assert result.has_errors is True
     assert determine_exit_code(result) == 2
@@ -3471,6 +3464,64 @@ def test_scan_model_streaming_retains_contradictory_index_through_terminal_valid
     assert determine_exit_code(result) == 2
     assert index_path.exists() is (not delete_after_scan)
     assert any(check.details.get("scan_outcome_reason") == "shard_boundary_changed" for check in result.checks)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained descriptor traversal")
+@pytest.mark.parametrize("symlinked", [False, True], ids=["regular", "symlink"])
+def test_scan_model_streaming_rebinds_family_members_to_retained_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+    symlinked: bool,
+) -> None:
+    """Shard and index reads must originate from the retained directory tree."""
+    del requires_symlinks
+    from modelaudit import core as core_module
+
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    target_dir = tmp_path / "targets"
+    if symlinked:
+        target_dir.mkdir()
+    shard_target = target_dir / shard.name if symlinked else shard
+    shard_target.write_bytes(struct.pack("<Q", len(header)) + header)
+    if symlinked:
+        shard.symlink_to(shard_target.relative_to(tmp_path))
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_target = target_dir / index_path.name if symlinked else index_path
+    index_target.write_text(
+        json.dumps({"weight_map": {"tensor": shard.name}}),
+        encoding="utf-8",
+    )
+    if symlinked:
+        index_path.symlink_to(index_target.relative_to(tmp_path))
+    retained_descriptors: dict[str, bool] = {}
+    original_dup = os.dup
+
+    def record_retained_dup(source_fd: int) -> int:
+        source_stat = os.fstat(source_fd)
+        for original_path in (shard, index_path):
+            if os.path.samestat(source_stat, original_path.stat()):
+                retained_descriptors[original_path.name] = True
+        return original_dup(source_fd)
+
+    monkeypatch.setattr(core_module.os, "dup", record_retained_dup)
+
+    stream_paths = [shard, index_path]
+    if symlinked:
+        stream_paths.extend((shard_target, index_target))
+    result = scan_model_streaming(
+        file_generator=iter((path, index == len(stream_paths) - 1) for index, path in enumerate(stream_paths)),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        skip_file_types=True,
+        cache_enabled=False,
+        scanners=["safetensors"],
+    )
+
+    assert result.success is True
+    assert retained_descriptors == {shard.name: True, index_path.name: True}
 
 
 def test_scan_model_streaming_fails_if_deleted_index_suffix_precedes_created_shard(tmp_path: Path) -> None:
@@ -4317,20 +4368,26 @@ def test_scan_model_streaming_total_one_rebases_pinned_result_paths(
     )
     pinned_dir = tmp_path.parent / f"{tmp_path.name}-alternate-pinned-path"
     pinned_dir.mkdir()
-    pinned_path = pinned_dir / shard.name
 
     @contextmanager
     def alternate_pinned_path(
         _resolved_path: str,
         _target: dict[str, int | str],
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> Iterator[Any]:
-        shutil.copyfile(shard, pinned_path)
+        source_fd = kwargs.get("source_fd")
+        assert isinstance(source_fd, int)
+        source_size = os.fstat(source_fd).st_size
+        logical_path = Path(kwargs.get("logical_path") or _resolved_path)
+        current_pinned_path = pinned_dir / logical_path.name
+        pinned_dir.mkdir(exist_ok=True)
+        current_pinned_path.write_bytes(os.pread(source_fd, source_size, 0))
         try:
-            yield SimpleNamespace(path=str(pinned_path), changed_during_scan=False)
+            yield SimpleNamespace(path=str(current_pinned_path), changed_during_scan=False)
         finally:
-            pinned_path.unlink(missing_ok=True)
-            pinned_dir.rmdir()
+            current_pinned_path.unlink(missing_ok=True)
+            if pinned_dir.exists() and not any(pinned_dir.iterdir()):
+                pinned_dir.rmdir()
 
     monkeypatch.setattr("modelaudit.core._pinned_shard_scan_path", alternate_pinned_path)
 

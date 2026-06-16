@@ -1195,6 +1195,7 @@ def test_explicit_shard_family_does_not_ignore_governing_ancestor_index(tmp_path
 )
 def test_explicit_same_shape_families_retain_governing_ancestor_index(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     index_target: str,
 ) -> None:
     """Another complete family cannot suppress authority above both families."""
@@ -1215,6 +1216,17 @@ def test_explicit_same_shape_families_retain_governing_ancestor_index(
 
     omitted = omitted_dir / "model-00002-of-00002.safetensors"
     omitted.write_bytes(struct.pack("<Q", len(header)) + header)
+    original_trust_check = cli_module._trusted_explicit_shard_family_scope
+    resolved_scope = scope.resolve()
+
+    def trust_only_controlled_scope(candidate_scope: str, shard_paths: tuple[str, ...] = ()) -> bool:
+        try:
+            Path(candidate_scope).resolve(strict=True).relative_to(resolved_scope)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return original_trust_check(candidate_scope, shard_paths)
+
+    monkeypatch.setattr(cli_module, "_trusted_explicit_shard_family_scope", trust_only_controlled_scope)
     second_target = selected_families[0][1] if index_target == "selected" else omitted
     (scope / "model.safetensors.index.json").write_text(
         json.dumps(

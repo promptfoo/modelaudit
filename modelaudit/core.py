@@ -7592,12 +7592,8 @@ def scan_model_directory_or_file(
                                                     str(pinned_companion_path),
                                                     deadline=start_time + timeout,
                                                 )
-                                            except Exception as error:
-                                                logger.debug(
-                                                    "Failed to hash context-only companion %s: %s",
-                                                    pinned_companion_path,
-                                                    error,
-                                                )
+                                            except Exception:
+                                                logger.debug("Failed to hash a context-only companion.")
                                                 aggregate_hash_complete = False
                                             else:
                                                 if companion_hash not in recorded_content_hashes:
@@ -8521,8 +8517,8 @@ def scan_model_directory_or_file(
                         )
                         if not is_dvc_pointer or file_hash not in file_hashes:
                             file_hashes.append(file_hash)
-                    except Exception as e:
-                        logger.debug(f"Failed to hash file {target}: {e}")
+                    except Exception:
+                        logger.debug("Failed to hash a top-level scan target.")
                     finally:
                         _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
 
@@ -8562,8 +8558,8 @@ def scan_model_directory_or_file(
                                         deadline=start_time + timeout,
                                         follow_validated_symlink=True,
                                     )
-                                except Exception as error:
-                                    logger.debug(f"Failed to hash companion file {pinned_companion_path}: {error}")
+                                except Exception:
+                                    logger.debug("Failed to hash a companion file.")
                                     aggregate_hash_complete = False
                                 else:
                                     if companion_hash not in file_hashes:
@@ -10433,6 +10429,7 @@ def scan_model_streaming(
         source_path: Path,
         *,
         charge_budget: bool = True,
+        source_fd: int | None = None,
     ) -> tuple[bool | None, _FileIdentitySnapshot | None]:
         """Return True for an index, False for proven non-index content, or None when indeterminate."""
         nonlocal streamed_index_document_probe_bytes
@@ -10443,8 +10440,9 @@ def scan_model_streaming(
         source_size = _snapshot_file_size(source_identity)
         open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
         index_fd: int | None = None
+        borrowed_source = source_fd is not None
         try:
-            index_fd = os.open(source_path, open_flags)
+            index_fd = os.dup(source_fd) if source_fd is not None else os.open(source_path, open_flags)
             opened_stat = os.fstat(index_fd)
             opened_identity = (
                 opened_stat.st_dev,
@@ -10457,7 +10455,7 @@ def scan_model_streaming(
             if opened_identity != source_identity.stat or not stat.S_ISREG(opened_stat.st_mode):
                 return None, None
             prefix_limit = min(source_size + 1, 4096)
-            index_bytes = os.read(index_fd, prefix_limit)
+            index_bytes = os.pread(index_fd, prefix_limit, 0) if borrowed_source else os.read(index_fd, prefix_limit)
             stripped_prefix = index_bytes.lstrip()
             prefix_is_complete = len(index_bytes) == source_size
             if (stripped_prefix and not stripped_prefix.startswith(b"{")) or (
@@ -10481,7 +10479,11 @@ def scan_model_streaming(
             remaining = source_size + 1 - len(index_bytes)
             index_buffer = bytearray(index_bytes)
             while remaining > 0:
-                chunk = os.read(index_fd, min(remaining, 64 * 1024))
+                chunk = (
+                    os.pread(index_fd, min(remaining, 64 * 1024), len(index_buffer))
+                    if borrowed_source
+                    else os.read(index_fd, min(remaining, 64 * 1024))
+                )
                 if not chunk:
                     break
                 index_buffer.extend(chunk)
@@ -11392,11 +11394,11 @@ def scan_model_streaming(
                 ShardedModelDetector.match_shard_filename(yielded_source_path.name) is not None
                 or yielded_source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
             )
+            bound_stream_source_path: Path | None = None
             if (
                 not is_precomputed_streamed_result
                 and bound_local_source_path is not None
                 and local_source_report_root is not None
-                and not preserve_stream_family_path
             ):
                 try:
                     relative_source = Path(os.path.abspath(yielded_source_path)).relative_to(
@@ -11405,7 +11407,11 @@ def scan_model_streaming(
                 except ValueError:
                     pass
                 else:
-                    source_path = Path(bound_local_source_path).joinpath(*relative_source.parts)
+                    rebound_source_path = Path(bound_local_source_path).joinpath(*relative_source.parts)
+                    if preserve_stream_family_path:
+                        bound_stream_source_path = rebound_source_path
+                    else:
+                        source_path = rebound_source_path
             local_source_relative_parts: tuple[str, ...] | None = None
             if initial_local_source_entries and not is_precomputed_streamed_result:
                 assert base_dir is not None
@@ -11525,7 +11531,7 @@ def scan_model_streaming(
                 break
             if not is_precomputed_streamed_result and source_key in consumed_openvino_companions:
                 continue
-            scan_path = source_path
+            scan_path = bound_stream_source_path or source_path
             pinned_scan_context: Any | None = None
             pinned_scan: Any | None = None
             pinned_local_alias = False
@@ -11535,6 +11541,7 @@ def scan_model_streaming(
             retained_stream_companion_fds: dict[str, int] = {}
             retained_stream_parent_fd: int | None = None
             retained_stream_source_fd: int | None = None
+            retained_stream_source_fd_owned = False
             retained_stream_discovery_path: Path | None = None
             if (
                 os.name == "posix"
@@ -11580,7 +11587,6 @@ def scan_model_streaming(
             structural_index_identity: _FileIdentitySnapshot | None = None
             structural_index_classification_complete = False
             content_routed_safetensors_index_payload = False
-
             # Check for interruption before starting work on the yielded file.
             try:
                 check_interrupted()
@@ -11600,6 +11606,52 @@ def scan_model_streaming(
                 break
 
             try:
+                if os.name == "posix" and bound_stream_source_path is not None:
+                    expected_stream_entry = (
+                        initial_local_source_entries.get(local_source_relative_parts)
+                        if local_source_relative_parts is not None
+                        else None
+                    )
+                    if expected_stream_entry is not None and expected_stream_entry.entry_type == "file":
+                        stream_source_fd = -1
+                        try:
+                            stream_source_fd = os.open(
+                                bound_stream_source_path,
+                                os.O_RDONLY
+                                | getattr(os, "O_CLOEXEC", 0)
+                                | getattr(os, "O_NONBLOCK", 0)
+                                | getattr(os, "O_NOFOLLOW", 0),
+                            )
+                            retained_stream_stat = os.fstat(stream_source_fd)
+                            if any(
+                                current != expected
+                                for current, expected in (
+                                    (retained_stream_stat.st_dev, expected_stream_entry.device),
+                                    (retained_stream_stat.st_ino, expected_stream_entry.inode),
+                                    (retained_stream_stat.st_mode, expected_stream_entry.mode),
+                                    (retained_stream_stat.st_size, expected_stream_entry.size),
+                                    (retained_stream_stat.st_mtime_ns, expected_stream_entry.mtime_ns),
+                                    (retained_stream_stat.st_ctime_ns, expected_stream_entry.ctime_ns),
+                                    (retained_stream_stat.st_nlink, expected_stream_entry.link_count),
+                                )
+                            ):
+                                raise OSError("retained streaming source changed while opening")
+                        except OSError as error:
+                            if stream_source_fd >= 0:
+                                os.close(stream_source_fd)
+                            raise _LocalSourceBoundaryError(
+                                "streamed local source could not be opened from its retained directory"
+                            ) from error
+                        retained_stream_source_fd = stream_source_fd
+                        retained_stream_source_fd_owned = True
+                if retained_stream_source_fd is not None and source_path.name.lower().endswith(
+                    SAFETENSORS_INDEX_SUFFIX
+                ):
+                    structural_index_classification, structural_index_identity = classify_structural_safetensors_index(
+                        source_path,
+                        source_fd=retained_stream_source_fd,
+                    )
+                    structural_index_classification_complete = True
                 if precomputed_result is not None:
                     _normalize_unclassified_scan_failure(precomputed_result)
                     metadata_dict = dict(precomputed_result.metadata or {})
@@ -11648,13 +11700,14 @@ def scan_model_streaming(
                     continue
 
                 if base_dir is not None:
+                    directory_source_path = bound_stream_source_path or source_path
                     logical_source_path = _local_source_logical_path(
-                        source_path,
+                        directory_source_path,
                         bound_local_source_path,
                         resolved_local_source_path,
                     )
                     resolved_path, is_hf_cache_symlink, entry_unavailable = _resolve_directory_scan_target(
-                        source_path,
+                        directory_source_path,
                         base_dir,
                         is_hf_cache=is_hf_cache,
                         hf_cache_root=hf_cache_root,
@@ -11689,7 +11742,47 @@ def scan_model_streaming(
                             issue_type=_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
                         )
                         continue
-                    snapshot_path = Path(os.path.abspath(source_path))
+                    expected_stream_entry = (
+                        initial_local_source_entries.get(local_source_relative_parts)
+                        if local_source_relative_parts is not None
+                        else None
+                    )
+                    if (
+                        os.name == "posix"
+                        and bound_stream_source_path is not None
+                        and retained_stream_source_fd is None
+                        and expected_stream_entry is not None
+                        and expected_stream_entry.entry_type == "link"
+                    ):
+                        stream_source_fd = -1
+                        try:
+                            stream_source_fd = os.open(
+                                bound_stream_source_path,
+                                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0),
+                            )
+                            retained_stream_stat = os.fstat(stream_source_fd)
+                            if not stat.S_ISREG(retained_stream_stat.st_mode) or not os.path.samestat(
+                                retained_stream_stat,
+                                scan_path.stat(),
+                            ):
+                                raise OSError("retained streaming link target changed while opening")
+                        except OSError as error:
+                            if stream_source_fd >= 0:
+                                os.close(stream_source_fd)
+                            raise _LocalSourceBoundaryError(
+                                "streamed local link target could not be opened from its retained directory"
+                            ) from error
+                        retained_stream_source_fd = stream_source_fd
+                        retained_stream_source_fd_owned = True
+                        if source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX):
+                            structural_index_classification, structural_index_identity = (
+                                classify_structural_safetensors_index(
+                                    source_path,
+                                    source_fd=retained_stream_source_fd,
+                                )
+                            )
+                            structural_index_classification_complete = True
+                    snapshot_path = Path(os.path.abspath(directory_source_path))
                     route_hf_onnx_alias = is_hf_cache_symlink and _should_scan_hf_cache_alias_lexically_for_onnx(
                         logical_source_path,
                         hf_cache_root,
@@ -11976,6 +12069,7 @@ def scan_model_streaming(
                             pending_pinned_scan_context = _pinned_shard_scan_path(
                                 resolved_target,
                                 initial_target,
+                                source_fd=retained_stream_source_fd,
                                 copy_max_bytes=initial_copy_limit,
                                 deadline=start_time + timeout,
                             )
@@ -12240,9 +12334,7 @@ def scan_model_streaming(
                         else logical_source_path
                     )
                     pin_is_alias = True
-                elif (
-                    bound_local_source_path is not None and not initial_shard_target and not preserve_stream_family_path
-                ):
+                elif bound_local_source_path is not None and not initial_shard_target:
                     pin_target = (
                         _snapshot_regular_file_descriptor(retained_stream_source_fd)
                         if retained_stream_source_fd is not None
@@ -12511,9 +12603,13 @@ def scan_model_streaming(
                             str(scan_path),
                             config=scan_config,
                         )
-                if source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX):
+                if (
+                    source_path.name.lower().endswith(SAFETENSORS_INDEX_SUFFIX)
+                    and not structural_index_classification_complete
+                ):
                     structural_index_classification, structural_index_identity = classify_structural_safetensors_index(
-                        source_path
+                        source_path,
+                        source_fd=retained_stream_source_fd,
                     )
                     structural_index_classification_complete = True
                 content_routed_safetensors_index_payload = bool(
@@ -12818,6 +12914,9 @@ def scan_model_streaming(
             finally:
                 if pinned_scan_context is not None:
                     pinned_scan_context.__exit__(None, None, None)
+                if retained_stream_source_fd_owned and retained_stream_source_fd is not None:
+                    with suppress(OSError):
+                        os.close(retained_stream_source_fd)
                 # Delete file after scanning if requested
                 if not preserve_source_after_scan:
                     delete_streamed_source(
