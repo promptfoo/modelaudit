@@ -45,9 +45,9 @@ use crate::stack::{
 };
 use crate::strings::{
     is_repeated_single_byte, is_suspicious_magic_method, suspicious_string_matches,
-    BASE64_ALIGNMENT_AMBIGUITY_SENTINEL, BASE64_SCAN_LIMIT_SENTINEL, BASE64_WORK_LIMIT_SENTINEL,
-    MAX_BASE64_TOTAL_SCAN_CHARS, MAX_STRIPPED_URL_SPANS, URL_CONTEXT_INCOMPLETE_SENTINEL,
-    URL_SCAN_LIMIT_SENTINEL,
+    suspicious_string_matches_window, BASE64_ALIGNMENT_AMBIGUITY_SENTINEL,
+    BASE64_SCAN_LIMIT_SENTINEL, BASE64_WORK_LIMIT_SENTINEL, MAX_BASE64_TOTAL_SCAN_CHARS,
+    MAX_STRIPPED_URL_SPANS, URL_CONTEXT_INCOMPLETE_SENTINEL, URL_SCAN_LIMIT_SENTINEL,
 };
 use crate::strings_policy::MAX_BASE64_TEXT_CANDIDATES;
 
@@ -6171,22 +6171,25 @@ impl<'a> ScanState<'a> {
             .min(SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS);
         let step_chars = suspicious_window_chars.saturating_sub(overlap_chars).max(1);
         let mut window_start = 0usize;
+        let mut starts_in_url = false;
         loop {
             let window_end = advance_chars_from(value, window_start, suspicious_window_chars);
-            self.scan_string_literal_candidate(
+            let next_window_start = advance_chars_from(value, window_start, step_chars);
+            let next_window_offset = next_window_start.saturating_sub(window_start);
+            let (matches, next_starts_in_url) = suspicious_string_matches_window(
                 &value[window_start..window_end],
-                op_name,
-                position,
-                suppress_hex_escape,
+                starts_in_url,
+                next_window_offset,
             );
+            self.record_string_literal_matches(matches, op_name, position, suppress_hex_escape);
             if window_end >= value.len() {
                 break;
             }
-            let next_window_start = advance_chars_from(value, window_start, step_chars);
             if next_window_start <= window_start {
                 break;
             }
             window_start = next_window_start;
+            starts_in_url = next_starts_in_url;
         }
     }
 
@@ -6197,7 +6200,22 @@ impl<'a> ScanState<'a> {
         position: usize,
         suppress_hex_escape: bool,
     ) {
-        for matched_pattern in suspicious_string_matches(value) {
+        self.record_string_literal_matches(
+            suspicious_string_matches(value),
+            op_name,
+            position,
+            suppress_hex_escape,
+        );
+    }
+
+    fn record_string_literal_matches(
+        &mut self,
+        matches: Vec<String>,
+        op_name: &'static str,
+        position: usize,
+        suppress_hex_escape: bool,
+    ) {
+        for matched_pattern in matches {
             let scan_limit = match matched_pattern.as_str() {
                 URL_SCAN_LIMIT_SENTINEL => Some((
                     "URL stripping scan exceeded its bounded span limit",

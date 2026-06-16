@@ -4583,6 +4583,46 @@ def test_pytorch_zip_keeps_split_downloader_pickle_url_actionable(tmp_path: Path
     assert _has_network_evidence_for_url(result, "https://attacker.example/payload")
 
 
+def test_pytorch_zip_ignores_passive_downloader_dict_keys(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "dict-key-metadata.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps(
+        {
+            "open": True,
+            "curl": "passive metadata",
+            "url": "https://docs.example.invalid/reference/os.system(command)",
+        },
+        protocol=4,
+    )
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(issue.rule_code in {"S302", "S309", "S310"} for issue in result.issues)
+    assert not any(
+        check.rule_code in {"S302", "S309", "S310"} and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_pytorch_zip_keeps_undecodable_split_downloader_url_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "binary-downloader.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps(
+        {"blob": b"\xff", "argv": [b"curl"], "url": "https://attacker.example/payload"},
+        protocol=4,
+    )
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S309"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("url") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_filters_inert_url_past_pickle_expensive_window(
     tmp_path: Path,
 ) -> None:

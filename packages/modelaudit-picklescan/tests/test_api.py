@@ -13293,6 +13293,51 @@ def test_scan_bytes_flags_suspicious_literal_content_beyond_default_prefix_suffi
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
+@pytest.mark.parametrize("protocol", [0, pickle.HIGHEST_PROTOCOL])
+def test_scan_bytes_keeps_cross_window_url_continuation_inert(protocol: int) -> None:
+    literal = "https://example.invalid/" + ("a" * (8 * 1024 * 1024)) + "os.system(cmd)"
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"cross-window-url-protocol-{protocol}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+def test_scan_bytes_preserves_call_after_cross_window_quoted_url() -> None:
+    literal = "metadata='https://example.invalid/" + ("a" * (8 * 1024 * 1024)) + "';os.system(cmd)"
+
+    report = scan_bytes(
+        pickle.dumps({"code": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="cross-window-url-call.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+def test_scan_bytes_keeps_url_crossing_overlap_start_inert() -> None:
+    literal = ("P" * 3000) + "https://example.invalid/" + ("a" * 1500) + "os.system(cmd)" + " " + ("B" * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="overlap-start-url.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
 def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_literals() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     padded_encoded_payload = base64.b64encode(nested_payload).decode("ascii") + ("A" * 128)

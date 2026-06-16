@@ -1114,6 +1114,78 @@ def test_scan_stream_filters_proven_inert_pickle_url_metadata(literal: str) -> N
     )
 
 
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_stream_ignores_passive_downloader_dict_keys(protocol: int) -> None:
+    payload = pickle.dumps(
+        {
+            "open": True,
+            "curl": "passive metadata",
+            "url": "https://docs.example.invalid/reference/os.system(command)",
+        },
+        protocol=protocol,
+    )
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="dict-key-metadata.pkl")
+
+    assert result.success is True
+    assert not any(issue.rule_code in {"S302", "S309", "S310"} for issue in result.issues)
+    assert not any(
+        check.rule_code in {"S302", "S309", "S310"} and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_stream_fails_closed_for_undecodable_literal_before_inert_url() -> None:
+    payload = pickle.dumps(
+        {"blob": b"\xff", "url": "https://docs.example.invalid/reference/os.system(command)"},
+        protocol=4,
+    )
+
+    assert pickle_scanner._pickle_literal_url_stripped_scan_view(payload, allow_filtering=True) == payload
+
+    result = PickleScanner(config={"enable_cache": False}).scan_stream(
+        io.BytesIO(payload), len(payload), source="binary-url-metadata.pkl"
+    )
+
+    assert result.success is True
+    assert any(
+        issue.rule_code == "S309"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("url") == "https://docs.example.invalid/reference/os.system(command)"
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_keeps_undecodable_split_downloader_url_actionable() -> None:
+    payload = pickle.dumps(
+        {"blob": b"\xff", "argv": [b"curl"], "url": "https://attacker.example/payload"},
+        protocol=4,
+    )
+
+    assert pickle_scanner._pickle_literal_url_stripped_scan_view(payload, allow_filtering=True) == payload
+
+    result = PickleScanner(config={"enable_cache": False}).scan_stream(
+        io.BytesIO(payload), len(payload), source="binary-downloader.pkl"
+    )
+
+    assert any(
+        issue.rule_code == "S309"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("url") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
+def test_pickle_url_filter_fails_closed_when_dict_key_is_reused_as_command() -> None:
+    downloader = "curl"
+    payload = pickle.dumps(
+        {downloader: True, "argv": [downloader], "url": "https://attacker.example/payload"},
+        protocol=4,
+    )
+
+    assert any(opcode.name == "BINGET" for opcode, _, _ in pickletools.genops(payload))
+    assert pickle_scanner._pickle_literal_url_stripped_scan_view(payload, allow_filtering=True) == payload
+
+
 def test_pickle_url_component_classification_is_bounded_for_many_components() -> None:
     url = "https://docs.example.invalid/reference?x=1" + "".join(f"&field{index}=value" for index in range(2048))
 

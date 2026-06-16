@@ -324,6 +324,8 @@ _PICKLE_LITERAL_OPCODE_NAMES = frozenset(
         "BYTEARRAY8",
     }
 )
+_PICKLE_MEMO_READ_OPCODE_NAMES = frozenset({"GET", "BINGET", "LONG_BINGET"})
+_PICKLE_MEMO_WRITE_OPCODE_NAMES = frozenset({"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"})
 _PICKLE_STRING_OPCODE_NAMES = frozenset(
     {
         "STRING",
@@ -1534,6 +1536,66 @@ def _has_downloader_command(value: str) -> bool:
     )
 
 
+def _direct_pickle_dict_key_literal_positions(
+    operations: list[tuple[pickletools.OpcodeInfo, Any | None, int | None]],
+) -> frozenset[int]:
+    if any(opcode.name in _PICKLE_MEMO_READ_OPCODE_NAMES for opcode, _, _ in operations):
+        return frozenset()
+
+    def previous_direct_value(index: int) -> int | None:
+        index -= 1
+        while index >= 0 and operations[index][0].name in _PICKLE_MEMO_WRITE_OPCODE_NAMES:
+            index -= 1
+        if index < 0:
+            return None
+        opcode = operations[index][0]
+        if opcode.name == "MARK" or opcode.stack_before or len(opcode.stack_after) != 1:
+            return None
+        return index
+
+    key_positions: set[int] = set()
+    for index, (opcode, _, _) in enumerate(operations):
+        if opcode.name == "SETITEM":
+            value_index = previous_direct_value(index)
+            key_index = previous_direct_value(value_index) if value_index is not None else None
+            key_position = operations[key_index][2] if key_index is not None else None
+            if (
+                key_index is not None
+                and operations[key_index][0].name in _PICKLE_LITERAL_OPCODE_NAMES
+                and isinstance(key_position, int)
+            ):
+                key_positions.add(key_position)
+            continue
+        if opcode.name not in {"DICT", "SETITEMS"}:
+            continue
+        mark_index = next(
+            (candidate for candidate in range(index - 1, -1, -1) if operations[candidate][0].name == "MARK"),
+            None,
+        )
+        if mark_index is None:
+            continue
+        item_indexes: list[int] = []
+        for candidate in range(mark_index + 1, index):
+            candidate_opcode = operations[candidate][0]
+            if candidate_opcode.name in _PICKLE_MEMO_WRITE_OPCODE_NAMES:
+                continue
+            if (
+                candidate_opcode.name == "MARK"
+                or candidate_opcode.stack_before
+                or len(candidate_opcode.stack_after) != 1
+            ):
+                item_indexes = []
+                break
+            item_indexes.append(candidate)
+        if len(item_indexes) % 2:
+            continue
+        for candidate in item_indexes[::2]:
+            key_position = operations[candidate][2]
+            if operations[candidate][0].name in _PICKLE_LITERAL_OPCODE_NAMES and isinstance(key_position, int):
+                key_positions.add(key_position)
+    return frozenset(key_positions)
+
+
 def _literal_ast_has_downloader_url_context(tree: ast.Module) -> bool:
     dict_key_ids = {id(key) for node in ast.walk(tree) if isinstance(node, ast.Dict) for key in node.keys if key}
     values = [
@@ -1649,11 +1711,17 @@ def _pickle_literal_url_stripped_scan_view(data: bytes, *, allow_filtering: bool
         if not operations or len(operations) > budget or operations[-1][0].name != "STOP":
             return data
         budget -= len(operations)
-        literal_values = [
-            _literal_arg_text(arg) for opcode, arg, _ in operations if opcode.name in _PICKLE_LITERAL_OPCODE_NAMES
+        literal_records = [
+            (position, _literal_arg_text(arg))
+            for opcode, arg, position in operations
+            if opcode.name in _PICKLE_LITERAL_OPCODE_NAMES
         ]
-        if any(_PICKLE_LITERAL_URL_TEXT_RE.search(value) for value in literal_values) and any(
-            _has_downloader_command(value) for value in literal_values
+        if any(value is None for _, value in literal_records):
+            return data
+        literal_values = [(position, value) for position, value in literal_records if value is not None]
+        dict_key_positions = _direct_pickle_dict_key_literal_positions(operations)
+        if any(_PICKLE_LITERAL_URL_TEXT_RE.search(value) for _, value in literal_values) and any(
+            position not in dict_key_positions and _has_downloader_command(value) for position, value in literal_values
         ):
             return data
         for (opcode, arg, position), (_, _, next_position) in pairwise(operations):

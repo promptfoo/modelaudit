@@ -50,6 +50,23 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     suspicious_string_matches_impl(value, true)
 }
 
+pub(crate) fn suspicious_string_matches_window(
+    value: &str,
+    starts_in_url: bool,
+    next_window_start: usize,
+) -> (Vec<String>, bool) {
+    let (plain_value, url_limit_exceeded, url_context_incomplete, next_starts_in_url) =
+        strip_url_spans_with_context(value, starts_in_url, next_window_start);
+    let mut matches = suspicious_string_matches_impl(plain_value.as_ref(), true);
+    if url_limit_exceeded {
+        push_unique(&mut matches, URL_SCAN_LIMIT_SENTINEL);
+    }
+    if url_context_incomplete {
+        push_unique(&mut matches, URL_CONTEXT_INCOMPLETE_SENTINEL);
+    }
+    (matches, next_starts_in_url)
+}
+
 fn suspicious_string_matches_impl(value: &str, scan_base64: bool) -> Vec<String> {
     if value.len() >= 1024 && is_repeated_single_byte(value.as_bytes()) {
         return Vec::new();
@@ -173,6 +190,16 @@ const URL_SCHEMES: &[&[u8]] = &[
 const URL_CODE_PADDING_BYTES: &[u8] = b" \t\r\n'\"!+-/%*|&;@=<>^~:,.[]{}()";
 
 fn strip_url_spans(value: &str) -> (Cow<'_, str>, bool, bool) {
+    let (plain, span_limit_exceeded, context_incomplete, _) =
+        strip_url_spans_with_context(value, false, value.len());
+    (plain, span_limit_exceeded, context_incomplete)
+}
+
+fn strip_url_spans_with_context(
+    value: &str,
+    starts_in_url: bool,
+    next_window_start: usize,
+) -> (Cow<'_, str>, bool, bool, bool) {
     let bytes = value.as_bytes();
     let mut output: Option<String> = None;
     let mut copied_through = 0usize;
@@ -181,6 +208,19 @@ fn strip_url_spans(value: &str) -> (Cow<'_, str>, bool, bool) {
     let mut span_limit_exceeded = false;
     let mut context_incomplete = false;
     let mut lex_stack: Vec<StringLexFrame> = Vec::new();
+    let mut next_starts_in_url = false;
+
+    if starts_in_url {
+        let (end, uncertain) = url_end(bytes, 0, None);
+        context_incomplete |= uncertain;
+        if end > 0 {
+            let stripped = output.get_or_insert_with(|| String::with_capacity(value.len()));
+            stripped.push('\0');
+            copied_through = end;
+            cursor = end;
+            next_starts_in_url = next_window_start < end;
+        }
+    }
 
     while cursor < bytes.len() {
         if url_scheme_starts(bytes, cursor) {
@@ -193,6 +233,7 @@ fn strip_url_spans(value: &str) -> (Cow<'_, str>, bool, bool) {
             // Keep bytes on opposite sides of a removed URL in separate
             // lexical tokens. MIME-Base64 whitespace must not stitch them.
             stripped.push('\0');
+            next_starts_in_url |= cursor <= next_window_start && next_window_start < end;
             copied_through = end;
             cursor = end;
             continue;
@@ -301,12 +342,14 @@ fn strip_url_spans(value: &str) -> (Cow<'_, str>, bool, bool) {
                 Cow::Owned(stripped),
                 span_limit_exceeded,
                 context_incomplete,
+                next_starts_in_url,
             )
         }
         None => (
             Cow::Borrowed(value),
             span_limit_exceeded,
             context_incomplete,
+            next_starts_in_url,
         ),
     }
 }
