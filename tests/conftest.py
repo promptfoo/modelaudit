@@ -156,6 +156,7 @@ def pytest_runtest_setup(item):
             "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_dependency_lock.py",  # Security-sensitive uv.lock dependency guardrails
             "test_perf_workflow.py",  # GitHub Actions workflow contract and benchmark regression tests
+            "test_nightly_asset_contracts.py",  # committed Nightly asset coverage contracts
             "test_nightly_prerequisites.py",  # deterministic Nightly input proofs
             "test_bug1_confidence_exploit.py",  # Security bug test
             "test_gguf_scanner.py",  # GGUF scanner tests
