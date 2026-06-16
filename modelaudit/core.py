@@ -147,6 +147,7 @@ from modelaudit.utils.file.large_file_handler import (
 )
 from modelaudit.utils.file.streaming import StreamedSourceByteAccounting, stream_analyze_file, stream_source_path
 from modelaudit.utils.helpers.cache_decorator import (
+    EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY,
     cached_scan,
     should_defer_hash_for_file_backed_onnx,
     should_defer_hash_for_pytorch_read_limit,
@@ -247,11 +248,12 @@ def _mark_onnx_external_data_stability_failure(
     model_path: str,
     changed_source_count: int,
 ) -> None:
-    """Fail closed when ONNX external data changes during its model scan."""
+    """Fail closed when ONNX primary or external-data identity cannot be kept stable."""
+    result.metadata.pop("content_hash", None)
     result.add_check(
         name="ONNX External Data Stability",
         passed=False,
-        message="ONNX external-data sources changed during the model scan",
+        message="ONNX primary model or external-data source identity changed or could not be verified",
         severity=IssueSeverity.INFO,
         location=model_path,
         details={
@@ -1455,6 +1457,11 @@ def _hash_is_needed_outside_onnx_package(
 def _openvino_xml_companion_key(path: Path) -> str:
     """Return a stable lexical key for one scheduled OpenVINO XML scan."""
     return os.path.normcase(os.path.normpath(str(Path(os.path.abspath(path)))))
+
+
+def _onnx_changed_source_key(path: str | Path) -> str:
+    """Return a lexical absolute key without following a potentially raced symlink."""
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
 def _with_openvino_scanned_xml_companion(config: dict[str, Any], xml_path: Path) -> dict[str, Any]:
@@ -4788,6 +4795,7 @@ def scan_model_directory_or_file(
                 onnx_external_data_sizes_by_path: dict[str, int] = {}
                 onnx_external_data_routing_paths: dict[str, str] = {}
                 onnx_package_hash_complete_by_path: dict[str, bool] = {}
+                onnx_model_identities_by_path: dict[str, _FileIdentitySnapshot] = {}
                 scan_entry_target_keys: set[_FileTargetIdentityKey] = set()
                 for (
                     _representative_file,
@@ -4829,13 +4837,20 @@ def scan_model_directory_or_file(
                         or not _is_streamed_onnx_external_data_hash_candidate(Path(representative_file))
                     ):
                         continue
+                    representative_model_identity = _snapshot_file_identity(Path(representative_file))
+                    if representative_model_identity is None:
+                        aggregate_hash_complete = False
+                    else:
+                        onnx_model_identities_by_path[representative_file] = representative_model_identity
                     representative_hash_deferred = should_defer_hash_for_file_backed_onnx(
                         representative_hash_source,
                         config,
                     )
                     if representative_hash_deferred:
                         aggregate_hash_complete = False
-                    onnx_package_hash_complete_by_path[representative_file] = not representative_hash_deferred
+                    onnx_package_hash_complete_by_path[representative_file] = (
+                        not representative_hash_deferred and representative_model_identity is not None
+                    )
                     if not _should_defer_hash_for_max_file_size(representative_hash_source, config):
                         representative_external_sources: list[str] = []
                         representative_external_roles: list[str] = []
@@ -5412,37 +5427,43 @@ def scan_model_directory_or_file(
                                 and _openvino_xml_companion_key(openvino_owner) in covered_openvino_xml_companions
                             ):
                                 file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
-                            pre_scan_model_identity = (
-                                _snapshot_file_identity(Path(representative_file))
-                                if representative_file in onnx_package_hash_complete_by_path
-                                else None
-                            )
-                            if pre_scan_model_identity is not None and (
+                            pre_scan_model_identity = onnx_model_identities_by_path.get(representative_file)
+                            if pre_scan_model_identity is not None and pre_scan_model_identity.stat is not None:
+                                file_config[EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY] = pre_scan_model_identity.stat
+                            elif representative_file in onnx_package_hash_complete_by_path:
+                                file_config["cache_enabled"] = False
+                            if representative_file in onnx_package_hash_complete_by_path and (
                                 onnx_external_data_identities_by_path.get(representative_file)
                                 or not onnx_package_hash_complete_by_path[representative_file]
                             ):
                                 file_config["cache_enabled"] = False
+                            if representative_file in onnx_package_hash_complete_by_path and (
+                                pre_scan_model_identity is None
+                                or _snapshot_file_identity(Path(representative_file)) != pre_scan_model_identity
+                            ):
+                                file_config["cache_enabled"] = False
                             file_result = scan_file(representative_file, file_config)
-                            changed_onnx_sidecars = [
-                                str(external_data_path)
+                            changed_onnx_sources = {
+                                _onnx_changed_source_key(external_data_path)
                                 for external_data_path, pre_scan_identity in onnx_external_data_identities_by_path.get(
                                     representative_file,
                                     (),
                                 )
                                 if _snapshot_file_identity(external_data_path) != pre_scan_identity
-                            ]
-                            if pre_scan_model_identity is not None and (
-                                _snapshot_file_identity(Path(representative_file)) != pre_scan_model_identity
+                            }
+                            if representative_file in onnx_package_hash_complete_by_path and (
+                                pre_scan_model_identity is None
+                                or _snapshot_file_identity(Path(representative_file)) != pre_scan_model_identity
                             ):
-                                changed_onnx_sidecars.append(representative_file)
-                            if changed_onnx_sidecars:
+                                changed_onnx_sources.add(_onnx_changed_source_key(representative_file))
+                            if changed_onnx_sources:
                                 aggregate_hash_complete = False
                                 onnx_package_hash_complete_by_path[representative_file] = False
                                 onnx_package_hashes_by_path.pop(representative_file, None)
                                 _mark_onnx_external_data_stability_failure(
                                     file_result,
                                     representative_file,
-                                    len(changed_onnx_sidecars),
+                                    len(changed_onnx_sources),
                                 )
                             file_result.bytes_scanned += covered_openvino_companion_sizes.get(
                                 _openvino_xml_companion_key(Path(representative_file)),
@@ -5581,22 +5602,21 @@ def scan_model_directory_or_file(
                             if len(scanned_file_paths) > 1 and "file_size" in combined_metadata:
                                 with suppress(OSError):
                                     combined_metadata["file_size"] = os.path.getsize(scanned_file_path)
+                            package_hash_complete = onnx_package_hash_complete_by_path.get(representative_file)
+                            if package_hash_complete is not None:
+                                combined_metadata["onnx_package_hash_complete"] = package_hash_complete
                             path_content_hash = content_hashes.get(scanned_file_path)
-                            if path_content_hash is not None:
-                                package_hash_complete = onnx_package_hash_complete_by_path.get(representative_file)
-                                if package_hash_complete is not None:
-                                    combined_metadata["onnx_package_hash_complete"] = package_hash_complete
+                            if package_hash_complete is False:
+                                combined_metadata.pop("content_hash", None)
+                                combined_metadata["duplicate_files"] = None
+                            elif path_content_hash is not None:
                                 identity_hash = (
                                     onnx_package_hashes_by_path[representative_file]
                                     if package_hash_complete
                                     else path_content_hash
                                 )
                                 combined_metadata["content_hash"] = identity_hash
-                                duplicate_files = (
-                                    duplicate_paths_by_hash.get(identity_hash, [])
-                                    if package_hash_complete is not False
-                                    else []
-                                )
+                                duplicate_files = duplicate_paths_by_hash.get(identity_hash, [])
                                 combined_metadata["duplicate_files"] = (
                                     duplicate_files if len(duplicate_files) > 1 else None
                                 )
@@ -5933,7 +5953,20 @@ def scan_model_directory_or_file(
                 ) and _is_streamed_onnx_external_data_hash_candidate(Path(target))
                 if onnx_package_candidate:
                     pre_scan_onnx_model_identity = _snapshot_file_identity(Path(target))
-                    onnx_package_hash_complete = not defer_hash_for_file_backed_onnx
+                    onnx_package_hash_complete = (
+                        not defer_hash_for_file_backed_onnx and pre_scan_onnx_model_identity is not None
+                    )
+                    if pre_scan_onnx_model_identity is None:
+                        aggregate_hash_complete = False
+                        target_config = dict(target_config)
+                        target_config["cache_enabled"] = False
+                    elif pre_scan_onnx_model_identity.stat is not None:
+                        target_config = dict(target_config)
+                        target_config[EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY] = pre_scan_onnx_model_identity.stat
+                    else:
+                        aggregate_hash_complete = False
+                        target_config = dict(target_config)
+                        target_config["cache_enabled"] = False
                 if (
                     defer_hash_for_max_total_size
                     or defer_hash_for_max_file_size
@@ -6006,21 +6039,29 @@ def scan_model_directory_or_file(
                     if recorded_file_hash is not None and (not is_dvc_pointer or recorded_file_hash not in file_hashes):
                         file_hashes.append(recorded_file_hash)
 
+                if onnx_package_candidate and (
+                    pre_scan_onnx_model_identity is None
+                    or _snapshot_file_identity(Path(target)) != pre_scan_onnx_model_identity
+                ):
+                    target_config = dict(target_config)
+                    target_config["cache_enabled"] = False
+
                 file_scan_started_at = _start_phase_timing(phase_timings)
                 try:
                     file_result = scan_file(target, target_config)
                 finally:
                     _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
                 file_result.bytes_scanned += onnx_external_data_bytes_scanned
-                changed_onnx_sources = [
-                    str(external_data_path)
+                changed_onnx_sources = {
+                    _onnx_changed_source_key(external_data_path)
                     for external_data_path, pre_scan_identity in onnx_external_data_pre_scan_identities
                     if _snapshot_file_identity(external_data_path) != pre_scan_identity
-                ]
-                if pre_scan_onnx_model_identity is not None and (
-                    _snapshot_file_identity(Path(target)) != pre_scan_onnx_model_identity
+                }
+                if onnx_package_candidate and (
+                    pre_scan_onnx_model_identity is None
+                    or _snapshot_file_identity(Path(target)) != pre_scan_onnx_model_identity
                 ):
-                    changed_onnx_sources.append(target)
+                    changed_onnx_sources.add(_onnx_changed_source_key(target))
                 if changed_onnx_sources:
                     aggregate_hash_complete = False
                     onnx_package_hash_complete = False
@@ -6608,7 +6649,7 @@ def _preserve_hf_download_sidecar_asset(
     return _has_hf_download_metadata_sidecar(path)
 
 
-@cached_scan()
+@cached_scan(expected_file_stat_key=EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY)
 def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.
@@ -8006,6 +8047,7 @@ def scan_model_streaming(
             onnx_external_data_hashes: list[tuple[str, str]] = []
             recorded_onnx_external_data_hashes: list[str] = []
             onnx_package_hash_complete: bool | None = None
+            onnx_model_pre_hash_identity: _FileIdentitySnapshot | None = None
             suppress_consumed_onnx_external_data_accounting = False
             openvino_sidecar_needs_independent_scan = False
             independent_openvino_sidecar_result: ScanResult | None = None
@@ -8279,6 +8321,19 @@ def scan_model_streaming(
                 onnx_package_candidate = scanner_selection.allows(
                     "onnx"
                 ) and _is_streamed_onnx_external_data_hash_candidate(scan_path)
+                if onnx_package_candidate:
+                    onnx_model_pre_hash_identity = _snapshot_file_identity(scan_path)
+                    if onnx_model_pre_hash_identity is None:
+                        aggregate_hash_complete = False
+                        scan_config = dict(scan_config)
+                        scan_config["cache_enabled"] = False
+                    elif onnx_model_pre_hash_identity.stat is not None:
+                        scan_config = dict(scan_config)
+                        scan_config[EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY] = onnx_model_pre_hash_identity.stat
+                    else:
+                        aggregate_hash_complete = False
+                        scan_config = dict(scan_config)
+                        scan_config["cache_enabled"] = False
                 file_hash = append_streamed_file_hash(
                     scan_path,
                     scan_config,
@@ -8297,7 +8352,11 @@ def scan_model_streaming(
                     str(scan_path),
                     scan_config,
                 ):
-                    onnx_package_hash_complete = file_hash is not None and not defer_hash_for_file_backed_onnx
+                    onnx_package_hash_complete = (
+                        file_hash is not None
+                        and not defer_hash_for_file_backed_onnx
+                        and onnx_model_pre_hash_identity is not None
+                    )
                     discovered_external_data_paths = _streamed_onnx_external_data_hash_paths(
                         scan_path,
                         deadline=start_time + timeout,
@@ -8395,6 +8454,13 @@ def scan_model_streaming(
                 if progress_callback:
                     progress_callback(f"Scanning {source_path.name}", (files_processed / (files_processed + 1)) * 100)
 
+                if onnx_package_candidate and (
+                    onnx_model_pre_hash_identity is None
+                    or _snapshot_file_identity(scan_path) != onnx_model_pre_hash_identity
+                ):
+                    scan_config = dict(scan_config)
+                    scan_config["cache_enabled"] = False
+
                 scan_result = scan_file(
                     str(scan_path),
                     config=scan_config,
@@ -8423,20 +8489,25 @@ def scan_model_streaming(
                     )
                     preserve_shard_reconciliation_errors = True
                     aggregate_hash_complete = False
-                changed_onnx_sidecars = {
-                    onnx_external_data_path
+                changed_onnx_sources = {
+                    _onnx_changed_source_key(onnx_external_data_path)
                     for onnx_external_data_path, pre_scan_identity in onnx_external_data_pre_scan_identities.items()
                     if _snapshot_file_identity(onnx_external_data_path) != pre_scan_identity
                 }
-                changed_onnx_sidecars.update(onnx_external_data_hash_unstable)
-                if changed_onnx_sidecars:
+                changed_onnx_sources.update(_onnx_changed_source_key(path) for path in onnx_external_data_hash_unstable)
+                if onnx_package_candidate and (
+                    onnx_model_pre_hash_identity is None
+                    or _snapshot_file_identity(scan_path) != onnx_model_pre_hash_identity
+                ):
+                    changed_onnx_sources.add(_onnx_changed_source_key(scan_path))
+                if changed_onnx_sources:
                     aggregate_hash_complete = False
                     onnx_package_hash_complete = False
                     preserve_shard_reconciliation_errors = True
                     _mark_onnx_external_data_stability_failure(
                         scan_result,
                         str(scan_path),
-                        len(changed_onnx_sidecars),
+                        len(changed_onnx_sources),
                     )
                 if openvino_sidecar_needs_independent_scan and openvino_scan_companion_path is not None:
                     independent_openvino_sidecar_path = openvino_scan_companion_path
@@ -8469,6 +8540,8 @@ def scan_model_streaming(
                                 _discard_recorded_hash(file_hashes, external_data_hash)
                             if package_content_hash not in file_hashes:
                                 file_hashes.append(package_content_hash)
+                        elif not onnx_package_hash_complete:
+                            metadata_dict.pop("content_hash", None)
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
                     if operational_scan_failure:
                         preserve_shard_reconciliation_errors = True

@@ -26,7 +26,7 @@ from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
 from modelaudit.scanner_results import MAX_MEMBER_FILE_HASH_RECORDS
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
-from tests.helpers import create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
+from tests.helpers import create_equal_length_onnx_payloads, create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
 
 
 class _MaliciousPicklePayload:
@@ -1547,6 +1547,352 @@ class TestHashGenerationEdgeCases:
 
 
 class TestOnnxExternalDataContentHash:
+    def test_direct_primary_replacement_after_cached_hit_probe_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "model.onnx"
+        replacement_path = tmp_path / "replacement.bin"
+        pytest.importorskip("onnx")
+        original, replacement = create_equal_length_onnx_payloads()
+        model_path.write_bytes(original)
+        replacement_path.write_bytes(replacement)
+        cache_dir = tmp_path / "cache"
+        scan_kwargs: dict[str, Any] = {
+            "recursive": False,
+            "cache_enabled": True,
+            "cache_dir": str(cache_dir),
+            "min_cache_file_size": 0,
+            "scanners": ["onnx"],
+        }
+        reset_cache_manager()
+        try:
+            first = scan_model_directory_or_file(str(model_path), **scan_kwargs)
+            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+            assert first.success is True
+            assert cache_manager.get_stats()["total_entries"] == 1
+            original_probe = cache_manager.get_cached_result_with_identity
+            replaced = False
+
+            def replace_after_hit_probe(*args: Any, **kwargs: Any) -> Any:
+                nonlocal replaced
+                result = original_probe(*args, **kwargs)
+                if result[0] is not None and not replaced:
+                    os.replace(replacement_path, model_path)
+                    replaced = True
+                return result
+
+            monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", replace_after_hit_probe)
+
+            result = scan_model_directory_or_file(str(model_path), **scan_kwargs)
+
+            stability_checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+            metadata = result.file_metadata[str(model_path)]
+            assert replaced is True
+            assert result.success is False
+            assert determine_exit_code(result) == 2
+            assert result.content_hash is None
+            assert metadata.get("onnx_package_hash_complete") is False
+            assert metadata.get("content_hash") is None
+            assert len(stability_checks) == 1
+            assert stability_checks[0].details["changed_source_count"] == 1
+            assert cache_manager.get_stats()["total_entries"] == 1
+        finally:
+            reset_cache_manager()
+
+    def test_direct_relative_self_referential_external_source_change_is_counted_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit import core
+
+        model_path = tmp_path / "model.onnx"
+        replacement_path = tmp_path / "replacement.onnx"
+        _write_regular_scan_onnx_model(
+            model_path,
+            external_location=model_path.name,
+            external_size=4,
+        )
+        replacement, _ = create_equal_length_onnx_payloads()
+        replacement_path.write_bytes(replacement)
+        monkeypatch.chdir(tmp_path)
+        relative_model_path = Path(model_path.name)
+        original_scan_file = core.scan_file
+        replaced = False
+
+        def replace_at_dispatch(path: str, config: dict[str, Any]) -> Any:
+            nonlocal replaced
+            if Path(path) == relative_model_path and not replaced:
+                os.replace(replacement_path, model_path)
+                replaced = True
+            return original_scan_file(path, config)
+
+        monkeypatch.setattr(core, "scan_file", replace_at_dispatch)
+
+        result = scan_model_directory_or_file(
+            str(relative_model_path),
+            recursive=False,
+            cache_enabled=False,
+            scanners=["onnx"],
+        )
+
+        stability_checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+        assert replaced is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert len(stability_checks) == 1
+        assert stability_checks[0].details["changed_source_count"] == 1
+
+    @pytest.mark.parametrize("route", ["direct", "directory"])
+    def test_primary_replacement_at_scan_dispatch_cannot_populate_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        route: str,
+    ) -> None:
+        from modelaudit import core
+        from modelaudit.utils.helpers.cache_decorator import EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY
+
+        scan_root = tmp_path / "scan-root"
+        scan_root.mkdir()
+        model_path = scan_root / "model.onnx"
+        replacement_path = tmp_path / "replacement.bin"
+        pytest.importorskip("onnx")
+        original, replacement = create_equal_length_onnx_payloads()
+        model_path.write_bytes(original)
+        replacement_path.write_bytes(replacement)
+        cache_dir = tmp_path / "cache"
+        original_scan_file = core.scan_file
+        dispatched_cache_enabled: list[bool | None] = []
+        replaced = False
+
+        def replace_at_dispatch(path: str, config: dict[str, Any]) -> Any:
+            nonlocal replaced
+            if Path(path) == model_path and not replaced:
+                dispatched_cache_enabled.append(config.get("cache_enabled"))
+                assert EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY in config
+                os.replace(replacement_path, model_path)
+                replaced = True
+            return original_scan_file(path, config)
+
+        monkeypatch.setattr(core, "scan_file", replace_at_dispatch)
+        reset_cache_manager()
+        try:
+            result = scan_model_directory_or_file(
+                str(model_path if route == "direct" else scan_root),
+                recursive=False,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                scanners=["onnx"],
+            )
+
+            stability_checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+            metadata = result.file_metadata[str(model_path)]
+            assert replaced is True
+            assert dispatched_cache_enabled == [True]
+            assert result.success is False
+            assert determine_exit_code(result) == 2
+            assert result.content_hash is None
+            assert metadata.get("onnx_package_hash_complete") is False
+            assert metadata.get("content_hash") is None
+            assert len(stability_checks) == 1
+            assert stability_checks[0].details["changed_source_count"] == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_direct_primary_replacement_after_hash_is_uncached(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit import core
+
+        model_path = tmp_path / "model.onnx"
+        replacement_path = tmp_path / "replacement.bin"
+        pytest.importorskip("onnx")
+        original, replacement = create_equal_length_onnx_payloads()
+        model_path.write_bytes(original)
+        replacement_path.write_bytes(replacement)
+        cache_dir = tmp_path / "cache"
+        original_hash = core._calculate_file_hash
+        original_scan_file = core.scan_file
+        dispatched_cache_enabled: list[bool | None] = []
+        replaced = False
+
+        def replace_after_hash(path: str, *, deadline: float | None = None) -> str:
+            nonlocal replaced
+            content_hash = original_hash(path, deadline=deadline)
+            if Path(path) == model_path and not replaced:
+                os.replace(replacement_path, model_path)
+                replaced = True
+            return content_hash
+
+        def observe_scan_config(path: str, config: dict[str, Any]) -> Any:
+            dispatched_cache_enabled.append(config.get("cache_enabled"))
+            return original_scan_file(path, config)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", replace_after_hash)
+        monkeypatch.setattr(core, "scan_file", observe_scan_config)
+        reset_cache_manager()
+        try:
+            result = scan_model_directory_or_file(
+                str(model_path),
+                recursive=False,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                scanners=["onnx"],
+            )
+
+            stability_checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+            metadata = result.file_metadata[str(model_path)]
+            assert replaced is True
+            assert dispatched_cache_enabled == [False]
+            assert result.success is False
+            assert determine_exit_code(result) == 2
+            assert result.content_hash is None
+            assert metadata.get("onnx_package_hash_complete") is False
+            assert metadata.get("content_hash") is None
+            assert len(stability_checks) == 1
+            assert stability_checks[0].details["changed_source_count"] == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_direct_primary_identity_unavailable_is_uncached(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit import core
+
+        model_path = tmp_path / "model.onnx"
+        pytest.importorskip("onnx")
+        original, _replacement = create_equal_length_onnx_payloads()
+        model_path.write_bytes(original)
+        cache_dir = tmp_path / "cache"
+        original_snapshot = core._snapshot_file_identity
+        original_scan_file = core.scan_file
+        snapshot_unavailable_returned = False
+        dispatched_cache_enabled: list[bool | None] = []
+
+        def unavailable_once(path: Path) -> Any:
+            nonlocal snapshot_unavailable_returned
+            if path == model_path and not snapshot_unavailable_returned:
+                snapshot_unavailable_returned = True
+                return None
+            return original_snapshot(path)
+
+        def observe_scan_config(path: str, config: dict[str, Any]) -> Any:
+            dispatched_cache_enabled.append(config.get("cache_enabled"))
+            return original_scan_file(path, config)
+
+        monkeypatch.setattr(core, "_snapshot_file_identity", unavailable_once)
+        monkeypatch.setattr(core, "scan_file", observe_scan_config)
+        reset_cache_manager()
+        try:
+            result = scan_model_directory_or_file(
+                str(model_path),
+                recursive=False,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                scanners=["onnx"],
+            )
+
+            stability_checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+            assert snapshot_unavailable_returned is True
+            assert dispatched_cache_enabled == [False]
+            assert result.success is False
+            assert determine_exit_code(result) == 2
+            assert result.content_hash is None
+            assert result.file_metadata[str(model_path)].get("onnx_package_hash_complete") is False
+            assert result.file_metadata[str(model_path)].get("content_hash") is None
+            assert len(stability_checks) == 1
+            assert stability_checks[0].details["changed_source_count"] == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize("snapshot_available", [True, False], ids=["changed", "unavailable"])
+    def test_directory_primary_replacement_after_hash_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        snapshot_available: bool,
+    ) -> None:
+        from modelaudit import core
+
+        scan_root = tmp_path / "scan-root"
+        scan_root.mkdir()
+        model_path = scan_root / "model.onnx"
+        replacement_path = tmp_path / "replacement.bin"
+        pytest.importorskip("onnx")
+        original, replacement = create_equal_length_onnx_payloads()
+        assert len(original) == len(replacement)
+        model_path.write_bytes(original)
+        replacement_path.write_bytes(replacement)
+        original_hash_files = core._hash_files_by_path
+        original_snapshot = core._snapshot_file_identity
+        original_scan_file = core.scan_file
+        cache_dir = tmp_path / "cache"
+        dispatched_cache_enabled: list[bool | None] = []
+        model_snapshot_calls = 0
+        replaced = False
+
+        def optionally_unavailable_snapshot(path: Path) -> Any:
+            nonlocal model_snapshot_calls
+            if path == model_path:
+                model_snapshot_calls += 1
+                if not snapshot_available and model_snapshot_calls == 2:
+                    return None
+            return original_snapshot(path)
+
+        def replace_after_hash(file_paths: list[str], **kwargs: Any) -> dict[str, str]:
+            nonlocal replaced
+            hashes = original_hash_files(file_paths, **kwargs)
+            if str(model_path) in file_paths and not replaced:
+                os.replace(replacement_path, model_path)
+                replaced = True
+            return hashes
+
+        def observe_scan_config(path: str, config: dict[str, Any]) -> Any:
+            dispatched_cache_enabled.append(config.get("cache_enabled"))
+            return original_scan_file(path, config)
+
+        monkeypatch.setattr(core, "_snapshot_file_identity", optionally_unavailable_snapshot)
+        monkeypatch.setattr(core, "_hash_files_by_path", replace_after_hash)
+        monkeypatch.setattr(core, "scan_file", observe_scan_config)
+        reset_cache_manager()
+        try:
+            result = scan_model_directory_or_file(
+                str(scan_root),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                scanners=["onnx"],
+            )
+
+            stability_checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
+            metadata = result.file_metadata[str(model_path)]
+            assert replaced is True
+            assert model_snapshot_calls >= 2
+            assert dispatched_cache_enabled == [False]
+            assert result.success is False
+            assert determine_exit_code(result) == 2
+            assert result.content_hash is None
+            assert metadata.get("onnx_package_hash_complete") is False
+            assert metadata.get("content_hash") is None
+            assert len(stability_checks) == 1
+            assert stability_checks[0].details["changed_source_count"] == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_directory_hash_is_deferred_when_onnx_sidecar_discovery_is_incomplete(
         self,
         tmp_path: Path,

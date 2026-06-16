@@ -6,6 +6,7 @@ and improve test maintainability.
 """
 
 from tests.helpers.file_creators import (
+    create_equal_length_onnx_payloads,
     create_malicious_pickle,
     create_mock_coreml,
     create_mock_gguf,
@@ -34,6 +35,7 @@ from tests.helpers.frameworks import (
 )
 
 __all__ = [
+    "create_equal_length_onnx_payloads",
     "create_malicious_pickle",
     "create_mock_coreml",
     "create_mock_gguf",

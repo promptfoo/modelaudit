@@ -270,6 +270,35 @@ def create_mock_onnx(
     return path
 
 
+def create_equal_length_onnx_payloads() -> tuple[bytes, bytes]:
+    """Create distinct checker-valid ONNX payloads with identical byte lengths."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    def model_bytes(*, op_type: str, domain: str, producer: str, padding: int = 0) -> bytes:
+        graph = helper.make_graph(
+            [helper.make_node(op_type, ["X"], ["Y"], domain=domain)],
+            "g",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+        )
+        graph.doc_string = "p" * padding
+        model = helper.make_model(
+            graph,
+            producer_name=producer,
+            opset_imports=[helper.make_opsetid("", 24), helper.make_opsetid("modelaudit.test", 1)],
+        )
+        onnx.checker.check_model(model)
+        return model.SerializeToString()
+
+    replacement = model_bytes(op_type="Tanh", domain="modelaudit.test", producer="new")
+    for padding in range(256):
+        original = model_bytes(op_type="Relu", domain="", producer="old", padding=padding)
+        if len(original) == len(replacement):
+            return original, replacement
+    raise AssertionError("could not construct equal-length checker-valid ONNX models")
+
+
 def _encode_protobuf_varint(value: int) -> bytes:
     if value < 0:
         raise ValueError("protobuf varints cannot encode negative values")

@@ -349,7 +349,9 @@ def test_external_data_race_is_uncached_fail_closed(
         assert determine_exit_code(result) == 2
         checks = [check for check in result.checks if check.name == "ONNX External Data Stability"]
         assert len(checks) == 1
-        assert checks[0].message == "ONNX external-data sources changed during the model scan"
+        assert (
+            checks[0].message == "ONNX primary model or external-data source identity changed or could not be verified"
+        )
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()

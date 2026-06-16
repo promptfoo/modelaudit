@@ -54,7 +54,7 @@ from modelaudit.cache.scan_results_cache import (
 )
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult
-from modelaudit.utils.helpers.cache_decorator import cached_scan
+from modelaudit.utils.helpers.cache_decorator import EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY, cached_scan
 
 
 @pytest.fixture(autouse=True)
@@ -575,6 +575,169 @@ def test_cached_scan_persists_miss_and_hits_on_second_call(tmp_path: Path) -> No
 
     cache_manager = get_cache_manager(str(cache_dir), enabled=True)
     assert cache_manager.get_stats()["total_entries"] == 1
+
+
+def _expected_primary_stat(path: Path) -> tuple[int, int, int, int, int, int]:
+    file_stat = path.stat()
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def test_identity_bound_cached_scan_uses_only_outer_cache_and_hits(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="bound-stable.dat")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY: _expected_primary_stat(file_path),
+    }
+    calls = 0
+    observed_cache_enabled: list[bool] = []
+
+    @cached_scan(expected_file_stat_key=EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY)
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        nonlocal calls
+        assert config is not None
+        assert EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY not in config
+        observed_cache_enabled.append(config["cache_enabled"])
+        calls += 1
+        return {"size": Path(path).stat().st_size}
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first == second == {"size": 2048}
+    assert calls == 1
+    assert observed_cache_enabled == [False]
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+
+
+def test_identity_bound_cached_hit_rechecks_path_after_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="bound-hit-race.dat")
+    replacement = _make_cacheable_file(tmp_path, name="bound-hit-replacement.dat")
+    file_path.write_bytes(b"A" * 2048)
+    replacement.write_bytes(b"B" * 2048)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY: _expected_primary_stat(file_path),
+    }
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    calls = 0
+    observed_cache_enabled: list[bool] = []
+
+    @cached_scan(expected_file_stat_key=EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY)
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        nonlocal calls
+        assert config is not None
+        observed_cache_enabled.append(config["cache_enabled"])
+        calls += 1
+        return {"prefix": Path(path).read_bytes()[:1].decode()}
+
+    assert scan(str(file_path), config) == {"prefix": "A"}
+    assert cache_manager.get_stats()["total_entries"] == 1
+    original_probe = cache_manager.get_cached_result_with_identity
+    replaced = False
+
+    def replace_after_hit_probe(*args: Any, **kwargs: Any) -> Any:
+        nonlocal replaced
+        result = original_probe(*args, **kwargs)
+        if not replaced:
+            os.replace(replacement, file_path)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", replace_after_hit_probe)
+
+    assert scan(str(file_path), config) == {"prefix": "B"}
+    assert replaced is True
+    assert calls == 2
+    assert observed_cache_enabled == [False, False]
+    assert cache_manager.get_stats()["total_entries"] == 1
+
+
+def test_identity_bound_cached_scan_does_not_cache_replacement_after_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="bound-race.dat")
+    replacement = _make_cacheable_file(tmp_path, name="bound-replacement.dat")
+    replacement.write_bytes(b"B" * file_path.stat().st_size)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY: _expected_primary_stat(file_path),
+    }
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    original_probe = cache_manager.get_cached_result_with_identity
+    replaced = False
+    observed_cache_enabled: list[bool] = []
+
+    def replace_after_probe(*args: Any, **kwargs: Any) -> Any:
+        nonlocal replaced
+        result = original_probe(*args, **kwargs)
+        if not replaced:
+            os.replace(replacement, file_path)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", replace_after_probe)
+
+    @cached_scan(expected_file_stat_key=EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY)
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        assert config is not None
+        observed_cache_enabled.append(config["cache_enabled"])
+        return {"prefix": Path(path).read_bytes()[:1].decode()}
+
+    result = scan(str(file_path), config)
+
+    assert replaced is True
+    assert result == {"prefix": "B"}
+    assert observed_cache_enabled == [False]
+    assert cache_manager.get_stats()["total_entries"] == 0
+
+
+def test_identity_bound_cached_scan_probe_error_fallback_is_uncached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="bound-probe-error.dat")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY: _expected_primary_stat(file_path),
+    }
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    observed_cache_enabled: list[bool] = []
+
+    def fail_probe(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("identity probe unavailable")
+
+    monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", fail_probe)
+
+    @cached_scan(expected_file_stat_key=EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY)
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        assert config is not None
+        observed_cache_enabled.append(config["cache_enabled"])
+        return {"size": Path(path).stat().st_size}
+
+    result = scan(str(file_path), config)
+
+    assert result == {"size": 2048}
+    assert observed_cache_enabled == [False]
+    assert cache_manager.get_stats()["total_entries"] == 0
 
 
 def test_cached_scan_restores_private_metadata_for_internal_scan_results(tmp_path: Path) -> None:

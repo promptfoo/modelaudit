@@ -44,6 +44,62 @@ _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset(
 )
 _PYTORCH_READ_LIMIT_DEFERRAL_EXTENSIONS = frozenset({".bin", ".ckpt", ".pkl", ".pt", ".pth"})
 
+# Private orchestration contract: callers that hash a primary file before
+# dispatch can bind cache lookup/store to that exact file instance.  The
+# decorator consumes this key before config validation or cache versioning.
+EXPECTED_PRIMARY_FILE_STAT_CONFIG_KEY = "_modelaudit_expected_primary_file_stat"
+_MISSING_EXPECTED_FILE_STAT = object()
+_FILE_STAT_IDENTITY_FIELDS = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+
+
+def _without_private_config_key(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    key: str,
+) -> tuple[object, tuple[Any, ...], dict[str, Any]]:
+    """Return a private config value and arguments with that key removed."""
+    extracted_config, _ = _extract_config_and_path(args, kwargs)
+    config = extracted_config or {}
+    if key not in config:
+        return _MISSING_EXPECTED_FILE_STAT, args, kwargs
+
+    value = config[key]
+    clean_config = dict(config)
+    clean_config.pop(key, None)
+    clean_args, clean_kwargs = _with_config(args, kwargs, clean_config)
+    return value, clean_args, clean_kwargs
+
+
+def _with_config(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Return call arguments with a copied function config."""
+    if args and not (hasattr(args[0], "__dict__") and hasattr(args[0], "config")):
+        if len(args) > 1:
+            return (args[0], config, *args[2:]), kwargs
+        return args, {**kwargs, "config": config}
+    return args, {**kwargs, "config": config}
+
+
+def _captured_stat_matches_expected(pre_scan_stat: os.stat_result, expected: object) -> bool:
+    """Return whether cache identity capture saw the caller's expected file instance."""
+    if not isinstance(expected, (tuple, list)) or len(expected) != len(_FILE_STAT_IDENTITY_FIELDS):
+        return False
+    return all(
+        getattr(pre_scan_stat, field) == value
+        for field, value in zip(_FILE_STAT_IDENTITY_FIELDS, expected, strict=True)
+    )
+
+
+def _current_stat_matches_expected(file_path: str, expected: object) -> bool:
+    """Recheck the path after a cache probe before accepting its result or identity."""
+    try:
+        return _captured_stat_matches_expected(os.stat(file_path), expected)
+    except OSError:
+        return False
+
 
 def _is_read_failure_aware_scanner_path(file_path: str) -> bool:
     try:
@@ -393,7 +449,12 @@ def should_bypass_cache_for_max_file_size(file_path: str, config: dict[str, Any]
     return not should_use_advanced_handler(file_path)
 
 
-def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "cache_dir") -> Callable[[F], F]:
+def cached_scan(
+    cache_enabled_key: str = "cache_enabled",
+    cache_dir_key: str = "cache_dir",
+    *,
+    expected_file_stat_key: str | None = None,
+) -> Callable[[F], F]:
     """
     Cache decorator for scan functions that take (path, config) arguments.
 
@@ -403,6 +464,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
     Args:
         cache_enabled_key: Config key to check if caching is enabled (default: "cache_enabled")
         cache_dir_key: Config key for cache directory (default: "cache_dir")
+        expected_file_stat_key: Private config key containing a pre-dispatch file-stat identity.
+            This binding applies to function-form scans with an explicit config argument.
 
     Returns:
         Decorated function with caching support
@@ -423,18 +486,36 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            expected_file_stat: object = _MISSING_EXPECTED_FILE_STAT
+            if expected_file_stat_key is not None:
+                expected_file_stat, args, kwargs = _without_private_config_key(
+                    args,
+                    kwargs,
+                    expected_file_stat_key,
+                )
+            has_expected_file_stat = expected_file_stat is not _MISSING_EXPECTED_FILE_STAT
+
+            def invoke_func() -> Any:
+                """Run bound scan bodies uncached; only this outer decorator may store."""
+                if not has_expected_file_stat:
+                    return func(*args, **kwargs)
+                raw_config, _ = _extract_config_and_path(args, kwargs)
+                uncached_config = {**(raw_config or {}), cache_enabled_key: False}
+                uncached_args, uncached_kwargs = _with_config(args, kwargs, uncached_config)
+                return func(*uncached_args, **uncached_kwargs)
+
             # Use optimized configuration extraction
             cache_config, file_path = config_extractor.extract_fast(args, kwargs)
 
             # Fast path for disabled caching or no config
             if not cache_config or not cache_config.enabled:
                 logger.debug(f"Cache disabled for {file_path}, calling function directly")
-                return func(*args, **kwargs)
+                return invoke_func()
 
             # If no file path, can't cache - call directly
             if not file_path:
                 logger.debug("No file path found, calling function directly")
-                return func(*args, **kwargs)
+                return invoke_func()
 
             # Check if file should be cached based on characteristics
             try:
@@ -443,55 +524,55 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if not os.access(file_path, os.R_OK):
                     logger.debug(f"Bypassing cache for unreadable file: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
                 if should_bypass_cache_for_read_failure_aware_file(file_path):
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
                 if should_bypass_cache_for_sharded_model(file_path):
                     logger.debug(f"Bypassing cache for sharded model family: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
                 if should_bypass_cache_for_openvino_sidecar(file_path):
                     logger.debug(f"Bypassing cache for OpenVINO sidecar-dependent scan: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
                 raw_config, _ = _extract_config_and_path(args, kwargs)
                 if should_bypass_cache_for_zip_entry_preflight(file_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded ZIP entry preflight: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
                 if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
                     logger.debug(f"Bypassing cache because HDF5 analysis is unavailable: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
                 if should_bypass_cache_for_file_backed_hdf5(file_path):
                     logger.debug(f"Bypassing cache for file-backed HDF5 inspection: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
                 if should_defer_hash_for_file_backed_onnx(file_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for file-backed ONNX inspection: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
                     logger.debug(f"File {file_path} not suitable for caching, calling function directly")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
                 if should_bypass_cache_for_safetensors_header_limit(file_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded SafeTensors header failure: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
                 if should_bypass_cache_for_max_file_size(file_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for max_file_size rejection: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
                 if should_defer_hash_for_pytorch_read_limit(file_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for bounded PyTorch read-limit scan: {file_path}")
-                    return func(*args, **kwargs)
+                    return invoke_func()
 
             except OSError:
                 # File doesn't exist or can't be accessed, call function directly
                 logger.debug(f"Cannot access {file_path}, calling function directly")
-                return func(*args, **kwargs)
+                return invoke_func()
 
             # Use cache manager for cache-enabled operations
             try:
@@ -500,14 +581,14 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
                 if cache_manager.cache is None:
-                    return func(*args, **kwargs)
+                    return invoke_func()
                 version_context = add_optional_dependency_availability_to_version_context(
                     cache_config.get_version_context()
                 )
 
                 def cached_func_wrapper(fpath: str) -> Any:
                     """Wrapper function for cache manager"""
-                    result = func(*args, **kwargs)
+                    result = invoke_func()
                     if _known_uncacheable_scan_result(result):
                         return result
 
@@ -536,6 +617,17 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                         include_private_metadata=True,
                     )
 
+                    if expected_file_stat is not _MISSING_EXPECTED_FILE_STAT and (
+                        pre_scan_identity is None
+                        or not _captured_stat_matches_expected(pre_scan_identity[0], expected_file_stat)
+                        or not _current_stat_matches_expected(file_path, expected_file_stat)
+                    ):
+                        logger.debug(
+                            "Bypassing cache for %s: pre-dispatch primary identity changed",
+                            file_path,
+                        )
+                        return invoke_func()
+
                     if cached_result is not None:
                         logger.debug(f"Cache hit for {os.path.basename(file_path)}")
                         result_dict = cached_result
@@ -544,7 +636,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                         logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
                         if pre_scan_identity is None:
                             logger.debug(f"Bypassing cache store for {file_path}: stable identity unavailable")
-                            return func(*args, **kwargs)
+                            return invoke_func()
                         pre_scan_stat, pre_scan_hash, pre_scan_change_token, pre_scan_ancestor_identity = (
                             pre_scan_identity
                         )
@@ -588,7 +680,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
             except Exception as e:
                 logger.warning(f"Cache system error for {file_path}: {e}. Falling back to direct execution.")
-                return func(*args, **kwargs)
+                return invoke_func()
 
         return wrapper  # type: ignore[return-value]
 

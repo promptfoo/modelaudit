@@ -24,6 +24,7 @@ _CACHE_ONLY_CONFIG_KEYS = frozenset(
 _RUNTIME_ONLY_CONFIG_KEYS = frozenset(
     {
         "_archive_nested_scan_callback",
+        "_modelaudit_expected_primary_file_stat",
         "enable_progress",
         "format",
         "output",
