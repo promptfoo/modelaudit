@@ -6564,7 +6564,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 if _has_supported_tar_compression_wrapper(Path(path))
                 else classify_raw_tar_prefix_ownership(path, hdf5_signature_offset, config=config)
             )
-            if hdf5_tar_prefix_ownership in {"incomplete", "inconclusive"}:
+            if hdf5_tar_prefix_ownership in {"scan_limit", "incomplete", "inconclusive"}:
                 config = dict(config)
                 config["cache_enabled"] = False
     except ZipPreflightRejected as exc:
@@ -6621,7 +6621,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         and scanner_id
         and (
             scanner_id == trusted_flax_overlap_scanner_id
-            or (scanner_id == "keras_h5" and hdf5_tar_prefix_ownership in {"incomplete", "inconclusive"})
+            or (scanner_id == "keras_h5" and hdf5_tar_prefix_ownership in {"scan_limit", "incomplete", "inconclusive"})
             or _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path, config)
         )
     ):
@@ -6978,7 +6978,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
             assert hdf5_signature_offset is not None
             assert hdf5_tar_prefix_ownership is not None
-            if hdf5_tar_prefix_ownership == "complete":
+            if hdf5_tar_prefix_ownership in {"complete", "scan_limit"}:
                 supplemental_config = dict(config)
                 supplemental_config[TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY] = hdf5_signature_offset
             elif hdf5_tar_prefix_ownership != "embedded_member":

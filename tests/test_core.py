@@ -9091,6 +9091,62 @@ def test_scan_file_bounds_compressed_nemo_tar_inside_valid_hdf5_userblock(
     assert "tar_analysis_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
 
 
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "expected_reason"),
+    [
+        ("max_total_size", 64, "tar_total_size_limit_exceeded"),
+        ("max_tar_total_uncompressed_size", 64, "tar_total_size_limit_exceeded"),
+        ("max_tar_entries", 1, "tar_entry_count_limit_exceeded"),
+    ],
+)
+def test_compressed_tar_hdf5_ownership_limits_preserve_early_nemo_findings(
+    tmp_path: Path,
+    limit_name: str,
+    limit_value: int,
+    expected_reason: str,
+) -> None:
+    model_path = tmp_path / f"compressed-nemo-{limit_name}.h5"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [
+            ("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n"),
+            ("weights.bin", b"A" * (128 * 1024)),
+        ],
+        compressed=True,
+    )
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(tmp_path / "cache"),
+        "min_cache_file_size": 0,
+        limit_name: limit_value,
+    }
+
+    from modelaudit.scanners.tar_scanner import classify_compressed_tar_prefix_ownership
+
+    assert classify_compressed_tar_prefix_ownership(str(model_path), userblock_size, config=config) == "scan_limit"
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(model_path), config=config)
+        repeated_result = scan_file(str(model_path), config=config)
+        cache_entries = get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"]
+    finally:
+        reset_cache_manager()
+
+    for file_result in (result, repeated_result):
+        assert file_result.scanner_name == "keras_h5"
+        assert "nemo" in file_result.metadata["supplemental_scanners"]
+        assert expected_reason in file_result.metadata["scan_outcome_reasons"]
+        assert "hdf5_tar_prefix_ownership_incomplete" not in file_result.metadata.get("scan_outcome_reasons", [])
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == "os.system"
+            for check in file_result.checks
+        )
+    assert cache_entries == 0
+
+
 @pytest.mark.parametrize("high_ratio", [False, True], ids=["within-limit", "ratio-bomb"])
 def test_hdf5_userblock_padding_does_not_inflate_compressed_tar_ratio_denominator(
     tmp_path: Path,

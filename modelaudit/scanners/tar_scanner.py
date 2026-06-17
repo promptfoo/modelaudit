@@ -71,7 +71,16 @@ TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON = "tar_compressed_trailing_data"
 TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON = "tar_compressed_padding_limit_exceeded"
 TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON = "tar_decompressed_size_limit_exceeded"
 TAR_DECOMPRESSION_RATIO_LIMIT_INCOMPLETE_REASON = "tar_decompression_ratio_limit_exceeded"
-TarPrefixOwnership = Literal["complete", "embedded_member", "incomplete", "inconclusive"]
+TarPrefixOwnership = Literal["complete", "embedded_member", "scan_limit", "incomplete", "inconclusive"]
+_TAR_OWNERSHIP_SCAN_LIMIT_REASONS = frozenset(
+    {
+        TAR_TOTAL_SIZE_INCOMPLETE_REASON,
+        TAR_ENTRY_COUNT_INCOMPLETE_REASON,
+        TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON,
+        TAR_DECOMPRESSION_RATIO_LIMIT_INCOMPLETE_REASON,
+        "tar_metadata_read_limit_exceeded",
+    }
+)
 TAR_SPARSE_PAX_SIZE_FIELDS = frozenset({"GNU.sparse.size", "GNU.sparse.realsize"})
 _POST_TAR_EOF_CONTINUABLE_INCOMPLETE_REASONS = frozenset(
     {
@@ -2518,10 +2527,9 @@ def classify_compressed_tar_prefix_ownership(
     result = ScanResult(scanner_name="tar")
     try:
         with open(path, "rb") as raw_file:
-            return (
-                "complete"
-                if scanner._preflight_tar_archive(path, result, retain_member_budget=False, raw_file=raw_file)
-                else "incomplete"
-            )
+            if scanner._preflight_tar_archive(path, result, retain_member_budget=False, raw_file=raw_file):
+                return "complete"
+            reasons = set(result.metadata.get("scan_outcome_reasons", []))
+            return "scan_limit" if reasons & _TAR_OWNERSHIP_SCAN_LIMIT_REASONS else "incomplete"
     except (EOFError, OSError, tarfile.TarError, ValueError):
         return "inconclusive"
