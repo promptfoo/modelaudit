@@ -8452,7 +8452,19 @@ class TestCVE202523304HydraTarget:
         finally:
             reset_cache_manager()
 
-    @pytest.mark.parametrize("mutation", ["truncate", "unlink"])
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "truncate",
+            pytest.param(
+                "unlink",
+                marks=pytest.mark.skipif(
+                    sys.platform == "win32",
+                    reason="Windows prevents unlinking an open source file",
+                ),
+            ),
+        ],
+    )
     def test_content_routed_nemo_tar_followup_preserves_findings_after_source_mutation(
         self,
         tmp_path: Path,

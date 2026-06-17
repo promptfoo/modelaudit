@@ -2733,6 +2733,10 @@ class TestTarScanner:
         assert "r:" in opened_modes
         assert "r|" not in opened_modes
 
+    @pytest.mark.skipif(
+        not hasattr(os, "SEEK_DATA") or not hasattr(os, "SEEK_HOLE"),
+        reason="allocated-range traversal is unavailable",
+    )
     def test_raw_tar_end_marker_stops_when_seek_data_reaches_tail_end(
         self,
         tmp_path: Path,
