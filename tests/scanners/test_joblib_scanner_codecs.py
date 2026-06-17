@@ -979,6 +979,47 @@ def test_validated_joblib_wrapper_cleanup_clears_private_actionable_failed_check
     assert result.metadata["pickle_verdict"] == "clean"
 
 
+def test_validated_joblib_wrapper_cleanup_preserves_bounded_string_analysis_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+        lambda _module, _name: True,
+    )
+    result = ScanResult("joblib")
+    result.metadata["analysis_incomplete"] = True
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    result.metadata["scan_outcome_message"] = "Scan analysis incomplete."
+    result.metadata["scan_outcome_reasons"] = ["base64_text_alignment_ambiguous"]
+    result.metadata["pickle_report_status"] = "inconclusive"
+    result.metadata["pickle_verdict"] = "unknown"
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="validated wrapper",
+        severity=IssueSeverity.WARNING,
+        details={
+            "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
+            "module": "joblib.numpy_pickle",
+            "name": "NumpyArrayWrapper",
+            "position": 10,
+        },
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+
+    JoblibScanner._remove_validated_numpy_array_wrapper_findings(
+        result,
+        {"joblib.numpy_pickle.NumpyArrayWrapper": frozenset({1})},
+    )
+
+    assert result.issues == []
+    assert result.checks == []
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["base64_text_alignment_ambiguous"]
+    assert result.metadata["pickle_report_status"] == "inconclusive"
+    assert result.metadata["pickle_verdict"] == "unknown"
+
+
 def test_validated_dtype_codec_cleanup_filters_private_actionable_failed_checks() -> None:
     benign_result = ScanResult("joblib")
     benign_result.add_check(

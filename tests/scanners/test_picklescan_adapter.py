@@ -1370,6 +1370,42 @@ def test_pickle_report_to_scan_result_fails_closed_for_nested_incomplete_notice(
     assert notice_check.message == "Nested pickle analysis did not complete"
 
 
+@pytest.mark.parametrize(
+    "notice_code",
+    [
+        "url_scan_limit_exceeded",
+        "url_context_proof_incomplete",
+        "base64_text_scan_limit_exceeded",
+        "base64_text_work_limit_exceeded",
+        "base64_text_alignment_ambiguous",
+    ],
+)
+def test_pickle_report_to_scan_result_fails_closed_for_bounded_string_notice(notice_code: str) -> None:
+    report = PickleReport(
+        source="bounded-string.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Bounded string analysis did not complete",
+                severity=Severity.INFO,
+                location="bounded-string.pkl (pos 4)",
+                code=notice_code,
+                details={"analysis_incomplete": True},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [notice_code]
+    notice_check = next(check for check in result.checks if check.details.get("pickle_notice_code") == notice_code)
+    assert notice_check.status.value == "failed"
+    assert notice_check.rule_code == "S902"
+
+
 def test_pickle_report_to_scan_result_keeps_parse_incomplete_notices_inconclusive() -> None:
     report = PickleReport(
         source="truncated.pkl",
