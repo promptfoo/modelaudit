@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import builtins
+import bz2
 import errno
 import gzip
 import importlib
 import io
 import json
+import lzma
 import os
 import pickle
 import stat
@@ -2643,6 +2645,31 @@ def _write_tar_hdf5_userblock(
     assert tar_payload.tell() <= userblock_size
     with path.open("r+b") as handle:
         handle.write(tar_payload.getvalue())
+    return userblock_size
+
+
+def _write_compressed_hdf5_userblock(
+    path: Path,
+    payload: bytes,
+    *,
+    codec: str,
+    userblock_size: int = 1024 * 1024,
+) -> int:
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(path, "w", userblock_size=userblock_size) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]}},
+        )
+    compressors: dict[str, Callable[[bytes], bytes]] = {
+        "gzip": lambda data: gzip.compress(data, mtime=0),
+        "bzip2": bz2.compress,
+        "xz": lzma.compress,
+        "zlib": zlib.compress,
+    }
+    compressed_payload = compressors[codec](payload)
+    assert len(compressed_payload) < userblock_size
+    with path.open("r+b") as handle:
+        handle.write(compressed_payload)
     return userblock_size
 
 
@@ -8904,6 +8931,79 @@ def test_scan_file_preserves_keras_finding_for_inconclusive_tar_inside_valid_hdf
     assert determine_exit_code(aggregate_result) == 1
 
 
+@pytest.mark.parametrize("codec", ["gzip", "bzip2", "xz", "zlib"])
+@pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
+def test_scan_file_bounds_standalone_compressed_payload_inside_valid_hdf5_userblock(
+    tmp_path: Path,
+    codec: str,
+    malicious: bool,
+) -> None:
+    model_path = tmp_path / f"{codec}-userblock-{'malicious' if malicious else 'benign'}.h5"
+    pickle_payload = _build_malicious_pickle(protocol=0) if malicious else pickle.dumps({"weights": [1]}, protocol=0)
+    userblock_size = _write_compressed_hdf5_userblock(model_path, pickle_payload, codec=codec)
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == codec
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    pickle_checks = [
+        check for check in result.checks if check.rule_code == "S201" and check.status == CheckStatus.FAILED
+    ]
+    assert result.scanner_name == "keras_h5"
+    assert "compressed" in result.metadata["supplemental_scanners"]
+    assert bool(pickle_checks) is malicious
+    assert "hdf5_tar_prefix_ownership_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "compressed_stream_decode_failed" not in result.metadata.get("scan_outcome_reasons", [])
+    assert result.metadata["file_size"] == model_path.stat().st_size
+    assert result.bytes_scanned <= model_path.stat().st_size
+
+
+def test_scan_file_fails_closed_for_nonzero_trailer_after_compressed_hdf5_userblock_payload(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "gzip-nonzero-trailer-userblock.h5"
+    payload = pickle.dumps({"weights": [1]}, protocol=0)
+    userblock_size = _write_compressed_hdf5_userblock(model_path, payload, codec="gzip")
+    compressed_size = len(gzip.compress(payload, mtime=0))
+    with model_path.open("r+b") as handle:
+        handle.seek(compressed_size + 64)
+        handle.write(b"unowned")
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert "compressed" in result.metadata["supplemental_scanners"]
+    assert result.success is False
+    assert "compressed_stream_decode_failed" in result.metadata["scan_outcome_reasons"]
+
+
+def test_hdf5_userblock_padding_does_not_inflate_standalone_compressed_ratio_denominator(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "gzip-ratio-bomb-userblock.h5"
+    userblock_size = _write_compressed_hdf5_userblock(
+        model_path,
+        b"A" * (2 * 1024 * 1024),
+        codec="gzip",
+    )
+
+    result = scan_file(
+        str(model_path),
+        config={
+            "cache_enabled": False,
+            "compressed_max_decompressed_bytes": 4 * 1024 * 1024,
+            "compressed_max_decompression_ratio": 20.0,
+        },
+    )
+
+    assert userblock_size == 1024 * 1024
+    assert result.scanner_name == "keras_h5"
+    assert result.success is False
+    assert "compressed_decompression_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+
 @pytest.mark.parametrize("target", ["torch.nn.Linear", "os.system"], ids=["benign", "malicious"])
 def test_scan_file_bounds_complete_raw_nemo_tar_inside_valid_hdf5_userblock(
     tmp_path: Path,
@@ -9180,8 +9280,8 @@ def test_scan_file_fails_closed_when_hdf5_signature_is_inside_gzip_extra_field(t
 
     metadata = aggregate.file_metadata[str(model_path)]
     assert aggregate.success is False
-    assert "hdf5_tar_prefix_ownership_incomplete" in metadata["scan_outcome_reasons"]
-    assert "compressed" not in metadata.get("supplemental_scanners", [])
+    assert "compressed_stream_decode_failed" in metadata["scan_outcome_reasons"]
+    assert "compressed" in metadata.get("supplemental_scanners", [])
     assert not any(check.rule_code == "S201" for check in aggregate.checks)
     assert cache_entries == 0
     assert determine_exit_code(aggregate) == 2

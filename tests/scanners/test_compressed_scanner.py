@@ -805,6 +805,28 @@ def test_read_lz4_stream_falls_back_to_chunk_api_when_decompressor_class_missing
     assert [length for context in fake_lz4_frame.contexts for length in context.max_lengths] == [8]
 
 
+@pytest.mark.parametrize("use_chunk_api", [False, True], ids=["frame-api", "chunk-api"])
+def test_read_lz4_stream_accepts_bounded_zero_padding(use_chunk_api: bool) -> None:
+    fake_lz4_frame = (
+        _FakeLz4ChunkModule({b"S": b"payload"}) if use_chunk_api else _FakeLz4FrameModule({b"S": b"payload"})
+    )
+    destination = io.BytesIO()
+
+    total_out = CompressedScanner._read_lz4_stream_with_limits(
+        source=io.BytesIO(_LZ4_FRAME_MAGIC + b"S" + bytes(128)),
+        destination=destination,
+        lz4_frame=fake_lz4_frame,
+        max_decompressed_bytes=1024,
+        max_ratio=1000.0,
+        compressed_size=16,
+        chunk_size=16,
+        allow_zero_padding_trailing=True,
+    )
+
+    assert total_out == len(b"payload")
+    assert destination.getvalue() == b"payload"
+
+
 def test_read_zlib_stream_allows_exact_limit_real_stream() -> None:
     payload = b"A" * 1024
     compressed = zlib.compress(payload)
