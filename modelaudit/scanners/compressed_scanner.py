@@ -750,7 +750,6 @@ class CompressedScanner(BaseScanner):
                         source,
                         chunk_size,
                     ):
-                        pending = b""
                         break
                     if on_new_member is not None:
                         on_new_member()
@@ -787,7 +786,6 @@ class CompressedScanner(BaseScanner):
                         source,
                         chunk_size,
                     ):
-                        pending = b""
                         break
                     if on_new_member is not None:
                         on_new_member()
