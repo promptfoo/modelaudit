@@ -69,7 +69,7 @@ TAR_SPECIAL_MEMBER_INCOMPLETE_REASON = "tar_special_member_unsupported"
 TAR_SPARSE_MEMBER_INCOMPLETE_REASON = "tar_sparse_member_unsupported"
 TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON = "tar_compressed_trailing_data"
 TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON = "tar_compressed_padding_limit_exceeded"
-TarPrefixOwnership = Literal["complete", "not_complete", "inconclusive"]
+TarPrefixOwnership = Literal["complete", "embedded_member", "incomplete", "inconclusive"]
 TAR_SPARSE_PAX_SIZE_FIELDS = frozenset({"GNU.sparse.size", "GNU.sparse.realsize"})
 _POST_TAR_EOF_CONTINUABLE_INCOMPLETE_REASONS = frozenset(
     {
@@ -150,6 +150,11 @@ class _TarBoundedStream:
         self.max_bytes = max_bytes
         self.max_read_size = max_read_size
         self.bytes_read = 0
+
+    @property
+    def zero_output_compressed_bytes(self) -> int:
+        value = getattr(self._fileobj, "zero_output_stream_bytes", 0)
+        return value if isinstance(value, int) and value > 0 else 0
 
     def read(self, size: int = -1) -> bytes:
         if size is None or size < 0:
@@ -232,6 +237,9 @@ class _StrictConcatenatedDecompressionReader:
         self._decompressor = self._new_decompressor()
         self._completed_streams = 0
         self._eof = False
+        self._current_stream_input_bytes = 0
+        self._current_stream_output_bytes = 0
+        self.zero_output_stream_bytes = 0
 
     def _new_decompressor(self) -> Any:
         if self._compression_codec == "gzip":
@@ -281,7 +289,9 @@ class _StrictConcatenatedDecompressionReader:
 
     def _decompress(self, block: bytes, max_length: int) -> bytes:
         try:
-            return cast(bytes, self._decompressor.decompress(block, max_length))
+            output = cast(bytes, self._decompressor.decompress(block, max_length))
+            self._current_stream_output_bytes += len(output)
+            return output
         except (OSError, lzma.LZMAError, zlib.error) as exc:
             if self._completed_streams > 0:
                 raise _TarCompressedPhysicalTrailingData(
@@ -298,12 +308,19 @@ class _StrictConcatenatedDecompressionReader:
         output = bytearray()
         while len(output) < size and not self._eof:
             if self._decompressor.eof:
+                consumed_stream_bytes = self._current_stream_input_bytes - len(
+                    cast(bytes, self._decompressor.unused_data)
+                )
+                if self._current_stream_output_bytes == 0:
+                    self.zero_output_stream_bytes += max(consumed_stream_bytes, 0)
                 self._completed_streams += 1
                 block = self._next_stream_input()
                 if block is None:
                     self._eof = True
                     break
                 self._decompressor = self._new_decompressor()
+                self._current_stream_input_bytes = len(block)
+                self._current_stream_output_bytes = 0
             elif getattr(self._decompressor, "needs_input", not getattr(self._decompressor, "unconsumed_tail", b"")):
                 block = self._fileobj.read(self._RAW_READ_SIZE)
                 if not block:
@@ -312,6 +329,7 @@ class _StrictConcatenatedDecompressionReader:
                             "Compressed wrapper contains truncated physical trailing data"
                         )
                     raise EOFError("Compressed file ended before the end-of-stream marker")
+                self._current_stream_input_bytes += len(block)
             else:
                 block = cast(bytes, self._decompressor.unconsumed_tail) if self._compression_codec == "gzip" else b""
 
@@ -1130,7 +1148,11 @@ class TarScanner(BaseScanner):
                     data_offset = os.lseek(file_obj.fileno(), offset, os.SEEK_DATA)
                 except OSError as exc:
                     return exc.errno == errno.ENXIO
+                if data_offset >= tail_end:
+                    return True
                 hole_offset = min(os.lseek(file_obj.fileno(), data_offset, os.SEEK_HOLE), tail_end)
+                if hole_offset <= offset:
+                    return False
                 checked_bytes += hole_offset - data_offset
                 if checked_bytes > self.max_xz_padding_bytes:
                     return False
@@ -1266,6 +1288,11 @@ class TarScanner(BaseScanner):
     def _project_compressed_stream_size(self, bounded_stream: _TarBoundedStream, member: tarfile.TarInfo) -> int:
         return self._finalize_tar_stream_size(bounded_stream.bytes_read + _tar_padded_size(member.size))
 
+    @staticmethod
+    def _payload_compressed_size(bounded_stream: _TarBoundedStream, compressed_size: int) -> int:
+        """Exclude completed zero-output streams from the decompression-ratio denominator."""
+        return max(compressed_size - bounded_stream.zero_output_compressed_bytes, 1)
+
     def _record_projected_compressed_member_limit(
         self,
         result: ScanResult,
@@ -1284,7 +1311,7 @@ class TarScanner(BaseScanner):
             result,
             path,
             stream_size=projected_stream_size,
-            compressed_size=compressed_size,
+            compressed_size=self._payload_compressed_size(bounded_stream, compressed_size),
             compression_codec=compression_codec,
         )
 
@@ -1398,7 +1425,8 @@ class TarScanner(BaseScanner):
         cast(Any, tar.fileobj).bufsize = read_size
         try:
             while True:
-                ratio_remaining = (compressed_size * self.max_decompression_ratio) - bounded_stream.bytes_read
+                payload_compressed_size = self._payload_compressed_size(bounded_stream, compressed_size)
+                ratio_remaining = (payload_compressed_size * self.max_decompression_ratio) - bounded_stream.bytes_read
                 tail_read_size = read_size
                 if ratio_remaining < read_size:
                     tail_read_size = max(int(ratio_remaining) + 1, 1)
@@ -1410,7 +1438,7 @@ class TarScanner(BaseScanner):
                     result,
                     path,
                     stream_size=bounded_stream.bytes_read,
-                    compressed_size=compressed_size,
+                    compressed_size=self._payload_compressed_size(bounded_stream, compressed_size),
                     compression_codec=compression_codec,
                 ):
                     return False
@@ -1544,7 +1572,7 @@ class TarScanner(BaseScanner):
                             result,
                             path,
                             stream_size=estimated_stream_size,
-                            compressed_size=compressed_size,
+                            compressed_size=self._payload_compressed_size(bounded_stream, compressed_size),
                             compression_codec=compression_codec,
                         ):
                             return False
@@ -1567,13 +1595,13 @@ class TarScanner(BaseScanner):
                 archive_uncompressed_size=archive_uncompressed_size,
             )
 
-            if compression_codec is not None:
+            if compression_codec is not None and bounded_stream is not None:
                 final_stream_size = consumed_size
                 if self._record_compressed_stream_limit(
                     result,
                     path=path,
                     stream_size=final_stream_size,
-                    compressed_size=compressed_size,
+                    compressed_size=self._payload_compressed_size(bounded_stream, compressed_size),
                     compression_codec=compression_codec,
                     emit_pass=True,
                 ):
@@ -2377,7 +2405,7 @@ class TarScanner(BaseScanner):
                 result,
                 path,
                 stream_size=final_stream_size,
-                compressed_size=compressed_size,
+                compressed_size=self._payload_compressed_size(bounded_stream, compressed_size),
                 compression_codec=compression_codec,
                 emit_pass=True,
             ):
@@ -2401,7 +2429,7 @@ def classify_raw_tar_prefix_ownership(
 ) -> TarPrefixOwnership:
     """Classify whether a bounded raw source prefix owns a complete TAR archive."""
     if boundary < 2 * tarfile.BLOCKSIZE or boundary % tarfile.BLOCKSIZE:
-        return "not_complete"
+        return "incomplete"
 
     scanner_config = dict(config or {})
     scanner_config[TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY] = boundary
@@ -2416,12 +2444,12 @@ def classify_raw_tar_prefix_ownership(
             ),
         ):
             if compression_codec is not None or bounded_stream is not None:
-                return "not_complete"
+                return "incomplete"
             entry_count = 0
             while True:
                 member = archive.next()
                 if member is None:
-                    return "complete" if scanner._raw_tar_has_complete_end_marker(archive) else "not_complete"
+                    return "complete" if scanner._raw_tar_has_complete_end_marker(archive) else "incomplete"
                 entry_count += 1
                 if entry_count > scanner.max_entries:
                     return "inconclusive"
@@ -2430,6 +2458,6 @@ def classify_raw_tar_prefix_ownership(
                     + ((max(member.size, 0) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
                 )
                 if padded_member_end > boundary:
-                    return "not_complete"
+                    return "embedded_member"
     except (EOFError, OSError, tarfile.TarError, ValueError):
         return "inconclusive"

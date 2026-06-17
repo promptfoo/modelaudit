@@ -2627,9 +2627,9 @@ def _write_tar_hdf5_userblock(
     members: list[tuple[str, bytes]],
     *,
     compressed: bool = False,
+    userblock_size: int = 1024 * 1024,
 ) -> int:
     h5py = pytest.importorskip("h5py")
-    userblock_size = 1024 * 1024
     with h5py.File(path, "w", userblock_size=userblock_size) as h5_file:
         h5_file.attrs["model_config"] = json.dumps(
             {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]}},
@@ -9018,6 +9018,62 @@ def test_hdf5_userblock_padding_does_not_inflate_compressed_tar_ratio_denominato
     assert (final_check.details["actual_ratio"] > 20.0) is high_ratio
 
 
+def test_empty_concatenated_gzip_members_do_not_inflate_hdf5_tar_ratio_denominator(tmp_path: Path) -> None:
+    from modelaudit.scanners.tar_scanner import TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY, TarScanner
+
+    model_path = tmp_path / "empty-prefix-members-ratio-bomb.tar.gz"
+    raw_tar = io.BytesIO()
+    with tarfile.open(fileobj=raw_tar, mode="w") as archive:
+        payload = b"A" * (12 * 1024 * 1024)
+        info = tarfile.TarInfo("weights.bin")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    empty_gzip = bytearray(gzip.compress(b"", mtime=0))
+    empty_gzip[3] |= 0x04
+    empty_with_extra = bytes(empty_gzip[:10]) + struct.pack("<H", 65_535) + (b"X" * 65_535) + bytes(empty_gzip[10:])
+    wrapper = (empty_with_extra * 10) + gzip.compress(raw_tar.getvalue(), mtime=0)
+    userblock_size = _write_tar_hdf5_userblock(model_path, [("placeholder", b"safe")], compressed=True)
+    assert len(wrapper) < userblock_size
+    with model_path.open("r+b") as handle:
+        handle.write(wrapper)
+
+    result = TarScanner(
+        config={
+            "cache_enabled": False,
+            "compressed_max_decompressed_bytes": 64 * 1024 * 1024,
+            "compressed_max_decompression_ratio": 20.0,
+            "max_tar_total_uncompressed_size": 64 * 1024 * 1024,
+            TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY: userblock_size,
+        },
+    ).scan(str(model_path))
+
+    failed_ratio_checks = [
+        check
+        for check in result.checks
+        if check.name == "Compressed Wrapper Decompression Limits" and check.status == CheckStatus.FAILED
+    ]
+    assert failed_ratio_checks
+    assert failed_ratio_checks[-1].details["actual_ratio"] > 20.0
+    assert failed_ratio_checks[-1].details["compressed_size"] < 100_000
+
+
+def test_sparse_large_raw_tar_hdf5_userblock_terminates_at_owner_boundary(tmp_path: Path) -> None:
+    model_path = tmp_path / "sparse-large-raw-tar-userblock.tar"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [("payload.pkl", pickle.dumps({"weights": [1]}, protocol=0))],
+        userblock_size=32 * 1024 * 1024,
+    )
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert result.scanner_name == "keras_h5"
+    assert "tar" in result.metadata["supplemental_scanners"]
+    assert "hdf5_tar_prefix_ownership_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
 def test_scan_file_fails_closed_when_raw_hdf5_tar_prefix_ownership_is_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9039,6 +9095,44 @@ def test_scan_file_fails_closed_when_raw_hdf5_tar_prefix_ownership_is_inconclusi
     assert result.success is False
     assert "hdf5_tar_prefix_ownership_incomplete" in result.metadata["scan_outcome_reasons"]
     assert any(check.name == "HDF5 User-Block TAR Ownership" for check in result.checks)
+
+
+def test_scan_file_fails_closed_without_cache_for_incomplete_raw_tar_hdf5_userblock(tmp_path: Path) -> None:
+    model_path = tmp_path / "incomplete-raw-tar-userblock.tar"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [("payload.pkl", pickle.dumps({"weights": [1]}, protocol=0))],
+    )
+    with model_path.open("r+b") as handle:
+        handle.seek(8 * tarfile.BLOCKSIZE)
+        handle.write(b"nonzero bytes after the raw TAR end marker")
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == "tar"
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+    finally:
+        reset_cache_manager()
+
+    metadata = aggregate.file_metadata[str(model_path)]
+    assert aggregate.success is False
+    assert "hdf5_tar_prefix_ownership_incomplete" in metadata["scan_outcome_reasons"]
+    assert "tar" not in metadata.get("supplemental_scanners", [])
+    assert any(
+        check.name == "HDF5 User-Block TAR Ownership" and check.details["ownership_state"] == "incomplete"
+        for check in aggregate.checks
+    )
+    assert cache_entries == 0
+    assert determine_exit_code(aggregate) == 2
 
 
 @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])

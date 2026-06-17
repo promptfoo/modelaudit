@@ -2733,6 +2733,35 @@ class TestTarScanner:
         assert "r:" in opened_modes
         assert "r|" not in opened_modes
 
+    def test_raw_tar_end_marker_stops_when_seek_data_reaches_tail_end(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "sparse-tail-end.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = 4
+            archive.addfile(info, io.BytesIO(b"safe"))
+        with archive_path.open("ab") as handle:
+            handle.truncate(32 * 1024 * 1024)
+
+        with archive_path.open("rb") as raw_file, tarfile.open(fileobj=raw_file, mode="r:") as archive:
+            archive.getmembers()
+            tail_end = os.fstat(raw_file.fileno()).st_size
+            seek_data_calls = 0
+
+            def seek_to_tail_end(_fd: int, _offset: int, whence: int) -> int:
+                nonlocal seek_data_calls
+                assert whence == os.SEEK_DATA
+                seek_data_calls += 1
+                return tail_end
+
+            monkeypatch.setattr(os, "lseek", seek_to_tail_end)
+
+            assert TarScanner()._raw_tar_has_complete_end_marker(archive) is True
+            assert seek_data_calls == 1
+
     @pytest.mark.parametrize(
         ("member_type", "expected_kind"),
         [(tarfile.CHRTYPE, "tar_device"), (tarfile.BLKTYPE, "tar_device")],
