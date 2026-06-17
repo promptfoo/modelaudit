@@ -8859,7 +8859,7 @@ def test_scan_file_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_p
     assert cache_entries == 0
 
 
-def test_scan_file_fails_closed_for_inconclusive_compressed_tar_inside_valid_hdf5_userblock(
+def test_scan_file_fails_closed_for_ratio_limited_compressed_tar_inside_valid_hdf5_userblock(
     tmp_path: Path,
 ) -> None:
     model_path = tmp_path / "inconclusive-tar-userblock.h5"
@@ -8873,7 +8873,7 @@ def test_scan_file_fails_closed_for_inconclusive_compressed_tar_inside_valid_hdf
     )
 
     assert find_hdf5_signature_offset(str(model_path)) == userblock_size
-    assert file_detection.detect_file_format(str(model_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert file_detection.detect_file_format(str(model_path)) == "tar"
 
     cache_dir = tmp_path / "cache"
     cache_config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
@@ -8890,17 +8890,19 @@ def test_scan_file_fails_closed_for_inconclusive_compressed_tar_inside_valid_hdf
 
     assert file_result.scanner_name == "keras_h5"
     assert repeated_result.scanner_name == "keras_h5"
-    assert file_result.success is False
-    assert repeated_result.success is False
-    assert cache_entries == 0
-    assert "nemo_routing_incomplete" in file_result.metadata["scan_outcome_reasons"]
+    for current_result in (file_result, repeated_result):
+        assert current_result.success is False
+        assert "tar" in current_result.metadata["supplemental_scanners"]
+        assert "tar_decompression_ratio_limit_exceeded" in current_result.metadata["scan_outcome_reasons"]
+    assert cache_entries == 1
     assert "keras_h5" in result.scanner_names
     assert "unknown" not in result.scanner_names
-    assert "nemo_routing_incomplete" in metadata["scan_outcome_reasons"]
-    assert determine_exit_code(result) == 2
+    assert "tar" in metadata["supplemental_scanners"]
+    assert "tar_decompression_ratio_limit_exceeded" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 1
 
 
-def test_scan_file_preserves_keras_finding_for_inconclusive_tar_inside_valid_hdf5_userblock(
+def test_scan_file_preserves_keras_finding_for_ratio_limited_tar_inside_valid_hdf5_userblock(
     tmp_path: Path,
 ) -> None:
     h5py = pytest.importorskip("h5py")
@@ -8929,7 +8931,7 @@ def test_scan_file_preserves_keras_finding_for_inconclusive_tar_inside_valid_hdf
         )
 
     assert find_hdf5_signature_offset(str(model_path)) == userblock_size
-    assert file_detection.detect_file_format(str(model_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert file_detection.detect_file_format(str(model_path)) == "tar"
 
     cache_dir = tmp_path / "cache"
     cache_config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
@@ -8947,7 +8949,8 @@ def test_scan_file_preserves_keras_finding_for_inconclusive_tar_inside_valid_hdf
     for result in (file_result, repeated_result):
         assert result.scanner_name == "keras_h5"
         assert result.success is False
-        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "tar" in result.metadata["supplemental_scanners"]
+        assert "tar_decompression_ratio_limit_exceeded" in result.metadata["scan_outcome_reasons"]
         assert any(
             check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
         )
@@ -8959,7 +8962,8 @@ def test_scan_file_preserves_keras_finding_for_inconclusive_tar_inside_valid_hdf
     assert cache_entries == 0
     assert "keras_h5" in aggregate_result.scanner_names
     assert "unknown" not in aggregate_result.scanner_names
-    assert "nemo_routing_incomplete" in metadata["scan_outcome_reasons"]
+    assert "tar" in metadata["supplemental_scanners"]
+    assert "tar_decompression_ratio_limit_exceeded" in metadata["scan_outcome_reasons"]
     assert any(
         issue.message == "Lambda layer contains dangerous Python code" and issue.severity == IssueSeverity.CRITICAL
         for issue in aggregate_result.issues
@@ -8999,7 +9003,7 @@ def test_scan_file_fails_closed_for_nonzero_trailer_after_compressed_hdf5_userbl
     tmp_path: Path,
 ) -> None:
     model_path = tmp_path / "gzip-nonzero-trailer-userblock.h5"
-    payload = pickle.dumps({"weights": [1]}, protocol=0)
+    payload = _build_malicious_pickle(protocol=0)
     userblock_size = _write_compressed_hdf5_userblock(model_path, payload, codec="gzip")
     compressed_size = len(gzip.compress(payload, mtime=0))
     with model_path.open("r+b") as handle:
@@ -9007,12 +9011,42 @@ def test_scan_file_fails_closed_for_nonzero_trailer_after_compressed_hdf5_userbl
         handle.write(b"unowned")
 
     assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    from modelaudit.scanners.compressed_scanner import classify_compressed_prefix_ownership
+
+    assert classify_compressed_prefix_ownership(str(model_path), userblock_size) == "incomplete"
     result = scan_file(str(model_path), config={"cache_enabled": False})
 
     assert result.scanner_name == "keras_h5"
     assert "compressed" in result.metadata["supplemental_scanners"]
     assert result.success is False
+    assert "hdf5_compressed_prefix_ownership_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "compressed_stream_decode_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
+def test_hdf5_compressed_prefix_source_limit_preserves_reachable_finding(tmp_path: Path) -> None:
+    model_path = tmp_path / "gzip-source-limit-userblock.h5"
+    userblock_size = _write_compressed_hdf5_userblock(
+        model_path,
+        _build_malicious_pickle(protocol=0),
+        codec="gzip",
+    )
+    config = {
+        "cache_enabled": False,
+        "max_file_read_size": 512,
+    }
+
+    from modelaudit.scanners.compressed_scanner import classify_compressed_prefix_ownership
+
+    assert classify_compressed_prefix_ownership(str(model_path), userblock_size, config=config) == "scan_limit"
+
+    result = scan_file(str(model_path), config=config)
+
+    assert result.scanner_name == "keras_h5"
+    assert "compressed" in result.metadata["supplemental_scanners"]
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert "hdf5_compressed_prefix_ownership_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 def test_hdf5_userblock_padding_does_not_inflate_standalone_compressed_ratio_denominator(
@@ -9452,18 +9486,18 @@ def test_scan_file_fails_closed_when_raw_hdf5_tar_prefix_ownership_is_inconclusi
     assert any(check.name == "HDF5 User-Block TAR Ownership" for check in result.checks)
 
 
-def test_scan_file_fails_closed_without_cache_for_incomplete_raw_tar_hdf5_userblock(tmp_path: Path) -> None:
-    model_path = tmp_path / "incomplete-raw-tar-userblock.tar"
+def test_scan_file_preserves_findings_without_cache_for_incomplete_raw_tar_hdf5_userblock(tmp_path: Path) -> None:
+    model_path = tmp_path / "incomplete-raw-nemo-userblock.tar"
     userblock_size = _write_tar_hdf5_userblock(
         model_path,
-        [("payload.pkl", pickle.dumps({"weights": [1]}, protocol=0))],
+        [("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")],
     )
     with model_path.open("r+b") as handle:
         handle.seek(8 * tarfile.BLOCKSIZE)
         handle.write(b"nonzero bytes after the raw TAR end marker")
 
     assert find_hdf5_signature_offset(str(model_path)) == userblock_size
-    assert file_detection.detect_file_format(str(model_path)) == "tar"
+    assert file_detection.detect_file_format(str(model_path)) == "nemo"
 
     cache_dir = tmp_path / "cache"
     reset_cache_manager()
@@ -9481,13 +9515,49 @@ def test_scan_file_fails_closed_without_cache_for_incomplete_raw_tar_hdf5_userbl
     metadata = aggregate.file_metadata[str(model_path)]
     assert aggregate.success is False
     assert "hdf5_tar_prefix_ownership_incomplete" in metadata["scan_outcome_reasons"]
-    assert "tar" not in metadata.get("supplemental_scanners", [])
+    assert "nemo" in metadata["supplemental_scanners"]
     assert any(
         check.name == "HDF5 User-Block TAR Ownership" and check.details["ownership_state"] == "incomplete"
         for check in aggregate.checks
     )
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in aggregate.checks
+    )
     assert cache_entries == 0
-    assert determine_exit_code(aggregate) == 2
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_complete_compressed_tar_hdf5_userblock_routes_large_first_member_to_tar(tmp_path: Path) -> None:
+    model_path = tmp_path / "complete-compressed-tar-userblock.bin"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [
+            ("large-weights.bin", b"A" * (128 * 1024)),
+            ("late-payload.pkl", _build_malicious_pickle(protocol=0)),
+        ],
+        compressed=True,
+    )
+
+    from modelaudit.scanners.tar_scanner import classify_compressed_tar_prefix_ownership
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert classify_compressed_tar_prefix_ownership(str(model_path), userblock_size) == "complete"
+    assert file_detection.detect_file_format(str(model_path)) == "tar"
+
+    result = scan_file(
+        str(model_path),
+        config={
+            "cache_enabled": False,
+            "compressed_max_decompression_ratio": 100_000.0,
+        },
+    )
+
+    assert result.scanner_name == "keras_h5"
+    assert "tar" in result.metadata["supplemental_scanners"]
+    assert any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 @pytest.mark.parametrize("suffix", [".nemo", ".bin"])

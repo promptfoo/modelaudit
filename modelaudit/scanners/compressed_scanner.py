@@ -47,11 +47,11 @@ class _CompressedPaddingLimitExceeded(_DecompressionLimitExceeded):
 
 
 class _PreservedCompressedScanLimit(_DecompressionLimitExceeded):
-    """Carry bounded decompressed output so reachable findings survive a scan limit."""
+    """Carry bounded decompressed output so reachable findings survive a wrapper failure."""
 
     def __init__(
         self,
-        cause: _DecompressionLimitExceeded,
+        cause: Exception,
         *,
         aggregate_path: str,
         member_paths: list[str],
@@ -236,10 +236,10 @@ class CompressedScanner(BaseScanner):
         removable_padding = max(trailing_zeros - self._MAX_CODEC_TRAILER_BYTES, 0)
         return max(source_size - removable_padding, 1)
 
-    def _check_source_size_limit(self, path: str, source_size: int) -> ScanResult | None:
-        if not self.max_file_read_size or self.max_file_read_size <= 0 or source_size <= self.max_file_read_size:
-            return None
-        result = self._create_result()
+    def _source_size_limit_exceeded(self, source_size: int) -> bool:
+        return bool(self.max_file_read_size and self.max_file_read_size > 0 and source_size > self.max_file_read_size)
+
+    def _record_source_size_limit_failure(self, result: ScanResult, path: str, source_size: int) -> None:
         mark_inconclusive_scan_result(result, "max_file_read_size_exceeded")
         result.metadata["file_size"] = self.get_file_size(path)
         if self.source_size_limit is not None:
@@ -257,6 +257,12 @@ class CompressedScanner(BaseScanner):
                 "scan_outcome_reason": "max_file_read_size_exceeded",
             },
         )
+
+    def _check_source_size_limit(self, path: str, source_size: int) -> ScanResult | None:
+        if not self._source_size_limit_exceeded(source_size):
+            return None
+        result = self._create_result()
+        self._record_source_size_limit_failure(result, path, source_size)
         result.finish(success=False)
         return result
 
@@ -863,8 +869,14 @@ class CompressedScanner(BaseScanner):
 
         return total_out
 
-    def _decompress_to_tempfiles(self, path: str, codec: str) -> tuple[str, list[str], int, int]:
-        source_size = self._source_size(path)
+    def _decompress_to_tempfiles(
+        self,
+        path: str,
+        codec: str,
+        *,
+        source_size_override: int | None = None,
+    ) -> tuple[str, list[str], int, int]:
+        source_size = source_size_override if source_size_override is not None else self._source_size(path)
         projected_compressed_size = self._projected_compressed_payload_size(path, source_size)
         suffix = self._derive_inner_suffix(path)
         outputs = _DecompressedOutputSink(suffix, self.max_members)
@@ -938,7 +950,7 @@ class CompressedScanner(BaseScanner):
                     )
                 else:
                     raise _CorruptStreamError(f"Unsupported compression codec: {codec}")
-        except _DecompressionLimitExceeded as exc:
+        except (_DecompressionLimitExceeded, _CorruptStreamError) as exc:
             if self.config.get(PRESERVE_LIMITED_PREFIX_PAYLOAD_CONFIG_KEY):
                 outputs.close()
                 decompressed_bytes = os.path.getsize(outputs.aggregate_path)
@@ -1225,15 +1237,43 @@ class CompressedScanner(BaseScanner):
             },
         )
 
+    def _record_stream_decode_failure(
+        self,
+        result: ScanResult,
+        path: str,
+        codec: str,
+        exc: _CorruptStreamError,
+    ) -> None:
+        """Record a wrapper decode failure after retaining reachable findings."""
+        mark_inconclusive_scan_result(result, self._STREAM_DECODE_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="Compressed Wrapper Stream Decode",
+            passed=False,
+            message=f"{exc}; analysis incomplete",
+            severity=(
+                IssueSeverity.INFO if self.config.get(COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY) else IssueSeverity.WARNING
+            ),
+            location=path,
+            details={
+                "codec": codec,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self._STREAM_DECODE_INCONCLUSIVE_REASON,
+            },
+        )
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
 
         source_size = self._source_size(path)
-        size_check_result = self._check_source_size_limit(path, source_size)
-        if size_check_result:
+        source_size_limited = self._source_size_limit_exceeded(source_size)
+        preserve_limited_prefix = bool(self.config.get(PRESERVE_LIMITED_PREFIX_PAYLOAD_CONFIG_KEY))
+        if source_size_limited and not preserve_limited_prefix:
+            size_check_result = self._check_source_size_limit(path, source_size)
+            assert size_check_result is not None
             return size_check_result
+        scan_source_size = min(source_size, int(self.max_file_read_size)) if source_size_limited else source_size
 
         result = self._create_result()
         result.metadata["file_size"] = self.get_file_size(path)
@@ -1272,7 +1312,7 @@ class CompressedScanner(BaseScanner):
 
         try:
             with open(path, "rb") as raw_handle:
-                handle = _BoundedCompressedSource(raw_handle, source_size)
+                handle = _BoundedCompressedSource(raw_handle, scan_source_size)
                 header = handle.read(8)
         except OSError as exc:
             result.add_check(
@@ -1330,6 +1370,7 @@ class CompressedScanner(BaseScanner):
             temp_path, member_temp_paths, decompressed_bytes, compressed_size = self._decompress_to_tempfiles(
                 path,
                 expected_codec,
+                source_size_override=scan_source_size,
             )
             routed_temp_paths = self._route_tokenizer_extensionless_or_bin(path, [temp_path, *member_temp_paths])
             temp_path = routed_temp_paths[0]
@@ -1361,7 +1402,9 @@ class CompressedScanner(BaseScanner):
                 depth=depth,
                 result=result,
             )
-            result.bytes_scanned += source_size
+            result.bytes_scanned += scan_source_size
+            if source_size_limited:
+                self._record_source_size_limit_failure(result, path, source_size)
         except _MissingOptionalDependencyError as exc:
             mark_inconclusive_scan_result(result, self._OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON)
             result.add_check(
@@ -1411,32 +1454,28 @@ class CompressedScanner(BaseScanner):
                         "analysis_incomplete": True,
                     },
                 )
-            self._record_decompression_limit_failure(result, path, expected_codec, exc.cause)
-            result.bytes_scanned += source_size
+            if isinstance(exc.cause, _DecompressionLimitExceeded):
+                self._record_decompression_limit_failure(result, path, expected_codec, exc.cause)
+            elif isinstance(exc.cause, _CorruptStreamError) and not source_size_limited:
+                self._record_stream_decode_failure(result, path, expected_codec, exc.cause)
+            if source_size_limited:
+                self._record_source_size_limit_failure(result, path, source_size)
+            result.bytes_scanned += scan_source_size
             result.finish(success=False)
             return result
         except _DecompressionLimitExceeded as exc:
             self._record_decompression_limit_failure(result, path, expected_codec, exc)
+            if source_size_limited:
+                self._record_source_size_limit_failure(result, path, source_size)
+            result.bytes_scanned += scan_source_size
             result.finish(success=False)
             return result
         except _CorruptStreamError as exc:
-            mark_inconclusive_scan_result(result, self._STREAM_DECODE_INCONCLUSIVE_REASON)
-            result.add_check(
-                name="Compressed Wrapper Stream Decode",
-                passed=False,
-                message=f"{exc}; analysis incomplete",
-                severity=(
-                    IssueSeverity.INFO
-                    if self.config.get(COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY)
-                    else IssueSeverity.WARNING
-                ),
-                location=path,
-                details={
-                    "codec": expected_codec,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": self._STREAM_DECODE_INCONCLUSIVE_REASON,
-                },
-            )
+            if not source_size_limited:
+                self._record_stream_decode_failure(result, path, expected_codec, exc)
+            if source_size_limited:
+                self._record_source_size_limit_failure(result, path, source_size)
+            result.bytes_scanned += scan_source_size
             result.finish(success=False)
             return result
         except Exception as exc:

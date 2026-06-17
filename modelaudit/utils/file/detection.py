@@ -6880,7 +6880,7 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
                                 from ...scanners.tar_scanner import classify_compressed_tar_prefix_ownership
 
                                 ownership = classify_compressed_tar_prefix_ownership(path, hdf5_signature_offset)
-                                if ownership != "incomplete":
+                                if ownership == "inconclusive":
                                     return NEMO_ROUTING_INCONCLUSIVE_FORMAT
                             return "tar"
                         body_skip_budget -= member_size
