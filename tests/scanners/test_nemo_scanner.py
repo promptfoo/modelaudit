@@ -729,6 +729,55 @@ class TestNemoScannerBasic:
         assert "decompression ratio exceeded" in limit_checks[0].message.lower()
         assert max_stream_bytes_read == tarfile.BLOCKSIZE
 
+    def test_compressed_ratio_preflight_preserves_reachable_hydra_finding_without_cache(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "ratio-prefix-malicious.nemo"
+        with tarfile.open(path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
+            _add_tar_bytes(archive, "weights.bin", b"A" * (4 * 1024 * 1024))
+        config = {
+            "compressed_max_decompressed_bytes": 8 * 1024 * 1024,
+            "compressed_max_decompression_ratio": 5.0,
+        }
+
+        direct = NemoScanner(config=config).scan(str(path))
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            compressed_max_decompressed_bytes=8 * 1024 * 1024,
+            compressed_max_decompression_ratio=5.0,
+        )
+
+        ratio_checks = [check for check in direct.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.success is False
+        assert len(ratio_checks) == 1
+        assert ratio_checks[0].status == CheckStatus.FAILED
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+        assert determine_exit_code(aggregate) == 2
+
+        cache_dir = tmp_path / "ratio-prefix-malicious-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                compressed_max_decompressed_bytes=8 * 1024 * 1024,
+                compressed_max_decompression_ratio=5.0,
+            )
+            assert determine_exit_code(cached) == 2
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_compressed_nemo_preflight_handles_truncated_member_body(self, tmp_path: Path) -> None:
         path = tmp_path / "truncated-member.nemo"
         info = tarfile.TarInfo("weights.bin")
@@ -8161,7 +8210,7 @@ class TestCVE202523304HydraTarget:
             reset_cache_manager()
 
     @pytest.mark.parametrize("boundary", ["decompressed_size"])
-    def test_inherited_preflight_limits_remain_terminal_before_nemo_analysis(
+    def test_inherited_preflight_limits_preserve_reachable_nemo_analysis(
         self,
         tmp_path: Path,
         boundary: str,
@@ -8184,8 +8233,13 @@ class TestCVE202523304HydraTarget:
         result = NemoScanner(config=config).scan(str(nemo_path))
 
         assert result.success is False
-        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23304"]
-        assert "tar_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        hydra_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert (
+            tar_scanner_module.TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON in result.metadata["scan_outcome_reasons"]
+        )
 
     @pytest.mark.parametrize(
         ("target", "expected_exit_code"),

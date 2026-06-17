@@ -69,6 +69,8 @@ TAR_SPECIAL_MEMBER_INCOMPLETE_REASON = "tar_special_member_unsupported"
 TAR_SPARSE_MEMBER_INCOMPLETE_REASON = "tar_sparse_member_unsupported"
 TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON = "tar_compressed_trailing_data"
 TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON = "tar_compressed_padding_limit_exceeded"
+TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON = "tar_decompressed_size_limit_exceeded"
+TAR_DECOMPRESSION_RATIO_LIMIT_INCOMPLETE_REASON = "tar_decompression_ratio_limit_exceeded"
 TarPrefixOwnership = Literal["complete", "embedded_member", "incomplete", "inconclusive"]
 TAR_SPARSE_PAX_SIZE_FIELDS = frozenset({"GNU.sparse.size", "GNU.sparse.realsize"})
 _POST_TAR_EOF_CONTINUABLE_INCOMPLETE_REASONS = frozenset(
@@ -183,7 +185,7 @@ class _TarBoundedStream:
                 f"TAR stream exceeded decompressed read limit ({self.bytes_read} > {self.max_bytes} bytes)",
                 bytes_read=self.bytes_read,
                 max_bytes=self.max_bytes,
-                reason="tar_decompressed_size_limit_exceeded",
+                reason=TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON,
             )
         return data
 
@@ -1208,6 +1210,7 @@ class TarScanner(BaseScanner):
         compressed_size: int,
         compression_codec: str,
         actual_ratio: float | None = None,
+        incomplete_reason: str | None = None,
     ) -> None:
         """Record compressed-wrapper policy checks with consistent details."""
         details: dict[str, Any] = {
@@ -1219,6 +1222,9 @@ class TarScanner(BaseScanner):
         }
         if actual_ratio is not None:
             details["actual_ratio"] = actual_ratio
+        if not passed and incomplete_reason is not None:
+            details["analysis_incomplete"] = True
+            details["scan_outcome_reason"] = incomplete_reason
 
         result.add_check(
             name="Compressed Wrapper Decompression Limits",
@@ -1345,12 +1351,15 @@ class TarScanner(BaseScanner):
         actual_ratio = (stream_size / compressed_size) if compressed_size > 0 else 0.0
         if stream_size > self.max_decompressed_bytes:
             passed = False
+            incomplete_reason = TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON
             message = f"Decompressed size exceeded limit ({stream_size} > {self.max_decompressed_bytes})"
         elif compressed_size > 0 and actual_ratio > self.max_decompression_ratio:
             passed = False
+            incomplete_reason = TAR_DECOMPRESSION_RATIO_LIMIT_INCOMPLETE_REASON
             message = f"Decompression ratio exceeded limit ({actual_ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
         elif emit_pass:
             passed = True
+            incomplete_reason = None
             message = f"Decompressed size/ratio are within limits ({stream_size} bytes, {actual_ratio:.1f}x)"
         else:
             return False
@@ -1364,9 +1373,11 @@ class TarScanner(BaseScanner):
             compressed_size=compressed_size,
             compression_codec=compression_codec,
             actual_ratio=actual_ratio,
+            incomplete_reason=incomplete_reason,
         )
         if not passed:
-            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
+            assert incomplete_reason is not None
+            mark_archive_scan_incomplete(result, incomplete_reason)
         return not passed
 
     def _record_tar_stream_budget_exceeded(
@@ -1378,7 +1389,7 @@ class TarScanner(BaseScanner):
         compression_codec: str | None,
         compressed_size: int,
     ) -> None:
-        if compression_codec is not None and exc.reason == "tar_decompressed_size_limit_exceeded":
+        if compression_codec is not None and exc.reason == TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON:
             actual_ratio = (exc.bytes_read / compressed_size) if compressed_size > 0 else 0.0
             self._add_compressed_wrapper_limit_check(
                 result,
@@ -1389,6 +1400,7 @@ class TarScanner(BaseScanner):
                 compressed_size=compressed_size,
                 compression_codec=compression_codec,
                 actual_ratio=actual_ratio,
+                incomplete_reason=exc.reason,
             )
         else:
             result.add_check(
