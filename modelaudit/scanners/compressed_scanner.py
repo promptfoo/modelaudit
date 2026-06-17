@@ -10,7 +10,7 @@ import tempfile
 import zlib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from .. import core
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -29,6 +29,8 @@ ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY = "_compressed_allow_safetensors
 COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY = "_compressed_source_size_limit"
 ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY = "_compressed_allow_zero_padding_trailing"
 COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY = "_compressed_prefix_ownership"
+DEFAULT_MAX_ZERO_PADDING_BYTES = 10 * 1024 * 1024
+CompressedPrefixOwnership = Literal["complete", "scan_limit", "incomplete", "inconclusive"]
 
 
 class _DecompressionLimitExceeded(ValueError):
@@ -37,6 +39,10 @@ class _DecompressionLimitExceeded(ValueError):
 
 class _CompressedMemberLimitExceeded(_DecompressionLimitExceeded):
     """Raised when concatenated-member fan-out exceeds the scan budget."""
+
+
+class _CompressedPaddingLimitExceeded(_DecompressionLimitExceeded):
+    """Raised when accepted wrapper padding exceeds the bounded scan budget."""
 
 
 class _CorruptStreamError(ValueError):
@@ -50,9 +56,10 @@ class _MissingOptionalDependencyError(ImportError):
 class _BoundedCompressedSource:
     """Expose at most one trusted compressed prefix from a larger artifact."""
 
-    def __init__(self, source: Any, size_limit: int):
+    def __init__(self, source: Any, size_limit: int, max_zero_padding_bytes: int = DEFAULT_MAX_ZERO_PADDING_BYTES):
         self._source = source
         self._remaining = size_limit
+        self.max_zero_padding_bytes = max_zero_padding_bytes
         self.accepted_zero_padding_bytes = 0
 
     def read(self, size: int = -1) -> bytes:
@@ -135,6 +142,7 @@ class CompressedScanner(BaseScanner):
     _DEPTH_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_depth_limit_exceeded"
     _MEMBER_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_member_limit_exceeded"
     _DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_decompression_limit_exceeded"
+    _PADDING_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_padding_limit_exceeded"
     _OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_optional_dependency_unavailable"
     _STREAM_DECODE_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_stream_decode_failed"
     _PYTHON_PAYLOAD_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_python_payload_analysis_incomplete"
@@ -155,6 +163,10 @@ class CompressedScanner(BaseScanner):
             self.DEFAULT_MAX_MEMBERS,
         )
         self.chunk_size = int(self.config.get("compressed_chunk_size", self.DEFAULT_CHUNK_SIZE))
+        self.max_zero_padding_bytes = self._normalize_positive_int_config(
+            self.config.get("compressed_max_zero_padding_bytes"),
+            DEFAULT_MAX_ZERO_PADDING_BYTES,
+        )
         self.source_size_limit = self._normalize_optional_positive_int(
             self.config.get(COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY),
         )
@@ -181,12 +193,21 @@ class CompressedScanner(BaseScanner):
         remaining = source_size
         with open(path, "rb") as handle:
             while remaining > 0:
-                read_size = min(self.chunk_size, remaining)
+                padding_probe_remaining = (
+                    self.max_zero_padding_bytes + self._MAX_CODEC_TRAILER_BYTES - trailing_zeros + 1
+                )
+                read_size = min(self.chunk_size, remaining, padding_probe_remaining)
                 remaining -= read_size
                 handle.seek(remaining)
                 chunk = handle.read(read_size)
                 stripped = chunk.rstrip(b"\x00")
                 trailing_zeros += len(chunk) - len(stripped)
+                if max(trailing_zeros - self._MAX_CODEC_TRAILER_BYTES, 0) > self.max_zero_padding_bytes:
+                    raise _CompressedPaddingLimitExceeded(
+                        "Compressed zero padding exceeded limit "
+                        f"({max(trailing_zeros - self._MAX_CODEC_TRAILER_BYTES, 0)} > "
+                        f"{self.max_zero_padding_bytes})",
+                    )
                 if stripped:
                     break
         removable_padding = max(trailing_zeros - self._MAX_CODEC_TRAILER_BYTES, 0)
@@ -222,13 +243,22 @@ class CompressedScanner(BaseScanner):
         if not pending or any(pending):
             return False
         padding_bytes = len(pending)
+        max_padding_bytes = int(getattr(source, "max_zero_padding_bytes", DEFAULT_MAX_ZERO_PADDING_BYTES))
+        if padding_bytes > max_padding_bytes:
+            raise _CompressedPaddingLimitExceeded(
+                f"Compressed zero padding exceeded limit ({padding_bytes} > {max_padding_bytes})",
+            )
         while True:
-            chunk = source.read(chunk_size)
+            chunk = source.read(min(chunk_size, max_padding_bytes - padding_bytes + 1))
             if not chunk:
                 break
             if any(chunk):
                 raise _CorruptStreamError("Invalid compressed stream: nonzero bytes follow zero padding")
             padding_bytes += len(chunk)
+            if padding_bytes > max_padding_bytes:
+                raise _CompressedPaddingLimitExceeded(
+                    f"Compressed zero padding exceeded limit ({padding_bytes} > {max_padding_bytes})",
+                )
         if hasattr(source, "accepted_zero_padding_bytes"):
             source.accepted_zero_padding_bytes += padding_bytes
         return True
@@ -819,7 +849,11 @@ class CompressedScanner(BaseScanner):
         bounded_source: _BoundedCompressedSource | None = None
         try:
             with open(path, "rb") as raw_source:
-                bounded_source = _BoundedCompressedSource(raw_source, source_size)
+                bounded_source = _BoundedCompressedSource(
+                    raw_source,
+                    source_size,
+                    self.max_zero_padding_bytes,
+                )
                 source = bounded_source
                 if codec == "gzip":
                     total_out = self._read_gzip_stream_with_limits(
@@ -1252,6 +1286,23 @@ class CompressedScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+        except _CompressedPaddingLimitExceeded as exc:
+            mark_inconclusive_scan_result(result, self._PADDING_LIMIT_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="Compressed Wrapper Padding Limit",
+                passed=False,
+                message=f"{exc}; analysis incomplete",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "codec": expected_codec,
+                    "max_zero_padding_bytes": self.max_zero_padding_bytes,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._PADDING_LIMIT_INCONCLUSIVE_REASON,
+                },
+            )
+            result.finish(success=False)
+            return result
         except _DecompressionLimitExceeded as exc:
             mark_inconclusive_scan_result(result, self._DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON)
             result.add_check(
@@ -1309,3 +1360,46 @@ class CompressedScanner(BaseScanner):
 
         result.finish(success=not member_scan_incomplete(result) and not result.has_errors)
         return result
+
+
+def classify_compressed_prefix_ownership(
+    path: str,
+    boundary: int,
+    *,
+    config: dict[str, Any] | None = None,
+) -> CompressedPrefixOwnership:
+    """Classify whether a bounded source prefix owns a complete compressed stream."""
+    if boundary <= 0:
+        return "incomplete"
+
+    scanner_config = dict(config or {})
+    scanner_config[COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY] = boundary
+    scanner_config[ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY] = True
+    scanner_config[COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY] = True
+    # Ownership is structural. The supplemental scan applies the caller's
+    # decompression-ratio policy after the physical boundary is established.
+    scanner_config["compressed_max_decompression_ratio"] = float("inf")
+    scanner = CompressedScanner(scanner_config)
+    source_size = scanner._source_size(path)
+    if scanner._check_source_size_limit(path, source_size) is not None:
+        return "scan_limit"
+
+    aggregate_path: str | None = None
+    member_paths: list[str] = []
+    try:
+        with open(path, "rb") as source:
+            codec = scanner._detect_codec_from_header(source.read(8))
+        if codec is None:
+            return "incomplete"
+        aggregate_path, member_paths, _, _ = scanner._decompress_to_tempfiles(path, codec)
+        return "complete"
+    except (_CompressedMemberLimitExceeded, _CompressedPaddingLimitExceeded, _DecompressionLimitExceeded):
+        return "scan_limit"
+    except _CorruptStreamError:
+        return "incomplete"
+    except (_MissingOptionalDependencyError, OSError, ValueError):
+        return "inconclusive"
+    finally:
+        for temp_path in [aggregate_path, *member_paths]:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.unlink(temp_path)

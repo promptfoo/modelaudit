@@ -2689,6 +2689,26 @@ def _write_compressed_hdf5_userblock(
     return userblock_size
 
 
+def _write_gzip_hdf5_extra_collision(path: Path, payload: bytes) -> int:
+    """Write a valid gzip stream whose FEXTRA contains an HDF5 lookalike."""
+    compressed = gzip.compress(payload, mtime=0)
+    gzip_header = bytearray(compressed[:10])
+    gzip_header[3] |= 0x04
+    extra = bytearray(1024)
+    wrapper_size = len(gzip_header) + 2 + len(extra) + len(compressed[10:])
+    signature_offset = 512
+    superblock = bytearray(HDF5_MAGIC + b"\x03\x08\x08\x00")
+    superblock.extend(signature_offset.to_bytes(8, "little"))
+    superblock.extend(b"\xff" * 8)
+    superblock.extend(wrapper_size.to_bytes(8, "little"))
+    superblock.extend((signature_offset + 48).to_bytes(8, "little"))
+    superblock.extend(hdf5_metadata_checksum(bytes(superblock)).to_bytes(4, "little"))
+    extra_offset = signature_offset - len(gzip_header) - 2
+    extra[extra_offset : extra_offset + len(superblock)] = superblock
+    path.write_bytes(bytes(gzip_header) + struct.pack("<H", len(extra)) + bytes(extra) + compressed[10:])
+    return signature_offset
+
+
 def _write_safe_r_serialized(path: Path) -> None:
     path.write_bytes(b"X\nsafe\nmodel\nweights")
 
@@ -9020,6 +9040,35 @@ def test_hdf5_userblock_padding_does_not_inflate_standalone_compressed_ratio_den
     assert "compressed_decompression_limit_exceeded" in result.metadata["scan_outcome_reasons"]
 
 
+def test_hdf5_userblock_compressed_padding_limit_fails_closed(tmp_path: Path) -> None:
+    model_path = tmp_path / "gzip-padding-limit-userblock.h5"
+    userblock_size = _write_compressed_hdf5_userblock(
+        model_path,
+        pickle.dumps({"weights": [1]}, protocol=0),
+        codec="gzip",
+    )
+    config = {
+        "cache_enabled": False,
+        "compressed_max_zero_padding_bytes": 64,
+    }
+
+    from modelaudit.scanners.compressed_scanner import classify_compressed_prefix_ownership
+
+    assert classify_compressed_prefix_ownership(str(model_path), userblock_size, config=config) == "scan_limit"
+
+    result = scan_file(str(model_path), config=config)
+
+    assert result.scanner_name == "keras_h5"
+    assert "compressed" in result.metadata["supplemental_scanners"]
+    assert "hdf5_compressed_prefix_ownership_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "HDF5 User-Block Compressed Ownership"
+        and check.status == CheckStatus.FAILED
+        and check.details["ownership_state"] == "scan_limit"
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize("target", ["torch.nn.Linear", "os.system"], ids=["benign", "malicious"])
 def test_scan_file_bounds_complete_raw_nemo_tar_inside_valid_hdf5_userblock(
     tmp_path: Path,
@@ -9161,6 +9210,38 @@ def test_compressed_tar_hdf5_ownership_limits_preserve_early_nemo_findings(
             for check in file_result.checks
         )
     assert cache_entries == 0
+
+
+def test_raw_tar_hdf5_entry_limit_preserves_early_nemo_finding(tmp_path: Path) -> None:
+    model_path = tmp_path / "raw-nemo-entry-limit.h5"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [
+            ("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n"),
+            ("weights.bin", b"safe weights"),
+        ],
+    )
+    config = {
+        "cache_enabled": False,
+        "max_tar_entries": 1,
+    }
+
+    from modelaudit.scanners.tar_scanner import classify_raw_tar_prefix_ownership
+
+    assert classify_raw_tar_prefix_ownership(str(model_path), userblock_size, config=config) == "scan_limit"
+
+    result = scan_file(str(model_path), config=config)
+
+    assert result.scanner_name == "keras_h5"
+    assert "nemo" in result.metadata["supplemental_scanners"]
+    assert "tar_entry_count_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert "hdf5_tar_prefix_ownership_incomplete" not in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize("high_ratio", [False, True], ids=["within-limit", "ratio-bomb"])
@@ -9307,32 +9388,27 @@ def test_scan_file_fails_closed_without_cache_for_incomplete_raw_tar_hdf5_userbl
     assert determine_exit_code(aggregate) == 2
 
 
-def test_scan_file_fails_closed_when_hdf5_signature_is_inside_gzip_extra_field(tmp_path: Path) -> None:
-    model_path = tmp_path / "gzip-extra-hdf5-collision.nemo"
+@pytest.mark.parametrize("suffix", [".nemo", ".bin"])
+def test_scan_file_routes_compressed_tar_when_hdf5_signature_is_inside_gzip_extra_field(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    model_path = tmp_path / f"gzip-extra-hdf5-collision{suffix}"
     raw_tar = io.BytesIO()
     with tarfile.open(fileobj=raw_tar, mode="w") as archive:
+        filler = b"A" * (128 * 1024)
+        filler_info = tarfile.TarInfo("large-weights.bin")
+        filler_info.size = len(filler)
+        archive.addfile(filler_info, io.BytesIO(filler))
         payload = _build_malicious_pickle(protocol=0)
         info = tarfile.TarInfo("late-payload.pkl")
         info.size = len(payload)
         archive.addfile(info, io.BytesIO(payload))
 
-    compressed_tar = gzip.compress(raw_tar.getvalue(), mtime=0)
-    gzip_header = bytearray(compressed_tar[:10])
-    gzip_header[3] |= 0x04
-    extra = bytearray(1024)
-    wrapper_size = len(gzip_header) + 2 + len(extra) + len(compressed_tar[10:])
-    signature_offset = 512
-    superblock = bytearray(HDF5_MAGIC + b"\x03\x08\x08\x00")
-    superblock.extend(signature_offset.to_bytes(8, "little"))
-    superblock.extend(b"\xff" * 8)
-    superblock.extend(wrapper_size.to_bytes(8, "little"))
-    superblock.extend((signature_offset + 48).to_bytes(8, "little"))
-    superblock.extend(hdf5_metadata_checksum(bytes(superblock)).to_bytes(4, "little"))
-    extra_offset = signature_offset - len(gzip_header) - 2
-    extra[extra_offset : extra_offset + len(superblock)] = superblock
-    model_path.write_bytes(bytes(gzip_header) + struct.pack("<H", len(extra)) + bytes(extra) + compressed_tar[10:])
+    signature_offset = _write_gzip_hdf5_extra_collision(model_path, raw_tar.getvalue())
 
     assert find_hdf5_signature_offset(str(model_path)) == signature_offset
+    assert file_detection.detect_file_format(str(model_path)) == "tar"
     from modelaudit.scanners.tar_scanner import classify_compressed_tar_prefix_ownership
 
     assert classify_compressed_tar_prefix_ownership(str(model_path), signature_offset) == "incomplete"
@@ -9351,12 +9427,31 @@ def test_scan_file_fails_closed_when_hdf5_signature_is_inside_gzip_extra_field(t
         reset_cache_manager()
 
     metadata = aggregate.file_metadata[str(model_path)]
-    assert aggregate.success is False
-    assert "compressed_stream_decode_failed" in metadata["scan_outcome_reasons"]
-    assert "compressed" in metadata.get("supplemental_scanners", [])
-    assert not any(check.rule_code == "S201" for check in aggregate.checks)
+    assert "compressed" not in metadata.get("supplemental_scanners", [])
+    assert any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in aggregate.checks)
     assert cache_entries == 0
-    assert determine_exit_code(aggregate) == 2
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_scan_file_preserves_compressed_payload_when_hdf5_signature_is_inside_gzip_extra_field(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "gzip-pickle-hdf5-collision.bin"
+    signature_offset = _write_gzip_hdf5_extra_collision(model_path, _build_malicious_pickle(protocol=0))
+
+    assert find_hdf5_signature_offset(str(model_path)) == signature_offset
+    assert file_detection.detect_file_format(str(model_path)) == "gzip"
+    from modelaudit.scanners.compressed_scanner import classify_compressed_prefix_ownership
+
+    assert classify_compressed_prefix_ownership(str(model_path), signature_offset) == "incomplete"
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert "compressed" in result.metadata["supplemental_scanners"]
+    assert "hdf5_compressed_prefix_ownership_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "compressed_stream_decode_failed" not in result.metadata["scan_outcome_reasons"]
+    assert any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])

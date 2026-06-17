@@ -16,7 +16,15 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
-from modelaudit.scanners.compressed_scanner import CompressedScanner, _MissingOptionalDependencyError
+from modelaudit.scanners.compressed_scanner import (
+    ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY,
+    COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY,
+    COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY,
+    CompressedScanner,
+    _BoundedCompressedSource,
+    _CompressedPaddingLimitExceeded,
+    _MissingOptionalDependencyError,
+)
 
 TarWriteMode = Literal["w:gz", "w:bz2", "w:xz"]
 
@@ -825,6 +833,39 @@ def test_read_lz4_stream_accepts_bounded_zero_padding(use_chunk_api: bool) -> No
 
     assert total_out == len(b"payload")
     assert destination.getvalue() == b"payload"
+
+
+def test_zero_padding_acceptance_stops_at_configured_limit() -> None:
+    backing = io.BytesIO(bytes(1024 * 1024))
+    source = _BoundedCompressedSource(backing, 1024 * 1024, max_zero_padding_bytes=64)
+
+    with pytest.raises(_CompressedPaddingLimitExceeded, match="zero padding exceeded limit"):
+        CompressedScanner._accept_zero_padding(b"\x00", source, chunk_size=1024)
+
+    assert backing.tell() == 64
+
+
+def test_compressed_scanner_fails_closed_when_zero_padding_exceeds_limit(tmp_path: Path) -> None:
+    wrapper = tmp_path / "padded.gz"
+    wrapper.write_bytes(gzip.compress(pickle.dumps({"weights": [1]}), mtime=0) + bytes(4096))
+    result = CompressedScanner(
+        config={
+            "cache_enabled": False,
+            "compressed_max_zero_padding_bytes": 64,
+            ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY: True,
+            COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY: wrapper.stat().st_size,
+            COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY: True,
+        }
+    ).scan(str(wrapper))
+
+    assert result.success is False
+    assert "compressed_padding_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Compressed Wrapper Padding Limit"
+        and check.status == CheckStatus.FAILED
+        and check.details["max_zero_padding_bytes"] == 64
+        for check in result.checks
+    )
 
 
 def test_read_zlib_stream_allows_exact_limit_real_stream() -> None:

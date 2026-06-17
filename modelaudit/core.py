@@ -193,6 +193,7 @@ _add_error_asset_to_results = core_results.add_error_asset_to_results
 _DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
 _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON = "tar_compressed_stream_incomplete"
 _HDF5_TAR_PREFIX_OWNERSHIP_INCOMPLETE_REASON = "hdf5_tar_prefix_ownership_incomplete"
+_HDF5_COMPRESSED_PREFIX_OWNERSHIP_INCOMPLETE_REASON = "hdf5_compressed_prefix_ownership_incomplete"
 _STREAMING_SOURCE_INTERRUPTED_REASON = "streaming_source_interrupted"
 
 
@@ -6356,6 +6357,28 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         except OSError as e:
             magic_format = "unknown"
             format_probe_error = e
+    hdf5_tar_prefix_ownership: str | None = None
+    compressed_tar_route_formats = {"tar", "nemo", NEMO_ROUTING_INCONCLUSIVE_FORMAT}
+    if (
+        hdf5_signature_offset is not None
+        and _has_supported_tar_compression_wrapper(Path(path))
+        and ({header_format, magic_format} & compressed_tar_route_formats)
+    ):
+        from modelaudit.scanners.tar_scanner import classify_compressed_tar_prefix_ownership
+
+        hdf5_tar_prefix_ownership = classify_compressed_tar_prefix_ownership(
+            path,
+            hdf5_signature_offset,
+            config=config,
+        )
+        if hdf5_tar_prefix_ownership == "incomplete":
+            # A complete compressed TAR that crosses this offset owns bytes
+            # which only resemble an HDF5 superblock inside its wrapper.
+            hdf5_signature_offset = None
+            if header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+                header_format = "tar"
+            if magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+                magic_format = "tar"
     skipped_overlap_scanner_id: str | None = None
     if (
         header_format == "xgboost"
@@ -6587,30 +6610,47 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
-    hdf5_tar_prefix_ownership: str | None = None
+    hdf5_compressed_prefix_ownership: str | None = None
     try:
         scanner_id = (
             "keras_h5"
             if hdf5_signature_offset is not None
-            else _select_preferred_scanner_id(path, header_format, ext, config)
+            else (
+                _select_non_hdf5_preferred_scanner_id(path, header_format, ext, config)
+                if hdf5_tar_prefix_ownership == "incomplete"
+                else _select_preferred_scanner_id(path, header_format, ext, config)
+            )
         )
         hdf5_userblock_supplemental_scanner_id = (
             _select_hdf5_userblock_supplemental_scanner_id(path, magic_format, ext, config)
             if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
             else None
         )
-        if hdf5_userblock_supplemental_scanner_id in {"nemo", "tar"}:
+        if hdf5_userblock_supplemental_scanner_id == "compressed":
+            from modelaudit.scanners.compressed_scanner import classify_compressed_prefix_ownership
+
+            assert hdf5_signature_offset is not None
+            hdf5_compressed_prefix_ownership = classify_compressed_prefix_ownership(
+                path,
+                hdf5_signature_offset,
+                config=config,
+            )
+            if hdf5_compressed_prefix_ownership != "complete":
+                config = dict(config)
+                config["cache_enabled"] = False
+        elif hdf5_userblock_supplemental_scanner_id in {"nemo", "tar"}:
             from modelaudit.scanners.tar_scanner import (
                 classify_compressed_tar_prefix_ownership,
                 classify_raw_tar_prefix_ownership,
             )
 
             assert hdf5_signature_offset is not None
-            hdf5_tar_prefix_ownership = (
-                classify_compressed_tar_prefix_ownership(path, hdf5_signature_offset, config=config)
-                if _has_supported_tar_compression_wrapper(Path(path))
-                else classify_raw_tar_prefix_ownership(path, hdf5_signature_offset, config=config)
-            )
+            if hdf5_tar_prefix_ownership is None:
+                hdf5_tar_prefix_ownership = (
+                    classify_compressed_tar_prefix_ownership(path, hdf5_signature_offset, config=config)
+                    if _has_supported_tar_compression_wrapper(Path(path))
+                    else classify_raw_tar_prefix_ownership(path, hdf5_signature_offset, config=config)
+                )
             if hdf5_tar_prefix_ownership in {"scan_limit", "incomplete", "inconclusive"}:
                 config = dict(config)
                 config["cache_enabled"] = False
@@ -7019,9 +7059,27 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
             assert hdf5_signature_offset is not None
             supplemental_config = dict(config)
-            supplemental_config[COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY] = hdf5_signature_offset
-            supplemental_config[ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY] = True
-            supplemental_config[COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY] = True
+            assert hdf5_compressed_prefix_ownership is not None
+            if hdf5_compressed_prefix_ownership == "complete":
+                supplemental_config[COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY] = hdf5_signature_offset
+                supplemental_config[ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY] = True
+                supplemental_config[COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY] = True
+            else:
+                supplemental_config["cache_enabled"] = False
+                _mark_inconclusive_scan_outcome(result, _HDF5_COMPRESSED_PREFIX_OWNERSHIP_INCOMPLETE_REASON)
+                result.add_check(
+                    name="HDF5 User-Block Compressed Ownership",
+                    passed=False,
+                    message="The HDF5 user-block does not contain a provably complete compressed stream",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": _HDF5_COMPRESSED_PREFIX_OWNERSHIP_INCOMPLETE_REASON,
+                        "ownership_state": hdf5_compressed_prefix_ownership,
+                    },
+                )
+                result.success = False
         elif hdf5_userblock_supplemental_scanner_id in {"nemo", "tar"}:
             from modelaudit.scanners.tar_scanner import TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY
 

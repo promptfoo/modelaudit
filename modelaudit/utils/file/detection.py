@@ -6799,12 +6799,37 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
 
     try:
         seekable_raw_tar_route = not _has_supported_tar_compression_wrapper(file_path)
-        tar_mode: Literal["r:", "r|*"] = "r:" if seekable_raw_tar_route else "r|*"
-        with tarfile.open(
-            file_path,
-            tar_mode,
-            tarinfo=bounded_tar_info_class(_NEMO_ROUTE_MAX_METADATA_BYTES),
-        ) as archive:
+        with ExitStack() as stack:
+            if seekable_raw_tar_route:
+                archive = stack.enter_context(
+                    tarfile.open(
+                        file_path,
+                        "r:",
+                        tarinfo=bounded_tar_info_class(_NEMO_ROUTE_MAX_METADATA_BYTES),
+                    )
+                )
+            else:
+                prefix = read_magic_bytes(str(file_path), len(_XZ_MAGIC))
+                if prefix.startswith(_GZIP_MAGIC) and len(prefix) > 3 and prefix[3] & 0x04:
+                    # tarfile's stream-mode gzip parser mishandles some valid
+                    # FEXTRA layouts; use the stdlib gzip reader for that case.
+                    raw = stack.enter_context(file_path.open("rb"))
+                    decompressed = cast(BinaryIO, stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb")))
+                    archive = stack.enter_context(
+                        tarfile.open(
+                            fileobj=decompressed,
+                            mode="r|",
+                            tarinfo=bounded_tar_info_class(_NEMO_ROUTE_MAX_METADATA_BYTES),
+                        )
+                    )
+                else:
+                    archive = stack.enter_context(
+                        tarfile.open(
+                            file_path,
+                            "r|*",
+                            tarinfo=bounded_tar_info_class(_NEMO_ROUTE_MAX_METADATA_BYTES),
+                        )
+                    )
             if file_path.suffix.lower() == ".nemo":
                 return "tar"
             members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
@@ -6850,8 +6875,13 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
                                 link_resolution_budget,
                             ):
                                 return "nemo"
-                            if not allow_incomplete_generic_tar_route and find_hdf5_signature_offset(path) is not None:
-                                return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+                            hdf5_signature_offset = find_hdf5_signature_offset(path)
+                            if not allow_incomplete_generic_tar_route and hdf5_signature_offset is not None:
+                                from ...scanners.tar_scanner import classify_compressed_tar_prefix_ownership
+
+                                ownership = classify_compressed_tar_prefix_ownership(path, hdf5_signature_offset)
+                                if ownership != "incomplete":
+                                    return NEMO_ROUTING_INCONCLUSIVE_FORMAT
                             return "tar"
                         body_skip_budget -= member_size
                 elif member.issym():

@@ -2497,7 +2497,7 @@ def classify_raw_tar_prefix_ownership(
                     return "complete" if scanner._raw_tar_has_complete_end_marker(archive) else "incomplete"
                 entry_count += 1
                 if entry_count > scanner.max_entries:
-                    return "inconclusive"
+                    return "scan_limit"
                 padded_member_end = (
                     member.offset_data
                     + ((max(member.size, 0) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
