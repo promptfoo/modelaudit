@@ -9044,7 +9044,7 @@ def test_hdf5_userblock_compressed_padding_limit_fails_closed(tmp_path: Path) ->
     model_path = tmp_path / "gzip-padding-limit-userblock.h5"
     userblock_size = _write_compressed_hdf5_userblock(
         model_path,
-        pickle.dumps({"weights": [1]}, protocol=0),
+        _build_malicious_pickle(protocol=0),
         codec="gzip",
     )
     config = {
@@ -9061,12 +9061,44 @@ def test_hdf5_userblock_compressed_padding_limit_fails_closed(tmp_path: Path) ->
     assert result.scanner_name == "keras_h5"
     assert "compressed" in result.metadata["supplemental_scanners"]
     assert "hdf5_compressed_prefix_ownership_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "compressed_padding_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
     assert any(
         check.name == "HDF5 User-Block Compressed Ownership"
         and check.status == CheckStatus.FAILED
         and check.details["ownership_state"] == "scan_limit"
         for check in result.checks
     )
+
+
+def test_hdf5_userblock_compressed_size_limit_preserves_earlier_member_finding(tmp_path: Path) -> None:
+    model_path = tmp_path / "gzip-size-limit-userblock.h5"
+    malicious_payload = _build_malicious_pickle(protocol=0)
+    userblock_size = _write_compressed_hdf5_userblock(
+        model_path,
+        malicious_payload,
+        codec="gzip",
+    )
+    concatenated_payload = gzip.compress(malicious_payload, mtime=0) + gzip.compress(b"A" * 4096, mtime=0)
+    with model_path.open("r+b") as handle:
+        handle.write(concatenated_payload)
+    config = {
+        "cache_enabled": False,
+        "compressed_max_decompressed_bytes": len(malicious_payload) + 64,
+        "compressed_max_decompression_ratio": 100_000.0,
+    }
+
+    from modelaudit.scanners.compressed_scanner import classify_compressed_prefix_ownership
+
+    assert classify_compressed_prefix_ownership(str(model_path), userblock_size, config=config) == "scan_limit"
+
+    result = scan_file(str(model_path), config=config)
+
+    assert result.scanner_name == "keras_h5"
+    assert "compressed" in result.metadata["supplemental_scanners"]
+    assert "hdf5_compressed_prefix_ownership_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "compressed_decompression_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 @pytest.mark.parametrize("target", ["torch.nn.Linear", "os.system"], ids=["benign", "malicious"])
@@ -9236,6 +9268,76 @@ def test_raw_tar_hdf5_entry_limit_preserves_early_nemo_finding(tmp_path: Path) -
     assert "nemo" in result.metadata["supplemental_scanners"]
     assert "tar_entry_count_limit_exceeded" in result.metadata["scan_outcome_reasons"]
     assert "hdf5_tar_prefix_ownership_incomplete" not in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in result.checks
+    )
+
+
+def test_raw_tar_hdf5_padding_limit_preserves_early_nemo_finding(tmp_path: Path) -> None:
+    model_path = tmp_path / "raw-nemo-padding-limit.h5"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")],
+    )
+    config = {
+        "cache_enabled": False,
+        "compressed_max_xz_padding_bytes": 64,
+    }
+
+    from modelaudit.scanners.tar_scanner import classify_raw_tar_prefix_ownership
+
+    assert classify_raw_tar_prefix_ownership(str(model_path), userblock_size, config=config) == "scan_limit"
+
+    result = scan_file(str(model_path), config=config)
+
+    assert result.scanner_name == "keras_h5"
+    assert "nemo" in result.metadata["supplemental_scanners"]
+    assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in result.checks
+    )
+
+
+def test_raw_tar_hdf5_metadata_limit_preserves_early_nemo_finding(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "raw-nemo-metadata-limit.h5"
+    userblock_size = 1024 * 1024
+    with h5py.File(model_path, "w", userblock_size=userblock_size) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense"}]}},
+        )
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        config_payload = b"model:\n  _target_: os.system\n  command: echo pwned\n"
+        config_info = tarfile.TarInfo("model_config.yaml")
+        config_info.size = len(config_payload)
+        archive.addfile(config_info, io.BytesIO(config_payload))
+        metadata_info = tarfile.TarInfo("weights.bin")
+        metadata_info.pax_headers = {"comment": "A" * (80 * 1024)}
+        archive.addfile(metadata_info, io.BytesIO(b""))
+    assert tar_payload.tell() < userblock_size
+    with model_path.open("r+b") as handle:
+        handle.write(tar_payload.getvalue())
+    config = {
+        "cache_enabled": False,
+        "max_tar_metadata_bytes": 64 * 1024,
+    }
+
+    from modelaudit.scanners.tar_scanner import classify_raw_tar_prefix_ownership
+
+    assert classify_raw_tar_prefix_ownership(str(model_path), userblock_size, config=config) == "scan_limit"
+
+    result = scan_file(str(model_path), config=config)
+
+    assert result.scanner_name == "keras_h5"
+    assert "nemo" in result.metadata["supplemental_scanners"]
+    assert "tar_metadata_read_limit_exceeded" in result.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "CVE-2025-23304: Dangerous Hydra _target_"
         and check.status == CheckStatus.FAILED

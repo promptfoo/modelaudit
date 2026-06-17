@@ -7055,16 +7055,19 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY,
                 COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY,
                 COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY,
+                PRESERVE_LIMITED_PREFIX_PAYLOAD_CONFIG_KEY,
             )
 
             assert hdf5_signature_offset is not None
             supplemental_config = dict(config)
             assert hdf5_compressed_prefix_ownership is not None
-            if hdf5_compressed_prefix_ownership == "complete":
+            if hdf5_compressed_prefix_ownership in {"complete", "scan_limit"}:
                 supplemental_config[COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY] = hdf5_signature_offset
                 supplemental_config[ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY] = True
                 supplemental_config[COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY] = True
-            else:
+                if hdf5_compressed_prefix_ownership == "scan_limit":
+                    supplemental_config[PRESERVE_LIMITED_PREFIX_PAYLOAD_CONFIG_KEY] = True
+            if hdf5_compressed_prefix_ownership != "complete":
                 supplemental_config["cache_enabled"] = False
                 _mark_inconclusive_scan_outcome(result, _HDF5_COMPRESSED_PREFIX_OWNERSHIP_INCOMPLETE_REASON)
                 result.add_check(

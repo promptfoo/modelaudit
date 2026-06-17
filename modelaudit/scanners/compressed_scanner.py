@@ -29,6 +29,7 @@ ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY = "_compressed_allow_safetensors
 COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY = "_compressed_source_size_limit"
 ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY = "_compressed_allow_zero_padding_trailing"
 COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY = "_compressed_prefix_ownership"
+PRESERVE_LIMITED_PREFIX_PAYLOAD_CONFIG_KEY = "_compressed_preserve_limited_prefix_payload"
 DEFAULT_MAX_ZERO_PADDING_BYTES = 10 * 1024 * 1024
 CompressedPrefixOwnership = Literal["complete", "scan_limit", "incomplete", "inconclusive"]
 
@@ -43,6 +44,26 @@ class _CompressedMemberLimitExceeded(_DecompressionLimitExceeded):
 
 class _CompressedPaddingLimitExceeded(_DecompressionLimitExceeded):
     """Raised when accepted wrapper padding exceeds the bounded scan budget."""
+
+
+class _PreservedCompressedScanLimit(_DecompressionLimitExceeded):
+    """Carry bounded decompressed output so reachable findings survive a scan limit."""
+
+    def __init__(
+        self,
+        cause: _DecompressionLimitExceeded,
+        *,
+        aggregate_path: str,
+        member_paths: list[str],
+        decompressed_bytes: int,
+        compressed_size: int,
+    ) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.aggregate_path = aggregate_path
+        self.member_paths = member_paths
+        self.decompressed_bytes = decompressed_bytes
+        self.compressed_size = compressed_size
 
 
 class _CorruptStreamError(ValueError):
@@ -203,6 +224,8 @@ class CompressedScanner(BaseScanner):
                 stripped = chunk.rstrip(b"\x00")
                 trailing_zeros += len(chunk) - len(stripped)
                 if max(trailing_zeros - self._MAX_CODEC_TRAILER_BYTES, 0) > self.max_zero_padding_bytes:
+                    if self.config.get(PRESERVE_LIMITED_PREFIX_PAYLOAD_CONFIG_KEY):
+                        return source_size
                     raise _CompressedPaddingLimitExceeded(
                         "Compressed zero padding exceeded limit "
                         f"({max(trailing_zeros - self._MAX_CODEC_TRAILER_BYTES, 0)} > "
@@ -915,6 +938,24 @@ class CompressedScanner(BaseScanner):
                     )
                 else:
                     raise _CorruptStreamError(f"Unsupported compression codec: {codec}")
+        except _DecompressionLimitExceeded as exc:
+            if self.config.get(PRESERVE_LIMITED_PREFIX_PAYLOAD_CONFIG_KEY):
+                outputs.close()
+                decompressed_bytes = os.path.getsize(outputs.aggregate_path)
+                if decompressed_bytes > 0:
+                    raise _PreservedCompressedScanLimit(
+                        exc,
+                        aggregate_path=outputs.aggregate_path,
+                        member_paths=outputs.member_paths,
+                        decompressed_bytes=decompressed_bytes,
+                        compressed_size=max(projected_compressed_size, 1),
+                    ) from exc
+                for temp_path in [outputs.aggregate_path, *outputs.member_paths]:
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+            else:
+                outputs.cleanup()
+            raise
         except Exception:
             outputs.cleanup()
             raise
@@ -1059,6 +1100,131 @@ class CompressedScanner(BaseScanner):
             ):
                 return
 
+    def _merge_decompressed_payload_results(
+        self,
+        *,
+        path: str,
+        temp_path: str,
+        member_temp_paths: list[str],
+        decompressed_bytes: int,
+        depth: int,
+        result: ScanResult,
+    ) -> None:
+        """Route bounded decompressed output and merge every reachable finding."""
+        nested_config = dict(self.config)
+        nested_config.pop(ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY, None)
+        nested_config.pop(ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY, None)
+        nested_config.pop(COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY, None)
+        nested_config.pop(COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY, None)
+        nested_config.pop(PRESERVE_LIMITED_PREFIX_PAYLOAD_CONFIG_KEY, None)
+        nested_config["_compressed_depth"] = depth + 1
+        nested_config["_archive_depth"] = depth + 1
+        # Extracted temp paths are removed after this scan and cannot yield reusable cache entries.
+        nested_config["cache_enabled"] = False
+        logical_wrapper_name = self.config.get(self._LOGICAL_WRAPPER_NAME_CONFIG, path)
+        if not isinstance(logical_wrapper_name, str) or not logical_wrapper_name:
+            logical_wrapper_name = path
+        security_name = self._derive_inner_security_name(logical_wrapper_name)
+        nested_config[self._LOGICAL_WRAPPER_NAME_CONFIG] = security_name
+        inner_result = core.scan_file(temp_path, nested_config)
+
+        inner_display = self._derive_inner_display_name(path)
+        provenance = f"{path} -> {inner_display}"
+        self._rewrite_inner_locations(inner_result, temp_path, provenance)
+        self._scan_decompressed_payload_security(
+            path=path,
+            security_name=security_name,
+            provenance=provenance,
+            temp_path=temp_path,
+            member_temp_paths=member_temp_paths,
+            decompressed_bytes=decompressed_bytes,
+            inner_owns_executable_content=(
+                len(member_temp_paths) == 1 and inner_result.scanner_name == "llamafile" and inner_result.success
+            ),
+            sniff_python_source=bool(self.config.get(ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY)),
+            result=result,
+        )
+
+        result.add_check(
+            name="Compressed Wrapper Inner Scanner Routing",
+            passed=True,
+            message=f"Routed decompressed payload to scanner: {inner_result.scanner_name}",
+            location=path,
+            details={"inner_scanner": inner_result.scanner_name, "provenance": provenance},
+        )
+
+        result.merge_member_result(inner_result, inner_display)
+        if len(member_temp_paths) > 1:
+            for member_index, member_temp_path in enumerate(member_temp_paths, start=1):
+                member_result = core.scan_file(member_temp_path, nested_config)
+                if self._is_transport_fragment_member(inner_result, member_result):
+                    continue
+                member_provenance = f"{provenance}#member-{member_index}"
+                member_identity = f"{inner_display}#member-{member_index}"
+                self._rewrite_inner_locations(member_result, member_temp_path, member_provenance)
+                result.add_check(
+                    name="Compressed Wrapper Member Scanner Routing",
+                    passed=True,
+                    message=f"Routed decompressed member {member_index} to scanner: {member_result.scanner_name}",
+                    location=path,
+                    details={
+                        "inner_scanner": member_result.scanner_name,
+                        "member_index": member_index,
+                        "provenance": member_provenance,
+                    },
+                )
+                result.merge_member_result(member_result, member_identity)
+
+    def _record_decompression_limit_failure(
+        self,
+        result: ScanResult,
+        path: str,
+        codec: str,
+        exc: _DecompressionLimitExceeded,
+    ) -> None:
+        """Record the precise fail-closed reason after retaining reachable findings."""
+        if isinstance(exc, _CompressedMemberLimitExceeded):
+            reason = self._MEMBER_LIMIT_INCONCLUSIVE_REASON
+            severity = IssueSeverity.INFO
+            check_name = "Compressed Wrapper Decompression Limits"
+            details = {
+                "codec": codec,
+                "max_decompressed_bytes": self.max_decompressed_bytes,
+                "max_decompression_ratio": self.max_decompression_ratio,
+                "max_compressed_members": self.max_members,
+            }
+        elif isinstance(exc, _CompressedPaddingLimitExceeded):
+            reason = self._PADDING_LIMIT_INCONCLUSIVE_REASON
+            severity = IssueSeverity.INFO
+            check_name = "Compressed Wrapper Padding Limit"
+            details = {
+                "codec": codec,
+                "max_zero_padding_bytes": self.max_zero_padding_bytes,
+            }
+        else:
+            reason = self._DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON
+            severity = IssueSeverity.WARNING
+            check_name = "Compressed Wrapper Decompression Limits"
+            details = {
+                "codec": codec,
+                "max_decompressed_bytes": self.max_decompressed_bytes,
+                "max_decompression_ratio": self.max_decompression_ratio,
+                "max_compressed_members": self.max_members,
+            }
+        mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name=check_name,
+            passed=False,
+            message=f"{exc}; analysis incomplete",
+            severity=severity,
+            location=path,
+            details={
+                **details,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -1187,68 +1353,14 @@ class CompressedScanner(BaseScanner):
                 },
             )
 
-            nested_config = dict(self.config)
-            nested_config.pop(ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY, None)
-            nested_config.pop(ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY, None)
-            nested_config.pop(COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY, None)
-            nested_config.pop(COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY, None)
-            nested_config["_compressed_depth"] = depth + 1
-            nested_config["_archive_depth"] = depth + 1
-            # Extracted temp paths are removed after this scan and cannot yield reusable cache entries.
-            nested_config["cache_enabled"] = False
-            logical_wrapper_name = self.config.get(self._LOGICAL_WRAPPER_NAME_CONFIG, path)
-            if not isinstance(logical_wrapper_name, str) or not logical_wrapper_name:
-                logical_wrapper_name = path
-            security_name = self._derive_inner_security_name(logical_wrapper_name)
-            nested_config[self._LOGICAL_WRAPPER_NAME_CONFIG] = security_name
-            inner_result = core.scan_file(temp_path, nested_config)
-
-            inner_display = self._derive_inner_display_name(path)
-            provenance = f"{path} -> {inner_display}"
-            self._rewrite_inner_locations(inner_result, temp_path, provenance)
-            self._scan_decompressed_payload_security(
+            self._merge_decompressed_payload_results(
                 path=path,
-                security_name=security_name,
-                provenance=provenance,
                 temp_path=temp_path,
                 member_temp_paths=member_temp_paths,
                 decompressed_bytes=decompressed_bytes,
-                inner_owns_executable_content=(
-                    len(member_temp_paths) == 1 and inner_result.scanner_name == "llamafile" and inner_result.success
-                ),
-                sniff_python_source=bool(self.config.get(ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY)),
+                depth=depth,
                 result=result,
             )
-
-            result.add_check(
-                name="Compressed Wrapper Inner Scanner Routing",
-                passed=True,
-                message=f"Routed decompressed payload to scanner: {inner_result.scanner_name}",
-                location=path,
-                details={"inner_scanner": inner_result.scanner_name, "provenance": provenance},
-            )
-
-            result.merge_member_result(inner_result, inner_display)
-            if len(member_temp_paths) > 1:
-                for member_index, member_temp_path in enumerate(member_temp_paths, start=1):
-                    member_result = core.scan_file(member_temp_path, nested_config)
-                    if self._is_transport_fragment_member(inner_result, member_result):
-                        continue
-                    member_provenance = f"{provenance}#member-{member_index}"
-                    member_identity = f"{inner_display}#member-{member_index}"
-                    self._rewrite_inner_locations(member_result, member_temp_path, member_provenance)
-                    result.add_check(
-                        name="Compressed Wrapper Member Scanner Routing",
-                        passed=True,
-                        message=(f"Routed decompressed member {member_index} to scanner: {member_result.scanner_name}"),
-                        location=path,
-                        details={
-                            "inner_scanner": member_result.scanner_name,
-                            "member_index": member_index,
-                            "provenance": member_provenance,
-                        },
-                    )
-                    result.merge_member_result(member_result, member_identity)
             result.bytes_scanned += source_size
         except _MissingOptionalDependencyError as exc:
             mark_inconclusive_scan_result(result, self._OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON)
@@ -1267,59 +1379,44 @@ class CompressedScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
-        except _CompressedMemberLimitExceeded as exc:
-            mark_inconclusive_scan_result(result, self._MEMBER_LIMIT_INCONCLUSIVE_REASON)
-            result.add_check(
-                name="Compressed Wrapper Decompression Limits",
-                passed=False,
-                message=f"{exc}; analysis incomplete",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "codec": expected_codec,
-                    "max_decompressed_bytes": self.max_decompressed_bytes,
-                    "max_decompression_ratio": self.max_decompression_ratio,
-                    "max_compressed_members": self.max_members,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": self._MEMBER_LIMIT_INCONCLUSIVE_REASON,
-                },
+        except _PreservedCompressedScanLimit as exc:
+            routed_temp_paths = self._route_tokenizer_extensionless_or_bin(
+                path,
+                [exc.aggregate_path, *exc.member_paths],
             )
-            result.finish(success=False)
-            return result
-        except _CompressedPaddingLimitExceeded as exc:
-            mark_inconclusive_scan_result(result, self._PADDING_LIMIT_INCONCLUSIVE_REASON)
-            result.add_check(
-                name="Compressed Wrapper Padding Limit",
-                passed=False,
-                message=f"{exc}; analysis incomplete",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "codec": expected_codec,
-                    "max_zero_padding_bytes": self.max_zero_padding_bytes,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": self._PADDING_LIMIT_INCONCLUSIVE_REASON,
-                },
-            )
+            temp_path = routed_temp_paths[0]
+            member_temp_paths = routed_temp_paths[1:]
+            temp_paths = routed_temp_paths
+            result.metadata["decompressed_bytes"] = exc.decompressed_bytes
+            result.metadata["compressed_member_count"] = len(member_temp_paths)
+            result.metadata["compressed_bytes_before_limit"] = exc.compressed_size
+            try:
+                self._merge_decompressed_payload_results(
+                    path=path,
+                    temp_path=temp_path,
+                    member_temp_paths=member_temp_paths,
+                    decompressed_bytes=exc.decompressed_bytes,
+                    depth=depth,
+                    result=result,
+                )
+            except Exception as payload_exc:
+                result.add_check(
+                    name="Compressed Wrapper Limited Payload Scan",
+                    passed=False,
+                    message=f"Error scanning bounded payload retained before wrapper limit: {payload_exc}",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "exception_type": type(payload_exc).__name__,
+                        "analysis_incomplete": True,
+                    },
+                )
+            self._record_decompression_limit_failure(result, path, expected_codec, exc.cause)
+            result.bytes_scanned += source_size
             result.finish(success=False)
             return result
         except _DecompressionLimitExceeded as exc:
-            mark_inconclusive_scan_result(result, self._DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON)
-            result.add_check(
-                name="Compressed Wrapper Decompression Limits",
-                passed=False,
-                message=f"{exc}; analysis incomplete",
-                severity=IssueSeverity.WARNING,
-                location=path,
-                details={
-                    "codec": expected_codec,
-                    "max_decompressed_bytes": self.max_decompressed_bytes,
-                    "max_decompression_ratio": self.max_decompression_ratio,
-                    "max_compressed_members": self.max_members,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": self._DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON,
-                },
-            )
+            self._record_decompression_limit_failure(result, path, expected_codec, exc)
             result.finish(success=False)
             return result
         except _CorruptStreamError as exc:

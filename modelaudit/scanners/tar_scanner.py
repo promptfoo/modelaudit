@@ -399,6 +399,7 @@ class TarScanner(BaseScanner):
             self.config.get("max_tar_metadata_bytes"),
             DEFAULT_MAX_TAR_METADATA_BYTES,
         )
+        self._raw_tar_end_marker_scan_limit_exceeded = False
         configured_source_limit = self.config.get(TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY)
         self.source_size_limit = (
             configured_source_limit
@@ -1136,6 +1137,7 @@ class TarScanner(BaseScanner):
 
                 checked_bytes += range_end - range_start
                 if checked_bytes > self.max_xz_padding_bytes:
+                    self._raw_tar_end_marker_scan_limit_exceeded = True
                     return False
 
                 file_obj.seek(range_start)
@@ -1157,6 +1159,7 @@ class TarScanner(BaseScanner):
 
     def _raw_tar_has_complete_end_marker(self, tar: tarfile.TarFile) -> bool:
         """Validate raw TAR EOF and bounded zero-only record padding."""
+        self._raw_tar_end_marker_scan_limit_exceeded = False
         file_obj = cast(BinaryIO, tar.fileobj)
         file_obj.seek(tar.offset)
         if file_obj.read(2 * tarfile.BLOCKSIZE) != b"\0" * (2 * tarfile.BLOCKSIZE):
@@ -1183,6 +1186,7 @@ class TarScanner(BaseScanner):
                     return False
                 checked_bytes += hole_offset - data_offset
                 if checked_bytes > self.max_xz_padding_bytes:
+                    self._raw_tar_end_marker_scan_limit_exceeded = True
                     return False
                 file_obj.seek(data_offset)
                 remaining = hole_offset - data_offset
@@ -1204,7 +1208,10 @@ class TarScanner(BaseScanner):
         tail_size = 0
         while chunk := file_obj.read(min(ARCHIVE_MEMBER_COPY_CHUNK_BYTES, self.max_xz_padding_bytes - tail_size + 1)):
             tail_size += len(chunk)
-            if tail_size > self.max_xz_padding_bytes or any(chunk):
+            if any(chunk):
+                return False
+            if tail_size > self.max_xz_padding_bytes:
+                self._raw_tar_end_marker_scan_limit_exceeded = True
                 return False
         return True
 
@@ -1545,7 +1552,7 @@ class TarScanner(BaseScanner):
                                     f"Raw TAR traversal stopped without a two-block end marker at offset {tar.offset}"
                                 ),
                             )
-                            break
+                            return False
                         if compression_codec is not None and bounded_stream is not None:
                             tail_complete = self._drain_compressed_tar_tail(
                                 tar,
@@ -2494,7 +2501,9 @@ def classify_raw_tar_prefix_ownership(
             while True:
                 member = archive.next()
                 if member is None:
-                    return "complete" if scanner._raw_tar_has_complete_end_marker(archive) else "incomplete"
+                    if scanner._raw_tar_has_complete_end_marker(archive):
+                        return "complete"
+                    return "scan_limit" if scanner._raw_tar_end_marker_scan_limit_exceeded else "incomplete"
                 entry_count += 1
                 if entry_count > scanner.max_entries:
                     return "scan_limit"
@@ -2504,6 +2513,8 @@ def classify_raw_tar_prefix_ownership(
                 )
                 if padded_member_end > boundary:
                     return "embedded_member"
+    except _TarStreamBudgetExceeded:
+        return "scan_limit"
     except (EOFError, OSError, tarfile.TarError, ValueError):
         return "inconclusive"
 
