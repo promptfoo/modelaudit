@@ -8904,12 +8904,16 @@ def test_scan_file_preserves_keras_finding_for_inconclusive_tar_inside_valid_hdf
     assert determine_exit_code(aggregate_result) == 1
 
 
-def test_scan_file_preserves_nemo_finding_inside_valid_hdf5_userblock(tmp_path: Path) -> None:
-    model_path = tmp_path / "nemo-tar-userblock.h5"
+@pytest.mark.parametrize("target", ["torch.nn.Linear", "os.system"], ids=["benign", "malicious"])
+def test_scan_file_bounds_complete_raw_nemo_tar_inside_valid_hdf5_userblock(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    model_path = tmp_path / f"nemo-raw-tar-userblock-{target.rsplit('.', 1)[-1]}.h5"
     userblock_size = _write_tar_hdf5_userblock(
         model_path,
         [
-            ("model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n"),
+            ("model_config.yaml", f"model:\n  _target_: {target}\n".encode()),
             ("weights.bin", b"benign weights"),
         ],
     )
@@ -8919,12 +8923,122 @@ def test_scan_file_preserves_nemo_finding_inside_valid_hdf5_userblock(tmp_path: 
 
     result = scan_file(str(model_path), config={"cache_enabled": False})
 
+    assert result.scanner_name == "keras_h5"
+    assert "nemo" in result.metadata["supplemental_scanners"]
     assert any(
         check.name == "CVE-2025-23304: Dangerous Hydra _target_"
         and check.status == CheckStatus.FAILED
         and check.details["target"] == "os.system"
         for check in result.checks
+    ) is (target == "os.system")
+    assert "hdf5_tar_prefix_ownership_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "tar_analysis_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+@pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
+def test_scan_file_bounds_complete_raw_tar_inside_valid_hdf5_userblock(
+    tmp_path: Path,
+    malicious: bool,
+) -> None:
+    model_path = tmp_path / f"raw-tar-userblock-{'malicious' if malicious else 'benign'}.tar"
+    pickle_payload = _build_malicious_pickle(protocol=0) if malicious else pickle.dumps({"weights": [1]}, protocol=0)
+    userblock_size = _write_tar_hdf5_userblock(model_path, [("payload.pkl", pickle_payload)])
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == "tar"
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    pickle_checks = [
+        check for check in result.checks if check.rule_code == "S201" and check.status == CheckStatus.FAILED
+    ]
+    assert result.scanner_name == "keras_h5"
+    assert "tar" in result.metadata["supplemental_scanners"]
+    assert bool(pickle_checks) is malicious
+    assert "hdf5_tar_prefix_ownership_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "tar_analysis_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+@pytest.mark.parametrize("target", ["torch.nn.Linear", "os.system"], ids=["benign", "malicious"])
+def test_scan_file_bounds_compressed_nemo_tar_inside_valid_hdf5_userblock(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    model_path = tmp_path / f"nemo-compressed-tar-userblock-{target.rsplit('.', 1)[-1]}.h5"
+    userblock_size = _write_tar_hdf5_userblock(
+        model_path,
+        [
+            ("model_config.yaml", f"model:\n  _target_: {target}\n".encode()),
+            ("weights.bin", b"benign weights"),
+        ],
+        compressed=True,
     )
+
+    assert find_hdf5_signature_offset(str(model_path)) == userblock_size
+    assert file_detection.detect_file_format(str(model_path)) == "nemo"
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert "nemo" in result.metadata["supplemental_scanners"]
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in result.checks
+    ) is (target == "os.system")
+    assert "tar_compressed_trailing_data" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "tar_analysis_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+@pytest.mark.parametrize("high_ratio", [False, True], ids=["within-limit", "ratio-bomb"])
+def test_hdf5_userblock_padding_does_not_inflate_compressed_tar_ratio_denominator(
+    tmp_path: Path,
+    high_ratio: bool,
+) -> None:
+    model_path = tmp_path / f"userblock-ratio-{'bomb' if high_ratio else 'safe'}.tar.gz"
+    payload = b"A" * (12 * 1024 * 1024) if high_ratio else os.urandom(128 * 1024)
+    userblock_size = _write_tar_hdf5_userblock(model_path, [("weights.bin", payload)], compressed=True)
+
+    result = scan_file(
+        str(model_path),
+        config={
+            "cache_enabled": False,
+            "compressed_max_decompressed_bytes": 64 * 1024 * 1024,
+            "compressed_max_decompression_ratio": 20.0,
+            "max_tar_total_uncompressed_size": 64 * 1024 * 1024,
+        },
+    )
+
+    ratio_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+    assert ratio_checks
+    assert any(check.status == CheckStatus.FAILED for check in ratio_checks) is high_ratio
+    final_check = ratio_checks[-1]
+    assert final_check.details["compressed_size"] < userblock_size
+    assert (final_check.details["actual_ratio"] > 20.0) is high_ratio
+
+
+def test_scan_file_fails_closed_when_raw_hdf5_tar_prefix_ownership_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "inconclusive-raw-tar-userblock.h5"
+    _write_tar_hdf5_userblock(
+        model_path,
+        [("model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")],
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.tar_scanner.classify_raw_tar_prefix_ownership",
+        lambda *_args, **_kwargs: "inconclusive",
+    )
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert "nemo" not in result.metadata.get("supplemental_scanners", [])
+    assert result.success is False
+    assert "hdf5_tar_prefix_ownership_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "HDF5 User-Block TAR Ownership" for check in result.checks)
 
 
 @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
@@ -8958,7 +9072,11 @@ def test_explicit_compressed_tar_hdf5_overlap_preserves_top_level_and_nested_tar
     assert file_detection.detect_file_format_from_magic(str(model_path)) == "tar"
     assert file_detection.detect_file_format_for_skip_filter(str(model_path)) == "tar"
 
-    top_level = scan_file(str(model_path), config={"cache_enabled": False})
+    overlap_config = {
+        "cache_enabled": False,
+        "compressed_max_decompression_ratio": 100_000.0,
+    }
+    top_level = scan_file(str(model_path), config=overlap_config)
 
     top_level_pickle_checks = [
         check for check in top_level.checks if check.rule_code == "S201" and check.status == CheckStatus.FAILED
@@ -8973,7 +9091,7 @@ def test_explicit_compressed_tar_hdf5_overlap_preserves_top_level_and_nested_tar
     with zipfile.ZipFile(outer_path, "w") as archive:
         archive.write(model_path, arcname="models/payload.tar.gz")
 
-    nested = scan_file(str(outer_path), config={"cache_enabled": False})
+    nested = scan_file(str(outer_path), config=overlap_config)
     nested_pickle_checks = [
         check for check in nested.checks if check.rule_code == "S201" and check.status == CheckStatus.FAILED
     ]

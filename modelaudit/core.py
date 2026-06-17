@@ -190,6 +190,7 @@ _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
 _DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
 _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON = "tar_compressed_stream_incomplete"
+_HDF5_TAR_PREFIX_OWNERSHIP_INCOMPLETE_REASON = "hdf5_tar_prefix_ownership_incomplete"
 _STREAMING_SOURCE_INTERRUPTED_REASON = "streaming_source_interrupted"
 
 
@@ -6939,19 +6940,46 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         and hdf5_userblock_supplemental_scanner_id not in safetensors_overlap_scanner_ids
     ):
         supplemental_config = config
-        if hdf5_userblock_supplemental_scanner_id == "tar" and _has_supported_tar_compression_wrapper(Path(path)):
-            from modelaudit.scanners.tar_scanner import TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY
+        supplemental_ownership_inconclusive = False
+        if hdf5_userblock_supplemental_scanner_id in {"nemo", "tar"}:
+            from modelaudit.scanners.tar_scanner import (
+                TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY,
+                classify_raw_tar_prefix_ownership,
+            )
 
-            supplemental_config = dict(config)
-            supplemental_config[TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY] = hdf5_signature_offset
-        _merge_supplemental_scanner_analysis(
-            path,
-            result,
-            supplemental_config,
-            scanner_selection,
-            hdf5_userblock_supplemental_scanner_id,
-            context="HDF5 user-block content analysis",
-        )
+            assert hdf5_signature_offset is not None
+            tar_prefix_ownership = (
+                "complete"
+                if _has_supported_tar_compression_wrapper(Path(path))
+                else classify_raw_tar_prefix_ownership(path, hdf5_signature_offset, config=config)
+            )
+            if tar_prefix_ownership == "complete":
+                supplemental_config = dict(config)
+                supplemental_config[TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY] = hdf5_signature_offset
+            elif tar_prefix_ownership == "inconclusive":
+                supplemental_ownership_inconclusive = True
+                _mark_inconclusive_scan_outcome(result, _HDF5_TAR_PREFIX_OWNERSHIP_INCOMPLETE_REASON)
+                result.add_check(
+                    name="HDF5 User-Block TAR Ownership",
+                    passed=False,
+                    message="Could not prove whether the HDF5 user-block contains a complete TAR archive",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": _HDF5_TAR_PREFIX_OWNERSHIP_INCOMPLETE_REASON,
+                    },
+                )
+                result.success = False
+        if not supplemental_ownership_inconclusive:
+            _merge_supplemental_scanner_analysis(
+                path,
+                result,
+                supplemental_config,
+                scanner_selection,
+                hdf5_userblock_supplemental_scanner_id,
+                context="HDF5 user-block content analysis",
+            )
 
     if ext == ".bin" and header_format == "pytorch_binary" and result.scanner_name == "pytorch_binary":
         _merge_pytorch_binary_supplemental_analysis(

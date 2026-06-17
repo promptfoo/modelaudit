@@ -12,7 +12,7 @@ import re
 import tarfile
 import tempfile
 from collections.abc import Iterator
-from typing import Any, BinaryIO, ClassVar
+from typing import Any, BinaryIO, ClassVar, cast
 
 from ..core_results import (
     OPERATIONAL_ERROR_REASON_METADATA_KEY,
@@ -37,9 +37,11 @@ from .tar_scanner import (
     TAR_ENTRY_COUNT_INCOMPLETE_REASON,
     TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY,
     TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY,
+    TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY,
     TarScanner,
     _tar_shared_scan_budget_exhausted,
     _tar_shared_scan_budget_scope,
+    _TarSourcePrefixFile,
 )
 
 try:
@@ -1441,7 +1443,15 @@ class NemoScanner(BaseScanner):
         shared_budget = tar_scanner._get_or_create_shared_budget()
         initial_member_bytes = shared_budget.member_bytes_consumed
         initial_budget_exhausted = shared_budget.exhausted
-        archive_file = open(path, "rb")  # noqa: SIM115 - descriptor spans preflight and analysis.
+        archive_file: BinaryIO = open(path, "rb")  # noqa: SIM115 - descriptor spans preflight and analysis.
+        if tar_scanner.source_size_limit is not None:
+            archive_file = cast(
+                BinaryIO,
+                _TarSourcePrefixFile(
+                    archive_file,
+                    tar_scanner._effective_source_size(path, archive_file),
+                ),
+            )
         try:
             initial_archive_identity = self._archive_identity(os.fstat(archive_file.fileno()))
             preflight_succeeded = tar_scanner._preflight_tar_archive(
@@ -3086,7 +3096,9 @@ class NemoScanner(BaseScanner):
             return
 
         try:
-            scanner = _get_nested_scanner_for_file(extracted_path, config=dict(self.config))
+            nested_config = dict(self.config)
+            nested_config.pop(TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY, None)
+            scanner = _get_nested_scanner_for_file(extracted_path, config=nested_config)
             if scanner is None:
                 self._mark_inconclusive_scan_result(
                     result,
@@ -3219,7 +3231,9 @@ class NemoScanner(BaseScanner):
             from .archive_dispatch import scan_nested_file
 
             try:
-                nested_result = scan_nested_file(extracted_path, config=dict(self.config))
+                nested_config = dict(self.config)
+                nested_config.pop(TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY, None)
+                nested_result = scan_nested_file(extracted_path, config=nested_config)
             except Exception as exc:
                 self._mark_inconclusive_scan_result(
                     result,

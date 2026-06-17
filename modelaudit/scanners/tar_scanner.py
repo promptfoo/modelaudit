@@ -16,7 +16,7 @@ import zlib
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, BinaryIO, ClassVar, cast
+from typing import Any, BinaryIO, ClassVar, Literal, cast
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.file.detection import (
@@ -69,6 +69,7 @@ TAR_SPECIAL_MEMBER_INCOMPLETE_REASON = "tar_special_member_unsupported"
 TAR_SPARSE_MEMBER_INCOMPLETE_REASON = "tar_sparse_member_unsupported"
 TAR_COMPRESSED_TRAILING_DATA_INCOMPLETE_REASON = "tar_compressed_trailing_data"
 TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON = "tar_compressed_padding_limit_exceeded"
+TarPrefixOwnership = Literal["complete", "not_complete", "inconclusive"]
 TAR_SPARSE_PAX_SIZE_FIELDS = frozenset({"GNU.sparse.size", "GNU.sparse.realsize"})
 _POST_TAR_EOF_CONTINUABLE_INCOMPLETE_REASONS = frozenset(
     {
@@ -371,6 +372,43 @@ class TarScanner(BaseScanner):
     def _effective_source_size(self, path: str, raw_file: BinaryIO | None = None) -> int:
         size = os.fstat(raw_file.fileno()).st_size if raw_file is not None else os.path.getsize(path)
         return min(size, self.source_size_limit) if self.source_size_limit is not None else size
+
+    def _effective_compressed_source_size(self, path: str, raw_file: BinaryIO | None = None) -> int:
+        """Exclude bounded HDF5 user-block padding from the compression ratio denominator."""
+        source_size = self._effective_source_size(path, raw_file)
+        if self.source_size_limit is None or source_size <= 0:
+            return source_size
+
+        with contextlib.nullcontext(raw_file) if raw_file is not None else open(path, "rb") as source:
+            assert source is not None
+            original_offset = source.tell()
+            try:
+                source.seek(0)
+                prefix = source.read(len(_XZ_MAGIC))
+                if not prefix.startswith((_GZIP_MAGIC, _BZIP2_MAGIC, _XZ_MAGIC)):
+                    return source_size
+
+                trailing_padding = 0
+                cursor = source_size
+                while cursor > 0:
+                    read_start = max(cursor - ARCHIVE_MEMBER_COPY_CHUNK_BYTES, 0)
+                    source.seek(read_start)
+                    block = source.read(cursor - read_start)
+                    trailing_padding += len(block) - len(block.rstrip(b"\0"))
+                    if trailing_padding > self.max_xz_padding_bytes:
+                        raise _TarStreamBudgetExceeded(
+                            "Compressed stream padding exceeded bounded read limit "
+                            f"({trailing_padding} > {self.max_xz_padding_bytes} bytes)",
+                            bytes_read=trailing_padding,
+                            max_bytes=self.max_xz_padding_bytes,
+                            reason=TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON,
+                        )
+                    if any(block):
+                        return max(source_size - trailing_padding, 1)
+                    cursor = read_start
+                return 1
+            finally:
+                source.seek(original_offset)
 
     @staticmethod
     def _normalize_positive_float_config(value: Any, default: float) -> float:
@@ -1420,6 +1458,7 @@ class TarScanner(BaseScanner):
         initial_member_bytes = shared_budget.member_bytes_consumed
 
         try:
+            compressed_size = self._effective_compressed_source_size(path, raw_file)
             with self._open_tar_stream(path, raw_file=raw_file) as (tar, bounded_stream, compression_codec):
                 while True:
                     try:
@@ -1705,6 +1744,7 @@ class TarScanner(BaseScanner):
         link_resolution_budget = [_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS]
 
         try:
+            compressed_size = self._effective_compressed_source_size(path, raw_file)
             with self._open_tar_stream(path, raw_file=raw_file) as (tar, bounded_stream, compression_codec):
                 security_only_nested_entries = self.config.get(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY)
                 if not isinstance(security_only_nested_entries, set):
@@ -2351,3 +2391,45 @@ class TarScanner(BaseScanner):
             mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
         result.finish(success=scan_complete and not member_scan_incomplete(result) and not result.has_errors)
         return result
+
+
+def classify_raw_tar_prefix_ownership(
+    path: str,
+    boundary: int,
+    *,
+    config: dict[str, Any] | None = None,
+) -> TarPrefixOwnership:
+    """Classify whether a bounded raw source prefix owns a complete TAR archive."""
+    if boundary < 2 * tarfile.BLOCKSIZE or boundary % tarfile.BLOCKSIZE:
+        return "not_complete"
+
+    scanner_config = dict(config or {})
+    scanner_config[TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY] = boundary
+    scanner = TarScanner(config=scanner_config)
+    try:
+        with (
+            open(path, "rb") as raw_file,
+            scanner._open_tar_stream(path, raw_file=raw_file) as (
+                archive,
+                bounded_stream,
+                compression_codec,
+            ),
+        ):
+            if compression_codec is not None or bounded_stream is not None:
+                return "not_complete"
+            entry_count = 0
+            while True:
+                member = archive.next()
+                if member is None:
+                    return "complete" if scanner._raw_tar_has_complete_end_marker(archive) else "not_complete"
+                entry_count += 1
+                if entry_count > scanner.max_entries:
+                    return "inconclusive"
+                padded_member_end = (
+                    member.offset_data
+                    + ((max(member.size, 0) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+                )
+                if padded_member_end > boundary:
+                    return "not_complete"
+    except (EOFError, OSError, tarfile.TarError, ValueError):
+        return "inconclusive"
