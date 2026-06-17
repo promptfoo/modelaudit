@@ -9135,6 +9135,58 @@ def test_scan_file_fails_closed_without_cache_for_incomplete_raw_tar_hdf5_userbl
     assert determine_exit_code(aggregate) == 2
 
 
+def test_scan_file_fails_closed_when_hdf5_signature_is_inside_gzip_extra_field(tmp_path: Path) -> None:
+    model_path = tmp_path / "gzip-extra-hdf5-collision.nemo"
+    raw_tar = io.BytesIO()
+    with tarfile.open(fileobj=raw_tar, mode="w") as archive:
+        payload = _build_malicious_pickle(protocol=0)
+        info = tarfile.TarInfo("late-payload.pkl")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    compressed_tar = gzip.compress(raw_tar.getvalue(), mtime=0)
+    gzip_header = bytearray(compressed_tar[:10])
+    gzip_header[3] |= 0x04
+    extra = bytearray(1024)
+    wrapper_size = len(gzip_header) + 2 + len(extra) + len(compressed_tar[10:])
+    signature_offset = 512
+    superblock = bytearray(HDF5_MAGIC + b"\x03\x08\x08\x00")
+    superblock.extend(signature_offset.to_bytes(8, "little"))
+    superblock.extend(b"\xff" * 8)
+    superblock.extend(wrapper_size.to_bytes(8, "little"))
+    superblock.extend((signature_offset + 48).to_bytes(8, "little"))
+    superblock.extend(hdf5_metadata_checksum(bytes(superblock)).to_bytes(4, "little"))
+    extra_offset = signature_offset - len(gzip_header) - 2
+    extra[extra_offset : extra_offset + len(superblock)] = superblock
+    model_path.write_bytes(bytes(gzip_header) + struct.pack("<H", len(extra)) + bytes(extra) + compressed_tar[10:])
+
+    assert find_hdf5_signature_offset(str(model_path)) == signature_offset
+    from modelaudit.scanners.tar_scanner import classify_compressed_tar_prefix_ownership
+
+    assert classify_compressed_tar_prefix_ownership(str(model_path), signature_offset) == "incomplete"
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+    finally:
+        reset_cache_manager()
+
+    metadata = aggregate.file_metadata[str(model_path)]
+    assert aggregate.success is False
+    assert "hdf5_tar_prefix_ownership_incomplete" in metadata["scan_outcome_reasons"]
+    assert "compressed" not in metadata.get("supplemental_scanners", [])
+    assert not any(check.rule_code == "S201" for check in aggregate.checks)
+    assert cache_entries == 0
+    assert determine_exit_code(aggregate) == 2
+
+
 @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
 def test_explicit_compressed_tar_hdf5_overlap_preserves_top_level_and_nested_tar_analysis(
     tmp_path: Path,

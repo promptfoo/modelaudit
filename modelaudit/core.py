@@ -2146,7 +2146,10 @@ def _select_non_hdf5_preferred_scanner_id(
     if ext == ".nemo":
         if header_format == "tar":
             return "nemo"
-        if header_format == "gzip" and _detect_tar_route(path, allow_incomplete_generic_tar_route=True) is not None:
+        if (
+            header_format in _COMPRESSED_HEADER_FORMATS
+            and _detect_tar_route(path, allow_incomplete_generic_tar_route=True) is not None
+        ):
             return "nemo"
 
     scanner_policy = policy_from_config(config) if config is not None else None
@@ -6549,12 +6552,15 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
             else None
         )
-        if hdf5_userblock_supplemental_scanner_id in {"nemo", "tar"}:
-            from modelaudit.scanners.tar_scanner import classify_raw_tar_prefix_ownership
+        if hdf5_userblock_supplemental_scanner_id in {"compressed", "nemo", "tar"}:
+            from modelaudit.scanners.tar_scanner import (
+                classify_compressed_tar_prefix_ownership,
+                classify_raw_tar_prefix_ownership,
+            )
 
             assert hdf5_signature_offset is not None
             hdf5_tar_prefix_ownership = (
-                "complete"
+                classify_compressed_tar_prefix_ownership(path, hdf5_signature_offset, config=config)
                 if _has_supported_tar_compression_wrapper(Path(path))
                 else classify_raw_tar_prefix_ownership(path, hdf5_signature_offset, config=config)
             )
@@ -6615,6 +6621,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         and scanner_id
         and (
             scanner_id == trusted_flax_overlap_scanner_id
+            or (scanner_id == "keras_h5" and hdf5_tar_prefix_ownership in {"incomplete", "inconclusive"})
             or _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path, config)
         )
     ):
@@ -6954,7 +6961,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     ):
         supplemental_config = config
         supplemental_ownership_inconclusive = False
-        if hdf5_userblock_supplemental_scanner_id in {"nemo", "tar"}:
+        if hdf5_userblock_supplemental_scanner_id in {"compressed", "nemo", "tar"}:
             from modelaudit.scanners.tar_scanner import TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY
 
             assert hdf5_signature_offset is not None

@@ -392,9 +392,9 @@ class TarScanner(BaseScanner):
         return min(size, self.source_size_limit) if self.source_size_limit is not None else size
 
     def _effective_compressed_source_size(self, path: str, raw_file: BinaryIO | None = None) -> int:
-        """Exclude bounded HDF5 user-block padding from the compression ratio denominator."""
+        """Exclude accepted trailing zero padding from the compression ratio denominator."""
         source_size = self._effective_source_size(path, raw_file)
-        if self.source_size_limit is None or source_size <= 0:
+        if source_size <= 0:
             return source_size
 
         with contextlib.nullcontext(raw_file) if raw_file is not None else open(path, "rb") as source:
@@ -414,13 +414,10 @@ class TarScanner(BaseScanner):
                     block = source.read(cursor - read_start)
                     trailing_padding += len(block) - len(block.rstrip(b"\0"))
                     if trailing_padding > self.max_xz_padding_bytes:
-                        raise _TarStreamBudgetExceeded(
-                            "Compressed stream padding exceeded bounded read limit "
-                            f"({trailing_padding} > {self.max_xz_padding_bytes} bytes)",
-                            bytes_read=trailing_padding,
-                            max_bytes=self.max_xz_padding_bytes,
-                            reason=TAR_COMPRESSED_PADDING_LIMIT_INCOMPLETE_REASON,
-                        )
+                        # Ratio accounting must not preempt archive findings.
+                        # The streaming reader owns definitive padding-policy
+                        # enforcement after reachable members are analyzed.
+                        return max(source_size - trailing_padding, 1)
                     if any(block):
                         return max(source_size - trailing_padding, 1)
                     cursor = read_start
@@ -2459,5 +2456,33 @@ def classify_raw_tar_prefix_ownership(
                 )
                 if padded_member_end > boundary:
                     return "embedded_member"
+    except (EOFError, OSError, tarfile.TarError, ValueError):
+        return "inconclusive"
+
+
+def classify_compressed_tar_prefix_ownership(
+    path: str,
+    boundary: int,
+    *,
+    config: dict[str, Any] | None = None,
+) -> TarPrefixOwnership:
+    """Prove a compressed TAR wrapper completes within its physical owner prefix."""
+    if boundary <= 0:
+        return "incomplete"
+
+    scanner_config = dict(config or {})
+    scanner_config[TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY] = boundary
+    # Ownership proof is structural; the actual supplemental scan enforces the
+    # caller's ratio policy after ownership is established.
+    scanner_config["compressed_max_decompression_ratio"] = 1e300
+    scanner = TarScanner(config=scanner_config)
+    result = ScanResult(scanner_name="tar")
+    try:
+        with open(path, "rb") as raw_file:
+            return (
+                "complete"
+                if scanner._preflight_tar_archive(path, result, retain_member_budget=False, raw_file=raw_file)
+                else "incomplete"
+            )
     except (EOFError, OSError, tarfile.TarError, ValueError):
         return "inconclusive"

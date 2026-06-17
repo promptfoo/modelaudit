@@ -3048,6 +3048,36 @@ class TestTarScanner:
         assert "decompressed size exceeded" in limit_checks[0].message.lower()
         assert "tar_decompressed_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
 
+    @pytest.mark.parametrize("high_ratio", [False, True], ids=["within-limit", "ratio-bomb"])
+    def test_trailing_zero_padding_does_not_inflate_top_level_compressed_ratio(
+        self,
+        tmp_path: Path,
+        high_ratio: bool,
+    ) -> None:
+        archive_path = tmp_path / f"padded-ratio-{'bomb' if high_ratio else 'safe'}.tar.gz"
+        payload = b"A" * (12 * 1024 * 1024) if high_ratio else os.urandom(128 * 1024)
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("weights.bin")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        with archive_path.open("ab") as archive_file:
+            archive_file.write(b"\0" * (512 * 1024))
+
+        result = TarScanner(
+            config={
+                "compressed_max_decompressed_bytes": 64 * 1024 * 1024,
+                "compressed_max_decompression_ratio": 20.0,
+                "compressed_max_xz_padding_bytes": 1024 * 1024,
+                "max_tar_total_uncompressed_size": 64 * 1024 * 1024,
+            }
+        ).scan(str(archive_path))
+
+        ratio_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert ratio_checks
+        assert any(check.status == CheckStatus.FAILED for check in ratio_checks) is high_ratio
+        assert ratio_checks[-1].details["compressed_size"] < 512 * 1024
+        assert (ratio_checks[-1].details["actual_ratio"] > 20.0) is high_ratio
+
     def test_scan_compressed_tar_rejects_nonzero_concatenated_wrapper_tail(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "nonzero_tail.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
