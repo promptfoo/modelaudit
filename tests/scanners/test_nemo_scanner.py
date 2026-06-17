@@ -7,6 +7,7 @@ import lzma
 import os
 import pickle
 import random
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -8279,6 +8280,7 @@ class TestCVE202523304HydraTarget:
         finally:
             reset_cache_manager()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
     @pytest.mark.parametrize("mode", ["w", "w:gz"])
     def test_nemo_analysis_uses_preflighted_descriptor_when_path_is_replaced(
         self,
@@ -8347,6 +8349,7 @@ class TestCVE202523304HydraTarget:
         finally:
             reset_cache_manager()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
     def test_nemo_prefix_fallback_preserves_preflight_failure_when_path_is_replaced(
         self,
         tmp_path: Path,
@@ -8405,6 +8408,7 @@ class TestCVE202523304HydraTarget:
         finally:
             reset_cache_manager()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
     def test_content_routed_nemo_tar_followup_uses_bound_descriptor_after_replacement(
         self,
         tmp_path: Path,
