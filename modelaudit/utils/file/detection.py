@@ -1,5 +1,6 @@
 import bz2
 import codecs
+import hashlib
 import json
 import lzma
 import math
@@ -15,6 +16,8 @@ import unicodedata
 import zipfile
 import zlib
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
 from io import BytesIO, StringIO
@@ -388,8 +391,12 @@ MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
 TOKENIZER_JSON_ROUTING_READ_BYTES = 16 * 1024 * 1024
 TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES = 64 * 1024 * 1024
 TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES = 64 * 1024 * 1024
+TOKENIZER_JSON_EOF_PROOF_READ_BYTES = 512 * 1024 * 1024
+TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT = "tokenizer_json_routing_inconclusive"
 _HF_TOKENIZER_STREAM_CHUNK_BYTES = 1024 * 1024
 _HF_TOKENIZER_STREAM_MAX_KEY_BYTES = 4096
+_HF_TOKENIZER_STREAM_MAX_TRACKED_KEYS = 4096
+_HF_TOKENIZER_STREAM_MAX_PRIMITIVE_BYTES = 4096
 _UTF8_BOM = b"\xef\xbb\xbf"
 _JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _JSON_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
@@ -427,6 +434,25 @@ _JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE = re.compile(
 _HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(_JAX_JSON_CHECKPOINT_IDENTITY_KEYS | _JAX_JSON_CHECKPOINT_MARKER_KEYS)
 _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS = (
     _HF_TOKENIZER_TEMPLATE_KEYS | _MXNET_SYMBOL_ROOT_KEYS | {"learner"} | _JAX_JSON_CHECKPOINT_MARKER_KEYS
+)
+_HFTokenizerEOFProofKey = tuple[str, int, int, int, int, int, int, int]
+
+
+@dataclass
+class _HFTokenizerEOFProofScope:
+    memo: dict[_HFTokenizerEOFProofKey, bool] = field(default_factory=dict)
+    positive_digests: dict[_HFTokenizerEOFProofKey, bytes] = field(default_factory=dict)
+    stable: bool = True
+
+    def validate(self) -> bool:
+        return all(
+            _hf_tokenizer_json_digest_matches_identity(key, digest) for key, digest in self.positive_digests.items()
+        )
+
+
+_HF_TOKENIZER_EOF_PROOF_SCOPE: ContextVar[_HFTokenizerEOFProofScope | None] = ContextVar(
+    "hf_tokenizer_eof_proof_scope",
+    default=None,
 )
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
@@ -830,6 +856,7 @@ class _JSONStreamContext:
     pending_key: str | None = None
     pending_route_key: str | None = None
     skip_templates: bool = False
+    seen_keys: set[str] | None = None
 
 
 def _json_probe_string_has_template_indicator(probe: bytes, start: int, end: int) -> bool:
@@ -1636,7 +1663,12 @@ def _is_hf_tokenizer_json_route_candidate_path(file_path: Path) -> bool:
     return file_path.name.lower() in _HF_TOKENIZER_JSON_ROUTE_FILENAMES
 
 
-def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
+def _malformed_hf_tokenizer_json_has_schema_evidence(
+    path: str | Path,
+    *,
+    accept_complete_prefix: bool = False,
+    complete_prefix_only: bool = False,
+) -> bool:
     """Return whether exact tokenizer.json has tokenizer evidence but malformed JSON."""
     file_path = Path(path)
     if not _is_hf_tokenizer_json_schema_path(file_path):
@@ -1666,30 +1698,36 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
     def has_tokenizer_root_evidence() -> bool:
         return saw_model_schema or saw_model_key or root_keys >= _HF_TOKENIZER_ROOT_KEYS
 
+    def incomplete_schema_evidence() -> bool:
+        return not complete_prefix_only and has_tokenizer_root_evidence()
+
     offset += 1
     while offset < len(probe):
         offset = _json_probe_skip_whitespace(probe, offset)
         if offset >= len(probe):
-            return sample_is_prefix and has_tokenizer_root_evidence()
+            return sample_is_prefix and incomplete_schema_evidence()
         if probe[offset] == ord("}"):
-            return has_tokenizer_root_evidence() and not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
+            return has_tokenizer_root_evidence() and (
+                not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
+                or (accept_complete_prefix and sample_is_prefix)
+            )
         if probe[offset] != ord('"'):
-            return has_tokenizer_root_evidence()
+            return incomplete_schema_evidence()
 
         key_start = offset
         key_end = _json_probe_skip_string(probe, offset)
         if key_end is None:
-            return has_tokenizer_root_evidence()
+            return incomplete_schema_evidence()
         key = _json_probe_decode_string(probe, key_start, key_end)
         if key is None:
-            return has_tokenizer_root_evidence()
+            return incomplete_schema_evidence()
 
         offset = _json_probe_skip_whitespace(probe, key_end)
         if offset >= len(probe) or probe[offset] != ord(":"):
-            return has_tokenizer_root_evidence()
+            return incomplete_schema_evidence()
         value_offset = _json_probe_skip_whitespace(probe, offset + 1)
         if value_offset >= len(probe):
-            return sample_is_prefix and has_tokenizer_root_evidence()
+            return sample_is_prefix and incomplete_schema_evidence()
 
         if key in _HF_TOKENIZER_ROOT_KEYS:
             root_keys.add(key)
@@ -1698,10 +1736,10 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
             try:
                 next_offset, model_schema = _hf_tokenizer_probe_model_object(probe, value_offset, state)
             except (_JSONProbeIncomplete, _JSONProbeInvalid):
-                return has_tokenizer_root_evidence()
+                return incomplete_schema_evidence()
             saw_model_schema = saw_model_schema or model_schema
             if next_offset is None:
-                return sample_is_prefix and has_tokenizer_root_evidence()
+                return sample_is_prefix and incomplete_schema_evidence()
         else:
             try:
                 next_offset = _json_probe_skip_value_with_template_scan(
@@ -1712,19 +1750,42 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
                     scan_string_template_indicators=key not in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS,
                 )
             except (_JSONProbeIncomplete, _JSONProbeInvalid):
-                return has_tokenizer_root_evidence()
+                return incomplete_schema_evidence()
 
         offset = _json_probe_skip_whitespace(probe, next_offset)
         if offset >= len(probe):
-            return sample_is_prefix and has_tokenizer_root_evidence()
+            return sample_is_prefix and incomplete_schema_evidence()
         if probe[offset] == ord(","):
             offset += 1
             continue
         if probe[offset] == ord("}"):
-            return has_tokenizer_root_evidence() and not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
-        return has_tokenizer_root_evidence()
+            return has_tokenizer_root_evidence() and (
+                not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
+                or (accept_complete_prefix and sample_is_prefix)
+            )
+        return incomplete_schema_evidence()
 
-    return sample_is_prefix and has_tokenizer_root_evidence()
+    return sample_is_prefix and incomplete_schema_evidence()
+
+
+def _hf_tokenizer_json_ownership_is_inconclusive(path: str | Path) -> bool:
+    """Return whether bounded probes cannot exclude a late tokenizer route conflict."""
+    file_path = Path(path)
+    if not _is_hf_tokenizer_json_schema_path(file_path):
+        return False
+    try:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        if file_size <= TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES:
+            return False
+    except OSError:
+        return False
+    return _malformed_hf_tokenizer_json_has_schema_evidence(
+        file_path,
+        accept_complete_prefix=True,
+        complete_prefix_only=file_size <= TOKENIZER_JSON_EOF_PROOF_READ_BYTES,
+    )
 
 
 def huggingface_tokenizer_json_has_template_route_evidence(path: str | Path) -> bool:
@@ -1757,11 +1818,517 @@ def huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(path: str | P
     )
 
 
+@contextmanager
+def huggingface_tokenizer_json_eof_proof_scope() -> Iterator[_HFTokenizerEOFProofScope]:
+    """Memoize tokenizer EOF proofs for one scan and verify positives at exit."""
+    scope = _HFTokenizerEOFProofScope()
+    token = _HF_TOKENIZER_EOF_PROOF_SCOPE.set(scope)
+    try:
+        yield scope
+    finally:
+        scope.stable = scope.validate()
+        _HF_TOKENIZER_EOF_PROOF_SCOPE.reset(token)
+
+
+def _hf_tokenizer_stat_matches_identity(stat_result: os.stat_result, key: _HFTokenizerEOFProofKey) -> bool:
+    _, file_size, mtime_ns, ctime_ns, device, inode, _, _ = key
+    return (
+        stat_result.st_size == file_size
+        and stat_result.st_mtime_ns == mtime_ns
+        and stat_result.st_ctime_ns == ctime_ns
+        and stat_result.st_dev == device
+        and stat_result.st_ino == inode
+    )
+
+
+def _hf_tokenizer_file_change_token(file_path: str, file_stat: os.stat_result) -> int:
+    from ...cache.scan_results_cache import ScanResultsCache
+
+    return ScanResultsCache._get_file_change_token(file_path, file_stat)
+
+
+def _hf_tokenizer_path_matches_identity(file_path: Path, key: _HFTokenizerEOFProofKey) -> bool:
+    try:
+        file_stat = file_path.stat()
+        return (
+            _hf_tokenizer_stat_matches_identity(file_stat, key)
+            and _hf_tokenizer_file_change_token(str(file_path), file_stat) == key[6]
+        )
+    except OSError:
+        return False
+
+
+def _hf_tokenizer_json_digest_matches_identity(key: _HFTokenizerEOFProofKey, expected_digest: bytes) -> bool:
+    file_path = Path(key[0])
+    file_size = key[1]
+    proof_budget = key[7]
+    hasher = hashlib.sha256()
+    bytes_read = 0
+    try:
+        if not file_path.is_file() or not _hf_tokenizer_path_matches_identity(file_path, key):
+            return False
+        with file_path.open("rb") as stream:
+            if not _hf_tokenizer_stat_matches_identity(os.fstat(stream.fileno()), key):
+                return False
+            while bytes_read <= proof_budget:
+                chunk = stream.read(min(_HF_TOKENIZER_STREAM_CHUNK_BYTES, proof_budget + 1 - bytes_read))
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                bytes_read += len(chunk)
+            if bytes_read != file_size or bytes_read > proof_budget:
+                return False
+            if not _hf_tokenizer_stat_matches_identity(os.fstat(stream.fileno()), key):
+                return False
+        if not _hf_tokenizer_path_matches_identity(file_path, key):
+            return False
+    except OSError:
+        return False
+    return hasher.digest() == expected_digest
+
+
+def _hf_tokenizer_json_eof_proves_ownership(file_path: Path) -> bool:
+    """Return whether bounded streaming JSON proves exact tokenizer ownership."""
+    try:
+        expected_stat = file_path.stat()
+        change_token = _hf_tokenizer_file_change_token(str(file_path), expected_stat)
+    except OSError:
+        return False
+    key: _HFTokenizerEOFProofKey = (
+        str(file_path),
+        expected_stat.st_size,
+        expected_stat.st_mtime_ns,
+        expected_stat.st_ctime_ns,
+        expected_stat.st_dev,
+        expected_stat.st_ino,
+        change_token,
+        TOKENIZER_JSON_EOF_PROOF_READ_BYTES,
+    )
+    scope = _HF_TOKENIZER_EOF_PROOF_SCOPE.get()
+    if scope is not None and key in scope.memo:
+        result = scope.memo[key]
+        if result:
+            return _hf_tokenizer_path_matches_identity(file_path, key)
+        return False
+    result = _hf_tokenizer_json_eof_proves_ownership_for_identity(*key)
+    if scope is not None:
+        scope.memo[key] = result
+    return result
+
+
+def _hf_tokenizer_json_eof_proves_ownership_for_identity(
+    file_path_str: str,
+    file_size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    device: int,
+    inode: int,
+    change_token: int,
+    proof_budget: int,
+) -> bool:
+    file_path = Path(file_path_str)
+    try:
+        expected_stat = file_path.stat()
+        if (
+            not file_path.is_file()
+            or expected_stat.st_size != file_size
+            or expected_stat.st_mtime_ns != mtime_ns
+            or expected_stat.st_ctime_ns != ctime_ns
+            or expected_stat.st_dev != device
+            or expected_stat.st_ino != inode
+            or _hf_tokenizer_file_change_token(file_path_str, expected_stat) != change_token
+            or expected_stat.st_size < 4
+            or expected_stat.st_size > proof_budget
+        ):
+            return False
+    except OSError:
+        return False
+
+    stack: list[_JSONStreamContext] = []
+    root_keys: set[str] = set()
+    model_keys: set[str] = set()
+    model_type: str | None = None
+    model_vocab_kind: str | None = None
+    saw_model_schema = False
+    root_started = False
+    root_complete = False
+    in_string = False
+    string_is_key = False
+    string_path: tuple[str, ...] = ()
+    string_bytes = bytearray()
+    string_tail = b""
+    capture_string = False
+    escaped = False
+    unicode_escape_remaining = 0
+    in_primitive = False
+    primitive = bytearray()
+    primitive_path: tuple[str, ...] = ()
+    bytes_read = 0
+    utf8_decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    content_hasher = hashlib.sha256()
+
+    def current_value_path() -> tuple[str, ...]:
+        if not stack:
+            return ()
+        context = stack[-1]
+        if context.kind == "object" and context.mode == "value" and context.pending_key is not None:
+            return (*context.path, context.pending_key)
+        return (*context.path, "[]")
+
+    def tracked_keys(path: tuple[str, ...]) -> set[str] | None:
+        if path == ():
+            return root_keys
+        if path == ("model",):
+            return model_keys
+        return None
+
+    def push_context(kind: str) -> None:
+        path = current_value_path()
+        if len(stack) >= 64:
+            raise _JSONProbeInvalid
+        stack.append(
+            _JSONStreamContext(
+                kind=kind,
+                path=path,
+                mode="key_or_end" if kind == "object" else "value_or_end",
+                seen_keys=tracked_keys(path),
+            )
+        )
+
+    def finish_value() -> None:
+        if not stack:
+            return
+        context = stack[-1]
+        context.mode = "after_value"
+        context.pending_key = None
+
+    def finish_container(byte: int) -> None:
+        nonlocal root_complete, saw_model_schema
+        context = stack[-1] if stack else None
+        if (
+            context is None
+            or (byte == ord("}") and context.kind != "object")
+            or (byte == ord("]") and context.kind != "array")
+        ):
+            raise _JSONProbeInvalid
+        if context.path == ("model",) and model_type is not None and model_vocab_kind is not None:
+            saw_model_schema = model_vocab_kind == ("array" if model_type == "Unigram" else "object")
+        stack.pop()
+        if stack:
+            finish_value()
+        else:
+            root_complete = True
+
+    def decode_captured_string() -> str:
+        try:
+            value = json.loads(b'"' + bytes(string_bytes) + b'"')
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _JSONProbeInvalid from exc
+        if not isinstance(value, str):
+            raise _JSONProbeInvalid
+        return value
+
+    def string_needs_capture(path: tuple[str, ...], is_key: bool) -> bool:
+        return (
+            (is_key and not _hf_tokenizer_stream_path_skips_templates(path))
+            or path == ("model", "type")
+            or (len(path) == 1 and path[0] in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS)
+        )
+
+    def string_scans_templates(path: tuple[str, ...]) -> bool:
+        return bool(path) and not _hf_tokenizer_stream_path_skips_templates(path)
+
+    def begin_string(*, is_key: bool) -> None:
+        nonlocal in_string, string_is_key, string_path, capture_string, escaped, unicode_escape_remaining, string_tail
+        in_string = True
+        string_is_key = is_key
+        string_path = stack[-1].path if is_key else current_value_path()
+        capture_string = string_needs_capture(string_path, is_key)
+        string_bytes.clear()
+        string_tail = b""
+        escaped = False
+        unicode_escape_remaining = 0
+
+    def note_key(key: str | None) -> None:
+        context = stack[-1] if stack else None
+        if context is None or context.kind != "object" or context.mode not in {"key", "key_or_end"}:
+            raise _JSONProbeInvalid
+        if key is None:
+            if not _hf_tokenizer_stream_path_skips_templates(context.path):
+                raise _JSONProbeInvalid
+            context.pending_key = ""
+            context.mode = "colon"
+            return
+        if context.seen_keys is not None:
+            if key in context.seen_keys or len(context.seen_keys) >= _HF_TOKENIZER_STREAM_MAX_TRACKED_KEYS:
+                raise _JSONProbeInvalid
+            context.seen_keys.add(key)
+        path = (*context.path, key)
+        if not _hf_tokenizer_stream_path_skips_templates(path) and key in _HF_TOKENIZER_TEMPLATE_KEYS:
+            raise _JSONProbeInvalid
+        if context.path == () and (
+            key in _MXNET_SYMBOL_ROOT_KEYS or key == "learner" or key in _JAX_JSON_CHECKPOINT_MARKER_KEYS
+        ):
+            raise _JSONProbeInvalid
+        context.pending_key = key
+        context.mode = "colon"
+
+    def note_string_value(value: str | None) -> None:
+        nonlocal model_type
+        if string_path == ("model", "type"):
+            model_type = value if value in _HF_TOKENIZER_MODEL_TYPES else None
+        if (
+            value is not None
+            and len(string_path) == 1
+            and string_path[0] in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS
+            and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value)
+        ):
+            raise _JSONProbeInvalid
+
+    def expected_value_marker(path: tuple[str, ...], byte: int) -> None:
+        if path in {("model",)} and byte != ord("{"):
+            raise _JSONProbeInvalid
+        if path in {("added_tokens",)} and byte != ord("["):
+            raise _JSONProbeInvalid
+        if path in {("version",), ("model", "type")} and byte != ord('"'):
+            raise _JSONProbeInvalid
+        if path == ("model", "vocab") and byte not in {ord("{"), ord("[")}:
+            raise _JSONProbeInvalid
+
+    def start_value(byte: int) -> None:
+        nonlocal in_primitive, model_vocab_kind, primitive_path
+        path = current_value_path()
+        expected_value_marker(path, byte)
+        if (
+            model_vocab_kind == "object"
+            and len(path) == 3
+            and path[:2] == ("model", "vocab")
+            and byte in {ord("{"), ord("["), ord('"')}
+        ):
+            raise _JSONProbeInvalid
+        if byte == ord("{"):
+            if path == ("model", "vocab"):
+                model_vocab_kind = "object"
+            push_context("object")
+            return
+        if byte == ord("["):
+            if path == ("model", "vocab"):
+                model_vocab_kind = "array"
+            push_context("array")
+            return
+        if byte == ord('"'):
+            begin_string(is_key=False)
+            return
+        in_primitive = True
+        primitive_path = path
+        primitive.clear()
+        primitive.append(byte)
+
+    def finish_primitive() -> None:
+        token = bytes(primitive)
+        if len(token) > _HF_TOKENIZER_STREAM_MAX_PRIMITIVE_BYTES:
+            raise _JSONProbeInvalid
+        if token not in {b"true", b"false", b"null"} and _JSON_NUMBER_PREFIX_RE.fullmatch(token) is None:
+            raise _JSONProbeInvalid
+        if (
+            model_vocab_kind == "object"
+            and len(primitive_path) == 3
+            and primitive_path[:2] == ("model", "vocab")
+            and (token in {b"true", b"false", b"null"} or b"." in token or b"e" in token.lower())
+        ):
+            raise _JSONProbeInvalid
+        finish_value()
+
+    def proof_chunks(stream: BinaryIO) -> Iterator[bytes]:
+        while read_chunk := stream.read(_HF_TOKENIZER_STREAM_CHUNK_BYTES):
+            content_hasher.update(read_chunk)
+            for offset in range(0, len(read_chunk), 4096):
+                yield read_chunk[offset : offset + 4096]
+
+    try:
+        with file_path.open("rb") as stream:
+            opened_stat = os.fstat(stream.fileno())
+            if (
+                opened_stat.st_size != file_size
+                or opened_stat.st_mtime_ns != mtime_ns
+                or opened_stat.st_ctime_ns != ctime_ns
+                or opened_stat.st_dev != device
+                or opened_stat.st_ino != inode
+                or _hf_tokenizer_file_change_token(file_path_str, opened_stat) != change_token
+            ):
+                return False
+            first_chunk = True
+            for chunk in proof_chunks(stream):
+                bytes_read += len(chunk)
+                if bytes_read > proof_budget:
+                    return False
+                utf8_decoder.decode(chunk, final=False)
+                if first_chunk:
+                    first_chunk = False
+                    if chunk.startswith(_UTF8_BOM):
+                        chunk = chunk[len(_UTF8_BOM) :]
+                if in_string and not capture_string and not escaped and unicode_escape_remaining == 0:
+                    boundary = string_tail + chunk[:16]
+                    if b'"' not in chunk and b"\\" not in chunk and min(chunk) >= 0x20:
+                        if string_scans_templates(string_path) and (
+                            any(
+                                indicator.encode() in chunk or indicator.encode() in boundary
+                                for indicator in _JSON_PROBE_TEMPLATE_INDICATORS
+                            )
+                            or _JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE.search(boundary) is not None
+                        ):
+                            raise _JSONProbeInvalid
+                        string_tail = chunk[-16:] if len(chunk) >= 16 else boundary[-16:]
+                        continue
+                for byte in chunk:
+                    if in_string:
+                        if unicode_escape_remaining:
+                            if byte not in _JSON_HEX_BYTES:
+                                raise _JSONProbeInvalid
+                            unicode_escape_remaining -= 1
+                        elif escaped:
+                            if byte not in _JSON_SIMPLE_ESCAPE_BYTES | {ord("u")}:
+                                raise _JSONProbeInvalid
+                            escaped = False
+                            unicode_escape_remaining = 4 if byte == ord("u") else 0
+                        elif byte == ord("\\"):
+                            escaped = True
+                        elif byte == ord('"'):
+                            in_string = False
+                            value = decode_captured_string() if capture_string else None
+                            if string_is_key:
+                                note_key(value)
+                            else:
+                                note_string_value(value)
+                                finish_value()
+                            continue
+                        elif byte < 0x20:
+                            raise _JSONProbeInvalid
+                        if capture_string:
+                            string_bytes.append(byte)
+                            if len(string_bytes) > _HF_TOKENIZER_STREAM_MAX_KEY_BYTES:
+                                raise _JSONProbeInvalid
+                        if string_scans_templates(string_path):
+                            string_tail = (string_tail + bytes((byte,)))[-16:]
+                            if any(
+                                indicator.encode() in string_tail for indicator in _JSON_PROBE_TEMPLATE_INDICATORS
+                            ) or (_JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE.search(string_tail) is not None):
+                                raise _JSONProbeInvalid
+                        continue
+                    if in_primitive:
+                        if byte in _JSON_VALUE_DELIMITERS:
+                            finish_primitive()
+                            in_primitive = False
+                        else:
+                            primitive.append(byte)
+                            if len(primitive) > _HF_TOKENIZER_STREAM_MAX_PRIMITIVE_BYTES:
+                                raise _JSONProbeInvalid
+                            continue
+                    if byte in b" \t\r\n":
+                        continue
+                    if root_complete:
+                        raise _JSONProbeInvalid
+                    if not root_started:
+                        if byte != ord("{"):
+                            raise _JSONProbeInvalid
+                        root_started = True
+                        push_context("object")
+                        continue
+                    context = stack[-1] if stack else None
+                    if context is None:
+                        raise _JSONProbeInvalid
+                    if context.kind == "object":
+                        if context.mode in {"key", "key_or_end"}:
+                            if byte == ord("}"):
+                                if context.mode != "key_or_end":
+                                    raise _JSONProbeInvalid
+                                finish_container(byte)
+                                continue
+                            if byte != ord('"'):
+                                raise _JSONProbeInvalid
+                            begin_string(is_key=True)
+                            continue
+                        if context.mode == "colon":
+                            if byte != ord(":"):
+                                raise _JSONProbeInvalid
+                            context.mode = "value"
+                            continue
+                        if context.mode == "value":
+                            start_value(byte)
+                            continue
+                        if byte == ord(","):
+                            context.mode = "key"
+                            continue
+                        if byte == ord("}"):
+                            finish_container(byte)
+                            continue
+                        raise _JSONProbeInvalid
+                    if context.mode in {"value", "value_or_end"}:
+                        if byte == ord("]"):
+                            if context.mode != "value_or_end":
+                                raise _JSONProbeInvalid
+                            finish_container(byte)
+                            continue
+                        start_value(byte)
+                        continue
+                    if byte == ord(","):
+                        context.mode = "value"
+                        continue
+                    if byte == ord("]"):
+                        finish_container(byte)
+                        continue
+                    raise _JSONProbeInvalid
+            utf8_decoder.decode(b"", final=True)
+            if in_string or in_primitive or stack or not root_complete:
+                return False
+            opened_after_stat = os.fstat(stream.fileno())
+            current_stat = file_path.stat()
+            current_change_token = _hf_tokenizer_file_change_token(file_path_str, current_stat)
+    except (OSError, UnicodeDecodeError, _JSONProbeInvalid):
+        return False
+
+    owns_tokenizer = (
+        opened_after_stat.st_size == expected_stat.st_size
+        and opened_after_stat.st_mtime_ns == expected_stat.st_mtime_ns
+        and opened_after_stat.st_ctime_ns == expected_stat.st_ctime_ns
+        and opened_after_stat.st_dev == expected_stat.st_dev
+        and opened_after_stat.st_ino == expected_stat.st_ino
+        and current_stat.st_size == expected_stat.st_size
+        and current_stat.st_mtime_ns == expected_stat.st_mtime_ns
+        and current_stat.st_ctime_ns == expected_stat.st_ctime_ns
+        and current_stat.st_dev == expected_stat.st_dev
+        and current_stat.st_ino == expected_stat.st_ino
+        and current_change_token == change_token
+        and root_keys >= _HF_TOKENIZER_ROOT_KEYS | {"model"}
+        and saw_model_schema
+    )
+    if not owns_tokenizer:
+        return False
+    key: _HFTokenizerEOFProofKey = (
+        file_path_str,
+        file_size,
+        mtime_ns,
+        ctime_ns,
+        device,
+        inode,
+        change_token,
+        proof_budget,
+    )
+    digest = content_hasher.digest()
+    scope = _HF_TOKENIZER_EOF_PROOF_SCOPE.get()
+    if scope is not None:
+        scope.positive_digests[key] = digest
+        return True
+    return _hf_tokenizer_json_digest_matches_identity(key, digest)
+
+
 def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
     """Return whether bounded filename and schema evidence proves tokenizer JSON ownership."""
     file_path = Path(path)
     if not _is_hf_tokenizer_json_schema_path(file_path):
         return False
+    if _hf_tokenizer_json_eof_proves_ownership(file_path):
+        return True
     try:
         if not file_path.is_file():
             return False
@@ -2180,14 +2747,16 @@ def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
 
 def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str | None:
     """Route plausible JSON symbol content or preserve bounded ambiguity."""
+    if is_huggingface_tokenizer_json_file(file_path):
+        return None
     tokenizer_has_mxnet_or_xgboost = huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(file_path)
     if not tokenizer_has_mxnet_or_xgboost and (
         huggingface_tokenizer_json_has_template_route_evidence(file_path)
         or huggingface_tokenizer_json_has_jax_route_evidence(file_path)
     ):
         return None
-    if is_huggingface_tokenizer_json_file(file_path):
-        return None
+    if not tokenizer_has_mxnet_or_xgboost and _hf_tokenizer_json_ownership_is_inconclusive(file_path):
+        return TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
     if not tokenizer_has_mxnet_or_xgboost and _malformed_hf_tokenizer_json_has_schema_evidence(file_path):
         return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
     if file_path.name.lower().endswith("-symbol.json"):

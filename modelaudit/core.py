@@ -98,6 +98,7 @@ from modelaudit.utils.file.detection import (
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+    TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     _is_malformed_sentencepiece_model_proto_candidate_file,
@@ -110,6 +111,7 @@ from modelaudit.utils.file.detection import (
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     gzip_tar_trailing_data_status,
+    huggingface_tokenizer_json_eof_proof_scope,
     huggingface_tokenizer_json_has_jax_route_evidence,
     huggingface_tokenizer_json_has_template_route_evidence,
     is_confirmed_jax_json_checkpoint_file,
@@ -388,6 +390,7 @@ _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON = "sentencepiece_model_proto_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
+_TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON = "tokenizer_json_ownership_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _PICKLE_ROUTING_INCOMPLETE_REASON = "pickle_routing_incomplete"
 _DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
@@ -2607,6 +2610,23 @@ def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, "nemo_routing_incomplete")
     _mark_operational_scan_error(result, "nemo_routing_incomplete")
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_tokenizer_json_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded inspection cannot prove exact tokenizer ownership."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Tokenizer JSON Routing",
+        passed=False,
+        message="Tokenizer JSON ownership was inconclusive because the bounded EOF proof could not establish it",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -6082,8 +6102,23 @@ def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     config.setdefault(NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_file)
     validate_scan_config(config)
 
-    # Delegate to internal implementation - cache decorator handles caching
-    return _scan_file_internal(path, config)
+    # Delegate to internal implementation - cache decorator handles caching.
+    with huggingface_tokenizer_json_eof_proof_scope() as tokenizer_proof_scope:
+        result = _scan_file_internal(path, config)
+    if not tokenizer_proof_scope.stable:
+        reason = "tokenizer_json_changed_during_scan"
+        result.add_check(
+            name="Tokenizer JSON Identity Check",
+            passed=False,
+            message="Tokenizer JSON changed while its ownership proof was in use; scan coverage is incomplete.",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={"analysis_incomplete": True, "scan_outcome": "inconclusive", "scan_outcome_reason": reason},
+        )
+        _mark_operational_scan_error(result, reason)
+        _mark_inconclusive_scan_outcome(result, reason)
+        result.finish(success=False)
+    return result
 
 
 def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> ScanResult:
@@ -6303,7 +6338,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         magic_format = "unknown"
     elif header_format == "zip":
         magic_format = "zip"
-    elif header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}:
+    elif header_format in {
+        "mxnet",
+        MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+        TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
+    }:
         magic_format = header_format
     else:
         try:
@@ -6387,6 +6426,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         return sr
     if header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_nemo_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if (
+        header_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+        or magic_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_tokenizer_json_routing_result(path)
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
@@ -6788,6 +6835,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_llamafile_routing_result(path, config)
             elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_nemo_routing_result(path)
+            elif magic_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_tokenizer_json_routing_result(path)
             elif magic_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
             elif magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
