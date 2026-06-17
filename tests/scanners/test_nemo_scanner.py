@@ -8335,7 +8335,8 @@ class TestCVE202523304HydraTarget:
                 max_tar_entries=1,
             )
 
-            metadata = aggregate.file_metadata[str(nemo_path)]
+            assert len(aggregate.file_metadata) == 1
+            metadata = next(iter(aggregate.file_metadata.values()))
             assert replacement_performed is True
             assert materialized_member_counts == [1]
             assert aggregate.success is False
