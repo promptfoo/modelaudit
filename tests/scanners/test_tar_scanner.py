@@ -3102,6 +3102,47 @@ class TestTarScanner:
         assert "tar_compressed_trailing_data" in result.metadata["scan_outcome_reasons"]
 
     @pytest.mark.parametrize(
+        ("suffix", "compress"),
+        [
+            (".tar.gz", gzip.compress),
+            (".tar.xz", lzma.compress),
+        ],
+    )
+    def test_inter_stream_padding_does_not_inflate_compressed_ratio(
+        self,
+        tmp_path: Path,
+        suffix: str,
+        compress: Any,
+    ) -> None:
+        archive_path = tmp_path / f"inter-stream-padding{suffix}"
+        raw_tar = io.BytesIO()
+        with tarfile.open(fileobj=raw_tar, mode="w") as archive:
+            payload = b"A" * (12 * 1024 * 1024)
+            info = tarfile.TarInfo("weights.bin")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        padding_size = 512 * 1024
+        archive_path.write_bytes(compress(b"") + (b"\0" * padding_size) + compress(raw_tar.getvalue()))
+
+        result = TarScanner(
+            config={
+                "compressed_max_decompressed_bytes": 64 * 1024 * 1024,
+                "compressed_max_decompression_ratio": 20.0,
+                "compressed_max_xz_padding_bytes": 1024 * 1024,
+                "max_tar_total_uncompressed_size": 64 * 1024 * 1024,
+            }
+        ).scan(str(archive_path))
+
+        failed_ratio_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compressed Wrapper Decompression Limits" and check.status == CheckStatus.FAILED
+        ]
+        assert failed_ratio_checks
+        assert failed_ratio_checks[-1].details["actual_ratio"] > 20.0
+        assert failed_ratio_checks[-1].details["compressed_size"] < padding_size
+
+    @pytest.mark.parametrize(
         ("suffix", "mode"),
         [
             (".tar.bz2", "w:bz2"),

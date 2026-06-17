@@ -152,9 +152,13 @@ class _TarBoundedStream:
         self.bytes_read = 0
 
     @property
-    def zero_output_compressed_bytes(self) -> int:
-        value = getattr(self._fileobj, "zero_output_stream_bytes", 0)
-        return value if isinstance(value, int) and value > 0 else 0
+    def ratio_excluded_compressed_bytes(self) -> int:
+        """Physical bytes accepted by framing but unrelated to payload output."""
+        zero_output = getattr(self._fileobj, "zero_output_stream_bytes", 0)
+        inter_stream_padding = getattr(self._fileobj, "inter_stream_padding_bytes", 0)
+        return sum(
+            value if isinstance(value, int) and value > 0 else 0 for value in (zero_output, inter_stream_padding)
+        )
 
     def read(self, size: int = -1) -> bytes:
         if size is None or size < 0:
@@ -240,6 +244,7 @@ class _StrictConcatenatedDecompressionReader:
         self._current_stream_input_bytes = 0
         self._current_stream_output_bytes = 0
         self.zero_output_stream_bytes = 0
+        self.inter_stream_padding_bytes = 0
 
     def _new_decompressor(self) -> Any:
         if self._compression_codec == "gzip":
@@ -270,6 +275,7 @@ class _StrictConcatenatedDecompressionReader:
             if block:
                 if self._compression_codec == "xz" and stream_padding_size % 4 != 0:
                     raise _TarCompressedPhysicalTrailingData("Invalid XZ stream padding")
+                self.inter_stream_padding_bytes += stream_padding_size
                 return block
 
             padding_remaining = self._max_xz_padding_bytes - self._xz_padding_bytes_read
@@ -1287,8 +1293,8 @@ class TarScanner(BaseScanner):
 
     @staticmethod
     def _payload_compressed_size(bounded_stream: _TarBoundedStream, compressed_size: int) -> int:
-        """Exclude completed zero-output streams from the decompression-ratio denominator."""
-        return max(compressed_size - bounded_stream.zero_output_compressed_bytes, 1)
+        """Exclude framing bytes that produce no payload from the ratio denominator."""
+        return max(compressed_size - bounded_stream.ratio_excluded_compressed_bytes, 1)
 
     def _record_projected_compressed_member_limit(
         self,
