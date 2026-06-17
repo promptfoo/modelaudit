@@ -12662,6 +12662,33 @@ def test_scan_file_tokenizer_over_eof_cap_with_hidden_late_conflict_fails_closed
     assert magic_probe_calls == 0
 
 
+def test_scan_file_tokenizer_in_budget_hidden_middle_conflict_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 1024
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", proof_budget)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    benign_tokenizer = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}'
+    hidden_conflict = ',"chat_template":"{{ cycler.__init__.__globals__.os.system(\'id\') }}"'
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(benign_tokenizer + (" " * 256) + hidden_conflict + (" " * 256), encoding="utf-8")
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES < tokenizer_path.stat().st_size <= proof_budget
+    assert result.success is False
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == ["tokenizer_json_ownership_incomplete"]
+    check = next(check for check in result.checks if check.name == "Tokenizer JSON Routing")
+    assert check.status == CheckStatus.FAILED
+    assert check.details["format"] == file_detection.TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
 @pytest.mark.parametrize(
     "model_fields, added_tokens",
     [

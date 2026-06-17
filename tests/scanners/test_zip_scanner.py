@@ -6001,6 +6001,32 @@ def test_scan_nested_file_fails_closed_when_tensorflow_protobuf_routing_budget_i
     assert "bounded structural probe reached its limit" in check.message
 
 
+def test_scan_nested_file_fails_closed_when_tokenizer_ownership_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    benign_tokenizer = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}'
+    hidden_conflict = ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}]'
+    extracted_member = tmp_path / "tokenizer.json"
+    extracted_member.write_text(benign_tokenizer + (" " * 320) + hidden_conflict + (" " * 128), encoding="utf-8")
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "tokenizer_json_ownership_incomplete"
+    check = next(check for check in result.checks if check.name == "Tokenizer JSON Routing")
+    assert check.details["format"] == file_detection.TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert "bounded EOF proof could not establish it" in check.message
+
+
 def test_scan_nested_file_fails_closed_when_protocolless_pickle_routing_budget_is_exhausted(
     tmp_path: Path,
 ) -> None:

@@ -451,6 +451,7 @@ def scanner_ids_for_detected_format(detected_format: str) -> frozenset[str]:
         PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+        TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
         XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
         XML_MODEL_INCONCLUSIVE_FORMAT,
     )
@@ -478,6 +479,8 @@ def scanner_ids_for_detected_format(detected_format: str) -> frozenset[str]:
         scanner_ids.update({"coreml", "onnx", "tf_metagraph", "tf_savedmodel"})
     if detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
         scanner_ids.update({"tf_metagraph", "tf_savedmodel"})
+    if detected_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.update({"jax_checkpoint", "jinja2_template", "mxnet", "xgboost"})
     if detected_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
         scanner_ids.update({"jax_checkpoint", "mxnet"})
     if detected_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:

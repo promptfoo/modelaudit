@@ -1667,6 +1667,7 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(
     path: str | Path,
     *,
     accept_complete_prefix: bool = False,
+    complete_prefix_only: bool = False,
 ) -> bool:
     """Return whether exact tokenizer.json has tokenizer evidence but malformed JSON."""
     file_path = Path(path)
@@ -1697,33 +1698,36 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(
     def has_tokenizer_root_evidence() -> bool:
         return saw_model_schema or saw_model_key or root_keys >= _HF_TOKENIZER_ROOT_KEYS
 
+    def incomplete_schema_evidence() -> bool:
+        return not complete_prefix_only and has_tokenizer_root_evidence()
+
     offset += 1
     while offset < len(probe):
         offset = _json_probe_skip_whitespace(probe, offset)
         if offset >= len(probe):
-            return sample_is_prefix and has_tokenizer_root_evidence()
+            return sample_is_prefix and incomplete_schema_evidence()
         if probe[offset] == ord("}"):
             return has_tokenizer_root_evidence() and (
                 not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
                 or (accept_complete_prefix and sample_is_prefix)
             )
         if probe[offset] != ord('"'):
-            return has_tokenizer_root_evidence()
+            return incomplete_schema_evidence()
 
         key_start = offset
         key_end = _json_probe_skip_string(probe, offset)
         if key_end is None:
-            return has_tokenizer_root_evidence()
+            return incomplete_schema_evidence()
         key = _json_probe_decode_string(probe, key_start, key_end)
         if key is None:
-            return has_tokenizer_root_evidence()
+            return incomplete_schema_evidence()
 
         offset = _json_probe_skip_whitespace(probe, key_end)
         if offset >= len(probe) or probe[offset] != ord(":"):
-            return has_tokenizer_root_evidence()
+            return incomplete_schema_evidence()
         value_offset = _json_probe_skip_whitespace(probe, offset + 1)
         if value_offset >= len(probe):
-            return sample_is_prefix and has_tokenizer_root_evidence()
+            return sample_is_prefix and incomplete_schema_evidence()
 
         if key in _HF_TOKENIZER_ROOT_KEYS:
             root_keys.add(key)
@@ -1732,10 +1736,10 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(
             try:
                 next_offset, model_schema = _hf_tokenizer_probe_model_object(probe, value_offset, state)
             except (_JSONProbeIncomplete, _JSONProbeInvalid):
-                return has_tokenizer_root_evidence()
+                return incomplete_schema_evidence()
             saw_model_schema = saw_model_schema or model_schema
             if next_offset is None:
-                return sample_is_prefix and has_tokenizer_root_evidence()
+                return sample_is_prefix and incomplete_schema_evidence()
         else:
             try:
                 next_offset = _json_probe_skip_value_with_template_scan(
@@ -1746,11 +1750,11 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(
                     scan_string_template_indicators=key not in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS,
                 )
             except (_JSONProbeIncomplete, _JSONProbeInvalid):
-                return has_tokenizer_root_evidence()
+                return incomplete_schema_evidence()
 
         offset = _json_probe_skip_whitespace(probe, next_offset)
         if offset >= len(probe):
-            return sample_is_prefix and has_tokenizer_root_evidence()
+            return sample_is_prefix and incomplete_schema_evidence()
         if probe[offset] == ord(","):
             offset += 1
             continue
@@ -1759,22 +1763,29 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(
                 not _json_probe_has_only_trailing_whitespace(probe, offset + 1)
                 or (accept_complete_prefix and sample_is_prefix)
             )
-        return has_tokenizer_root_evidence()
+        return incomplete_schema_evidence()
 
-    return sample_is_prefix and has_tokenizer_root_evidence()
+    return sample_is_prefix and incomplete_schema_evidence()
 
 
-def _hf_tokenizer_json_eof_proof_exceeds_budget(path: str | Path) -> bool:
-    """Return whether exact tokenizer evidence extends beyond the EOF proof cap."""
+def _hf_tokenizer_json_ownership_is_inconclusive(path: str | Path) -> bool:
+    """Return whether bounded probes cannot exclude a late tokenizer route conflict."""
     file_path = Path(path)
     if not _is_hf_tokenizer_json_schema_path(file_path):
         return False
     try:
-        if not file_path.is_file() or file_path.stat().st_size <= TOKENIZER_JSON_EOF_PROOF_READ_BYTES:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        if file_size <= TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES:
             return False
     except OSError:
         return False
-    return _malformed_hf_tokenizer_json_has_schema_evidence(file_path, accept_complete_prefix=True)
+    return _malformed_hf_tokenizer_json_has_schema_evidence(
+        file_path,
+        accept_complete_prefix=True,
+        complete_prefix_only=file_size <= TOKENIZER_JSON_EOF_PROOF_READ_BYTES,
+    )
 
 
 def huggingface_tokenizer_json_has_template_route_evidence(path: str | Path) -> bool:
@@ -2744,7 +2755,7 @@ def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str |
         or huggingface_tokenizer_json_has_jax_route_evidence(file_path)
     ):
         return None
-    if not tokenizer_has_mxnet_or_xgboost and _hf_tokenizer_json_eof_proof_exceeds_budget(file_path):
+    if not tokenizer_has_mxnet_or_xgboost and _hf_tokenizer_json_ownership_is_inconclusive(file_path):
         return TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
     if not tokenizer_has_mxnet_or_xgboost and _malformed_hf_tokenizer_json_has_schema_evidence(file_path):
         return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT

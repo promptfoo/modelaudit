@@ -2615,12 +2615,12 @@ def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
 
 
 def _make_incomplete_tokenizer_json_routing_result(path: str) -> ScanResult:
-    """Fail closed when exact tokenizer ownership cannot be proven within its EOF cap."""
+    """Fail closed when bounded inspection cannot prove exact tokenizer ownership."""
     result = ScanResult(scanner_name="unknown")
     result.add_check(
         name="Tokenizer JSON Routing",
         passed=False,
-        message="Tokenizer JSON ownership was inconclusive because the bounded EOF proof reached its limit",
+        message="Tokenizer JSON ownership was inconclusive because the bounded EOF proof could not establish it",
         severity=IssueSeverity.INFO,
         location=path,
         details={"format": TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT, "path": path},

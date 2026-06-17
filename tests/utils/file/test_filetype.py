@@ -5000,6 +5000,30 @@ def test_hf_tokenizer_json_over_eof_cap_with_hidden_late_conflict_is_inconclusiv
     assert detect_file_format_for_skip_filter(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
 
 
+def test_hf_tokenizer_json_in_budget_hidden_middle_conflict_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 1024
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", proof_budget)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    benign_tokenizer = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}'
+    hidden_conflict = ',"chat_template":"{{ cycler.__init__.__globals__.os.system(\'id\') }}"'
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(benign_tokenizer + (" " * 256) + hidden_conflict + (" " * 256), encoding="utf-8")
+
+    assert file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES < tokenizer_path.stat().st_size <= proof_budget
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
 def test_hf_tokenizer_json_eof_proof_keeps_large_vocab_token_memory_bounded(tmp_path: Path) -> None:
     long_token = "x" * (file_detection._HF_TOKENIZER_STREAM_MAX_KEY_BYTES + 1)
     tokenizer_path = tmp_path / "tokenizer.json"
