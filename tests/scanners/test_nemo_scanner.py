@@ -1092,6 +1092,44 @@ class TestNemoScannerBasic:
         finally:
             reset_cache_manager()
 
+    def test_corrupt_gzip_crc_nemo_preserves_hydra_finding_without_cache(self, tmp_path: Path) -> None:
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model:\n  _target_: os.system\n",
+            filename="corrupt-crc-malicious.nemo",
+            mode="w:gz",
+        )
+        compressed = bytearray(path.read_bytes())
+        compressed[-8] ^= 1
+        path.write_bytes(compressed)
+
+        direct = NemoScanner(config={"cache_enabled": False}).scan(str(path))
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.success is False
+        assert "tar_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+        assert determine_exit_code(aggregate) == 2
+
+        cache_dir = tmp_path / "corrupt-crc-malicious-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == 2
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     @pytest.mark.parametrize("route_format", ["gzip", "nemo"])
     def test_truncated_gzip_nemo_keeps_nemo_ownership_for_content_routes(
         self,

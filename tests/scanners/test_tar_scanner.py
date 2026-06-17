@@ -3142,6 +3142,64 @@ class TestTarScanner:
         assert failed_ratio_checks[-1].details["actual_ratio"] > 20.0
         assert failed_ratio_checks[-1].details["compressed_size"] < padding_size
 
+    def test_zero_valued_gzip_trailer_byte_is_not_treated_as_padding(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "zero-trailer-byte.tar.gz"
+        payload = bytes(range(256)) * 512
+        raw_tar = io.BytesIO()
+        with tarfile.open(fileobj=raw_tar, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            info = tarfile.TarInfo("weights.bin")
+            info.size = len(payload)
+            info.mtime = 0
+            info.mode = 0o644
+            info.uid = 0
+            info.gid = 0
+            archive.addfile(info, io.BytesIO(payload))
+        wrapped = gzip.compress(raw_tar.getvalue(), compresslevel=9, mtime=0)
+        archive_path.write_bytes(wrapped)
+        trailing_zeros = len(wrapped) - len(wrapped.rstrip(b"\0"))
+        assert trailing_zeros == 1
+        physical_ratio = len(raw_tar.getvalue()) / len(wrapped)
+        incorrectly_trimmed_ratio = len(raw_tar.getvalue()) / (len(wrapped) - trailing_zeros)
+
+        result = TarScanner(
+            config={
+                "compressed_max_decompressed_bytes": 1024 * 1024,
+                "compressed_max_decompression_ratio": (physical_ratio + incorrectly_trimmed_ratio) / 2,
+                "max_tar_total_uncompressed_size": 1024 * 1024,
+            }
+        ).scan(str(archive_path))
+
+        ratio_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert result.success is True
+        assert ratio_checks[-1].status == CheckStatus.PASSED
+        assert ratio_checks[-1].details["compressed_size"] == len(wrapped)
+        assert ratio_checks[-1].details["actual_ratio"] == pytest.approx(physical_ratio)
+
+    def test_terminal_empty_gzip_member_is_excluded_once_from_ratio(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "terminal-empty-member.tar.gz"
+        raw_tar = io.BytesIO()
+        with tarfile.open(fileobj=raw_tar, mode="w") as archive:
+            payload = os.urandom(128 * 1024)
+            info = tarfile.TarInfo("weights.bin")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        payload_member = gzip.compress(raw_tar.getvalue(), mtime=0)
+        empty_member = gzip.compress(b"", mtime=0)
+        archive_path.write_bytes(payload_member + empty_member)
+
+        result = TarScanner(
+            config={
+                "compressed_max_decompressed_bytes": 1024 * 1024,
+                "compressed_max_decompression_ratio": 100.0,
+                "max_tar_total_uncompressed_size": 1024 * 1024,
+            }
+        ).scan(str(archive_path))
+
+        ratio_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert result.success is True
+        assert ratio_checks[-1].status == CheckStatus.PASSED
+        assert ratio_checks[-1].details["compressed_size"] == len(payload_member)
+
     @pytest.mark.parametrize(
         ("suffix", "mode"),
         [

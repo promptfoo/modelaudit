@@ -156,8 +156,10 @@ class _TarBoundedStream:
         """Physical bytes accepted by framing but unrelated to payload output."""
         zero_output = getattr(self._fileobj, "zero_output_stream_bytes", 0)
         inter_stream_padding = getattr(self._fileobj, "inter_stream_padding_bytes", 0)
+        terminal_padding = getattr(self._fileobj, "terminal_padding_bytes", 0)
         return sum(
-            value if isinstance(value, int) and value > 0 else 0 for value in (zero_output, inter_stream_padding)
+            value if isinstance(value, int) and value > 0 else 0
+            for value in (zero_output, inter_stream_padding, terminal_padding)
         )
 
     def read(self, size: int = -1) -> bytes:
@@ -245,6 +247,7 @@ class _StrictConcatenatedDecompressionReader:
         self._current_stream_output_bytes = 0
         self.zero_output_stream_bytes = 0
         self.inter_stream_padding_bytes = 0
+        self.terminal_padding_bytes = 0
 
     def _new_decompressor(self) -> Any:
         if self._compression_codec == "gzip":
@@ -283,6 +286,7 @@ class _StrictConcatenatedDecompressionReader:
             if not block:
                 if self._compression_codec == "xz" and stream_padding_size % 4 != 0:
                     raise _TarCompressedPhysicalTrailingData("Invalid XZ stream padding")
+                self.terminal_padding_bytes += stream_padding_size
                 return None
 
     def _next_stream_input(self) -> bytes | None:
@@ -398,7 +402,16 @@ class TarScanner(BaseScanner):
         return min(size, self.source_size_limit) if self.source_size_limit is not None else size
 
     def _effective_compressed_source_size(self, path: str, raw_file: BinaryIO | None = None) -> int:
-        """Exclude accepted trailing zero padding from the compression ratio denominator."""
+        """Return the exact physical compressed source size."""
+        return self._effective_source_size(path, raw_file)
+
+    def _projected_compressed_source_size(self, path: str, raw_file: BinaryIO | None = None) -> int:
+        """Conservatively exclude provable padding before payload extraction.
+
+        Exact terminal padding is reported by the strict reader after wrapper
+        EOF/CRC validation. This estimate preserves the largest possible
+        codec trailer so zero-valued trailer bytes are never misclassified.
+        """
         source_size = self._effective_source_size(path, raw_file)
         if source_size <= 0:
             return source_size
@@ -409,7 +422,11 @@ class TarScanner(BaseScanner):
             try:
                 source.seek(0)
                 prefix = source.read(len(_XZ_MAGIC))
-                if not prefix.startswith((_GZIP_MAGIC, _BZIP2_MAGIC, _XZ_MAGIC)):
+                if prefix.startswith(_GZIP_MAGIC):
+                    protected_trailer_bytes = 8
+                elif prefix.startswith(_XZ_MAGIC):
+                    protected_trailer_bytes = 12
+                else:
                     return source_size
 
                 trailing_padding = 0
@@ -420,14 +437,11 @@ class TarScanner(BaseScanner):
                     block = source.read(cursor - read_start)
                     trailing_padding += len(block) - len(block.rstrip(b"\0"))
                     if trailing_padding > self.max_xz_padding_bytes:
-                        # Ratio accounting must not preempt archive findings.
-                        # The streaming reader owns definitive padding-policy
-                        # enforcement after reachable members are analyzed.
-                        return max(source_size - trailing_padding, 1)
+                        return max(source_size - max(trailing_padding - protected_trailer_bytes, 0), 1)
                     if any(block):
-                        return max(source_size - trailing_padding, 1)
+                        return max(source_size - max(trailing_padding - protected_trailer_bytes, 0), 1)
                     cursor = read_start
-                return 1
+                return max(source_size - max(trailing_padding - protected_trailer_bytes, 0), 1)
             finally:
                 source.seek(original_offset)
 
@@ -1482,6 +1496,7 @@ class TarScanner(BaseScanner):
         """Stream TAR headers once to enforce wrapper and optional aggregate limits."""
         entry_count = 0
         compressed_size = self._effective_source_size(path, raw_file)
+        projected_compressed_size = compressed_size
         compression_codec: str | None = None
         consumed_size = 0
         archive_uncompressed_size = 0
@@ -1490,6 +1505,7 @@ class TarScanner(BaseScanner):
 
         try:
             compressed_size = self._effective_compressed_source_size(path, raw_file)
+            projected_compressed_size = self._projected_compressed_source_size(path, raw_file)
             with self._open_tar_stream(path, raw_file=raw_file) as (tar, bounded_stream, compression_codec):
                 while True:
                     try:
@@ -1566,7 +1582,7 @@ class TarScanner(BaseScanner):
                             member,
                             bounded_stream,
                             compression_codec=compression_codec,
-                            compressed_size=compressed_size,
+                            compressed_size=projected_compressed_size,
                         ):
                             return False
                         consumed_size = max(consumed_size, bounded_stream.bytes_read)
@@ -1575,7 +1591,10 @@ class TarScanner(BaseScanner):
                             result,
                             path,
                             stream_size=estimated_stream_size,
-                            compressed_size=self._payload_compressed_size(bounded_stream, compressed_size),
+                            compressed_size=self._payload_compressed_size(
+                                bounded_stream,
+                                projected_compressed_size,
+                            ),
                             compression_codec=compression_codec,
                         ):
                             return False
@@ -1616,7 +1635,7 @@ class TarScanner(BaseScanner):
                 path,
                 exc,
                 compression_codec=compression_codec,
-                compressed_size=compressed_size,
+                compressed_size=projected_compressed_size,
             )
             return False
         except _TarCompressedPhysicalTrailingData:
@@ -1764,6 +1783,7 @@ class TarScanner(BaseScanner):
         entry_count_check_recorded = False
         aggregate_size_check_recorded = False
         compressed_size = self._effective_source_size(path, raw_file)
+        projected_compressed_size = compressed_size
         compression_codec: str | None = None
         bounded_stream: _TarBoundedStream | None = None
         shared_budget = self._get_or_create_shared_budget()
@@ -1776,6 +1796,7 @@ class TarScanner(BaseScanner):
 
         try:
             compressed_size = self._effective_compressed_source_size(path, raw_file)
+            projected_compressed_size = self._projected_compressed_source_size(path, raw_file)
             with self._open_tar_stream(path, raw_file=raw_file) as (tar, bounded_stream, compression_codec):
                 security_only_nested_entries = self.config.get(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY)
                 if not isinstance(security_only_nested_entries, set):
@@ -1805,7 +1826,7 @@ class TarScanner(BaseScanner):
                             path,
                             exc,
                             compression_codec=compression_codec,
-                            compressed_size=compressed_size,
+                            compressed_size=projected_compressed_size,
                         )
                         break
                     except _TarCompressedPhysicalTrailingData:
@@ -1911,7 +1932,7 @@ class TarScanner(BaseScanner):
                                 member,
                                 bounded_stream,
                                 compression_codec=compression_codec,
-                                compressed_size=compressed_size,
+                                compressed_size=projected_compressed_size,
                             ):
                                 scan_complete = False
                                 stream_budget_failed = True
@@ -2118,7 +2139,7 @@ class TarScanner(BaseScanner):
                             member,
                             bounded_stream,
                             compression_codec=compression_codec,
-                            compressed_size=compressed_size,
+                            compressed_size=projected_compressed_size,
                         ):
                             stream_budget_failed = True
                             break
@@ -2156,7 +2177,7 @@ class TarScanner(BaseScanner):
                                 member,
                                 bounded_stream,
                                 compression_codec=compression_codec,
-                                compressed_size=compressed_size,
+                                compressed_size=projected_compressed_size,
                             )
                             if stream_budget_exceeded:
                                 stream_budget_failed = True
@@ -2190,7 +2211,7 @@ class TarScanner(BaseScanner):
                         member,
                         bounded_stream,
                         compression_codec=compression_codec,
-                        compressed_size=compressed_size,
+                        compressed_size=projected_compressed_size,
                     ):
                         scan_complete = False
                         stream_budget_failed = True
@@ -2313,7 +2334,7 @@ class TarScanner(BaseScanner):
                             path,
                             exc,
                             compression_codec=compression_codec,
-                            compressed_size=compressed_size,
+                            compressed_size=projected_compressed_size,
                         )
                         break
                     except _TarEntryExtractionIncomplete as exc:
@@ -2370,7 +2391,7 @@ class TarScanner(BaseScanner):
                 path,
                 exc,
                 compression_codec=compression_codec,
-                compressed_size=compressed_size,
+                compressed_size=projected_compressed_size,
             )
         except Exception as exc:
             if raw_file is None:

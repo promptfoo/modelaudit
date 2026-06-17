@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 _PREFLIGHT_PREFIX_ANALYSIS_REASONS = frozenset(
     {
         "tar_metadata_read_limit_exceeded",
+        "tar_scan_incomplete",
         "tar_total_size_limit_exceeded",
         TAR_ENTRY_COUNT_INCOMPLETE_REASON,
     }
@@ -1473,13 +1474,22 @@ class NemoScanner(BaseScanner):
                 if preflight_reasons and preflight_reasons <= _PREFLIGHT_PREFIX_ANALYSIS_REASONS:
                     shared_budget.member_bytes_consumed = initial_member_bytes
                     shared_budget.exhausted = initial_budget_exhausted
-                    result.merge(
-                        tar_scanner._scan_tar_file(
-                            path,
-                            depth=archive_depth,
-                            raw_file=archive_file,
-                        )
+                    prefix_result = tar_scanner._scan_tar_file(
+                        path,
+                        depth=archive_depth,
+                        raw_file=archive_file,
                     )
+                    prefix_result.checks = [
+                        check
+                        for check in prefix_result.checks
+                        if check.details.get("scan_outcome_reason") not in preflight_reasons
+                    ]
+                    prefix_result.issues = [
+                        issue
+                        for issue in prefix_result.issues
+                        if issue.details.get("scan_outcome_reason") not in preflight_reasons
+                    ]
+                    result.merge(prefix_result)
             finally:
                 archive_source_changed = archive_source_changed or self._archive_source_changed(
                     path,
