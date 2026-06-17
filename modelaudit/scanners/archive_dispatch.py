@@ -40,6 +40,7 @@ from ..utils.file.detection import (
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+    TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     _is_malformed_sentencepiece_model_proto_candidate_file,
@@ -91,6 +92,7 @@ _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON = "sentencepiece_model_proto_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
+_TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON = "tokenizer_json_ownership_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _PICKLE_ROUTING_INCOMPLETE_REASON = "pickle_routing_incomplete"
 _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
@@ -1033,6 +1035,23 @@ def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
     return result
 
 
+def _make_incomplete_tokenizer_json_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded nested inspection cannot prove tokenizer ownership."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Tokenizer JSON Routing",
+        passed=False,
+        message="Tokenizer JSON ownership was inconclusive because the bounded EOF proof could not establish it",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, _TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON)
+    mark_operational_scan_error(result, _TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
 def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """Fail closed when bounded nested MXNet symbol routing cannot decide."""
     result = ScanResult(scanner_name="unknown")
@@ -1304,6 +1323,8 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         return with_safetensors_overlap(_make_incomplete_llamafile_routing_result(path, config))
     if trusted_content_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
         return with_safetensors_overlap(_make_incomplete_nemo_routing_result(path))
+    if trusted_content_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT:
+        return with_safetensors_overlap(_make_incomplete_tokenizer_json_routing_result(path))
     if trusted_content_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
         result = _make_incomplete_mxnet_symbol_routing_result(path, config)
         if skipped_overlap_scanner_id:

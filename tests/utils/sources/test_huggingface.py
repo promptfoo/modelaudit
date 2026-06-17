@@ -38,6 +38,7 @@ from modelaudit.utils.file.detection import (
     MEDIA_ROUTE_TAIL_READ_BYTES,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
+    TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format_for_skip_filter,
 )
 from modelaudit.utils.file.hdf5 import HDF5_MAGIC, hdf5_metadata_checksum
@@ -100,6 +101,23 @@ from tests.helpers import create_mock_coreml, create_mock_onnx
 from tests.helpers.file_creators import malicious_pickle_bytes, valid_jpeg_bytes, valid_png_bytes
 
 _HF_TEST_REVISION = "a" * 40
+
+
+def test_hf_selective_routes_preserve_inconclusive_tokenizer_candidates() -> None:
+    from modelaudit.utils.sources.huggingface import (
+        _get_hf_content_route_formats,
+        _hf_detected_format_excluded_by_selected_route_formats,
+    )
+
+    assert TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT in _get_hf_content_route_formats()
+    assert not _hf_detected_format_excluded_by_selected_route_formats(
+        TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
+        {"mxnet"},
+    )
+    assert _hf_detected_format_excluded_by_selected_route_formats(
+        TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
+        {"pickle"},
+    )
 
 
 def test_hf_acquisition_interrupt_check_honors_global_cancel_and_deadline(

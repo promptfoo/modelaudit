@@ -1,12 +1,16 @@
 import bz2
 import gzip
+import hashlib
 import importlib
 import io
 import json
 import lzma
+import os
 import pickle
 import struct
 import tarfile
+import time
+import tracemalloc
 import zipfile
 import zlib
 from collections.abc import Callable
@@ -29,6 +33,7 @@ from modelaudit.utils.file.detection import (
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+    TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_for_skip_filter,
@@ -2076,7 +2081,7 @@ def test_hf_tokenizer_json_key_text_inside_padding_string_does_not_route_jinja(
     )
 
     assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
-    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
     assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
 
 
@@ -2144,7 +2149,7 @@ def test_hf_tokenizer_json_escaped_jinja_string_between_probe_and_suffix_routes_
     assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
 
 
-def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed_across_gap(
+def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_eof_claimed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2161,8 +2166,8 @@ def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed_acro
     )
 
     assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
-    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
-    assert detect_file_format(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
 def test_hf_tokenizer_json_route_key_after_value_ending_at_probe_boundary_routes_jinja(
@@ -5066,3 +5071,490 @@ def test_openvino_vs_pmml_detection(tmp_path):
     # Validation should pass for both
     assert validate_file_type(str(openvino_path)) is True
     assert validate_file_type(str(pmml_path)) is True
+
+
+def _write_streamed_hf_tokenizer_json(path: Path, *, padding_size: int, late_fields: str = "") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"padding":"'
+        )
+        chunk = "x" * (1024 * 1024)
+        remaining = padding_size
+        while remaining:
+            current = min(remaining, len(chunk))
+            handle.write(chunk[:current])
+            remaining -= current
+        handle.write(f'"{late_fields}}}')
+    return path
+
+
+def test_hf_tokenizer_json_eof_proof_claims_valid_over_64m_tokenizer(tmp_path: Path) -> None:
+    tokenizer_path = _write_streamed_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES + 1,
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_eof_proof_budget_boundary_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert file_detection.TOKENIZER_JSON_EOF_PROOF_READ_BYTES == 512 * 1024 * 1024
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=256)
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_EOF_PROOF_READ_BYTES
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_hf_tokenizer_json_over_eof_cap_with_hidden_late_conflict_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 256
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", proof_budget)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    benign_tokenizer = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}'
+    hidden_conflict = ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}]'
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(benign_tokenizer + (" " * 320) + hidden_conflict + (" " * 128), encoding="utf-8")
+
+    assert tokenizer_path.stat().st_size > proof_budget
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_hf_tokenizer_json_in_budget_hidden_middle_conflict_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 1024
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", proof_budget)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    benign_tokenizer = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}'
+    hidden_conflict = ',"chat_template":"{{ cycler.__init__.__globals__.os.system(\'id\') }}"'
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(benign_tokenizer + (" " * 256) + hidden_conflict + (" " * 256), encoding="utf-8")
+
+    assert file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES < tokenizer_path.stat().st_size <= proof_budget
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_hf_tokenizer_json_eof_proof_keeps_large_vocab_token_memory_bounded(tmp_path: Path) -> None:
+    long_token = "x" * (file_detection._HF_TOKENIZER_STREAM_MAX_KEY_BYTES + 1)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"' + long_token + '":0},"merges":[]}}',
+        encoding="utf-8",
+    )
+
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_eof_proof_keeps_large_padding_memory_bounded(tmp_path: Path) -> None:
+    tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=4 * 1024 * 1024)
+
+    tracemalloc.start()
+    try:
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 3 * 1024 * 1024
+
+
+def test_hf_tokenizer_json_eof_proof_uses_configured_chunk_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunk_size = 8192
+    tokenizer_path = _write_streamed_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=chunk_size * 2,
+    )
+    original_open = Path.open
+    read_sizes: list[int] = []
+
+    class TrackingReader:
+        def __init__(self, wrapped: IO[bytes]) -> None:
+            self.wrapped = wrapped
+
+        def __enter__(self) -> "TrackingReader":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.wrapped.close()
+
+        def fileno(self) -> int:
+            return self.wrapped.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            return self.wrapped.read(size)
+
+    def tracking_open(self: Path, mode: str = "r", *args: object, **kwargs: object) -> IO[Any]:
+        return cast(IO[Any], TrackingReader(cast(IO[bytes], original_open(self, mode))))
+
+    monkeypatch.setattr(file_detection, "_HF_TOKENIZER_STREAM_CHUNK_BYTES", chunk_size)
+    monkeypatch.setattr(Path, "open", tracking_open)
+
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+    assert read_sizes
+    assert set(read_sizes) == {chunk_size}
+
+
+def test_hf_tokenizer_json_eof_proof_reuses_only_within_scan_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=8192)
+    original_proof = file_detection._hf_tokenizer_json_eof_proves_ownership_for_identity
+    proof_calls = 0
+
+    def counting_proof(*args: Any, **kwargs: Any) -> bool:
+        nonlocal proof_calls
+        proof_calls += 1
+        return original_proof(*args, **kwargs)
+
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_json_eof_proves_ownership_for_identity", counting_proof)
+
+    with file_detection.huggingface_tokenizer_json_eof_proof_scope() as proof_scope:
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+        assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+
+    assert proof_scope.stable is True
+    assert proof_calls == 1
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+    assert proof_calls == 2
+
+
+def test_hf_tokenizer_json_eof_proof_scope_digest_rejects_restored_metadata_rewrite(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"clean":[{"op":"null","name":"data","inputs":[]}],"safe_keys":[0],"quiet":[[0,0,0]]',
+    )
+    conflict_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "conflict.json",
+        late_fields=',"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]',
+    )
+    conflict_bytes = conflict_path.read_bytes()
+    clean_stat = tokenizer_path.stat()
+    assert len(conflict_bytes) == clean_stat.st_size
+
+    with file_detection.huggingface_tokenizer_json_eof_proof_scope() as proof_scope:
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+        time.sleep(0.01)
+        tokenizer_path.write_bytes(conflict_bytes)
+        os.utime(tokenizer_path, ns=(clean_stat.st_atime_ns, clean_stat.st_mtime_ns))
+
+    assert proof_scope.stable is False
+
+
+def test_hf_tokenizer_json_eof_proof_rejects_late_conflict_after_old_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    tokenizer_path = _write_streamed_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=256,
+        late_fields=',"chat_template":"{{ dangerous }}"',
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_eof_proof_rechecks_same_inode_restored_mtime_conflict(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"clean":[{"op":"null","name":"data","inputs":[]}],"safe_keys":[0],"quiet":[[0,0,0]]',
+    )
+    clean_stat = tokenizer_path.stat()
+
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+    time.sleep(0.01)
+
+    _write_ordered_hf_tokenizer_json(
+        tokenizer_path,
+        late_fields=',"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]',
+    )
+    os.utime(tokenizer_path, ns=(clean_stat.st_atime_ns, clean_stat.st_mtime_ns))
+
+    rewritten_stat = tokenizer_path.stat()
+    assert rewritten_stat.st_ino == clean_stat.st_ino
+    assert rewritten_stat.st_size == clean_stat.st_size
+    assert rewritten_stat.st_mtime_ns == clean_stat.st_mtime_ns
+    if os.name != "nt":
+        assert rewritten_stat.st_ctime_ns != clean_stat.st_ctime_ns
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "mxnet"
+
+
+def test_hf_tokenizer_json_eof_proof_rejects_post_eof_same_inode_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"clean":[{"op":"null","name":"data","inputs":[]}],"safe_keys":[0],"quiet":[[0,0,0]]',
+    )
+    conflict_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "conflict.json",
+        late_fields=',"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]',
+    )
+    conflict_bytes = conflict_path.read_bytes()
+    clean_stat = tokenizer_path.stat()
+    assert len(conflict_bytes) == clean_stat.st_size
+    time.sleep(0.01)
+    original_open = Path.open
+
+    class EOFRewriteReader:
+        def __init__(self, wrapped: IO[bytes]) -> None:
+            self.wrapped = wrapped
+            self.rewritten = False
+
+        def __enter__(self) -> "EOFRewriteReader":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.wrapped.close()
+
+        def fileno(self) -> int:
+            return self.wrapped.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            chunk = self.wrapped.read(size)
+            if not chunk and not self.rewritten:
+                self.rewritten = True
+                with original_open(tokenizer_path, "wb") as rewrite_stream:
+                    rewrite_stream.write(conflict_bytes)
+                os.utime(tokenizer_path, ns=(clean_stat.st_atime_ns, clean_stat.st_mtime_ns))
+            return chunk
+
+    def tracking_open(self: Path, mode: str = "r", *args: object, **kwargs: object) -> IO[Any]:
+        del args, kwargs
+        stream: IO[Any] = original_open(self, mode)
+        if self == tokenizer_path and mode == "rb":
+            return cast(IO[Any], EOFRewriteReader(cast(IO[bytes], stream)))
+        return stream
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+    rewritten_stat = tokenizer_path.stat()
+    assert rewritten_stat.st_ino == clean_stat.st_ino
+    assert rewritten_stat.st_size == clean_stat.st_size
+    assert rewritten_stat.st_mtime_ns == clean_stat.st_mtime_ns
+    if os.name != "nt":
+        assert rewritten_stat.st_ctime_ns != clean_stat.st_ctime_ns
+    assert file_detection.huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_digest_verifier_bounds_concurrent_growth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 256
+    tokenizer_path = _write_ordered_hf_tokenizer_json(tmp_path / "tokenizer.json")
+    file_stat = tokenizer_path.stat()
+    key: file_detection._HFTokenizerEOFProofKey = (
+        str(tokenizer_path),
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_detection._hf_tokenizer_file_change_token(str(tokenizer_path), file_stat),
+        proof_budget,
+    )
+    original_open = Path.open
+    bytes_returned = 0
+
+    class GrowingReader:
+        def __init__(self, wrapped: IO[bytes]) -> None:
+            self.wrapped = wrapped
+
+        def __enter__(self) -> "GrowingReader":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.wrapped.close()
+
+        def fileno(self) -> int:
+            return self.wrapped.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal bytes_returned
+            chunk = b"x" * size
+            bytes_returned += len(chunk)
+            return chunk
+
+    def growing_open(self: Path, mode: str = "r", *args: object, **kwargs: object) -> IO[Any]:
+        del args, kwargs
+        return cast(IO[Any], GrowingReader(cast(IO[bytes], original_open(self, mode))))
+
+    monkeypatch.setattr(Path, "open", growing_open)
+
+    assert file_detection._hf_tokenizer_json_digest_matches_identity(key, b"not-the-digest") is False
+    assert bytes_returned == proof_budget + 1
+
+
+def test_hf_tokenizer_json_digest_verifier_rejects_windows_like_eof_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"clean":[{"op":"null","name":"data","inputs":[]}],"safe_keys":[0],"quiet":[[0,0,0]]',
+    )
+    conflict_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "conflict.json",
+        late_fields=',"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]',
+    )
+    clean_bytes = tokenizer_path.read_bytes()
+    conflict_bytes = conflict_path.read_bytes()
+    clean_stat = tokenizer_path.stat()
+    assert len(conflict_bytes) == len(clean_bytes)
+    generation = 1
+    key: file_detection._HFTokenizerEOFProofKey = (
+        str(tokenizer_path),
+        clean_stat.st_size,
+        clean_stat.st_mtime_ns,
+        clean_stat.st_ctime_ns,
+        clean_stat.st_dev,
+        clean_stat.st_ino,
+        generation,
+        4096,
+    )
+    original_open = Path.open
+
+    class EOFRewriteReader:
+        def __init__(self, wrapped: IO[bytes]) -> None:
+            self.wrapped = wrapped
+            self.rewritten = False
+
+        def __enter__(self) -> "EOFRewriteReader":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.wrapped.close()
+
+        def fileno(self) -> int:
+            return self.wrapped.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal generation
+            chunk = self.wrapped.read(size)
+            if not chunk and not self.rewritten:
+                self.rewritten = True
+                with original_open(tokenizer_path, "wb") as rewrite_stream:
+                    rewrite_stream.write(conflict_bytes)
+                os.utime(tokenizer_path, ns=(clean_stat.st_atime_ns, clean_stat.st_mtime_ns))
+                generation += 1
+            return chunk
+
+    def tracking_open(self: Path, mode: str = "r", *args: object, **kwargs: object) -> IO[Any]:
+        del args, kwargs
+        return cast(IO[Any], EOFRewriteReader(cast(IO[bytes], original_open(self, mode))))
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_stat_matches_identity", lambda *args: True)
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_file_change_token", lambda *args: generation)
+
+    assert file_detection._hf_tokenizer_json_digest_matches_identity(key, hashlib.sha256(clean_bytes).digest()) is False
+
+
+@pytest.mark.parametrize(
+    "model_fields, added_tokens",
+    [
+        ('"type":"BPE","vocab":{"hello":0},"merges":[]', '[{"id":1,"content":"hello","special":false}]'),
+        ('"type":"Unigram","vocab":[["hello",-1.0]],"unk_id":0', '[{"id":1,"content":"hello","special":false}]'),
+    ],
+)
+def test_hf_tokenizer_json_eof_proof_accepts_array_elements_after_old_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_fields: str,
+    added_tokens: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", 4096)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        f'{{"version":"1.0","added_tokens":{added_tokens},"model":{{{model_fields}}},"padding":"{"x" * 256}"}}',
+        encoding="utf-8",
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is True
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_eof_proof_rejects_flat_deep_duplicate_and_invalid_utf8(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", 4096)
+    flat_root = ",".join(f'"field_{index}":0' for index in range(file_detection._HF_TOKENIZER_STREAM_MAX_TRACKED_KEYS))
+    payloads = [
+        '{"version":"1.0","version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}',
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","type":"BPE","vocab":{"hello":0},"merges":[]}}',
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"deep":'
+        + ("[" * 65)
+        + "0"
+        + ("]" * 65)
+        + "}",
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},' + flat_root + "}",
+    ]
+    for index, payload in enumerate(payloads):
+        tokenizer_path = tmp_path / f"case-{index}" / "tokenizer.json"
+        tokenizer_path.parent.mkdir()
+        tokenizer_path.write_text(payload, encoding="utf-8")
+        assert file_detection._hf_tokenizer_json_eof_proves_ownership(tokenizer_path) is False
+
+    late_duplicate = _write_streamed_hf_tokenizer_json(
+        tmp_path / "late-duplicate" / "tokenizer.json",
+        padding_size=256,
+        late_fields=',"version":"1.0"',
+    )
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(late_duplicate) is False
+
+    invalid_utf8_path = tmp_path / "invalid" / "tokenizer.json"
+    invalid_utf8_path.parent.mkdir()
+    invalid_utf8_path.write_bytes(
+        b'{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"\xff":0},"merges":[]}}'
+    )
+    assert file_detection._hf_tokenizer_json_eof_proves_ownership(invalid_utf8_path) is False

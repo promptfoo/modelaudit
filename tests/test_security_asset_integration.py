@@ -271,13 +271,13 @@ class TestSecurityAssetIntegration:
             exit_code = determine_exit_code(results)
             assert exit_code == 1, "Should detect evil.pickle as malicious"
 
-        # Test dill_func.pkl (should be suspicious due to dill usage)
+        # Test dill_func.pkl (intentionally incomplete but still security-positive)
         dill_func = pickles_dir / "dill_func.pkl"
         if dill_func.exists():
             results = scan_model_directory_or_file(str(dill_func))
             exit_code = determine_exit_code(results)
-            assert results.success is True, "Should scan dill_func.pkl successfully"
-            # dill_func.pkl should be flagged as suspicious (exit code 1) due to dill usage
+            assert results.success is False, "dill_func.pkl should preserve its incomplete scan outcome"
+            # The detected dill usage should still preserve the security exit code.
             assert exit_code == 1, "dill_func.pkl should be flagged as suspicious due to dill usage"
 
     @pytest.mark.skipif(

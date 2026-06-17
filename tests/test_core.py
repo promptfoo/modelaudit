@@ -375,6 +375,22 @@ def _write_ordered_hf_tokenizer_json(
     return path
 
 
+def _write_streamed_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"padding":"'
+        )
+        chunk = "x" * (1024 * 1024)
+        remaining = padding_size
+        while remaining:
+            current = min(remaining, len(chunk))
+            handle.write(chunk[:current])
+            remaining -= current
+        handle.write('"}')
+    return path
+
+
 def _write_truncated_ordered_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
     path.write_text(
         (
@@ -13267,6 +13283,152 @@ def test_scan_file_large_hf_tokenizer_json_does_not_run_binary_json_scanners(
     assert not any(check.name == "JSON Content Analysis" for check in result.checks)
 
 
+def test_scan_file_valid_over_64m_hf_tokenizer_json_does_not_fail_closed_as_mxnet(tmp_path: Path) -> None:
+    tokenizer_path = _write_streamed_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES + 1,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert result.success is True
+    assert result.scanner_name not in {"manifest", "jinja2_template", "mxnet", "xgboost"}
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_scan_file_tokenizer_over_eof_cap_with_hidden_late_conflict_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 256
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", proof_budget)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    benign_tokenizer = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}'
+    hidden_conflict = ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}]'
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(benign_tokenizer + (" " * 320) + hidden_conflict + (" " * 128), encoding="utf-8")
+    magic_probe_calls = 0
+
+    def counting_magic_probe(path: str) -> str:
+        nonlocal magic_probe_calls
+        magic_probe_calls += 1
+        return file_detection.detect_file_format_from_magic(path)
+
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", counting_magic_probe)
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert tokenizer_path.stat().st_size > proof_budget
+    assert result.success is False
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == ["tokenizer_json_ownership_incomplete"]
+    assert any(check.name == "Tokenizer JSON Routing" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata["scan_outcome_reasons"]
+    assert magic_probe_calls == 0
+
+
+def test_scan_file_tokenizer_in_budget_hidden_middle_conflict_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof_budget = 1024
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", proof_budget)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    benign_tokenizer = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}'
+    hidden_conflict = ',"chat_template":"{{ cycler.__init__.__globals__.os.system(\'id\') }}"'
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(benign_tokenizer + (" " * 256) + hidden_conflict + (" " * 256), encoding="utf-8")
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES < tokenizer_path.stat().st_size <= proof_budget
+    assert result.success is False
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == ["tokenizer_json_ownership_incomplete"]
+    check = next(check for check in result.checks if check.name == "Tokenizer JSON Routing")
+    assert check.status == CheckStatus.FAILED
+    assert check.details["format"] == file_detection.TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+@pytest.mark.parametrize(
+    "model_fields, added_tokens",
+    [
+        ('"type":"BPE","vocab":{"hello":0},"merges":[]', '[{"id":1,"content":"hello","special":false}]'),
+        ('"type":"Unigram","vocab":[["hello",-1.0]],"unk_id":0', '[{"id":1,"content":"hello","special":false}]'),
+    ],
+)
+def test_scan_file_eof_owned_tokenizer_array_elements_do_not_fail_closed_as_mxnet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_fields: str,
+    added_tokens: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_EOF_PROOF_READ_BYTES", 4096)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        f'{{"version":"1.0","added_tokens":{added_tokens},"model":{{{model_fields}}},"padding":"{"x" * 256}"}}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert result.success is True
+    assert result.scanner_name not in {"manifest", "jinja2_template", "mxnet", "xgboost"}
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_scan_file_eof_tokenizer_ownership_proof_is_cached_per_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=4096)
+    original_proof = file_detection._hf_tokenizer_json_eof_proves_ownership_for_identity
+    proof_calls = 0
+
+    def counting_proof(*args: Any, **kwargs: Any) -> bool:
+        nonlocal proof_calls
+        proof_calls += 1
+        return original_proof(*args, **kwargs)
+
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_json_eof_proves_ownership_for_identity", counting_proof)
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert proof_calls == 1
+
+
+def test_scan_file_fails_closed_when_tokenizer_proof_scope_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    tokenizer_path = _write_streamed_hf_tokenizer_json(tmp_path / "tokenizer.json", padding_size=4096)
+    monkeypatch.setattr(file_detection, "_hf_tokenizer_json_digest_matches_identity", lambda *args: False)
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert "tokenizer_json_changed_during_scan" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Tokenizer JSON Identity Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_file_oversized_hf_tokenizer_json_does_not_fail_closed_as_mxnet(tmp_path: Path) -> None:
     tokenizer_path = _write_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
@@ -13610,7 +13772,7 @@ def test_scan_file_oversized_tokenizer_model_template_after_vocab_preserves_jinj
     )
 
 
-def test_scan_file_tokenizer_model_vocab_after_structure_probe_fails_closed(
+def test_scan_file_tokenizer_model_vocab_after_structure_probe_is_eof_claimed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -13629,12 +13791,12 @@ def test_scan_file_tokenizer_model_vocab_after_structure_probe_fails_closed(
 
     result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
 
-    assert file_detection.is_huggingface_tokenizer_json_file(tokenizer_path) is False
-    assert result.success is False
-    assert "mxnet_symbol_routing_incomplete" in result.metadata.get("scan_outcome_reasons", [])
+    assert file_detection.is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert result.success is True
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
     assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
     assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
-    assert any(check.name == "MXNet Symbol Routing" for check in result.checks)
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
 def test_scan_file_malformed_tokenizer_model_vocab_container_fails_closed(tmp_path: Path) -> None:

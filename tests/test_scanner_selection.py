@@ -35,6 +35,7 @@ from modelaudit.utils.file.detection import (
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+    TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
 )
 from modelaudit.utils.sources.cloud_storage import filter_scannable_files as filter_cloud_scannable_files
 from modelaudit.utils.sources.jfrog import filter_scannable_files as filter_jfrog_scannable_files
@@ -767,6 +768,12 @@ def test_remote_prefilters_fail_open_for_header_routed_scanners() -> None:
 
 def test_pickle_routing_inconclusive_format_maps_to_pickle_scanner() -> None:
     assert scanner_ids_for_detected_format(PICKLE_ROUTING_INCONCLUSIVE_FORMAT) == frozenset({"pickle"})
+
+
+def test_tokenizer_routing_inconclusive_format_maps_to_possible_route_owners() -> None:
+    assert scanner_ids_for_detected_format(TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT) == frozenset(
+        {"jax_checkpoint", "jinja2_template", "mxnet", "xgboost"}
+    )
 
 
 def test_remote_safetensors_route_preserves_possible_overlap_scanners() -> None:

@@ -27,6 +27,7 @@ from modelaudit.utils.file.detection import (
     _XML_MODEL_SIGNATURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+    TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
 )
 from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
@@ -1367,6 +1368,39 @@ def test_filter_scannable_cloud_files_preserves_inconclusive_protocolless_pickle
             "content_detected_format": PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("selected_scanner", "expected"),
+    [
+        pytest.param("mxnet", True, id="possible-owner"),
+        pytest.param("pickle", False, id="unrelated-owner"),
+    ],
+)
+def test_filter_scannable_cloud_files_honors_selection_for_inconclusive_tokenizer_routes(
+    monkeypatch: pytest.MonkeyPatch,
+    selected_scanner: str,
+    expected: bool,
+) -> None:
+    url = "s3://bucket/models/tokenizer.payload"
+    files = [{"path": url, "name": "tokenizer.payload", "size": 1024, "human_size": "1.0 KB"}]
+    scanner_policy = resolve_scanner_selection_policy(scanners=[selected_scanner])
+    monkeypatch.setattr(
+        "modelaudit.utils.sources.cloud_storage._detect_cloud_content_route_format",
+        lambda _fs, _file_info, _sniff_budget: TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
+    )
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=make_fs_mock(),
+        scannable_extensions=selected_scanner_extensions(scanner_policy, conservative=True),
+        scanner_selection=scanner_policy.to_config(),
+    )
+
+    expected_files = (
+        [{**files[0], "content_detected_format": TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT}] if expected else []
+    )
+    assert actual == expected_files
 
 
 @pytest.mark.parametrize(

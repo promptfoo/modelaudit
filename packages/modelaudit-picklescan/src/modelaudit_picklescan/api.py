@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import os
 import pickletools
 import tempfile
@@ -1794,6 +1795,61 @@ def _canonical_pytorch_tensor_rebuild_invocations_match(
     return bool(observed_invocations) and observed_invocations <= canonical_invocations
 
 
+def _complete_pickle_stream_payloads(payload: bytes) -> tuple[tuple[int, bytes], ...] | None:
+    streams: list[tuple[int, bytes]] = []
+    offset = 0
+    opcode_count = 0
+    stream = io.BytesIO(payload)
+    try:
+        while offset < len(payload):
+            stream_end: int | None = None
+            stream.seek(offset)
+            for opcode, _arg, position in pickletools.genops(stream):
+                opcode_count += 1
+                if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
+                    return None
+                if opcode.name != "STOP":
+                    continue
+                if type(position) is not int:
+                    return None
+                stream_end = position + 1
+                break
+            if stream_end is None:
+                return None
+            streams.append((offset, payload[offset:stream_end]))
+            offset = stream_end
+    except Exception:
+        return None
+    return tuple(streams)
+
+
+def _merge_pytorch_storage_reference_parses(
+    parses: tuple[_PytorchStorageReferenceParse, ...],
+) -> _PytorchStorageReferenceParse:
+    referenced_keys: set[str] = set()
+    storage_refs_by_key: dict[str, _PytorchStorageRef] = {}
+    storage_global_positions: set[int] = set()
+    for parsed in parses:
+        if not parsed.parse_complete:
+            return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+        for key, storage_ref in parsed.storage_refs_by_key.items():
+            existing_storage_ref = storage_refs_by_key.get(key)
+            if existing_storage_ref is not None and existing_storage_ref != storage_ref:
+                return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+            storage_refs_by_key[key] = storage_ref
+        referenced_keys.update(parsed.referenced_keys)
+        storage_global_positions.update(parsed.storage_global_positions)
+    return _PytorchStorageReferenceParse(
+        referenced_keys=referenced_keys,
+        storage_refs_by_key=storage_refs_by_key,
+        storage_global_positions=storage_global_positions,
+        # Rebuild context is stream-local; only storage PID structure composes safely.
+        canonical_tensor_rebuild_invocations=set(),
+        parse_complete=True,
+        all_persistent_ids_are_pytorch_storage=all(parsed.all_persistent_ids_are_pytorch_storage for parsed in parses),
+    )
+
+
 def _pytorch_storage_keys_from_pickle_bytes(
     pickle_data: bytes,
     *,
@@ -1801,6 +1857,22 @@ def _pytorch_storage_keys_from_pickle_bytes(
     deadline: float | None = None,
     position_offset: int = 0,
 ) -> _PytorchStorageReferenceParse:
+    pickle_streams = _complete_pickle_stream_payloads(pickle_data)
+    if pickle_streams is None:
+        return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+    if len(pickle_streams) > 1:
+        return _merge_pytorch_storage_reference_parses(
+            tuple(
+                _pytorch_storage_keys_from_pickle_bytes(
+                    stream_payload,
+                    opcode_budget_remaining=opcode_budget_remaining,
+                    deadline=deadline,
+                    position_offset=position_offset + stream_offset,
+                )
+                for stream_offset, stream_payload in pickle_streams
+            )
+        )
+
     marker = object()
     memo: dict[int, Any] = {}
     stack: list[Any] = []
@@ -3532,6 +3604,8 @@ def _with_untrusted_allowlisted_import_findings(
         raw_position = reference.get("position")
         position = raw_position if type(raw_position) is int else None
         key = (import_reference, position)
+        if _is_skippable_pytorch_storage_persistent_id_reference(reference):
+            continue
         source_backed_import_initialization_untrusted = (
             _source_backed_import_requires_initialization_proof((module, name))
             and not module_is_loaded_without_import_hooks(module)
@@ -3544,7 +3618,6 @@ def _with_untrusted_allowlisted_import_findings(
             or bool(reference.get("is_dangerous"))
             or not bool(reference.get("requires_origin_verification"))
             or key in existing_references
-            or _is_skippable_pytorch_storage_persistent_id_reference(reference)
             or (
                 not _allowlisted_import_requires_origin_finding(module, name)
                 and not source_backed_import_initialization_untrusted

