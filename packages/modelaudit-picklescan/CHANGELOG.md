@@ -9,6 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- ignore executable-looking terms inside inert URL string literals while preserving network reducer detections
 - isolate canonical legacy PyTorch storage globals across concatenated control pickle streams before source-sensitive call-graph enrichment while malformed tails still fail closed
 - mirror cached path-importer semantics for call-graph origin proofs and shared snapshots with symlink-sensitive lexical paths, loaded-package contexts, bounded memoized `FileFinder` summaries, preflighted and archive-validated ZIP directories, and startup-frozen distribution roots across Python 3.10-3.13, failing closed on cached misses and untrusted earlier finders while preserving trusted earlier resolutions and metadata-only finder removal
 - suppress canonical PyTorch tensor rebuild warnings only for validated unloaded-runtime ZIP `data.pkl` storage context
