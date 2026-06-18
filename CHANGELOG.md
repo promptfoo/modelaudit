@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- stream large TAR and compressed-TAR model archives through TAR-specific inspection instead of generic whole-file read rejection, bound shared nested NeMo work after aggregate-budget exhaustion, preserve reachable findings at TAR and compressed-wrapper scan limits, preserve trusted HDF5 findings when overlapping TAR routing is inconclusive, prove compressed-stream ownership before bounding HDF5 user-block scans, and cap accepted compressed-wrapper zero padding
 - prove large valid Hugging Face `tokenizer.json` files with bounded EOF streaming so they do not fail closed as MXNet/JAX overlap, while explicitly failing closed when ownership exceeds the EOF proof cap
 - require executable pickle context before reporting URL-only S310 network findings while preserving reducer and loader detections
 - refresh vulnerable aiohttp, cryptography, and required MLflow lock entries detected by dependency audit

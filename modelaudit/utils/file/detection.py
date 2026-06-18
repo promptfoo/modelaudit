@@ -1,5 +1,6 @@
 import bz2
 import codecs
+import gzip
 import hashlib
 import json
 import lzma
@@ -16,13 +17,13 @@ import unicodedata
 import zipfile
 import zlib
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Literal, cast
+from typing import Any, BinaryIO, ClassVar, Literal, cast
 
 from ...scanner_registry_metadata import (
     TEXT_CONTENT_ROUTED_FILENAMES,
@@ -88,7 +89,8 @@ _TensorFlowProtoRoute = Literal[
 ]
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
 _SentencePieceModelProtoRoute = Literal["unknown", "strong", "malformed_candidate"]
-_GzipTarTrailingStatus = Literal["invalid", "nonzero"]
+_GzipTarTrailingStatus = Literal["entry_limit", "invalid", "nonzero"]
+_GZIP_TAR_STATUS_UNSET = object()
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _TORCH7_ASCII_HEADER_MAX_LINE_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
@@ -251,13 +253,16 @@ _ZIP_MAGIC_SIGNATURES = (
     b"PK\x07\x08",  # data descriptor
 )
 _TAR_BLOCK_SIZE = 512
+_TAR_EMPTY_ARCHIVE_PROBE_BYTES = 2 * _TAR_BLOCK_SIZE
+_TAR_EMPTY_ARCHIVE_MAX_VERIFY_BYTES = 10 * 1024 * 1024
+_TAR_FORMAT_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 _TAR_USTAR_OFFSET = 257
 _TAR_USTAR_MAGIC_SIZE = 5
 _TAR_USTAR_MIN_BYTES = _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
 _TAR_CHECKSUM_OFFSET = 148
 _TAR_CHECKSUM_SIZE = 8
 _TAR_GZIP_POST_EOF_TRAILING_READ_BYTES = 64 * 1024
-_TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+_TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 _TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSION_RATIO = 250.0
 _TAR_NUMERIC_FIELD_SLICES = (
     (100, 108),  # mode
@@ -302,6 +307,8 @@ _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
 _NEMO_CONFIG_ENTRIES = frozenset({"model_config.yaml", "model_config.yml"})
 _NEMO_ROUTE_MAX_ENTRIES = 10_000
 _NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS = 100_000
+_NEMO_ROUTE_MAX_BODY_SKIP_BYTES = 64 * 1024
+_NEMO_ROUTE_MAX_METADATA_BYTES = 64 * 1024
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
@@ -6360,6 +6367,149 @@ class _NemoRouteResolutionLimitExceeded(Exception):
     """Raised when bounded NeMo TAR link routing cannot safely continue."""
 
 
+class _NemoRouteProbeBudgetExceeded(Exception):
+    """Raised when bounded NeMo TAR routing would need too much stream data."""
+
+
+class _NemoRouteSparseProbeBudgetExceeded(_NemoRouteProbeBudgetExceeded):
+    """Raised when a GNU sparse extension chain exceeds the routing budget."""
+
+
+_TarMetadataExceptionFactory = Callable[[str, int, int], Exception]
+
+
+@dataclass
+class _TarMetadataBudget:
+    max_bytes: int
+    bytes_read: int = 0
+
+
+class _TarMetadataBoundedFile:
+    """Count and bound reads performed inside tarfile metadata processors."""
+
+    def __init__(
+        self,
+        fileobj: Any,
+        budget: _TarMetadataBudget,
+        exception_factory: _TarMetadataExceptionFactory,
+    ) -> None:
+        self._fileobj = fileobj
+        self.budget = budget
+        self._exception_factory = exception_factory
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self.budget.max_bytes - self.budget.bytes_read
+        if size is None or size < 0 or size > remaining:
+            raise self._exception_factory(
+                f"TAR metadata exceeds cumulative limit ({self.budget.bytes_read + max(size, 1)} > "
+                f"{self.budget.max_bytes} bytes)",
+                self.budget.bytes_read,
+                self.budget.max_bytes,
+            )
+        data = cast(bytes, self._fileobj.read(size))
+        self.budget.bytes_read += len(data)
+        return data
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._fileobj, name)
+
+
+class _BoundedTarInfo(tarfile.TarInfo):
+    """TarInfo variant that bounds cumulative extension and sparse metadata reads."""
+
+    _modelaudit_metadata_budget: ClassVar[_TarMetadataBudget]
+    _modelaudit_exception_factory: ClassVar[_TarMetadataExceptionFactory]
+    _modelaudit_sparse_exception_factory: ClassVar[_TarMetadataExceptionFactory]
+
+    def _check_extension_header_size(self, header_kind: str) -> None:
+        padded_size = ((max(self.size, 0) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+        budget = type(self)._modelaudit_metadata_budget
+        if padded_size > budget.max_bytes:
+            raise type(self)._modelaudit_exception_factory(
+                f"TAR {header_kind} extension header exceeds metadata limit ({padded_size} > {budget.max_bytes} bytes)",
+                budget.bytes_read,
+                budget.max_bytes,
+            )
+
+    def _process_metadata(
+        self,
+        tar_file: tarfile.TarFile,
+        processor: Callable[[], tarfile.TarInfo],
+        *,
+        exception_factory: _TarMetadataExceptionFactory | None = None,
+    ) -> tarfile.TarInfo:
+        budget = type(self)._modelaudit_metadata_budget
+        current_fileobj = tar_file.fileobj
+        if isinstance(current_fileobj, _TarMetadataBoundedFile) and current_fileobj.budget is budget:
+            if exception_factory is None:
+                return processor()
+            original_exception_factory = current_fileobj._exception_factory
+            current_fileobj._exception_factory = exception_factory
+            try:
+                return processor()
+            finally:
+                current_fileobj._exception_factory = original_exception_factory
+
+        tar_file.fileobj = _TarMetadataBoundedFile(
+            current_fileobj,
+            budget,
+            exception_factory or type(self)._modelaudit_exception_factory,
+        )
+        try:
+            return processor()
+        finally:
+            tar_file.fileobj = current_fileobj
+
+    def _proc_pax(self, tar_file: tarfile.TarFile) -> tarfile.TarInfo:
+        self._check_extension_header_size("PAX")
+        parent = cast(Any, super())
+        return self._process_metadata(tar_file, lambda: cast(tarfile.TarInfo, parent._proc_pax(tar_file)))
+
+    def _proc_gnulong(self, tar_file: tarfile.TarFile) -> tarfile.TarInfo:
+        self._check_extension_header_size("GNU long-name")
+        parent = cast(Any, super())
+        return self._process_metadata(tar_file, lambda: cast(tarfile.TarInfo, parent._proc_gnulong(tar_file)))
+
+    def _proc_sparse(self, tar_file: tarfile.TarFile) -> tarfile.TarInfo:
+        parent = cast(Any, super())
+        return self._process_metadata(
+            tar_file,
+            lambda: cast(tarfile.TarInfo, parent._proc_sparse(tar_file)),
+            exception_factory=type(self)._modelaudit_sparse_exception_factory,
+        )
+
+
+def bounded_tar_info_class(
+    max_metadata_bytes: int,
+    *,
+    exception_factory: _TarMetadataExceptionFactory | None = None,
+    sparse_exception_factory: _TarMetadataExceptionFactory | None = None,
+) -> type[_BoundedTarInfo]:
+    """Create an archive-local TarInfo class with one cumulative metadata budget."""
+    normalized_limit = max(1, max_metadata_bytes)
+
+    def default_exception_factory(message: str, _bytes_read: int, _max_bytes: int) -> Exception:
+        return _NemoRouteProbeBudgetExceeded(message)
+
+    def default_sparse_exception_factory(message: str, _bytes_read: int, _max_bytes: int) -> Exception:
+        return _NemoRouteSparseProbeBudgetExceeded(message)
+
+    resolved_exception_factory = exception_factory or default_exception_factory
+    resolved_sparse_exception_factory = (
+        sparse_exception_factory or exception_factory or default_sparse_exception_factory
+    )
+
+    return type(
+        "_ArchiveBoundedTarInfo",
+        (_BoundedTarInfo,),
+        {
+            "_modelaudit_metadata_budget": _TarMetadataBudget(normalized_limit),
+            "_modelaudit_exception_factory": resolved_exception_factory,
+            "_modelaudit_sparse_exception_factory": resolved_sparse_exception_factory,
+        },
+    )
+
+
 def _consume_nemo_route_link_visit(member_visit_budget: list[int]) -> None:
     if member_visit_budget[0] <= 0:
         raise _NemoRouteResolutionLimitExceeded
@@ -6510,7 +6660,48 @@ def _normalize_positive_float(value: Any, default: float) -> float:
         normalized = float(value)
     except (TypeError, ValueError):
         return default
-    return normalized if normalized > 0 else default
+    return normalized if math.isfinite(normalized) and normalized > 0 else default
+
+
+class _GzipTarProbeLimitExceeded(Exception):
+    """Raised when gzip TAR validation exceeds configured work limits."""
+
+
+def _gzip_tar_probe_limit_exception(message: str, _bytes_read: int, _max_bytes: int) -> Exception:
+    """Translate bounded TAR metadata work into the gzip-tail probe outcome."""
+    return _GzipTarProbeLimitExceeded(message)
+
+
+class _GzipTarBoundedReader:
+    def __init__(
+        self,
+        fileobj: Any,
+        *,
+        max_bytes: int,
+        max_ratio: float,
+        compressed_size: int,
+    ) -> None:
+        self._fileobj = fileobj
+        self.max_bytes = max_bytes
+        self.max_ratio = max_ratio
+        self.compressed_size = compressed_size
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = _TAR_GZIP_POST_EOF_TRAILING_READ_BYTES
+        read_size = min(size, self.max_bytes - self.bytes_read + 1)
+        if self.compressed_size > 0:
+            ratio_remaining = (self.compressed_size * self.max_ratio) - self.bytes_read
+            if ratio_remaining < read_size:
+                read_size = max(int(ratio_remaining) + 1, 1)
+        data = cast(bytes, self._fileobj.read(read_size))
+        self.bytes_read += len(data)
+        if self.bytes_read > self.max_bytes:
+            raise _GzipTarProbeLimitExceeded
+        if self.compressed_size > 0 and self.bytes_read / self.compressed_size > self.max_ratio:
+            raise _GzipTarProbeLimitExceeded
+        return data
 
 
 def _gzip_tar_trailing_data_status(
@@ -6518,6 +6709,7 @@ def _gzip_tar_trailing_data_status(
     *,
     max_decompressed_bytes: int | None = None,
     max_decompression_ratio: float | None = None,
+    max_entries: int | None = None,
 ) -> _GzipTarTrailingStatus | None:
     """Return proven gzip TAR stream-tail status after the TAR EOF padding."""
     decompressed_limit = _normalize_positive_int(
@@ -6528,52 +6720,50 @@ def _gzip_tar_trailing_data_status(
         max_decompression_ratio,
         _TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSION_RATIO,
     )
+    entry_limit = _normalize_positive_int(max_entries, _NEMO_ROUTE_MAX_ENTRIES)
     try:
         compressed_size = path.stat().st_size
         with path.open("rb") as raw:
             if raw.read(len(_GZIP_MAGIC)) != _GZIP_MAGIC:
                 return None
-            try:
-                is_tar = tarfile.is_tarfile(path)
-            except (EOFError, tarfile.TarError):
-                return None
-            if not is_tar:
-                return None
             raw.seek(0)
-            with tarfile.open(fileobj=raw, mode="r:gz") as archive:
-                archive.getmembers()
-                trailing_size = 0
-                while True:
-                    trailing = archive.fileobj.read(_TAR_GZIP_POST_EOF_TRAILING_READ_BYTES)
-                    if not trailing:
+            with gzip.GzipFile(fileobj=raw, mode="rb") as decompressed:
+                bounded = _GzipTarBoundedReader(
+                    decompressed,
+                    max_bytes=decompressed_limit,
+                    max_ratio=ratio_limit,
+                    compressed_size=compressed_size,
+                )
+                with ExitStack() as stack:
+                    try:
+                        archive = stack.enter_context(
+                            tarfile.open(
+                                fileobj=cast(Any, bounded),
+                                mode="r|",
+                                bufsize=tarfile.BLOCKSIZE,
+                                tarinfo=cast(
+                                    type[tarfile.TarInfo],
+                                    bounded_tar_info_class(
+                                        _NEMO_ROUTE_MAX_METADATA_BYTES,
+                                        exception_factory=_gzip_tar_probe_limit_exception,
+                                    ),
+                                ),
+                            )
+                        )
+                    except (EOFError, OSError, tarfile.TarError, zlib.error):
                         return None
-                    if any(byte != 0 for byte in trailing):
-                        return "nonzero"
-
-                    trailing_size += len(trailing)
-                    if trailing_size > decompressed_limit:
-                        return "invalid"
-                    if compressed_size > 0 and trailing_size / compressed_size > ratio_limit:
-                        return "invalid"
-    except (EOFError, OSError, tarfile.TarError, zlib.error):
+                    for entry_count, _member in enumerate(archive, start=1):
+                        if entry_count > entry_limit:
+                            return "entry_limit"
+                    cast(Any, archive.fileobj).bufsize = _TAR_GZIP_POST_EOF_TRAILING_READ_BYTES
+                    while True:
+                        trailing = archive.fileobj.read(_TAR_GZIP_POST_EOF_TRAILING_READ_BYTES)
+                        if not trailing:
+                            return None
+                        if any(trailing):
+                            return "nonzero"
+    except (_GzipTarProbeLimitExceeded, EOFError, OSError, tarfile.TarError, zlib.error):
         return "invalid"
-
-
-def has_gzip_tar_nonzero_trailing_data(
-    path: str,
-    *,
-    max_decompressed_bytes: int | None = None,
-    max_decompression_ratio: float | None = None,
-) -> bool:
-    """Return whether a gzip TAR has non-zero trailing data after archive EOF."""
-    return (
-        gzip_tar_trailing_data_status(
-            path,
-            max_decompressed_bytes=max_decompressed_bytes,
-            max_decompression_ratio=max_decompression_ratio,
-        )
-        == "nonzero"
-    )
 
 
 def gzip_tar_trailing_data_status(
@@ -6581,29 +6771,72 @@ def gzip_tar_trailing_data_status(
     *,
     max_decompressed_bytes: int | None = None,
     max_decompression_ratio: float | None = None,
+    max_entries: int | None = None,
 ) -> _GzipTarTrailingStatus | None:
     """Return proven gzip TAR stream-tail status after archive EOF."""
     return _gzip_tar_trailing_data_status(
         Path(path),
         max_decompressed_bytes=max_decompressed_bytes,
         max_decompression_ratio=max_decompression_ratio,
+        max_entries=max_entries,
     )
 
 
-def _detect_tar_route(path: str) -> str | None:
+def _path_claims_tar_container(file_path: Path) -> bool:
+    return file_path.name.lower().endswith(_TAR_FORMAT_SUFFIXES)
+
+
+def _has_supported_tar_compression_wrapper(file_path: Path) -> bool:
+    prefix = read_magic_bytes(str(file_path), len(_XZ_MAGIC))
+    return prefix.startswith((_GZIP_MAGIC, _BZIP2_MAGIC, _XZ_MAGIC))
+
+
+def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = False) -> str | None:
     """Return the safe content route for a valid TAR-backed artifact."""
     file_path = Path(path)
     if not file_path.is_file():
         return None
 
     try:
-        with tarfile.open(file_path, "r:*") as archive:
+        seekable_raw_tar_route = not _has_supported_tar_compression_wrapper(file_path)
+        with ExitStack() as stack:
+            if seekable_raw_tar_route:
+                archive = stack.enter_context(
+                    tarfile.open(
+                        file_path,
+                        "r:",
+                        tarinfo=bounded_tar_info_class(_NEMO_ROUTE_MAX_METADATA_BYTES),
+                    )
+                )
+            else:
+                prefix = read_magic_bytes(str(file_path), len(_XZ_MAGIC))
+                if prefix.startswith(_GZIP_MAGIC) and len(prefix) > 3 and prefix[3] & 0x04:
+                    # tarfile's stream-mode gzip parser mishandles some valid
+                    # FEXTRA layouts; use the stdlib gzip reader for that case.
+                    raw = stack.enter_context(file_path.open("rb"))
+                    decompressed = cast(BinaryIO, stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb")))
+                    archive = stack.enter_context(
+                        tarfile.open(
+                            fileobj=decompressed,
+                            mode="r|",
+                            tarinfo=bounded_tar_info_class(_NEMO_ROUTE_MAX_METADATA_BYTES),
+                        )
+                    )
+                else:
+                    archive = stack.enter_context(
+                        tarfile.open(
+                            file_path,
+                            "r|*",
+                            tarinfo=bounded_tar_info_class(_NEMO_ROUTE_MAX_METADATA_BYTES),
+                        )
+                    )
             if file_path.suffix.lower() == ".nemo":
                 return "tar"
             members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
             root_config_links: list[tarfile.TarInfo] = []
             symlink_targets: dict[str, str] = {}
             occupied_names: set[str] = set()
+            body_skip_budget = _NEMO_ROUTE_MAX_BODY_SKIP_BYTES
             link_resolution_budget = [_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS]
             for entry_count, member in enumerate(archive, start=1):
                 if entry_count > _NEMO_ROUTE_MAX_ENTRIES:
@@ -6633,6 +6866,24 @@ def _detect_tar_route(path: str) -> str | None:
                     )
                     if physical_destination is not None:
                         occupied_names.add(physical_destination)
+                    if not seekable_raw_tar_route:
+                        member_size = max(member.size, 0)
+                        if member_size > body_skip_budget:
+                            if _tar_links_resolve_to_regular_member(
+                                root_config_links,
+                                members_by_normalized_name,
+                                link_resolution_budget,
+                            ):
+                                return "nemo"
+                            hdf5_signature_offset = find_hdf5_signature_offset(path)
+                            if not allow_incomplete_generic_tar_route and hdf5_signature_offset is not None:
+                                from ...scanners.tar_scanner import classify_compressed_tar_prefix_ownership
+
+                                ownership = classify_compressed_tar_prefix_ownership(path, hdf5_signature_offset)
+                                if ownership == "inconclusive":
+                                    return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+                            return "tar"
+                        body_skip_budget -= member_size
                 elif member.issym():
                     destination_name = _resolve_safe_tar_path_through_symlinks(
                         member.name,
@@ -6717,6 +6968,10 @@ def _detect_tar_route(path: str) -> str | None:
                         root_config_links.append(member)
     except _NemoRouteResolutionLimitExceeded:
         return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    except _NemoRouteSparseProbeBudgetExceeded:
+        return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    except _NemoRouteProbeBudgetExceeded:
+        return "tar"
     except (EOFError, OSError, tarfile.TarError):
         return None
 
@@ -6742,10 +6997,7 @@ def is_nemo_archive(path: str) -> bool:
 def _is_tar_archive(path: str) -> bool:
     """Return whether a path is a TAR archive, including compressed wrappers."""
     try:
-        if not tarfile.is_tarfile(path):
-            return False
-        file_path = Path(path)
-        return _gzip_tar_trailing_data_status(file_path) is None
+        return _detect_tar_route(path, allow_incomplete_generic_tar_route=True) is not None
     except Exception:
         return False
 
@@ -6797,6 +7049,35 @@ def _has_valid_tar_checksum_header(header: bytes) -> bool:
 
 def _looks_like_uncompressed_tar_header(header: bytes) -> bool:
     return _has_tar_ustar_signature(header) or _has_valid_tar_checksum_header(header)
+
+
+def _classify_empty_tar_prefix(file_path: Path, header: bytes, file_size: int) -> str | None:
+    """Classify an apparent empty TAR without trusting its zero prefix alone."""
+    has_zero_prefix = (
+        file_size >= _TAR_EMPTY_ARCHIVE_PROBE_BYTES
+        and len(header) >= _TAR_EMPTY_ARCHIVE_PROBE_BYTES
+        and header[:_TAR_EMPTY_ARCHIVE_PROBE_BYTES] == b"\0" * _TAR_EMPTY_ARCHIVE_PROBE_BYTES
+    )
+    if not has_zero_prefix:
+        return None
+
+    hdf5_signature_offset = find_hdf5_signature_offset(str(file_path))
+    if hdf5_signature_offset is not None:
+        return "hdf5"
+    if zipfile.is_zipfile(file_path):
+        return "zip"
+    if file_size % _TAR_BLOCK_SIZE != 0:
+        return None
+
+    if file_size <= _TAR_EMPTY_ARCHIVE_MAX_VERIFY_BYTES:
+        try:
+            with file_path.open("rb") as stream:
+                if all(not any(chunk) for chunk in iter(lambda: stream.read(64 * 1024), b"")):
+                    return "tar"
+        except OSError:
+            return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+    return NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def _has_zip_magic(prefix: bytes) -> bool:
@@ -9434,10 +9715,28 @@ def detect_file_format_from_magic(path: str) -> str:
             return _detect_renamed_tensorflow_protobuf(file_path, size)
 
         with file_path.open("rb") as f:
-            header = f.read(min(size, _TAR_BLOCK_SIZE))
+            header = f.read(min(size, _TAR_EMPTY_ARCHIVE_PROBE_BYTES))
+
+            empty_tar_route = _classify_empty_tar_prefix(file_path, header, size)
+            if empty_tar_route is not None:
+                if empty_tar_route != "tar":
+                    return empty_tar_route
+                return (
+                    _detect_tar_route(
+                        path,
+                        allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+                    )
+                    or "tar"
+                )
 
             if _looks_like_uncompressed_tar_header(header):
-                return _detect_tar_route(path) or "tar"
+                return (
+                    _detect_tar_route(
+                        path,
+                        allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+                    )
+                    or "tar"
+                )
 
             magic4 = header[:4]
             magic8 = header[:8]
@@ -9464,8 +9763,11 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
             if format_result in {"gzip", "bzip2", "xz"}:
-                tar_route = _detect_tar_route(path)
-                if tar_route in {"nemo", NEMO_ROUTING_INCONCLUSIVE_FORMAT}:
+                tar_route = _detect_tar_route(
+                    path,
+                    allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+                )
+                if tar_route is not None:
                     return tar_route
             if format_result != "unknown":
                 return format_result
@@ -9624,7 +9926,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     if size < 4:
         return "unknown"
 
-    initial_read_size = min(size, max(64, _TAR_BLOCK_SIZE))
+    initial_read_size = min(size, max(64, _TAR_EMPTY_ARCHIVE_PROBE_BYTES))
     with file_path.open("rb") as f:
         prefix = f.read(initial_read_size)
 
@@ -9633,8 +9935,26 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         magic8 = header[:8]
         magic16 = header[:16]
 
+        empty_tar_route = _classify_empty_tar_prefix(file_path, prefix, size)
+        if empty_tar_route is not None:
+            if empty_tar_route != "tar":
+                return empty_tar_route
+            return (
+                _detect_tar_route(
+                    path,
+                    allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+                )
+                or "tar"
+            )
+
         if _looks_like_uncompressed_tar_header(prefix):
-            return _detect_tar_route(path) or "tar"
+            return (
+                _detect_tar_route(
+                    path,
+                    allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+                )
+                or "tar"
+            )
 
         llamafile_format = _detect_llamafile_route_format(file_path, magic4)
         if llamafile_format is not None:
@@ -9649,7 +9969,10 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result == "zip":
             return "zip"
         if format_result in {"gzip", "bzip2", "xz", "lz4", "zlib"}:
-            tar_route = _detect_tar_route(path)
+            tar_route = _detect_tar_route(
+                path,
+                allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+            )
             if tar_route is not None:
                 return tar_route
             return format_result
@@ -9768,13 +10091,25 @@ def detect_file_format(path: str) -> str:
 
     # Read first bytes for format detection using a single file handle
     with file_path.open("rb") as f:
-        header = f.read(min(size, _TAR_BLOCK_SIZE))
+        header = f.read(min(size, _TAR_EMPTY_ARCHIVE_PROBE_BYTES))
 
     magic4 = header[:4]
     magic8 = header[:8]
     magic16 = header[:16]
     ext = file_path.suffix.lower()
     filename_lower = file_path.name.lower()
+
+    empty_tar_route = _classify_empty_tar_prefix(file_path, header, size)
+    if empty_tar_route is not None:
+        if empty_tar_route != "tar":
+            return empty_tar_route
+        return (
+            _detect_tar_route(
+                path,
+                allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+            )
+            or "tar"
+        )
 
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
@@ -9858,23 +10193,28 @@ def detect_file_format(path: str) -> str:
             return "pickle"
 
     # Compound tar wrappers should route to TAR scanner semantics.
-    if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
-        tar_route = _detect_tar_route(path)
+    if _path_claims_tar_container(file_path) and filename_lower.endswith(
+        (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
+    ):
+        tar_route = _detect_tar_route(path, allow_incomplete_generic_tar_route=True)
         if tar_route is not None:
             return tar_route
         if _detect_compression_format(header) is not None:
-            return "tar"
+            return "compressed"
         torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
         if _is_torch7_signature(torch7_prefix):
             return "torch7"
-        return "tar"
+        return "unknown"
 
     if ext in _COMPRESSED_EXTENSION_CODECS:
         tar_route = _detect_tar_route(path)
         if tar_route is not None:
             return tar_route
         expected_codec = _COMPRESSED_EXTENSION_CODECS[ext]
-        if compression_format == expected_codec:
+        if compression_format == expected_codec and _has_structurally_valid_compression_header(
+            header,
+            expected_codec,
+        ):
             return "compressed"
         torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
         if _is_torch7_signature(torch7_prefix):
@@ -9885,9 +10225,18 @@ def detect_file_format(path: str) -> str:
     if _has_rar_magic(magic8):
         return "rar"
     if _looks_like_uncompressed_tar_header(header):
-        return _detect_tar_route(path) or "tar"
+        return (
+            _detect_tar_route(
+                path,
+                allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+            )
+            or "tar"
+        )
     if compression_format:
-        tar_route = _detect_tar_route(path)
+        tar_route = _detect_tar_route(
+            path,
+            allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+        )
         if tar_route is not None:
             return tar_route
         return compression_format
@@ -10176,7 +10525,13 @@ def detect_format_from_extension(path: FilePath) -> FileFormat:
     return detect_format_from_extension_pattern_matching(file_path.suffix)
 
 
-def validate_file_type_with_formats(path: str, header_format: str, ext_format: str) -> bool:
+def validate_file_type_with_formats(
+    path: str,
+    header_format: str,
+    ext_format: str,
+    *,
+    gzip_tar_trailing_status: _GzipTarTrailingStatus | None | object = _GZIP_TAR_STATUS_UNSET,
+) -> bool:
     """Validate file type using precomputed magic/header and extension formats."""
     try:
         # If extension format is unknown, we can't validate - assume valid
@@ -10250,11 +10605,20 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         if ext_format == "tar":
             filename_lower = Path(path).name.lower()
             if filename_lower.endswith((".tar.gz", ".tgz")):
-                return header_format in {"tar", "gzip", "nemo"}
+                return header_format in {"tar", "nemo"} or (
+                    header_format == "gzip"
+                    and _detect_tar_route(path, allow_incomplete_generic_tar_route=True) is not None
+                )
             if filename_lower.endswith((".tar.bz2", ".tbz2")):
-                return header_format in {"tar", "bzip2", "nemo"}
+                return header_format in {"tar", "nemo"} or (
+                    header_format == "bzip2"
+                    and _detect_tar_route(path, allow_incomplete_generic_tar_route=True) is not None
+                )
             if filename_lower.endswith((".tar.xz", ".txz")):
-                return header_format in {"tar", "xz", "nemo"}
+                return header_format in {"tar", "nemo"} or (
+                    header_format == "xz"
+                    and _detect_tar_route(path, allow_incomplete_generic_tar_route=True) is not None
+                )
             return header_format in {"tar", "nemo"}
 
         # Standalone compressed wrappers must match their declared codecs.
@@ -10263,14 +10627,22 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
             expected_codec = _COMPRESSED_EXTENSION_CODECS.get(file_extension)
             if expected_codec is None:
                 return False
-            return header_format == expected_codec
+            if header_format == expected_codec:
+                return True
+            return (
+                header_format in {"tar", "nemo"}
+                and _detect_compression_format(read_magic_bytes(path, 8)) == expected_codec
+            )
 
         # NeMo files are TAR archives, commonly carried in gzip-compressed TAR wrappers.
         if ext_format == "nemo":
-            if header_format in {"tar", "nemo"}:
-                return True
-            if header_format == "gzip":
-                return _is_tar_archive(path)
+            is_tar = header_format in {"tar", "nemo"} or (header_format == "gzip" and _is_tar_archive(path))
+            if not is_tar:
+                return False
+            trailing_status = gzip_tar_trailing_status
+            if trailing_status is _GZIP_TAR_STATUS_UNSET:
+                trailing_status = _gzip_tar_trailing_data_status(Path(path))
+            return trailing_status is None
 
         # ExecuTorch files may be ZIP archives or valid FlatBuffers binaries.
         if ext_format == "executorch":
