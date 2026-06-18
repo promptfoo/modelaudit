@@ -1793,10 +1793,16 @@ class TestTarScanner:
         )
         assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
 
-    def test_compressed_tar_truncated_nemo_route_fails_closed_on_linked_root_config(
+    @pytest.mark.parametrize(
+        ("target", "expects_hydra_finding"),
+        [("os.system", True), ("torch.nn.Linear", False)],
+    )
+    def test_compressed_tar_truncated_nemo_route_scans_linked_root_config(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        target: str,
+        expects_hydra_finding: bool,
     ) -> None:
         monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
         archive_path = tmp_path / "linked-config.tar.gz"
@@ -1812,7 +1818,7 @@ class TestTarScanner:
             link_info.linkname = "payload.yaml"
             archive.addfile(link_info)
 
-            config_payload = b"model:\n  _target_: os.system\n"
+            config_payload = f"model:\n  _target_: {target}\n".encode()
             payload_info = tarfile.TarInfo("payload.yaml")
             payload_info.size = len(config_payload)
             archive.addfile(payload_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
@@ -1828,6 +1834,14 @@ class TestTarScanner:
             and check.details["scan_outcome_reason"] == "nemo_link_semantics_incomplete"
             for check in result.checks
         )
+        hydra_findings = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.status == CheckStatus.FAILED
+        ]
+        assert bool(hydra_findings) is expects_hydra_finding
+        if hydra_findings:
+            assert hydra_findings[0].location == f"{archive_path}:model_config.yaml"
 
     def test_compound_tar_gz_total_budget_stops_before_member_body_reads(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -6626,6 +6626,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
             else None
         )
+        if hdf5_userblock_supplemental_scanner_id is None and validated_hdf5_nemo_overlap:
+            hdf5_userblock_supplemental_scanner_id = "tar"
         if hdf5_userblock_supplemental_scanner_id == "compressed" and scanner_selection.allows(
             hdf5_userblock_supplemental_scanner_id
         ):
@@ -6939,7 +6941,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_unavailable_recognized_format_result(path, magic_format, scanner_id)
             result = sr
 
-    if validated_hdf5_nemo_overlap:
+    if validated_hdf5_nemo_overlap and scanner_selection.allows(hdf5_userblock_supplemental_scanner_id):
         result.merge(_make_incomplete_nemo_routing_result(path))
 
     if skipped_overlap_scanner_id:
@@ -7100,6 +7102,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if hdf5_tar_prefix_ownership in {"complete", "scan_limit"}:
                 supplemental_config = dict(config)
                 supplemental_config[TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY] = hdf5_signature_offset
+            elif hdf5_tar_prefix_ownership == "embedded_member":
+                # The HDF5 signature is member content, not the outer TAR boundary.
+                supplemental_config = dict(config)
             elif hdf5_tar_prefix_ownership != "embedded_member":
                 supplemental_ownership_inconclusive = hdf5_tar_prefix_ownership != "incomplete"
                 if hdf5_tar_prefix_ownership == "incomplete":

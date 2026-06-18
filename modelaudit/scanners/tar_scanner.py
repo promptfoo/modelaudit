@@ -1825,6 +1825,7 @@ class TarScanner(BaseScanner):
         wrapper_integrity_failed = False
         symlink_targets: dict[str, str] = {}
         materialized_symlinks: dict[str, tarfile.TarInfo] = {}
+        reachable_nemo_link_targets: dict[str, str] = {}
         link_resolution_budget = [_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS]
 
         try:
@@ -2051,6 +2052,8 @@ class TarScanner(BaseScanner):
                             else:
                                 symlink_targets[destination_name] = target_name
                                 materialized_symlinks[destination_name] = member
+                                if self._is_reachable_nemo_root_config(destination_name):
+                                    reachable_nemo_link_targets[destination_name] = target_name
                         elif not link_rejected:
                             try:
                                 destination_name = _resolve_safe_tar_path_through_symlinks(
@@ -2105,6 +2108,14 @@ class TarScanner(BaseScanner):
                                 else:
                                     symlink_targets[destination_name] = redirected_target
                                     materialized_symlinks[destination_name] = target_symlink
+                            if (
+                                destination_name is not None
+                                and resolved_target_name is not None
+                                and self._is_reachable_nemo_root_config(destination_name)
+                            ):
+                                reachable_nemo_link_targets[destination_name] = (
+                                    redirected_target or resolved_target_name
+                                )
                         if not link_rejected and self._record_reachable_nemo_link_incomplete(
                             result,
                             archive_path=path,
@@ -2275,6 +2286,30 @@ class TarScanner(BaseScanner):
                             message="TAR member destination exceeded bounded NeMo symlink resolution",
                         )
 
+                    reachable_nemo_config_names = [effective_member_name or name]
+                    if effective_member_name is not None:
+                        for config_name, target_name in reachable_nemo_link_targets.items():
+                            try:
+                                resolved_target_name = _resolve_safe_tar_path_through_symlinks(
+                                    target_name,
+                                    symlink_targets,
+                                    link_resolution_budget,
+                                )
+                            except _NemoRouteResolutionLimitExceeded:
+                                scan_complete = False
+                                self._record_nemo_link_resolution_incomplete(
+                                    result,
+                                    archive_path=path,
+                                    entry_name=config_name,
+                                    message="TAR linked NeMo config exceeded bounded symlink resolution",
+                                )
+                                continue
+                            if (
+                                resolved_target_name == effective_member_name
+                                and config_name not in reachable_nemo_config_names
+                            ):
+                                reachable_nemo_config_names.append(config_name)
+
                     try:
                         name_lower = name.lower()
                         member_basename = os.path.basename(name.replace("\\", "/"))
@@ -2326,14 +2361,15 @@ class TarScanner(BaseScanner):
                                     result.bytes_scanned += total_size
                                     asset_entry = {"path": f"{path}:{name}", "type": "nemo_managed"}
                                 else:
-                                    if not self._scan_reachable_nemo_config_member(
-                                        archive_path=path,
-                                        member_name=effective_member_name or name,
-                                        member_size=member.size,
-                                        tmp_path=tmp_path,
-                                        result=result,
-                                    ):
-                                        scan_complete = False
+                                    for reachable_config_name in reachable_nemo_config_names:
+                                        if not self._scan_reachable_nemo_config_member(
+                                            archive_path=path,
+                                            member_name=reachable_config_name,
+                                            member_size=member.size,
+                                            tmp_path=tmp_path,
+                                            result=result,
+                                        ):
+                                            scan_complete = False
 
                                     nested_config = dict(self.config)
                                     nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)

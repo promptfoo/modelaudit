@@ -9055,6 +9055,76 @@ def test_hdf5_compressed_ownership_honors_keras_only_scanner_selection(tmp_path:
     assert not any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
+def test_hdf5_nemo_overlap_honors_keras_only_scanner_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "selected-keras-nemo-overlap.h5"
+    _write_tar_hdf5_userblock(
+        model_path,
+        [("first.bin", b"x"), ("second.bin", b"x")],
+    )
+    monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 1)
+
+    assert file_detection.detect_file_format(str(model_path)) == file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+    result = scan_file(
+        str(model_path),
+        config={
+            "scanners": ["keras_h5"],
+            "cache_enabled": False,
+        },
+    )
+
+    selection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "tar"
+    ]
+    assert result.scanner_name == "keras_h5"
+    assert result.success is True
+    assert len(selection_checks) == 1
+    assert selection_checks[0].details["context"] == "HDF5 user-block content analysis"
+    assert "nemo_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "supplemental_scanners" not in result.metadata
+
+
+def test_embedded_hdf5_member_preserves_outer_tar_analysis(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    embedded_hdf = tmp_path / "embedded.h5"
+    with h5py.File(embedded_hdf, "w") as h5_file:
+        h5_file.attrs["model_config"] = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
+
+    archive_path = tmp_path / "embedded-hdf.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        metadata_info = tarfile.TarInfo("metadata.txt")
+        metadata_info.size = 1
+        archive.addfile(metadata_info, io.BytesIO(b"x"))
+        archive.addfile(tarfile.TarInfo("spacer.txt"), io.BytesIO())
+
+        hdf_payload = embedded_hdf.read_bytes()
+        hdf_info = tarfile.TarInfo("model.h5")
+        hdf_info.size = len(hdf_payload)
+        archive.addfile(hdf_info, io.BytesIO(hdf_payload))
+
+        pickle_payload = _build_malicious_pickle(protocol=0)
+        pickle_info = tarfile.TarInfo("late-payload.pkl")
+        pickle_info.size = len(pickle_payload)
+        archive.addfile(pickle_info, io.BytesIO(pickle_payload))
+
+    signature_offset = find_hdf5_signature_offset(str(archive_path))
+    assert signature_offset == 4 * tarfile.BLOCKSIZE
+    from modelaudit.scanners.tar_scanner import classify_raw_tar_prefix_ownership
+
+    assert classify_raw_tar_prefix_ownership(str(archive_path), signature_offset) == "embedded_member"
+
+    result = scan_file(str(archive_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert "tar" in result.metadata["supplemental_scanners"]
+    assert any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
 def test_hdf5_compressed_prefix_source_limit_preserves_reachable_finding(tmp_path: Path) -> None:
     model_path = tmp_path / "gzip-source-limit-userblock.h5"
     userblock_size = _write_compressed_hdf5_userblock(
