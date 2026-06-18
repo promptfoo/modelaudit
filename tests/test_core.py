@@ -9089,6 +9089,70 @@ def test_hdf5_nemo_overlap_honors_keras_only_scanner_selection(
     assert "supplemental_scanners" not in result.metadata
 
 
+def test_hdf5_userblock_honors_compressed_only_scanner_selection(tmp_path: Path) -> None:
+    model_path = tmp_path / "selected-compressed-userblock.h5"
+    _write_compressed_hdf5_userblock(
+        model_path,
+        _build_malicious_pickle(protocol=0),
+        codec="gzip",
+    )
+
+    result = scan_file(
+        str(model_path),
+        config={
+            "scanners": ["compressed"],
+            "cache_enabled": False,
+        },
+    )
+
+    assert result.scanner_name == "compressed"
+    assert any(
+        check.name == "Compressed Wrapper Decompression Limits" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "keras_h5"
+        and check.details.get("context") == "preferred scanner"
+        for check in result.checks
+    )
+    assert "compressed_stream_decode_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+@pytest.mark.parametrize("selected_scanner", ["tar", "nemo"])
+def test_hdf5_userblock_bounds_selected_tar_family_scanner(
+    tmp_path: Path,
+    selected_scanner: str,
+) -> None:
+    members = (
+        [("model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")]
+        if selected_scanner == "nemo"
+        else [("weights.bin", b"x")]
+    )
+    model_path = tmp_path / f"selected-{selected_scanner}-userblock.h5"
+    userblock_size = _write_tar_hdf5_userblock(model_path, members)
+
+    result = scan_file(
+        str(model_path),
+        config={
+            "scanners": [selected_scanner],
+            "cache_enabled": False,
+        },
+    )
+
+    assert result.scanner_name == selected_scanner
+    assert result.success is True
+    assert result.metadata["file_size"] == userblock_size
+    assert "tar_scan_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "tar_compressed_trailing_data" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "keras_h5"
+        and check.details.get("context") == "preferred scanner"
+        for check in result.checks
+    )
+
+
 def test_embedded_hdf5_member_preserves_outer_tar_analysis(tmp_path: Path) -> None:
     h5py = pytest.importorskip("h5py")
     embedded_hdf = tmp_path / "embedded.h5"
