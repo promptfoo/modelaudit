@@ -9024,6 +9024,37 @@ def test_scan_file_fails_closed_for_nonzero_trailer_after_compressed_hdf5_userbl
     assert any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
+def test_hdf5_compressed_ownership_honors_keras_only_scanner_selection(tmp_path: Path) -> None:
+    model_path = tmp_path / "selected-keras-compressed-userblock.h5"
+    payload = _build_malicious_pickle(protocol=0)
+    _write_compressed_hdf5_userblock(model_path, payload, codec="gzip")
+    compressed_size = len(gzip.compress(payload, mtime=0))
+    with model_path.open("r+b") as handle:
+        handle.seek(compressed_size + 64)
+        handle.write(b"unowned")
+
+    result = scan_file(
+        str(model_path),
+        config={
+            "scanners": ["keras_h5"],
+            "cache_enabled": False,
+        },
+    )
+
+    selection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "compressed"
+    ]
+    assert result.scanner_name == "keras_h5"
+    assert result.success is True
+    assert len(selection_checks) == 1
+    assert selection_checks[0].details["context"] == "HDF5 user-block content analysis"
+    assert "hdf5_compressed_prefix_ownership_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "HDF5 User-Block Compressed Ownership" for check in result.checks)
+    assert not any(check.rule_code == "S201" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
 def test_hdf5_compressed_prefix_source_limit_preserves_reachable_finding(tmp_path: Path) -> None:
     model_path = tmp_path / "gzip-source-limit-userblock.h5"
     userblock_size = _write_compressed_hdf5_userblock(

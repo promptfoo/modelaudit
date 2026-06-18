@@ -2205,12 +2205,20 @@ class TestTarScanner:
         assert any(entry["path"].endswith("later.txt") for entry in contents)
         assert payload_bytes_read < tarfile.BLOCKSIZE
 
-    def test_scan_compressed_tar_stops_after_oversized_member_without_streaming_body(
+    def test_scan_compressed_tar_continues_after_oversized_member_with_bounded_drain(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        scanner = TarScanner(config={"max_entry_size": 64})
+        max_decompressed_bytes = 64 * 1024
+        scanner = TarScanner(
+            config={
+                "max_entry_size": 64,
+                "compressed_max_decompressed_bytes": max_decompressed_bytes,
+                "compressed_max_decompression_ratio": 100_000.0,
+                "max_tar_total_uncompressed_size": max_decompressed_bytes,
+            }
+        )
         archive_path = tmp_path / "oversized_first.tar.gz"
         payload = b"B" * 4096
         malicious_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
@@ -2241,11 +2249,11 @@ class TestTarScanner:
         assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
         contents = result.metadata["contents"]
         assert any(entry["path"].endswith("payload.bin") for entry in contents)
-        assert not any(entry["path"].endswith("payload.txt") for entry in contents)
-        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert bytes_read < len(payload)
+        assert any(entry["path"].endswith("payload.txt") for entry in contents)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert len(payload) <= bytes_read <= max_decompressed_bytes
         aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
-        assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
+        assert any(check.status == CheckStatus.PASSED for check in aggregate_checks)
 
     def test_tiny_total_budget_allows_tar_header_reads_for_empty_member(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "tiny_total_empty.tar"
@@ -2419,6 +2427,54 @@ class TestTarScanner:
             max_entry_size=64,
         )
         assert core.determine_exit_code(aggregate) == 1
+
+    @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
+    @pytest.mark.parametrize(
+        ("suffix", "mode"),
+        [
+            (".tar.gz", "w:gz"),
+            (".tar.bz2", "w:bz2"),
+            (".tar.xz", "w:xz"),
+        ],
+    )
+    def test_scan_continues_after_oversized_compressed_member_and_scans_later_payload(
+        self,
+        tmp_path: Path,
+        suffix: str,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+        malicious: bool,
+    ) -> None:
+        archive_path = tmp_path / f"oversized-first-{malicious}{suffix}"
+        pickle_payload = (
+            b'cos\nsystem\n(S"echo pwned"\ntR.' if malicious else pickle.dumps({"weights": [1]}, protocol=0)
+        )
+        with tarfile.open(archive_path, mode) as archive:
+            large_member = tarfile.TarInfo("large-weights.bin")
+            large_data = b"A" * 128
+            large_member.size = len(large_data)
+            archive.addfile(large_member, tarfile.io.BytesIO(large_data))  # type: ignore[attr-defined]
+
+            payload_member = tarfile.TarInfo("late-payload.pkl")
+            payload_member.size = len(pickle_payload)
+            archive.addfile(payload_member, tarfile.io.BytesIO(pickle_payload))  # type: ignore[attr-defined]
+
+        result = TarScanner(
+            config={
+                "max_entry_size": 64,
+                "compressed_max_decompression_ratio": 100_000.0,
+            }
+        ).scan(str(archive_path))
+
+        assert result.success is False
+        assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "TAR Entry Scan"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("entry") == "large-weights.bin"
+            for check in result.checks
+        )
+        assert any(entry["path"].endswith("late-payload.pkl") for entry in result.metadata["contents"])
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is malicious
 
     def test_nested_member_scan_exception_returns_inconclusive_exit_code(self, tmp_path: Path) -> None:
         """A member scanner failure is unavailable coverage, not an observed finding."""

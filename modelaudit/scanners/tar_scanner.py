@@ -98,6 +98,10 @@ _TAR_HEADER_PROBE_BYTES = 2 * tarfile.BLOCKSIZE
 class _TarEntryExtractionIncomplete(ValueError):
     """Raised when a TAR member cannot be inspected within extraction policy."""
 
+    def __init__(self, message: str, *, stream_position_recoverable: bool = False) -> None:
+        super().__init__(message)
+        self.stream_position_recoverable = stream_position_recoverable
+
 
 class _TarStreamBudgetExceeded(ValueError):
     """Raised when TAR stream traversal exceeds bounded work limits."""
@@ -922,7 +926,8 @@ class TarScanner(BaseScanner):
         max_entry_size = self._get_max_entry_size()
         if member.size > max_entry_size:
             raise _TarEntryExtractionIncomplete(
-                f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes"
+                f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes",
+                stream_position_recoverable=True,
             )
         fileobj = tar.extractfile(member)
         if fileobj is None:
@@ -2391,7 +2396,7 @@ class TarScanner(BaseScanner):
                                 "scan_outcome_reason": TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON,
                             },
                         )
-                        if compression_codec is not None:
+                        if compression_codec is not None and not exc.stream_position_recoverable:
                             break
                     except Exception as exc:
                         scan_complete = False

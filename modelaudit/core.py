@@ -6626,7 +6626,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
             else None
         )
-        if hdf5_userblock_supplemental_scanner_id == "compressed":
+        if hdf5_userblock_supplemental_scanner_id == "compressed" and scanner_selection.allows(
+            hdf5_userblock_supplemental_scanner_id
+        ):
             from modelaudit.scanners.compressed_scanner import classify_compressed_prefix_ownership
 
             assert hdf5_signature_offset is not None
@@ -6638,7 +6640,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if hdf5_compressed_prefix_ownership != "complete":
                 config = dict(config)
                 config["cache_enabled"] = False
-        elif hdf5_userblock_supplemental_scanner_id in {"nemo", "tar"}:
+        elif hdf5_userblock_supplemental_scanner_id in {"nemo", "tar"} and scanner_selection.allows(
+            hdf5_userblock_supplemental_scanner_id
+        ):
             from modelaudit.scanners.tar_scanner import (
                 classify_compressed_tar_prefix_ownership,
                 classify_raw_tar_prefix_ownership,
@@ -7035,7 +7039,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 hdf5_signature_offset,
                 context="HDF5 user-block ZIP",
             )
-        elif hdf5_userblock_supplemental_scanner_id is not None:
+        if (
+            hdf5_userblock_supplemental_scanner_id is not None
+            and not scanner_selection.allows(hdf5_userblock_supplemental_scanner_id)
+            and (hdf5_userblock_supplemental_scanner_id != "zip" or not userblock_zip_allowed)
+        ):
             add_scanner_selection_skip_check(
                 result,
                 path,
@@ -7047,6 +7055,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         hdf5_userblock_supplemental_scanner_id not in (None, "zip")
         and result.scanner_name != hdf5_userblock_supplemental_scanner_id
         and hdf5_userblock_supplemental_scanner_id not in safetensors_overlap_scanner_ids
+        and scanner_selection.allows(hdf5_userblock_supplemental_scanner_id)
     ):
         supplemental_config = config
         supplemental_ownership_inconclusive = False
