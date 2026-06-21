@@ -442,8 +442,11 @@ class TestFileTypeValidationIntegration:
 
         assert len(validation_warnings) > 0, "Should generate file type validation warnings"
 
-        # Should still complete successfully (warnings, not errors)
-        assert results["success"], "Scan should complete successfully despite warnings"
+        # Scan should run to completion without operational errors. A WARNING-level
+        # failed security check (file-type spoofing) intentionally marks success=False
+        # while still being a non-fatal warning, surfaced via exit code 1 below.
+        assert not results["has_errors"], "Scan should complete without operational errors despite warnings"
+        assert results["files_scanned"] > 0, "Scan should have processed files"
 
         # Exit code should be 1 (warnings found) not 0 (clean) or 2 (errors)
         from modelaudit.core import determine_exit_code

@@ -3,6 +3,7 @@
 import os
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
@@ -314,6 +315,8 @@ class TestPerformanceBenchmarks:
         # Benchmark validation time
         import os
 
+        from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
+
         from modelaudit.scanners.pickle_scanner import _is_legitimate_serialization_file
 
         has_runner_contention = bool(
@@ -323,24 +326,39 @@ class TestPerformanceBenchmarks:
             or os.getenv("PYTEST_XDIST_WORKER_COUNT")
         )
         iters = 30 if has_runner_contention else 60
-        samples: list[float] = []
-        _is_legitimate_serialization_file(str(test_file))
-        for _ in range(5):
-            start_time = time.process_time()
-            for _ in range(iters):  # Multiple calls to get meaningful measurement
-                _is_legitimate_serialization_file(str(test_file))
-            samples.append((time.process_time() - start_time) / iters)
 
-        # Validation should use little CPU even when wall-clock scheduling is noisy.
-        avg_validation_time = min(samples)
-        threshold = 0.010 if sys.platform == "win32" else 0.006
-        if has_runner_contention:
-            threshold *= 4.0
-        assert avg_validation_time < threshold, (
-            f"Fastest validation batch averaged {avg_validation_time:.6f}s, expected < {threshold:.3f}s"
+        def _fastest_cpu_per_call(call: Callable[[], object]) -> float:
+            call()  # warm up caches/imports so the timing reflects steady state
+            samples: list[float] = []
+            for _ in range(5):
+                start_time = time.process_time()
+                for _ in range(iters):  # Multiple calls to get a meaningful measurement
+                    call()
+                samples.append((time.process_time() - start_time) / iters)
+            return min(samples)
+
+        # The unavoidable cost is the underlying Rust pickle scan; absolute CPU time
+        # for it varies wildly across hardware/CI runners. The validation wrapper must
+        # add little overhead *relative to that baseline*, so assert on the marginal
+        # cost rather than a brittle machine-specific absolute threshold.
+        baseline_scanner = StandalonePickleScanner()
+        baseline_time = _fastest_cpu_per_call(lambda: baseline_scanner.scan_file(test_file, enrich_call_graph=False))
+        avg_validation_time = _fastest_cpu_per_call(lambda: _is_legitimate_serialization_file(str(test_file)))
+
+        validation_overhead = max(0.0, avg_validation_time - baseline_time)
+        # Allow generous slack for scheduling noise while still catching a real
+        # validation-specific regression (e.g. the wrapper doubling the scan cost).
+        overhead_threshold = max(0.75 * baseline_time, 0.005)
+        assert validation_overhead < overhead_threshold, (
+            f"Validation added {validation_overhead:.6f}s CPU over the {baseline_time:.6f}s "
+            f"baseline scan, expected overhead < {overhead_threshold:.6f}s "
+            f"(validation={avg_validation_time:.6f}s)"
         )
 
-        print(f"Average validation CPU time: {avg_validation_time:.6f}s")
+        print(
+            f"Validation CPU time: {avg_validation_time:.6f}s "
+            f"(baseline {baseline_time:.6f}s, overhead {validation_overhead:.6f}s)"
+        )
 
 
 class TestErrorScenarios:

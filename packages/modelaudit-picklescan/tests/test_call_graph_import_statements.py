@@ -7568,6 +7568,15 @@ def test_scan_bytes_keeps_future_pending_callback_lazy(tmp_path: Path) -> None:
     scan_child_code = """
 import sys
 
+# Load concurrent.futures before importing the scanner so the pending callback's
+# trusted stdlib references (concurrent.futures.Future[.add_done_callback]) are
+# captured in the call-graph identity snapshot. Otherwise an ambient late import
+# of concurrent.futures (which happens under some CI runners) makes those
+# allowlisted references correctly fail closed as SUSPICIOUS -- behavior that is
+# orthogonal to the lazy-callback property this test exercises and is covered by
+# test_scan_bytes_fails_closed_for_late_loaded_stdlib_source_modules_*.
+import concurrent.futures  # noqa: F401
+
 from modelaudit_picklescan import SafetyVerdict, scan_bytes
 
 payload = bytes.fromhex(sys.argv[1])

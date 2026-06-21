@@ -92,6 +92,8 @@ class TestSecurityAssetIntegration:
                         "nested_pickle",  # Our intentionally malicious nested pickle test files
                         "decode_exec",  # Our intentionally malicious decode-exec test files
                         "simple_nested",  # Our intentionally malicious simple nested pickle test file
+                        "injection",  # Malicious keras loss/metric injection samples
+                        "attack",  # Malicious keras custom-layer attack sample
                     ]
                     if (
                         not any(indicator in file_path.name.lower() for indicator in exclusions)
@@ -295,8 +297,11 @@ class TestSecurityAssetIntegration:
         for scenario_dir in license_scenarios.iterdir():
             if scenario_dir.is_dir():
                 results = scan_model_directory_or_file(str(scenario_dir))
-                assert results.success is True, f"License scenario scan failed: {scenario_dir.name}"
-                # License scenarios might have license issues but should scan successfully
+                # License scenarios must scan to completion. Some fixtures (e.g.
+                # agpl_component) embed pickles that reference __main__ globals and
+                # are now correctly flagged as security findings, so success may be
+                # False; the scan must still have run and processed the files.
+                assert results.files_scanned > 0, f"License scenario produced no scanned files: {scenario_dir.name}"
 
     @pytest.mark.skipif(
         sys.version_info[:2] in [(3, 10), (3, 12)],
@@ -384,12 +389,14 @@ class TestSecurityAssetIntegration:
         if not assets_dir.exists():
             pytest.skip("Assets directory not found")
 
-        # Scan the entire assets directory
+        # Scan the entire assets directory. The tree intentionally contains
+        # exploits/ and malicious samples/, so success is expected to be False;
+        # what matters for discovery is that the scan ran and processed files.
         results = scan_model_directory_or_file(str(assets_dir))
-        assert results.success is True, "Assets directory scan should succeed"
 
         # Should find various file types
         assert results.files_scanned > 0, "Should find some files to scan"
+        assert len(results.issues) > 0, "Assets tree contains exploits; findings expected"
 
         # Check for different file extensions in issues (indicates they were processed)
         scanned_extensions = set()
@@ -423,8 +430,11 @@ class TestSecurityAssetIntegration:
         results = scan_model_directory_or_file(str(assets_dir))
         duration = time.perf_counter() - start_time
 
-        # Should complete in reasonable time
-        assert results.success is True, "Performance test scan should succeed"
+        # Should complete in reasonable time. The assets tree contains exploits,
+        # so success is expected to be False; assert the scan ran and produced
+        # findings rather than demanding success on malicious inputs.
+        assert results.files_scanned > 0, "Performance test scan should process files"
+        assert len(results.issues) > 0, "Assets tree contains exploits; findings expected"
         is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
         threshold = 60 if is_ci else 30
         assert duration < threshold, f"Scan took too long: {duration:.2f}s"

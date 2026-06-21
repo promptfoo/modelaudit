@@ -59,8 +59,10 @@ class TestCoreIntegration:
             # Scan the directory
             results = core.scan_model_directory_or_file(temp_dir)
 
-            # Should have completed successfully
-            assert results["success"] is True
+            # This test verifies lazy loading, not the security verdict. The
+            # non-pickle model.pkl now (correctly) produces fail-closed spoofing
+            # warnings, so assert the scan ran over both files instead of demanding
+            # success, which is no longer a valid proxy for "scan completed".
             assert results["files_scanned"] == 2
 
             # Should have loaded only necessary scanners
