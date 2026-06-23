@@ -7,6 +7,7 @@ import builtins
 import bz2
 import errno
 import gzip
+import hashlib
 import importlib
 import io
 import json
@@ -2060,6 +2061,19 @@ def test_calculate_file_hash_rejects_fifo_swap_without_blocking(
         core_module._calculate_file_hash(str(source_path))
 
     assert swapped is True
+
+
+def test_calculate_file_hash_spans_chunks(tmp_path: Path) -> None:
+    """Dedup hashing must be output-identical across the chunked read boundary."""
+    from modelaudit.scanners.base import DEFAULT_READ_CHUNK_SIZE
+
+    content = (b"modelaudit-dedup-payload" * 4096) + bytes(DEFAULT_READ_CHUNK_SIZE + 7)
+    assert len(content) > DEFAULT_READ_CHUNK_SIZE
+
+    source_path = tmp_path / "dedup-asset.bin"
+    source_path.write_bytes(content)
+
+    assert core_module._calculate_file_hash(str(source_path)) == hashlib.sha256(content).hexdigest()
 
 
 def test_filtered_savedmodel_owner_asset_updates_aggregate_hash_and_accounting(tmp_path: Path) -> None:

@@ -1449,7 +1449,7 @@ class BaseScanner(ABC):
 
             with open(path, "rb") as f:
                 # Read file in chunks to handle large files
-                for chunk in iter(lambda: f.read(8192), b""):
+                for chunk in iter(lambda: f.read(DEFAULT_READ_CHUNK_SIZE), b""):
                     md5_hash.update(chunk)
                     sha256_hash.update(chunk)
                     sha512_hash.update(chunk)
