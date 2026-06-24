@@ -9,6 +9,14 @@
       "matchPackageNames": ["numpy"],
       "matchCurrentValue": "/<2\\.0/",
       "allowedVersions": "<2.0"
+    },
+    {
+      "description": "Keep NumPy 2.4.x constraints on Python 3.11 markers in pyproject.toml.",
+      "matchFileNames": ["pyproject.toml"],
+      "matchManagers": ["pep621"],
+      "matchPackageNames": ["numpy"],
+      "matchCurrentValue": "/<2\\.5/",
+      "allowedVersions": "<2.5"
     }
   ],
   "vulnerabilityAlerts": {
