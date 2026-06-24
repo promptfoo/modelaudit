@@ -354,7 +354,9 @@ jobs:
 
       - name: Pin Python version
         run: |
-          uv python pin 3.12
+          # Match tool.mypy.python_version so version-gated dependency stubs use
+          # syntax valid for the minimum supported Python target.
+          uv python pin 3.10
 
       - name: Install Rust toolchain
         run: |
@@ -368,9 +370,9 @@ jobs:
             .venv
             ~/.cache/pip
             ~/.cache/uv
-          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          key: ${{ runner.os }}-uv-py3.10-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-uv-py3.12-
+            ${{ runner.os }}-uv-py3.10-
             ${{ runner.os }}-uv-
 
       - name: Sync dependencies
