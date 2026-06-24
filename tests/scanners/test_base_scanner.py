@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
@@ -197,16 +197,42 @@ def test_base_scanner_get_file_size(tmp_path):
     assert size == len(content)
 
 
-def test_base_scanner_calculate_file_hashes_spans_chunks(tmp_path):
+def test_base_scanner_calculate_file_hashes_spans_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Hashing must be output-identical across the chunked read boundary."""
     content = (b"modelaudit-hash-payload" * 4096) + bytes(DEFAULT_READ_CHUNK_SIZE + 7)
     assert len(content) > DEFAULT_READ_CHUNK_SIZE
 
     test_file = tmp_path / "model.test"
     test_file.write_bytes(content)
+    read_sizes: list[int] = []
+
+    class RecordingReader:
+        def __init__(self) -> None:
+            self.offset = 0
+
+        def __enter__(self) -> "RecordingReader":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            chunk = content[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+    def recording_open(*_args: Any, **_kwargs: Any) -> RecordingReader:
+        return RecordingReader()
+
+    monkeypatch.setattr("builtins.open", recording_open)
 
     hashes = MockScanner().calculate_file_hashes(str(test_file))
 
+    assert read_sizes == [DEFAULT_READ_CHUNK_SIZE] * 3
     assert hashes["md5"] == hashlib.md5(content).hexdigest()
     assert hashes["sha256"] == hashlib.sha256(content).hexdigest()
     assert hashes["sha512"] == hashlib.sha512(content).hexdigest()

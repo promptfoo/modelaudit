@@ -200,6 +200,7 @@ _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON = "tar_compressed_stream_incomplete"
 _HDF5_TAR_PREFIX_OWNERSHIP_INCOMPLETE_REASON = "hdf5_tar_prefix_ownership_incomplete"
 _HDF5_COMPRESSED_PREFIX_OWNERSHIP_INCOMPLETE_REASON = "hdf5_compressed_prefix_ownership_incomplete"
 _STREAMING_SOURCE_INTERRUPTED_REASON = "streaming_source_interrupted"
+_DEADLINE_HASH_READ_CHUNK_SIZE = 8 * 1024
 
 
 def _repository_member_path_for_scan(scan_path: str, scan_root: Path | None) -> str | None:
@@ -2868,10 +2869,11 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                 raise OSError(f"File changed before hashing: {file_path}")
 
             hash_sha256 = hashlib.sha256()
+            read_chunk_size = _DEADLINE_HASH_READ_CHUNK_SIZE if deadline is not None else DEFAULT_READ_CHUNK_SIZE
             while True:
                 if deadline is not None and time.time() > deadline:
                     raise TimeoutError(f"File hashing timed out: {file_path}")
-                chunk = source.read(DEFAULT_READ_CHUNK_SIZE)
+                chunk = source.read(read_chunk_size)
                 if not chunk:
                     break
                 hash_sha256.update(chunk)
