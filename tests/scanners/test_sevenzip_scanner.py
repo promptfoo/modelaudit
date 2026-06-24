@@ -172,6 +172,22 @@ def _xgboost_ubjson_deep_before_counted_null_array_probe() -> bytes:
 class TestSevenZipScanner:
     """Test suite for SevenZipScanner functionality"""
 
+    def test_header_probe_accepts_py7zr_close_hook(self, scanner: SevenZipScanner) -> None:
+        """py7zr 1.1.3 closes factory products before callers inspect them."""
+
+        class ClosingArchive:
+            def extract(self, *, targets: list[str], factory: Any) -> None:
+                probe = factory.create(targets[0])
+                probe.write(b"pickle-prefix")
+                probe.close()
+
+            def reset(self) -> None:
+                return None
+
+        prefix = scanner._read_member_probe_prefix(ClosingArchive(), "model.dat", 16)
+
+        assert prefix == b"pickle-prefix"
+
     @pytest.fixture
     def scanner(self):
         """Create a SevenZipScanner instance for testing"""

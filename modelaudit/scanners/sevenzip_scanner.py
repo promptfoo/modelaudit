@@ -87,6 +87,9 @@ class _HeaderProbeBuffer:
     def flush(self) -> None:
         self._buffer.flush()
 
+    def close(self) -> None:
+        """Preserve captured bytes when py7zr signals member completion."""
+
     def size(self) -> int:
         return self._buffer.getbuffer().nbytes
 
