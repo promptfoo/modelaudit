@@ -2450,7 +2450,11 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
         assert first_identity is not None
         first_work_count = work_count
         first_type_validation_count = type_validation_count
-        assert first_work_count <= len(finder_state["_path_cache"]) + 4
+        # Identity work spans both the exact path cache and the relaxed
+        # (lowercased) cache that FileFinder populates on case-insensitive
+        # filesystems (macOS/Windows); on case-sensitive filesystems the
+        # relaxed cache is empty, so this bound is unchanged on Linux.
+        assert first_work_count <= len(finder_state["_path_cache"]) + len(finder_state["_relaxed_path_cache"]) + 4
         assert first_type_validation_count == 1
         assert call_graph._file_finder_resolution_identity(finder, path_entry) == first_identity
         assert not work_count > first_work_count
@@ -2462,7 +2466,11 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
         replacement_work_count = work_count
         finder_state["_path_cache"] = set(finder_state["_path_cache"])
         assert call_graph._file_finder_resolution_identity(finder, path_entry) == first_identity
-        assert replacement_work_count < work_count <= replacement_work_count + len(finder_state["_path_cache"]) + 4
+        assert (
+            replacement_work_count
+            < work_count
+            <= replacement_work_count + len(finder_state["_path_cache"]) + len(finder_state["_relaxed_path_cache"]) + 4
+        )
         assert type_validation_count == first_type_validation_count + 1
         work_before_transition = work_count
         transitioned_cache = set(cast(frozenset[str], finder_state["_path_cache"]))
@@ -2480,7 +2488,10 @@ def test_file_finder_resolution_identity_caches_bounded_state_work(
             work_before_transition
             < work_count
             <= work_before_transition
-            + (call_graph._MAX_FILE_FINDER_RESOLUTION_ATTEMPTS * (len(transitioned_cache) + 4))
+            + (
+                call_graph._MAX_FILE_FINDER_RESOLUTION_ATTEMPTS
+                * (len(transitioned_cache) + len(finder_state["_relaxed_path_cache"]) + 4)
+            )
         )
 
         work_before_oversized = work_count
