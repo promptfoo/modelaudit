@@ -5,6 +5,12 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Bug Fixes
+
+- restore Windows call-graph detection by reconciling descriptor and path stats with a cross-view identity that omits `st_ctime` (Windows reports it differently across stat methods); previously every stdlib callable source read failed closed on Windows, collapsing call-graph verdicts to inconclusive
+
 ## [0.1.7](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.6...modelaudit-picklescan-v0.1.7) (2026-06-24)
 
 ### Bug Fixes
