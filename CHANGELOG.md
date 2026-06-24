@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- preserve bounded nested 7z format probes when py7zr signals per-member completion
+- require patched py7zr 1.1.3 for 7z support and preserve bounded nested format probes when it signals per-member completion
 - require patched `msgpack>=1.2.1` so default and optional installs avoid the `Unpacker` reuse crash advisory
 - stream large TAR and compressed-TAR model archives through TAR-specific inspection instead of generic whole-file read rejection, bound shared nested NeMo work after aggregate-budget exhaustion, preserve reachable findings at TAR and compressed-wrapper scan limits, preserve trusted HDF5 findings when overlapping TAR routing is inconclusive, prove compressed-stream ownership before bounding HDF5 user-block scans, and cap accepted compressed-wrapper zero padding
 - prove large valid Hugging Face `tokenizer.json` files with bounded EOF streaming so they do not fail closed as MXNet/JAX overlap, while explicitly failing closed when ownership exceeds the EOF proof cap
