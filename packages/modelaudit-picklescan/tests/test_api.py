@@ -11468,7 +11468,7 @@ def test_effective_bytecode_validation_rejects_oversized_files_without_unbounded
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO files are not supported on this platform")
 def test_resolution_candidate_fingerprint_rejects_fifo(tmp_path: Path) -> None:
     source_path = tmp_path / "blocked_source.py"
-    os.mkfifo(source_path)
+    os.mkfifo(source_path)  # type: ignore[attr-defined]  # os.mkfifo is POSIX-only
 
     reusable, fingerprint = _resolution_candidate_fingerprint(source_path)
 
