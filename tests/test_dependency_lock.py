@@ -15,6 +15,8 @@ PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproj
 PATCHED_GITPYTHON_FLOOR = (3, 1, 50)
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
 REQUIRED_PICKLESCAN_RELEASE = "modelaudit-picklescan>=0.1.7,<0.2.0"
+PATCHED_PY7ZR_REQUIREMENT = "py7zr>=1.1.3"
+PY7ZR_EXTRAS = ("sevenzip", "all-ci", "all")
 
 
 def _lock_package_block(name: str) -> str:
@@ -76,3 +78,11 @@ def test_root_requires_hardened_picklescan_release() -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
 
     assert REQUIRED_PICKLESCAN_RELEASE in root_config["project"]["dependencies"]
+
+
+def test_py7zr_extras_require_patched_release() -> None:
+    root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+    optional_dependencies = root_config["project"]["optional-dependencies"]
+
+    for extra in PY7ZR_EXTRAS:
+        assert PATCHED_PY7ZR_REQUIREMENT in optional_dependencies[extra]
