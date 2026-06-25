@@ -2166,6 +2166,15 @@ def test_relative_zip_preflight_preserves_symlink_parent_traversal(
     assert cache_key == "link/../modules.zip"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "CPython's zipimport normalizes '..' member-prefix segments on Windows, so the "
+        "POSIX literal-segment contract this test asserts does not hold there. The scanner "
+        "mirrors each platform's zipimporter (it collapses the prefix on Windows to match), "
+        "so exclusion stays aligned with what Windows would actually import."
+    ),
+)
 @pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
 @pytest.mark.parametrize("include_module", [False, True], ids=["near-match", "module"])
 def test_zip_preflight_preserves_literal_dot_segments(

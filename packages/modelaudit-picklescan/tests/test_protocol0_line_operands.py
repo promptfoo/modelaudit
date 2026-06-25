@@ -735,7 +735,14 @@ def test_scan_bytes_bounds_valid_utf8_encoded_byte_literal_prefilter() -> None:
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
-@pytest.mark.parametrize("payload_bytes", [b"UA" * 2_500_000, b"N" * 5_000_000])
+@pytest.mark.parametrize(
+    "payload_bytes",
+    [b"UA" * 2_500_000, b"N" * 5_000_000],
+    # Multi-megabyte parametrized values become the test id, which pytest writes
+    # into PYTEST_CURRENT_TEST; Windows rejects env vars over 32767 chars, so give
+    # the cases short ids.
+    ids=["utf8_pair_5mb", "ascii_n_5mb"],
+)
 def test_scan_bytes_bounds_valid_utf8_byte_literal_runtime(
     container: type[bytes] | type[bytearray],
     payload_bytes: bytes,

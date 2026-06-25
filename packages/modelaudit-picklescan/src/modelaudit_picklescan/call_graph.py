@@ -3796,15 +3796,20 @@ def _stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, 
     )
 
 
-def _cross_view_file_stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    # Windows path stat derives executable bits from the suffix; descriptor stat cannot.
+def _cross_view_file_stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    # Cross-view comparison spans a descriptor stat and a path stat. Windows path
+    # stat derives executable bits from the suffix (descriptor stat cannot) and
+    # reports st_ctime mirroring st_mtime while descriptor stat reports the true
+    # creation time, so both fields are stat-method dependent and excluded here.
+    # On POSIX these fields agree across views, so omitting them is a no-op there;
+    # st_dev/st_ino still pin the exact file and st_size/st_mtime still catch
+    # mutation, so cross-view swap and tamper detection is preserved.
     return (
         file_stat.st_dev,
         file_stat.st_ino,
         stat.S_IFMT(file_stat.st_mode),
         file_stat.st_size,
         file_stat.st_mtime_ns,
-        file_stat.st_ctime_ns,
     )
 
 
@@ -4524,7 +4529,13 @@ def _read_bounded_regular_file(path: Path, max_bytes: int | None) -> tuple[bytes
             path_stat = path.stat()
         except OSError as error:
             raise OSError(f"source candidate path changed while being read: {path}") from error
-        if len({_stat_identity(before), _stat_identity(after), _stat_identity(path_stat)}) != 1:
+        # before/after share the descriptor view, so compare them with the full
+        # identity. path_stat is a path view; reconcile it with the cross-view
+        # identity that omits fields Windows reports differently across stat
+        # methods (st_ctime, permission bits).
+        if _stat_identity(before) != _stat_identity(after) or _cross_view_file_stat_identity(
+            before
+        ) != _cross_view_file_stat_identity(path_stat):
             raise OSError(f"source candidate changed while being read: {path}")
         if max_bytes is not None and len(content) > max_bytes:
             raise _SourceReadTooLargeError(f"source candidate exceeds {max_bytes} bytes: {path}")
@@ -4617,7 +4628,15 @@ def _read_candidate_fingerprint(
     finally:
         os.close(file_descriptor)
 
-    if len({_stat_identity(value) for value in (before, opened, after, path_after)}) != 1:
+    # opened/after share the descriptor view and before/path_after share the path
+    # view, so each pair uses the full identity. The two views are reconciled with
+    # the cross-view identity (Windows reports st_ctime and permission bits
+    # differently across stat methods).
+    if (
+        _stat_identity(opened) != _stat_identity(after)
+        or _stat_identity(before) != _stat_identity(path_after)
+        or _cross_view_file_stat_identity(before) != _cross_view_file_stat_identity(opened)
+    ):
         return False, None
     if require_complete and len(source) > read_limit:
         return False, None
