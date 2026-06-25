@@ -1077,8 +1077,11 @@ def test_loaded_trusted_function_builtin_mutation_is_not_allowlisted(
     assert type(builtins_namespace) is dict
     original_next = builtins_namespace["next"]
 
-    def hostile_next(iterator: object) -> object:
-        return cast(Any, original_next)(iterator)
+    # Mirror the real next signature (iterator[, default]); replacing the global
+    # builtin with a one-arg stand-in would make the scanner's own next(it, default)
+    # calls raise during analysis (platform/sys.path dependent), erroring the scan.
+    def hostile_next(iterator: object, *args: object) -> object:
+        return cast(Any, original_next)(iterator, *args)
 
     monkeypatch.setitem(builtins_namespace, "next", hostile_next)
     _clear_call_graph_caches()
