@@ -69,7 +69,12 @@ from modelaudit.scanners.archive_dispatch import (
     merge_inconclusive_flax_msgpack_outcome,
     merge_safetensors_overlap_analysis,
 )
-from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
+from modelaudit.scanners.base import (
+    DEFAULT_MAX_FILE_READ_SIZE,
+    DEFAULT_READ_CHUNK_SIZE,
+    FORMAT_VALIDATION_CONFIG_KEY,
+    BaseScanner,
+)
 from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES as SAFETENSORS_MAX_HEADER_BYTES
 from modelaudit.scanners.xgboost_scanner import (
@@ -2866,7 +2871,7 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
             while True:
                 if deadline is not None and time.time() > deadline:
                     raise TimeoutError(f"File hashing timed out: {file_path}")
-                chunk = source.read(8192)
+                chunk = source.read(DEFAULT_READ_CHUNK_SIZE)
                 if not chunk:
                     break
                 hash_sha256.update(chunk)
