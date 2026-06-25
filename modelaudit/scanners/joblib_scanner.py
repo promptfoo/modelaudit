@@ -486,6 +486,13 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
         if instance.reference == _JoblibPickleGlobal("joblib.numpy_pickle", "NumpyArrayWrapper"):
             self._skip_numpy_array_payload(instance, state)
 
+    def load_stop(self) -> None:
+        if self.metastack:
+            raise pickle.UnpicklingError("STOP opcode encountered with an unmatched MARK")
+        if not self._pickle_stack:
+            raise pickle.UnpicklingError("STOP opcode encountered with an empty stack")
+        raise pickle._Stop(self._pickle_stack.pop())  # type: ignore[attr-defined]
+
     def load_inst(self) -> None:
         readline = cast(Callable[[], bytes], self.readline)  # type: ignore[attr-defined]
         module = readline()[:-1].decode("ascii")
@@ -592,6 +599,7 @@ _SafeJoblibUnpickler.dispatch[pickle.BYTEARRAY8[0]] = _SafeJoblibUnpickler.load_
 _SafeJoblibUnpickler.dispatch[pickle.NEWOBJ[0]] = _SafeJoblibUnpickler.load_newobj
 _SafeJoblibUnpickler.dispatch[pickle.NEWOBJ_EX[0]] = _SafeJoblibUnpickler.load_newobj_ex
 _SafeJoblibUnpickler.dispatch[pickle.BUILD[0]] = _SafeJoblibUnpickler.load_build
+_SafeJoblibUnpickler.dispatch[pickle.STOP[0]] = _SafeJoblibUnpickler.load_stop
 _SafeJoblibUnpickler.dispatch[pickle.INST[0]] = _SafeJoblibUnpickler.load_inst
 _SafeJoblibUnpickler.dispatch[pickle.OBJ[0]] = _SafeJoblibUnpickler.load_obj
 _SafeJoblibUnpickler.dispatch[pickle.PERSID[0]] = _SafeJoblibUnpickler.load_unsupported_reference

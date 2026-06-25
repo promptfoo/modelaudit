@@ -63,6 +63,7 @@ def _scan_payload(
     path = tmp_path / filename
     path.write_bytes(payload)
     original_reference_is_trusted = picklescan_api.import_only_reference_is_proven_trusted
+    original_invocation_is_trusted = picklescan_api.import_only_reference_is_proven_trusted_for_pickle_invocation
     original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
     if picklescan_trust_numpy_dtype is None:
         picklescan_trust_numpy_dtype = trust_numpy_dtype
@@ -102,8 +103,25 @@ def _scan_payload(
             return trust_numpy_dtype
         return original_reference_is_trusted(module, name)
 
+    def trust_embedded_pickle_invocation(module: str, name: str, reference: dict[str, object]) -> bool:
+        if (module, name) in {
+            ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+            ("numpy", "memmap"),
+            ("numpy", "matrix"),
+            ("numpy", "ndarray"),
+        }:
+            return trust_numpy_array_wrapper
+        if (module, name) == ("numpy", "dtype"):
+            return picklescan_trust_numpy_dtype
+        return original_invocation_is_trusted(module, name, reference)
+
     def requires_origin_review(module: str, name: str) -> bool:
-        if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
+        if (module, name) in {
+            ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+            ("numpy", "memmap"),
+            ("numpy", "matrix"),
+            ("numpy", "ndarray"),
+        }:
             return not trust_numpy_array_wrapper
         if (module, name) == ("numpy", "dtype"):
             return not picklescan_trust_numpy_dtype
@@ -121,10 +139,18 @@ def _scan_payload(
                 trust_embedded_pickle_reference,
             ),
             patch("modelaudit_picklescan.api.import_only_reference_is_proven_trusted", trust_embedded_pickle_reference),
+            patch(
+                "modelaudit_picklescan.api.import_only_reference_is_proven_trusted_for_pickle_invocation",
+                trust_embedded_pickle_invocation,
+            ),
             patch("modelaudit_picklescan.api.import_only_module_requires_origin_review", requires_origin_review),
             patch(
                 "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted",
                 trust_embedded_pickle_reference,
+            ),
+            patch(
+                "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted_for_pickle_invocation",
+                trust_embedded_pickle_invocation,
             ),
             patch(
                 "modelaudit_picklescan.call_graph.import_only_module_requires_origin_review",
@@ -357,6 +383,14 @@ def test_safe_parser_rejects_truncated_bytearray8_before_allocation(monkeypatch:
 
     assert _pickle_without_joblib_numpy_array_data(payload) is None
     assert allocation_requests == []
+
+
+def test_safe_parser_rejects_stop_with_unmatched_mark_after_raw_array() -> None:
+    payload = _joblib_numpy_list_payload(resumed_ops=b"\x80\x01K\x01.")
+    parser = _SafeJoblibUnpickler(io.BytesIO(payload))
+
+    with pytest.raises(pickle.UnpicklingError, match="unmatched MARK"):
+        parser.load()
 
 
 def test_safe_parser_accepts_bounded_bytearray8_before_numpy_payload(tmp_path: Path) -> None:
@@ -1250,6 +1284,8 @@ def test_scan_fails_closed_on_protocol1_pickle_in_numpy_wrapper_tail(tmp_path: P
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["parsing_failed"] is True
+    assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
     assert "trusted_incomplete_tail" not in result.metadata
 
 

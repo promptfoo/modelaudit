@@ -190,6 +190,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- reject premature pickle `STOP` opcodes inside Joblib NumPy wrapper streams
+
 ### Bug Fixes
 
 - support NumPy 2.5 on Python 3.12+ while retaining NumPy 2.4 on Python 3.11, matching NumPy's supported Python versions
