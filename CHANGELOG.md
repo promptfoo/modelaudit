@@ -192,6 +192,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- support NumPy 2.5 on Python 3.12+ while retaining NumPy 2.4 on Python 3.11, matching NumPy's supported Python versions
 - require patched py7zr 1.1.3 for 7z support and preserve bounded nested format probes when it signals per-member completion
 - require patched `msgpack>=1.2.1` so default and optional installs avoid the `Unpacker` reuse crash advisory
 - stream large TAR and compressed-TAR model archives through TAR-specific inspection instead of generic whole-file read rejection, bound shared nested NeMo work after aggregate-budget exhaustion, preserve reachable findings at TAR and compressed-wrapper scan limits, preserve trusted HDF5 findings when overlapping TAR routing is inconclusive, prove compressed-stream ownership before bounding HDF5 user-block scans, and cap accepted compressed-wrapper zero padding
