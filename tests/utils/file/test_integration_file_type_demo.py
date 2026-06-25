@@ -134,7 +134,7 @@ class TestFileTypeValidationDemo:
             assert results["success"], "Directory scan should succeed"
             assert len(validation_warnings) == 0, "No validation warnings expected for legitimate directory"
 
-    def test_end_to_end_security_demo(self, test_data_dir, tmp_path):
+    def test_end_to_end_security_demo(self, test_data_dir: Path, tmp_path: Path) -> None:
         """End-to-end demonstration of security validation in mixed directory."""
         print("\n=== File Type Validation Demo: End-to-End Security ===")
 

@@ -96,7 +96,7 @@ def test_cli_json_output_parsing(temp_model_dir):
     assert len(output_json["issues"]) >= 0
 
 
-def test_scan_with_all_options(temp_model_dir, mock_progress_callback):
+def test_scan_with_all_options(temp_model_dir: Path, mock_progress_callback: Any) -> None:
     """Test scanning with all options enabled."""
     results = scan_model_directory_or_file(
         str(temp_model_dir),

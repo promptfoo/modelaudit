@@ -416,7 +416,7 @@ class TestFileTypeValidationIntegration:
         # Should complete in reasonable time (this is a basic smoke test)
         assert elapsed < 30, "Scanning should complete in reasonable time"
 
-    def test_cli_integration_with_validation_warnings(self, temp_test_dir):
+    def test_cli_integration_with_validation_warnings(self, temp_test_dir: Path) -> None:
         """Test CLI integration produces appropriate validation warnings."""
         # Create a directory with validation issues
         attack_dir = temp_test_dir / "validation_test"

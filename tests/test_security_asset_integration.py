@@ -67,6 +67,11 @@ class TestSecurityAssetIntegration:
     def get_safe_samples(self, samples_dir: Path) -> list[Path]:
         """Get all safe sample files from organized structure."""
         safe_files = []
+        explicitly_malicious_fixtures = {
+            "custom_layer_attack.h5",
+            "loss_injection.h5",
+            "metric_injection.h5",
+        }
 
         categories = [
             "pickles",
@@ -92,11 +97,10 @@ class TestSecurityAssetIntegration:
                         "nested_pickle",  # Our intentionally malicious nested pickle test files
                         "decode_exec",  # Our intentionally malicious decode-exec test files
                         "simple_nested",  # Our intentionally malicious simple nested pickle test file
-                        "injection",  # Malicious keras loss/metric injection samples
-                        "attack",  # Malicious keras custom-layer attack sample
                     ]
                     if (
                         not any(indicator in file_path.name.lower() for indicator in exclusions)
+                        and file_path.name not in explicitly_malicious_fixtures
                         and file_path.is_file()
                         and not file_path.name.startswith(".")
                     ):
@@ -286,7 +290,7 @@ class TestSecurityAssetIntegration:
         sys.version_info[:2] in [(3, 10), (3, 12)],
         reason="Integration test hangs on Python 3.10 and 3.12 in CI - core functionality tested in unit tests",
     )
-    def test_license_scenarios_integration(self, scenarios_dir):
+    def test_license_scenarios_integration(self, scenarios_dir: Path) -> None:
         """Test that license scenarios still work with new structure."""
         license_scenarios = scenarios_dir / "license_scenarios"
 
@@ -302,6 +306,7 @@ class TestSecurityAssetIntegration:
                 # are now correctly flagged as security findings, so success may be
                 # False; the scan must still have run and processed the files.
                 assert results.files_scanned > 0, f"License scenario produced no scanned files: {scenario_dir.name}"
+                assert results.has_errors is False, f"License scenario had operational errors: {scenario_dir.name}"
 
     @pytest.mark.skipif(
         sys.version_info[:2] in [(3, 10), (3, 12)],
@@ -384,7 +389,7 @@ class TestSecurityAssetIntegration:
         sys.version_info[:2] in [(3, 10), (3, 12)],
         reason="Integration test hangs on Python 3.10 and 3.12 in CI - core functionality tested in unit tests",
     )
-    def test_asset_discovery_completeness(self, assets_dir):
+    def test_asset_discovery_completeness(self, assets_dir: Path) -> None:
         """Test that asset discovery finds all expected file types."""
         if not assets_dir.exists():
             pytest.skip("Assets directory not found")
@@ -396,6 +401,7 @@ class TestSecurityAssetIntegration:
 
         # Should find various file types
         assert results.files_scanned > 0, "Should find some files to scan"
+        assert results.has_errors is False, "Assets directory scan should not have operational errors"
         assert len(results.issues) > 0, "Assets tree contains exploits; findings expected"
 
         # Check for different file extensions in issues (indicates they were processed)
@@ -419,7 +425,7 @@ class TestSecurityAssetIntegration:
         sys.version_info[:2] in [(3, 10), (3, 12)],
         reason="Integration test hangs on Python 3.10 and 3.12 in CI - core functionality tested in unit tests",
     )
-    def test_performance_with_organized_structure(self, assets_dir):
+    def test_performance_with_organized_structure(self, assets_dir: Path) -> None:
         """Test that organized structure doesn't significantly impact performance."""
         if not assets_dir.exists():
             pytest.skip("Assets directory not found")
@@ -434,6 +440,7 @@ class TestSecurityAssetIntegration:
         # so success is expected to be False; assert the scan ran and produced
         # findings rather than demanding success on malicious inputs.
         assert results.files_scanned > 0, "Performance test scan should process files"
+        assert results.has_errors is False, "Performance test scan should not have operational errors"
         assert len(results.issues) > 0, "Assets tree contains exploits; findings expected"
         is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
         threshold = 60 if is_ci else 30

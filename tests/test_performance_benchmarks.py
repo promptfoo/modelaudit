@@ -344,7 +344,7 @@ class TestPerformanceBenchmarks:
         )
 
     @pytest.mark.slow
-    def test_stress_performance(self, assets_dir):
+    def test_stress_performance(self, assets_dir: Path) -> None:
         """Stress test with many repeated operations."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")

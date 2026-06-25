@@ -102,6 +102,7 @@ class TestAssetInventoryIntegration:
 
         # Should have scanned multiple files
         assert results.files_scanned >= 4
+        assert results.has_errors is False
         # The scan reports WARNING findings (not an error) because weights.zip
         # contains a real numpy pickle whose invoked allowlisted globals cannot be
         # proven against trusted loaded source when scanned inside the archive.

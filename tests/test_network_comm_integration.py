@@ -201,7 +201,7 @@ class NetworkExfiltrator:
         # CRITICAL is reserved for actual code execution vectors
         assert len(severities) > 0, "Should detect network-related patterns"
 
-    def test_combined_detections(self, tmp_path):
+    def test_combined_detections(self, tmp_path: Path) -> None:
         """Test that network detection works alongside other detections."""
         # Create a pickle with multiple security issues
         test_file = tmp_path / "multi_issue.pkl"
