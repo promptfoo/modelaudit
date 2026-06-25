@@ -5,6 +5,12 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.7...modelaudit-picklescan-v0.1.8) (2026-06-25)
+
+### Bug Fixes
+
+- **picklescan:** restore Windows call-graph detection via cross-view stat identity ([#1715](https://github.com/promptfoo/modelaudit/issues/1715)) ([51c0074](https://github.com/promptfoo/modelaudit/commit/51c00742ad1c090e5a3f61c1f0c6662e66d06a40))
+
 ## [Unreleased]
 
 ### Bug Fixes
