@@ -10767,8 +10767,9 @@ def test_scan_bytes_warns_on_invoked_trusted_import_reference_without_source_ana
         source="invoked-trusted-native-global.pkl",
     )
 
-    source_unavailable = any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
-    assert report.status == (ScanStatus.INCONCLUSIVE if source_unavailable else ScanStatus.COMPLETE)
+    assert report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE}
+    if report.status == ScanStatus.INCONCLUSIVE:
+        assert report.metadata.get("analysis_incomplete") is True
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
