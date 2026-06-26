@@ -190,6 +190,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- validate Windows MLflow staging hardlinks with native file identities so aliases outside the staging tree fail closed
+- treat protocol-relative report sources as remote identifiers before any Windows UNC filesystem probe
+- reject premature pickle `STOP` opcodes inside Joblib NumPy wrapper streams and fail closed when wrapper validation cannot complete
+
 ### Bug Fixes
 
 - support NumPy 2.5 on Python 3.12+ while retaining NumPy 2.4 on Python 3.11, matching NumPy's supported Python versions

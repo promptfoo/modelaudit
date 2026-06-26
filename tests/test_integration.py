@@ -17,10 +17,18 @@ def test_scan_directory_with_multiple_models(temp_model_dir: Path, mock_progress
         progress_callback=mock_progress_callback,
     )
 
-    # Check basic results
-    assert results.success is True
+    # Check basic results. The fixture intentionally includes an unparseable
+    # ``saved_model.pb`` that fails closed with a CRITICAL finding, so the
+    # aggregate ``success`` is False by design. The scan must still complete
+    # without operational errors and keep surfacing that security signal.
+    assert results.has_errors is False
     assert results.files_scanned >= 4  # At least our 4 test files
     assert results.bytes_scanned > 0
+    assert any(
+        getattr(getattr(issue, "severity", None), "value", None) == "critical"
+        and "TF SavedModel" in getattr(issue, "message", "")
+        for issue in results.issues
+    ), "Expected the fail-closed CRITICAL SavedModel finding to fire"
 
     # Check progress callback was called
     assert len(mock_progress_callback.messages) > 0
@@ -88,7 +96,7 @@ def test_cli_json_output_parsing(temp_model_dir):
     assert len(output_json["issues"]) >= 0
 
 
-def test_scan_with_all_options(temp_model_dir, mock_progress_callback):
+def test_scan_with_all_options(temp_model_dir: Path, mock_progress_callback: Any) -> None:
     """Test scanning with all options enabled."""
     results = scan_model_directory_or_file(
         str(temp_model_dir),
@@ -100,9 +108,17 @@ def test_scan_with_all_options(temp_model_dir, mock_progress_callback):
         additional_option="test_value",
     )
 
-    assert results.success is True
+    # ``success`` is False by design: the fixture's unparseable SavedModel fails
+    # closed with a CRITICAL finding. Assert the scan completed cleanly and that
+    # the genuine security signal is still reported.
+    assert results.has_errors is False
     assert results.files_scanned > 0
     assert results.bytes_scanned > 0
+    assert any(
+        getattr(getattr(issue, "severity", None), "value", None) == "critical"
+        and "TF SavedModel" in getattr(issue, "message", "")
+        for issue in results.issues
+    ), "Expected the fail-closed CRITICAL SavedModel finding to fire"
 
     # Check progress callback was called
     assert len(mock_progress_callback.messages) > 0

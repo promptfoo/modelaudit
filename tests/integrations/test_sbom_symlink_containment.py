@@ -171,7 +171,7 @@ def test_sbom_omits_hash_when_file_becomes_directory_before_open(
         dir_fd: int | None = None,
     ) -> int:
         nonlocal replaced
-        if path == model_file.name and dir_fd is not None and not replaced:
+        if path in {model_file.name, str(model_file)} and not replaced:
             replaced = True
             model_file.unlink()
             model_file.mkdir()
@@ -211,6 +211,10 @@ def test_sbom_hashes_in_root_symlink_targets(
     assert _property_value(component, "size") == str(len(content))
 
 
+@pytest.mark.skipif(
+    not _supports_descriptor_walk(),
+    reason="requires descriptor-relative symlink validation",
+)
 def test_sbom_omits_hash_when_in_root_symlink_target_changes_during_validation(
     tmp_path: Path,
     requires_symlinks: None,
@@ -321,7 +325,7 @@ def test_sbom_hashing_stays_bound_to_open_parent_directory_during_swap(
         dir_fd: int | None = None,
     ) -> int:
         nonlocal swapped
-        if path == model_file.name and dir_fd is not None and not swapped:
+        if path in {model_file.name, str(model_file)} and not swapped:
             swapped = True
             parent.rename(moved_parent)
             parent.symlink_to(outside_parent, target_is_directory=True)
@@ -339,6 +343,10 @@ def test_sbom_hashing_stays_bound_to_open_parent_directory_during_swap(
     assert hashlib.sha256(outside_content).hexdigest() not in _sha256_values(component)
 
 
+@pytest.mark.skipif(
+    not _supports_descriptor_walk(),
+    reason="requires descriptor-relative symlink validation",
+)
 def test_sbom_omits_recorded_hash_when_listed_symlink_disappears_after_containment_check(
     tmp_path: Path,
     requires_symlinks: None,
@@ -516,7 +524,7 @@ def test_sbom_enumeration_stays_bound_to_replaced_scan_root(
     (outside_root / "secret.bin").write_bytes(outside_content)
     outside_hash = hashlib.sha256(outside_content).hexdigest()
     real_walk = os.walk
-    real_fwalk = os.fwalk
+    real_fwalk = getattr(os, "fwalk", None)
     swapped = False
 
     def _replace_root() -> None:
@@ -533,10 +541,12 @@ def test_sbom_enumeration_stays_bound_to_replaced_scan_root(
 
     def _replace_root_before_fwalk(*args: Any, **kwargs: Any) -> Any:
         _replace_root()
+        assert real_fwalk is not None
         return real_fwalk(*args, **kwargs)
 
     monkeypatch.setattr(os, "walk", _replace_root_before_walk)
-    monkeypatch.setattr(os, "fwalk", _replace_root_before_fwalk)
+    if real_fwalk is not None:
+        monkeypatch.setattr(os, "fwalk", _replace_root_before_fwalk)
 
     if use_pydantic:
         sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())

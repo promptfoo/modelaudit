@@ -486,6 +486,13 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
         if instance.reference == _JoblibPickleGlobal("joblib.numpy_pickle", "NumpyArrayWrapper"):
             self._skip_numpy_array_payload(instance, state)
 
+    def load_stop(self) -> None:
+        if self.metastack:
+            raise pickle.UnpicklingError("STOP opcode encountered with an unmatched MARK")
+        if not self._pickle_stack:
+            raise pickle.UnpicklingError("STOP opcode encountered with an empty stack")
+        raise pickle._Stop(self._pickle_stack.pop())  # type: ignore[attr-defined]
+
     def load_inst(self) -> None:
         readline = cast(Callable[[], bytes], self.readline)  # type: ignore[attr-defined]
         module = readline()[:-1].decode("ascii")
@@ -592,6 +599,7 @@ _SafeJoblibUnpickler.dispatch[pickle.BYTEARRAY8[0]] = _SafeJoblibUnpickler.load_
 _SafeJoblibUnpickler.dispatch[pickle.NEWOBJ[0]] = _SafeJoblibUnpickler.load_newobj
 _SafeJoblibUnpickler.dispatch[pickle.NEWOBJ_EX[0]] = _SafeJoblibUnpickler.load_newobj_ex
 _SafeJoblibUnpickler.dispatch[pickle.BUILD[0]] = _SafeJoblibUnpickler.load_build
+_SafeJoblibUnpickler.dispatch[pickle.STOP[0]] = _SafeJoblibUnpickler.load_stop
 _SafeJoblibUnpickler.dispatch[pickle.INST[0]] = _SafeJoblibUnpickler.load_inst
 _SafeJoblibUnpickler.dispatch[pickle.OBJ[0]] = _SafeJoblibUnpickler.load_obj
 _SafeJoblibUnpickler.dispatch[pickle.PERSID[0]] = _SafeJoblibUnpickler.load_unsupported_reference
@@ -782,6 +790,9 @@ class JoblibScanner(BaseScanner):
     ) -> None:
         """Analyze a raw or decompressed pickle payload with CVE and opcode checks."""
         sanitized = _pickle_without_joblib_numpy_array_data(payload)
+        numpy_wrapper_validation_failed = (
+            sanitized is None and _JOBLIB_NUMPY_ARRAY_WRAPPER_NAME.encode("ascii") in payload
+        )
         scan_payload = sanitized.payload if sanitized is not None else payload
         raw_array_count = sanitized.raw_array_count if sanitized is not None else 0
         has_only_validated_codec_encodes = (
@@ -816,6 +827,8 @@ class JoblibScanner(BaseScanner):
             result.merge(sub_result)
         else:
             result.merge_member_result(sub_result, member_identity)
+        if numpy_wrapper_validation_failed:
+            self._record_numpy_wrapper_validation_failure(result, context)
         if has_only_validated_codec_encodes:
             self._remove_validated_dtype_codec_findings(result)
         if raw_array_count and self._numpy_array_wrapper_origin_is_trusted():
@@ -842,6 +855,46 @@ class JoblibScanner(BaseScanner):
         else:
             self._downgrade_embedded_pickle_parse_errors(result)
         result.bytes_scanned = len(payload)
+
+    @staticmethod
+    def _record_numpy_wrapper_validation_failure(result: ScanResult, context: str) -> None:
+        mark_inconclusive_scan_result(result, "joblib_numpy_array_wrapper_validation_failed")
+        result.metadata.setdefault("file_type", "pickle")
+        result.metadata.setdefault("parsing_failed", True)
+        result.metadata.setdefault("failure_reason", "unknown_opcode_or_format_error")
+
+        def is_parse_failure(finding: Any) -> bool:
+            details = getattr(finding, "details", {})
+            return (
+                getattr(finding, "rule_code", None) == "S901"
+                and isinstance(details, dict)
+                and details.get("category") == "parse_error"
+            )
+
+        has_parse_failure = any(is_parse_failure(finding) for finding in (*result.issues, *result.checks))
+        if has_parse_failure:
+            return
+        result.add_check(
+            name="Pickle Format Check",
+            passed=False,
+            message="Pickle parsing failed before full scan completion",
+            severity=IssueSeverity.INFO,
+            location=context,
+            details={
+                "pickle_source": context,
+                "file_type": "pickle",
+                "category": "parse_error",
+                "parsing_failed": True,
+                "failure_reason": "unknown_opcode_or_format_error",
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "joblib_numpy_array_wrapper_validation_failed",
+            },
+            why=(
+                "The scanner could not statically validate this Joblib NumPy wrapper payload. "
+                "Because full opcode analysis could not be proven complete, the payload is treated as unsafe."
+            ),
+            rule_code="S901",
+        )
 
     @staticmethod
     def _remove_validated_dtype_codec_findings(result: ScanResult) -> None:
