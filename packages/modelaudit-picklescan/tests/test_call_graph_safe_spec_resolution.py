@@ -45,6 +45,24 @@ def _clear_call_graph_caches() -> None:
         function.cache_clear()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows ctime differs across stat views")
+def test_cross_view_file_identity_keeps_posix_ctime() -> None:
+    """POSIX cross-view checks must detect metadata-only inode reuse."""
+    original = SimpleNamespace(
+        st_dev=1,
+        st_ino=2,
+        st_mode=0o100644,
+        st_size=3,
+        st_mtime_ns=4,
+        st_ctime_ns=5,
+    )
+    replaced = SimpleNamespace(**{**vars(original), "st_ctime_ns": 6})
+
+    assert call_graph._cross_view_file_stat_identity(
+        cast(os.stat_result, original)
+    ) != call_graph._cross_view_file_stat_identity(cast(os.stat_result, replaced))
+
+
 def _posixpath_text_regex_cache_name() -> str:
     for name in ("_varsub", "_varprog"):
         if name in posixpath.expandvars.__code__.co_names:

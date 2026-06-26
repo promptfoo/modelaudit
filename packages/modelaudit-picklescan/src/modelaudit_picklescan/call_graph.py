@@ -3796,21 +3796,23 @@ def _stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, 
     )
 
 
-def _cross_view_file_stat_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+def _cross_view_file_stat_identity(file_stat: os.stat_result) -> tuple[int, ...]:
     # Cross-view comparison spans a descriptor stat and a path stat. Windows path
     # stat derives executable bits from the suffix (descriptor stat cannot) and
     # reports st_ctime mirroring st_mtime while descriptor stat reports the true
-    # creation time, so both fields are stat-method dependent and excluded here.
-    # On POSIX these fields agree across views, so omitting them is a no-op there;
-    # st_dev/st_ino still pin the exact file and st_size/st_mtime still catch
-    # mutation, so cross-view swap and tamper detection is preserved.
-    return (
+    # creation time, so both fields are stat-method dependent and excluded there.
+    # POSIX reports ctime consistently across views, where it helps catch a
+    # same-size, same-mtime replacement that reuses the original inode.
+    identity = (
         file_stat.st_dev,
         file_stat.st_ino,
         stat.S_IFMT(file_stat.st_mode),
         file_stat.st_size,
         file_stat.st_mtime_ns,
     )
+    if os.name == "nt":
+        return identity
+    return (*identity, file_stat.st_ctime_ns)
 
 
 def _zipimport_bounded_central_directory_names(
