@@ -176,17 +176,17 @@ def test_existing_local_assignment_paths_are_preserved(tmp_path: Path) -> None:
     second_path.write_bytes(b"second")
     encoded_name_path = tmp_path / "model%3Fv1.pkl"
     encoded_name_path.write_bytes(b"encoded name")
-    query_name_path = tmp_path / "model?version=1.pkl"
-    query_name_path.write_bytes(b"query name")
     parameter_name_path = tmp_path / "model;version=1.pkl"
     parameter_name_path.write_bytes(b"parameter name")
 
     assert redact_source_identifier(str(first_path)) == str(first_path)
     assert redact_source_identifier(str(second_path)) == str(second_path)
     assert redact_source_identifier(str(encoded_name_path)) == str(encoded_name_path)
-    assert redact_source_identifier(str(query_name_path)) == str(query_name_path)
     assert redact_source_identifier(str(parameter_name_path)) == str(parameter_name_path)
     if os.name != "nt":
+        query_name_path = tmp_path / "model?version=1.pkl"
+        query_name_path.write_bytes(b"query name")
+        assert redact_source_identifier(str(query_name_path)) == str(query_name_path)
         double_slash_path = f"/{query_name_path}"
         assert os.path.lexists(double_slash_path)
         assert redact_source_identifier(double_slash_path) == double_slash_path
@@ -323,7 +323,7 @@ def test_unclassifiable_mapping_keys_fail_closed() -> None:
     assert "TUPLE-SECRET" not in output
     assert "PATH-KEY-SECRET" not in output
     assert "PATH-VALUE-SECRET" not in output
-    assert "bucket/model.pkl" in output
+    assert "bucket/model.pkl" in output.replace("\\\\", "/")
 
 
 def test_recursive_export_values_fail_closed() -> None:
@@ -861,11 +861,12 @@ def test_benign_colon_path_segments_are_preserved(source: str) -> None:
 
 def test_nonexistent_local_suffix_is_redacted_but_literal_filename_is_preserved(tmp_path: Path) -> None:
     missing_path = tmp_path / "missing.pkl?token=source-secret"
-    literal_path = tmp_path / "literal.pkl?token=filename-text"
-    literal_path.write_bytes(b"model")
 
     assert redact_source_identifier(str(missing_path)) == str(tmp_path / "missing.pkl")
-    assert redact_source_identifier(str(literal_path)) == str(literal_path)
+    if os.name != "nt":
+        literal_path = tmp_path / "literal.pkl?token=filename-text"
+        literal_path.write_bytes(b"model")
+        assert redact_source_identifier(str(literal_path)) == str(literal_path)
     assert redact_source_identifier("./missing.pkl%3Ftoken%3Dsource-secret") == "./missing.pkl"
 
 
@@ -969,7 +970,7 @@ def test_format_scan_output_serializes_pydantic_urls_and_preserves_text_findings
     assert payload["issues"][0]["details"] == {
         "binary": "<binary data>",
         "generated_at": "2026-01-02T03:04:05Z",
-        "local_path": "models/model.pkl",
+        "local_path": str(Path("models/model.pkl")),
         "scan_id": "12345678-1234-5678-1234-567812345678",
     }
 

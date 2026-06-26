@@ -231,11 +231,13 @@ def redact_source_identifier(source: str) -> str:
                 return source
             return _redact_url_identifier(comparison_source)
         return _redact_url_identifier(normalized_source)
-    if _local_path_exists(source):
-        return source
     if normalized_source.startswith("//") and not normalized_source.startswith("///"):
+        if os.name != "nt" and _local_path_exists(source):
+            return source
         safe_url = _redact_url_identifier(f"https:{normalized_source}")
         return safe_url.removeprefix("https:")
+    if _local_path_exists(source):
+        return source
 
     if _is_local_path_identifier(source):
         return _redact_local_path_identifier(source)

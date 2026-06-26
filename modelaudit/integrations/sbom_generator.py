@@ -417,7 +417,7 @@ def _resolve_component_size_and_sha256(
         if scan_root_fd is None and not _is_path_within_directory(path, scan_root):
             return 0, ""
 
-    path_exists = os.path.lexists(path)
+    path_exists = False if allow_metadata_fallback and _is_non_filesystem_identifier(path) else os.path.lexists(path)
     if scan_root is not None or path_exists or not allow_metadata_fallback:
         opened_file = _opened_file_size_and_sha256(
             path,
@@ -472,7 +472,11 @@ def _should_skip_sbom_file(path: str) -> bool:
 
 def _is_non_filesystem_identifier(path: str) -> bool:
     """Return whether metadata identifies a remote source rather than a local path."""
-    return "://" in path
+    if "://" in path:
+        return True
+    if path.startswith("//") and not path.startswith("///"):
+        return os.name == "nt" or not os.path.lexists(path)
+    return False
 
 
 def _redacted_component_identity(
@@ -895,7 +899,8 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
         reserved={redact_source_reference(path) for path in ordered_paths if redact_source_identifier(path) == path}
     )
     for input_path in ordered_paths:
-        if os.path.isdir(input_path):
+        is_remote_identifier = _is_non_filesystem_identifier(input_path)
+        if not is_remote_identifier and os.path.isdir(input_path):
             scan_root = os.path.realpath(input_path)
             require_stable_root = _supports_descriptor_walk()
             scan_root_fd = _open_scan_root_fd(scan_root, readable=True)
@@ -929,10 +934,9 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                 if scan_root_fd is not None:
                     os.close(scan_root_fd)
         else:
-            is_remote_identifier = _is_non_filesystem_identifier(input_path)
-            allow_metadata_fallback = (
-                is_remote_identifier or input_path in trusted_metadata_paths
-            ) and not os.path.lexists(input_path)
+            allow_metadata_fallback = (is_remote_identifier or input_path in trusted_metadata_paths) and (
+                is_remote_identifier or not os.path.lexists(input_path)
+            )
             input_directory = os.path.dirname(input_path) or "."
             single_scan_root: str | None = None if allow_metadata_fallback else os.path.realpath(input_directory)
             require_stable_root = single_scan_root is not None and _supports_descriptor_walk()
@@ -987,7 +991,8 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
         reserved={redact_source_reference(path) for path in ordered_paths if redact_source_identifier(path) == path}
     )
     for input_path in ordered_paths:
-        if os.path.isdir(input_path):
+        is_remote_identifier = _is_non_filesystem_identifier(input_path)
+        if not is_remote_identifier and os.path.isdir(input_path):
             scan_root = os.path.realpath(input_path)
             require_stable_root = _supports_descriptor_walk()
             scan_root_fd = _open_scan_root_fd(scan_root, readable=True)
@@ -1016,10 +1021,9 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
                 if scan_root_fd is not None:
                     os.close(scan_root_fd)
         else:
-            is_remote_identifier = _is_non_filesystem_identifier(input_path)
-            allow_metadata_fallback = (
-                is_remote_identifier or input_path in trusted_metadata_paths
-            ) and not os.path.lexists(input_path)
+            allow_metadata_fallback = (is_remote_identifier or input_path in trusted_metadata_paths) and (
+                is_remote_identifier or not os.path.lexists(input_path)
+            )
             input_directory = os.path.dirname(input_path) or "."
             single_scan_root: str | None = None if allow_metadata_fallback else os.path.realpath(input_directory)
             require_stable_root = single_scan_root is not None and _supports_descriptor_walk()

@@ -192,6 +192,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- validate Windows MLflow staging hardlinks with native file identities so aliases outside the staging tree fail closed
+- treat protocol-relative report sources as remote identifiers before any Windows UNC filesystem probe
 - reject premature pickle `STOP` opcodes inside Joblib NumPy wrapper streams
 
 ### Bug Fixes
