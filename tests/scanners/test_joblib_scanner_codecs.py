@@ -130,6 +130,11 @@ def _scan_payload(
     _clear_source_sensitive_caches()
     try:
         with (
+            patch.object(
+                JoblibScanner,
+                "_numpy_array_wrapper_origin_is_trusted",
+                return_value=trust_numpy_array_wrapper,
+            ),
             patch(
                 "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
                 trust_joblib_validated_reference,
@@ -587,6 +592,39 @@ def test_scan_fails_closed_when_numpy_wrapper_prefix_has_unknown_tail(tmp_path: 
         issue.rule_code == "S901"
         and issue.severity == IssueSeverity.INFO
         and issue.message == "Pickle parsing failed before full scan completion"
+        for issue in result.issues
+    )
+    assert "joblib_numpy_array_wrapper_validation_failed" in result.metadata["scan_outcome_reasons"]
+
+
+def test_numpy_wrapper_validation_failure_overrides_clean_pickle_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "clean_backend_invalid_wrapper.joblib"
+    path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\n\xff")
+    scanner = JoblibScanner()
+    assert scanner.pickle_scanner is not None
+
+    def clean_scan(*_args: object, **_kwargs: object) -> ScanResult:
+        clean_result = ScanResult("pickle")
+        clean_result.finish(success=True)
+        return clean_result
+
+    monkeypatch.setattr(scanner.pickle_scanner, "scan_stream", clean_scan)
+
+    result = scanner.scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["parsing_failed"] is True
+    assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
+    assert result.metadata["scan_outcome_reasons"] == ["joblib_numpy_array_wrapper_validation_failed"]
+    assert any(
+        issue.rule_code == "S901"
+        and issue.severity == IssueSeverity.INFO
+        and issue.details.get("scan_outcome_reason") == "joblib_numpy_array_wrapper_validation_failed"
         for issue in result.issues
     )
 

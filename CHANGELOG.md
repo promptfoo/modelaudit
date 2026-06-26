@@ -194,7 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - validate Windows MLflow staging hardlinks with native file identities so aliases outside the staging tree fail closed
 - treat protocol-relative report sources as remote identifiers before any Windows UNC filesystem probe
-- reject premature pickle `STOP` opcodes inside Joblib NumPy wrapper streams
+- reject premature pickle `STOP` opcodes inside Joblib NumPy wrapper streams and fail closed when wrapper validation cannot complete
 
 ### Bug Fixes
 
