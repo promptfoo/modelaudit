@@ -460,6 +460,7 @@ class ScanResultsCache:
         cached_result, file_identity = self.get_cached_result_with_identity(
             file_path,
             version_context=version_context,
+            file_stat=file_stat,
             include_private_metadata=include_private_metadata,
         )
         if file_identity is not None:
@@ -471,6 +472,7 @@ class ScanResultsCache:
         file_path: str,
         version_context: dict[str, Any] | None = None,
         *,
+        file_stat: os.stat_result | None = None,
         include_private_metadata: bool = False,
     ) -> tuple[dict[str, Any] | None, ScannedFileIdentity | None]:
         """Return a cache lookup plus the monitored identity reusable by a miss scan."""
@@ -480,7 +482,10 @@ class ScanResultsCache:
                 logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
                 return None, None
 
-            file_identity = self.capture_file_identity(file_path)
+            if file_stat is None:
+                file_identity = self.capture_file_identity(file_path)
+            else:
+                file_identity = self.capture_file_identity(file_path, file_stat=file_stat)
             file_stat, file_hash, _change_token, _ancestor_identity = file_identity
             cache_key, _content_hash = self._generate_cache_key_material(
                 file_path,
@@ -854,14 +859,20 @@ class ScanResultsCache:
                 temporary_cache_path.unlink(missing_ok=True)
             self.release_ancestor_identity(expected_ancestor_identity)
 
-    def capture_file_identity(self, file_path: str) -> ScannedFileIdentity:
-        """Capture a stable stat, content hash, and platform change token before scanning."""
+    def capture_file_identity(
+        self,
+        file_path: str,
+        file_stat: os.stat_result | None = None,
+    ) -> ScannedFileIdentity:
+        """Capture a stable file identity, reusing a caller stat snapshot for the first probe when available."""
         if self._path_has_symlink_component(file_path):
             raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
 
         last_change_error: ValueError | None = None
+        stat_hint = file_stat
         for _capture_attempt in range(_MAX_IDENTITY_CAPTURE_ATTEMPTS):
-            preliminary_stat = os.stat(file_path)
+            preliminary_stat = stat_hint if stat_hint is not None else os.stat(file_path)
+            stat_hint = None
             probe = self._get_change_clock_probe(file_path, preliminary_stat.st_dev)
             preliminary_change_token = self._get_file_change_token(file_path, preliminary_stat)
             preliminary_ancestor_identity = self._capture_ancestor_identity(file_path)

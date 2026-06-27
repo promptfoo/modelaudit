@@ -671,6 +671,79 @@ def test_cache_manager_reuses_lookup_identity_for_miss(
     assert capture_calls == 1
 
 
+def test_scan_results_cache_get_cached_result_with_stat_reuses_provided_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="scan-results-stat.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    file_identity = cache.capture_file_identity(str(file_path))
+    recorded_stats: list[os.stat_result | None] = []
+    provided_stat = os.stat(file_path)
+
+    def lookup_with_record(
+        path: str,
+        version_context: dict[str, Any] | None = None,
+        *,
+        file_stat: os.stat_result | None = None,
+        include_private_metadata: bool = False,
+    ) -> Any:
+        assert path == str(file_path)
+        assert version_context is not None
+        assert include_private_metadata is False
+        recorded_stats.append(file_stat)
+        return expected, file_identity
+
+    monkeypatch.setattr(cache, "get_cached_result_with_identity", lookup_with_record)
+
+    cached_result = cache.get_cached_result_with_stat(str(file_path), provided_stat, version_context=version_context)
+
+    assert cached_result == expected
+    assert len(recorded_stats) == 1
+    assert recorded_stats[0] is provided_stat
+
+
+def test_cache_manager_get_cached_result_with_stat_reuses_provided_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="cache-manager-stat.cache")
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    file_identity = cache_manager.cache.capture_file_identity(str(file_path))
+    recorded_stats: list[os.stat_result | None] = []
+    provided_stat = os.stat(file_path)
+
+    def lookup_with_record(
+        path: str,
+        version_context: dict[str, Any] | None = None,
+        *,
+        file_stat: os.stat_result | None = None,
+        include_private_metadata: bool = False,
+    ) -> Any:
+        assert path == str(file_path)
+        assert version_context is not None
+        assert include_private_metadata is False
+        recorded_stats.append(file_stat)
+        return expected, file_identity
+
+    monkeypatch.setattr(cache_manager.cache, "get_cached_result_with_identity", lookup_with_record)
+
+    cached_result = cache_manager.get_cached_result_with_stat(
+        str(file_path),
+        provided_stat,
+        version_context=version_context,
+    )
+
+    assert cached_result == expected
+    assert len(recorded_stats) == 1
+    assert recorded_stats[0] is provided_stat
+
+
 def test_cached_scan_does_not_store_result_after_post_scan_replacement(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path, name="race.dat")
     clean_payload = b"clean:" + (b"x" * 2042)

@@ -87,6 +87,7 @@ class CacheManager:
         cached_result, file_identity = self.get_cached_result_with_identity(
             file_path,
             version_context=version_context,
+            file_stat=stat_result,
             include_private_metadata=include_private_metadata,
         )
         try:
@@ -100,17 +101,21 @@ class CacheManager:
         file_path: str,
         version_context: dict[str, Any] | None = None,
         *,
+        file_stat: os.stat_result | None = None,
         include_private_metadata: bool = False,
     ) -> tuple[dict[str, Any] | None, ScannedFileIdentity | None]:
         """Return a cache lookup and retain the monitored identity for a miss scan."""
         if not self.enabled or not self.cache:
             return None, None
 
-        cached_result, file_identity = self.cache.get_cached_result_with_identity(
-            file_path,
-            version_context=version_context,
-            include_private_metadata=include_private_metadata,
-        )
+        lookup_kwargs: dict[str, Any] = {
+            "version_context": version_context,
+            "include_private_metadata": include_private_metadata,
+        }
+        if file_stat is not None:
+            lookup_kwargs["file_stat"] = file_stat
+
+        cached_result, file_identity = self.cache.get_cached_result_with_identity(file_path, **lookup_kwargs)
         if cached_result is not None and not cached_scan_result_dependencies_available(cached_result):
             logger.debug(f"Bypassing cached result with unavailable scanner dependencies: {Path(file_path).name}")
             return None, file_identity
