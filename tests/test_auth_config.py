@@ -238,6 +238,113 @@ def test_write_global_config_uses_private_file_permissions(
         assert stat.S_IMODE(config_file.stat().st_mode) == 0o600
 
 
+def test_write_global_config_partial_preserves_account_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config"
+    fallback_dir = tmp_path / "home" / ".promptfoo"
+    _patch_config_paths(auth_config, monkeypatch, config_dir, fallback_dir)
+
+    auth_config.write_global_config(
+        auth_config.GlobalConfig(
+            {
+                "id": "fixed-id",
+                "account": {
+                    "email": "old@example.com",
+                    "name": "Keep Me",
+                    "organization": "promptfoo",
+                },
+                "cloud": {"apiKey": "secret"},
+            }
+        )
+    )
+
+    auth_config.write_global_config_partial({"account": {"email": "new@example.com"}})
+
+    written = yaml.safe_load((config_dir / "promptfoo.yaml").read_text())
+
+    assert written["account"] == {
+        "email": "new@example.com",
+        "name": "Keep Me",
+        "organization": "promptfoo",
+    }
+    assert written["cloud"] == {"apiKey": "secret"}
+
+
+def test_write_global_config_partial_deep_merges_cloud_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config"
+    fallback_dir = tmp_path / "home" / ".promptfoo"
+    _patch_config_paths(auth_config, monkeypatch, config_dir, fallback_dir)
+
+    auth_config.write_global_config(
+        auth_config.GlobalConfig(
+            {
+                "id": "fixed-id",
+                "account": {"email": "user@example.com"},
+                "cloud": {
+                    "apiHost": "https://old-api.example",
+                    "apiKey": "old-token",
+                    "featureFlags": {"beta": True, "region": "eu"},
+                    "customField": "keep-me",
+                },
+            }
+        )
+    )
+
+    auth_config.write_global_config_partial(
+        {
+            "cloud": {
+                "apiHost": "https://new-api.example",
+                "featureFlags": {"region": "us"},
+            }
+        }
+    )
+
+    written = yaml.safe_load((config_dir / "promptfoo.yaml").read_text())
+
+    assert written["cloud"] == {
+        "apiHost": "https://new-api.example",
+        "apiKey": "old-token",
+        "featureFlags": {"beta": True, "region": "us"},
+        "customField": "keep-me",
+    }
+    assert written["account"] == {"email": "user@example.com"}
+
+
+def test_cloud_config_delete_clears_cloud_section_without_touching_account(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config"
+    fallback_dir = tmp_path / "home" / ".promptfoo"
+    _patch_config_paths(auth_config, monkeypatch, config_dir, fallback_dir)
+
+    auth_config.write_global_config(
+        auth_config.GlobalConfig(
+            {
+                "id": "fixed-id",
+                "account": {"email": "user@example.com", "name": "Keep Me"},
+                "cloud": {
+                    "apiHost": "https://api.promptfoo.app",
+                    "apiKey": "secret-token",
+                    "customField": "remove-me",
+                },
+            }
+        )
+    )
+
+    auth_config.CloudConfig().delete()
+
+    written = yaml.safe_load((config_dir / "promptfoo.yaml").read_text())
+
+    assert written["account"] == {"email": "user@example.com", "name": "Keep Me"}
+    assert written["cloud"] == {}
+
+
 @pytest.mark.parametrize(
     ("api_host", "expected"),
     [
