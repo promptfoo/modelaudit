@@ -1,5 +1,7 @@
 """Test interrupt handling functionality."""
 
+import builtins
+import runpy
 import signal
 import subprocess
 import sys
@@ -8,6 +10,31 @@ import time
 from pathlib import Path
 
 import pytest
+
+
+def test_module_entrypoint_handles_interrupt_during_cli_import(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Startup Ctrl+C should not leak a raw import traceback."""
+    original_import = builtins.__import__
+
+    def interrupt_cli_import(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        if name == "cli" and level == 1:
+            raise KeyboardInterrupt
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", interrupt_cli_import)
+
+    with pytest.raises(SystemExit, match="2"):
+        runpy.run_module("modelaudit", run_name="__main__")
+
+    assert capsys.readouterr().err == "Scan interrupted by user\n"
 
 
 def test_interrupt_handler_basic():
