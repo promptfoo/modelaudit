@@ -187,12 +187,26 @@ def test_valid_joblib_raw_array_tail_is_trusted(
     joblib_file = tmp_path / "numpy_arrays.joblib"
     _write_joblib_numpy_array_pickle(joblib_file)
 
-    def trusted_joblib_references(module: str, name: str) -> bool:
+    def trusted_joblib_references(
+        module: str,
+        name: str,
+        *,
+        pickle_entrypoint_methods: tuple[str, ...] | None = None,
+        pickle_invokes_metaclass_call: bool | None = None,
+    ) -> bool:
+        del pickle_entrypoint_methods, pickle_invokes_metaclass_call
         return (module, name) in {
             ("joblib.numpy_pickle", "NumpyArrayWrapper"),
             ("numpy", "ndarray"),
             ("numpy", "dtype"),
         }
+
+    def trusted_joblib_invocation(module: str, name: str, reference: dict[str, object]) -> bool:
+        del reference
+        return trusted_joblib_references(module, name)
+
+    def requires_origin_review(module: str, name: str) -> bool:
+        return not trusted_joblib_references(module, name)
 
     monkeypatch.setattr(
         "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
@@ -205,6 +219,26 @@ def test_valid_joblib_raw_array_tail_is_trusted(
     monkeypatch.setattr(
         "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
         trusted_joblib_references,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted_for_pickle_invocation",
+        trusted_joblib_invocation,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted",
+        trusted_joblib_references,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted_for_pickle_invocation",
+        trusted_joblib_invocation,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_module_requires_origin_review",
+        requires_origin_review,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_module_requires_origin_review",
+        requires_origin_review,
     )
 
     result = PickleScanner().scan(str(joblib_file))

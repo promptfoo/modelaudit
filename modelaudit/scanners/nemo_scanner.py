@@ -12,7 +12,7 @@ import re
 import tarfile
 import tempfile
 from collections.abc import Iterator
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar, cast
 
 from ..core_results import (
     OPERATIONAL_ERROR_REASON_METADATA_KEY,
@@ -34,8 +34,16 @@ from .archive_member_security import (
 )
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .tar_scanner import (
+    TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON,
+    TAR_DECOMPRESSION_RATIO_LIMIT_INCOMPLETE_REASON,
+    TAR_ENTRY_COUNT_INCOMPLETE_REASON,
     TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY,
+    TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY,
+    TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY,
     TarScanner,
+    _tar_shared_scan_budget_exhausted,
+    _tar_shared_scan_budget_scope,
+    _TarSourcePrefixFile,
 )
 
 try:
@@ -47,6 +55,17 @@ except ImportError:
     yaml = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+_PREFLIGHT_PREFIX_ANALYSIS_REASONS = frozenset(
+    {
+        "tar_metadata_read_limit_exceeded",
+        "tar_scan_incomplete",
+        "tar_total_size_limit_exceeded",
+        TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON,
+        TAR_DECOMPRESSION_RATIO_LIMIT_INCOMPLETE_REASON,
+        TAR_ENTRY_COUNT_INCOMPLETE_REASON,
+    }
+)
 
 # Safe _target_ prefixes that are expected in legitimate NeMo configs
 _SAFE_TARGET_PREFIXES = (
@@ -1344,10 +1363,67 @@ class NemoScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext in cls.supported_extensions:
             # Preserve legacy coverage for `.nemo` archives whose config is malformed or missing.
-            return tarfile.is_tarfile(path)
+            return TarScanner.can_handle(path)
         return is_nemo_archive(path)
 
+    @staticmethod
+    def _archive_identity(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+
+    @classmethod
+    def _archive_source_changed(
+        cls,
+        path: str,
+        archive_file: BinaryIO,
+        expected_identity: tuple[int, int, int, int, int],
+    ) -> bool:
+        """Return whether the open archive or its pathname changed during analysis."""
+        try:
+            descriptor_identity = cls._archive_identity(os.fstat(archive_file.fileno()))
+            path_identity = cls._archive_identity(os.stat(path))
+        except OSError:
+            return True
+        return descriptor_identity != expected_identity or path_identity != expected_identity
+
+    @staticmethod
+    def _record_archive_identity_change(result: ScanResult, path: str) -> None:
+        mark_archive_scan_incomplete(result, "nemo_archive_identity_changed")
+        result.add_check(
+            name="NeMo Archive Identity",
+            passed=False,
+            message="NeMo archive changed while it was being scanned",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "nemo_archive_identity_changed",
+            },
+        )
+
+    @staticmethod
+    def _downgrade_identity_attributable_integrity_failure(result: ScanResult) -> None:
+        for check in result.checks:
+            if check.name == "NeMo Archive Integrity":
+                check.severity = IssueSeverity.INFO
+        for issue in result.issues:
+            if issue.details.get("scan_outcome_reason") == "nemo_archive_integrity_incomplete":
+                issue.severity = IssueSeverity.INFO
+
     def scan(self, path: str) -> ScanResult:
+        budget_scanner = TarScanner(config=dict(self.config))
+        with _tar_shared_scan_budget_scope(
+            self.config,
+            max_total_uncompressed_size=budget_scanner._get_max_total_uncompressed_size(),
+        ):
+            return self._scan_with_shared_tar_budget(path)
+
+    def _scan_with_shared_tar_budget(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
@@ -1369,10 +1445,70 @@ class NemoScanner(BaseScanner):
             return result
 
         preflight_result = ScanResult(scanner_name="tar")
-        if not tar_scanner._preflight_tar_archive(path, preflight_result):
-            mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
-            preflight_result.finish(success=False)
-            result.merge(preflight_result)
+        shared_budget = tar_scanner._get_or_create_shared_budget()
+        initial_member_bytes = shared_budget.member_bytes_consumed
+        initial_budget_exhausted = shared_budget.exhausted
+        archive_file: BinaryIO = open(path, "rb")  # noqa: SIM115 - descriptor spans preflight and analysis.
+        if tar_scanner.source_size_limit is not None:
+            archive_file = cast(
+                BinaryIO,
+                _TarSourcePrefixFile(
+                    archive_file,
+                    tar_scanner._effective_source_size(path, archive_file),
+                ),
+            )
+        try:
+            initial_archive_identity = self._archive_identity(os.fstat(archive_file.fileno()))
+            preflight_succeeded = tar_scanner._preflight_tar_archive(
+                path,
+                preflight_result,
+                retain_member_budget=is_declared_nemo,
+                raw_file=archive_file,
+            )
+        except BaseException:
+            archive_file.close()
+            raise
+        if not preflight_succeeded:
+            archive_source_changed = self._archive_source_changed(path, archive_file, initial_archive_identity)
+            try:
+                preflight_reasons = set(preflight_result.metadata.get("scan_outcome_reasons", []))
+                mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
+                preflight_result.finish(success=False)
+                result.merge(preflight_result)
+                if preflight_reasons and preflight_reasons <= _PREFLIGHT_PREFIX_ANALYSIS_REASONS:
+                    shared_budget.member_bytes_consumed = initial_member_bytes
+                    shared_budget.exhausted = initial_budget_exhausted
+                    prefix_result = tar_scanner._scan_tar_file(
+                        path,
+                        depth=archive_depth,
+                        raw_file=archive_file,
+                    )
+                    prefix_result.checks = [
+                        check
+                        for check in prefix_result.checks
+                        if check.details.get("scan_outcome_reason") not in preflight_reasons
+                    ]
+                    prefix_result.issues = [
+                        issue
+                        for issue in prefix_result.issues
+                        if issue.details.get("scan_outcome_reason") not in preflight_reasons
+                    ]
+                    result.merge(prefix_result)
+            finally:
+                archive_source_changed = archive_source_changed or self._archive_source_changed(
+                    path,
+                    archive_file,
+                    initial_archive_identity,
+                )
+                archive_file.close()
+            if archive_source_changed:
+                for check in result.checks:
+                    if check.details.get("scan_outcome_reason") in preflight_reasons:
+                        check.severity = IssueSeverity.INFO
+                for issue in result.issues:
+                    if issue.details.get("scan_outcome_reason") in preflight_reasons:
+                        issue.severity = IssueSeverity.INFO
+                self._record_archive_identity_change(result, path)
             result.bytes_scanned = file_size
             self._finish_scan_result(result)
             return result
@@ -1382,39 +1518,62 @@ class NemoScanner(BaseScanner):
             result.merge(preflight_result)
 
         nemo_owned_entries: set[str] = set()
-        if not HAS_YAML:
-            result.add_check(
-                name="YAML Parser Availability",
-                passed=False,
-                message="PyYAML not available; cannot analyze NeMo config for Hydra _target_ injection",
-                severity=IssueSeverity.WARNING,
-                location=path,
-            )
-        else:
-            try:
-                self._scan_nemo_archive(
-                    path,
-                    result,
-                    nemo_owned_entries,
-                    inspect_embedded_members=is_declared_nemo,
-                )
-            except tarfile.TarError as e:
+        archive_source_changed = self._archive_source_changed(path, archive_file, initial_archive_identity)
+        try:
+            if not HAS_YAML:
                 result.add_check(
-                    name="NeMo Archive Integrity",
+                    name="YAML Parser Availability",
                     passed=False,
-                    message=f"Failed to open NeMo archive: {e}",
+                    message="PyYAML not available; cannot analyze NeMo config for Hydra _target_ injection",
                     severity=IssueSeverity.WARNING,
                     location=path,
                 )
-                result.success = False
-
-        if not is_declared_nemo:
-            tar_config = dict(self.config)
-            tar_config[TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY] = nemo_owned_entries
-            # The enclosing NeMo result controls whether this artifact is
-            # complete enough to cache; nested TAR dispatch must not persist partial results.
-            tar_config["cache_enabled"] = False
-            result.merge(TarScanner(config=tar_config).scan(path))
+            else:
+                try:
+                    self._scan_nemo_archive(
+                        path,
+                        result,
+                        nemo_owned_entries,
+                        archive_file=archive_file,
+                        inspect_embedded_members=is_declared_nemo,
+                    )
+                except tarfile.TarError as e:
+                    result.add_check(
+                        name="NeMo Archive Integrity",
+                        passed=False,
+                        message=f"Failed to open NeMo archive: {e}",
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "nemo_archive_integrity_incomplete",
+                        },
+                    )
+                    result.success = False
+            if not is_declared_nemo:
+                tar_config = dict(self.config)
+                tar_config[TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY] = nemo_owned_entries
+                tar_config[TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY] = True
+                # The enclosing NeMo result controls whether this artifact is
+                # complete enough to cache; nested TAR dispatch must not persist partial results.
+                tar_config["cache_enabled"] = False
+                result.merge(
+                    TarScanner(config=tar_config)._scan_tar_file(
+                        path,
+                        depth=archive_depth,
+                        raw_file=archive_file,
+                    )
+                )
+        finally:
+            archive_source_changed = archive_source_changed or self._archive_source_changed(
+                path,
+                archive_file,
+                initial_archive_identity,
+            )
+            archive_file.close()
+        if archive_source_changed:
+            self._downgrade_identity_attributable_integrity_failure(result)
+            self._record_archive_identity_change(result, path)
 
         result.bytes_scanned = file_size
         self._finish_scan_result(result)
@@ -1468,6 +1627,7 @@ class NemoScanner(BaseScanner):
         result: ScanResult,
         nemo_owned_entries: set[str],
         *,
+        archive_file: BinaryIO,
         inspect_embedded_members: bool,
     ) -> None:
         """Extract and scan YAML configs from a NeMo tar archive."""
@@ -1481,7 +1641,8 @@ class NemoScanner(BaseScanner):
         link_resolution_budget_reported = False
         linked_loaded_path_reported = False
 
-        with tarfile.open(path, "r:*") as tar:
+        archive_file.seek(0)
+        with tarfile.open(fileobj=archive_file, mode="r:*") as tar:
             archive_members = tar.getmembers()
             members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
             linked_loaded_paths: set[str] = set()
@@ -1686,7 +1847,7 @@ class NemoScanner(BaseScanner):
                 if not self._tar_member_materializes_file_content(member):
                     continue
 
-                if inspect_embedded_members:
+                if inspect_embedded_members and not _tar_shared_scan_budget_exhausted(self.config):
                     self._scan_embedded_member_for_known_risks(tar, member, path, result)
 
                 # Check for suspicious files in the archive
@@ -1869,6 +2030,121 @@ class NemoScanner(BaseScanner):
         with member_file:
             return member_file.read(2) == b"MZ"
 
+    def _parse_yaml_config_bytes(
+        self,
+        raw: bytes,
+        *,
+        config_file: str,
+        archive_path: str,
+        result: ScanResult,
+        declared_size: int | None = None,
+    ) -> dict[Any, Any] | list[Any] | None:
+        """Parse bounded NeMo YAML bytes with consistent incomplete outcomes."""
+        config_size = declared_size if declared_size is not None else len(raw)
+        if config_size > self.MAX_CONFIG_SIZE or len(raw) > self.MAX_CONFIG_SIZE:
+            reported_size = max(config_size, len(raw))
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_config_size_limit",
+                check_name="NeMo Config Size Check",
+                message=f"Config file too large: {config_file} ({reported_size} bytes)",
+                location=f"{archive_path}:{config_file}",
+                severity=IssueSeverity.WARNING,
+                details={
+                    "config_file": config_file,
+                    "size_bytes": reported_size,
+                    "max_config_size": self.MAX_CONFIG_SIZE,
+                },
+            )
+            return None
+
+        if not HAS_YAML:
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_yaml_parser_unavailable",
+                check_name="YAML Parser Availability",
+                message="PyYAML not available; cannot analyze NeMo config for Hydra _target_ injection",
+                location=f"{archive_path}:{config_file}",
+                severity=IssueSeverity.WARNING,
+                details={"config_file": config_file},
+            )
+            return None
+
+        try:
+            parsed_config = yaml.safe_load(raw)
+        except yaml.YAMLError:
+            logger.debug("Failed to parse NeMo YAML config %s in %s", config_file, archive_path)
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_config_yaml_parse_failed",
+                check_name="NeMo Config YAML Parsing",
+                message=f"Failed to parse YAML config {config_file}",
+                location=f"{archive_path}:{config_file}",
+                details={"config_file": config_file},
+            )
+            return None
+        except RecursionError:
+            logger.debug("NeMo YAML config %s in %s exceeded parser recursion limits", config_file, archive_path)
+            self._mark_config_traversal_inconclusive(
+                result,
+                config_file=config_file,
+                archive_path=archive_path,
+                reason="nemo_config_yaml_complexity_limit",
+                message="YAML config exceeded parser complexity limits",
+            )
+            return None
+
+        if not isinstance(parsed_config, dict | list):
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_config_invalid_structure",
+                check_name="NeMo Config Structure",
+                message=(f"YAML config {config_file} has unsupported top-level type: {type(parsed_config).__name__}"),
+                location=f"{archive_path}:{config_file}",
+                details={
+                    "config_file": config_file,
+                    "expected_type": "dict_or_list",
+                    "actual_type": type(parsed_config).__name__,
+                },
+            )
+            return None
+
+        return parsed_config
+
+    def scan_reachable_root_config_bytes(
+        self,
+        raw: bytes,
+        *,
+        config_file: str,
+        archive_path: str,
+        result: ScanResult,
+        declared_size: int | None = None,
+    ) -> bool:
+        """Analyze root NeMo config bytes reached by a generic TAR scan."""
+        config = self._parse_yaml_config_bytes(
+            raw,
+            config_file=config_file,
+            archive_path=archive_path,
+            result=result,
+            declared_size=declared_size,
+        )
+        if config is None:
+            return False
+
+        try:
+            self._check_hydra_targets(config, config_file, archive_path, result)
+        except _NemoConfigTraversalLimit as exc:
+            self._mark_config_traversal_inconclusive(
+                result,
+                config_file=config_file,
+                archive_path=archive_path,
+                reason=exc.reason,
+                message=str(exc),
+            )
+            return False
+
+        return True
+
     def _scan_yaml_config_member(
         self,
         tar: tarfile.TarFile,
@@ -1883,18 +2159,12 @@ class NemoScanner(BaseScanner):
     ) -> bool:
         """Analyze one YAML config entry, including a safe root-config link target."""
         if member.size > self.MAX_CONFIG_SIZE:
-            self._mark_inconclusive_scan_result(
-                result,
-                reason="nemo_config_size_limit",
-                check_name="NeMo Config Size Check",
-                message=f"Config file too large: {config_file} ({member.size} bytes)",
-                location=f"{archive_path}:{config_file}",
-                severity=IssueSeverity.WARNING,
-                details={
-                    "config_file": config_file,
-                    "size_bytes": member.size,
-                    "max_config_size": self.MAX_CONFIG_SIZE,
-                },
+            self._parse_yaml_config_bytes(
+                b"",
+                config_file=config_file,
+                archive_path=archive_path,
+                result=result,
+                declared_size=member.size,
             )
             return False
 
@@ -1902,59 +2172,16 @@ class NemoScanner(BaseScanner):
         if member_file is None:
             return False
         with member_file:
-            try:
-                raw = member_file.read(self.MAX_CONFIG_SIZE + 1)
-                if len(raw) > self.MAX_CONFIG_SIZE:
-                    self._mark_inconclusive_scan_result(
-                        result,
-                        reason="nemo_config_size_limit",
-                        check_name="NeMo Config Size Check",
-                        message=f"Config file too large: {config_file} ({len(raw)} bytes)",
-                        location=f"{archive_path}:{config_file}",
-                        severity=IssueSeverity.WARNING,
-                        details={
-                            "config_file": config_file,
-                            "size_bytes": len(raw),
-                            "max_config_size": self.MAX_CONFIG_SIZE,
-                        },
-                    )
-                    return False
-                config = yaml.safe_load(raw)
-            except yaml.YAMLError:
-                logger.debug("Failed to parse YAML config %s in %s", config_file, archive_path)
-                self._mark_inconclusive_scan_result(
-                    result,
-                    reason="nemo_config_yaml_parse_failed",
-                    check_name="NeMo Config YAML Parsing",
-                    message=f"Failed to parse YAML config {config_file}",
-                    location=f"{archive_path}:{config_file}",
-                    details={"config_file": config_file},
-                )
-                return False
-            except RecursionError:
-                logger.debug("YAML config %s in %s exceeded parser recursion limits", config_file, archive_path)
-                self._mark_config_traversal_inconclusive(
-                    result,
-                    config_file=config_file,
-                    archive_path=archive_path,
-                    reason="nemo_config_yaml_complexity_limit",
-                    message="YAML config exceeded parser complexity limits",
-                )
-                return False
+            raw = member_file.read(self.MAX_CONFIG_SIZE + 1)
 
-        if not isinstance(config, dict | list):
-            self._mark_inconclusive_scan_result(
-                result,
-                reason="nemo_config_invalid_structure",
-                check_name="NeMo Config Structure",
-                message=f"YAML config {config_file} has unsupported top-level type: {type(config).__name__}",
-                location=f"{archive_path}:{config_file}",
-                details={
-                    "config_file": config_file,
-                    "expected_type": "dict_or_list",
-                    "actual_type": type(config).__name__,
-                },
-            )
+        config = self._parse_yaml_config_bytes(
+            raw,
+            config_file=config_file,
+            archive_path=archive_path,
+            result=result,
+            declared_size=member.size,
+        )
+        if config is None:
             return False
 
         try:
@@ -1970,9 +2197,13 @@ class NemoScanner(BaseScanner):
             )
             return False
 
+        nemo_owned_entries.update(referenced_member_name for _, referenced_member_name in referenced_members)
         for config_path, referenced_member_name in referenced_members:
-            nemo_owned_entries.add(referenced_member_name)
             referenced_member_contexts.setdefault(referenced_member_name, (config_file, config_path))
+
+        for config_path, referenced_member_name in referenced_members:
+            if _tar_shared_scan_budget_exhausted(self.config):
+                break
             if referenced_member_name in scanned_member_entries:
                 continue
             referenced_member_scanned = self._scan_config_referenced_member(
@@ -2842,6 +3073,9 @@ class NemoScanner(BaseScanner):
         entry_name: str | None = None,
     ) -> None:
         """Run existing nested scanners over small NeMo checkpoint members."""
+        if _tar_shared_scan_budget_exhausted(self.config):
+            return
+
         report_entry = entry_name or member.name
         max_scan_bytes = self._normalize_positive_int_config(
             self.config.get("max_nemo_checkpoint_scan_bytes"),
@@ -2876,7 +3110,9 @@ class NemoScanner(BaseScanner):
             return
 
         try:
-            scanner = _get_nested_scanner_for_file(extracted_path, config=dict(self.config))
+            nested_config = dict(self.config)
+            nested_config.pop(TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY, None)
+            scanner = _get_nested_scanner_for_file(extracted_path, config=nested_config)
             if scanner is None:
                 self._mark_inconclusive_scan_result(
                     result,
@@ -2939,6 +3175,9 @@ class NemoScanner(BaseScanner):
         scanned_regular_checkpoint_sources: set[tuple[str, int]],
     ) -> bool:
         """Scan `nemo:`-referenced archive members through content-based nested dispatch."""
+        if _tar_shared_scan_budget_exhausted(self.config):
+            return False
+
         try:
             member = tar.getmember(referenced_member_name)
         except KeyError:
@@ -3006,7 +3245,9 @@ class NemoScanner(BaseScanner):
             from .archive_dispatch import scan_nested_file
 
             try:
-                nested_result = scan_nested_file(extracted_path, config=dict(self.config))
+                nested_config = dict(self.config)
+                nested_config.pop(TAR_SOURCE_SIZE_LIMIT_CONFIG_KEY, None)
+                nested_result = scan_nested_file(extracted_path, config=nested_config)
             except Exception as exc:
                 self._mark_inconclusive_scan_result(
                     result,

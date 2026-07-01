@@ -16,7 +16,15 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
-from modelaudit.scanners.compressed_scanner import CompressedScanner, _MissingOptionalDependencyError
+from modelaudit.scanners.compressed_scanner import (
+    ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY,
+    COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY,
+    COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY,
+    CompressedScanner,
+    _BoundedCompressedSource,
+    _CompressedPaddingLimitExceeded,
+    _MissingOptionalDependencyError,
+)
 
 TarWriteMode = Literal["w:gz", "w:bz2", "w:xz"]
 
@@ -235,7 +243,7 @@ def test_compound_tar_wrappers_route_to_tar_scanner(
     assert scanner.name == "tar"
 
 
-def test_truncated_compound_tar_wrapper_routes_to_compressed_scanner(tmp_path: Path) -> None:
+def test_truncated_compound_tar_wrapper_routes_to_compressed_scanner_incomplete(tmp_path: Path) -> None:
     archive_path = tmp_path / "truncated.tar.gz"
     archive_path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
 
@@ -243,6 +251,26 @@ def test_truncated_compound_tar_wrapper_routes_to_compressed_scanner(tmp_path: P
 
     assert scanner is not None
     assert scanner.name == "compressed"
+    result = scanner.scan(str(archive_path))
+    assert result.success is False
+    assert "compressed_stream_decode_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Compressed Wrapper Stream Decode" for check in result.checks)
+
+
+def test_gzip_wrapped_pickle_named_tar_gz_routes_to_compressed_scanner(tmp_path: Path) -> None:
+    archive_path = tmp_path / "malicious.tar.gz"
+    archive_path.write_bytes(gzip.compress(pickle.dumps({"payload": _MaliciousPayload()})))
+
+    scanner = get_scanner_for_file(str(archive_path))
+
+    assert scanner is not None
+    assert scanner.name == "compressed"
+    result = scanner.scan(str(archive_path))
+    routing_checks = [check for check in result.checks if check.name == "Compressed Wrapper Inner Scanner Routing"]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert routing_checks and routing_checks[0].details["inner_scanner"] == "pickle"
+    assert critical_issues
+    assert any("eval" in issue.message.lower() for issue in critical_issues)
 
 
 @pytest.mark.parametrize(
@@ -783,6 +811,61 @@ def test_read_lz4_stream_falls_back_to_chunk_api_when_decompressor_class_missing
     assert total_out == 8
     assert destination.getvalue() == b"12345678"
     assert [length for context in fake_lz4_frame.contexts for length in context.max_lengths] == [8]
+
+
+@pytest.mark.parametrize("use_chunk_api", [False, True], ids=["frame-api", "chunk-api"])
+def test_read_lz4_stream_accepts_bounded_zero_padding(use_chunk_api: bool) -> None:
+    fake_lz4_frame = (
+        _FakeLz4ChunkModule({b"S": b"payload"}) if use_chunk_api else _FakeLz4FrameModule({b"S": b"payload"})
+    )
+    destination = io.BytesIO()
+
+    total_out = CompressedScanner._read_lz4_stream_with_limits(
+        source=io.BytesIO(_LZ4_FRAME_MAGIC + b"S" + bytes(128)),
+        destination=destination,
+        lz4_frame=fake_lz4_frame,
+        max_decompressed_bytes=1024,
+        max_ratio=1000.0,
+        compressed_size=16,
+        chunk_size=16,
+        allow_zero_padding_trailing=True,
+    )
+
+    assert total_out == len(b"payload")
+    assert destination.getvalue() == b"payload"
+
+
+def test_zero_padding_acceptance_stops_at_configured_limit() -> None:
+    backing = io.BytesIO(bytes(1024 * 1024))
+    source = _BoundedCompressedSource(backing, 1024 * 1024, max_zero_padding_bytes=64)
+
+    with pytest.raises(_CompressedPaddingLimitExceeded, match="zero padding exceeded limit"):
+        CompressedScanner._accept_zero_padding(b"\x00", source, chunk_size=1024)
+
+    assert backing.tell() == 64
+
+
+def test_compressed_scanner_fails_closed_when_zero_padding_exceeds_limit(tmp_path: Path) -> None:
+    wrapper = tmp_path / "padded.gz"
+    wrapper.write_bytes(gzip.compress(pickle.dumps({"weights": [1]}), mtime=0) + bytes(4096))
+    result = CompressedScanner(
+        config={
+            "cache_enabled": False,
+            "compressed_max_zero_padding_bytes": 64,
+            ALLOW_ZERO_PADDING_TRAILING_CONFIG_KEY: True,
+            COMPRESSED_SOURCE_SIZE_LIMIT_CONFIG_KEY: wrapper.stat().st_size,
+            COMPRESSED_PREFIX_OWNERSHIP_CONFIG_KEY: True,
+        }
+    ).scan(str(wrapper))
+
+    assert result.success is False
+    assert "compressed_padding_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Compressed Wrapper Padding Limit"
+        and check.status == CheckStatus.FAILED
+        and check.details["max_zero_padding_bytes"] == 64
+        for check in result.checks
+    )
 
 
 def test_read_zlib_stream_allows_exact_limit_real_stream() -> None:

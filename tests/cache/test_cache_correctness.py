@@ -3282,6 +3282,23 @@ def test_cached_scan_normalizes_and_skips_persisting_bare_unsuccessful_scan_resu
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
+def test_cached_scan_normalizes_bare_unsuccessful_result_on_direct_bypass(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.bin")
+    config = {"cache_enabled": True, "cache_dir": str(tmp_path / "cache")}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        result = ScanResult(scanner_name="numpy")
+        result.finish(success=False)
+        return result
+
+    result = scan(str(file_path), config)
+
+    assert isinstance(result, ScanResult)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["scanner_reported_unsuccessful_without_outcome"]
+
+
 def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

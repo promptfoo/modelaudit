@@ -5,6 +5,57 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.7...modelaudit-picklescan-v0.1.8) (2026-06-25)
+
+### Bug Fixes
+
+- **picklescan:** restore Windows call-graph detection via cross-view stat identity ([#1715](https://github.com/promptfoo/modelaudit/issues/1715)) ([51c0074](https://github.com/promptfoo/modelaudit/commit/51c00742ad1c090e5a3f61c1f0c6662e66d06a40))
+
+## [Unreleased]
+
+### Bug Fixes
+
+- restore Windows call-graph detection by reconciling descriptor and path stats with a cross-view identity that omits `st_ctime` (Windows reports it differently across stat methods); previously every stdlib callable source read failed closed on Windows, collapsing call-graph verdicts to inconclusive
+
+## [0.1.7](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.6...modelaudit-picklescan-v0.1.7) (2026-06-24)
+
+### Bug Fixes
+
+- bound picklescan pytorch zip members ([#1569](https://github.com/promptfoo/modelaudit/issues/1569)) ([322c01b](https://github.com/promptfoo/modelaudit/commit/322c01b5be89e22043cee4f414eeebb502a59df6))
+- bound protocol0 line operands ([#1534](https://github.com/promptfoo/modelaudit/issues/1534)) ([95e27df](https://github.com/promptfoo/modelaudit/commit/95e27dff409b0229bd3f3984a87759640a012454))
+- contextualize SafeTensors license metadata ([#1661](https://github.com/promptfoo/modelaudit/issues/1661)) ([0904a91](https://github.com/promptfoo/modelaudit/commit/0904a91c414eac1bcc6cffdef528c56d160cc5fa))
+- **deps:** update rust crate pyo3 to 0.29.0 [security] ([#1677](https://github.com/promptfoo/modelaudit/issues/1677)) ([a2fe49c](https://github.com/promptfoo/modelaudit/commit/a2fe49cd7fe9ef3c8d2946d1bac90344631441b2))
+- fail closed on nested protocol0 operand limits ([#1536](https://github.com/promptfoo/modelaudit/issues/1536)) ([c018c26](https://github.com/promptfoo/modelaudit/commit/c018c2652b55dec69aaa391882862f4c455bd8bd))
+- harden picklescan spec resolution ([#1568](https://github.com/promptfoo/modelaudit/issues/1568)) ([b5b1355](https://github.com/promptfoo/modelaudit/commit/b5b1355528383bde54f20448ff49c14d64acd97d))
+- invalidate pickle cache on source changes ([#1447](https://github.com/promptfoo/modelaudit/issues/1447)) ([beac45c](https://github.com/promptfoo/modelaudit/commit/beac45c4b7d5c5920f36192072eacab45c126f18))
+- isolate legacy pytorch storage controls ([#1699](https://github.com/promptfoo/modelaudit/issues/1699)) ([1a9b556](https://github.com/promptfoo/modelaudit/commit/1a9b556ad33bfb7ef89dfa2514f209e38f9f8674))
+- **pickle:** require source proof for framework metadata ([bb38b74](https://github.com/promptfoo/modelaudit/commit/bb38b74f0e94375a0bdce2ade8bc4b51537e857c))
+- **picklescan:** bound hidden ZIP probe bytes ([#1624](https://github.com/promptfoo/modelaudit/issues/1624)) ([e8dc55e](https://github.com/promptfoo/modelaudit/commit/e8dc55e25df5c8aad789339d2f228ea35bc84432))
+- **picklescan:** close encoded protocol0 probe gaps ([#1594](https://github.com/promptfoo/modelaudit/issues/1594)) ([dfaedd1](https://github.com/promptfoo/modelaudit/commit/dfaedd1f0a1d8d2a47f1a6bacd5dd2945a7407ed))
+- **picklescan:** fail closed at nested depth limits ([#1583](https://github.com/promptfoo/modelaudit/issues/1583)) ([5eb7390](https://github.com/promptfoo/modelaudit/commit/5eb7390d2a59af2060a613398679df972fe883b0))
+- **picklescan:** fail closed on unverifiable stream boundaries ([#1521](https://github.com/promptfoo/modelaudit/issues/1521)) ([9cd9e67](https://github.com/promptfoo/modelaudit/commit/9cd9e67ebb0f09d962ded57168d0a9b6ca4513a1))
+- **picklescan:** harden encoded byte probes ([#1604](https://github.com/promptfoo/modelaudit/issues/1604)) ([f8192be](https://github.com/promptfoo/modelaudit/commit/f8192be4a633978fbb22bb6869979adf5be29dbf))
+- **picklescan:** ignore short base64 collisions ([#1617](https://github.com/promptfoo/modelaudit/issues/1617)) ([1d1a93d](https://github.com/promptfoo/modelaudit/commit/1d1a93da9ab66de4bd60a9a4bee2cf2abdae16c7))
+- **picklescan:** mirror cached path importer semantics ([#1683](https://github.com/promptfoo/modelaudit/issues/1683)) ([b948f8c](https://github.com/promptfoo/modelaudit/commit/b948f8c519d3fd3348589131c03574b79407a2d3))
+- **picklescan:** preserve nested INST limit findings ([#1585](https://github.com/promptfoo/modelaudit/issues/1585)) ([68d1d19](https://github.com/promptfoo/modelaudit/commit/68d1d1925c51be18a83e7bb7e8577e0f5df31c1c))
+- **picklescan:** reject padded short payload bypasses ([#1626](https://github.com/promptfoo/modelaudit/issues/1626)) ([4edcac0](https://github.com/promptfoo/modelaudit/commit/4edcac010b51d04ebd734df63f5005204569eb7c))
+- **picklescan:** resolve loaded extension exports directly ([#1620](https://github.com/promptfoo/modelaudit/issues/1620)) ([ab6e58e](https://github.com/promptfoo/modelaudit/commit/ab6e58ebe587197b2b46866c69f7d41d75e08a55))
+- **picklescan:** safely filter inert URL metadata ([#1658](https://github.com/promptfoo/modelaudit/issues/1658)) ([8a55653](https://github.com/promptfoo/modelaudit/commit/8a5565379e7bd1248c0680c47d1e70e294f27b6b))
+- **picklescan:** scan encoded byte literals ([#1602](https://github.com/promptfoo/modelaudit/issues/1602)) ([21956ab](https://github.com/promptfoo/modelaudit/commit/21956abfe97ec8312bb4f6312b5da99ec0fa640e))
+- **picklescan:** validate canonical PyTorch ZIP tensor rebuilds ([#1680](https://github.com/promptfoo/modelaudit/issues/1680)) ([2f188ad](https://github.com/promptfoo/modelaudit/commit/2f188ad3b47ee6c378e68adaade2bb114ea47557))
+- **pytorch:** aggregate exact pickle opcodes ([#1611](https://github.com/promptfoo/modelaudit/issues/1611)) ([3728964](https://github.com/promptfoo/modelaudit/commit/37289644f219a57e4c043dcc083c3eea434aaca3))
+- **pytorch:** trust referenced storage members ([#1654](https://github.com/promptfoo/modelaudit/issues/1654)) ([3a4f64b](https://github.com/promptfoo/modelaudit/commit/3a4f64bf6c05c32bc77b662cf0b6d23e0575bac7))
+- reject undersized nested pickle budgets ([#1532](https://github.com/promptfoo/modelaudit/issues/1532)) ([0ce9bf3](https://github.com/promptfoo/modelaudit/commit/0ce9bf37a4a26e50c9c7d1a10d2023ee12cb7755))
+- restore main CI coverage ([#1606](https://github.com/promptfoo/modelaudit/issues/1606)) ([c81db69](https://github.com/promptfoo/modelaudit/commit/c81db697363f5b50187a1b555b8adcf2f2a38c0d))
+- **routing:** prefer validated safetensors framing ([#1612](https://github.com/promptfoo/modelaudit/issues/1612)) ([2f782ba](https://github.com/promptfoo/modelaudit/commit/2f782ba1f18ab5aac4716c8c7ac6f0a16f0c6f60))
+- strictly pin picklescan maturin backend ([#1531](https://github.com/promptfoo/modelaudit/issues/1531)) ([ac07522](https://github.com/promptfoo/modelaudit/commit/ac07522e39398d94e334fbc3d688a6ec5b10dff2))
+- **text:** validate basic auth credential context ([#1669](https://github.com/promptfoo/modelaudit/issues/1669)) ([a675581](https://github.com/promptfoo/modelaudit/commit/a675581e3a448a0ddade29d3b051c1d5fbb6b56e))
+- validate pickle getattr reconstruction ([c6c4713](https://github.com/promptfoo/modelaudit/commit/c6c4713f3240012888ad5d8915bf5726e4e86c6d))
+
+### Documentation
+
+- add agent trace lessons ([#1627](https://github.com/promptfoo/modelaudit/issues/1627)) ([cadc17d](https://github.com/promptfoo/modelaudit/commit/cadc17d2e85a150fcb8a6571b17448c7b77ce2fc))
+
 ## [Unreleased]
 
 ### Bug Fixes

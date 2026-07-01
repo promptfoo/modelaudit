@@ -1,8 +1,13 @@
 """Tests for CVE-2025-23304: NVIDIA NeMo Hydra _target_ injection."""
 
+import bz2
 import gzip
 import io
+import lzma
+import os
 import pickle
+import random
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -17,15 +22,25 @@ try:
 except ImportError:
     HAS_YAML = False
 
+from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanners import archive_dispatch
 from modelaudit.scanners import nemo_scanner as nemo_scanner_module
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners import tar_scanner as tar_scanner_module
+from modelaudit.scanners.base import (
+    DEFAULT_MAX_FILE_READ_SIZE,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    Check,
+    CheckStatus,
+    IssueSeverity,
+    ScanResult,
+)
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 from modelaudit.utils.file import detection as file_detection
 
 _TMP_PATH_MARKER = "__MODELAUDIT_TMP__/"
-_NemoTarWriteMode = Literal["w", "w:gz"]
+_NemoTarWriteMode = Literal["w", "w:gz", "w:bz2", "w:xz"]
 
 
 def _create_nemo_file_from_bytes(
@@ -62,10 +77,126 @@ def _create_nemo_file(
     return _create_nemo_file_from_bytes(tmp_path, config_bytes, filename=filename, config_name=config_name, mode=mode)
 
 
+def _create_sparse_raw_nemo_with_late_invalid_header(
+    tmp_path: Path,
+    *,
+    filename: str,
+    target: str,
+) -> Path:
+    path = tmp_path / filename
+    config = f"model:\n  _target_: {target}\n".encode()
+    with path.open("wb") as archive:
+        info = tarfile.TarInfo("model_config.yaml")
+        info.size = len(config)
+        archive.write(info.tobuf())
+        archive.write(config)
+        archive.write(b"\0" * (-len(config) % tarfile.BLOCKSIZE))
+        archive.write(b"A" * tarfile.BLOCKSIZE)
+        archive.write(b"\0" * (2 * tarfile.BLOCKSIZE))
+        archive.seek(DEFAULT_MAX_FILE_READ_SIZE)
+        archive.write(b"\0")
+    return path
+
+
+def _create_renamed_compressed_nemo_after_route_budget(
+    tmp_path: Path,
+    *,
+    filename: str,
+    target: str,
+    mode: Literal["w:gz", "w:bz2", "w:xz"],
+) -> Path:
+    path = tmp_path / filename
+    early_payload = random.Random(0).randbytes(file_detection._NEMO_ROUTE_MAX_BODY_SKIP_BYTES + 1)
+    with tarfile.open(path, mode) as archive:
+        _add_tar_bytes(archive, "large-weights.bin", early_payload)
+        _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
+    return path
+
+
 def _add_tar_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
     info = tarfile.TarInfo(name=name)
     info.size = len(payload)
     tar.addfile(info, io.BytesIO(payload))
+
+
+def _create_gzip_nemo_with_pax_tail(
+    tmp_path: Path,
+    *,
+    filename: str,
+    target: str,
+    path_length: int,
+) -> Path:
+    path = tmp_path / filename
+    with tarfile.open(path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+        _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
+        _add_tar_bytes(archive, f"assets/{'a' * path_length}.bin", b"safe")
+    return path
+
+
+def _create_nemo_with_nested_tar_checkpoints(
+    tmp_path: Path,
+    *,
+    filename: str,
+    checkpoint_count: int,
+    payload_size: int,
+) -> Path:
+    nemo_path = tmp_path / filename
+    with tarfile.open(nemo_path, "w:gz") as archive:
+        _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+        for index in range(checkpoint_count):
+            checkpoint = io.BytesIO()
+            with tarfile.open(fileobj=checkpoint, mode="w:gz") as nested_archive:
+                _add_tar_bytes(nested_archive, f"tensor-{index}.bin", bytes([index]) * payload_size)
+            _add_tar_bytes(archive, f"weights-{index}.ckpt", checkpoint.getvalue())
+    return nemo_path
+
+
+class _NestedWorkCounters:
+    def __init__(self) -> None:
+        self.checkpoint_dispatches = 0
+        self.reference_dispatches = 0
+        self.nested_extractions = 0
+        self.extracted_members: list[str] = []
+        self.decompressed_bytes = 0
+
+
+def _track_nested_work(monkeypatch: pytest.MonkeyPatch) -> _NestedWorkCounters:
+    counters = _NestedWorkCounters()
+    original_checkpoint_dispatch = nemo_scanner_module._get_nested_scanner_for_file
+    original_reference_dispatch = archive_dispatch.scan_nested_file
+    original_extract = NemoScanner._extract_member_to_tempfile
+    original_gzip_read = gzip.GzipFile.read
+
+    def count_checkpoint_dispatch(path: str, *, config: dict[str, Any]) -> Any:
+        counters.checkpoint_dispatches += 1
+        return original_checkpoint_dispatch(path, config=config)
+
+    def count_reference_dispatch(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        counters.reference_dispatches += 1
+        return original_reference_dispatch(path, config=config)
+
+    def count_extract(
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        *,
+        suffix_source: str | None = None,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        counters.extracted_members.append(member.name)
+        if suffix_source is not None:
+            counters.nested_extractions += 1
+        return original_extract(tar, member, suffix_source=suffix_source, max_bytes=max_bytes)
+
+    def count_gzip_read(stream: gzip.GzipFile, size: int = -1) -> bytes:
+        data = original_gzip_read(stream, size)
+        counters.decompressed_bytes += len(data)
+        return data
+
+    monkeypatch.setattr(nemo_scanner_module, "_get_nested_scanner_for_file", count_checkpoint_dispatch)
+    monkeypatch.setattr(archive_dispatch, "scan_nested_file", count_reference_dispatch)
+    monkeypatch.setattr(NemoScanner, "_extract_member_to_tempfile", staticmethod(count_extract))
+    monkeypatch.setattr(gzip.GzipFile, "read", count_gzip_read)
+    return counters
 
 
 def _build_nemo_tar_bytes(config_bytes: bytes, *, mode: _NemoTarWriteMode = "w:gz") -> bytes:
@@ -183,6 +314,227 @@ class TestNemoScannerBasic:
             for issue in aggregate_result.issues
         )
         assert determine_exit_code(aggregate_result) == 1
+
+    def test_gzip_nemo_tail_validation_runs_once_with_scanner_limits(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "torch.nn.Linear"}},
+            mode="w:gz",
+        )
+        calls = 0
+        original_status = core_module.gzip_tar_trailing_data_status
+
+        def tracked_status(*args: Any, **kwargs: Any) -> str | None:
+            nonlocal calls
+            calls += 1
+            return original_status(*args, **kwargs)
+
+        monkeypatch.setattr(core_module, "gzip_tar_trailing_data_status", tracked_status)
+
+        result = scan_file(
+            str(path),
+            config={
+                "cache_scan_results": False,
+                "compressed_max_decompressed_bytes": 4 * 1024 * 1024 * 1024,
+            },
+        )
+
+        assert result.scanner_name == "nemo"
+        assert calls == 1
+
+    def test_gzip_nemo_tail_validation_uses_configured_entry_limit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 2)
+        path = tmp_path / "configured-entry-limit.nemo"
+        with tarfile.open(path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+            _add_tar_bytes(archive, "weights-1.bin", b"safe")
+            _add_tar_bytes(archive, "weights-2.bin", b"safe")
+
+        configured = scan_file(
+            str(path),
+            config={"cache_enabled": False, "max_tar_entries": 4},
+        )
+        scanner_limited = scan_file(
+            str(path),
+            config={"cache_enabled": False, "max_tar_entries": 2},
+        )
+
+        assert configured.scanner_name == "nemo"
+        assert configured.success is True
+        assert not [check for check in configured.checks if check.name == "Compressed TAR Stream Integrity"]
+        assert scanner_limited.success is False
+        assert any(
+            check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+            for check in scanner_limited.checks
+        )
+
+    def test_gzip_nemo_tail_validation_uses_chunked_tar_reads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "torch.nn.Linear"}}, mode="w:gz")
+        observed_read_sizes: list[int] = []
+        original_read = file_detection._GzipTarBoundedReader.read
+
+        def tracked_read(reader: Any, size: int = -1) -> bytes:
+            observed_read_sizes.append(size)
+            return original_read(reader, size)
+
+        monkeypatch.setattr(file_detection._GzipTarBoundedReader, "read", tracked_read)
+
+        status = file_detection.gzip_tar_trailing_data_status(str(path))
+
+        assert status is None
+        assert 64 * 1024 in observed_read_sizes
+
+    def test_gzip_nemo_tail_validation_bounds_ratio_read_overshoot(self) -> None:
+        compressed_size = 10
+        max_ratio = 2.0
+        source = io.BytesIO(b"x" * 1024)
+        reader = file_detection._GzipTarBoundedReader(
+            source,
+            max_bytes=1024,
+            max_ratio=max_ratio,
+            compressed_size=compressed_size,
+        )
+
+        with pytest.raises(file_detection._GzipTarProbeLimitExceeded):
+            reader.read(1024)
+
+        assert source.tell() == int(compressed_size * max_ratio) + 1
+
+    def test_gzip_nemo_oversized_pax_tail_metadata_fails_closed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _create_gzip_nemo_with_pax_tail(
+            tmp_path,
+            filename="oversized-pax-tail.nemo",
+            target="torch.nn.Linear",
+            path_length=128 * 1024,
+        )
+
+        direct_result = scan_file(str(path), config={"cache_enabled": False})
+        aggregate_result = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+        )
+
+        integrity_checks = [
+            check
+            for check in direct_result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert direct_result.scanner_name == "nemo"
+        assert direct_result.success is False
+        assert len(integrity_checks) == 1
+        assert integrity_checks[0].rule_code == "S902"
+        assert integrity_checks[0].details["stream_tail_status"] == "invalid"
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 2
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        ("target", "expected_cve"),
+        [
+            ("torch.nn.Linear", False),
+            ("os.system", True),
+        ],
+    )
+    def test_gzip_nemo_pax_tail_metadata_within_limit_preserves_findings(
+        self,
+        tmp_path: Path,
+        target: str,
+        expected_cve: bool,
+    ) -> None:
+        path = _create_gzip_nemo_with_pax_tail(
+            tmp_path,
+            filename=f"within-pax-tail-{expected_cve}.nemo",
+            target=target,
+            path_length=32 * 1024,
+        )
+
+        result = scan_file(str(path), config={"cache_enabled": False})
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert result.scanner_name == "nemo"
+        assert not [check for check in result.checks if check.name == "Compressed TAR Stream Integrity"]
+        assert bool(cve_checks) is expected_cve
+        assert result.success is (not expected_cve)
+
+    @pytest.mark.parametrize(
+        "compression_codec",
+        ["bzip2", "xz"],
+    )
+    def test_content_routed_bzip2_xz_physical_tail_fails_closed_during_preflight(
+        self,
+        tmp_path: Path,
+        compression_codec: Literal["bzip2", "xz"],
+    ) -> None:
+        path = tmp_path / "renamed-model.bin"
+        info = tarfile.TarInfo("model_config.yaml")
+        info.size = 1024 * 1024
+        truncated_tar = info.tobuf() + (b"A" * 100)
+        compressed_tar = bz2.compress(truncated_tar) if compression_codec == "bzip2" else lzma.compress(truncated_tar)
+        path.write_bytes(compressed_tar + b"physical trailing payload")
+
+        result = scan_file(
+            str(path),
+            config={
+                "cache_enabled": False,
+                "compressed_max_decompressed_bytes": 2 * 1024 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            },
+        )
+
+        trailing_checks = [check for check in result.checks if check.name == "Compressed TAR Trailing Data"]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert len(trailing_checks) == 1
+        assert trailing_checks[0].status == CheckStatus.FAILED
+        assert trailing_checks[0].rule_code == "S902"
+        assert "tar_compressed_trailing_data" in result.metadata["scan_outcome_reasons"]
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                compressed_max_decompressed_bytes=2 * 1024 * 1024,
+                compressed_max_decompression_ratio=100_000.0,
+            )
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 1
+            assert any(issue.rule_code == "S902" for issue in aggregate.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_malformed_gzip_nemo_still_reports_s901(self, tmp_path: Path) -> None:
         """A .nemo suffix plus gzip magic is not enough unless it is a valid TAR."""
@@ -340,6 +692,422 @@ class TestNemoScannerBasic:
         assert integrity_checks[0].rule_code == "S902"
         assert "could not be fully validated" in integrity_checks[0].message
 
+    def test_compressed_nemo_preflight_projects_member_before_reading_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_path / "projected-ratio.nemo"
+        payload = b"A" * (1024 * 1024)
+        with tarfile.open(path, "w:gz") as archive:
+            info = tarfile.TarInfo("weights.bin")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        header_only_ratio = tarfile.RECORDSIZE / path.stat().st_size
+
+        max_stream_bytes_read = 0
+        original_read = tar_scanner_module._TarBoundedStream.read
+
+        def track_stream_read(stream: tar_scanner_module._TarBoundedStream, size: int = -1) -> bytes:
+            nonlocal max_stream_bytes_read
+            data = original_read(stream, size)
+            max_stream_bytes_read = max(max_stream_bytes_read, stream.bytes_read)
+            return data
+
+        monkeypatch.setattr(tar_scanner_module._TarBoundedStream, "read", track_stream_read)
+
+        result = NemoScanner(
+            config={
+                "compressed_max_decompressed_bytes": 2 * 1024 * 1024,
+                "compressed_max_decompression_ratio": header_only_ratio * 2,
+            }
+        ).scan(str(path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert result.success is False
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompression ratio exceeded" in limit_checks[0].message.lower()
+        assert max_stream_bytes_read == tarfile.BLOCKSIZE
+
+    def test_compressed_ratio_preflight_preserves_reachable_hydra_finding_without_cache(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "ratio-prefix-malicious.nemo"
+        with tarfile.open(path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
+            _add_tar_bytes(archive, "weights.bin", b"A" * (4 * 1024 * 1024))
+        config = {
+            "compressed_max_decompressed_bytes": 8 * 1024 * 1024,
+            "compressed_max_decompression_ratio": 5.0,
+        }
+
+        direct = NemoScanner(config=config).scan(str(path))
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            compressed_max_decompressed_bytes=8 * 1024 * 1024,
+            compressed_max_decompression_ratio=5.0,
+        )
+
+        ratio_checks = [check for check in direct.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.success is False
+        assert len(ratio_checks) == 1
+        assert ratio_checks[0].status == CheckStatus.FAILED
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+        assert determine_exit_code(aggregate) == 2
+
+        cache_dir = tmp_path / "ratio-prefix-malicious-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                compressed_max_decompressed_bytes=8 * 1024 * 1024,
+                compressed_max_decompression_ratio=5.0,
+            )
+            assert determine_exit_code(cached) == 2
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_compressed_nemo_preflight_handles_truncated_member_body(self, tmp_path: Path) -> None:
+        path = tmp_path / "truncated-member.nemo"
+        info = tarfile.TarInfo("weights.bin")
+        info.size = 1024 * 1024
+        path.write_bytes(gzip.compress(info.tobuf() + (b"A" * 100)))
+
+        result = NemoScanner(
+            config={
+                "compressed_max_decompressed_bytes": 2 * 1024 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            }
+        ).scan(str(path))
+
+        scan_checks = [check for check in result.checks if check.name == "TAR File Scan"]
+        assert result.success is False
+        assert len(scan_checks) == 1
+        assert scan_checks[0].status == CheckStatus.FAILED
+        assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    def test_sparse_raw_nemo_late_invalid_header_is_inconclusive_without_cache(self, tmp_path: Path) -> None:
+        path = _create_sparse_raw_nemo_with_late_invalid_header(
+            tmp_path,
+            filename="late-invalid-benign.nemo",
+            target="torch.nn.Linear",
+        )
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        assert not [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert determine_exit_code(aggregate) == 2
+
+        cache_dir = tmp_path / "late-invalid-benign-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_sparse_raw_nemo_late_invalid_header_preserves_hydra_finding_without_cache(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _create_sparse_raw_nemo_with_late_invalid_header(
+            tmp_path,
+            filename="late-invalid-malicious.nemo",
+            target="os.system",
+        )
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert hydra_checks[0].location == f"{path}:model_config.yaml"
+        assert determine_exit_code(aggregate) == 1
+
+        cache_dir = tmp_path / "late-invalid-malicious-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == 1
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        ("codec", "mode", "expected_exit_code"),
+        [
+            ("gzip", "w:gz", 2),
+            ("bzip2", "w:bz2", 1),
+            ("xz", "w:xz", 1),
+        ],
+    )
+    def test_compressed_tail_nemo_is_inconclusive_without_cache(
+        self,
+        tmp_path: Path,
+        codec: str,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+        expected_exit_code: int,
+    ) -> None:
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model:\n  _target_: torch.nn.Linear\n",
+            filename=f"compressed-tail-benign-{codec}.nemo",
+            mode=mode,
+        )
+        tail = {
+            "gzip": gzip.compress(b"non-tar trailing payload", mtime=0),
+            "bzip2": bz2.compress(b"non-tar trailing payload"),
+            "xz": lzma.compress(b"non-tar trailing payload"),
+        }[codec]
+        with path.open("ab") as archive:
+            archive.write(tail)
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_compressed_trailing_data" in direct.metadata["scan_outcome_reasons"]
+        assert not [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert determine_exit_code(aggregate) == expected_exit_code
+
+        cache_dir = tmp_path / f"compressed-tail-benign-{codec}-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == expected_exit_code
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        ("codec", "mode", "expected_exit_code"),
+        [
+            ("gzip", "w:gz", 2),
+            ("bzip2", "w:bz2", 1),
+            ("xz", "w:xz", 1),
+        ],
+    )
+    def test_compressed_tail_nemo_preserves_hydra_finding_without_cache(
+        self,
+        tmp_path: Path,
+        codec: str,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+        expected_exit_code: int,
+    ) -> None:
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model:\n  _target_: os.system\n",
+            filename=f"compressed-tail-malicious-{codec}.nemo",
+            mode=mode,
+        )
+        tail = {
+            "gzip": gzip.compress(b"non-tar trailing payload", mtime=0),
+            "bzip2": bz2.compress(b"non-tar trailing payload"),
+            "xz": lzma.compress(b"non-tar trailing payload"),
+        }[codec]
+        with path.open("ab") as archive:
+            archive.write(tail)
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_compressed_trailing_data" in direct.metadata["scan_outcome_reasons"]
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert hydra_checks[0].location == f"{path}:model_config.yaml"
+        assert determine_exit_code(aggregate) == expected_exit_code
+
+        cache_dir = tmp_path / f"compressed-tail-malicious-{codec}-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == expected_exit_code
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        ("target", "expects_hydra_finding", "expected_exit_code"),
+        [
+            ("torch.nn.Linear", False, 2),
+            ("os.system", True, 1),
+        ],
+    )
+    def test_xz_padding_limit_nemo_preserves_reachable_analysis_without_cache(
+        self,
+        tmp_path: Path,
+        target: str,
+        expects_hydra_finding: bool,
+        expected_exit_code: int,
+    ) -> None:
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            f"model:\n  _target_: {target}\n".encode(),
+            filename=f"xz-padding-limit-{'malicious' if expects_hydra_finding else 'benign'}.nemo",
+            mode="w:xz",
+        )
+        with path.open("ab") as archive:
+            archive.write(b"\0" * 68)
+
+        direct = scan_file(
+            str(path),
+            config={"cache_enabled": False, "compressed_max_xz_padding_bytes": 64},
+        )
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            compressed_max_xz_padding_bytes=64,
+        )
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.scanner_name == "nemo"
+        assert direct.success is False
+        assert "tar_compressed_padding_limit_exceeded" in direct.metadata["scan_outcome_reasons"]
+        assert bool(hydra_checks) is expects_hydra_finding
+        assert determine_exit_code(aggregate) == expected_exit_code
+
+        cache_dir = tmp_path / f"xz-padding-limit-{'malicious' if expects_hydra_finding else 'benign'}-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                compressed_max_xz_padding_bytes=64,
+            )
+            assert determine_exit_code(cached) == expected_exit_code
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues) is (
+                expects_hydra_finding
+            )
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        ("target", "expects_hydra_finding", "expected_exit_code"),
+        [
+            ("torch.nn.Linear", False, 2),
+            ("os.system", True, 1),
+        ],
+    )
+    def test_declared_nemo_preserves_config_before_later_metadata_budget_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        target: str,
+        expects_hydra_finding: bool,
+        expected_exit_code: int,
+    ) -> None:
+        nemo_path = _create_gzip_nemo_with_pax_tail(
+            tmp_path,
+            filename=f"metadata-budget-{target.replace('.', '-')}.nemo",
+            target=target,
+            path_length=2 * 1024,
+        )
+        original_extract = tar_scanner_module.TarScanner._extract_member_to_tempfile
+
+        def reject_later_member_work(
+            scanner: tar_scanner_module.TarScanner,
+            tar: tarfile.TarFile,
+            member: tarfile.TarInfo,
+            **kwargs: Any,
+        ) -> tuple[str, int]:
+            if member.name != "model_config.yaml":
+                pytest.fail(f"metadata-rejected member was extracted: {member.name}")
+            return original_extract(scanner, tar, member, **kwargs)
+
+        monkeypatch.setattr(
+            tar_scanner_module.TarScanner,
+            "_extract_member_to_tempfile",
+            reject_later_member_work,
+        )
+        scanner_config = {"max_tar_metadata_bytes": 1024}
+
+        direct = NemoScanner(config=scanner_config).scan(str(nemo_path))
+        aggregate = scan_model_directory_or_file(
+            str(nemo_path),
+            cache_enabled=False,
+            max_tar_metadata_bytes=1024,
+        )
+
+        assert direct.success is False
+        assert "tar_metadata_read_limit_exceeded" in direct.metadata["scan_outcome_reasons"]
+        assert any(check.details.get("cve_id") == "CVE-2025-23304" for check in direct.checks) is (
+            expects_hydra_finding
+        )
+        assert determine_exit_code(aggregate) == expected_exit_code
+        assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues) is (
+            expects_hydra_finding
+        )
+
+        cache_dir = tmp_path / f"metadata-budget-{target.replace('.', '-')}-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_metadata_bytes=1024,
+            )
+            assert determine_exit_code(cached) == expected_exit_code
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues) is (
+                expects_hydra_finding
+            )
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_truncated_gzip_nemo_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
         """A readable TAR prefix is not enough when the outer gzip stream is incomplete."""
         path = tmp_path / "truncated.nemo"
@@ -374,16 +1142,57 @@ class TestNemoScannerBasic:
         finally:
             reset_cache_manager()
 
-    def test_truncated_gzip_nemo_keeps_nemo_ownership_when_header_stays_gzip(
+    def test_corrupt_gzip_crc_nemo_preserves_hydra_finding_without_cache(self, tmp_path: Path) -> None:
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model:\n  _target_: os.system\n",
+            filename="corrupt-crc-malicious.nemo",
+            mode="w:gz",
+        )
+        compressed = bytearray(path.read_bytes())
+        compressed[-8] ^= 1
+        path.write_bytes(compressed)
+
+        direct = NemoScanner(config={"cache_enabled": False}).scan(str(path))
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.success is False
+        assert "tar_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+        assert determine_exit_code(aggregate) == 2
+
+        cache_dir = tmp_path / "corrupt-crc-malicious-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(cached) == 2
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize("route_format", ["gzip", "nemo"])
+    def test_truncated_gzip_nemo_keeps_nemo_ownership_for_content_routes(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        route_format: Literal["gzip", "nemo"],
     ) -> None:
-        """Retained gzip headers with invalid TAR tails still fail closed as NeMo-owned scans."""
-        path = tmp_path / "truncated-retained-gzip.nemo"
+        """Recognized content routes with invalid gzip tails fail closed as NeMo-owned scans."""
+        path = tmp_path / f"truncated-{route_format}-route.nemo"
         payload = _build_nemo_tar_bytes(b"model:\n  _target_: nemo.Model\n")
         path.write_bytes(payload[:-1])
-        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: "gzip")
+        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: route_format)
+        monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", lambda _path: route_format)
 
         direct_result = scan_file(str(path), config={"cache_scan_results": False})
         aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
@@ -398,6 +1207,7 @@ class TestNemoScannerBasic:
         assert integrity_checks
         assert integrity_checks[0].rule_code == "S902"
         assert "could not be fully validated" in integrity_checks[0].message
+        assert integrity_checks[0].details["stream_tail_status"] == "invalid"
         assert aggregate_result.scanner_names == ["nemo"]
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) == 2
@@ -3368,6 +4178,180 @@ class TestCVE202523304HydraTarget:
             and check.details["target"] == "os.system"
             for check in result.checks
         )
+
+    @pytest.mark.parametrize(
+        ("target", "expected_success", "expected_exit_code"),
+        [("torch.nn.Linear", True, 0), ("os.system", False, 1)],
+    )
+    def test_raw_tar_metadata_route_overflow_hands_off_to_tar_scanner(
+        self,
+        tmp_path: Path,
+        target: str,
+        expected_success: bool,
+        expected_exit_code: int,
+    ) -> None:
+        path = tmp_path / f"raw-large-pax-{'safe' if expected_success else 'malicious'}.jpg"
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as archive:
+            metadata = tarfile.TarInfo("metadata.bin")
+            metadata.pax_headers = {"comment": "x" * (file_detection._NEMO_ROUTE_MAX_METADATA_BYTES + 1)}
+            archive.addfile(metadata, io.BytesIO())
+            _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
+
+        assert file_detection.detect_file_format(str(path)) == "tar"
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        assert direct.scanner_name == "tar"
+        assert direct.success is expected_success
+        assert "nemo_routing_incomplete" not in direct.metadata.get("scan_outcome_reasons", [])
+        assert any(check.details.get("cve_id") == "CVE-2025-23304" for check in direct.checks) is (not expected_success)
+        assert determine_exit_code(aggregate) == expected_exit_code
+
+    @pytest.mark.parametrize(
+        ("target", "expected_success"),
+        [("torch.nn.Linear", True), ("os.system", False)],
+    )
+    def test_raw_tar_metadata_route_overflow_ignores_embedded_hdf5_owner(
+        self,
+        tmp_path: Path,
+        target: str,
+        expected_success: bool,
+    ) -> None:
+        h5py = pytest.importorskip("h5py")
+        embedded_path = tmp_path / "embedded.h5"
+        with h5py.File(embedded_path, "w") as h5_file:
+            h5_file.create_dataset("weights", data=[1])
+        embedded_hdf5 = embedded_path.read_bytes()
+
+        path = tmp_path / f"pax-embedded-hdf5-{'safe' if expected_success else 'malicious'}.tar"
+        archive_bytes = io.BytesIO()
+        with tarfile.open(fileobj=archive_bytes, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            metadata = tarfile.TarInfo("metadata.bin")
+            metadata.pax_headers = {"comment": "x" * (file_detection._NEMO_ROUTE_MAX_METADATA_BYTES + 1)}
+            archive.addfile(metadata, io.BytesIO())
+
+            member_data_offset = archive_bytes.tell() + tarfile.BLOCKSIZE
+            hdf5_signature_offset = tarfile.BLOCKSIZE
+            while hdf5_signature_offset < member_data_offset:
+                hdf5_signature_offset *= 2
+            embedded_payload = bytes(hdf5_signature_offset - member_data_offset) + embedded_hdf5
+            _add_tar_bytes(archive, "assets/embedded.h5", embedded_payload)
+            _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
+        path.write_bytes(archive_bytes.getvalue())
+
+        assert file_detection.find_hdf5_signature_offset(str(path)) == hdf5_signature_offset
+        assert file_detection.detect_file_format(str(path)) == "tar"
+
+        result = scan_file(str(path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "keras_h5"
+        assert "tar" in result.metadata["supplemental_scanners"]
+        assert result.success is False
+        assert "nemo_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+        assert any(check.details.get("cve_id") == "CVE-2025-23304" for check in result.checks) is (not expected_success)
+
+    def test_raw_tar_metadata_route_overflow_remains_uncacheable_when_tar_limit_is_lower(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "raw-large-pax-incomplete.jpg"
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as archive:
+            metadata = tarfile.TarInfo("metadata.bin")
+            metadata.pax_headers = {"comment": "x" * (file_detection._NEMO_ROUTE_MAX_METADATA_BYTES + 1)}
+            archive.addfile(metadata, io.BytesIO())
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+
+        cache_dir = tmp_path / "raw-pax-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_metadata_bytes=32 * 1024,
+            )
+
+            file_metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is False
+            assert "tar_metadata_read_limit_exceeded" in file_metadata["scan_outcome_reasons"]
+            assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
+    def test_renamed_compressed_nemo_after_route_budget_scans_benign_config(
+        self,
+        tmp_path: Path,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+    ) -> None:
+        path = _create_renamed_compressed_nemo_after_route_budget(
+            tmp_path,
+            filename=f"late-benign-config-{mode.replace(':', '-')}.jpg",
+            target="torch.nn.Linear",
+            mode=mode,
+        )
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        assert direct.scanner_name == "tar"
+        assert direct.success is True
+        assert "nemo_routing_incomplete" not in direct.metadata.get("scan_outcome_reasons", [])
+        assert not [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert determine_exit_code(aggregate) == 0
+
+    @pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
+    def test_renamed_compressed_nemo_after_route_budget_preserves_hydra_finding(
+        self,
+        tmp_path: Path,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+    ) -> None:
+        path = _create_renamed_compressed_nemo_after_route_budget(
+            tmp_path,
+            filename=f"late-malicious-config-{mode.replace(':', '-')}.jpg",
+            target="os.system",
+            mode=mode,
+        )
+
+        direct = scan_file(str(path), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+        hydra_checks = [check for check in direct.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert direct.scanner_name == "tar"
+        assert direct.success is False
+        assert "nemo_routing_incomplete" not in direct.metadata.get("scan_outcome_reasons", [])
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert hydra_checks[0].location == f"{path}:model_config.yaml"
+        assert determine_exit_code(aggregate) == 1
+
+    @pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
+    def test_nested_renamed_compressed_nemo_after_route_budget_preserves_hydra_finding(
+        self,
+        tmp_path: Path,
+        mode: Literal["w:gz", "w:bz2", "w:xz"],
+    ) -> None:
+        nested_path = _create_renamed_compressed_nemo_after_route_budget(
+            tmp_path,
+            filename=f"nested-late-malicious-config-{mode.replace(':', '-')}.jpg",
+            target="os.system",
+            mode=mode,
+        )
+        archive_path = tmp_path / f"nested-late-config-{mode.replace(':', '-')}.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.write(nested_path, arcname="models/payload.jpg")
+
+        result = scan_file(str(archive_path), config={"cache_enabled": False})
+
+        hydra_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert result.scanner_name == "zip"
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert "models/payload.jpg:model_config.yaml" in str(hydra_checks[0].location)
 
     def test_renamed_nemo_safe_symlink_root_routes_before_late_target(
         self,
@@ -7107,3 +8091,776 @@ class TestCVE202523304HydraTarget:
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
         finally:
             reset_cache_manager()
+
+    def test_declared_nemo_enforces_tar_aggregate_budget_before_member_reads(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "over-budget.nemo"
+        with tarfile.open(nemo_path, "w") as archive:
+            _add_tar_bytes(archive, "weights.bin", b"x" * 128)
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+
+        result = NemoScanner(
+            config={
+                "max_tar_total_uncompressed_size": 64,
+                "max_total_size": 64,
+            }
+        ).scan(str(nemo_path))
+
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is False
+        assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
+        assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("target", "expects_hydra_finding", "expected_exit_code"),
+        [
+            ("torch.nn.Linear", False, 1),
+            ("os.system", True, 1),
+        ],
+    )
+    def test_content_routed_nemo_enforces_tar_aggregate_budget_before_checkpoint_reads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        target: str,
+        expects_hydra_finding: bool,
+        expected_exit_code: int,
+    ) -> None:
+        nemo_path = tmp_path / f"over-budget-{target.replace('.', '-')}.tar.gz"
+        config_payload = f"model:\n  _target_: {target}\n".encode()
+        with tarfile.open(nemo_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", config_payload)
+            _add_tar_bytes(archive, "weights.ckpt", b"x" * 128)
+
+        def fail_checkpoint_extraction(*_args: Any, **_kwargs: Any) -> None:
+            pytest.fail("content-routed checkpoint was read after aggregate preflight rejection")
+
+        monkeypatch.setattr(NemoScanner, "_extract_member_to_tempfile", fail_checkpoint_extraction)
+        original_tar_extract = tar_scanner_module.TarScanner._extract_member_to_tempfile
+
+        def reject_over_budget_tar_member(
+            scanner: tar_scanner_module.TarScanner,
+            tar: tarfile.TarFile,
+            member: tarfile.TarInfo,
+            **kwargs: Any,
+        ) -> tuple[str, int]:
+            if member.name == "weights.ckpt":
+                pytest.fail("aggregate-rejected member was extracted")
+            return original_tar_extract(scanner, tar, member, **kwargs)
+
+        monkeypatch.setattr(
+            tar_scanner_module.TarScanner,
+            "_extract_member_to_tempfile",
+            reject_over_budget_tar_member,
+        )
+
+        def reject_full_archive_integrity_read(*_args: Any, **_kwargs: Any) -> None:
+            pytest.fail("prefix recovery attempted a full-archive integrity read")
+
+        monkeypatch.setattr(
+            tar_scanner_module.TarScanner,
+            "_add_streaming_safe_integrity_check",
+            reject_full_archive_integrity_read,
+        )
+        shared_budget = tar_scanner_module._TarSharedScanBudget(max_total_uncompressed_size=64)
+
+        result = NemoScanner(
+            config={
+                "max_tar_total_uncompressed_size": 64,
+                "max_total_size": 64,
+                tar_scanner_module.TAR_SHARED_SCAN_BUDGET_CONFIG_KEY: shared_budget,
+            }
+        ).scan(str(nemo_path))
+
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is False
+        assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
+        assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(check.details.get("cve_id") == "CVE-2025-23304" for check in result.checks) is (
+            expects_hydra_finding
+        )
+        assert shared_budget.member_bytes_consumed == len(config_payload)
+
+        aggregate = scan_model_directory_or_file(
+            str(nemo_path),
+            cache_enabled=False,
+            max_tar_total_uncompressed_size=64,
+        )
+        assert determine_exit_code(aggregate) == expected_exit_code
+        assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues) is (
+            expects_hydra_finding
+        )
+
+        cache_dir = tmp_path / f"over-budget-{target.replace('.', '-')}-cache"
+        reset_cache_manager()
+        try:
+            cached = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_total_uncompressed_size=64,
+            )
+            assert determine_exit_code(cached) == expected_exit_code
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in cached.issues) is (
+                expects_hydra_finding
+            )
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize("boundary", ["decompressed_size"])
+    def test_inherited_preflight_limits_preserve_reachable_nemo_analysis(
+        self,
+        tmp_path: Path,
+        boundary: str,
+    ) -> None:
+        nemo_path = tmp_path / f"terminal-{boundary}.nemo"
+        mode: _NemoTarWriteMode = "w" if boundary == "entry_count" else "w:gz"
+        with tarfile.open(nemo_path, mode) as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
+            _add_tar_bytes(archive, "later.bin", b"x" * (20 * 1024))
+
+        config = (
+            {"max_tar_entries": 1}
+            if boundary == "entry_count"
+            else {
+                "compressed_max_decompressed_bytes": 10 * 1024,
+                "compressed_max_decompression_ratio": 100_000.0,
+            }
+        )
+
+        result = NemoScanner(config=config).scan(str(nemo_path))
+
+        assert result.success is False
+        hydra_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23304"]
+        assert len(hydra_checks) == 1
+        assert hydra_checks[0].status == CheckStatus.FAILED
+        assert hydra_checks[0].severity == IssueSeverity.CRITICAL
+        assert (
+            tar_scanner_module.TAR_DECOMPRESSED_SIZE_LIMIT_INCOMPLETE_REASON in result.metadata["scan_outcome_reasons"]
+        )
+
+    @pytest.mark.parametrize(
+        ("target", "expected_exit_code"),
+        [("torch.nn.Linear", 2), ("os.system", 1)],
+    )
+    def test_nemo_entry_limit_replays_only_bounded_prefix(
+        self,
+        tmp_path: Path,
+        target: str,
+        expected_exit_code: int,
+    ) -> None:
+        nemo_path = tmp_path / f"entry-prefix-{target.replace('.', '-')}.nemo"
+        with tarfile.open(nemo_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", f"model:\n  _target_: {target}\n".encode())
+            _add_tar_bytes(archive, "safe.bin", b"safe")
+            _add_tar_bytes(archive, "late.pkl", b'cos\nsystem\n(S"echo late"\ntR.')
+
+        cache_dir = tmp_path / f"entry-prefix-{target.replace('.', '-')}-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_entries=2,
+            )
+
+            metadata = aggregate.file_metadata[str(nemo_path)]
+            hydra_findings = [issue for issue in aggregate.issues if issue.details.get("cve_id") == "CVE-2025-23304"]
+            assert aggregate.success is False
+            assert "tar_entry_count_limit_exceeded" in metadata["scan_outcome_reasons"]
+            assert bool(hydra_findings) is (target == "os.system")
+            assert not any("late.pkl" in str(issue.location) for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == expected_exit_code
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
+    @pytest.mark.parametrize("mode", ["w", "w:gz"])
+    def test_nemo_analysis_uses_preflighted_descriptor_when_path_is_replaced(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mode: Literal["w", "w:gz"],
+    ) -> None:
+        nemo_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "os.system", "command": "echo pwned"}},
+            filename="replace-after-preflight.nemo",
+            mode=mode,
+        )
+        replacement_path = tmp_path / "replacement.nemo"
+        with tarfile.open(replacement_path, "w") as archive:
+            for index in range(129):
+                _add_tar_bytes(archive, f"weights-{index}.bin", b"safe")
+
+        original_preflight = tar_scanner_module.TarScanner._preflight_tar_archive
+        replacement_performed = False
+
+        def replace_after_preflight(
+            scanner: tar_scanner_module.TarScanner,
+            path: str,
+            result: ScanResult,
+            **kwargs: Any,
+        ) -> bool:
+            nonlocal replacement_performed
+            succeeded = original_preflight(scanner, path, result, **kwargs)
+            if succeeded and not replacement_performed:
+                os.replace(replacement_path, nemo_path)
+                replacement_performed = True
+            return succeeded
+
+        monkeypatch.setattr(tar_scanner_module.TarScanner, "_preflight_tar_archive", replace_after_preflight)
+        original_getmembers = tarfile.TarFile.getmembers
+        materialized_member_counts: list[int] = []
+
+        def tracked_getmembers(archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
+            members = original_getmembers(archive)
+            materialized_member_counts.append(len(members))
+            return members
+
+        monkeypatch.setattr(tarfile.TarFile, "getmembers", tracked_getmembers)
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_entries=1,
+            )
+
+            assert len(aggregate.file_metadata) == 1
+            metadata = next(iter(aggregate.file_metadata.values()))
+            assert replacement_performed is True
+            assert materialized_member_counts == [1]
+            assert aggregate.success is False
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
+    def test_nemo_prefix_fallback_preserves_preflight_failure_when_path_is_replaced(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = tmp_path / "replace-after-failed-preflight.nemo"
+        with tarfile.open(nemo_path, "w") as archive:
+            _add_tar_bytes(archive, "oversized.bin", b"x" * 128)
+        replacement_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "torch.nn.Linear"}},
+            filename="replacement.nemo",
+        )
+
+        original_preflight = tar_scanner_module.TarScanner._preflight_tar_archive
+        replacement_performed = False
+
+        def replace_after_failed_preflight(
+            scanner: tar_scanner_module.TarScanner,
+            path: str,
+            result: ScanResult,
+            **kwargs: Any,
+        ) -> bool:
+            nonlocal replacement_performed
+            succeeded = original_preflight(scanner, path, result, **kwargs)
+            if not succeeded and not replacement_performed:
+                os.replace(replacement_path, nemo_path)
+                replacement_performed = True
+            return succeeded
+
+        monkeypatch.setattr(
+            tar_scanner_module.TarScanner,
+            "_preflight_tar_archive",
+            replace_after_failed_preflight,
+        )
+
+        cache_dir = tmp_path / "prefix-fallback-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_total_uncompressed_size=100,
+            )
+
+            metadata = aggregate.file_metadata[str(nemo_path)]
+            assert replacement_performed is True
+            assert aggregate.success is False
+            assert "tar_total_size_limit_exceeded" in metadata["scan_outcome_reasons"]
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            assert not any(issue.details.get("cve_id") for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
+    def test_content_routed_nemo_tar_followup_uses_bound_descriptor_after_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "replace-before-tar-followup.tar.gz"
+        with tarfile.open(model_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: torch.nn.Linear\n")
+            _add_tar_bytes(archive, "payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+        replacement_path = tmp_path / "replacement.tar.gz"
+        with tarfile.open(replacement_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "safe.txt", b"safe")
+
+        original_nemo_scan = NemoScanner._scan_nemo_archive
+        replacement_performed = False
+
+        def replace_after_nemo_analysis(scanner: NemoScanner, path: str, *args: Any, **kwargs: Any) -> None:
+            nonlocal replacement_performed
+            original_nemo_scan(scanner, path, *args, **kwargs)
+            os.replace(replacement_path, model_path)
+            replacement_performed = True
+
+        monkeypatch.setattr(NemoScanner, "_scan_nemo_archive", replace_after_nemo_analysis)
+
+        cache_dir = tmp_path / "tar-followup-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            metadata = aggregate.file_metadata[str(model_path)]
+            assert replacement_performed is True
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            assert any("os.system" in issue.message.lower() for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "truncate",
+            pytest.param(
+                "unlink",
+                marks=pytest.mark.skipif(
+                    sys.platform == "win32",
+                    reason="Windows prevents unlinking an open source file",
+                ),
+            ),
+        ],
+    )
+    def test_content_routed_nemo_tar_followup_preserves_findings_after_source_mutation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mutation: Literal["truncate", "unlink"],
+    ) -> None:
+        model_path = tmp_path / f"mutated-before-tar-followup-{mutation}.tar.gz"
+        with tarfile.open(model_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
+            _add_tar_bytes(archive, "payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        original_nemo_scan = NemoScanner._scan_nemo_archive
+
+        def mutate_after_nemo_analysis(scanner: NemoScanner, path: str, *args: Any, **kwargs: Any) -> None:
+            original_nemo_scan(scanner, path, *args, **kwargs)
+            if mutation == "truncate":
+                with model_path.open("r+b") as archive_file:
+                    archive_file.truncate(0)
+            else:
+                model_path.unlink()
+
+        monkeypatch.setattr(NemoScanner, "_scan_nemo_archive", mutate_after_nemo_analysis)
+
+        cache_dir = tmp_path / f"tar-followup-{mutation}-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            metadata = aggregate.file_metadata[str(model_path)]
+            assert aggregate.success is False
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            if mutation == "truncate":
+                assert "tar_scan_incomplete" in metadata["scan_outcome_reasons"]
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_identity_caused_nemo_integrity_failure_is_operational(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "torch.nn.Linear"}},
+            filename="identity-corruption.nemo",
+        )
+        original_preflight = tar_scanner_module.TarScanner._preflight_tar_archive
+
+        def truncate_after_preflight(
+            scanner: tar_scanner_module.TarScanner,
+            path: str,
+            result: ScanResult,
+            **kwargs: Any,
+        ) -> bool:
+            succeeded = original_preflight(scanner, path, result, **kwargs)
+            if succeeded:
+                with nemo_path.open("r+b") as archive_file:
+                    archive_file.truncate(0)
+            return succeeded
+
+        monkeypatch.setattr(tar_scanner_module.TarScanner, "_preflight_tar_archive", truncate_after_preflight)
+
+        cache_dir = tmp_path / "identity-corruption-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            metadata = aggregate.file_metadata[str(nemo_path)]
+            integrity_issues = [
+                issue
+                for issue in aggregate.issues
+                if issue.details.get("scan_outcome_reason") == "nemo_archive_integrity_incomplete"
+            ]
+            assert aggregate.success is False
+            assert "nemo_archive_identity_changed" in metadata["scan_outcome_reasons"]
+            assert len(integrity_issues) == 1
+            assert integrity_issues[0].severity == IssueSeverity.INFO
+            assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_identity_caused_nemo_integrity_failure_preserves_prior_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "os.system", "command": "echo pwned"}},
+            filename="identity-corruption-after-finding.nemo",
+        )
+        original_nemo_scan = NemoScanner._scan_nemo_archive
+
+        def fail_after_nemo_finding(scanner: NemoScanner, path: str, *args: Any, **kwargs: Any) -> None:
+            original_nemo_scan(scanner, path, *args, **kwargs)
+            with nemo_path.open("r+b") as archive_file:
+                archive_file.truncate(0)
+            raise tarfile.ReadError("archive changed after NeMo analysis")
+
+        monkeypatch.setattr(NemoScanner, "_scan_nemo_archive", fail_after_nemo_finding)
+
+        cache_dir = tmp_path / "identity-corruption-finding-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            integrity_issues = [
+                issue
+                for issue in aggregate.issues
+                if issue.details.get("scan_outcome_reason") == "nemo_archive_integrity_incomplete"
+            ]
+            assert any(issue.details.get("cve_id") == "CVE-2025-23304" for issue in aggregate.issues)
+            assert len(integrity_issues) == 1
+            assert integrity_issues[0].severity == IssueSeverity.INFO
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_nemo_preflight_interrupt_closes_bound_descriptor(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "torch.nn.Linear"}},
+            filename="interrupted-preflight.nemo",
+        )
+        captured_files: list[Any] = []
+
+        def interrupt_preflight(
+            _scanner: tar_scanner_module.TarScanner,
+            _path: str,
+            _result: ScanResult,
+            **kwargs: Any,
+        ) -> bool:
+            captured_files.append(kwargs["raw_file"])
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(tar_scanner_module.TarScanner, "_preflight_tar_archive", interrupt_preflight)
+
+        with pytest.raises(KeyboardInterrupt):
+            NemoScanner().scan(str(nemo_path))
+
+        assert len(captured_files) == 1
+        assert captured_files[0].closed is True
+
+    def test_content_routed_nemo_preflight_does_not_double_charge_shared_budget(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "within-budget.tar.gz"
+        config_payload = b"model:\n  _target_: torch.nn.Linear\n"
+        weights_payload = b"safe weights"
+        with tarfile.open(nemo_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", config_payload)
+            _add_tar_bytes(archive, "weights.bin", weights_payload)
+
+        initial_consumed = 32
+        expected_consumed = initial_consumed + len(config_payload) + len(weights_payload)
+        shared_budget = tar_scanner_module._TarSharedScanBudget(
+            max_total_uncompressed_size=expected_consumed,
+            member_bytes_consumed=initial_consumed,
+        )
+
+        result = NemoScanner(
+            config={
+                "max_tar_total_uncompressed_size": expected_consumed,
+                "max_total_size": expected_consumed,
+                tar_scanner_module.TAR_SHARED_SCAN_BUDGET_CONFIG_KEY: shared_budget,
+            }
+        ).scan(str(nemo_path))
+
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is True
+        assert not any(check.status == CheckStatus.FAILED for check in aggregate_checks)
+        assert shared_budget.member_bytes_consumed == expected_consumed
+
+    def test_declared_nemo_nested_checkpoints_share_aggregate_budget(self, tmp_path: Path) -> None:
+        nemo_path = _create_nemo_with_nested_tar_checkpoints(
+            tmp_path,
+            filename="nested-checkpoints.nemo",
+            checkpoint_count=4,
+            payload_size=8_000,
+        )
+
+        config = {
+            "cache_scan_results": False,
+            "max_tar_total_uncompressed_size": 15_000,
+            "max_total_size": 15_000,
+        }
+        direct_result = scan_file(str(nemo_path), config=config)
+        aggregate_result = scan_model_directory_or_file(
+            str(nemo_path),
+            max_total_size=15_000,
+            max_tar_total_uncompressed_size=15_000,
+            cache_scan_results=False,
+        )
+
+        aggregate_checks = [
+            check
+            for check in direct_result.checks
+            if check.name == "TAR Aggregate Size Limit Check" and check.status == CheckStatus.FAILED
+        ]
+        assert direct_result.scanner_name == "nemo"
+        assert direct_result.success is False
+        assert aggregate_checks
+        assert aggregate_checks[0].details["archive_uncompressed_size"] > 15_000
+        assert aggregate_checks[0].details["max_tar_total_uncompressed_size"] == 15_000
+        assert "tar_total_size_limit_exceeded" in direct_result.metadata["scan_outcome_reasons"]
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 1
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_total_uncompressed_size=15_000,
+                max_total_size=15_000,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_declared_nemo_aggregate_budget_exhaustion_stops_later_nested_work(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        checkpoint = io.BytesIO()
+        with tarfile.open(fileobj=checkpoint, mode="w:gz") as nested_archive:
+            _add_tar_bytes(nested_archive, "tensor.bin", b"x" * 8_000)
+        checkpoint_payload = checkpoint.getvalue()
+
+        nemo_path = tmp_path / "many-nested-checkpoints.nemo"
+        with tarfile.open(nemo_path, "w") as archive:
+            _add_tar_bytes(archive, "weights-0.ckpt", checkpoint_payload)
+            _add_tar_bytes(archive, "artifacts/tokenizer.model", checkpoint_payload)
+            _add_tar_bytes(
+                archive,
+                "model_config.yaml",
+                (b"model:\n  _target_: os.system\ntokenizer:\n  model: nemo:artifacts/tokenizer.model\n"),
+            )
+            for index in range(1, 100):
+                _add_tar_bytes(archive, f"weights-{index}.ckpt", checkpoint_payload)
+
+        counters = _track_nested_work(monkeypatch)
+        result = scan_file(
+            str(nemo_path),
+            config={
+                "cache_enabled": False,
+                "max_tar_total_uncompressed_size": 15_000,
+            },
+        )
+
+        aggregate_checks = [
+            check
+            for check in result.checks
+            if check.name == "TAR Aggregate Size Limit Check" and check.status == CheckStatus.FAILED
+        ]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(aggregate_checks) == 1
+        assert aggregate_checks[0].rule_code == "S410"
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(check.details.get("target") == "os.system" for check in result.checks)
+        assert counters.checkpoint_dispatches == 1
+        assert counters.reference_dispatches == 0
+        assert counters.nested_extractions == 1
+        assert all(member_name == "weights-0.ckpt" for member_name in counters.extracted_members)
+        assert 0 < counters.decompressed_bytes <= 2 * tarfile.RECORDSIZE
+
+        aggregate_result = scan_model_directory_or_file(
+            str(nemo_path),
+            max_tar_total_uncompressed_size=15_000,
+            cache_scan_results=False,
+        )
+        assert aggregate_result.success is False
+        assert any(issue.details.get("target") == "os.system" for issue in aggregate_result.issues)
+        assert determine_exit_code(aggregate_result) == 1
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_tar_total_uncompressed_size=15_000,
+            )
+
+            assert cached_aggregate.success is False
+            assert determine_exit_code(cached_aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_declared_nemo_reference_budget_exhaustion_stops_later_references(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nested_tar = io.BytesIO()
+        with tarfile.open(fileobj=nested_tar, mode="w:gz") as nested_archive:
+            _add_tar_bytes(nested_archive, "tensor.bin", b"x" * 8_000)
+        nested_payload = nested_tar.getvalue()
+
+        nemo_path = tmp_path / "nested-references.nemo"
+        config_payload = b"artifacts:\n" + b"".join(
+            f"  item_{index}: nemo:artifacts/{index}.bin\n".encode() for index in range(3)
+        )
+        with tarfile.open(nemo_path, "w") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", config_payload)
+            for index in range(3):
+                _add_tar_bytes(archive, f"artifacts/{index}.bin", nested_payload)
+
+        counters = _track_nested_work(monkeypatch)
+        result = scan_file(
+            str(nemo_path),
+            config={
+                "cache_enabled": False,
+                "max_tar_total_uncompressed_size": 4_000,
+            },
+        )
+
+        aggregate_checks = [
+            check
+            for check in result.checks
+            if check.name == "TAR Aggregate Size Limit Check" and check.status == CheckStatus.FAILED
+        ]
+        assert result.success is False
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(aggregate_checks) == 1
+        assert counters.checkpoint_dispatches == 0
+        assert counters.reference_dispatches == 1
+        assert counters.nested_extractions == 1
+        assert not {"artifacts/1.bin", "artifacts/2.bin"}.intersection(counters.extracted_members)
+        assert 0 < counters.decompressed_bytes <= 2 * tarfile.RECORDSIZE
+
+    def test_declared_nemo_nested_checkpoint_within_aggregate_budget_remains_complete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nemo_path = _create_nemo_with_nested_tar_checkpoints(
+            tmp_path,
+            filename="nested-checkpoint-within-budget.nemo",
+            checkpoint_count=1,
+            payload_size=8_000,
+        )
+
+        counters = _track_nested_work(monkeypatch)
+        result = scan_file(
+            str(nemo_path),
+            config={
+                "cache_enabled": False,
+                "max_tar_total_uncompressed_size": 15_000,
+                "max_total_size": 15_000,
+            },
+        )
+
+        assert result.scanner_name == "nemo"
+        assert result.success is True
+        assert counters.checkpoint_dispatches == 1
+        assert result.metadata.get("analysis_incomplete") is not True
+        assert "scan_outcome" not in result.metadata
+        assert not result.metadata.get("scan_outcome_reasons")
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "TAR Aggregate Size Limit Check" and check.status == CheckStatus.FAILED
+        ]

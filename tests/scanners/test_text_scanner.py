@@ -16,6 +16,7 @@ from modelaudit.scanners.text_scanner import (
     TextScanner,
 )
 from modelaudit.utils.helpers import cache_decorator
+from tests.helpers import is_huggingface_rate_limit_error
 
 
 def _failed_network_detection_checks(result: Any) -> list[Any]:
@@ -359,7 +360,12 @@ def test_omnivoice_pinned_audio_tokenizer_readme_basic_links_not_basic_auth_secr
         "https://huggingface.co/k2-fsa/OmniVoice/resolve/"
         "999c332499c708b116876ff5fe1aa5dd15f422ce/audio_tokenizer/README.md"
     )
-    downloaded_path = Path(download_file_from_hf(url, cache_dir=tmp_path / "hf", max_size=1024 * 1024))
+    try:
+        downloaded_path = Path(download_file_from_hf(url, cache_dir=tmp_path / "hf", max_size=1024 * 1024))
+    except Exception as exc:
+        if is_huggingface_rate_limit_error(exc):
+            pytest.skip("Hugging Face rate-limited the pinned OmniVoice README download")
+        raise
 
     assert "Provide the basic links for the model" in downloaded_path.read_text(encoding="utf-8")
     result = TextScanner(config={"check_network_comm": False}).scan(str(downloaded_path))

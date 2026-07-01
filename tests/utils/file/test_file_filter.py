@@ -729,6 +729,21 @@ class TestFileFilter:
 
         assert not should_skip_file(str(disguised_zip))
 
+    def test_non_aligned_empty_tar_prefix_zip_stays_scannable(self, tmp_path: Path) -> None:
+        disguised_zip = tmp_path / "archive.jpg"
+        with zipfile.ZipFile(disguised_zip, "w") as archive:
+            archive.writestr("version", "3\n")
+            archive.writestr("data.pkl", malicious_pickle_bytes())
+        payload = (b"\0" * 1024) + disguised_zip.read_bytes()
+        if len(payload) % 512 == 0:
+            payload += b"\0"
+        disguised_zip.write_bytes(payload)
+
+        assert zipfile.is_zipfile(disguised_zip)
+        assert disguised_zip.stat().st_size % 512 != 0
+        assert detect_file_format_for_skip_filter(str(disguised_zip)) == "zip"
+        assert not should_skip_file(str(disguised_zip))
+
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_content_recognized_payloads_bypass_default_hidden_and_basename_skips(
         self,

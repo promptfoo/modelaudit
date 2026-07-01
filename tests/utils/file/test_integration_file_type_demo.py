@@ -134,7 +134,7 @@ class TestFileTypeValidationDemo:
             assert results["success"], "Directory scan should succeed"
             assert len(validation_warnings) == 0, "No validation warnings expected for legitimate directory"
 
-    def test_end_to_end_security_demo(self, test_data_dir, tmp_path):
+    def test_end_to_end_security_demo(self, test_data_dir: Path, tmp_path: Path) -> None:
         """End-to-end demonstration of security validation in mixed directory."""
         print("\n=== File Type Validation Demo: End-to-End Security ===")
 
@@ -172,7 +172,11 @@ class TestFileTypeValidationDemo:
 
         # Should detect security issues
         assert len(validation_warnings) > 0, "Should detect file type validation issues"
-        assert results["success"], "Scan should complete successfully despite warnings"
+        # Scan should run to completion without operational errors. The file-type spoofing
+        # warning is an intentional WARNING-level failed security check (success=False),
+        # not an error; non-fatal status is asserted via exit code 1 below.
+        assert not results["has_errors"], "Scan should complete without operational errors despite warnings"
+        assert results["files_scanned"] > 0, "Scan should have processed files"
 
         # Exit code should be 1 (warnings found)
         exit_code = self._get_exit_code(results)

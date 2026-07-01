@@ -344,7 +344,7 @@ class TestPerformanceBenchmarks:
         )
 
     @pytest.mark.slow
-    def test_stress_performance(self, assets_dir):
+    def test_stress_performance(self, assets_dir: Path) -> None:
         """Stress test with many repeated operations."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
@@ -364,7 +364,13 @@ class TestPerformanceBenchmarks:
             duration = time.perf_counter() - start_time
             durations.append(duration)
 
-            assert results.success, f"Iteration {i + 1} should succeed"
+            # The assets directory contains intentional adversarial exploit fixtures,
+            # so a hardened scan correctly reports success=False. The stress test only
+            # cares that each iteration completes without operational errors and keeps
+            # discovering files (i.e. the scanner stays healthy under repeated load),
+            # not that the malicious corpus is declared clean.
+            assert not results.has_errors, f"Iteration {i + 1} hit operational errors"
+            assert results.files_scanned > 0, f"Iteration {i + 1} scanned no files"
 
         # Remove outliers using IQR method
         q1 = statistics.quantiles(durations, n=4)[0]

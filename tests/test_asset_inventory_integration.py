@@ -27,6 +27,7 @@ from safetensors.numpy import save_file
 
 from modelaudit.cli import cli
 from modelaudit.core import scan_model_directory_or_file
+from modelaudit.models import IssueSeverity
 
 
 class TestAssetInventoryIntegration:
@@ -101,7 +102,20 @@ class TestAssetInventoryIntegration:
 
         # Should have scanned multiple files
         assert results.files_scanned >= 4
-        assert results.success is True
+        assert results.has_errors is False
+        # The scan reports WARNING findings (not an error) because weights.zip
+        # contains a real numpy pickle whose invoked allowlisted globals cannot be
+        # proven against trusted loaded source when scanned inside the archive.
+        # That hardening is intentional; assert the detection still fires rather
+        # than treating success as a proxy for "scan completed".
+        nested_global_warnings = [
+            issue
+            for issue in results.issues
+            if "invoked allowlisted global without trusted" in issue.message
+            and "weights.zip:model_state.pkl" in (issue.location or "")
+        ]
+        assert nested_global_warnings, "expected import-only pickle global warning"
+        assert all(issue.severity == IssueSeverity.WARNING for issue in nested_global_warnings)
 
         # Should have assets for each file
         assets = results.assets

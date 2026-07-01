@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ import pytest
 from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.scanners.base import (
+    DEFAULT_READ_CHUNK_SIZE,
     INCONCLUSIVE_SCAN_OUTCOME,
     BaseScanner,
     CheckStatus,
@@ -193,6 +195,21 @@ def test_base_scanner_get_file_size(tmp_path):
     size = scanner.get_file_size(str(test_file))
 
     assert size == len(content)
+
+
+def test_base_scanner_calculate_file_hashes_spans_chunks(tmp_path):
+    """Hashing must be output-identical across the chunked read boundary."""
+    content = (b"modelaudit-hash-payload" * 4096) + bytes(DEFAULT_READ_CHUNK_SIZE + 7)
+    assert len(content) > DEFAULT_READ_CHUNK_SIZE
+
+    test_file = tmp_path / "model.test"
+    test_file.write_bytes(content)
+
+    hashes = MockScanner().calculate_file_hashes(str(test_file))
+
+    assert hashes["md5"] == hashlib.md5(content).hexdigest()
+    assert hashes["sha256"] == hashlib.sha256(content).hexdigest()
+    assert hashes["sha512"] == hashlib.sha512(content).hexdigest()
 
 
 def test_base_scanner_get_file_size_oserror(tmp_path, monkeypatch):
