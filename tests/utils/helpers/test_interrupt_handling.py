@@ -37,6 +37,22 @@ def test_module_entrypoint_handles_interrupt_during_cli_import(
     assert capsys.readouterr().err == "Scan interrupted by user\n"
 
 
+def test_package_init_defers_scanner_result_imports() -> None:
+    """Package discovery must stay lightweight until the startup guard runs."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import modelaudit, sys; assert 'modelaudit.scanner_results' not in sys.modules",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_interrupt_handler_basic():
     """Test basic interrupt handler functionality."""
     from modelaudit.utils.helpers.interrupt_handler import (
