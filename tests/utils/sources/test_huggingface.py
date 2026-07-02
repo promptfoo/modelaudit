@@ -97,10 +97,24 @@ from modelaudit.utils.sources.huggingface import (
     redact_huggingface_url_for_display,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
-from tests.helpers import create_mock_coreml, create_mock_onnx
+from tests.helpers import create_mock_coreml, create_mock_onnx, is_huggingface_rate_limit_error
 from tests.helpers.file_creators import malicious_pickle_bytes, valid_jpeg_bytes, valid_png_bytes
 
 _HF_TEST_REVISION = "a" * 40
+
+
+def test_huggingface_rate_limit_error_walks_wrapped_statuses() -> None:
+    class HttpError(RuntimeError):
+        def __init__(self, status_code: int) -> None:
+            super().__init__(f"HTTP {status_code}")
+            self.response = SimpleNamespace(status_code=status_code)
+
+    wrapped = RuntimeError("download wrapper failed")
+    wrapped.__cause__ = HttpError(429)
+
+    assert is_huggingface_rate_limit_error(wrapped)
+    assert is_huggingface_rate_limit_error(RuntimeError("429 Too Many Requests"))
+    assert not is_huggingface_rate_limit_error(HttpError(404))
 
 
 def test_hf_selective_routes_preserve_inconclusive_tokenizer_candidates() -> None:
@@ -5455,11 +5469,16 @@ class TestModelDownloadStreaming:
         repo_id = "xai-org/grok-1"
         revision = "5de83eb225f49624b424f1c8aa74f96983b5885c"
 
-        repo_files, resolved_revision = _list_huggingface_repo_files_at_revision(
-            repo_id,
-            requested_revision=revision,
-            timeout_seconds=30,
-        )
+        try:
+            repo_files, resolved_revision = _list_huggingface_repo_files_at_revision(
+                repo_id,
+                requested_revision=revision,
+                timeout_seconds=30,
+            )
+        except Exception as exc:
+            if is_huggingface_rate_limit_error(exc):
+                pytest.skip("Hugging Face rate-limited the pinned Grok inventory request")
+            raise
 
         assert resolved_revision == revision
         assert len(repo_files) == 773

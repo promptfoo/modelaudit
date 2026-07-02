@@ -523,7 +523,7 @@ jobs:
           rustup default stable
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry
@@ -1063,7 +1063,7 @@ jobs:
           path: dist/
 
       - name: Generate artifact attestations
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
           subject-path: "dist/*"
 
@@ -1117,7 +1117,7 @@ jobs:
           merge-multiple: true
 
       - name: Generate artifact attestations
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
           subject-path: "dist/*"
 

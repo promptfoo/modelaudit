@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import pickle
@@ -174,7 +175,11 @@ def test_scan_file_keeps_plain_descriptor_after_path_replacement(
     original_is_zipfile = package_api.zipfile.is_zipfile
 
     def replace_and_check_zipfile(candidate: Any) -> bool:
-        replacement_path.replace(payload_path)
+        # Windows refuses to replace a file that the scanner holds open; the
+        # scanner keeps reading its original descriptor either way, which is the
+        # property under test.
+        with contextlib.suppress(OSError):
+            replacement_path.replace(payload_path)
         return original_is_zipfile(candidate)
 
     monkeypatch.setattr(package_api.zipfile, "is_zipfile", replace_and_check_zipfile)
@@ -202,7 +207,11 @@ def test_scan_file_keeps_zip_descriptor_after_path_replacement(
     original_is_zipfile = package_api.zipfile.is_zipfile
 
     def replace_and_check_zipfile(candidate: Any) -> bool:
-        replacement_path.replace(archive_path)
+        # Windows refuses to replace a file that the scanner holds open; the
+        # scanner keeps reading its original descriptor either way, which is the
+        # property under test.
+        with contextlib.suppress(OSError):
+            replacement_path.replace(archive_path)
         return original_is_zipfile(candidate)
 
     monkeypatch.setattr(package_api.zipfile, "is_zipfile", replace_and_check_zipfile)

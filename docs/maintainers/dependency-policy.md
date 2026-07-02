@@ -68,7 +68,8 @@ Before approving any new dependency:
 
 # Example: environment marker for Python-version split
 "numpy>=1.19.0,<2.0; python_version == '3.10'",
-"numpy>=2.4,<2.5; python_version >= '3.11'",
+"numpy>=2.4,<2.5; python_version == '3.11'",
+"numpy>=2.5,<2.6; python_version >= '3.12'",
 ```
 
 ## PR Requirements

@@ -2322,7 +2322,7 @@ class TestJFrogFolderDownload:
             )
 
         assert existing_link.is_symlink()
-        assert existing_link.readlink() == target
+        assert os.path.samefile(existing_link, target)
         assert target.read_bytes() == b"target"
         assert mock_download.call_count == 2
 

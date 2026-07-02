@@ -201,7 +201,7 @@ class NetworkExfiltrator:
         # CRITICAL is reserved for actual code execution vectors
         assert len(severities) > 0, "Should detect network-related patterns"
 
-    def test_combined_detections(self, tmp_path):
+    def test_combined_detections(self, tmp_path: Path) -> None:
         """Test that network detection works alongside other detections."""
         # Create a pickle with multiple security issues
         test_file = tmp_path / "multi_issue.pkl"
@@ -229,9 +229,12 @@ class NetworkExfiltrator:
 
         assert len(network_checks) > 0
 
-        # Should detect multiple network patterns
+        # Should detect multiple network patterns. Source/stream URLs are redacted
+        # out of finding messages (URL-redaction hardening) and bare inert URL
+        # metadata is filtered, so the literal "evil.com" no longer appears; assert
+        # the real signal instead: the network capability still fires at CRITICAL.
+        assert any(c.severity == IssueSeverity.CRITICAL for c in network_checks)
         network_messages = [c.message for c in network_checks]
-        assert any("evil.com" in msg for msg in network_messages)
         assert any("socket" in msg for msg in network_messages)
         assert any("c2" in msg.lower() for msg in network_messages)
 
@@ -291,11 +294,19 @@ class NetworkExfiltrator:
         scanner = PickleScanner()
         result = scanner.scan(str(test_file))
 
-        network_checks = [
+        # A bare, passive URL stored as plain pickle metadata is inert data, not a
+        # network capability, so it is filtered before network detection and produces
+        # no failed finding. Any network finding that does surface must stay INFO, and
+        # the benign metadata must never escalate to a warning/critical issue.
+        network_failures = [
             c for c in result.checks if "Network Communication" in c.name and c.status == CheckStatus.FAILED
         ]
-        assert network_checks
-        assert all(c.severity == IssueSeverity.INFO for c in network_checks)
+        assert all(c.severity == IssueSeverity.INFO for c in network_failures)
+
+        network_pass = [
+            c for c in result.checks if "Network Communication" in c.name and c.status == CheckStatus.PASSED
+        ]
+        assert network_pass, "Expected the benign metadata URL to leave a passing network check"
 
         warning_or_critical_issues = [
             issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}

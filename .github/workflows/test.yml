@@ -94,7 +94,7 @@ jobs:
           rustup default stable
 
       - name: Cache Python dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             .venv
@@ -354,7 +354,9 @@ jobs:
 
       - name: Pin Python version
         run: |
-          uv python pin 3.12
+          # Match tool.mypy.python_version so version-gated dependency stubs use
+          # syntax valid for the minimum supported Python target.
+          uv python pin 3.10
 
       - name: Install Rust toolchain
         run: |
@@ -362,15 +364,15 @@ jobs:
           rustup default stable
 
       - name: Cache Python dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             .venv
             ~/.cache/pip
             ~/.cache/uv
-          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          key: ${{ runner.os }}-uv-py3.10-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-uv-py3.12-
+            ${{ runner.os }}-uv-py3.10-
             ${{ runner.os }}-uv-
 
       - name: Sync dependencies
@@ -458,7 +460,7 @@ jobs:
           rustup default stable
 
       - name: Cache Python dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             .venv
@@ -516,7 +518,7 @@ jobs:
           rustup default stable
 
       - name: Cache Python dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             .venv
@@ -571,7 +573,7 @@ jobs:
           rustup default stable
 
       - name: Cache Python dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             .venv
@@ -615,9 +617,10 @@ jobs:
       matrix:
         # Test both NumPy versions with appropriate Python versions:
         # - NumPy 1.x on Python 3.10 (last version supporting NumPy 1.x)
-        # - NumPy 2.x on Python 3.11+ (requires Python >=3.11)
+        # - NumPy 2.4.x on Python 3.11 (NumPy 2.5 requires Python >=3.12)
+        # - NumPy 2.5.x on Python 3.12+
         # Reduced matrix for PRs, full matrix for main and merge_group runs
-        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"}]') || fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"},{"python-version":"3.12","numpy-mode":"2.x"},{"python-version":"3.13","numpy-mode":"2.x"}]') }}
+        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"},{"python-version":"3.12","numpy-mode":"2.x"}]') || fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"},{"python-version":"3.12","numpy-mode":"2.x"},{"python-version":"3.13","numpy-mode":"2.x"}]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -637,7 +640,7 @@ jobs:
           rustup default stable
 
       - name: Cache Python dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             .venv
@@ -652,13 +655,28 @@ jobs:
       - name: Install dependencies
         run: |
           # Dependencies are automatically version-matched based on Python version
-          # Python 3.10: NumPy 1.x + TensorFlow 2.13+
-          # Python 3.11+: NumPy 2.x + TensorFlow 2.17+
+          # Python 3.10: NumPy 1.x
+          # Python 3.11: NumPy 2.4.x
+          # Python 3.12+: NumPy 2.5.x
           uv sync --extra all-ci
 
       - name: Check NumPy version
         run: |
-          uv run python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
+          uv run python - <<'PY'
+          import sys
+
+          import numpy
+
+          version = tuple(int(part) for part in numpy.__version__.split(".")[:2])
+          expected = {
+              (3, 10): (1, 0) <= version < (2, 0),
+              (3, 11): (2, 4) <= version < (2, 5),
+              (3, 12): (2, 5) <= version < (2, 6),
+              (3, 13): (2, 5) <= version < (2, 6),
+          }[sys.version_info[:2]]
+          assert expected, f"unexpected NumPy {numpy.__version__} on Python {sys.version_info[:2]}"
+          print(f"NumPy version: {numpy.__version__}")
+          PY
 
       - name: Test scanner diagnostics
         run: |
@@ -868,7 +886,7 @@ jobs:
           rustup default stable
 
       - name: Cache Python dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             .venv
@@ -960,7 +978,7 @@ jobs:
           rustup default stable
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry

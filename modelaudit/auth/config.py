@@ -26,6 +26,7 @@ API_HOST_ALLOWED_HOSTS_ENV = "MODELAUDIT_API_ALLOWED_HOSTS"
 _API_HOST_ENV_VARS = ("MODELAUDIT_API_HOST", "API_HOST")
 _PROMPTFOO_API_HOST_SUFFIX = "promptfoo.app"
 _DNS_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_DEEP_MERGE_CONFIG_SECTIONS = frozenset({"account", "cloud"})
 
 
 def _normalize_api_hostname(hostname: str) -> str:
@@ -264,7 +265,7 @@ class CloudConfig:
 
     def delete(self) -> None:
         """Delete cloud configuration."""
-        write_global_config_partial({"cloud": {}})
+        write_global_config_partial({"cloud": None})
 
     def _save_config(self) -> None:
         """Save cloud configuration."""
@@ -409,6 +410,18 @@ def write_global_config(config: GlobalConfig) -> None:
         pass
 
 
+def _deep_merge_config_dicts(current: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge nested config dictionaries without dropping siblings."""
+    merged = dict(current)
+    for key, value in updates.items():
+        existing_value = merged.get(key)
+        if isinstance(existing_value, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_config_dicts(existing_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def write_global_config_partial(partial_config: dict[str, Any]) -> None:
     """Merge partial configuration into existing config."""
     current_config = read_global_config()
@@ -416,11 +429,16 @@ def write_global_config_partial(partial_config: dict[str, Any]) -> None:
 
     # Merge the partial config
     for key, value in partial_config.items():
-        if value is not None:
-            current_data[key] = value
-        else:
+        if value is None:
             # Remove the property if value is None
             current_data.pop(key, None)
+            continue
+
+        existing_value = current_data.get(key)
+        if key in _DEEP_MERGE_CONFIG_SECTIONS and isinstance(existing_value, dict) and isinstance(value, dict):
+            current_data[key] = _deep_merge_config_dicts(existing_value, value)
+        else:
+            current_data[key] = value
 
     write_global_config(GlobalConfig(current_data))
 
