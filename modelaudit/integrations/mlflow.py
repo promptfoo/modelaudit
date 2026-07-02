@@ -2157,6 +2157,87 @@ def _mlflow_entry_is_reparse_point(path: Path, path_stat: os.stat_result) -> boo
     return bool(reparse_flag and file_attributes & reparse_flag)
 
 
+def _windows_mlflow_file_identity(path: Path) -> tuple[tuple[int, int], int]:
+    """Return the native Windows file identity and hardlink count for ``path``."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    file_read_attributes = 0x0080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        str(path),
+        file_read_attributes,
+        file_share_read | file_share_write | file_share_delete,
+        None,
+        open_existing,
+        file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle_value):
+        error = ctypes_windows.get_last_error()
+        raise OSError(error, f"CreateFileW failed for {path}")
+
+    get_file_information = kernel32.GetFileInformationByHandle
+    get_file_information.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
+    get_file_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    information = ByHandleFileInformation()
+    try:
+        if not get_file_information(handle, ctypes.byref(information)):
+            error = ctypes_windows.get_last_error()
+            raise OSError(error, f"GetFileInformationByHandle failed for {path}")
+    finally:
+        close_handle(handle)
+
+    file_index = (int(information.file_index_high) << 32) | int(information.file_index_low)
+    link_count = int(information.number_of_links)
+    if link_count < 1:
+        raise OSError(f"Windows returned an invalid hardlink count for {path}")
+    return (int(information.volume_serial_number), file_index), link_count
+
+
+def _mlflow_file_identity(path: Path, path_stat: os.stat_result) -> tuple[tuple[int, int], int]:
+    """Return a stable file identity and hardlink count for staging validation."""
+    if _IS_WINDOWS:
+        return _windows_mlflow_file_identity(path)
+    return (int(path_stat.st_dev), int(path_stat.st_ino)), int(getattr(path_stat, "st_nlink", 1))
+
+
 def _capture_mlflow_download_root(
     model_uri: str,
     download_dir: str,
@@ -2322,9 +2403,8 @@ def _validate_mlflow_download_tree(
                             },
                         )
 
-                    link_count = int(getattr(entry_stat, "st_nlink", 1))
+                    inode_key, link_count = _mlflow_file_identity(entry_path, entry_stat)
                     if link_count > 1:
-                        inode_key = (entry_stat.st_dev, entry_stat.st_ino)
                         hardlink_counts[inode_key] = hardlink_counts.get(inode_key, 0) + 1
                         previous_total = hardlink_totals.setdefault(inode_key, link_count)
                         if previous_total != link_count:

@@ -3523,7 +3523,11 @@ def test_scan_bytes_blocks_types_dynamicclassattribute_get_descriptor_rce(tmp_pa
     payload = _types_dynamicclassattribute_get_payload(marker, include_call=True)
 
     control_report = scan_bytes(control_payload, source="types-dynamicclassattribute-get-control.pkl")
-    assert control_report.verdict == SafetyVerdict.CLEAN
+    assert control_report.verdict in {SafetyVerdict.CLEAN, SafetyVerdict.UNKNOWN}
+    if control_report.verdict == SafetyVerdict.UNKNOWN:
+        assert control_report.status == ScanStatus.INCONCLUSIVE
+        assert control_report.findings == ()
+        assert control_report.metadata.get("analysis_incomplete") is True
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)

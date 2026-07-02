@@ -153,6 +153,7 @@ def test_snapshot_local_mlflow_sources_accepts_existing_empty_directory(tmp_path
 
 
 def test_local_mlflow_artifact_root_rejects_remote_file_authority(tmp_path: Path) -> None:
+    pytest.importorskip("mlflow")
     from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
 
     artifact_root = tmp_path / "artifacts"
@@ -1795,6 +1796,7 @@ def test_delegated_mlflow_download_skips_structurally_missing_optional_target(tm
 
 def test_delegated_standard_repository_uses_validated_file_plan(tmp_path: Path) -> None:
     """A standard MLflow repository cannot swap in traversal entries during recursive download."""
+    pytest.importorskip("mlflow")
     from mlflow.entities import FileInfo
     from mlflow.store.artifact.artifact_repo import ArtifactRepository
 

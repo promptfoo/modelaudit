@@ -38,6 +38,7 @@ from modelaudit.scanners.weight_distribution_scanner import WeightDistributionSc
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
+from tests.helpers import is_huggingface_rate_limit_error
 
 
 def _make_external_tensor(name: str, data_type: int, dims: list[int], external_path: str) -> Any:
@@ -8073,13 +8074,18 @@ class TestLargeOnnxFileBackedInspection:
         monkeypatch.setattr(onnx, "load_model_from_string", _fail_string_parse)
         monkeypatch.setattr(OnnxScanner, "_read_onnx_raw_detector_input", _tracking_raw_input)
 
-        path = Path(
-            hf_hub_download(
-                repo_id=repo_id,
-                revision=revision,
-                filename="onnx/model.onnx",
-            ),
-        )
+        try:
+            path = Path(
+                hf_hub_download(
+                    repo_id=repo_id,
+                    revision=revision,
+                    filename="onnx/model.onnx",
+                ),
+            )
+        except Exception as exc:
+            if is_huggingface_rate_limit_error(exc):
+                pytest.skip("Hugging Face rate-limited the pinned ONNX download")
+            raise
 
         assert path.stat().st_size == expected_size
         assert _sha256_file(path) == expected_sha256

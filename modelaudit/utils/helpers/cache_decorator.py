@@ -376,6 +376,18 @@ def _known_uncacheable_scan_result(result: Any) -> bool:
     )
 
 
+def _normalize_uncached_scan_result(result: Any) -> Any:
+    """Preserve fail-closed ScanResult metadata on direct cache bypasses."""
+    try:
+        from ...scanner_results import ScanResult, normalize_unclassified_scan_failure
+    except Exception:
+        return result
+
+    if isinstance(result, ScanResult):
+        normalize_unclassified_scan_failure(result)
+    return result
+
+
 def should_bypass_cache_for_max_file_size(file_path: str, config: dict[str, Any], file_size: int) -> bool:
     """Bypass cache key hashing when regular scanning will reject the file size."""
     try:
@@ -429,12 +441,12 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
             # Fast path for disabled caching or no config
             if not cache_config or not cache_config.enabled:
                 logger.debug(f"Cache disabled for {file_path}, calling function directly")
-                return func(*args, **kwargs)
+                return _normalize_uncached_scan_result(func(*args, **kwargs))
 
             # If no file path, can't cache - call directly
             if not file_path:
                 logger.debug("No file path found, calling function directly")
-                return func(*args, **kwargs)
+                return _normalize_uncached_scan_result(func(*args, **kwargs))
 
             # Check if file should be cached based on characteristics
             try:
@@ -443,55 +455,55 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if not os.access(file_path, os.R_OK):
                     logger.debug(f"Bypassing cache for unreadable file: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
                 if should_bypass_cache_for_read_failure_aware_file(file_path):
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
                 if should_bypass_cache_for_sharded_model(file_path):
                     logger.debug(f"Bypassing cache for sharded model family: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
                 if should_bypass_cache_for_openvino_sidecar(file_path):
                     logger.debug(f"Bypassing cache for OpenVINO sidecar-dependent scan: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
                 raw_config, _ = _extract_config_and_path(args, kwargs)
                 if should_bypass_cache_for_zip_entry_preflight(file_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded ZIP entry preflight: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
                 if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
                     logger.debug(f"Bypassing cache because HDF5 analysis is unavailable: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
                 if should_bypass_cache_for_file_backed_hdf5(file_path):
                     logger.debug(f"Bypassing cache for file-backed HDF5 inspection: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
                 if should_defer_hash_for_file_backed_onnx(file_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for file-backed ONNX inspection: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
                     logger.debug(f"File {file_path} not suitable for caching, calling function directly")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
                 if should_bypass_cache_for_safetensors_header_limit(file_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded SafeTensors header failure: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
                 if should_bypass_cache_for_max_file_size(file_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for max_file_size rejection: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
                 if should_defer_hash_for_pytorch_read_limit(file_path, raw_config or {}, file_stat.st_size):
                     logger.debug(f"Bypassing cache for bounded PyTorch read-limit scan: {file_path}")
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
 
             except OSError:
                 # File doesn't exist or can't be accessed, call function directly
                 logger.debug(f"Cannot access {file_path}, calling function directly")
-                return func(*args, **kwargs)
+                return _normalize_uncached_scan_result(func(*args, **kwargs))
 
             # Use cache manager for cache-enabled operations
             try:
@@ -500,7 +512,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
                 if cache_manager.cache is None:
-                    return func(*args, **kwargs)
+                    return _normalize_uncached_scan_result(func(*args, **kwargs))
                 version_context = add_optional_dependency_availability_to_version_context(
                     cache_config.get_version_context()
                 )
@@ -544,7 +556,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                         logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
                         if pre_scan_identity is None:
                             logger.debug(f"Bypassing cache store for {file_path}: stable identity unavailable")
-                            return func(*args, **kwargs)
+                            return _normalize_uncached_scan_result(func(*args, **kwargs))
                         pre_scan_stat, pre_scan_hash, pre_scan_change_token, pre_scan_ancestor_identity = (
                             pre_scan_identity
                         )
@@ -588,7 +600,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
             except Exception as e:
                 logger.warning(f"Cache system error for {file_path}: {e}. Falling back to direct execution.")
-                return func(*args, **kwargs)
+                return _normalize_uncached_scan_result(func(*args, **kwargs))
 
         return wrapper  # type: ignore[return-value]
 
