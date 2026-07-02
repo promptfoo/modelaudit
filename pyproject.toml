@@ -148,7 +148,7 @@ all = [
 ]
 
 [project.scripts]
-modelaudit = "modelaudit.cli:main"
+modelaudit = "modelaudit.__main__:_run"
 
 [project.urls]
 Repository = "https://github.com/promptfoo/modelaudit"
