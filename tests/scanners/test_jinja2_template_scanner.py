@@ -213,6 +213,27 @@ class TestJinja2TemplateScannerPatternCategories:
         patterns = {c.details.get("pattern_type") for c in failed_checks if c.details}
         assert "global_access" in patterns or "object_traversal" in patterns
 
+    def test_detects_lipsum_and_get_flashed_messages_gadgets(self, tmp_path: Path) -> None:
+        """Global-access gadgets via lipsum / get_flashed_messages should be flagged.
+
+        These reach __globals__ through the dotted attribute form, which Jinja2
+        resolves via getattr then getitem, so they carry no __globals__[ subscript
+        and no separately-flagged sink. Benign marker only, no exploit chain.
+        """
+        for name, gadget in (
+            ("lipsum", "{{ lipsum.__globals__.os }}"),
+            ("get_flashed_messages", "{{ get_flashed_messages.__globals__.os }}"),
+        ):
+            template_file = tmp_path / f"{name}.jinja"
+            template_file.write_text(gadget)
+
+            result = Jinja2TemplateScanner().scan(str(template_file))
+
+            failed_checks = [c for c in result.checks if c.status == CheckStatus.FAILED]
+            assert failed_checks, f"{name} gadget should be flagged"
+            patterns = {c.details.get("pattern_type") for c in failed_checks if c.details}
+            assert "global_access" in patterns, f"{name}: {patterns}"
+
     def test_detects_builtins_access(self, tmp_path: Path) -> None:
         """Test detection of __builtins__ access patterns."""
         template_file = tmp_path / "builtins.jinja"

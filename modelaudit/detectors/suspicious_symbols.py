@@ -924,6 +924,13 @@ JINJA2_SSTI_PATTERNS = {
         # Request/application context access (web frameworks)
         r"request\.application\.__globals__",  # Flask request object
         r"config\.__class__\.__init__\.__globals__",  # Config object globals
+        # Default Jinja2 / Flask globals that also expose __globals__ (SSTI gadgets)
+        r"lipsum\.__globals__",  # Via lipsum (a default Jinja2 global)
+        r"get_flashed_messages\.__globals__",  # Via Flask get_flashed_messages global
+        # Generic attribute-access reach into __globals__ (e.g. x.__globals__.os),
+        # which Jinja2 resolves via getattr then getitem but which evades the
+        # __globals__[ subscript pattern above; also covers future gadget objects
+        r"\.__globals__",  # Any attribute access to __globals__
         # Module globals access
         r"\._module\.__builtins__",  # Module builtins
         r"sys\.modules\[",  # Access loaded modules
