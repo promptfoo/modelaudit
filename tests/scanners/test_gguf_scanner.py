@@ -922,6 +922,9 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
     [
         ("{{ ''.__class__.__mro__[1].__subclasses__() }}", "jinja2_object_traversal"),
         ("{{ request|attr('__class__') }}", "jinja2_obfuscation"),
+        ("{{ lipsum . __globals__ . os }}", "jinja2_named_global_access"),
+        ("Don't ignore {{ lipsum.__globals__.os }}", "jinja2_named_global_access"),
+        ("{{ lipsum.__globals__ ['os'] }}", "jinja2_named_global_access"),
     ],
 )
 def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidence(
@@ -942,6 +945,34 @@ def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidenc
         check.details["evidence_type"] == "template_injection" and check.details["pattern"] == expected_pattern
         for check in checks
     )
+    assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    "benign_payload",
+    [
+        '{{ "docs: lipsum.__globals__.os" }}',
+        "{{ \"docs: lipsum.__globals__ ['os']\" }}",
+        "{% set lipsum = {'__globals__': {'os': 'docs'}} %}{{ lipsum.__globals__.os }}",
+        "{% with lipsum = {'__globals__': {'os': 'docs'}} %}{{ lipsum.__globals__.os }}{% endwith %}",
+        "Docs: lipsum.__globals__.os",
+        "{% raw %}{{ lipsum.__globals__.os }}{% endraw %}",
+        "{# {{ lipsum.__globals__.os }} #}",
+    ],
+)
+def test_gguf_oversized_chat_template_ignores_inert_named_gadget_text(
+    tmp_path: Path,
+    benign_payload: str,
+) -> None:
+    template = benign_payload + ("{{ content }}" * 100)
+    path = create_mock_gguf(
+        tmp_path / "large-inert-template.gguf",
+        metadata={"tokenizer.chat_template": template},
+    )
+
+    result = GgufScanner(config={"max_template_size": 64}).scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
     assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
