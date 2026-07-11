@@ -1809,8 +1809,10 @@ class Jinja2TemplateScanner(BaseScanner):
                     literal_items = [item.key for item in node.iter.items]
 
                 if literal_items == []:
+                    else_shadowed = shadowed.copy()
+                    else_dangerous = dangerous_aliases.copy()
                     for child in node.else_:
-                        visit(child, shadowed.copy(), dangerous_aliases.copy(), node)
+                        visit(child, else_shadowed, else_dangerous, node)
                     return
 
                 if literal_items is not None:
