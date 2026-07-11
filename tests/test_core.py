@@ -2100,7 +2100,9 @@ def test_calculate_file_hash_keeps_large_reads_with_distant_deadline(
     monkeypatch.setattr(core_module.time, "time", lambda: 0.0)
 
     deadline = core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 60.0
-    assert core_module._calculate_file_hash(str(source_path), deadline=deadline) == hashlib.sha256(content).hexdigest()
+    assert (
+        core_module._calculate_file_hash(str(source_path), deadline=deadline) == hashlib.sha256(content).hexdigest()
+    )
     assert read_sizes == [DEFAULT_READ_CHUNK_SIZE] * 3
 
 
