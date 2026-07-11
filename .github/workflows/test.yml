@@ -119,9 +119,7 @@ jobs:
 
       - name: Check formatting with Ruff
         run: |
-          uv run ruff format modelaudit/scanners/jinja2_template_scanner.py
-          git diff -- modelaudit/scanners/jinja2_template_scanner.py
-          exit 1
+          uv run ruff format --check modelaudit/ tests/
 
   dependency-audit:
     name: Dependency Audit
