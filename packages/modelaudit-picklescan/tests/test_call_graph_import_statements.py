@@ -3068,14 +3068,12 @@ def _is_typing_get_type_hints_guard(statement: ast.stmt) -> bool:
         and any(
             isinstance(branch_statement, ast.Assign)
             and any(
-                isinstance(target, ast.Name) and target.id == "get_type_hints"
-                for target in branch_statement.targets
+                isinstance(target, ast.Name) and target.id == "get_type_hints" for target in branch_statement.targets
             )
             for branch_statement in statement.body
         )
         and any(
-            isinstance(branch_statement, ast.FunctionDef)
-            and branch_statement.name == "get_type_hints"
+            isinstance(branch_statement, ast.FunctionDef) and branch_statement.name == "get_type_hints"
             for branch_statement in statement.orelse
         )
     )
