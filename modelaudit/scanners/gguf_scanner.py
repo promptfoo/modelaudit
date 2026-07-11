@@ -2173,15 +2173,17 @@ class GgufScanner(BaseScanner):
                 end,
                 JINJA2_NAMED_GLOBAL_ACCESS_PATTERN,
             ):
+                if len(match.group("open")) != len(match.group("close")):
+                    continue
                 previous = match.start() - 1
                 while previous >= start and value[previous].isspace():
                     previous -= 1
-                if previous < start or value[previous] != ".":
+                if previous < start or value[previous] not in ".(":
                     named_global_access = True
                     break
 
             for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
-                if pattern.pattern == r"__globals__\s*\[":
+                if pattern.pattern == r"__globals__\s*\)*\s*\[":
                     matched = next(cls._iter_unquoted_template_matches(value, start, end, pattern), None) is not None
                 else:
                     matched = pattern.search(value, start, end) is not None
