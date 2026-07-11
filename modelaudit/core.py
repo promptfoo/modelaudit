@@ -2887,9 +2887,7 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                         raise TimeoutError(f"File hashing timed out: {file_path}")
                     fine_read_window = _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS
                     if coarse_read_seconds is not None:
-                        fine_read_window += (
-                            coarse_read_seconds * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
-                        )
+                        fine_read_window += coarse_read_seconds * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
                     if remaining_seconds <= fine_read_window:
                         read_chunk_size = _DEADLINE_HASH_FINE_READ_CHUNK_SIZE
                     elif calibration_mode and calibration_read_seconds is not None:
