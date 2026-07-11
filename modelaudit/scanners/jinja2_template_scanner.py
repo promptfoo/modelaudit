@@ -1591,18 +1591,12 @@ class Jinja2TemplateScanner(BaseScanner):
                 {node.name} if isinstance(node, jinja2.nodes.Name) and node.ctx in {"param", "store"} else set()
             )
 
-        def is_safe_literal(node: Any) -> bool:
-            try:
-                node.as_const()
-            except Exception:
-                return False
-            return True
-
         def constant_truth(node: Any) -> bool | None:
-            try:
-                return bool(node.as_const())
-            except Exception:
-                return None
+            if isinstance(node, jinja2.nodes.Const):
+                return bool(node.value)
+            if isinstance(node, (jinja2.nodes.List, jinja2.nodes.Tuple, jinja2.nodes.Dict)):
+                return bool(node.items)
+            return None
 
         def is_dangerous_name(
             node: Any,
@@ -1619,6 +1613,16 @@ class Jinja2TemplateScanner(BaseScanner):
                 return is_dangerous_name(node.expr1, shadowed, dangerous_aliases) or (
                     node.expr2 is not None and is_dangerous_name(node.expr2, shadowed, dangerous_aliases)
                 )
+            if isinstance(node, (jinja2.nodes.And, jinja2.nodes.Or)):
+                truth = constant_truth(node.left)
+                if truth is None:
+                    return is_dangerous_name(node.left, shadowed, dangerous_aliases) or is_dangerous_name(
+                        node.right,
+                        shadowed,
+                        dangerous_aliases,
+                    )
+                selected = node.right if truth == isinstance(node, jinja2.nodes.And) else node.left
+                return is_dangerous_name(selected, shadowed, dangerous_aliases)
             sequence_types = (jinja2.nodes.List, jinja2.nodes.Tuple)
             if (
                 isinstance(node, jinja2.nodes.Getitem)
@@ -1629,6 +1633,21 @@ class Jinja2TemplateScanner(BaseScanner):
             ):
                 return is_dangerous_name(node.node.items[node.arg.value], shadowed, dangerous_aliases)
             return False
+
+        def direct_named_root(node: Any, shadowed: set[str]) -> str | None:
+            if isinstance(node, jinja2.nodes.Name):
+                return node.name if node.name in named_roots and node.name not in shadowed else None
+            if isinstance(node, jinja2.nodes.CondExpr):
+                truth = constant_truth(node.test)
+                if truth is None:
+                    return None
+                selected = node.expr1 if truth else node.expr2
+                return direct_named_root(selected, shadowed) if selected is not None else None
+            if isinstance(node, jinja2.nodes.And):
+                return direct_named_root(node.right, shadowed) if constant_truth(node.left) is True else None
+            if isinstance(node, jinja2.nodes.Or):
+                return direct_named_root(node.right, shadowed) if constant_truth(node.left) is False else None
+            return None
 
         def update_bindings(
             target_node: Any,
@@ -1665,19 +1684,13 @@ class Jinja2TemplateScanner(BaseScanner):
                     )
                 return
 
-            safe_value = is_safe_literal(value) or (
-                isinstance(value, jinja2.nodes.Name) and value.name in source_shadowed
-            )
             dangerous_value = is_dangerous_name(
                 value,
                 source_shadowed,
                 source_dangerous_aliases,
             )
             for target in stored_names(target_node):
-                if safe_value:
-                    shadowed.add(target)
-                    dangerous_aliases.discard(target)
-                elif dangerous_value:
+                if dangerous_value:
                     shadowed.discard(target)
                     dangerous_aliases.add(target)
                 else:
@@ -1692,13 +1705,25 @@ class Jinja2TemplateScanner(BaseScanner):
         ) -> None:
             if isinstance(node, jinja2.nodes.Getattr):
                 receiver = node.node
+                receiver_root = direct_named_root(receiver, shadowed)
                 if (
                     node.attr == "__globals__"
-                    and isinstance(receiver, jinja2.nodes.Name)
-                    and receiver.name in named_roots
-                    and receiver.name not in shadowed
+                    and receiver_root is not None
+                    and (isinstance(receiver, jinja2.nodes.Name) or not isinstance(parent, jinja2.nodes.Getitem))
                 ):
-                    matches.append(receiver.name)
+                    matches.append(receiver_root)
+
+            if isinstance(node, (jinja2.nodes.And, jinja2.nodes.Or)):
+                visit(node.left, shadowed, dangerous_aliases, node)
+                truth = constant_truth(node.left)
+                if (
+                    isinstance(node, jinja2.nodes.And)
+                    and truth is not False
+                    or isinstance(node, jinja2.nodes.Or)
+                    and truth is not True
+                ):
+                    visit(node.right, shadowed, dangerous_aliases, node)
+                return
 
             if isinstance(node, jinja2.nodes.CondExpr):
                 visit(node.test, shadowed, dangerous_aliases, node)
@@ -1777,10 +1802,20 @@ class Jinja2TemplateScanner(BaseScanner):
             if isinstance(node, jinja2.nodes.For):
                 visit(node.iter, shadowed, dangerous_aliases, node)
                 target_names = stored_names(node.target)
-                sequence_types = (jinja2.nodes.List, jinja2.nodes.Tuple)
-                if isinstance(node.iter, sequence_types) and node.iter.items:
+                literal_items: list[Any] | None = None
+                if isinstance(node.iter, (jinja2.nodes.List, jinja2.nodes.Tuple)):
+                    literal_items = list(node.iter.items)
+                elif isinstance(node.iter, jinja2.nodes.Dict):
+                    literal_items = [item.key for item in node.iter.items]
+
+                if literal_items == []:
+                    for child in node.else_:
+                        visit(child, shadowed.copy(), dangerous_aliases.copy(), node)
+                    return
+
+                if literal_items is not None:
                     iteration_states: list[tuple[set[str], set[str]]] = []
-                    for item in node.iter.items:
+                    for item in literal_items:
                         item_shadowed = shadowed.copy()
                         item_dangerous = dangerous_aliases.copy()
                         update_bindings(
@@ -1801,10 +1836,11 @@ class Jinja2TemplateScanner(BaseScanner):
                     visit(node.test, body_shadowed, body_dangerous, node)
                 for child in node.body:
                     visit(child, body_shadowed, body_dangerous, node)
-                else_shadowed = shadowed.copy()
-                else_dangerous = dangerous_aliases.copy()
-                for child in node.else_:
-                    visit(child, else_shadowed, else_dangerous, node)
+                if literal_items is None or node.test is not None:
+                    else_shadowed = shadowed.copy()
+                    else_dangerous = dangerous_aliases.copy()
+                    for child in node.else_:
+                        visit(child, else_shadowed, else_dangerous, node)
                 return
 
             if isinstance(node, jinja2.nodes.Macro):
