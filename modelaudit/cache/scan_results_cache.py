@@ -457,7 +457,7 @@ class ScanResultsCache:
         Returns:
             Cached scan result dictionary if found and valid, None otherwise
         """
-        if type(self).get_cached_result_with_identity is ScanResultsCache.get_cached_result_with_identity:
+        if getattr(self.get_cached_result_with_identity, "__func__", None) is ScanResultsCache.get_cached_result_with_identity:
             cached_result, file_identity = self._get_cached_result_with_identity(
                 file_path,
                 version_context=version_context,
@@ -504,7 +504,10 @@ class ScanResultsCache:
                 logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
                 return None, None
 
-            if file_stat is not None and type(self).capture_file_identity is ScanResultsCache.capture_file_identity:
+            if (
+                file_stat is not None
+                and getattr(self.capture_file_identity, "__func__", None) is ScanResultsCache.capture_file_identity
+            ):
                 file_identity = self._capture_file_identity(file_path, file_stat=file_stat)
             else:
                 # Preserve legacy subclasses that override the established signature.
