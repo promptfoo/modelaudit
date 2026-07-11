@@ -975,6 +975,8 @@ def test_gguf_oversized_chat_template_bounds_malformed_tag_name() -> None:
             "{% raw-%}{{ docs }}{% endraw-%}{{ lipsum.__globals__.os }}",
             "jinja2_named_global_access",
         ),
+        ("{% raw-evil %}{{ other.__globals__['os'] }}", "jinja2_global_access"),
+        ("{% raw+suffix %}{{ other.__globals__['os'] }}", "jinja2_global_access"),
     ],
 )
 def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidence(
