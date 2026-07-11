@@ -765,6 +765,10 @@ def test_cache_manager_forwards_stat_to_existing_cache_api(
         return override_expected, override_identity
 
     monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", legacy_manager_lookup)
+    monkeypatch.setattr(
+        "modelaudit.cache.cache_manager.cached_scan_result_dependencies_available",
+        lambda _result: False,
+    )
 
     assert cache_manager.get_cached_result_with_stat(str(file_path), provided_stat) == override_expected
     assert manager_override_called is True
