@@ -2084,7 +2084,7 @@ def test_calculate_file_hash_preserves_throughput_before_fine_window(
     deadline: float,
     expected_read_sizes: list[int],
 ) -> None:
-    """Timeout-bound scans must retain large reads after bounded calibration."""
+    """Timeout-bound scans use large reads or bounded 1 MiB calibration."""
     from modelaudit.scanners.base import DEFAULT_READ_CHUNK_SIZE
 
     content = bytes(DEFAULT_READ_CHUNK_SIZE + 7)
