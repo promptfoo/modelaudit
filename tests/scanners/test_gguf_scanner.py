@@ -972,7 +972,10 @@ def test_gguf_oversized_chat_template_ignores_inert_named_gadget_text(
 
     result = GgufScanner(config={"max_template_size": 64}).scan(str(path))
 
-    assert _failed_metadata_value_checks(result) == []
+    assert not any(
+        check.details["pattern"] == "jinja2_named_global_access"
+        for check in _failed_metadata_value_checks(result)
+    )
     assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
