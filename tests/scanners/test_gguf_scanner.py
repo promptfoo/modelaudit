@@ -956,6 +956,13 @@ def test_gguf_oversized_chat_template_ignores_large_quoted_named_gadget() -> Non
     assert GgufScanner._oversized_chat_template_security_evidence(template) == []
 
 
+def test_gguf_oversized_chat_template_bounds_malformed_tag_name() -> None:
+    template = "{%" + ("a" * 50001)
+
+    assert list(Jinja2TemplateScanner.iter_executable_template_ranges(template)) == [(0, len(template), True)]
+    assert GgufScanner._oversized_chat_template_security_evidence(template) == []
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_pattern"),
     [
@@ -964,6 +971,10 @@ def test_gguf_oversized_chat_template_ignores_large_quoted_named_gadget() -> Non
         ("{{ lipsum . __globals__ . os }}", "jinja2_named_global_access"),
         ("Don't ignore {{ lipsum.__globals__.os }}", "jinja2_named_global_access"),
         ("{{ lipsum.__globals__ ['os'] }}", "jinja2_named_global_access"),
+        (
+            "{% raw-%}{{ docs }}{% endraw-%}{{ lipsum.__globals__.os }}",
+            "jinja2_named_global_access",
+        ),
     ],
 )
 def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidence(
@@ -996,6 +1007,7 @@ def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidenc
         "{% with lipsum = {'__globals__': {'os': 'docs'}} %}{{ lipsum.__globals__.os }}{% endwith %}",
         "Docs: lipsum.__globals__.os",
         "{% raw %}{{ lipsum.__globals__.os }}{% endraw %}",
+        "{% raw-%}{{ lipsum.__globals__.os }}{% endraw-%}",
         "{# {{ lipsum.__globals__.os }} #}",
     ],
 )
