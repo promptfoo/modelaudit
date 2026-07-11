@@ -1462,7 +1462,7 @@ class Jinja2TemplateScanner(BaseScanner):
         named_receiver_pattern = (
             re.compile(
                 rf"(?<!\w)(?:{'|'.join(re.escape(receiver) for receiver in sorted(covered_global_receivers))})"
-                r"\s*\.\s*__globals__\b"
+                r"\s*\)*\s*\.\s*__globals__\b"
             )
             if covered_global_receivers
             else None
@@ -1595,6 +1595,12 @@ class Jinja2TemplateScanner(BaseScanner):
                 return False
             return True
 
+        def constant_truth(node: Any) -> bool | None:
+            try:
+                return bool(node.as_const())
+            except Exception:
+                return None
+
         def is_dangerous_name(
             node: Any,
             shadowed: set[str],
@@ -1602,6 +1608,12 @@ class Jinja2TemplateScanner(BaseScanner):
         ) -> bool:
             if isinstance(node, jinja2.nodes.Name):
                 return node.name in dangerous_aliases or (node.name in named_roots and node.name not in shadowed)
+            if isinstance(node, jinja2.nodes.CondExpr):
+                truth = constant_truth(node.test)
+                if truth is not None:
+                    selected = node.expr1 if truth else node.expr2
+                    return is_dangerous_name(selected, shadowed, dangerous_aliases)
+                return False
             sequence_types = (jinja2.nodes.List, jinja2.nodes.Tuple)
             if (
                 isinstance(node, jinja2.nodes.Getitem)
@@ -1717,28 +1729,30 @@ class Jinja2TemplateScanner(BaseScanner):
                 return
 
             if isinstance(node, jinja2.nodes.If):
-                visit(node.test, shadowed, dangerous_aliases, node)
                 branch_states: list[tuple[set[str], set[str]]] = []
+                fallthrough_possible = True
+                branches = [(node.test, node.body), *((elif_node.test, elif_node.body) for elif_node in node.elif_)]
+                for branch_test, branch_body in branches:
+                    if not fallthrough_possible:
+                        break
+                    visit(branch_test, shadowed, dangerous_aliases, node)
+                    truth = constant_truth(branch_test)
+                    if truth is False:
+                        continue
+                    branch_shadowed = shadowed.copy()
+                    branch_dangerous = dangerous_aliases.copy()
+                    for child in branch_body:
+                        visit(child, branch_shadowed, branch_dangerous, node)
+                    branch_states.append((branch_shadowed, branch_dangerous))
+                    if truth is True:
+                        fallthrough_possible = False
 
-                body_shadowed = shadowed.copy()
-                body_dangerous = dangerous_aliases.copy()
-                for child in node.body:
-                    visit(child, body_shadowed, body_dangerous, node)
-                branch_states.append((body_shadowed, body_dangerous))
-
-                for elif_node in node.elif_:
-                    visit(elif_node.test, shadowed, dangerous_aliases, elif_node)
-                    elif_shadowed = shadowed.copy()
-                    elif_dangerous = dangerous_aliases.copy()
-                    for child in elif_node.body:
-                        visit(child, elif_shadowed, elif_dangerous, elif_node)
-                    branch_states.append((elif_shadowed, elif_dangerous))
-
-                else_shadowed = shadowed.copy()
-                else_dangerous = dangerous_aliases.copy()
-                for child in node.else_:
-                    visit(child, else_shadowed, else_dangerous, node)
-                branch_states.append((else_shadowed, else_dangerous))
+                if fallthrough_possible:
+                    else_shadowed = shadowed.copy()
+                    else_dangerous = dangerous_aliases.copy()
+                    for child in node.else_:
+                        visit(child, else_shadowed, else_dangerous, node)
+                    branch_states.append((else_shadowed, else_dangerous))
 
                 shadowed.clear()
                 shadowed.update(set.intersection(*(state[0] for state in branch_states)))
