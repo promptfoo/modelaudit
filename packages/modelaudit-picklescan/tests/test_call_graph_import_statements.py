@@ -3120,7 +3120,9 @@ def test_runtime_guard_selects_live_builtin_sentinel_branch() -> None:
     typing_extensions = pytest.importorskip("typing_extensions")
     source_path = Path(typing_extensions.__file__)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    guard = next(statement for statement in tree.body if _is_builtin_sentinel_guard(statement))
+    guard = next((statement for statement in tree.body if _is_builtin_sentinel_guard(statement)), None)
+    if guard is None:
+        pytest.skip("installed typing_extensions has no builtins.sentinel runtime guard")
 
     statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
 
@@ -3147,7 +3149,9 @@ def test_runtime_guard_keeps_dynamic_builtin_sentinel_ambiguous(
         pytest.skip("builtins.sentinel is directly available")
     source_path = Path(typing_extensions.__file__)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    guard = next(statement for statement in tree.body if _is_builtin_sentinel_guard(statement))
+    guard = next((statement for statement in tree.body if _is_builtin_sentinel_guard(statement)), None)
+    if guard is None:
+        pytest.skip("installed typing_extensions has no builtins.sentinel runtime guard")
     monkeypatch.setitem(builtins_namespace, "__getattr__", lambda _name: object())
 
     assert hasattr(builtins, "sentinel")
