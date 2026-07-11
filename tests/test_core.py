@@ -2073,11 +2073,7 @@ def test_calculate_file_hash_rejects_fifo_swap_without_blocking(
         ),
         pytest.param(
             9.0,
-            [
-                core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE,
-                core_module.DEFAULT_READ_CHUNK_SIZE,
-                core_module.DEFAULT_READ_CHUNK_SIZE,
-            ],
+            [core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE] * 10,
             id="short",
         ),
     ],
