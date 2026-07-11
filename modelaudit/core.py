@@ -2877,6 +2877,7 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
 
             hash_sha256 = hashlib.sha256()
             coarse_read_seconds: float | None = None
+            calibration_mode = False
             while True:
                 read_chunk_size = DEFAULT_READ_CHUNK_SIZE
                 if deadline is not None:
@@ -2888,7 +2889,7 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                         fine_read_window += coarse_read_seconds * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
                     if remaining_seconds <= fine_read_window:
                         read_chunk_size = _DEADLINE_HASH_FINE_READ_CHUNK_SIZE
-                    elif (
+                    elif calibration_mode or (
                         coarse_read_seconds is None
                         and remaining_seconds
                         <= _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
@@ -2900,8 +2901,12 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                 read_elapsed = max(0.0, time.monotonic() - read_started)
                 if not chunk:
                     break
-                if read_chunk_size in {DEFAULT_READ_CHUNK_SIZE, _DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE}:
+                if read_chunk_size == DEFAULT_READ_CHUNK_SIZE:
                     coarse_read_seconds = read_elapsed
+                    calibration_mode = False
+                elif read_chunk_size == _DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE:
+                    coarse_read_seconds = read_elapsed
+                    calibration_mode = True
                 hash_sha256.update(chunk)
 
             final_stat = os.fstat(source.fileno())
