@@ -3272,6 +3272,9 @@ def test_onnx_scanner_registered_ai_onnx_preview_operator_not_flagged(
         return (domain, op_type, version) == ("ai.onnx.preview", "FlexAttention", 1)
 
     monkeypatch.setattr("modelaudit.scanners.onnx_scanner._has_operator_schema", registered_schema)
+    # This classifier test supplies a synthetic schema through the scanner
+    # hook, so isolate it from ONNX's independent schema registry.
+    monkeypatch.setattr(onnx.checker, "check_model", lambda _model: None)
     model_path = create_onnx_model(
         tmp_path,
         custom=True,
