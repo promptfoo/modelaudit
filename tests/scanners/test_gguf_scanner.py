@@ -26,6 +26,7 @@ from modelaudit.scanners.gguf_scanner import (
     GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON,
     GgufScanner,
 )
+from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_gguf
 
@@ -915,6 +916,33 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
     assert not any(check.name == "Jinja2 SSTI Analysis" for check in direct.checks)
     assert _failed_metadata_value_checks(direct) == []
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
+
+
+def test_gguf_oversized_chat_template_security_evidence_streams_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    def iter_spans(value: str) -> Iterator[str]:
+        seen.append(value)
+        yield "{{ content }}"
+        yield "{{ lipsum.__globals__.os }}"
+
+    monkeypatch.setattr(
+        Jinja2TemplateScanner,
+        "iter_executable_template_spans",
+        staticmethod(iter_spans),
+    )
+    monkeypatch.setattr(
+        Jinja2TemplateScanner,
+        "executable_template_spans",
+        staticmethod(lambda _value: pytest.fail("oversized evidence must not materialize all spans")),
+    )
+
+    evidence = GgufScanner._oversized_chat_template_security_evidence("oversized")
+
+    assert seen == ["oversized"]
+    assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
 
 
 @pytest.mark.parametrize(
