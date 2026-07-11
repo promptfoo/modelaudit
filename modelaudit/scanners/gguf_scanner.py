@@ -2173,7 +2173,7 @@ class GgufScanner(BaseScanner):
                 end,
                 JINJA2_NAMED_GLOBAL_ACCESS_PATTERN,
             ):
-                if len(match.group("open")) != len(match.group("close")):
+                if match.group("open").count("(") != match.group("close").count(")"):
                     continue
                 previous = match.start() - 1
                 while previous >= start and value[previous].isspace():
