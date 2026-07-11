@@ -213,6 +213,189 @@ class TestJinja2TemplateScannerPatternCategories:
         patterns = {c.details.get("pattern_type") for c in failed_checks if c.details}
         assert "global_access" in patterns or "object_traversal" in patterns
 
+    @pytest.mark.parametrize(
+        ("name", "template"),
+        [
+            ("lipsum", "{{ lipsum.__globals__.os }}"),
+            ("lipsum-spaced", "{{ lipsum . __globals__ . os }}"),
+            ("flashes", "{{ get_flashed_messages.__globals__.os }}"),
+            ("flashes-spaced", "{{ get_flashed_messages. __globals__ .os }}"),
+            ("lipsum-subscript", "{{ lipsum.__globals__['os'] }}"),
+            ("lipsum-spaced-subscript", "{{ lipsum.__globals__ ['os'] }}"),
+            ("lipsum-parenthesized-subscript", "{{ (lipsum.__globals__)['os'] }}"),
+        ],
+    )
+    def test_detects_named_global_access_once(
+        self,
+        tmp_path: Path,
+        name: str,
+        template: str,
+    ) -> None:
+        template_file = tmp_path / f"{name}.jinja"
+        template_file.write_text(template)
+
+        result = Jinja2TemplateScanner().scan(str(template_file))
+
+        global_access_checks = [
+            check
+            for check in result.checks
+            if check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+        ]
+        assert len(global_access_checks) == 1
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{% set lipsum = {'__globals__': {'os': 'docs'}} %}{{ lipsum.__globals__.os }}",
+            "{% with lipsum = {'__globals__': {'os': 'docs'}} %}{{ lipsum.__globals__.os }}{% endwith %}",
+            "{% for x, lipsum in pairs %}{{ lipsum.__globals__.os }}{% endfor %}",
+            "{% macro demo(lipsum) %}{{ lipsum.__globals__.os }}{% endmacro %}",
+            "{% set lipsum %}docs{% endset %}{{ lipsum.__globals__.os }}",
+            "{% call(lipsum) helper() %}{{ lipsum.__globals__.os }}{% endcall %}",
+            "{{ \"docs: lipsum.__globals__ ['os']\" }}",
+            "{% set safe = {'__globals__': {'os': 'docs'}} %}{% set lipsum = safe %}{{ lipsum.__globals__.os }}",
+            "{% import 'helpers.j2' as lipsum %}{{ lipsum.__globals__.os }}",
+            "{% from 'helpers.j2' import helper as lipsum %}{{ lipsum.__globals__.os }}",
+            "{% macro lipsum() %}{% endmacro %}{{ lipsum.__globals__.os }}",
+            "{% macro lipsum() %}{{ lipsum.__globals__.os }}{% endmacro %}",
+        ],
+    )
+    def test_named_global_access_ignores_ast_local_bindings(
+        self,
+        tmp_path: Path,
+        template: str,
+    ) -> None:
+        if not jinja2_template_scanner.HAS_JINJA2_SANDBOX:
+            pytest.skip("Jinja2 AST unavailable")
+        template_file = tmp_path / "local-binding.jinja"
+        template_file.write_text(template)
+
+        result = Jinja2TemplateScanner().scan(str(template_file))
+
+        assert not any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{% set saved = lipsum %}{% set lipsum = {} %}{% set lipsum = saved %}{{ lipsum.__globals__.os }}",
+            "".join(
+                (
+                    "{% set saved = lipsum %}{% set lipsum = {} %}",
+                    "{% if true %}{% set lipsum = saved %}{% endif %}",
+                    "{{ lipsum.__globals__.os }}",
+                )
+            ),
+            "{% set saved = lipsum %}{% set lipsum = [saved][0] %}{{ lipsum.__globals__.os }}",
+            "".join(
+                (
+                    "{% set saved = lipsum %}{% set lipsum = {} %}",
+                    "{% set lipsum, other = saved, 0 %}{{ lipsum.__globals__.os }}",
+                )
+            ),
+            "{% macro demo(x=lipsum) %}{{ lipsum.__globals__.os }}{% endmacro %}",
+            "{% set lipsum, saved = {}, lipsum %}{% set lipsum = saved %}{{ lipsum.__globals__.os }}",
+            "{% with lipsum = {}, saved = lipsum %}{% set lipsum = saved %}{{ lipsum.__globals__.os }}{% endwith %}",
+            "{% macro lipsum(lipsum=lipsum) %}{{ lipsum.__globals__.os }}{% endmacro %}",
+            "{% for lipsum, unused in [(lipsum, 0)] %}{{ lipsum.__globals__.os }}{% endfor %}",
+            "{% macro demo(lipsum=lipsum) %}{{ lipsum.__globals__.os }}{% endmacro %}",
+            "{% call(lipsum=lipsum) helper() %}{{ lipsum.__globals__.os }}{% endcall %}",
+            "{% import lipsum.__globals__.get('os') as helper %}",
+            "{% from lipsum.__globals__.get('os') import helper %}",
+        ],
+    )
+    def test_named_global_access_detects_ast_dynamic_rebindings(
+        self,
+        tmp_path: Path,
+        template: str,
+    ) -> None:
+        if not jinja2_template_scanner.HAS_JINJA2_SANDBOX:
+            pytest.skip("Jinja2 AST unavailable")
+        template_file = tmp_path / "dynamic-binding.jinja"
+        template_file.write_text(template)
+
+        result = Jinja2TemplateScanner().scan(str(template_file))
+
+        assert any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in result.checks
+        )
+
+    def test_named_global_access_keeps_unrelated_subscript_finding(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        template_file = tmp_path / "mixed-globals.jinja"
+        template_file.write_text("{% set lipsum = {} %}{{ lipsum.__globals__.os, other.__globals__['os'] }}")
+
+        result = Jinja2TemplateScanner({"enable_sandbox_test": False}).scan(
+            str(template_file)
+        )
+
+        global_access_checks = [
+            check
+            for check in result.checks
+            if check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+        ]
+        assert len(global_access_checks) == 1
+        assert global_access_checks[0].details.get("match_text") == "__globals__["
+
+    def test_named_global_access_fallback_is_conservative_around_statements(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_JINJA2_SANDBOX", False)
+        direct_file = tmp_path / "direct.jinja"
+        direct_file.write_text("{{ '{%' }}{{ lipsum . __globals__ . os }}")
+        quoted_file = tmp_path / "quoted.jinja"
+        quoted_file.write_text("{{ \"docs: lipsum.__globals__ ['os']\" }}")
+        scoped_file = tmp_path / "scoped.jinja"
+        scoped_file.write_text("{% set lipsum = {'__globals__': {'os': 'docs'}} %}{{ lipsum.__globals__.os }}")
+        statement_subscript_file = tmp_path / "statement-subscript.jinja"
+        statement_subscript_file.write_text(
+            "{% if true %}{{ lipsum.__globals__['os'] }}{% endif %}"
+        )
+
+        direct_result = Jinja2TemplateScanner().scan(str(direct_file))
+        quoted_result = Jinja2TemplateScanner().scan(str(quoted_file))
+        scoped_result = Jinja2TemplateScanner().scan(str(scoped_file))
+        statement_subscript_result = Jinja2TemplateScanner().scan(
+            str(statement_subscript_file)
+        )
+
+        assert any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in direct_result.checks
+        )
+        assert not any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in quoted_result.checks + scoped_result.checks
+        )
+        statement_global_checks = [
+            check
+            for check in statement_subscript_result.checks
+            if check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+        ]
+        assert len(statement_global_checks) == 1
+        assert statement_global_checks[0].details.get("match_text") == "__globals__["
+
     def test_detects_builtins_access(self, tmp_path: Path) -> None:
         """Test detection of __builtins__ access patterns."""
         template_file = tmp_path / "builtins.jinja"
