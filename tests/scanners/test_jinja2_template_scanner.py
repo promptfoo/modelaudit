@@ -385,7 +385,11 @@ class TestJinja2TemplateScannerPatternCategories:
         direct_file = tmp_path / "direct.jinja"
         direct_file.write_text("{{ '{%' }}{{ lipsum . __globals__ . os }}")
         quoted_file = tmp_path / "quoted.jinja"
-        quoted_file.write_text("{{ \"docs: lipsum.__globals__ ['os']\" }}")
+        quoted_file.write_text("{{ \"docs: (lipsum).__globals__ ['os']\" }}")
+        parenthesized_file = tmp_path / "parenthesized.jinja"
+        parenthesized_file.write_text("{{ (lipsum).__globals__.os }}")
+        nested_receiver_file = tmp_path / "nested-receiver.jinja"
+        nested_receiver_file.write_text("{{ (obj.lipsum).__globals__.os }}")
         scoped_file = tmp_path / "scoped.jinja"
         scoped_file.write_text("{% set lipsum = {'__globals__': {'os': 'docs'}} %}{{ lipsum.__globals__.os }}")
         statement_subscript_file = tmp_path / "statement-subscript.jinja"
@@ -393,6 +397,8 @@ class TestJinja2TemplateScannerPatternCategories:
 
         direct_result = Jinja2TemplateScanner().scan(str(direct_file))
         quoted_result = Jinja2TemplateScanner().scan(str(quoted_file))
+        parenthesized_result = Jinja2TemplateScanner().scan(str(parenthesized_file))
+        nested_receiver_result = Jinja2TemplateScanner().scan(str(nested_receiver_file))
         scoped_result = Jinja2TemplateScanner().scan(str(scoped_file))
         statement_subscript_result = Jinja2TemplateScanner().scan(str(statement_subscript_file))
 
@@ -402,11 +408,17 @@ class TestJinja2TemplateScannerPatternCategories:
             and check.details.get("pattern_type") == "global_access"
             for check in direct_result.checks
         )
+        assert any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in parenthesized_result.checks
+        )
         assert not any(
             check.status == CheckStatus.FAILED
             and check.details
             and check.details.get("pattern_type") == "global_access"
-            for check in quoted_result.checks + scoped_result.checks
+            for check in quoted_result.checks + nested_receiver_result.checks + scoped_result.checks
         )
         statement_global_checks = [
             check
