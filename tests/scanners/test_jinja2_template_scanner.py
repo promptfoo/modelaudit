@@ -223,6 +223,7 @@ class TestJinja2TemplateScannerPatternCategories:
             ("lipsum-subscript", "{{ lipsum.__globals__['os'] }}"),
             ("lipsum-spaced-subscript", "{{ lipsum.__globals__ ['os'] }}"),
             ("lipsum-parenthesized-subscript", "{{ (lipsum.__globals__)['os'] }}"),
+            ("nested-receiver-subscript", "{{ obj.lipsum.__globals__['os'] }}"),
         ],
     )
     def test_detects_named_global_access_once(
@@ -256,6 +257,7 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% call(lipsum) helper() %}{{ lipsum.__globals__.os }}{% endcall %}",
             "{{ \"docs: lipsum.__globals__ ['os']\" }}",
             "{% set safe = {'__globals__': {'os': 'docs'}} %}{% set lipsum = safe %}{{ lipsum.__globals__.os }}",
+            "{% set lipsum = missing %}{{ lipsum.__globals__.os }}",
             "{% import 'helpers.j2' as lipsum %}{{ lipsum.__globals__.os }}",
             "{% from 'helpers.j2' import helper as lipsum %}{{ lipsum.__globals__.os }}",
             "{% macro lipsum() %}{% endmacro %}{{ lipsum.__globals__.os }}",
