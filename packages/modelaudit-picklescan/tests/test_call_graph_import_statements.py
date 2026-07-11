@@ -3100,6 +3100,25 @@ def test_runtime_guard_selects_live_typing_extensions_export() -> None:
         )
 
 
+def test_runtime_guard_marks_unloaded_module_snapshot_unreusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    guard = next(statement for statement in tree.body if _is_typing_get_type_hints_guard(statement))
+    assert isinstance(guard, ast.If)
+    monkeypatch.delitem(sys.modules, "typing_extensions")
+
+    with call_graph.shared_source_sensitive_caches():
+        snapshot = call_graph._SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+        assert snapshot is not None
+        snapshot.reusable = True
+
+        assert call_graph._typing_extensions_runtime_guard_value(guard, "typing_extensions") is None
+        assert snapshot.reusable is False
+
+
 def test_runtime_guard_keeps_mutated_typing_extensions_export_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
