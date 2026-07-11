@@ -337,9 +337,7 @@ class TestJinja2TemplateScannerPatternCategories:
         template_file = tmp_path / "mixed-globals.jinja"
         template_file.write_text("{% set lipsum = {} %}{{ lipsum.__globals__.os, other.__globals__['os'] }}")
 
-        result = Jinja2TemplateScanner({"enable_sandbox_test": False}).scan(
-            str(template_file)
-        )
+        result = Jinja2TemplateScanner({"enable_sandbox_test": False}).scan(str(template_file))
 
         global_access_checks = [
             check
@@ -364,16 +362,12 @@ class TestJinja2TemplateScannerPatternCategories:
         scoped_file = tmp_path / "scoped.jinja"
         scoped_file.write_text("{% set lipsum = {'__globals__': {'os': 'docs'}} %}{{ lipsum.__globals__.os }}")
         statement_subscript_file = tmp_path / "statement-subscript.jinja"
-        statement_subscript_file.write_text(
-            "{% if true %}{{ lipsum.__globals__['os'] }}{% endif %}"
-        )
+        statement_subscript_file.write_text("{% if true %}{{ lipsum.__globals__['os'] }}{% endif %}")
 
         direct_result = Jinja2TemplateScanner().scan(str(direct_file))
         quoted_result = Jinja2TemplateScanner().scan(str(quoted_file))
         scoped_result = Jinja2TemplateScanner().scan(str(scoped_file))
-        statement_subscript_result = Jinja2TemplateScanner().scan(
-            str(statement_subscript_file)
-        )
+        statement_subscript_result = Jinja2TemplateScanner().scan(str(statement_subscript_file))
 
         assert any(
             check.status == CheckStatus.FAILED
