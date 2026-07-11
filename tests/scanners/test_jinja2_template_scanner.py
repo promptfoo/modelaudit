@@ -308,6 +308,7 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% call(lipsum=lipsum) helper() %}{{ lipsum.__globals__.os }}{% endcall %}",
             "{% import lipsum.__globals__.get('os') as helper %}",
             "{% from lipsum.__globals__.get('os') import helper %}",
+            "{% set x | replace('a', lipsum.__globals__.os) %}a{% endset %}",
         ],
     )
     def test_named_global_access_detects_ast_dynamic_rebindings(
