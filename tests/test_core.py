@@ -2063,11 +2063,32 @@ def test_calculate_file_hash_rejects_fifo_swap_without_blocking(
     assert swapped is True
 
 
-def test_calculate_file_hash_keeps_large_reads_with_distant_deadline(
+@pytest.mark.parametrize(
+    ("deadline", "expected_read_sizes"),
+    [
+        pytest.param(
+            core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 60.0,
+            [core_module.DEFAULT_READ_CHUNK_SIZE] * 3,
+            id="distant",
+        ),
+        pytest.param(
+            9.0,
+            [
+                core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE,
+                core_module.DEFAULT_READ_CHUNK_SIZE,
+                core_module.DEFAULT_READ_CHUNK_SIZE,
+            ],
+            id="short",
+        ),
+    ],
+)
+def test_calculate_file_hash_preserves_throughput_before_fine_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    deadline: float,
+    expected_read_sizes: list[int],
 ) -> None:
-    """Normal timeout-bound scans must retain the large-read hashing path."""
+    """Timeout-bound scans must retain large reads after bounded calibration."""
     from modelaudit.scanners.base import DEFAULT_READ_CHUNK_SIZE
 
     content = bytes(DEFAULT_READ_CHUNK_SIZE + 7)
@@ -2104,11 +2125,11 @@ def test_calculate_file_hash_keeps_large_reads_with_distant_deadline(
     monkeypatch.setattr(core_module.time, "time", lambda: now)
     monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
 
-    deadline = core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 60.0
-    assert core_module._calculate_file_hash(
-        str(source_path), deadline=deadline
-    ) == hashlib.sha256(content).hexdigest()
-    assert read_sizes == [DEFAULT_READ_CHUNK_SIZE] * 3
+    assert (
+        core_module._calculate_file_hash(str(source_path), deadline=deadline)
+        == hashlib.sha256(content).hexdigest()
+    )
+    assert read_sizes == expected_read_sizes
 
 
 def test_calculate_file_hash_uses_fine_reads_near_deadline(
@@ -2159,7 +2180,7 @@ def test_calculate_file_hash_probes_before_coarse_read_at_deadline_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unsampled read just outside the base window must stay fine-grained."""
+    """An unsampled read just outside the base window must stay bounded."""
     source_path = tmp_path / "deadline-boundary.bin"
     source_path.write_bytes(b"x" * (core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE + 1))
     real_fdopen = os.fdopen
@@ -2197,7 +2218,7 @@ def test_calculate_file_hash_probes_before_coarse_read_at_deadline_boundary(
     with pytest.raises(TimeoutError, match="File hashing timed out"):
         core_module._calculate_file_hash(str(source_path), deadline=deadline)
 
-    assert read_sizes == [core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE]
+    assert read_sizes == [core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE]
 
 
 def test_filtered_savedmodel_owner_asset_updates_aggregate_hash_and_accounting(tmp_path: Path) -> None:
