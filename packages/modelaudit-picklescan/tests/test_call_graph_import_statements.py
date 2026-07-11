@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import importlib
 import io
 import os
@@ -3079,6 +3080,21 @@ def _is_typing_get_type_hints_guard(statement: ast.stmt) -> bool:
     )
 
 
+def _is_builtin_sentinel_guard(statement: ast.stmt) -> bool:
+    if not isinstance(statement, ast.If) or not isinstance(statement.test, ast.Call):
+        return False
+    test = statement.test
+    return (
+        isinstance(test.func, ast.Name)
+        and test.func.id == "hasattr"
+        and len(test.args) == 2
+        and isinstance(test.args[0], ast.Name)
+        and test.args[0].id == "builtins"
+        and isinstance(test.args[1], ast.Constant)
+        and test.args[1].value == "sentinel"
+    )
+
+
 def test_runtime_guard_selects_live_typing_extensions_export() -> None:
     typing_extensions = pytest.importorskip("typing_extensions")
     source_path = Path(typing_extensions.__file__)
@@ -3097,6 +3113,27 @@ def test_runtime_guard_selects_live_typing_extensions_export() -> None:
     else:
         assert any(
             isinstance(statement, ast.FunctionDef) and statement.name == "get_type_hints" for statement in statements
+        )
+
+
+def test_runtime_guard_selects_live_builtin_sentinel_branch() -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    guard = next(statement for statement in tree.body if _is_builtin_sentinel_guard(statement))
+
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
+
+    assert guard not in statements
+    if hasattr(builtins, "sentinel"):
+        assert any(
+            isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "sentinel" for target in statement.targets)
+            for statement in statements
+        )
+    else:
+        assert any(
+            isinstance(statement, ast.ClassDef) and statement.name == "sentinel" for statement in statements
         )
 
 
