@@ -1462,7 +1462,7 @@ class Jinja2TemplateScanner(BaseScanner):
         named_receiver_roots = "|".join(re.escape(receiver) for receiver in sorted(covered_global_receivers))
         named_receiver_pattern = (
             re.compile(
-                rf"(?<!\w)(?:(?:{named_receiver_roots})|\(\s*(?:{named_receiver_roots})\s*\))"
+                rf"(?<!\w)(?P<open>\(*)\s*(?:{named_receiver_roots})\s*(?P<close>\)*)"
                 r"\s*\.\s*__globals__\b"
             )
             if covered_global_receivers
@@ -1487,6 +1487,8 @@ class Jinja2TemplateScanner(BaseScanner):
                     ):
                         named_ranges: list[tuple[int, int]] = []
                         for named_match in named_receiver_pattern.finditer(pattern_text):
+                            if len(named_match.group("open")) != len(named_match.group("close")):
+                                continue
                             boundary = named_match.start() - 1
                             while boundary >= 0 and pattern_text[boundary].isspace():
                                 boundary -= 1
@@ -1613,8 +1615,10 @@ class Jinja2TemplateScanner(BaseScanner):
                 truth = constant_truth(node.test)
                 if truth is not None:
                     selected = node.expr1 if truth else node.expr2
-                    return is_dangerous_name(selected, shadowed, dangerous_aliases)
-                return False
+                    return selected is not None and is_dangerous_name(selected, shadowed, dangerous_aliases)
+                return is_dangerous_name(node.expr1, shadowed, dangerous_aliases) or (
+                    node.expr2 is not None and is_dangerous_name(node.expr2, shadowed, dangerous_aliases)
+                )
             sequence_types = (jinja2.nodes.List, jinja2.nodes.Tuple)
             if (
                 isinstance(node, jinja2.nodes.Getitem)
@@ -1701,7 +1705,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 truth = constant_truth(node.test)
                 if truth is not False:
                     visit(node.expr1, shadowed, dangerous_aliases, node)
-                if truth is not True:
+                if truth is not True and node.expr2 is not None:
                     visit(node.expr2, shadowed, dangerous_aliases, node)
                 return
 
