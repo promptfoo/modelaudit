@@ -100,7 +100,7 @@ _DETECTION_MESSAGE_LABELS = {
     "sandbox_violation": "sandbox violation",
 }
 _MAX_REPORTED_TEMPLATE_LOCATIONS = 20
-_QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN = r"__globals__\s*\["
+_QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN = r"__globals__\s*\)*\s*\["
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -1616,11 +1616,11 @@ class Jinja2TemplateScanner(BaseScanner):
             if isinstance(node, (jinja2.nodes.And, jinja2.nodes.Or)):
                 truth = constant_truth(node.left)
                 if truth is None:
-                    return is_dangerous_name(node.left, shadowed, dangerous_aliases) or is_dangerous_name(
-                        node.right,
-                        shadowed,
-                        dangerous_aliases,
-                    )
+                    left_dangerous = is_dangerous_name(node.left, shadowed, dangerous_aliases)
+                    right_dangerous = is_dangerous_name(node.right, shadowed, dangerous_aliases)
+                    if isinstance(node, jinja2.nodes.And) and left_dangerous:
+                        return right_dangerous
+                    return left_dangerous or right_dangerous
                 selected = node.right if truth == isinstance(node, jinja2.nodes.And) else node.left
                 return is_dangerous_name(selected, shadowed, dangerous_aliases)
             sequence_types = (jinja2.nodes.List, jinja2.nodes.Tuple)
