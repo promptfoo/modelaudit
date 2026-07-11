@@ -6244,7 +6244,11 @@ def _typing_extensions_runtime_guard_value(
             or vars(builtins_module) is not _IMPORT_RUNTIME_BUILTINS
         ):
             return None
-        return "sentinel" in _IMPORT_RUNTIME_BUILTINS
+        if "sentinel" in _IMPORT_RUNTIME_BUILTINS:
+            return True
+        if "__getattr__" in _IMPORT_RUNTIME_BUILTINS:
+            return None
+        return False
 
     typing_module = sys.modules.get("typing")
     if type(typing_module) is not ModuleType or _trusted_module_origin_kind("typing") != "stdlib":
@@ -6308,6 +6312,7 @@ def _typing_extensions_runtime_guard_value(
     ):
         return None
     return False
+
 
 def _runtime_selected_module_statements(
     statements: Iterable[ast.stmt],
@@ -7397,18 +7402,8 @@ def _collect_assignment_aliases(
                 for target_name, node_id in last_resolved_node_ids.items()
             )
             if changed_conditionally or resolved_from_conditional_read:
-                ambiguous_target = next(
-                    (
-                        target_name
-                        for target_name, node_id in (*last_changed_node_ids.items(), *last_resolved_node_ids.items())
-                        if node_id in effective_conditionally_rebound_node_ids.get(target_name, set())
-                        or node_id in propagated_rebound_node_ids.get(target_name, set())
-                    ),
-                    "<unknown>",
-                )
                 raise _CallGraphAnalysisLimitError(
-                    "assignment alias analysis encountered ambiguous conditional rebinding for "
-                    f"{ambiguous_target[:64]!r}"
+                    "assignment alias analysis encountered ambiguous conditional rebinding"
                 )
             break
         if next_state in seen_states:
