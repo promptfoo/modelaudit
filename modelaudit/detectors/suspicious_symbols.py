@@ -956,7 +956,7 @@ JINJA2_SSTI_PATTERNS = {
     # These patterns access global namespaces to reach restricted functions
     "global_access": [
         # Direct global access
-        r"__globals__\s*\[",  # Access globals dictionary
+        r"__globals__\s*\)*\s*\[",  # Access globals dictionary, including parenthesized access
         r"__builtins__\[",  # Access builtins dictionary
         r"__init__\.__globals__",  # Access through __init__ method
         # Framework-specific global access
