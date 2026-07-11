@@ -6226,6 +6226,7 @@ def _typing_extensions_runtime_guard_value(
     ):
         return None
 
+    _mark_shared_source_snapshot_unreusable()
     extension_module = sys.modules.get("typing_extensions")
     typing_module = sys.modules.get("typing")
     if (
@@ -6236,7 +6237,6 @@ def _typing_extensions_runtime_guard_value(
     ):
         return None
 
-    _mark_shared_source_snapshot_unreusable()
     extension_namespace = vars(extension_module)
     typing_namespace = vars(typing_module)
     if "ReadOnly" in typing_namespace:
