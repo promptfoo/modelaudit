@@ -2064,17 +2064,41 @@ def test_calculate_file_hash_rejects_fifo_swap_without_blocking(
 
 
 @pytest.mark.parametrize(
-    ("deadline", "expected_read_sizes"),
+    (
+        "deadline",
+        "content_size",
+        "fixed_read_seconds",
+        "seconds_per_mib",
+        "expected_read_sizes",
+    ),
     [
         pytest.param(
             core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 60.0,
+            core_module.DEFAULT_READ_CHUNK_SIZE + 7,
+            0.25,
+            None,
             [core_module.DEFAULT_READ_CHUNK_SIZE] * 3,
             id="distant",
         ),
         pytest.param(
             9.0,
-            [core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE] * 10,
-            id="short",
+            core_module.DEFAULT_READ_CHUNK_SIZE + 7,
+            0.1,
+            None,
+            [
+                core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE,
+                core_module.DEFAULT_READ_CHUNK_SIZE,
+                core_module.DEFAULT_READ_CHUNK_SIZE,
+            ],
+            id="short-low-latency",
+        ),
+        pytest.param(
+            9.5,
+            core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE * 2,
+            None,
+            1.0,
+            [core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE] * 3,
+            id="short-bandwidth-limited",
         ),
     ],
 )
@@ -2082,12 +2106,15 @@ def test_calculate_file_hash_preserves_throughput_before_fine_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     deadline: float,
+    content_size: int,
+    fixed_read_seconds: float | None,
+    seconds_per_mib: float | None,
     expected_read_sizes: list[int],
 ) -> None:
-    """Timeout-bound scans use large reads or bounded 1 MiB calibration."""
+    """Deadline hashing promotes only calibration reads that predict enough margin."""
     from modelaudit.scanners.base import DEFAULT_READ_CHUNK_SIZE
 
-    content = bytes(DEFAULT_READ_CHUNK_SIZE + 7)
+    content = bytes(content_size)
     source_path = tmp_path / "dedup-asset.bin"
     source_path.write_bytes(content)
     real_fdopen = os.fdopen
@@ -2111,7 +2138,14 @@ def test_calculate_file_hash_preserves_throughput_before_fine_window(
             nonlocal now
             read_sizes.append(size)
             chunk = cast(bytes, self.handle.read(size))
-            now += 0.25
+            if fixed_read_seconds is not None:
+                now += fixed_read_seconds
+            elif seconds_per_mib is not None:
+                now += (
+                    len(chunk)
+                    / core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE
+                    * seconds_per_mib
+                )
             return chunk
 
     def recording_fdopen(*args: Any, **kwargs: Any) -> RecordingReader:
@@ -2126,7 +2160,6 @@ def test_calculate_file_hash_preserves_throughput_before_fine_window(
         == hashlib.sha256(content).hexdigest()
     )
     assert read_sizes == expected_read_sizes
-
 
 def test_calculate_file_hash_uses_fine_reads_near_deadline(
     tmp_path: Path,
