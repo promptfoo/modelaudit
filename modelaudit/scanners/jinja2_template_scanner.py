@@ -40,7 +40,12 @@ except ImportError:
     resource = None  # type: ignore[assignment]
     HAS_RESOURCE_LIMITS = False
 
-from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
+from modelaudit.detectors.suspicious_symbols import (
+    JINJA2_NAMED_GLOBAL_ACCESS_PATTERN,
+    JINJA2_SSTI_PATTERNS,
+    find_unquoted_jinja_named_global_access,
+    mask_quoted_jinja_text,
+)
 from modelaudit.scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from modelaudit.utils.file.detection import (
     huggingface_tokenizer_json_has_jax_route_evidence,
@@ -94,6 +99,7 @@ _DETECTION_MESSAGE_LABELS = {
     "sandbox_violation": "sandbox violation",
 }
 _MAX_REPORTED_TEMPLATE_LOCATIONS = 20
+_QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN = r"__globals__\s*\["
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -1446,16 +1452,49 @@ class Jinja2TemplateScanner(BaseScanner):
             return detections, analysis_failures
 
         executable_spans = self._executable_template_spans(template_content)
+        named_detections, covered_global_receivers = self._detect_named_global_access(
+            template_content,
+            executable_spans,
+            location,
+        )
+        detections.extend(named_detections)
+        named_receiver_pattern = (
+            re.compile(
+                rf"\b(?:{'|'.join(re.escape(receiver) for receiver in sorted(covered_global_receivers))})"
+                r"\s*\.\s*__globals__\b"
+            )
+            if covered_global_receivers
+            else None
+        )
 
         # Check each pattern category only inside executable Jinja spans. Literal
         # template data can contain model instructions or documentation prose.
         for category, compiled_patterns in self._compiled_patterns.items():
             for compiled_pattern, original_pattern in compiled_patterns:
-                matches = (
-                    match
-                    for executable_span in executable_spans
-                    for match in compiled_pattern.finditer(executable_span.text)
-                )
+                matches: list[re.Match[str]] = []
+                for executable_span in executable_spans:
+                    pattern_text = (
+                        mask_quoted_jinja_text(executable_span.text)
+                        if original_pattern == _QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN
+                        else executable_span.text
+                    )
+                    pattern_matches = list(compiled_pattern.finditer(pattern_text))
+                    if (
+                        original_pattern == _QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN
+                        and named_receiver_pattern is not None
+                    ):
+                        named_ranges = [
+                            (named_match.start(), named_match.end())
+                            for named_match in named_receiver_pattern.finditer(pattern_text)
+                        ]
+                        pattern_matches = [
+                            match
+                            for match in pattern_matches
+                            if not any(
+                                named_start <= match.start() < named_end for named_start, named_end in named_ranges
+                            )
+                        ]
+                    matches.extend(pattern_matches)
 
                 for match in matches:
                     # Skip if this is a common ML pattern and we're configured to ignore them
@@ -1491,6 +1530,368 @@ class Jinja2TemplateScanner(BaseScanner):
                 )
 
         return detections, analysis_failures
+
+    def _detect_named_global_access(
+        self,
+        template_content: str,
+        executable_spans: list[_ExecutableTemplateSpan],
+        location: str,
+    ) -> tuple[list[DetectionResult], frozenset[str]]:
+        matches = self._parsed_named_global_access(template_content)
+        parsed_succeeded = matches is not None
+        if matches is None:
+            matches = self._fallback_named_global_access(executable_spans)
+
+        covered_receivers = (
+            {"lipsum", "get_flashed_messages"} if parsed_succeeded else set(matches)
+        )
+
+        return [
+            DetectionResult(
+                pattern_type="global_access",
+                pattern=JINJA2_NAMED_GLOBAL_ACCESS_PATTERN.pattern,
+                match_text=f"{root}.__globals__",
+                risk_level=self._get_risk_level_for_category("global_access"),
+                location=location,
+                explanation=self._get_pattern_explanation("global_access", f"{root}.__globals__"),
+            )
+            for root in matches
+        ], frozenset(covered_receivers)
+
+    @staticmethod
+    def _parsed_named_global_access(template_content: str) -> list[str] | None:
+        if not HAS_JINJA2_SANDBOX:
+            return None
+        try:
+            parsed = jinja2.Environment().parse(template_content)
+        except Exception:
+            return None
+
+        matches: list[str] = []
+        named_roots = {"lipsum", "get_flashed_messages"}
+        with_node_type = getattr(jinja2.nodes, "With", None)
+        isolated_scope_types = tuple(
+            node_type
+            for name in (
+                "Block",
+                "FilterBlock",
+                "Scope",
+                "OverlayScope",
+            )
+            if (node_type := getattr(jinja2.nodes, name, None)) is not None
+        )
+
+        def stored_names(node: Any) -> set[str]:
+            return {
+                name.name
+                for name in node.find_all(jinja2.nodes.Name)
+                if name.ctx in {"param", "store"}
+            } | (
+                {node.name}
+                if isinstance(node, jinja2.nodes.Name) and node.ctx in {"param", "store"}
+                else set()
+            )
+
+        def is_safe_literal(node: Any) -> bool:
+            try:
+                node.as_const()
+            except Exception:
+                return False
+            return True
+
+        def is_dangerous_name(
+            node: Any,
+            shadowed: set[str],
+            dangerous_aliases: set[str],
+        ) -> bool:
+            return isinstance(node, jinja2.nodes.Name) and (
+                node.name in dangerous_aliases
+                or (node.name in named_roots and node.name not in shadowed)
+            )
+
+        def update_bindings(
+            target_node: Any,
+            value: Any,
+            shadowed: set[str],
+            dangerous_aliases: set[str],
+            *,
+            source_shadowed: set[str] | None = None,
+            source_dangerous_aliases: set[str] | None = None,
+        ) -> None:
+            if source_shadowed is None:
+                source_shadowed = shadowed.copy()
+            if source_dangerous_aliases is None:
+                source_dangerous_aliases = dangerous_aliases.copy()
+
+            sequence_types = (jinja2.nodes.List, jinja2.nodes.Tuple)
+            if (
+                isinstance(target_node, sequence_types)
+                and isinstance(value, sequence_types)
+                and len(target_node.items) == len(value.items)
+            ):
+                for target_item, value_item in zip(
+                    target_node.items,
+                    value.items,
+                    strict=True,
+                ):
+                    update_bindings(
+                        target_item,
+                        value_item,
+                        shadowed,
+                        dangerous_aliases,
+                        source_shadowed=source_shadowed,
+                        source_dangerous_aliases=source_dangerous_aliases,
+                    )
+                return
+
+            safe_value = is_safe_literal(value) or (
+                isinstance(value, jinja2.nodes.Name)
+                and value.name in source_shadowed
+            )
+            dangerous_value = is_dangerous_name(
+                value,
+                source_shadowed,
+                source_dangerous_aliases,
+            )
+            for target in stored_names(target_node):
+                if safe_value:
+                    shadowed.add(target)
+                    dangerous_aliases.discard(target)
+                elif dangerous_value:
+                    shadowed.discard(target)
+                    dangerous_aliases.add(target)
+                else:
+                    shadowed.discard(target)
+                    dangerous_aliases.discard(target)
+
+        def visit(
+            node: Any,
+            shadowed: set[str],
+            dangerous_aliases: set[str],
+            parent: Any = None,
+        ) -> None:
+            if isinstance(node, jinja2.nodes.Getattr):
+                receiver = node.node
+                if (
+                    node.attr == "__globals__"
+                    and isinstance(receiver, jinja2.nodes.Name)
+                    and receiver.name in named_roots
+                    and receiver.name not in shadowed
+                ):
+                    matches.append(receiver.name)
+
+            if isinstance(node, jinja2.nodes.Assign):
+                visit(node.node, shadowed, dangerous_aliases, node)
+                update_bindings(
+                    node.target,
+                    node.node,
+                    shadowed,
+                    dangerous_aliases,
+                )
+                return
+
+            if isinstance(node, jinja2.nodes.AssignBlock):
+                for child in node.body:
+                    visit(child, shadowed, dangerous_aliases, node)
+                targets = stored_names(node.target)
+                shadowed.update(targets)
+                dangerous_aliases.difference_update(targets)
+                return
+
+            if isinstance(node, jinja2.nodes.Import):
+                visit(node.template, shadowed, dangerous_aliases, node)
+                shadowed.add(node.target)
+                dangerous_aliases.discard(node.target)
+                return
+
+            if isinstance(node, jinja2.nodes.FromImport):
+                visit(node.template, shadowed, dangerous_aliases, node)
+                imported_names = {
+                    imported[1] if isinstance(imported, tuple) else imported
+                    for imported in node.names
+                }
+                shadowed.update(imported_names)
+                dangerous_aliases.difference_update(imported_names)
+                return
+
+            if isinstance(node, jinja2.nodes.If):
+                visit(node.test, shadowed, dangerous_aliases, node)
+                branch_states: list[tuple[set[str], set[str]]] = []
+
+                body_shadowed = shadowed.copy()
+                body_dangerous = dangerous_aliases.copy()
+                for child in node.body:
+                    visit(child, body_shadowed, body_dangerous, node)
+                branch_states.append((body_shadowed, body_dangerous))
+
+                for elif_node in node.elif_:
+                    visit(elif_node.test, shadowed, dangerous_aliases, elif_node)
+                    elif_shadowed = shadowed.copy()
+                    elif_dangerous = dangerous_aliases.copy()
+                    for child in elif_node.body:
+                        visit(child, elif_shadowed, elif_dangerous, elif_node)
+                    branch_states.append((elif_shadowed, elif_dangerous))
+
+                else_shadowed = shadowed.copy()
+                else_dangerous = dangerous_aliases.copy()
+                for child in node.else_:
+                    visit(child, else_shadowed, else_dangerous, node)
+                branch_states.append((else_shadowed, else_dangerous))
+
+                shadowed.clear()
+                shadowed.update(set.intersection(*(state[0] for state in branch_states)))
+                dangerous_aliases.clear()
+                dangerous_aliases.update(*(state[1] for state in branch_states))
+                return
+
+            if isinstance(node, jinja2.nodes.For):
+                visit(node.iter, shadowed, dangerous_aliases, node)
+                target_names = stored_names(node.target)
+                sequence_types = (jinja2.nodes.List, jinja2.nodes.Tuple)
+                if isinstance(node.iter, sequence_types) and node.iter.items:
+                    iteration_states: list[tuple[set[str], set[str]]] = []
+                    for item in node.iter.items:
+                        item_shadowed = shadowed.copy()
+                        item_dangerous = dangerous_aliases.copy()
+                        update_bindings(
+                            node.target,
+                            item,
+                            item_shadowed,
+                            item_dangerous,
+                            source_shadowed=shadowed,
+                            source_dangerous_aliases=dangerous_aliases,
+                        )
+                        iteration_states.append((item_shadowed, item_dangerous))
+                    body_shadowed = set.intersection(
+                        *(state[0] for state in iteration_states)
+                    )
+                    body_dangerous = set().union(
+                        *(state[1] for state in iteration_states)
+                    )
+                else:
+                    body_shadowed = shadowed | target_names
+                    body_dangerous = dangerous_aliases - target_names
+                if node.test is not None:
+                    visit(node.test, body_shadowed, body_dangerous, node)
+                for child in node.body:
+                    visit(child, body_shadowed, body_dangerous, node)
+                else_shadowed = shadowed.copy()
+                else_dangerous = dangerous_aliases.copy()
+                for child in node.else_:
+                    visit(child, else_shadowed, else_dangerous, node)
+                return
+
+            if isinstance(node, jinja2.nodes.Macro):
+                for default in node.defaults:
+                    visit(default, shadowed, dangerous_aliases, node)
+                macro_shadowed = shadowed.copy()
+                macro_dangerous = dangerous_aliases.copy()
+                macro_shadowed.add(node.name)
+                macro_dangerous.discard(node.name)
+                required_count = len(node.args) - len(node.defaults)
+                for argument in node.args[:required_count]:
+                    names = stored_names(argument)
+                    macro_shadowed.update(names)
+                    macro_dangerous.difference_update(names)
+                for argument, default in zip(
+                    node.args[required_count:],
+                    node.defaults,
+                    strict=True,
+                ):
+                    update_bindings(
+                        argument,
+                        default,
+                        macro_shadowed,
+                        macro_dangerous,
+                        source_shadowed=shadowed,
+                        source_dangerous_aliases=dangerous_aliases,
+                    )
+                for child in node.body:
+                    visit(child, macro_shadowed, macro_dangerous, node)
+                shadowed.add(node.name)
+                dangerous_aliases.discard(node.name)
+                return
+
+            if isinstance(node, jinja2.nodes.CallBlock):
+                visit(node.call, shadowed, dangerous_aliases, node)
+                for default in node.defaults:
+                    visit(default, shadowed, dangerous_aliases, node)
+                call_shadowed = shadowed.copy()
+                call_dangerous = dangerous_aliases.copy()
+                required_count = len(node.args) - len(node.defaults)
+                for argument in node.args[:required_count]:
+                    names = stored_names(argument)
+                    call_shadowed.update(names)
+                    call_dangerous.difference_update(names)
+                for argument, default in zip(
+                    node.args[required_count:],
+                    node.defaults,
+                    strict=True,
+                ):
+                    update_bindings(
+                        argument,
+                        default,
+                        call_shadowed,
+                        call_dangerous,
+                        source_shadowed=shadowed,
+                        source_dangerous_aliases=dangerous_aliases,
+                    )
+                for child in node.body:
+                    visit(child, call_shadowed, call_dangerous, node)
+                return
+
+            if with_node_type is not None and isinstance(node, with_node_type):
+                for value in node.values:
+                    visit(value, shadowed, dangerous_aliases, node)
+                with_shadowed = shadowed.copy()
+                with_dangerous = dangerous_aliases.copy()
+                for target, value in zip(node.targets, node.values, strict=True):
+                    update_bindings(
+                        target,
+                        value,
+                        with_shadowed,
+                        with_dangerous,
+                        source_shadowed=shadowed,
+                        source_dangerous_aliases=dangerous_aliases,
+                    )
+                for child in node.body:
+                    visit(child, with_shadowed, with_dangerous, node)
+                return
+
+            if isolated_scope_types and isinstance(node, isolated_scope_types):
+                scope_shadowed = shadowed.copy()
+                scope_dangerous = dangerous_aliases.copy()
+                for child in node.iter_child_nodes():
+                    visit(child, scope_shadowed, scope_dangerous, node)
+                return
+
+            for child in node.iter_child_nodes():
+                visit(child, shadowed, dangerous_aliases, node)
+
+        visit(parsed, set(), set())
+        return matches
+
+    @staticmethod
+    def conservative_named_global_access(executable_spans: list[str]) -> list[str]:
+        """Detect direct named gadgets only when fallback scope is unambiguous."""
+        if any("{%" in mask_quoted_jinja_text(span) for span in executable_spans):
+            return []
+        return [root for span in executable_spans for root in find_unquoted_jinja_named_global_access(span)]
+
+    @staticmethod
+    def _fallback_named_global_access(
+        executable_spans: list[_ExecutableTemplateSpan],
+    ) -> list[str]:
+        return Jinja2TemplateScanner.conservative_named_global_access([span.text for span in executable_spans])
+
+    @staticmethod
+    def _mask_quoted_template_text(text: str) -> str:
+        return mask_quoted_jinja_text(text)
+
+    @staticmethod
+    def executable_template_spans(template_content: str) -> list[str]:
+        """Return executable Jinja spans, excluding literals, comments, and raw blocks."""
+        return [span.text for span in Jinja2TemplateScanner._executable_template_spans(template_content)]
 
     @staticmethod
     def _executable_template_spans(template_content: str) -> list[_ExecutableTemplateSpan]:
