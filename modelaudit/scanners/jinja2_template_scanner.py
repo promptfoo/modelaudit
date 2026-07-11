@@ -1717,10 +1717,8 @@ class Jinja2TemplateScanner(BaseScanner):
                 visit(node.left, shadowed, dangerous_aliases, node)
                 truth = constant_truth(node.left)
                 if (
-                    isinstance(node, jinja2.nodes.And)
-                    and truth is not False
-                    or isinstance(node, jinja2.nodes.Or)
-                    and truth is not True
+                    (isinstance(node, jinja2.nodes.And) and truth is not False)
+                    or (isinstance(node, jinja2.nodes.Or) and truth is not True)
                 ):
                     visit(node.right, shadowed, dangerous_aliases, node)
                 return
