@@ -861,7 +861,7 @@ SUSPICIOUS_CONFIG_PATTERNS = {
 # =============================================================================
 
 JINJA2_NAMED_GLOBAL_ACCESS_PATTERN: re.Pattern[str] = re.compile(
-    r"(?<![\w.(])(?P<open>\(*)\s*(?P<root>lipsum|get_flashed_messages)\s*(?P<close>\)*)\s*\.\s*__globals__\b"
+    r"(?<![\w.(])(?P<open>(?:\(\s*)*)\s*(?P<root>lipsum|get_flashed_messages)(?P<close>(?:\s*\))*)\s*\.\s*__globals__\b"
 )
 
 
@@ -893,7 +893,7 @@ def find_unquoted_jinja_named_global_access(text: str) -> list[str]:
     roots: list[str] = []
 
     for match in JINJA2_NAMED_GLOBAL_ACCESS_PATTERN.finditer(unquoted_text):
-        if len(match.group("open")) != len(match.group("close")):
+        if match.group("open").count("(") != match.group("close").count(")"):
             continue
         previous = match.start() - 1
         while previous >= 0 and unquoted_text[previous].isspace():
