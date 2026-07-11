@@ -1461,7 +1461,7 @@ class Jinja2TemplateScanner(BaseScanner):
         detections.extend(named_detections)
         named_receiver_pattern = (
             re.compile(
-                rf"(?<![\w.])(?:{'|'.join(re.escape(receiver) for receiver in sorted(covered_global_receivers))})"
+                rf"(?<!\w)(?:{'|'.join(re.escape(receiver) for receiver in sorted(covered_global_receivers))})"
                 r"\s*\.\s*__globals__\b"
             )
             if covered_global_receivers
@@ -1484,10 +1484,13 @@ class Jinja2TemplateScanner(BaseScanner):
                         original_pattern == _QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN
                         and named_receiver_pattern is not None
                     ):
-                        named_ranges = [
-                            (named_match.start(), named_match.end())
-                            for named_match in named_receiver_pattern.finditer(pattern_text)
-                        ]
+                        named_ranges: list[tuple[int, int]] = []
+                        for named_match in named_receiver_pattern.finditer(pattern_text):
+                            boundary = named_match.start() - 1
+                            while boundary >= 0 and pattern_text[boundary].isspace():
+                                boundary -= 1
+                            if boundary < 0 or pattern_text[boundary] != ".":
+                                named_ranges.append((named_match.start(), named_match.end()))
                         pattern_matches = [
                             match
                             for match in pattern_matches
@@ -1597,9 +1600,18 @@ class Jinja2TemplateScanner(BaseScanner):
             shadowed: set[str],
             dangerous_aliases: set[str],
         ) -> bool:
-            return isinstance(node, jinja2.nodes.Name) and (
-                node.name in dangerous_aliases or (node.name in named_roots and node.name not in shadowed)
-            )
+            if isinstance(node, jinja2.nodes.Name):
+                return node.name in dangerous_aliases or (node.name in named_roots and node.name not in shadowed)
+            sequence_types = (jinja2.nodes.List, jinja2.nodes.Tuple)
+            if (
+                isinstance(node, jinja2.nodes.Getitem)
+                and isinstance(node.node, sequence_types)
+                and isinstance(node.arg, jinja2.nodes.Const)
+                and type(node.arg.value) is int
+                and -len(node.node.items) <= node.arg.value < len(node.node.items)
+            ):
+                return is_dangerous_name(node.node.items[node.arg.value], shadowed, dangerous_aliases)
+            return False
 
         def update_bindings(
             target_node: Any,
@@ -1920,13 +1932,24 @@ class Jinja2TemplateScanner(BaseScanner):
         return list(Jinja2TemplateScanner._iter_delimiter_executable_template_spans(template_content))
 
     @staticmethod
-    def iter_executable_template_spans(template_content: str) -> Iterator[str]:
+    def iter_executable_template_spans(
+        template_content: str,
+        *,
+        max_span_chars: int | None = None,
+    ) -> Iterator[str]:
         """Yield executable spans without retaining copies of oversized templates."""
-        for span in Jinja2TemplateScanner._iter_delimiter_executable_template_spans(template_content):
+        for span in Jinja2TemplateScanner._iter_delimiter_executable_template_spans(
+            template_content,
+            max_span_chars=max_span_chars,
+        ):
             yield span.text
 
     @staticmethod
-    def _iter_delimiter_executable_template_spans(template_content: str) -> Iterator[_ExecutableTemplateSpan]:
+    def _iter_delimiter_executable_template_spans(
+        template_content: str,
+        *,
+        max_span_chars: int | None = None,
+    ) -> Iterator[_ExecutableTemplateSpan]:
         cursor = 0
         while cursor < len(template_content):
             marker_start, marker = Jinja2TemplateScanner._next_jinja_marker(template_content, cursor)
@@ -1944,18 +1967,21 @@ class Jinja2TemplateScanner(BaseScanner):
 
             if marker == "{{":
                 span_end = Jinja2TemplateScanner._find_jinja_tag_end(template_content, marker_start, "}}")
-                yield _ExecutableTemplateSpan(template_content[marker_start:span_end])
+                if max_span_chars is None or span_end - marker_start <= max_span_chars:
+                    yield _ExecutableTemplateSpan(template_content[marker_start:span_end])
                 cursor = max(span_end, marker_start + len(marker))
                 continue
 
             span_end = Jinja2TemplateScanner._find_jinja_tag_end(template_content, marker_start, "%}")
-            span_text = template_content[marker_start:span_end]
+            bounded_end = span_end if max_span_chars is None else min(span_end, marker_start + max_span_chars)
+            span_text = template_content[marker_start:bounded_end]
             tag_name = Jinja2TemplateScanner._jinja_block_tag_name(span_text)
             if tag_name == "raw":
                 cursor = Jinja2TemplateScanner._find_jinja_raw_end(template_content, span_end)
                 continue
 
-            yield _ExecutableTemplateSpan(span_text)
+            if max_span_chars is None or span_end - marker_start <= max_span_chars:
+                yield _ExecutableTemplateSpan(span_text)
             cursor = max(span_end, marker_start + len(marker))
 
     @staticmethod
