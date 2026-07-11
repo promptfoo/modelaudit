@@ -2139,11 +2139,7 @@ def test_calculate_file_hash_preserves_throughput_before_fine_window(
             if fixed_read_seconds is not None:
                 now += fixed_read_seconds
             elif seconds_per_mib is not None:
-                now += (
-                    len(chunk)
-                    / core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE
-                    * seconds_per_mib
-                )
+                now += len(chunk) / core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE * seconds_per_mib
             return chunk
 
     def recording_fdopen(*args: Any, **kwargs: Any) -> RecordingReader:
@@ -2153,10 +2149,7 @@ def test_calculate_file_hash_preserves_throughput_before_fine_window(
     monkeypatch.setattr(core_module.time, "time", lambda: now)
     monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
 
-    assert (
-        core_module._calculate_file_hash(str(source_path), deadline=deadline)
-        == hashlib.sha256(content).hexdigest()
-    )
+    assert core_module._calculate_file_hash(str(source_path), deadline=deadline) == hashlib.sha256(content).hexdigest()
     assert read_sizes == expected_read_sizes
 
 
