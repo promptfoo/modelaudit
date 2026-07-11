@@ -671,6 +671,109 @@ def test_cache_manager_reuses_lookup_identity_for_miss(
     assert capture_calls == 1
 
 
+def test_stat_aware_lookup_reuses_hint_without_changing_public_override_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="stat-aware.cache")
+    provided_stat = os.stat(file_path)
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    observed_stats: list[os.stat_result | None] = []
+    original_capture = cache._capture_file_identity
+
+    def capture_with_record(path: str, *, file_stat: os.stat_result | None) -> Any:
+        observed_stats.append(file_stat)
+        return original_capture(path, file_stat=file_stat)
+
+    monkeypatch.setattr(cache, "_capture_file_identity", capture_with_record)
+
+    assert cache.get_cached_result_with_stat(str(file_path), provided_stat) is None
+    assert observed_stats == [provided_stat]
+
+    class LegacyIdentityLookupCache(ScanResultsCache):
+        lookup_called = False
+
+        def get_cached_result_with_identity(
+            self,
+            path: str,
+            version_context: dict[str, Any] | None = None,
+            *,
+            include_private_metadata: bool = False,
+        ) -> Any:
+            self.lookup_called = True
+            return None, None
+
+    legacy_lookup_cache = LegacyIdentityLookupCache(str(tmp_path / "legacy-lookup-cache"))
+
+    assert legacy_lookup_cache.get_cached_result_with_stat(str(file_path), provided_stat) is None
+    assert legacy_lookup_cache.lookup_called is True
+
+    class LegacyCaptureCache(ScanResultsCache):
+        capture_called = False
+
+        def capture_file_identity(self, path: str) -> Any:
+            self.capture_called = True
+            return super().capture_file_identity(path)
+
+    legacy_capture_cache = LegacyCaptureCache(str(tmp_path / "legacy-capture-cache"))
+
+    assert legacy_capture_cache.get_cached_result_with_stat(str(file_path), provided_stat) is None
+    assert legacy_capture_cache.capture_called is True
+
+
+def test_cache_manager_forwards_stat_to_existing_cache_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="manager-stat.cache")
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    provided_stat = os.stat(file_path)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    observed_stats: list[os.stat_result] = []
+
+    def lookup_with_stat(
+        path: str,
+        file_stat: os.stat_result,
+        version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
+    ) -> Any:
+        assert path == str(file_path)
+        assert version_context is None
+        assert include_private_metadata is False
+        observed_stats.append(file_stat)
+        return expected
+
+    monkeypatch.setattr(cache_manager.cache, "get_cached_result_with_stat", lookup_with_stat)
+
+    assert cache_manager.get_cached_result_with_stat(str(file_path), provided_stat) == expected
+    assert observed_stats == [provided_stat]
+
+    override_expected = {**expected, "scanner": "manager-override"}
+    override_identity = cache_manager.cache.capture_file_identity(str(file_path))
+    manager_override_called = False
+
+    def legacy_manager_lookup(
+        path: str,
+        version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
+    ) -> Any:
+        nonlocal manager_override_called
+        manager_override_called = True
+        return override_expected, override_identity
+
+    monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", legacy_manager_lookup)
+    monkeypatch.setattr(
+        "modelaudit.cache.cache_manager.cached_scan_result_dependencies_available",
+        lambda _result: False,
+    )
+
+    assert cache_manager.get_cached_result_with_stat(str(file_path), provided_stat) == override_expected
+    assert manager_override_called is True
+
+
 def test_cached_scan_does_not_store_result_after_post_scan_replacement(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path, name="race.dat")
     clean_payload = b"clean:" + (b"x" * 2042)
