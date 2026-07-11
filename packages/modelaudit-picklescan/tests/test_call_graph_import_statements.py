@@ -3066,25 +3066,18 @@ def test_runtime_guard_selects_live_typing_extensions_export() -> None:
     source_path = Path(typing_extensions.__file__)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
 
-    statements = call_graph._runtime_selected_module_statements(
-        tree.body, "typing_extensions"
-    )
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
 
     assert not any(_is_typing_readonly_guard(statement) for statement in statements)
     if typing_extensions.get_type_hints is typing.get_type_hints:
         assert any(
             isinstance(statement, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "get_type_hints"
-                for target in statement.targets
-            )
+            and any(isinstance(target, ast.Name) and target.id == "get_type_hints" for target in statement.targets)
             for statement in statements
         )
     else:
         assert any(
-            isinstance(statement, ast.FunctionDef)
-            and statement.name == "get_type_hints"
-            for statement in statements
+            isinstance(statement, ast.FunctionDef) and statement.name == "get_type_hints" for statement in statements
         )
 
 
@@ -3096,9 +3089,7 @@ def test_runtime_guard_keeps_mutated_typing_extensions_export_ambiguous(
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     monkeypatch.setattr(typing_extensions, "get_type_hints", object())
 
-    statements = call_graph._runtime_selected_module_statements(
-        tree.body, "typing_extensions"
-    )
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
 
     assert any(_is_typing_readonly_guard(statement) for statement in statements)
 
@@ -3116,9 +3107,7 @@ def test_runtime_guard_keeps_shared_replacement_alias_ambiguous(
     monkeypatch.setattr(typing, "get_type_hints", replacement)
     monkeypatch.setattr(typing_extensions, "get_type_hints", replacement)
 
-    statements = call_graph._runtime_selected_module_statements(
-        tree.body, "typing_extensions"
-    )
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
 
     assert any(_is_typing_readonly_guard(statement) for statement in statements)
 
@@ -3129,17 +3118,12 @@ def test_runtime_guard_keeps_source_location_forgery_ambiguous(
     typing_extensions = pytest.importorskip("typing_extensions")
     source_path = Path(typing_extensions.__file__)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    guard = next(
-        statement
-        for statement in tree.body
-        if _is_typing_readonly_guard(statement)
-    )
+    guard = next(statement for statement in tree.body if _is_typing_readonly_guard(statement))
     assert isinstance(guard, ast.If)
     wrapper = next(
         statement
         for statement in guard.orelse
-        if isinstance(statement, ast.FunctionDef)
-        and statement.name == "get_type_hints"
+        if isinstance(statement, ast.FunctionDef) and statement.name == "get_type_hints"
     )
 
     def replacement(*_args: object, **_kwargs: object) -> dict[str, object]:
@@ -3152,9 +3136,7 @@ def test_runtime_guard_keeps_source_location_forgery_ambiguous(
     forged = FunctionType(forged_code, vars(typing_extensions), "get_type_hints")
     monkeypatch.setattr(typing_extensions, "get_type_hints", forged)
 
-    statements = call_graph._runtime_selected_module_statements(
-        tree.body, "typing_extensions"
-    )
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
 
     assert any(_is_typing_readonly_guard(statement) for statement in statements)
 
@@ -3167,10 +3149,7 @@ def test_call_graph_models_version_gated_typing_extensions_definitions() -> None
     path = call_graph._find_sink_path(function_name)
 
     if hasattr(typing, "ReadOnly"):
-        assert (
-            call_graph._resolve_function_target(function_name)
-            == "typing.get_type_hints"
-        )
+        assert call_graph._resolve_function_target(function_name) == "typing.get_type_hints"
     else:
         assert call_graph._call_graph_entrypoints(function_name) == (function_name,)
         assert "typing.get_type_hints" in calls
