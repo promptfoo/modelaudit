@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- **hashing:** preserve throughput while checking scan deadlines responsively
 - **cli:** handle interrupts during CLI startup without a traceback
 
 ## [0.2.49](https://github.com/promptfoo/modelaudit/compare/v0.2.48...v0.2.49) (2026-06-25)

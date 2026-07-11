@@ -2063,17 +2063,183 @@ def test_calculate_file_hash_rejects_fifo_swap_without_blocking(
     assert swapped is True
 
 
-def test_calculate_file_hash_spans_chunks(tmp_path: Path) -> None:
-    """Dedup hashing must be output-identical across the chunked read boundary."""
-    from modelaudit.scanners.base import DEFAULT_READ_CHUNK_SIZE
-
-    content = (b"modelaudit-dedup-payload" * 4096) + bytes(DEFAULT_READ_CHUNK_SIZE + 7)
-    assert len(content) > DEFAULT_READ_CHUNK_SIZE
-
+@pytest.mark.parametrize(
+    (
+        "deadline",
+        "content_size",
+        "fixed_read_seconds",
+        "seconds_per_mib",
+        "expected_read_sizes",
+    ),
+    [
+        pytest.param(
+            core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 60.0,
+            core_module.DEFAULT_READ_CHUNK_SIZE + 7,
+            0.25,
+            None,
+            [core_module.DEFAULT_READ_CHUNK_SIZE] * 3,
+            id="distant",
+        ),
+        pytest.param(
+            9.0,
+            core_module.DEFAULT_READ_CHUNK_SIZE + 7,
+            0.1,
+            None,
+            [
+                core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE,
+                core_module.DEFAULT_READ_CHUNK_SIZE,
+                core_module.DEFAULT_READ_CHUNK_SIZE,
+            ],
+            id="short-low-latency",
+        ),
+        pytest.param(
+            9.5,
+            core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE * 2,
+            None,
+            1.0,
+            [core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE] * 3,
+            id="short-bandwidth-limited",
+        ),
+    ],
+)
+def test_calculate_file_hash_preserves_throughput_before_fine_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    deadline: float,
+    content_size: int,
+    fixed_read_seconds: float | None,
+    seconds_per_mib: float | None,
+    expected_read_sizes: list[int],
+) -> None:
+    """Deadline hashing promotes only calibration reads that predict enough margin."""
+    content = bytes(content_size)
     source_path = tmp_path / "dedup-asset.bin"
     source_path.write_bytes(content)
+    real_fdopen = os.fdopen
+    read_sizes: list[int] = []
+    now = 0.0
 
-    assert core_module._calculate_file_hash(str(source_path)) == hashlib.sha256(content).hexdigest()
+    class RecordingReader:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> RecordingReader:
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.handle, name)
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal now
+            read_sizes.append(size)
+            chunk = cast(bytes, self.handle.read(size))
+            if fixed_read_seconds is not None:
+                now += fixed_read_seconds
+            elif seconds_per_mib is not None:
+                now += len(chunk) / core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE * seconds_per_mib
+            return chunk
+
+    def recording_fdopen(*args: Any, **kwargs: Any) -> RecordingReader:
+        return RecordingReader(real_fdopen(*args, **kwargs))
+
+    monkeypatch.setattr(core_module.os, "fdopen", recording_fdopen)
+    monkeypatch.setattr(core_module.time, "time", lambda: now)
+    monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
+
+    assert core_module._calculate_file_hash(str(source_path), deadline=deadline) == hashlib.sha256(content).hexdigest()
+    assert read_sizes == expected_read_sizes
+
+
+def test_calculate_file_hash_uses_fine_reads_near_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hashing must return to the deadline check after a bounded near-deadline read."""
+    source_path = tmp_path / "deadline-asset.bin"
+    source_path.write_bytes(b"x" * (core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE + 1))
+    real_fdopen = os.fdopen
+    read_sizes: list[int] = []
+    now = 0.0
+
+    class DeadlineReader:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> DeadlineReader:
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.handle, name)
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal now
+            read_sizes.append(size)
+            chunk = cast(bytes, self.handle.read(size))
+            now += len(chunk) / core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE
+            return chunk
+
+    def deadline_fdopen(*args: Any, **kwargs: Any) -> DeadlineReader:
+        return DeadlineReader(real_fdopen(*args, **kwargs))
+
+    monkeypatch.setattr(core_module.os, "fdopen", deadline_fdopen)
+    monkeypatch.setattr(core_module.time, "time", lambda: now)
+    monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
+
+    with pytest.raises(TimeoutError, match="File hashing timed out"):
+        core_module._calculate_file_hash(str(source_path), deadline=0.5)
+
+    assert read_sizes == [core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE]
+
+
+def test_calculate_file_hash_probes_before_coarse_read_at_deadline_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsampled read just outside the base window must stay bounded."""
+    source_path = tmp_path / "deadline-boundary.bin"
+    source_path.write_bytes(b"x" * (core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE + 1))
+    real_fdopen = os.fdopen
+    read_sizes: list[int] = []
+    now = 0.0
+
+    class BoundaryReader:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> BoundaryReader:
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.handle, name)
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal now
+            read_sizes.append(size)
+            chunk = cast(bytes, self.handle.read(size))
+            now += core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 1.0
+            return chunk
+
+    def boundary_fdopen(*args: Any, **kwargs: Any) -> BoundaryReader:
+        return BoundaryReader(real_fdopen(*args, **kwargs))
+
+    monkeypatch.setattr(core_module.os, "fdopen", boundary_fdopen)
+    monkeypatch.setattr(core_module.time, "time", lambda: now)
+    monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
+
+    deadline = core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 0.5
+    with pytest.raises(TimeoutError, match="File hashing timed out"):
+        core_module._calculate_file_hash(str(source_path), deadline=deadline)
+
+    assert read_sizes == [core_module._DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE]
 
 
 def test_filtered_savedmodel_owner_asset_updates_aggregate_hash_and_accounting(tmp_path: Path) -> None:

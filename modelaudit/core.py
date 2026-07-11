@@ -200,6 +200,10 @@ _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON = "tar_compressed_stream_incomplete"
 _HDF5_TAR_PREFIX_OWNERSHIP_INCOMPLETE_REASON = "hdf5_tar_prefix_ownership_incomplete"
 _HDF5_COMPRESSED_PREFIX_OWNERSHIP_INCOMPLETE_REASON = "hdf5_compressed_prefix_ownership_incomplete"
 _STREAMING_SOURCE_INTERRUPTED_REASON = "streaming_source_interrupted"
+_DEADLINE_HASH_FINE_READ_CHUNK_SIZE = 8 * 1024
+_DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE = 1024 * 1024
+_DEADLINE_HASH_FINE_READ_WINDOW_SECONDS = 5.0
+_DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR = 2.0
 
 
 def _repository_member_path_for_scan(scan_path: str, scan_root: Path | None) -> str | None:
@@ -2845,6 +2849,10 @@ def _scan_executable_zip_polyglot(path: str, config: dict[str, Any]) -> ScanResu
 def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
+    Deadline enforcement is best effort between synchronous reads. Distant
+    deadlines retain large reads; short unsampled deadlines use one bounded
+    calibration read before observed read latency controls the fine-read switch.
+
     Raises:
         Exception: If file cannot be hashed (security: prevents hash collision attacks)
     """
@@ -2868,12 +2876,52 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                 raise OSError(f"File changed before hashing: {file_path}")
 
             hash_sha256 = hashlib.sha256()
+            coarse_read_seconds: float | None = None
+            calibration_read_seconds: float | None = None
+            calibration_mode = False
             while True:
-                if deadline is not None and time.time() > deadline:
-                    raise TimeoutError(f"File hashing timed out: {file_path}")
-                chunk = source.read(DEFAULT_READ_CHUNK_SIZE)
+                read_chunk_size = DEFAULT_READ_CHUNK_SIZE
+                if deadline is not None:
+                    remaining_seconds = deadline - time.time()
+                    if remaining_seconds < 0:
+                        raise TimeoutError(f"File hashing timed out: {file_path}")
+                    fine_read_window = _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS
+                    if coarse_read_seconds is not None:
+                        fine_read_window += coarse_read_seconds * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
+                    if remaining_seconds <= fine_read_window:
+                        read_chunk_size = _DEADLINE_HASH_FINE_READ_CHUNK_SIZE
+                    elif calibration_mode and calibration_read_seconds is not None:
+                        estimated_coarse_read_seconds = (
+                            calibration_read_seconds
+                            * DEFAULT_READ_CHUNK_SIZE
+                            / _DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE
+                        )
+                        promotion_window = (
+                            _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS
+                            + estimated_coarse_read_seconds * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
+                        )
+                        if remaining_seconds <= promotion_window:
+                            read_chunk_size = _DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE
+                    elif (
+                        coarse_read_seconds is None
+                        and remaining_seconds
+                        <= _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
+                    ):
+                        read_chunk_size = _DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE
+
+                read_started = time.monotonic()
+                chunk = source.read(read_chunk_size)
+                read_elapsed = max(0.0, time.monotonic() - read_started)
                 if not chunk:
                     break
+                if read_chunk_size == DEFAULT_READ_CHUNK_SIZE:
+                    coarse_read_seconds = read_elapsed
+                    calibration_read_seconds = None
+                    calibration_mode = False
+                elif read_chunk_size == _DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE:
+                    coarse_read_seconds = read_elapsed
+                    calibration_read_seconds = read_elapsed
+                    calibration_mode = True
                 hash_sha256.update(chunk)
 
             final_stat = os.fstat(source.fileno())
