@@ -7387,8 +7387,18 @@ def _collect_assignment_aliases(
                 for target_name, node_id in last_resolved_node_ids.items()
             )
             if changed_conditionally or resolved_from_conditional_read:
+                ambiguous_target = next(
+                    (
+                        target_name
+                        for target_name, node_id in (*last_changed_node_ids.items(), *last_resolved_node_ids.items())
+                        if node_id in effective_conditionally_rebound_node_ids.get(target_name, set())
+                        or node_id in propagated_rebound_node_ids.get(target_name, set())
+                    ),
+                    "<unknown>",
+                )
                 raise _CallGraphAnalysisLimitError(
-                    "assignment alias analysis encountered ambiguous conditional rebinding"
+                    "assignment alias analysis encountered ambiguous conditional rebinding for "
+                    f"{ambiguous_target[:64]!r}"
                 )
             break
         if next_state in seen_states:
