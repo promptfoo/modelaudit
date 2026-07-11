@@ -950,6 +950,20 @@ def test_gguf_oversized_chat_template_keeps_large_statement_conservative() -> No
     assert GgufScanner._oversized_chat_template_security_evidence(template) == []
 
 
+def test_gguf_oversized_chat_template_allows_unrelated_statements() -> None:
+    template = "{% for message in messages %}{{ lipsum.__globals__.os }}{% endfor %}"
+
+    evidence = GgufScanner._oversized_chat_template_security_evidence(template)
+
+    assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
+
+
+def test_gguf_oversized_chat_template_suppresses_root_shadowing_statement() -> None:
+    template = "{% for lipsum in safe_values %}{{ lipsum.__globals__.os }}{% endfor %}"
+
+    assert GgufScanner._oversized_chat_template_security_evidence(template) == []
+
+
 def test_gguf_oversized_chat_template_ignores_large_quoted_named_gadget() -> None:
     template = '{{ "' + (" " * 50001) + 'lipsum.__globals__.os" }}'
 
