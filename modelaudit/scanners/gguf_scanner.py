@@ -219,6 +219,7 @@ _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] =
     for pattern_type in _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES
     for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
 )
+_GGUF_JINJA_NAMED_ROOT_PATTERN = re.compile(r"(?<!\w)(?P<root>lipsum|get_flashed_messages)\b")
 _GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
 _GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
@@ -2162,11 +2163,20 @@ class GgufScanner(BaseScanner):
 
     @classmethod
     def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
-        named_global_access = False
-        has_statement = False
+        named_global_roots: set[str] = set()
+        statement_named_roots: set[str] = set()
         matched_patterns: set[str] = set()
         for start, end, is_statement in Jinja2TemplateScanner.iter_executable_template_ranges(value):
-            has_statement = has_statement or is_statement
+            if is_statement:
+                statement_named_roots.update(
+                    match.group("root")
+                    for match in cls._iter_unquoted_template_matches(
+                        value,
+                        start,
+                        end,
+                        _GGUF_JINJA_NAMED_ROOT_PATTERN,
+                    )
+                )
             for match in cls._iter_unquoted_template_matches(
                 value,
                 start,
@@ -2179,8 +2189,7 @@ class GgufScanner(BaseScanner):
                 while previous >= start and value[previous].isspace():
                     previous -= 1
                 if previous < start or value[previous] not in ".(":
-                    named_global_access = True
-                    break
+                    named_global_roots.add(match.group("root"))
 
             for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
                 if pattern.pattern == r"__globals__\s*\)*\s*\[":
@@ -2190,7 +2199,7 @@ class GgufScanner(BaseScanner):
                 if matched:
                     matched_patterns.add(pattern_type)
 
-        if named_global_access and not has_statement:
+        if named_global_roots - statement_named_roots:
             return [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
         for pattern_type, _pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
             if pattern_type in matched_patterns:
