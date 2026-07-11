@@ -3066,19 +3066,24 @@ def test_runtime_guard_selects_live_typing_extensions_export() -> None:
     source_path = Path(typing_extensions.__file__)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
 
-    guard = next(statement for statement in tree.body if _is_typing_readonly_guard(statement))
+    guard = next(
+        statement for statement in tree.body if _is_typing_readonly_guard(statement)
+    )
     assert isinstance(guard, ast.If)
     wrapper = next(
         (
             statement
             for statement in guard.orelse
-            if isinstance(statement, ast.FunctionDef) and statement.name == "get_type_hints"
+            if isinstance(statement, ast.FunctionDef)
+            and statement.name == "get_type_hints"
         ),
         None,
     )
     exported = vars(typing_extensions).get("get_type_hints")
     exported_code = getattr(exported, "__code__", None)
-    guard_value = call_graph._typing_extensions_runtime_guard_value(guard, "typing_extensions")
+    guard_value = call_graph._typing_extensions_runtime_guard_value(
+        guard, "typing_extensions"
+    )
     diagnostics = {
         "extension_origin": call_graph._trusted_module_origin_kind("typing_extensions"),
         "typing_origin": call_graph._trusted_module_origin_kind("typing"),
@@ -3086,7 +3091,8 @@ def test_runtime_guard_selects_live_typing_extensions_export() -> None:
         "typing_getattr": "__getattr__" in vars(typing),
         "export_type": type(exported).__name__,
         "export_name": getattr(exported, "__name__", None),
-        "export_globals_match": getattr(exported, "__globals__", None) is vars(typing_extensions),
+        "export_globals_match": getattr(exported, "__globals__", None)
+        is vars(typing_extensions),
         "typing_binding_match": vars(typing_extensions).get("typing") is typing,
         "line_match": wrapper is not None
         and getattr(exported_code, "co_firstlineno", None) == wrapper.lineno,
