@@ -2161,6 +2161,7 @@ def test_calculate_file_hash_preserves_throughput_before_fine_window(
     )
     assert read_sizes == expected_read_sizes
 
+
 def test_calculate_file_hash_uses_fine_reads_near_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
