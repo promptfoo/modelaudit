@@ -269,7 +269,6 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% for _ in [] %}{{ lipsum.__globals__.os }}{% endfor %}",
             "{% for _ in {} %}{{ lipsum.__globals__.os }}{% endfor %}",
             "{% for _ in [0] %}{% else %}{{ lipsum.__globals__.os }}{% endfor %}",
-            "{% for lipsum in [lipsum] if false %}{{ lipsum.__globals__.os }}{% endfor %}",
             "{{ false and lipsum.__globals__.os }}",
             "{{ true or get_flashed_messages.__globals__.os }}",
             (
@@ -321,10 +320,6 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% set x = none or lipsum %}{% set lipsum = x %}{{ lipsum.__globals__.os }}",
             "{% set lipsum = condition and lipsum %}{{ lipsum.__globals__.os }}",
             "{% for lipsum in {lipsum: 0} %}{{ lipsum.__globals__.os }}{% endfor %}",
-            (
-                "{% for lipsum in [lipsum] if false %}{% else %}"
-                + "{{ lipsum.__globals__.os }}{% endfor %}"
-            ),
             "".join(
                 (
                     "{% set saved = lipsum %}{% set lipsum = {} %}",
@@ -362,6 +357,39 @@ class TestJinja2TemplateScannerPatternCategories:
             for check in result.checks
         )
 
+    @pytest.mark.parametrize(
+        ("template", "expected_detection"),
+        [
+            (
+                "{% for lipsum in [lipsum] if false %}{{ lipsum.__globals__.os }}{% endfor %}",
+                False,
+            ),
+            (
+                "{% for lipsum in [lipsum] if false %}{% else %}"
+                + "{{ lipsum.__globals__.os }}{% endfor %}",
+                True,
+            ),
+        ],
+    )
+    def test_named_global_access_respects_constant_false_loop_filter(
+        self,
+        tmp_path: Path,
+        template: str,
+        expected_detection: bool,
+    ) -> None:
+        template_file = tmp_path / "filtered-loop.jinja"
+        template_file.write_text(template)
+
+        result = Jinja2TemplateScanner({"enable_sandbox_test": False}).scan(str(template_file))
+
+        has_global_access = any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in result.checks
+        )
+        assert has_global_access is expected_detection
+
     def test_named_global_access_keeps_unrelated_subscript_finding(
         self,
         tmp_path: Path,
@@ -392,9 +420,9 @@ class TestJinja2TemplateScannerPatternCategories:
         quoted_file = tmp_path / "quoted.jinja"
         quoted_file.write_text("{{ \"docs: (lipsum).__globals__ ['os']\" }}")
         parenthesized_file = tmp_path / "parenthesized.jinja"
-        parenthesized_file.write_text("{{ ((lipsum)).__globals__.os }}")
+        parenthesized_file.write_text("{{ ( (lipsum) ).__globals__.os }}")
         unmatched_file = tmp_path / "unmatched.jinja"
-        unmatched_file.write_text("{{ (lipsum.__globals__.os }}")
+        unmatched_file.write_text("{{ ( lipsum.__globals__.os }}")
         nested_receiver_file = tmp_path / "nested-receiver.jinja"
         nested_receiver_file.write_text("{{ (obj.lipsum).__globals__.os }}")
         scoped_file = tmp_path / "scoped.jinja"
