@@ -201,7 +201,9 @@ _HDF5_TAR_PREFIX_OWNERSHIP_INCOMPLETE_REASON = "hdf5_tar_prefix_ownership_incomp
 _HDF5_COMPRESSED_PREFIX_OWNERSHIP_INCOMPLETE_REASON = "hdf5_compressed_prefix_ownership_incomplete"
 _STREAMING_SOURCE_INTERRUPTED_REASON = "streaming_source_interrupted"
 _DEADLINE_HASH_FINE_READ_CHUNK_SIZE = 8 * 1024
+_DEADLINE_HASH_PROBE_READ_CHUNK_SIZE = 64 * 1024
 _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS = 5.0
+_DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR = 2.0
 
 
 def _repository_member_path_for_scan(scan_path: str, scan_root: Path | None) -> str | None:
@@ -2847,6 +2849,10 @@ def _scan_executable_zip_polyglot(path: str, config: dict[str, Any]) -> ScanResu
 def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
+    Deadline enforcement is best effort between synchronous reads. A small first
+    read calibrates the switch to fine-grained reads without penalizing normal
+    timeout-bound scans for the entire file.
+
     Raises:
         Exception: If file cannot be hashed (security: prevents hash collision attacks)
     """
@@ -2870,17 +2876,36 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                 raise OSError(f"File changed before hashing: {file_path}")
 
             hash_sha256 = hashlib.sha256()
+            needs_deadline_probe = deadline is not None
+            projected_coarse_read_seconds = 0.0
             while True:
                 read_chunk_size = DEFAULT_READ_CHUNK_SIZE
                 if deadline is not None:
                     remaining_seconds = deadline - time.time()
                     if remaining_seconds < 0:
                         raise TimeoutError(f"File hashing timed out: {file_path}")
-                    if remaining_seconds <= _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS:
+                    fine_read_window = (
+                        _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS
+                        + projected_coarse_read_seconds * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
+                    )
+                    if remaining_seconds <= fine_read_window:
                         read_chunk_size = _DEADLINE_HASH_FINE_READ_CHUNK_SIZE
+                    elif needs_deadline_probe:
+                        read_chunk_size = _DEADLINE_HASH_PROBE_READ_CHUNK_SIZE
+
+                read_started = time.monotonic()
                 chunk = source.read(read_chunk_size)
+                read_elapsed = max(0.0, time.monotonic() - read_started)
                 if not chunk:
                     break
+                if read_chunk_size == _DEADLINE_HASH_PROBE_READ_CHUNK_SIZE:
+                    projected_coarse_read_seconds = max(
+                        projected_coarse_read_seconds,
+                        read_elapsed * DEFAULT_READ_CHUNK_SIZE / _DEADLINE_HASH_PROBE_READ_CHUNK_SIZE,
+                    )
+                    needs_deadline_probe = False
+                elif read_chunk_size == DEFAULT_READ_CHUNK_SIZE:
+                    projected_coarse_read_seconds = max(projected_coarse_read_seconds, read_elapsed)
                 hash_sha256.update(chunk)
 
             final_stat = os.fstat(source.fileno())
