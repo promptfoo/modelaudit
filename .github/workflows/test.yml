@@ -1021,9 +1021,11 @@ jobs:
         run: |
           uv run --with ruff ruff check --select I src tests
 
-      - name: Check standalone package formatting with Ruff
+      - name: Show standalone package formatting changes
         run: |
-          uv run --with ruff ruff format --check src tests
+          uv run --with ruff ruff format src tests
+          git diff -- src tests
+          exit 1
 
       - name: Type check standalone package with mypy
         run: |
