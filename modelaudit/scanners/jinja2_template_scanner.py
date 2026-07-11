@@ -1691,6 +1691,8 @@ class Jinja2TemplateScanner(BaseScanner):
                 return
 
             if isinstance(node, jinja2.nodes.AssignBlock):
+                if node.filter is not None:
+                    visit(node.filter, shadowed, dangerous_aliases, node)
                 for child in node.body:
                     visit(child, shadowed, dangerous_aliases, node)
                 targets = stored_names(node.target)
