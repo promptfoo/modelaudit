@@ -922,10 +922,10 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
 def test_gguf_oversized_chat_template_security_evidence_streams_spans(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    seen: list[str] = []
+    seen: list[tuple[str, int | None]] = []
 
-    def iter_spans(value: str) -> Iterator[str]:
-        seen.append(value)
+    def iter_spans(value: str, *, max_span_chars: int | None = None) -> Iterator[str]:
+        seen.append((value, max_span_chars))
         yield "{{ content }}"
         yield "{{ lipsum.__globals__.os }}"
 
@@ -945,7 +945,7 @@ def test_gguf_oversized_chat_template_security_evidence_streams_spans(
 
     evidence = GgufScanner._oversized_chat_template_security_evidence("oversized")
 
-    assert seen == ["oversized"]
+    assert seen == [("oversized", 50000)]
     assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
 
 
