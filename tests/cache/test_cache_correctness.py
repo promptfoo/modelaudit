@@ -750,6 +750,25 @@ def test_cache_manager_forwards_stat_to_existing_cache_api(
     assert cache_manager.get_cached_result_with_stat(str(file_path), provided_stat) == expected
     assert observed_stats == [provided_stat]
 
+    override_expected = {**expected, "scanner": "manager-override"}
+    override_identity = cache_manager.cache.capture_file_identity(str(file_path))
+    manager_override_called = False
+
+    def legacy_manager_lookup(
+        path: str,
+        version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
+    ) -> Any:
+        nonlocal manager_override_called
+        manager_override_called = True
+        return override_expected, override_identity
+
+    monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", legacy_manager_lookup)
+
+    assert cache_manager.get_cached_result_with_stat(str(file_path), provided_stat) == override_expected
+    assert manager_override_called is True
+
 
 def test_cached_scan_does_not_store_result_after_post_scan_replacement(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path, name="race.dat")
