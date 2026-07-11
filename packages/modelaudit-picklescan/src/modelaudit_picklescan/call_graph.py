@@ -7447,6 +7447,8 @@ def _assignment_alias_value(
     ):
         return resolved
     alias_target = _static_import_reference_alias(resolved) or resolved
+    if module_name == "typing_extensions" and alias_target == "typing.get_type_hints":
+        return resolved
     if alias_target.startswith(f"{module_name}."):
         return None
     current_source_path = _resolve_module_source(module_name)
