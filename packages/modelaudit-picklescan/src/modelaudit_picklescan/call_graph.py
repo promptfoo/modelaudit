@@ -6220,24 +6220,35 @@ def _typing_extensions_runtime_guard_value(
         or len(test.args) != 2
         or test.keywords
         or not isinstance(test.args[0], ast.Name)
-        or test.args[0].id != "typing"
         or not isinstance(test.args[1], ast.Constant)
-        or test.args[1].value != "ReadOnly"
     ):
+        return None
+    guard = (test.args[0].id, test.args[1].value)
+    if guard not in {("typing", "ReadOnly"), ("builtins", "sentinel")}:
         return None
 
     _mark_shared_source_snapshot_unreusable()
     extension_module = sys.modules.get("typing_extensions")
-    typing_module = sys.modules.get("typing")
     if (
         type(extension_module) is not ModuleType
-        or type(typing_module) is not ModuleType
         or _trusted_module_origin_kind("typing_extensions") != "site_packages"
-        or _trusted_module_origin_kind("typing") != "stdlib"
     ):
         return None
-
     extension_namespace = vars(extension_module)
+
+    if guard == ("builtins", "sentinel"):
+        builtins_module = extension_namespace.get("builtins")
+        if (
+            type(builtins_module) is not ModuleType
+            or type(_IMPORT_RUNTIME_BUILTINS) is not dict
+            or vars(builtins_module) is not _IMPORT_RUNTIME_BUILTINS
+        ):
+            return None
+        return "sentinel" in _IMPORT_RUNTIME_BUILTINS
+
+    typing_module = sys.modules.get("typing")
+    if type(typing_module) is not ModuleType or _trusted_module_origin_kind("typing") != "stdlib":
+        return None
     typing_namespace = vars(typing_module)
     if "ReadOnly" in typing_namespace:
         guard_value = True
@@ -6297,7 +6308,6 @@ def _typing_extensions_runtime_guard_value(
     ):
         return None
     return False
-
 
 def _runtime_selected_module_statements(
     statements: Iterable[ast.stmt],
