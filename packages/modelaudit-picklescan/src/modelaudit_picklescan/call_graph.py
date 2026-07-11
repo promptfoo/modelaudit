@@ -6229,10 +6229,7 @@ def _typing_extensions_runtime_guard_value(
 
     _mark_shared_source_snapshot_unreusable()
     extension_module = sys.modules.get("typing_extensions")
-    if (
-        type(extension_module) is not ModuleType
-        or _trusted_module_origin_kind("typing_extensions") != "site_packages"
-    ):
+    if type(extension_module) is not ModuleType or _trusted_module_origin_kind("typing_extensions") != "site_packages":
         return None
     extension_namespace = vars(extension_module)
 
