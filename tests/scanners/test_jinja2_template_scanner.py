@@ -227,6 +227,7 @@ class TestJinja2TemplateScannerPatternCategories:
             ("lipsum-nested-parenthesized-receiver", "{{ ((lipsum)).__globals__['os'] }}"),
             ("composite-parenthesized-receiver", "{{ (foo or lipsum).__globals__['os'] }}"),
             ("proven-expression-receiver", "{{ (none or lipsum).__globals__.get('os') }}"),
+            ("parenthesized-expression-globals", "{{ ((none or lipsum).__globals__)['os'] }}"),
             ("nested-receiver-subscript", "{{ obj.lipsum.__globals__['os'] }}"),
             ("spaced-nested-receiver-subscript", "{{ obj . lipsum.__globals__['os'] }}"),
         ],
@@ -264,6 +265,7 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% set safe = {'__globals__': {'os': 'docs'}} %}{% set lipsum = safe %}{{ lipsum.__globals__.os }}",
             "{% set lipsum = missing %}{{ lipsum.__globals__.os }}",
             "{% set lipsum = 'x' * 1000000000 %}{{ lipsum.__globals__.os }}",
+            "{% set saved = lipsum %}{% set lipsum = saved and {} %}{{ lipsum.__globals__.os }}",
             "{% for _ in [] %}{{ lipsum.__globals__.os }}{% endfor %}",
             "{% for _ in {} %}{{ lipsum.__globals__.os }}{% endfor %}",
             "{% for _ in [0] %}{% else %}{{ lipsum.__globals__.os }}{% endfor %}",
@@ -316,6 +318,7 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% set saved = lipsum %}{% set lipsum = saved if true else {} %}{{ lipsum.__globals__.os }}",
             "{% set x = lipsum if cond %}{% set lipsum = x %}{{ lipsum.__globals__.os }}",
             "{% set x = none or lipsum %}{% set lipsum = x %}{{ lipsum.__globals__.os }}",
+            "{% set lipsum = condition and lipsum %}{{ lipsum.__globals__.os }}",
             "{% for lipsum in {lipsum: 0} %}{{ lipsum.__globals__.os }}{% endfor %}",
             "".join(
                 (
