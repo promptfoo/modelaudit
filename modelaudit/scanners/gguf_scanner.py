@@ -6,14 +6,11 @@ import os
 import re
 import struct
 from bisect import bisect_left
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
-from modelaudit.detectors.suspicious_symbols import (
-    JINJA2_SSTI_PATTERNS,
-    mask_quoted_jinja_text,
-)
+from modelaudit.detectors.suspicious_symbols import JINJA2_NAMED_GLOBAL_ACCESS_PATTERN, JINJA2_SSTI_PATTERNS
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .jinja2_template_scanner import Jinja2TemplateScanner
@@ -2131,23 +2128,64 @@ class GgufScanner(BaseScanner):
             return "network_api"
         return None
 
+    @staticmethod
+    def _iter_unquoted_template_matches(
+        value: str,
+        start: int,
+        end: int,
+        pattern: re.Pattern[str],
+    ) -> Iterator[re.Match[str]]:
+        quote: str | None = None
+        escaped = False
+        segment_start = start
+        cursor = start
+        while cursor < end:
+            character = value[cursor]
+            if quote is None:
+                if character in {"'", '"'}:
+                    yield from pattern.finditer(value, segment_start, cursor)
+                    quote = character
+                cursor += 1
+                continue
+
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+                segment_start = cursor + 1
+            cursor += 1
+
+        if quote is None:
+            yield from pattern.finditer(value, segment_start, end)
+
     @classmethod
     def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
         named_global_access = False
         has_statement = False
         matched_patterns: set[str] = set()
-        for span in Jinja2TemplateScanner.iter_executable_template_spans(
-            value,
-            max_span_chars=_GGUF_DEFAULT_MAX_TEMPLATE_SIZE,
-        ):
-            masked_span = mask_quoted_jinja_text(span)
-            has_statement = has_statement or "{%" in masked_span
-            named_global_access = named_global_access or bool(
-                Jinja2TemplateScanner.conservative_named_global_access([span])
-            )
+        for start, end, is_statement in Jinja2TemplateScanner.iter_executable_template_ranges(value):
+            has_statement = has_statement or is_statement
+            for match in cls._iter_unquoted_template_matches(
+                value,
+                start,
+                end,
+                JINJA2_NAMED_GLOBAL_ACCESS_PATTERN,
+            ):
+                previous = match.start() - 1
+                while previous >= start and value[previous].isspace():
+                    previous -= 1
+                if previous < start or value[previous] != ".":
+                    named_global_access = True
+                    break
+
             for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
-                pattern_text = masked_span if pattern.pattern == r"__globals__\s*\[" else span
-                if pattern.search(pattern_text):
+                if pattern.pattern == r"__globals__\s*\[":
+                    matched = next(cls._iter_unquoted_template_matches(value, start, end, pattern), None) is not None
+                else:
+                    matched = pattern.search(value, start, end) is not None
+                if matched:
                     matched_patterns.add(pattern_type)
 
         if named_global_access and not has_statement:
