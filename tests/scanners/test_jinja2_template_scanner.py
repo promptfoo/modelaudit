@@ -223,6 +223,7 @@ class TestJinja2TemplateScannerPatternCategories:
             ("lipsum-subscript", "{{ lipsum.__globals__['os'] }}"),
             ("lipsum-spaced-subscript", "{{ lipsum.__globals__ ['os'] }}"),
             ("lipsum-parenthesized-subscript", "{{ (lipsum.__globals__)['os'] }}"),
+            ("lipsum-parenthesized-receiver", "{{ (lipsum).__globals__['os'] }}"),
             ("nested-receiver-subscript", "{{ obj.lipsum.__globals__['os'] }}"),
             ("spaced-nested-receiver-subscript", "{{ obj . lipsum.__globals__['os'] }}"),
         ],
@@ -259,6 +260,7 @@ class TestJinja2TemplateScannerPatternCategories:
             "{{ \"docs: lipsum.__globals__ ['os']\" }}",
             "{% set safe = {'__globals__': {'os': 'docs'}} %}{% set lipsum = safe %}{{ lipsum.__globals__.os }}",
             "{% set lipsum = missing %}{{ lipsum.__globals__.os }}",
+            "{% set saved = lipsum %}{% set lipsum = {} %}{% if false %}{% set lipsum = saved %}{% endif %}{{ lipsum.__globals__.os }}",
             "{% import 'helpers.j2' as lipsum %}{{ lipsum.__globals__.os }}",
             "{% from 'helpers.j2' import helper as lipsum %}{{ lipsum.__globals__.os }}",
             "{% macro lipsum() %}{% endmacro %}{{ lipsum.__globals__.os }}",
@@ -296,6 +298,7 @@ class TestJinja2TemplateScannerPatternCategories:
                 )
             ),
             "{% set saved = lipsum %}{% set lipsum = [saved][0] %}{{ lipsum.__globals__.os }}",
+            "{% set saved = lipsum %}{% set lipsum = saved if true else {} %}{{ lipsum.__globals__.os }}",
             "".join(
                 (
                     "{% set saved = lipsum %}{% set lipsum = {} %}",
