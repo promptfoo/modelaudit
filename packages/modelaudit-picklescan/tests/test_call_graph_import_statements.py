@@ -3077,6 +3077,7 @@ def test_runtime_guard_selects_live_typing_extensions_export() -> None:
         None,
     )
     exported = vars(typing_extensions).get("get_type_hints")
+    exported_code = getattr(exported, "__code__", None)
     guard_value = call_graph._typing_extensions_runtime_guard_value(guard, "typing_extensions")
     diagnostics = {
         "extension_origin": call_graph._trusted_module_origin_kind("typing_extensions"),
@@ -3087,7 +3088,8 @@ def test_runtime_guard_selects_live_typing_extensions_export() -> None:
         "export_name": getattr(exported, "__name__", None),
         "export_globals_match": getattr(exported, "__globals__", None) is vars(typing_extensions),
         "typing_binding_match": vars(typing_extensions).get("typing") is typing,
-        "line_match": wrapper is not None and getattr(exported, "__code__", None).co_firstlineno == wrapper.lineno,
+        "line_match": wrapper is not None
+        and getattr(exported_code, "co_firstlineno", None) == wrapper.lineno,
         "source_match": isinstance(exported, FunctionType)
         and call_graph._function_owner_matches_trusted_source(
             exported,
