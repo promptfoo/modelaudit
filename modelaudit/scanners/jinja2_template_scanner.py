@@ -27,6 +27,7 @@ import platform
 import queue
 import re
 import warnings
+from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -1460,7 +1461,7 @@ class Jinja2TemplateScanner(BaseScanner):
         detections.extend(named_detections)
         named_receiver_pattern = (
             re.compile(
-                rf"\b(?:{'|'.join(re.escape(receiver) for receiver in sorted(covered_global_receivers))})"
+                rf"(?<![\w.])(?:{'|'.join(re.escape(receiver) for receiver in sorted(covered_global_receivers))})"
                 r"\s*\.\s*__globals__\b"
             )
             if covered_global_receivers
@@ -1651,7 +1652,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     shadowed.discard(target)
                     dangerous_aliases.add(target)
                 else:
-                    shadowed.discard(target)
+                    shadowed.add(target)
                     dangerous_aliases.discard(target)
 
         def visit(
@@ -1916,7 +1917,16 @@ class Jinja2TemplateScanner(BaseScanner):
 
     @staticmethod
     def _delimiter_executable_template_spans(template_content: str) -> list[_ExecutableTemplateSpan]:
-        spans: list[_ExecutableTemplateSpan] = []
+        return list(Jinja2TemplateScanner._iter_delimiter_executable_template_spans(template_content))
+
+    @staticmethod
+    def iter_executable_template_spans(template_content: str) -> Iterator[str]:
+        """Yield executable spans without retaining copies of oversized templates."""
+        for span in Jinja2TemplateScanner._iter_delimiter_executable_template_spans(template_content):
+            yield span.text
+
+    @staticmethod
+    def _iter_delimiter_executable_template_spans(template_content: str) -> Iterator[_ExecutableTemplateSpan]:
         cursor = 0
         while cursor < len(template_content):
             marker_start, marker = Jinja2TemplateScanner._next_jinja_marker(template_content, cursor)
@@ -1934,7 +1944,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
             if marker == "{{":
                 span_end = Jinja2TemplateScanner._find_jinja_tag_end(template_content, marker_start, "}}")
-                spans.append(_ExecutableTemplateSpan(template_content[marker_start:span_end]))
+                yield _ExecutableTemplateSpan(template_content[marker_start:span_end])
                 cursor = max(span_end, marker_start + len(marker))
                 continue
 
@@ -1945,10 +1955,8 @@ class Jinja2TemplateScanner(BaseScanner):
                 cursor = Jinja2TemplateScanner._find_jinja_raw_end(template_content, span_end)
                 continue
 
-            spans.append(_ExecutableTemplateSpan(span_text))
+            yield _ExecutableTemplateSpan(span_text)
             cursor = max(span_end, marker_start + len(marker))
-
-        return spans
 
     @staticmethod
     def _next_jinja_marker(template_content: str, cursor: int) -> tuple[int | None, str | None]:
