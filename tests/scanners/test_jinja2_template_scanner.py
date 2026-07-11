@@ -224,6 +224,7 @@ class TestJinja2TemplateScannerPatternCategories:
             ("lipsum-spaced-subscript", "{{ lipsum.__globals__ ['os'] }}"),
             ("lipsum-parenthesized-subscript", "{{ (lipsum.__globals__)['os'] }}"),
             ("nested-receiver-subscript", "{{ obj.lipsum.__globals__['os'] }}"),
+            ("spaced-nested-receiver-subscript", "{{ obj . lipsum.__globals__['os'] }}"),
         ],
     )
     def test_detects_named_global_access_once(
