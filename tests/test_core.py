@@ -2112,8 +2112,6 @@ def test_calculate_file_hash_preserves_throughput_before_fine_window(
     expected_read_sizes: list[int],
 ) -> None:
     """Deadline hashing promotes only calibration reads that predict enough margin."""
-    from modelaudit.scanners.base import DEFAULT_READ_CHUNK_SIZE
-
     content = bytes(content_size)
     source_path = tmp_path / "dedup-asset.bin"
     source_path.write_bytes(content)
