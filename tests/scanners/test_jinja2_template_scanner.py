@@ -365,8 +365,7 @@ class TestJinja2TemplateScannerPatternCategories:
                 False,
             ),
             (
-                "{% for lipsum in [lipsum] if false %}{% else %}"
-                + "{{ lipsum.__globals__.os }}{% endfor %}",
+                "{% for lipsum in [lipsum] if false %}{% else %}" + "{{ lipsum.__globals__.os }}{% endfor %}",
                 True,
             ),
         ],
@@ -455,10 +454,7 @@ class TestJinja2TemplateScannerPatternCategories:
             and check.details
             and check.details.get("pattern_type") == "global_access"
             for check in (
-                quoted_result.checks
-                + unmatched_result.checks
-                + nested_receiver_result.checks
-                + scoped_result.checks
+                quoted_result.checks + unmatched_result.checks + nested_receiver_result.checks + scoped_result.checks
             )
         )
         statement_global_checks = [
