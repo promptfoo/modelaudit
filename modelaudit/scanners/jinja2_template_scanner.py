@@ -1616,8 +1616,16 @@ class Jinja2TemplateScanner(BaseScanner):
             if isinstance(node, (jinja2.nodes.And, jinja2.nodes.Or)):
                 truth = constant_truth(node.left)
                 if truth is None:
-                    left_dangerous = is_dangerous_name(node.left, shadowed, dangerous_aliases)
-                    right_dangerous = is_dangerous_name(node.right, shadowed, dangerous_aliases)
+                    left_dangerous = is_dangerous_name(
+                        node.left,
+                        shadowed,
+                        dangerous_aliases,
+                    )
+                    right_dangerous = is_dangerous_name(
+                        node.right,
+                        shadowed,
+                        dangerous_aliases,
+                    )
                     if isinstance(node, jinja2.nodes.And) and left_dangerous:
                         return right_dangerous
                     return left_dangerous or right_dangerous
@@ -1834,6 +1842,12 @@ class Jinja2TemplateScanner(BaseScanner):
                     body_dangerous = dangerous_aliases - target_names
                 if node.test is not None:
                     visit(node.test, body_shadowed, body_dangerous, node)
+                    if constant_truth(node.test) is False:
+                        else_shadowed = shadowed.copy()
+                        else_dangerous = dangerous_aliases.copy()
+                        for child in node.else_:
+                            visit(child, else_shadowed, else_dangerous, node)
+                        return
                 for child in node.body:
                     visit(child, body_shadowed, body_dangerous, node)
                 if literal_items is None or node.test is not None:
