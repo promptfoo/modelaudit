@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- **jinja2:** detect default global SSTI gadgets with scope-aware false-positive controls
 - **hashing:** preserve throughput while checking scan deadlines responsively
 - **cli:** handle interrupts during CLI startup without a traceback
 
