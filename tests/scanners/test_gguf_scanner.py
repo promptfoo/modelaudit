@@ -5,6 +5,7 @@ import struct
 import sys
 import time
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -928,6 +929,9 @@ def test_gguf_oversized_chat_template_security_evidence_streams_spans(
         yield "{{ content }}"
         yield "{{ lipsum.__globals__.os }}"
 
+    def fail_materialize(_value: str) -> list[str]:
+        pytest.fail("oversized evidence must not materialize all spans")
+
     monkeypatch.setattr(
         Jinja2TemplateScanner,
         "iter_executable_template_spans",
@@ -936,7 +940,7 @@ def test_gguf_oversized_chat_template_security_evidence_streams_spans(
     monkeypatch.setattr(
         Jinja2TemplateScanner,
         "executable_template_spans",
-        staticmethod(lambda _value: pytest.fail("oversized evidence must not materialize all spans")),
+        staticmethod(fail_materialize),
     )
 
     evidence = GgufScanner._oversized_chat_template_security_evidence("oversized")
