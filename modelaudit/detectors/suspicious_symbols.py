@@ -861,7 +861,7 @@ SUSPICIOUS_CONFIG_PATTERNS = {
 # =============================================================================
 
 JINJA2_NAMED_GLOBAL_ACCESS_PATTERN: re.Pattern[str] = re.compile(
-    r"(?<![\w.])(?P<root>lipsum|get_flashed_messages)\s*\.\s*__globals__\b"
+    r"(?<![\w.])(?P<paren>\()?\s*(?P<root>lipsum|get_flashed_messages)\s*(?(paren)\))\s*\.\s*__globals__\b"
 )
 
 
