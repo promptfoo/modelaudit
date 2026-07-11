@@ -5,7 +5,6 @@ import struct
 import sys
 import time
 import zipfile
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -919,34 +918,42 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
 
 
-def test_gguf_oversized_chat_template_security_evidence_streams_spans(
+def test_gguf_oversized_chat_template_security_evidence_uses_zero_copy_ranges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    seen: list[tuple[str, int | None]] = []
-
-    def iter_spans(value: str, *, max_span_chars: int | None = None) -> Iterator[str]:
-        seen.append((value, max_span_chars))
-        yield "{{ content }}"
-        yield "{{ lipsum.__globals__.os }}"
-
     def fail_materialize(_value: str) -> list[str]:
-        pytest.fail("oversized evidence must not materialize all spans")
+        pytest.fail("oversized evidence must not materialize executable spans")
 
     monkeypatch.setattr(
         Jinja2TemplateScanner,
         "iter_executable_template_spans",
-        staticmethod(iter_spans),
-    )
-    monkeypatch.setattr(
-        Jinja2TemplateScanner,
-        "executable_template_spans",
         staticmethod(fail_materialize),
     )
+    template = "{{ lipsum.__globals__.os }}"
 
-    evidence = GgufScanner._oversized_chat_template_security_evidence("oversized")
+    evidence = GgufScanner._oversized_chat_template_security_evidence(template)
 
-    assert seen == [("oversized", 50000)]
     assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
+
+
+def test_gguf_oversized_chat_template_scans_large_expression_without_copying() -> None:
+    template = "{{ lipsum.__globals__.os" + (" " * 50001) + "}}"
+
+    evidence = GgufScanner._oversized_chat_template_security_evidence(template)
+
+    assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
+
+
+def test_gguf_oversized_chat_template_keeps_large_statement_conservative() -> None:
+    template = "{% set lipsum = " + ("0" * 50001) + " %}{{ lipsum.__globals__.os }}"
+
+    assert GgufScanner._oversized_chat_template_security_evidence(template) == []
+
+
+def test_gguf_oversized_chat_template_ignores_large_quoted_named_gadget() -> None:
+    template = '{{ "' + (" " * 50001) + 'lipsum.__globals__.os" }}'
+
+    assert GgufScanner._oversized_chat_template_security_evidence(template) == []
 
 
 @pytest.mark.parametrize(
