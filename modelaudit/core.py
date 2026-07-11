@@ -2877,6 +2877,7 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
 
             hash_sha256 = hashlib.sha256()
             coarse_read_seconds: float | None = None
+            calibration_read_seconds: float | None = None
             calibration_mode = False
             while True:
                 read_chunk_size = DEFAULT_READ_CHUNK_SIZE
@@ -2891,7 +2892,19 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                         )
                     if remaining_seconds <= fine_read_window:
                         read_chunk_size = _DEADLINE_HASH_FINE_READ_CHUNK_SIZE
-                    elif calibration_mode or (
+                    elif calibration_mode and calibration_read_seconds is not None:
+                        estimated_coarse_read_seconds = (
+                            calibration_read_seconds
+                            * DEFAULT_READ_CHUNK_SIZE
+                            / _DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE
+                        )
+                        promotion_window = (
+                            _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS
+                            + estimated_coarse_read_seconds * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
+                        )
+                        if remaining_seconds <= promotion_window:
+                            read_chunk_size = _DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE
+                    elif (
                         coarse_read_seconds is None
                         and remaining_seconds
                         <= _DEADLINE_HASH_FINE_READ_WINDOW_SECONDS * _DEADLINE_HASH_READ_LATENCY_SAFETY_FACTOR
@@ -2905,9 +2918,11 @@ def _calculate_file_hash(file_path: str, *, deadline: float | None = None) -> st
                     break
                 if read_chunk_size == DEFAULT_READ_CHUNK_SIZE:
                     coarse_read_seconds = read_elapsed
+                    calibration_read_seconds = None
                     calibration_mode = False
                 elif read_chunk_size == _DEADLINE_HASH_CALIBRATION_READ_CHUNK_SIZE:
                     coarse_read_seconds = read_elapsed
+                    calibration_read_seconds = read_elapsed
                     calibration_mode = True
                 hash_sha256.update(chunk)
 
