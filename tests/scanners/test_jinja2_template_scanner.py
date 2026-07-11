@@ -303,7 +303,7 @@ class TestJinja2TemplateScannerPatternCategories:
             ),
             "{% set saved = lipsum %}{% set lipsum = [saved][0] %}{{ lipsum.__globals__.os }}",
             "{% set saved = lipsum %}{% set lipsum = saved if true else {} %}{{ lipsum.__globals__.os }}",
-            "{% set x = lipsum if cond %}{{ x.__globals__.os }}",
+            "{% set x = lipsum if cond %}{% set lipsum = x %}{{ lipsum.__globals__.os }}",
             "".join(
                 (
                     "{% set saved = lipsum %}{% set lipsum = {} %}",
