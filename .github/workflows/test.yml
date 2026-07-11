@@ -119,7 +119,11 @@ jobs:
 
       - name: Check formatting with Ruff
         run: |
-          uv run ruff format --check modelaudit/ tests/
+          if ! uv run ruff format --check modelaudit/ tests/; then
+            uv run ruff format modelaudit/ tests/
+            git diff -- modelaudit/core.py tests/test_core.py
+            exit 1
+          fi
 
   dependency-audit:
     name: Dependency Audit
