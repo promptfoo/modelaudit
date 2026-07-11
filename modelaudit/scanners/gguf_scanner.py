@@ -2133,14 +2133,24 @@ class GgufScanner(BaseScanner):
 
     @classmethod
     def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
-        executable_spans = Jinja2TemplateScanner.executable_template_spans(value)
-        if Jinja2TemplateScanner.conservative_named_global_access(executable_spans):
+        named_global_access = False
+        has_statement = False
+        matched_patterns: set[str] = set()
+        for span in Jinja2TemplateScanner.iter_executable_template_spans(value):
+            masked_span = mask_quoted_jinja_text(span)
+            has_statement = has_statement or "{%" in masked_span
+            named_global_access = named_global_access or bool(
+                Jinja2TemplateScanner.conservative_named_global_access([span])
+            )
+            for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
+                pattern_text = masked_span if pattern.pattern == r"__globals__\s*\[" else span
+                if pattern.search(pattern_text):
+                    matched_patterns.add(pattern_type)
+
+        if named_global_access and not has_statement:
             return [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
-        for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
-            if any(
-                pattern.search(mask_quoted_jinja_text(span) if pattern.pattern == r"__globals__\s*\[" else span)
-                for span in executable_spans
-            ):
+        for pattern_type, _pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
+            if pattern_type in matched_patterns:
                 return [{"evidence_type": "template_injection", "pattern": f"jinja2_{pattern_type}"}]
         return []
 
