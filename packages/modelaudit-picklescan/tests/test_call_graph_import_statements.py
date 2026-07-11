@@ -3141,12 +3141,14 @@ def test_runtime_guard_keeps_dynamic_builtin_sentinel_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     typing_extensions = pytest.importorskip("typing_extensions")
-    if "sentinel" in call_graph._IMPORT_RUNTIME_BUILTINS:
+    builtins_namespace = call_graph._IMPORT_RUNTIME_BUILTINS
+    assert isinstance(builtins_namespace, dict)
+    if "sentinel" in builtins_namespace:
         pytest.skip("builtins.sentinel is directly available")
     source_path = Path(typing_extensions.__file__)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     guard = next(statement for statement in tree.body if _is_builtin_sentinel_guard(statement))
-    monkeypatch.setitem(call_graph._IMPORT_RUNTIME_BUILTINS, "__getattr__", lambda _name: object())
+    monkeypatch.setitem(builtins_namespace, "__getattr__", lambda _name: object())
 
     assert hasattr(builtins, "sentinel")
     statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
