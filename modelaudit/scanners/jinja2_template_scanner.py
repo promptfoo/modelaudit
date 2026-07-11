@@ -1932,24 +1932,19 @@ class Jinja2TemplateScanner(BaseScanner):
         return list(Jinja2TemplateScanner._iter_delimiter_executable_template_spans(template_content))
 
     @staticmethod
-    def iter_executable_template_spans(
-        template_content: str,
-        *,
-        max_span_chars: int | None = None,
-    ) -> Iterator[str]:
-        """Yield executable spans without retaining copies of oversized templates."""
-        for span in Jinja2TemplateScanner._iter_delimiter_executable_template_spans(
-            template_content,
-            max_span_chars=max_span_chars,
-        ):
+    def iter_executable_template_spans(template_content: str) -> Iterator[str]:
+        """Yield executable spans without retaining the full span list."""
+        for span in Jinja2TemplateScanner._iter_delimiter_executable_template_spans(template_content):
             yield span.text
 
     @staticmethod
-    def _iter_delimiter_executable_template_spans(
-        template_content: str,
-        *,
-        max_span_chars: int | None = None,
-    ) -> Iterator[_ExecutableTemplateSpan]:
+    def _iter_delimiter_executable_template_spans(template_content: str) -> Iterator[_ExecutableTemplateSpan]:
+        for start, end, _is_statement in Jinja2TemplateScanner.iter_executable_template_ranges(template_content):
+            yield _ExecutableTemplateSpan(template_content[start:end])
+
+    @staticmethod
+    def iter_executable_template_ranges(template_content: str) -> Iterator[tuple[int, int, bool]]:
+        """Yield executable span offsets without copying span contents."""
         cursor = 0
         while cursor < len(template_content):
             marker_start, marker = Jinja2TemplateScanner._next_jinja_marker(template_content, cursor)
@@ -1965,23 +1960,21 @@ class Jinja2TemplateScanner(BaseScanner):
                 )
                 continue
 
-            if marker == "{{":
-                span_end = Jinja2TemplateScanner._find_jinja_tag_end(template_content, marker_start, "}}")
-                if max_span_chars is None or span_end - marker_start <= max_span_chars:
-                    yield _ExecutableTemplateSpan(template_content[marker_start:span_end])
-                cursor = max(span_end, marker_start + len(marker))
-                continue
-
-            span_end = Jinja2TemplateScanner._find_jinja_tag_end(template_content, marker_start, "%}")
-            bounded_end = span_end if max_span_chars is None else min(span_end, marker_start + max_span_chars)
-            span_text = template_content[marker_start:bounded_end]
-            tag_name = Jinja2TemplateScanner._jinja_block_tag_name(span_text)
-            if tag_name == "raw":
+            end_token = "}}" if marker == "{{" else "%}"
+            span_end = Jinja2TemplateScanner._find_jinja_tag_end(template_content, marker_start, end_token)
+            if (
+                marker == "{%"
+                and Jinja2TemplateScanner._jinja_block_tag_name_at(
+                    template_content,
+                    marker_start,
+                    span_end,
+                )
+                == "raw"
+            ):
                 cursor = Jinja2TemplateScanner._find_jinja_raw_end(template_content, span_end)
                 continue
 
-            if max_span_chars is None or span_end - marker_start <= max_span_chars:
-                yield _ExecutableTemplateSpan(span_text)
+            yield marker_start, span_end, marker == "{%"
             cursor = max(span_end, marker_start + len(marker))
 
     @staticmethod
@@ -2033,10 +2026,17 @@ class Jinja2TemplateScanner(BaseScanner):
     def _jinja_block_tag_name(span_text: str) -> str:
         if not span_text.startswith("{%"):
             return ""
-        if span_text.endswith("%}"):
-            span_text = span_text[:-2]
-        inner = span_text[2:].strip(" \t\r\n-+")
-        return inner.split(None, 1)[0].lower() if inner else ""
+        return Jinja2TemplateScanner._jinja_block_tag_name_at(span_text, 0, len(span_text))
+
+    @staticmethod
+    def _jinja_block_tag_name_at(template_content: str, start: int, end: int) -> str:
+        cursor = start + 2
+        while cursor < end and template_content[cursor] in " \t\r\n-+":
+            cursor += 1
+        name_start = cursor
+        while cursor < end and not template_content[cursor].isspace() and template_content[cursor] not in "%}":
+            cursor += 1
+        return template_content[name_start:cursor].lower()
 
     @staticmethod
     def _find_jinja_raw_end(template_content: str, cursor: int) -> int:
@@ -2050,8 +2050,9 @@ class Jinja2TemplateScanner(BaseScanner):
                 "%}",
                 quote_aware=False,
             )
-            block_text = template_content[block_start:block_end]
-            if Jinja2TemplateScanner._jinja_block_tag_name(block_text) == "endraw":
+            if (
+                Jinja2TemplateScanner._jinja_block_tag_name_at(template_content, block_start, block_end) == "endraw"
+            ):
                 return block_end
             cursor = block_start + 2
         return len(template_content)
