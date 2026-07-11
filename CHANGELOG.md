@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- **picklescan:** resolve reviewed runtime `hasattr` guards without losing call-graph sinks
 - **hashing:** preserve throughput while checking scan deadlines responsively
 - **cli:** handle interrupts during CLI startup without a traceback
 
