@@ -84,7 +84,6 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return None
 
-        file_identity: ScannedFileIdentity | None = None
         if (
             getattr(self.get_cached_result_with_identity, "__func__", None)
             is CacheManager.get_cached_result_with_identity
@@ -95,18 +94,18 @@ class CacheManager:
                 version_context=version_context,
                 include_private_metadata=include_private_metadata,
             )
-        else:
-            # Preserve the established override contract for subclasses and monkeypatches.
-            cached_result, file_identity = self.get_cached_result_with_identity(
-                file_path,
-                version_context=version_context,
-                include_private_metadata=include_private_metadata,
-            )
-
-        try:
             if cached_result is not None and not cached_scan_result_dependencies_available(cached_result):
                 logger.debug(f"Bypassing cached result with unavailable scanner dependencies: {Path(file_path).name}")
                 return None
+            return cached_result
+
+        # Preserve the established override contract for subclasses and monkeypatches.
+        cached_result, file_identity = self.get_cached_result_with_identity(
+            file_path,
+            version_context=version_context,
+            include_private_metadata=include_private_metadata,
+        )
+        try:
             return cached_result
         finally:
             if file_identity is not None:
