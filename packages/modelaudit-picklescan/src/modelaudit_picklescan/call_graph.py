@@ -6260,7 +6260,7 @@ def _typing_extensions_runtime_guard_value(
     exported = extension_namespace.get("get_type_hints")
     typing_export = typing_namespace.get("get_type_hints")
     if (
-        type(typing_export) is FunctionType
+        isinstance(typing_export, FunctionType)
         and exported is typing_export
         and typing_export.__name__ == "get_type_hints"
         and typing_export.__globals__ is typing_namespace
