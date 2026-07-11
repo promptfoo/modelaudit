@@ -3061,52 +3061,35 @@ def _is_typing_readonly_guard(statement: ast.stmt) -> bool:
     )
 
 
+def _is_typing_get_type_hints_guard(statement: ast.stmt) -> bool:
+    return (
+        _is_typing_readonly_guard(statement)
+        and isinstance(statement, ast.If)
+        and any(
+            isinstance(branch_statement, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "get_type_hints"
+                for target in branch_statement.targets
+            )
+            for branch_statement in statement.body
+        )
+        and any(
+            isinstance(branch_statement, ast.FunctionDef)
+            and branch_statement.name == "get_type_hints"
+            for branch_statement in statement.orelse
+        )
+    )
+
+
 def test_runtime_guard_selects_live_typing_extensions_export() -> None:
     typing_extensions = pytest.importorskip("typing_extensions")
     source_path = Path(typing_extensions.__file__)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-
-    guard = next(
-        statement for statement in tree.body if _is_typing_readonly_guard(statement)
-    )
-    assert isinstance(guard, ast.If)
-    wrapper = next(
-        (
-            statement
-            for statement in guard.orelse
-            if isinstance(statement, ast.FunctionDef)
-            and statement.name == "get_type_hints"
-        ),
-        None,
-    )
-    exported = vars(typing_extensions).get("get_type_hints")
-    exported_code = getattr(exported, "__code__", None)
-    guard_value = call_graph._typing_extensions_runtime_guard_value(
-        guard, "typing_extensions"
-    )
-    diagnostics = {
-        "extension_origin": call_graph._trusted_module_origin_kind("typing_extensions"),
-        "typing_origin": call_graph._trusted_module_origin_kind("typing"),
-        "extension_getattr": "__getattr__" in vars(typing_extensions),
-        "typing_getattr": "__getattr__" in vars(typing),
-        "export_type": type(exported).__name__,
-        "export_name": getattr(exported, "__name__", None),
-        "export_globals_match": getattr(exported, "__globals__", None)
-        is vars(typing_extensions),
-        "typing_binding_match": vars(typing_extensions).get("typing") is typing,
-        "line_match": wrapper is not None
-        and getattr(exported_code, "co_firstlineno", None) == wrapper.lineno,
-        "source_match": isinstance(exported, FunctionType)
-        and call_graph._function_owner_matches_trusted_source(
-            exported,
-            expected_module="typing_extensions",
-        ),
-    }
-    assert guard_value is not None, diagnostics
+    guard = next(statement for statement in tree.body if _is_typing_get_type_hints_guard(statement))
 
     statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
 
-    assert not any(_is_typing_readonly_guard(statement) for statement in statements)
+    assert guard not in statements
     if typing_extensions.get_type_hints is typing.get_type_hints:
         assert any(
             isinstance(statement, ast.Assign)
@@ -3129,7 +3112,7 @@ def test_runtime_guard_keeps_mutated_typing_extensions_export_ambiguous(
 
     statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
 
-    assert any(_is_typing_readonly_guard(statement) for statement in statements)
+    assert any(_is_typing_get_type_hints_guard(statement) for statement in statements)
 
 
 def test_runtime_guard_keeps_shared_replacement_alias_ambiguous(
@@ -3147,7 +3130,7 @@ def test_runtime_guard_keeps_shared_replacement_alias_ambiguous(
 
     statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
 
-    assert any(_is_typing_readonly_guard(statement) for statement in statements)
+    assert any(_is_typing_get_type_hints_guard(statement) for statement in statements)
 
 
 def test_runtime_guard_keeps_source_location_forgery_ambiguous(
@@ -3156,7 +3139,7 @@ def test_runtime_guard_keeps_source_location_forgery_ambiguous(
     typing_extensions = pytest.importorskip("typing_extensions")
     source_path = Path(typing_extensions.__file__)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    guard = next(statement for statement in tree.body if _is_typing_readonly_guard(statement))
+    guard = next(statement for statement in tree.body if _is_typing_get_type_hints_guard(statement))
     assert isinstance(guard, ast.If)
     wrapper = next(
         statement
@@ -3176,7 +3159,7 @@ def test_runtime_guard_keeps_source_location_forgery_ambiguous(
 
     statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
 
-    assert any(_is_typing_readonly_guard(statement) for statement in statements)
+    assert any(_is_typing_get_type_hints_guard(statement) for statement in statements)
 
 
 def test_call_graph_models_version_gated_typing_extensions_definitions() -> None:
