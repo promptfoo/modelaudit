@@ -6261,8 +6261,8 @@ def _typing_extensions_runtime_guard_value(
 
     extension_namespace = vars(extension_module)
     typing_namespace = vars(typing_module)
-    exported = extension_namespace.get("get_type_hints")
-    typing_export = typing_namespace.get("get_type_hints")
+    exported = cast(object, extension_namespace.get("get_type_hints"))
+    typing_export = cast(object, typing_namespace.get("get_type_hints"))
     if (
         _is_exact_function(typing_export)
         and exported is typing_export
