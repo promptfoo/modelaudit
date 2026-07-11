@@ -269,6 +269,7 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% for _ in [] %}{{ lipsum.__globals__.os }}{% endfor %}",
             "{% for _ in {} %}{{ lipsum.__globals__.os }}{% endfor %}",
             "{% for _ in [0] %}{% else %}{{ lipsum.__globals__.os }}{% endfor %}",
+            "{% for lipsum in [lipsum] if false %}{{ lipsum.__globals__.os }}{% endfor %}",
             "{{ false and lipsum.__globals__.os }}",
             "{{ true or get_flashed_messages.__globals__.os }}",
             (
@@ -320,6 +321,10 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% set x = none or lipsum %}{% set lipsum = x %}{{ lipsum.__globals__.os }}",
             "{% set lipsum = condition and lipsum %}{{ lipsum.__globals__.os }}",
             "{% for lipsum in {lipsum: 0} %}{{ lipsum.__globals__.os }}{% endfor %}",
+            (
+                "{% for lipsum in [lipsum] if false %}{% else %}"
+                + "{{ lipsum.__globals__.os }}{% endfor %}"
+            ),
             "".join(
                 (
                     "{% set saved = lipsum %}{% set lipsum = {} %}",
@@ -387,7 +392,9 @@ class TestJinja2TemplateScannerPatternCategories:
         quoted_file = tmp_path / "quoted.jinja"
         quoted_file.write_text("{{ \"docs: (lipsum).__globals__ ['os']\" }}")
         parenthesized_file = tmp_path / "parenthesized.jinja"
-        parenthesized_file.write_text("{{ (lipsum).__globals__.os }}")
+        parenthesized_file.write_text("{{ ((lipsum)).__globals__.os }}")
+        unmatched_file = tmp_path / "unmatched.jinja"
+        unmatched_file.write_text("{{ (lipsum.__globals__.os }}")
         nested_receiver_file = tmp_path / "nested-receiver.jinja"
         nested_receiver_file.write_text("{{ (obj.lipsum).__globals__.os }}")
         scoped_file = tmp_path / "scoped.jinja"
@@ -398,6 +405,7 @@ class TestJinja2TemplateScannerPatternCategories:
         direct_result = Jinja2TemplateScanner().scan(str(direct_file))
         quoted_result = Jinja2TemplateScanner().scan(str(quoted_file))
         parenthesized_result = Jinja2TemplateScanner().scan(str(parenthesized_file))
+        unmatched_result = Jinja2TemplateScanner().scan(str(unmatched_file))
         nested_receiver_result = Jinja2TemplateScanner().scan(str(nested_receiver_file))
         scoped_result = Jinja2TemplateScanner().scan(str(scoped_file))
         statement_subscript_result = Jinja2TemplateScanner().scan(str(statement_subscript_file))
@@ -418,7 +426,12 @@ class TestJinja2TemplateScannerPatternCategories:
             check.status == CheckStatus.FAILED
             and check.details
             and check.details.get("pattern_type") == "global_access"
-            for check in quoted_result.checks + nested_receiver_result.checks + scoped_result.checks
+            for check in (
+                quoted_result.checks
+                + unmatched_result.checks
+                + nested_receiver_result.checks
+                + scoped_result.checks
+            )
         )
         statement_global_checks = [
             check
