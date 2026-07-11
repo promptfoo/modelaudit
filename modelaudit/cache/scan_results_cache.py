@@ -457,7 +457,10 @@ class ScanResultsCache:
         Returns:
             Cached scan result dictionary if found and valid, None otherwise
         """
-        if getattr(self.get_cached_result_with_identity, "__func__", None) is ScanResultsCache.get_cached_result_with_identity:
+        if (
+            getattr(self.get_cached_result_with_identity, "__func__", None)
+            is ScanResultsCache.get_cached_result_with_identity
+        ):
             cached_result, file_identity = self._get_cached_result_with_identity(
                 file_path,
                 version_context=version_context,
