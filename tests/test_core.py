@@ -2075,6 +2075,7 @@ def test_calculate_file_hash_keeps_large_reads_with_distant_deadline(
     source_path.write_bytes(content)
     real_fdopen = os.fdopen
     read_sizes: list[int] = []
+    now = 0.0
 
     class RecordingReader:
         def __init__(self, handle: Any) -> None:
@@ -2090,25 +2091,24 @@ def test_calculate_file_hash_keeps_large_reads_with_distant_deadline(
             return getattr(self.handle, name)
 
         def read(self, size: int = -1) -> bytes:
+            nonlocal now
             read_sizes.append(size)
-            return cast(bytes, self.handle.read(size))
+            chunk = cast(bytes, self.handle.read(size))
+            now += 0.25
+            return chunk
 
     def recording_fdopen(*args: Any, **kwargs: Any) -> RecordingReader:
         return RecordingReader(real_fdopen(*args, **kwargs))
 
     monkeypatch.setattr(core_module.os, "fdopen", recording_fdopen)
-    monkeypatch.setattr(core_module.time, "time", lambda: 0.0)
-    monkeypatch.setattr(core_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(core_module.time, "time", lambda: now)
+    monkeypatch.setattr(core_module.time, "monotonic", lambda: now)
 
     deadline = core_module._DEADLINE_HASH_FINE_READ_WINDOW_SECONDS + 60.0
     assert core_module._calculate_file_hash(
         str(source_path), deadline=deadline
     ) == hashlib.sha256(content).hexdigest()
-    assert read_sizes == [
-        core_module._DEADLINE_HASH_PROBE_READ_CHUNK_SIZE,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_READ_CHUNK_SIZE,
-    ]
+    assert read_sizes == [DEFAULT_READ_CHUNK_SIZE] * 3
 
 
 def test_calculate_file_hash_uses_fine_reads_near_deadline(
@@ -2159,9 +2159,9 @@ def test_calculate_file_hash_probes_before_coarse_read_at_deadline_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The first deadline-bound read must not cross the fine window at 8 MiB."""
+    """An unsampled read just outside the base window must stay fine-grained."""
     source_path = tmp_path / "deadline-boundary.bin"
-    source_path.write_bytes(b"x" * (core_module._DEADLINE_HASH_PROBE_READ_CHUNK_SIZE + 1))
+    source_path.write_bytes(b"x" * (core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE + 1))
     real_fdopen = os.fdopen
     read_sizes: list[int] = []
     now = 0.0
@@ -2197,7 +2197,7 @@ def test_calculate_file_hash_probes_before_coarse_read_at_deadline_boundary(
     with pytest.raises(TimeoutError, match="File hashing timed out"):
         core_module._calculate_file_hash(str(source_path), deadline=deadline)
 
-    assert read_sizes == [core_module._DEADLINE_HASH_PROBE_READ_CHUNK_SIZE]
+    assert read_sizes == [core_module._DEADLINE_HASH_FINE_READ_CHUNK_SIZE]
 
 
 def test_filtered_savedmodel_owner_asset_updates_aggregate_hash_and_accounting(tmp_path: Path) -> None:
