@@ -2033,10 +2033,16 @@ class Jinja2TemplateScanner(BaseScanner):
         cursor = start + 2
         while cursor < end and template_content[cursor] in " \t\r\n-+":
             cursor += 1
-        name_start = cursor
-        while cursor < end and not template_content[cursor].isspace() and template_content[cursor] not in "%}":
+        name: list[str] = []
+        while cursor < end:
+            character = template_content[cursor]
+            if character.isspace() or character in "%}-+":
+                break
+            if len(name) >= 16:
+                return ""
+            name.append(character)
             cursor += 1
-        return template_content[name_start:cursor].lower()
+        return "".join(name).lower()
 
     @staticmethod
     def _find_jinja_raw_end(template_content: str, cursor: int) -> int:
