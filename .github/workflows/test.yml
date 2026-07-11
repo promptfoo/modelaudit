@@ -1024,7 +1024,7 @@ jobs:
       - name: Check standalone package formatting with Ruff
         run: |
           uv run --with ruff ruff format src tests
-          git diff -- tests/test_call_graph_import_statements.py
+          git diff -- src tests
           exit 1
 
       - name: Type check standalone package with mypy
