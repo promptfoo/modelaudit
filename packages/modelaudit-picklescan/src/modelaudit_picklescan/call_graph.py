@@ -6298,6 +6298,7 @@ def _typing_extensions_runtime_guard_value(
         return None
     return False
 
+
 def _runtime_selected_module_statements(
     statements: Iterable[ast.stmt],
     module_name: str | None = None,
