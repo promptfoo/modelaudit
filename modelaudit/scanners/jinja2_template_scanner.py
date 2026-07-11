@@ -2036,8 +2036,16 @@ class Jinja2TemplateScanner(BaseScanner):
         name: list[str] = []
         while cursor < end:
             character = template_content[cursor]
-            if character.isspace() or character in "%}-+":
+            if character.isspace() or character in "%}":
                 break
+            if character in "-+" and end >= 2 and template_content[end - 2 : end] == "%}":
+                trailing_control = True
+                for suffix_cursor in range(cursor, end - 2):
+                    if template_content[suffix_cursor] not in " \t\r\n-+":
+                        trailing_control = False
+                        break
+                if trailing_control:
+                    break
             if len(name) >= 16:
                 return ""
             name.append(character)
