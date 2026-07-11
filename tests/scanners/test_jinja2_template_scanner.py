@@ -262,7 +262,11 @@ class TestJinja2TemplateScannerPatternCategories:
             "{{ \"docs: lipsum.__globals__ ['os']\" }}",
             "{% set safe = {'__globals__': {'os': 'docs'}} %}{% set lipsum = safe %}{{ lipsum.__globals__.os }}",
             "{% set lipsum = missing %}{{ lipsum.__globals__.os }}",
-            "{% set saved = lipsum %}{% set lipsum = {} %}{% if false %}{% set lipsum = saved %}{% endif %}{{ lipsum.__globals__.os }}",
+            (
+                "{% set saved = lipsum %}{% set lipsum = {} %}"
+                + "{% if false %}{% set lipsum = saved %}{% endif %}"
+                + "{{ lipsum.__globals__.os }}"
+            ),
             "{% set x = 0 if true else lipsum.__globals__.os %}{{ x }}",
             "{% set x = lipsum if false %}{{ x.__globals__.os }}",
             "{% import 'helpers.j2' as lipsum %}{{ lipsum.__globals__.os }}",
