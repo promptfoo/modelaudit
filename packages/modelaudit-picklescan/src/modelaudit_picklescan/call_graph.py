@@ -50,11 +50,15 @@ from types import (
     ModuleType,
     WrapperDescriptorType,
 )
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Protocol, TypeGuard, TypeVar, cast
 from zipimport import zipimporter
 
 _MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
 _MAX_STARTUP_DISTRIBUTION_NAMES = 4096
+
+
+def _is_exact_function(value: object) -> TypeGuard[FunctionType]:
+    return type(value) is FunctionType
 
 
 def _capture_startup_distribution_roots() -> Mapping[str, tuple[tuple[Path, Path], ...]]:
@@ -6260,7 +6264,7 @@ def _typing_extensions_runtime_guard_value(
     exported = extension_namespace.get("get_type_hints")
     typing_export = typing_namespace.get("get_type_hints")
     if (
-        type(typing_export) is FunctionType
+        _is_exact_function(typing_export)
         and exported is typing_export
         and typing_export.__name__ == "get_type_hints"
         and typing_export.__globals__ is typing_namespace
